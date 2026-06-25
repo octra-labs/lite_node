@@ -122,10 +122,10 @@ module EncryptedBalance = struct
       let data = Base64.decode_exn encrypted in
       if String.length data < 32 then Error "Invalid v1 payload"
       else
-        let nonce     = String.sub data 0 16 in
-        let tag       = String.sub data 16 16 in
-        let cipher    = String.sub data 32 (String.length data - 32) in
-        let calc_tag  =
+        let nonce = String.sub data 0 16 in
+        let tag = String.sub data 16 16 in
+        let cipher = String.sub data 32 (String.length data - 32) in
+        let calc_tag =
           Digestif.SHA256.(digest_string (nonce ^ cipher ^ key)
                           |> to_raw_string |> fun s -> String.sub s 0 16) in
         if not (Eqaf.equal tag calc_tag) then Error "Auth failed (v1)"
@@ -952,7 +952,7 @@ module Wallet = struct
         else
           let sk, pk = Mirage_crypto_ec.Ed25519.generate () in
           let priv_s = Base64.encode_exn (Mirage_crypto_ec.Ed25519.priv_to_octets sk) in
-          let pub_s  = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
+          let pub_s = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
           let pub_raw = Mirage_crypto_ec.Ed25519.pub_to_octets pk in
           let hash = Digestif.SHA256.digest_string pub_raw in
           let base58_hash = Base58.encode (Digestif.SHA256.to_raw_string hash) in
