@@ -1,0 +1,4 @@
+(library
+ (name octra_log)
+ (wrapped false)
+ (libraries unix))

@@ -1,0 +1,3 @@
+(library
+ (name octra_supply)
+ (libraries zarith yojson))

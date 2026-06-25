@@ -1,0 +1,20 @@
+(library
+ (name zk_ffi)
+ (foreign_stubs
+  (language cxx)
+  (names zk_stubs)
+  (flags (:include flags.sexp)))
+ (c_library_flags (:include clib_flags.sexp))
+ (libraries bytes))
+
+(rule
+ (targets flags.sexp)
+ (action
+  (with-stdout-to flags.sexp
+   (bash "SRC_ROOT=$(cd %{workspace_root} && pwd | sed -E 's|/_build[^/]*/.*||'); echo \"(-std=c++17 -O2 -fPIC -DMCL_FP_BIT=256 -DMCL_FR_BIT=256 -I $SRC_ROOT/mcl/include)\""))))
+
+(rule
+ (targets clib_flags.sexp)
+ (action
+  (with-stdout-to clib_flags.sexp
+   (bash "SRC_ROOT=$(cd %{workspace_root} && pwd | sed -E 's|/_build[^/]*/.*||'); if [ \"$(uname -s)\" = 'Darwin' ]; then echo \"(-L $SRC_ROOT/mcl/lib -lmcl -lc++)\"; else echo \"(-Wl,--whole-archive $SRC_ROOT/mcl/lib/libmcl.a -Wl,--no-whole-archive -lstdc++)\"; fi"))))

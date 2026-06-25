@@ -1,0 +1,4 @@
+upstream: https://github.com/herumi/mcl
+commit:   d1a53d4e1b4ef184c48adb3194db037695f97ad8
+vendored: 2026-05-03
+license:  BSD-3-Clause (see COPYRIGHT in this directory)

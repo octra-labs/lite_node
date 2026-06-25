@@ -1,0 +1,20 @@
+(library
+ (name pvac_ffi)
+ (foreign_stubs
+  (language cxx)
+  (names pvac_stubs)
+  (flags (:include flags.sexp)))
+ (c_library_flags (:include clib_flags.sexp))
+ (libraries bytes threads.posix))
+
+(rule
+ (targets flags.sexp)
+ (action
+  (with-stdout-to flags.sexp
+   (bash "SRC_ROOT=$(cd %{workspace_root} && pwd | sed -E 's|/_build[^/]*/.*||'); ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; echo \"(-std=c++17 -O2 -fPIC $AES_FLAGS -I $SRC_ROOT/pvac/include -I $SRC_ROOT/lib/pvac_ffi)\""))))
+
+(rule
+ (targets clib_flags.sexp)
+ (action
+  (with-stdout-to clib_flags.sexp
+   (bash "if [ \"$(uname -s)\" = 'Darwin' ]; then echo '(-lc++)'; else echo '(-lstdc++)'; fi"))))

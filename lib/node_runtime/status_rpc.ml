@@ -1,0 +1,88 @@
+(*
+Octra Labs 2026
+
+Lite node, for internal use only (pre-release build 0x1067dzc2)
+
+Include at startup:
+- compiler
+- env-constructor
+- binary-proto consensus for updates
+- PVAC (optimized version, build 0f24dd-2025)
+- libp2p
+- gRPC (version 9738fdy44-2025)
+*)
+
+
+module Rpc = Octra_core.Rpc
+
+let node_version () =
+  Rpc_view.node_version ()
+
+let validator_view_pubkey ~validator_view_pub ~validator_address =
+  Rpc_view.validator_view_pubkey
+    ~validator_view_pub
+    ~validator_address
+
+let epoch_tags ~tags ~keep_epochs =
+  Rpc_view.epoch_tags ~tags ~keep_epochs
+
+let consensus_peer_states ~now ~diag ~peer_records =
+  let diag_json, score_rows = Rpc_view.peer_diag diag ~now in
+  match peer_records with
+  | None ->
+    Rpc_view.consensus_peer_states
+      ~enabled:false
+      ~peers:[]
+      ~scores:score_rows
+      ~diag:diag_json
+  | Some records ->
+    let peers =
+      records
+      |> List.sort (fun a b ->
+        String.compare a.Octra_consensus.C_driver.responder_addr
+          b.Octra_consensus.C_driver.responder_addr)
+      |> List.map (Rpc_view.consensus_peer ~now)
+    in
+    Rpc_view.consensus_peer_states
+      ~enabled:true
+      ~peers
+      ~scores:score_rows
+      ~diag:diag_json
+
+let node_status ~epoch ~validator ~roots ~timestamp ~head =
+  Rpc_view.node_status
+    ~epoch
+    ~validator
+    ~roots
+    ~timestamp
+    ~head
+
+let node_stats ~current_epoch ~total_accounts ~active_accounts ~true_total
+    ~encrypted ~max_supply ~total_confirmed ~staging ~recent_tx_count
+    ~latest_epochs ~head =
+  let display_supply = Z.add true_total encrypted in
+  Rpc_view.node_stats
+    ~current_epoch
+    ~total_accounts
+    ~active_accounts
+    ~display_supply
+    ~encrypted_supply:encrypted
+    ~max_supply
+    ~total_confirmed
+    ~staging
+    ~recent_tx_count
+    ~latest_epochs
+    ~head
+
+let validator_set_proof ~chain_id ~config_hash ?scheduled validator_set =
+  let proof =
+    Octra_consensus.C_light_validator_set.of_validator_set
+      ~chain_id
+      ~config_hash
+      ?scheduled
+      validator_set
+  in
+  if Octra_consensus.C_light_validator_set.verify proof then
+    Ok (Rpc_view.validator_set_proof proof)
+  else
+    Error (Rpc.err (-32000) "invalid validator set proof" None)

@@ -1,0 +1,13 @@
+(library
+ (name octra_vm)
+ (libraries
+  octra_core
+  pvac_ffi
+  zk_ffi
+  zarith
+  lwt
+  sqlite3
+  base64
+  yojson
+  octra_log
+  digestif digestif.c))

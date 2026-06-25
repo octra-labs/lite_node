@@ -1,0 +1,45 @@
+name: test
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - '*'
+
+jobs:
+  build:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: lscpu
+    - run: sudo apt update
+    - run: sudo apt install valgrind nasm
+    - run: make bin/pairing.exe -j4
+    - run: valgrind bin/pairing.exe
+    - run: make clean
+#    - run: wget https://software.intel.com/content/dam/develop/external/us/en/documents/downloads/sde-external-8.63.0-2021-01-18-lin.tar.bz2
+#    - run: bzip2 -dc sde-external-8.63.0-2021-01-18-lin.tar.bz2 | tar xvf -
+#    - run: make bin/bn_test.exe DEBUG=1 -j4
+#    - run: sde-external-8.63.0-2021-01-18-lin/sde64 -hsw -- bin/bn_test.exe
+    - run: git reset --hard
+    - run: make test_ci DEBUG=1 -j4
+    - run: make clean
+    - run: make test_ci DEBUG=1 -j4 CXX=clang++
+    - run: make clean
+    - run: make test_ci DEBUG=1 -j4 CXX=clang++ MCL_USE_XBYAK=0
+    - run: make clean
+    - run: make test_ci DEBUG=1 -j4 CXX=clang++ MCL_USE_XBYAK=0 MCL_USE_LLVM=0
+    - run: make clean
+    - run: make test_ci DEBUG=4 -j4 CXX=clang++
+    - run: make clean
+    - run: make bin/pairing_c_min.exe && bin/pairing_c_min.exe
+    - run: make clean
+    - run: make lib/libmcl.a MCL_STATIC_CODE=1
+    - run: make clean
+    - run: make MCL_FP_BIT=256 MCL_FR_BIT=256 DEBUG=3 bin/ecdsa_c_test.exe && bin/ecdsa_c_test.exe
+#    - run: make MCL_FP_BIT=256 MCL_FR_BIT=256 DEBUG=3 test_ci -j4 # check setArrayMod
+#    - run: make test_go
+#    - run: sudo apt install openjdk-8-jdk
+#    - run: make -C ffi/java test JAVA_INC=-I/usr/lib/jvm/java-8-openjdk-amd64/include

@@ -1,0 +1,3 @@
+(library
+ (name octra_bootstrap)
+ (libraries octra_core octra_net octra_consensus unix yojson digestif digestif.c))
