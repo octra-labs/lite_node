@@ -1398,14 +1398,14 @@ let start_height t height =
   process_outputs t
 
 let realign_height t height =
-  Octra_log.stdout "CONSENSUS [%s]: realign height = %Ld\n%!"
+  Octra_log.stdout "realign height = %Ld\n%!"
     t.config.my_addr height;
   start_height t height
 
 let start t =
   t.running <- true;
   let open Lwt.Syntax in
-  Octra_log.stdout "CONSENSUS: driver started addr = %s height = %Ld n = %d quorum = %d\n%!"
+  Octra_log.stdout "driver started addr = %s height = %Ld n = %d quorum = %d\n%!"
     t.config.my_addr t.engine.state.height t.engine.vs.n t.engine.vs.quorum;
   let min_peers =
     if t.n_validators <= 1 then 0
@@ -1414,20 +1414,20 @@ let start t =
     let pc = Octra_net.P2p_swarm.connected_count t.swarm in
     if pc >= min_peers || tries <= 0 then Lwt.return_unit
     else begin
-      Octra_log.stdout "CONSENSUS [%s]: waiting for peers (%d/%d, need %d)...\n%!" t.config.my_addr pc t.n_validators min_peers;
+      Octra_log.stdout "waiting for peers (%d/%d, need %d)...\n%!" t.config.my_addr pc t.n_validators min_peers;
       let* () = Lwt_unix.sleep 1.0 in
       wait_peers (tries - 1)
     end
   in
   let* () = wait_peers 60 in
-  Octra_log.stdout "CONSENSUS [%s]: peers = %d/%d (min = %d), starting consensus\n%!" t.config.my_addr (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
+  Octra_log.stdout "peers = %d/%d (min = %d), starting consensus\n%!" t.config.my_addr (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
 
   let* () = Lwt_unix.sleep 3.0 in
   if C_engine.is_pristine t.engine then
     C_engine.start_height t.engine t.engine.state.height;
 
   let* () = if C_engine.am_i_leader t.engine then begin
-    Octra_log.stdout "CONSENSUS [%s]: I am leader, proposing height = %Ld\n%!" t.config.my_addr t.engine.state.height;
+    Octra_log.stdout "proposing height = %Ld\n%!" t.config.my_addr t.engine.state.height;
     let* proposal_opt = t.config.make_proposal t.engine.state.height in
     (match proposal_opt with
     | Some (hdr, txs) ->
