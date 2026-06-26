@@ -64,13 +64,76 @@ type deps = {
   incr_ahead_streak : unit -> unit;
 }
 
+type fork_repair_deps = {
+  committed_head_epoch : unit -> int;
+  target_matches : target:int -> root:string -> bool;
+  empty_after : target:int -> head:int -> bool;
+  run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  drop_finality_after : int -> int;
+  prune_after_epoch : int -> unit;
+  set_current_epoch : int -> unit;
+  set_state_attested : head:int -> root:string -> unit;
+  set_catchup_in_progress : bool -> unit;
+  clear_quarantine : string -> unit;
+  mark_quarantine : string -> unit;
+  start_height : int64 -> unit Lwt.t;
+  wake_ready : unit -> unit Lwt.t;
+}
+
 let short_hex8 s =
   String.concat ""
     (List.init
        (min 8 (String.length s))
        (fun i -> Printf.sprintf "%02x" (Char.code s.[i])))
 
-let peer_target_epoch deps ~active_f ~our_head responses =
+let repair_snapshot (deps : fork_repair_deps) reason =
+  deps.mark_quarantine ("fork_snapshot_required:" ^ reason);
+  Lwt.return false
+
+let repair_empty_fork (deps : fork_repair_deps) ~target_epoch ~target_root ~required
+    ~current_root_quorum =
+  let open Lwt.Syntax in
+  let target = Int64.to_int target_epoch in
+  let our_head = deps.committed_head_epoch () in
+  if target < 0 then repair_snapshot deps "negative_target"
+  else
+    let target_local_matches =
+      deps.target_matches ~target ~root:target_root
+    in
+    let empty_fork =
+      deps.empty_after ~target ~head:our_head
+    in
+    match C_catchup.decide_fork_repair
+            ~our_head:(Int64.of_int our_head)
+            ~target:target_epoch
+            ~current_root_quorum
+            ~target_root_quorum:true
+            ~target_local_matches
+            ~empty_fork with
+    | C_catchup.No_fork_repair ->
+      Lwt.return false
+    | C_catchup.Fork_snapshot_required reason ->
+      repair_snapshot deps reason
+    | C_catchup.Rollback_fork_head _ ->
+      let* result = deps.run_empty ~target ~root:target_root in
+      match result with
+      | Octra_core.Fork_head_repair.Snapshot_required reason ->
+        repair_snapshot deps reason
+      | Octra_core.Fork_head_repair.Repaired r ->
+        let dropped = deps.drop_finality_after target in
+        deps.prune_after_epoch target;
+        deps.set_current_epoch (target + 1);
+        deps.set_state_attested ~head:target ~root:target_root;
+        deps.set_catchup_in_progress false;
+        deps.clear_quarantine "fork_empty_rollback";
+        Log.warn "catchup"
+          "fork_empty_rollback target = %d old_head = %d required = %d finality_dropped = %d root = %s"
+          r.target r.old_head required dropped (short_hex8 r.root);
+        let* () = deps.start_height (Int64.succ target_epoch) in
+        let* () = deps.wake_ready () in
+        Lwt.return true
+
+let peer_target_epoch (deps : deps) ~active_f ~our_head responses =
   let peer_heads =
     List.map
       (fun (r : C_driver.epoch_root_response_record) ->
@@ -90,14 +153,14 @@ let peer_target_epoch deps ~active_f ~our_head responses =
   | Some queued when Int64.compare queued peer_target > 0 -> queued
   | _ -> peer_target
 
-let clear_unattested_current_head deps head =
+let clear_unattested_current_head (deps : deps) head =
   if not (deps.attested_head head) then deps.clear_state_attested ()
 
-let quarantine_peer_root_mismatch deps ~head count =
+let quarantine_peer_root_mismatch (deps : deps) ~head count =
   deps.mark_quarantine
     (Printf.sprintf "peer_root_mismatch_at_head count = %d epoch = %d" count head)
 
-let accept_current_root deps ~head ~root reason =
+let accept_current_root (deps : deps) ~head ~root reason =
   let open Lwt.Syntax in
   deps.set_state_attested ~head ~root;
   deps.set_catchup_in_progress false;
@@ -105,7 +168,7 @@ let accept_current_root deps ~head ~root reason =
   let* () = deps.drain_pending_finalized () in
   deps.wake_ready ()
 
-let wake_if_ready deps wake_ready =
+let wake_if_ready (deps : deps) wake_ready =
   let open Lwt.Syntax in
   if wake_ready then
     let* () = deps.drain_pending_finalized () in

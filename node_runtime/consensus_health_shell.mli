@@ -61,6 +61,30 @@ type deps = {
   incr_ahead_streak : unit -> unit;
 }
 
+type fork_repair_deps = {
+  committed_head_epoch : unit -> int;
+  target_matches : target:int -> root:string -> bool;
+  empty_after : target:int -> head:int -> bool;
+  run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  drop_finality_after : int -> int;
+  prune_after_epoch : int -> unit;
+  set_current_epoch : int -> unit;
+  set_state_attested : head:int -> root:string -> unit;
+  set_catchup_in_progress : bool -> unit;
+  clear_quarantine : string -> unit;
+  mark_quarantine : string -> unit;
+  start_height : int64 -> unit Lwt.t;
+  wake_ready : unit -> unit Lwt.t;
+}
+
+val repair_empty_fork :
+  fork_repair_deps ->
+  target_epoch:int64 ->
+  target_root:string ->
+  required:int ->
+  current_root_quorum:bool ->
+  bool Lwt.t
+
 val run :
   ?stale_retries:int ->
   config ->
