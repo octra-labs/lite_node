@@ -77,6 +77,21 @@ type ready_marker = {
   records_verified : int;
 }
 
+type apply_deps = {
+  current_epoch : unit -> int;
+  put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  put_root : int -> string -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  root : unit -> string;
+  eic : unit -> string option;
+  now : unit -> float;
+}
+
 val normalize_base : string -> string
 
 val root_hex64 : string -> string
@@ -105,6 +120,12 @@ val finality_entry :
   ts:float ->
   prepared ->
   Octra_consensus.Finality_log.entry
+
+val apply_records :
+  apply_deps ->
+  cursor:cursor ->
+  record list ->
+  (cursor * int) Lwt.t
 
 val ready_marker :
   data_dir:string ->

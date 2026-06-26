@@ -80,6 +80,21 @@ type ready_marker = {
   records_verified : int;
 }
 
+type apply_deps = {
+  current_epoch : unit -> int;
+  put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  put_root : int -> string -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  root : unit -> string;
+  eic : unit -> string option;
+  now : unit -> float;
+}
+
 let normalize_base s =
   if String.length s > 0 && s.[String.length s - 1] = '/' then
     String.sub s 0 (String.length s - 1)
@@ -274,6 +289,49 @@ let finality_entry ~ts prepared =
     ~txid_hi:(-1L)
     ~ts
     ()
+
+let apply_prepared deps prepared =
+  let open Lwt.Syntax in
+  let record = prepared.record in
+  if prepared.epoch_int <> deps.current_epoch () then
+    failwith
+      (Printf.sprintf
+         "join local epoch mismatch local = %d record = %d"
+         (deps.current_epoch ())
+         prepared.epoch_int);
+  Option.iter (deps.put_proposer prepared.epoch_int) prepared.proposer_info;
+  deps.put_root prepared.epoch_int record.state_root;
+  deps.write_entry (finality_entry ~ts:(deps.now ()) prepared);
+  let* () =
+    deps.apply
+      ~txs:prepared.txs
+      ~receipts_json:record.receipts_json
+      ~proposer_info:prepared.proposer_info
+  in
+  let root = deps.root () in
+  if root <> record.state_root then
+    failwith
+      (Printf.sprintf
+         "join post-apply root mismatch epoch = %Ld local = %s leader = %s"
+         record.epoch_id
+         root
+         record.state_root);
+  if deps.eic () <> Some prepared.expected_eic then
+    failwith
+      (Printf.sprintf
+         "join post-apply EIC mismatch epoch = %Ld"
+         record.epoch_id);
+  Lwt.return_unit
+
+let apply_records deps ~cursor records =
+  let open Lwt.Syntax in
+  Lwt_list.fold_left_s
+    (fun (cursor, count) record ->
+      let prepared = prepare_record ~cursor record in
+      let* () = apply_prepared deps prepared in
+      Lwt.return (prepared.next_cursor, count + 1))
+    (cursor, 0)
+    records
 
 let ready_marker ~data_dir ~consensus_role ~leader_rpc ~chain_id ~validator
     ~validator_pubkey ~priv_b64 ~ready_epoch ~state_root ~records_verified
