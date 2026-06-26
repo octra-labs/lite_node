@@ -92,6 +92,28 @@ type apply_deps = {
   now : unit -> float;
 }
 
+type run_deps = {
+  fetch_head : string -> Yojson.Safe.t Lwt.t;
+  fetch_range :
+    string ->
+    from_epoch:int64 ->
+    max_epochs:int ->
+    Yojson.Safe.t Lwt.t;
+  local_next : unit -> int64;
+  local_root : unit -> string;
+  cursor : from_epoch:int64 -> cursor;
+  apply_range : cursor:cursor -> record list -> (cursor * int) Lwt.t;
+  write_ready :
+    base:string ->
+    ready_epoch:int64 ->
+    state_root:string ->
+    records_verified:int ->
+    unit;
+  sleep : float -> unit Lwt.t;
+  log_start : base:string -> unit;
+  log_applied : applied:int -> unit;
+}
+
 val normalize_base : string -> string
 
 val root_hex64 : string -> string
@@ -126,6 +148,11 @@ val apply_records :
   cursor:cursor ->
   record list ->
   (cursor * int) Lwt.t
+
+val run_catchup :
+  run_deps ->
+  string ->
+  unit Lwt.t
 
 val ready_marker :
   data_dir:string ->

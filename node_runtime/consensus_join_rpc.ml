@@ -95,6 +95,28 @@ type apply_deps = {
   now : unit -> float;
 }
 
+type run_deps = {
+  fetch_head : string -> Yojson.Safe.t Lwt.t;
+  fetch_range :
+    string ->
+    from_epoch:int64 ->
+    max_epochs:int ->
+    Yojson.Safe.t Lwt.t;
+  local_next : unit -> int64;
+  local_root : unit -> string;
+  cursor : from_epoch:int64 -> cursor;
+  apply_range : cursor:cursor -> record list -> (cursor * int) Lwt.t;
+  write_ready :
+    base:string ->
+    ready_epoch:int64 ->
+    state_root:string ->
+    records_verified:int ->
+    unit;
+  sleep : float -> unit Lwt.t;
+  log_start : base:string -> unit;
+  log_applied : applied:int -> unit;
+}
+
 let normalize_base s =
   if String.length s > 0 && s.[String.length s - 1] = '/' then
     String.sub s 0 (String.length s - 1)
@@ -332,6 +354,49 @@ let apply_records deps ~cursor records =
       Lwt.return (prepared.next_cursor, count + 1))
     (cursor, 0)
     records
+
+let run_catchup deps base =
+  let open Lwt.Syntax in
+  let base = normalize_base base in
+  deps.log_start ~base;
+  let rec loop ~records_verified =
+    let local_next = deps.local_next () in
+    let* head_json = deps.fetch_head base in
+    let head = parse_head head_json in
+    match sync_plan ~local_next ~local_root:(deps.local_root ()) head with
+    | Local_ahead p ->
+      Lwt.fail_with
+        (Printf.sprintf
+           "join local head ahead of leader local = %Ld leader = %Ld"
+           p.local_head
+           p.leader_head)
+    | Root_mismatch p ->
+      Lwt.fail_with
+        (Printf.sprintf
+           "join ready root mismatch local = %s leader = %s epoch = %Ld"
+           p.local_root
+           p.leader_root
+           p.epoch)
+    | Ready p ->
+      deps.write_ready
+        ~base
+        ~ready_epoch:p.ready_epoch
+        ~state_root:p.state_root
+        ~records_verified;
+      Lwt.return_unit
+    | Fetch_range from_epoch ->
+      let* range_json = deps.fetch_range base ~from_epoch ~max_epochs:16 in
+      match parse_range ~from_epoch range_json with
+      | Retry ->
+        let* () = deps.sleep 1.0 in
+        loop ~records_verified
+      | Records records ->
+        let* _, applied =
+          deps.apply_range ~cursor:(deps.cursor ~from_epoch) records in
+        deps.log_applied ~applied;
+        loop ~records_verified:(records_verified + applied)
+  in
+  loop ~records_verified:0
 
 let ready_marker ~data_dir ~consensus_role ~leader_rpc ~chain_id ~validator
     ~validator_pubkey ~priv_b64 ~ready_epoch ~state_root ~records_verified
