@@ -177,3 +177,83 @@ let load_plan ~default_chain_id ~header_path ~bundle_path =
     | Some path -> parse_bundle (Yojson.Safe.from_file path)
   in
   build_plan ~header ~commit_round ~txs
+
+type one_shot_deps = {
+  current_epoch : unit -> int;
+  store_finalized : int -> C_types.finalize -> unit;
+  store_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  store_expected_root : int -> string -> unit;
+  set_proposal : Transaction.t list -> string list -> unit;
+  write_finality : plan -> unit;
+  apply : plan -> unit Lwt.t;
+  exit_error : unit -> unit;
+  exit_success : unit -> unit;
+}
+
+type node_one_shot_deps = {
+  current_epoch : unit -> int;
+  finality : Consensus_finality_state.callbacks;
+  set_proposal : Transaction.t list -> string list -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply : plan -> unit Lwt.t;
+  exit_error : unit -> unit;
+  exit_success : unit -> unit;
+}
+
+let finality_log_entry replay =
+  Octra_consensus.Finality_log.of_header
+    ~round:replay.commit_round
+    replay.header
+
+let node_one_shot_deps (deps : node_one_shot_deps) =
+  {
+    current_epoch = deps.current_epoch;
+    store_finalized = (fun epoch finalize ->
+      deps.finality.store_finalized ~epoch finalize);
+    store_proposer = deps.finality.store_proposer;
+    store_expected_root = (fun epoch root ->
+      deps.finality.store_expected_root ~epoch ~root);
+    set_proposal = deps.set_proposal;
+    write_finality = (fun replay ->
+      deps.write_entry (finality_log_entry replay));
+    apply = deps.apply;
+    exit_error = deps.exit_error;
+    exit_success = deps.exit_success;
+  }
+
+let run_one_shot ~env ~default_chain_id (deps : one_shot_deps) =
+  match env "OCTRA_REPLAY_HEADER_JSON" with
+  | None -> Lwt.return_unit
+  | Some header_path ->
+    let bundle_path = env "OCTRA_REPLAY_BUNDLE_JSON" in
+    let exit_after_replay = env "OCTRA_EXIT_AFTER_REPLAY" = Some "1" in
+    let replay =
+      load_plan
+        ~default_chain_id
+        ~header_path
+        ~bundle_path
+    in
+    if replay.epoch <> deps.current_epoch () then begin
+      Octra_log.fatal "replay"
+        "replay header_epoch = %d current_epoch = %d reason = snapshot_not_at_target"
+        replay.epoch (deps.current_epoch ());
+      deps.exit_error ();
+      Lwt.return_unit
+    end else begin
+      deps.store_finalized replay.epoch replay.finalize;
+      Option.iter (deps.store_proposer replay.epoch) replay.proposer_info;
+      Option.iter (deps.store_expected_root replay.epoch) replay.expected_root;
+      deps.set_proposal replay.txs replay.tx_hashes;
+      Octra_log.info "replay"
+        "starting one-shot replay epoch = %d txs = %d header = %s bundle = %s"
+        replay.epoch
+        (List.length replay.txs)
+        header_path
+        (match bundle_path with Some p -> p | None -> "<none>");
+      deps.write_finality replay;
+      let open Lwt.Syntax in
+      let* () = deps.apply replay in
+      Octra_log.info "replay" "completed one-shot replay epoch = %d" replay.epoch;
+      if exit_after_replay then deps.exit_success ();
+      Lwt.return_unit
+    end

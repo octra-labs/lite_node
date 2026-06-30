@@ -14,6 +14,7 @@ Include at startup:
 
 
 module C_driver = Octra_consensus.C_driver
+module Head_manifest = Octra_core.Head_manifest
 module Wal = Octra_core.Wal
 
 type decision =
@@ -81,7 +82,11 @@ type deps = {
   delete_pending_commit : epoch_id:int -> round:int -> unit;
 }
 
-let unresolved deps =
+let head_epoch_of_manifest = function
+  | Some head -> head.Head_manifest.epoch_id
+  | None -> -1
+
+let unresolved (deps : deps) =
   let head = deps.head_epoch () in
   let pending =
     deps.read_pending_commits ()
@@ -89,10 +94,10 @@ let unresolved deps =
   in
   head, pending
 
-let delete deps p =
+let delete (deps : deps) p =
   deps.delete_pending_commit ~epoch_id:p.Wal.epoch_id ~round:p.round
 
-let run_confirmed deps p ~agreed ~quorum =
+let run_confirmed (deps : deps) p ~agreed ~quorum =
   let open Lwt.Syntax in
   let epoch = Int64.of_int p.Wal.epoch_id in
   Octra_log.warn "consensus"
@@ -128,7 +133,7 @@ let run_inconclusive p ~agreed ~peers ~responses ~quorum =
     p.Wal.epoch_id agreed peers responses quorum;
   Lwt.return_unit
 
-let run_pending deps ~validator_count ~peer_quorum p =
+let run_pending (deps : deps) ~validator_count ~peer_quorum p =
   let open Lwt.Syntax in
   let epoch = Int64.of_int p.Wal.epoch_id in
   let* responses = deps.query_epoch_root ~epoch_id:epoch in
@@ -141,7 +146,7 @@ let run_pending deps ~validator_count ~peer_quorum p =
   | Inconclusive { agreed; peers; responses; quorum } ->
     run_inconclusive p ~agreed ~peers ~responses ~quorum
 
-let run_once deps ~validator_count ~peer_quorum =
+let run_once (deps : deps) ~validator_count ~peer_quorum =
   let head, pending = unresolved deps in
   if pending = [] then Lwt.return_unit
   else begin

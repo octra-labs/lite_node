@@ -44,3 +44,39 @@ val load_plan :
   header_path:string ->
   bundle_path:string option ->
   plan
+
+type one_shot_deps = {
+  current_epoch : unit -> int;
+  store_finalized : int -> Octra_consensus.C_types.finalize -> unit;
+  store_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  store_expected_root : int -> string -> unit;
+  set_proposal : Octra_core.Transaction.t list -> string list -> unit;
+  write_finality : plan -> unit;
+  apply : plan -> unit Lwt.t;
+  exit_error : unit -> unit;
+  exit_success : unit -> unit;
+}
+
+type node_one_shot_deps = {
+  current_epoch : unit -> int;
+  finality : Consensus_finality_state.callbacks;
+  set_proposal : Octra_core.Transaction.t list -> string list -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply : plan -> unit Lwt.t;
+  exit_error : unit -> unit;
+  exit_success : unit -> unit;
+}
+
+val finality_log_entry :
+  plan ->
+  Octra_consensus.Finality_log.entry
+
+val node_one_shot_deps :
+  node_one_shot_deps ->
+  one_shot_deps
+
+val run_one_shot :
+  env:(string -> string option) ->
+  default_chain_id:string ->
+  one_shot_deps ->
+  unit Lwt.t

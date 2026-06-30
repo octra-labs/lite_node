@@ -54,6 +54,12 @@ type result = {
   reset : reset option;
 }
 
+type driver_snapshot = {
+  height : int64;
+  round : int;
+  step : string;
+}
+
 let create ~now = {
   key = "";
   key_started_at = now;
@@ -129,3 +135,34 @@ let record state (sample : sample) =
         resets;
       };
     }
+
+let step_label = function
+  | Octra_consensus.C_types.ProposeStep -> "propose"
+  | Octra_consensus.C_types.PrevoteStep -> "prevote"
+  | Octra_consensus.C_types.PrecommitStep -> "precommit"
+
+let driver_snapshot driver =
+  {
+    height = Octra_consensus.C_driver.current_height driver;
+    round = Octra_consensus.C_driver.current_round driver;
+    step = step_label (Octra_consensus.C_driver.current_step driver);
+  }
+
+let record_snapshot state snapshot ~expected ~now ~source ~stall_sec ~observer
+    ~voting ~catchup_active ~quarantine_active ~state_attested
+    ~pending_finalized =
+  record state {
+    height = snapshot.height;
+    round = snapshot.round;
+    step = snapshot.step;
+    expected;
+    now;
+    source;
+    stall_sec;
+    observer;
+    voting;
+    catchup_active;
+    quarantine_active;
+    state_attested;
+    pending_finalized;
+  }

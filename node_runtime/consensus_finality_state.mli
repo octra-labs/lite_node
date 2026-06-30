@@ -1,0 +1,45 @@
+(*
+Octra Labs 2026
+
+Lite node, for internal use only (pre-release build 0x1067dzc2)
+
+Include at startup:
+- compiler
+- env-constructor
+- binary-proto consensus for updates
+- PVAC (optimized version, build 0f24dd-2025)
+- libp2p
+- gRPC (version 9738fdy44-2025)
+*)
+
+
+type t
+
+type callbacks = {
+  find_finalized : int -> Octra_consensus.C_types.finalize option;
+  has_finalized : int -> bool;
+  store_finalized : epoch:int -> Octra_consensus.C_types.finalize -> unit;
+  store_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  store_flow_proposer : Consensus_finalized_flow.proposer_info -> unit;
+  store_expected_root : epoch:int -> root:string -> unit;
+  remove_finalized : epoch:int -> unit;
+  remove_proposer : epoch:int -> unit;
+  prune_after_epoch : int -> unit;
+}
+
+val create : unit -> t
+val find_finalized : t -> int -> Octra_consensus.C_types.finalize option
+val has_finalized : t -> int -> bool
+val store_finalized : t -> int -> Octra_consensus.C_types.finalize -> unit
+val remove_finalized : t -> int -> unit
+val find_proposer : t -> int -> Octra_core.Epochlog.proposer_info option
+val store_proposer : t -> int -> Octra_core.Epochlog.proposer_info -> unit
+val store_flow_proposer : t -> Consensus_finalized_flow.proposer_info -> unit
+val remove_proposer : t -> int -> unit
+val prune_proposers_before : t -> int -> unit
+val find_expected_root : t -> int -> string option
+val store_expected_root : t -> int -> string -> unit
+val remove_expected_root : t -> int -> unit
+val prune_expected_roots_before : t -> int -> unit
+val prune_after_epoch : t -> int -> unit
+val callbacks : t -> callbacks

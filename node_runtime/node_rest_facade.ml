@@ -1,0 +1,235 @@
+(*
+Octra Labs 2026
+
+Lite node, for internal use only (pre-release build 0x1067dzc2)
+
+Include at startup:
+- compiler
+- env-constructor
+- binary-proto consensus for updates
+- PVAC (optimized version, build 0f24dd-2025)
+- libp2p
+- gRPC (version 9738fdy44-2025)
+*)
+
+
+module Denomination = Octra_core.Denomination
+module Ledger = Octra_core.Ledger
+module Store_irmin = Octra_core.Store_irmin
+module Store_chaindata = Octra_core.Store_chaindata
+module Transaction = Octra_core.Transaction
+module Staging = Octra_core.Tx_staging
+module Tree = Octra_core.Tree
+module WSServer = Octra_core.Ws_server
+module Wallet = Octra_core.Crypto.Wallet
+
+type runtime = {
+  swarm_ref : Octra_net.P2p_swarm.t option ref;
+}
+
+let cli_has_flag name =
+  Array.exists (fun a -> a = name) Sys.argv
+
+let encrypted_supply_aggregate () =
+  let default_oct = 12_413_100 in
+  let oct =
+    match Sys.getenv_opt "OCTRA_ENCRYPTED_SUPPLY_OCT" with
+    | Some s -> (try int_of_string s with _ -> default_oct)
+    | None -> default_oct
+  in
+  Z.mul (Z.of_int oct) Denomination.units_per_oct
+
+let notify_staging_update ?(total_txs = List.length (Staging.all ()))
+    ?(total_ou = !Staging.total_ou) ?(max_ou = Staging.max_ou) () =
+  WSServer.notify_staging_update ~total_txs ~total_ou ~max_ou
+
+let sweep_low_fee_stealth () =
+  let min_ou = Rest_read_rpc.stealth_floor () in
+  let victims = Tx_view.low_fee_heavy_hashes ~min_ou (Staging.all ()) in
+  List.iter (fun h ->
+    ignore (Staging.remove_by_hash h);
+    Preverify_cache.remove h
+  ) victims;
+  let n = List.length victims in
+  if n > 0 then
+    Log.info "staging" "sweep_low_fee_stealth removed = %d min_ou = %s"
+      n
+      (Z.to_string min_ou);
+  n
+
+let add_tx_to_staging ?(relay = true) runtime ledger tx =
+  match Tx_view.staging_submit_admission
+          ~min_ou:(Rest_read_rpc.stealth_floor ())
+          ~min_relay_fee:(Staging.min_relay_fee tx)
+          tx with
+  | Error e -> Error e
+  | Ok () ->
+    let tx_hash = Transaction.hash tx in
+    let lookup addr =
+      Ledger.find_opt ledger addr
+      |> Option.map (fun a -> (a.Ledger.balance, a.Ledger.nonce))
+    in
+    match Staging.add_smart ~lookup tx with
+    | Error e -> Error e
+    | Ok _ ->
+      let swarm_opt = !(runtime.swarm_ref) in
+      let peer_count =
+        match swarm_opt with
+        | Some swarm -> Octra_net.P2p_swarm.peer_count swarm
+        | None -> 0
+      in
+      let effects =
+        Tx_view.staging_submit_effects
+          ~relay
+          ~peer_count
+          ~total_txs:(List.length (Staging.all ()))
+          ~total_ou:!Staging.total_ou
+          ~max_ou:Staging.max_ou
+          ~tx_hash
+      in
+      WSServer.notify_new_tx tx;
+      notify_staging_update
+        ~total_txs:effects.Tx_view.total_txs
+        ~total_ou:effects.total_ou
+        ~max_ou:effects.max_ou
+        ();
+      begin
+        match swarm_opt, effects.relay_payload with
+        | Some swarm, Some payload ->
+          Lwt.async (fun () ->
+            Octra_net.P2p_swarm.broadcast swarm
+              {
+                Octra_net.P2p_frame.msg_type =
+                  Octra_net.P2p_frame.msg_tx_gossip;
+                payload;
+              })
+        | _ -> ()
+      end;
+      Ok tx_hash
+
+let max_encrypted_data_len = 50_000_000
+let max_message_len = 256
+let max_message_len_zkp = 50_000
+let max_message_len_validator = 16_384
+let max_message_len_contract = 10_000_000
+
+let tx_payload_limits = Tx_view.{
+  encrypted_data_len = max_encrypted_data_len;
+  message_len = max_message_len;
+  message_zkp_len = max_message_len_zkp;
+  message_validator_len = max_message_len_validator;
+  message_program_len = max_message_len_contract;
+}
+
+let max_timestamp_drift = 300.0
+
+let consensus_mode_flags () =
+  Consensus_mode.of_inputs
+    ~cli_observer:(cli_has_flag "--observer")
+    ~env_mode:(Sys.getenv_opt "OCTRA_CONSENSUS_MODE")
+
+let bft_mode () =
+  (consensus_mode_flags ()).consensus_enabled
+
+let observer_rpc_mode () =
+  (consensus_mode_flags ()).observer_enabled
+
+let bft_pending_nonce_window () =
+  max 1 (Env.int_value "OCTRA_BFT_PENDING_NONCE_WINDOW" 32)
+
+let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
+  let now = Unix.gettimeofday () in
+  match Tx_view.submit_pre_signature_admission
+          ~now
+          ~max_timestamp_drift
+          ~observer_rpc_mode:(observer_rpc_mode ())
+          ~bft_mode:(bft_mode ())
+          ~limits:tx_payload_limits
+          ~sender_exists:(Ledger.mem ledger tx.from)
+          tx with
+  | Error e -> Error e
+  | Ok () ->
+    let acc = Ledger.find ledger tx.from in
+    match Tx_view.submit_signature_admission
+            ~account_public_key:acc.Ledger.public_key
+            ~preverify_has_capacity:(Preverify_cache.has_capacity ())
+            ~preverify_pending:(Preverify_cache.pending_count ())
+            ~preverify_pending_max:(Preverify_cache.pending_max ())
+            ~bft_mode:(bft_mode ())
+            ~confirmed_nonce:acc.Ledger.nonce
+            ~bft_window:(bft_pending_nonce_window ())
+            tx with
+    | Error e -> Error e
+    | Ok () ->
+      match add_tx_to_staging runtime ledger tx with
+      | Error msg ->
+        let (t, r) = Tx_view.staging_error msg in
+        Error (t, r)
+      | Ok tx_hash ->
+        begin
+          match tx.Transaction.op_type with
+          | Transaction.StealthOp ->
+            Preverify_submit.launch_for_tx
+              {
+                get_pvac_pubkey =
+                  (fun addr -> Ledger.get_pvac_pubkey ledger addr);
+                sender_enc =
+                  (fun addr ->
+                    Option.value
+                      ~default:"0"
+                      (Ledger.find ledger addr).encrypted_balance);
+                start_task = Preverify_cache.start_task;
+                insert_task = Preverify_cache.insert_with_cap;
+                verify_ranges =
+                  (fun ~pubkey_blob ~sender_enc ptd ->
+                    Lwt_preemptive.detach (fun () ->
+                      Tx_view.preverify_stealth_ranges
+                        ~pubkey_blob
+                        ~sender_enc
+                        ptd) ());
+                now = Unix.gettimeofday;
+              }
+              ~tx_hash
+              tx
+          | _ -> ()
+        end;
+        Ok tx_hash
+
+let run_s = Node_rpc_server.run_s
+
+let list_saved_epochs chaindata =
+  Octra_core.Store_chaindata.list_epoch_ids chaindata
+  |> List.sort_uniq compare
+  |> List.rev
+
+let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
+    ~consensus_config_hash ~consensus_validator_set ~scheduled_validator_set
+    ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
+    ~chaindata ~consensus_driver_ref =
+  let deps = Node_rpc_server.{
+    validate = validate_and_submit_tx runtime ledger;
+    encrypted_supply = encrypted_supply_aggregate;
+    notify_staging_update = (fun () -> notify_staging_update ());
+    bft_mode;
+    account_path_profile_enabled = Env.flag "OCTRA_PROFILE_ACCOUNT_PATHS";
+    swarm = (fun () -> !(runtime.swarm_ref));
+  } in
+  Node_rpc_server.start Node_rpc_server.{
+    port;
+    data_dir;
+    store;
+    ledger;
+    tree_ref;
+    wallet;
+    chain_id;
+    consensus_config_hash;
+    consensus_validator_set;
+    scheduled_validator_set;
+    current_epoch;
+    total_tx_count;
+    validator_view_sk;
+    validator_view_pub;
+    chaindata;
+    consensus_driver_ref;
+    deps;
+  }

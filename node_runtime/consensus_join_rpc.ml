@@ -80,6 +80,22 @@ type ready_marker = {
   records_verified : int;
 }
 
+type ready_marker_config = {
+  data_dir : string;
+  consensus_role : string;
+  chain_id : string;
+  validator : string;
+  validator_pubkey : string;
+  priv_b64 : string;
+  generated_at : unit -> float;
+}
+
+type ready_marker_write_deps = {
+  write_text : path:string -> contents:string -> unit;
+  rename : src:string -> dst:string -> unit;
+  log_written : ready_marker -> unit;
+}
+
 type apply_deps = {
   current_epoch : unit -> int;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
@@ -117,6 +133,82 @@ type run_deps = {
   log_applied : applied:int -> unit;
 }
 
+type node_deps = {
+  fetch_json : string -> Yojson.Safe.t Lwt.t;
+  current_epoch : unit -> int;
+  local_root : unit -> string;
+  base_eic_root : unit -> string;
+  next_txid : unit -> int64;
+  put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  put_root : int -> string -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  local_eic : unit -> string option;
+  write_ready :
+    base:string ->
+    ready_epoch:int64 ->
+    state_root:string ->
+    records_verified:int ->
+    unit;
+  sleep : float -> unit Lwt.t;
+  now : unit -> float;
+}
+
+type node_runtime_deps = {
+  env : string -> string option;
+  fetch_json : string -> Yojson.Safe.t Lwt.t;
+  current_epoch : unit -> int;
+  head : unit -> Octra_core.Head_manifest.t option;
+  next_txid : unit -> int64;
+  put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  put_root_raw : int -> string -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  sleep : float -> unit Lwt.t;
+  now : unit -> float;
+  data_dir : string;
+  consensus_role : string;
+  chain_id : string;
+  validator : string;
+  validator_pubkey : string;
+  priv_b64 : string;
+}
+
+type node_runtime_wiring = {
+  env : string -> string option;
+  fetch_json : string -> Yojson.Safe.t Lwt.t;
+  current_epoch : unit -> int;
+  head : unit -> Octra_core.Head_manifest.t option;
+  next_txid : unit -> int64;
+  finality : Consensus_finality_state.callbacks;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  sleep : float -> unit Lwt.t;
+  now : unit -> float;
+  data_dir : string;
+  consensus_role : string;
+  chain_id : string;
+  validator : string;
+  validator_pubkey : string;
+  priv_b64 : string;
+}
+
+let configured_base = function
+  | Some s when String.trim s <> "" -> Some (String.trim s)
+  | _ -> None
+
 let normalize_base s =
   if String.length s > 0 && s.[String.length s - 1] = '/' then
     String.sub s 0 (String.length s - 1)
@@ -125,6 +217,22 @@ let normalize_base s =
 
 let root_hex64 s =
   if String.length s > 64 then String.sub s 0 64 else s
+
+let local_root_from_head = function
+  | Some h -> root_hex64 h.Octra_core.Head_manifest.state_root
+  | None -> ""
+
+let base_eic_root_from_head = function
+  | Some h ->
+    (match h.Octra_core.Head_manifest.ledger_state_root,
+           h.Octra_core.Head_manifest.epoch_index_root with
+     | Some _, Some root -> root
+     | _ -> Octra_core.Epoch_index_commitment.genesis_root)
+  | None -> Octra_core.Epoch_index_commitment.genesis_root
+
+let local_eic_from_head = function
+  | Some h -> h.Octra_core.Head_manifest.epoch_index_root
+  | None -> None
 
 let head_url base =
   base ^ "/state-sync/v1/head"
@@ -137,6 +245,16 @@ let range_url base ~from_epoch ~max_epochs =
     ]
   in
   base ^ "/state-sync/v1/range?" ^ query
+
+let http_get_json url =
+  let open Lwt.Syntax in
+  let* resp, body = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
+  let code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+  let* body_s = Cohttp_lwt.Body.to_string body in
+  if code < 200 || code >= 300 then
+    Lwt.fail_with (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s)
+  else
+    Lwt.return (Yojson.Safe.from_string body_s)
 
 let int64_field json name =
   let module U = Yojson.Safe.Util in
@@ -312,7 +430,7 @@ let finality_entry ~ts prepared =
     ~ts
     ()
 
-let apply_prepared deps prepared =
+let apply_prepared (deps : apply_deps) prepared =
   let open Lwt.Syntax in
   let record = prepared.record in
   if prepared.epoch_int <> deps.current_epoch () then
@@ -345,7 +463,7 @@ let apply_prepared deps prepared =
          record.epoch_id);
   Lwt.return_unit
 
-let apply_records deps ~cursor records =
+let apply_records (deps : apply_deps) ~cursor records =
   let open Lwt.Syntax in
   Lwt_list.fold_left_s
     (fun (cursor, count) record ->
@@ -355,7 +473,7 @@ let apply_records deps ~cursor records =
     (cursor, 0)
     records
 
-let run_catchup deps base =
+let run_catchup (deps : run_deps) base =
   let open Lwt.Syntax in
   let base = normalize_base base in
   deps.log_start ~base;
@@ -397,6 +515,57 @@ let run_catchup deps base =
         loop ~records_verified:(records_verified + applied)
   in
   loop ~records_verified:0
+
+let node_cursor (deps : node_deps) ~from_epoch =
+  {
+    epoch = from_epoch;
+    prev_root = deps.local_root ();
+    eic = deps.base_eic_root ();
+    txid = deps.next_txid ();
+  }
+
+let node_apply_deps (deps : node_deps) =
+  ({
+    current_epoch = deps.current_epoch;
+    put_proposer = deps.put_proposer;
+    put_root = deps.put_root;
+    write_entry = deps.write_entry;
+    apply = deps.apply;
+    root = deps.local_root;
+    eic = deps.local_eic;
+    now = deps.now;
+  } : apply_deps)
+
+let run_node_catchup (deps : node_deps) base =
+  let open Lwt.Syntax in
+  let apply_deps = node_apply_deps deps in
+  let run_deps = {
+    fetch_head = (fun base -> deps.fetch_json (head_url base));
+    fetch_range = (fun base ~from_epoch ~max_epochs ->
+      deps.fetch_json (range_url base ~from_epoch ~max_epochs));
+    local_next = (fun () -> Int64.of_int (deps.current_epoch ()));
+    local_root = deps.local_root;
+    cursor = node_cursor deps;
+    apply_range = (fun ~cursor records ->
+      apply_records apply_deps ~cursor records);
+    write_ready = deps.write_ready;
+    sleep = deps.sleep;
+    log_start = (fun ~base ->
+      Octra_log.info "join"
+        "RPC catchup start leader = %s local_next = %d"
+        base
+        (deps.current_epoch ()));
+    log_applied = (fun ~applied ->
+      Octra_log.info "join"
+        "applied catchup records = %d next_epoch = %d"
+        applied
+        (deps.current_epoch ()));
+  } in
+  let* () = run_catchup run_deps base in
+  Octra_log.info "join"
+    "RPC catchup complete local_next = %d"
+    (deps.current_epoch ());
+  Lwt.return_unit
 
 let ready_marker ~data_dir ~consensus_role ~leader_rpc ~chain_id ~validator
     ~validator_pubkey ~priv_b64 ~ready_epoch ~state_root ~records_verified
@@ -440,3 +609,108 @@ let ready_marker ~data_dir ~consensus_role ~leader_rpc ~chain_id ~validator
         ~signature
         ~generated_at;
   }
+
+let ready_marker_payload_text marker =
+  Yojson.Safe.pretty_to_string marker.payload ^ "\n"
+
+let write_ready_marker_with deps marker =
+  deps.write_text ~path:marker.tmp_path ~contents:(ready_marker_payload_text marker);
+  deps.rename ~src:marker.tmp_path ~dst:marker.path;
+  deps.log_written marker
+
+let write_text_file ~path ~contents =
+  let oc = open_out path in
+  Fun.protect
+    ~finally:(fun () -> close_out_noerr oc)
+    (fun () -> output_string oc contents)
+
+let log_ready_marker marker =
+  Octra_log.info "join"
+    "READY_TO_VOTE_MARKER written path = %s epoch = %Ld root = %s records = %d"
+    marker.path
+    marker.ready_epoch
+    marker.state_root
+    marker.records_verified
+
+let write_ready_marker
+    (config : ready_marker_config)
+    ~base
+    ~ready_epoch
+    ~state_root
+    ~records_verified =
+  let marker =
+    ready_marker
+      ~data_dir:config.data_dir
+      ~consensus_role:config.consensus_role
+      ~leader_rpc:base
+      ~chain_id:config.chain_id
+      ~validator:config.validator
+      ~validator_pubkey:config.validator_pubkey
+      ~priv_b64:config.priv_b64
+      ~ready_epoch
+      ~state_root
+      ~records_verified
+      ~generated_at:(config.generated_at ())
+  in
+  write_ready_marker_with
+    {
+      write_text = write_text_file;
+      rename = (fun ~src ~dst -> Unix.rename src dst);
+      log_written = log_ready_marker;
+    }
+    marker
+
+let node_deps_of_runtime (deps : node_runtime_deps) =
+  let ready_marker_config = {
+    data_dir = deps.data_dir;
+    consensus_role = deps.consensus_role;
+    chain_id = deps.chain_id;
+    validator = deps.validator;
+    validator_pubkey = deps.validator_pubkey;
+    priv_b64 = deps.priv_b64;
+    generated_at = deps.now;
+  } in
+  {
+    fetch_json = deps.fetch_json;
+    current_epoch = deps.current_epoch;
+    local_root = (fun () -> local_root_from_head (deps.head ()));
+    base_eic_root = (fun () -> base_eic_root_from_head (deps.head ()));
+    next_txid = deps.next_txid;
+    put_proposer = deps.put_proposer;
+    put_root = (fun epoch root ->
+      deps.put_root_raw epoch (Runtime_text.hex_to_raw32_lossy root));
+    write_entry = deps.write_entry;
+    apply = deps.apply;
+    local_eic = (fun () -> local_eic_from_head (deps.head ()));
+    write_ready = write_ready_marker ready_marker_config;
+    sleep = deps.sleep;
+    now = deps.now;
+  }
+
+let node_runtime_deps (deps : node_runtime_wiring) =
+  {
+    env = deps.env;
+    fetch_json = deps.fetch_json;
+    current_epoch = deps.current_epoch;
+    head = deps.head;
+    next_txid = deps.next_txid;
+    put_proposer = deps.finality.store_proposer;
+    put_root_raw = (fun epoch root ->
+      deps.finality.store_expected_root ~epoch ~root);
+    write_entry = deps.write_entry;
+    apply = deps.apply;
+    sleep = deps.sleep;
+    now = deps.now;
+    data_dir = deps.data_dir;
+    consensus_role = deps.consensus_role;
+    chain_id = deps.chain_id;
+    validator = deps.validator;
+    validator_pubkey = deps.validator_pubkey;
+    priv_b64 = deps.priv_b64;
+  }
+
+let run_configured_node_catchup (deps : node_runtime_deps) =
+  match configured_base (deps.env "OCTRA_JOIN_RPC") with
+  | None -> Lwt.return_unit
+  | Some base ->
+    run_node_catchup (node_deps_of_runtime deps) base

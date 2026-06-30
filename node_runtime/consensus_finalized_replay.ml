@@ -25,13 +25,27 @@ type deps = {
   apply_finalized : C_types.finalize -> unit Lwt.t;
 }
 
+type node_deps = {
+  current_epoch : unit -> int;
+  catchup_active : unit -> bool;
+  quarantine_active : unit -> bool;
+  finality : Consensus_finality_state.callbacks;
+  read_local_root_raw : unit -> string Lwt.t;
+  apply_finalized : C_types.finalize -> unit Lwt.t;
+}
+
+type runner = {
+  drain_pending : unit -> unit Lwt.t;
+  replay_stashed_while_safe : source:string -> unit Lwt.t;
+}
+
 let short_hex8 s =
   String.concat ""
     (List.init
        (min 8 (String.length s))
        (fun i -> Printf.sprintf "%02x" (Char.code s.[i])))
 
-let rec drain deps =
+let rec drain (deps : deps) =
   let open Lwt.Syntax in
   let epoch = deps.current_epoch () in
   match deps.find_finalized epoch with
@@ -41,7 +55,7 @@ let rec drain deps =
     drain deps
   | None -> Lwt.return_unit
 
-let rec replay_while_safe deps ~source =
+let rec replay_while_safe (deps : deps) ~source =
   let open Lwt.Syntax in
   if deps.catchup_active () then
     Lwt.return_unit
@@ -65,3 +79,22 @@ let rec replay_while_safe deps ~source =
         let* () = deps.apply_finalized finalize in
         replay_while_safe deps ~source
       end
+
+let node_deps (deps : node_deps) =
+  {
+    current_epoch = deps.current_epoch;
+    catchup_active = deps.catchup_active;
+    quarantine_active = deps.quarantine_active;
+    find_finalized = deps.finality.find_finalized;
+    read_local_root_raw = deps.read_local_root_raw;
+    apply_finalized = deps.apply_finalized;
+  }
+
+let node_runner (deps : node_deps) =
+  let deps = node_deps deps in
+  {
+    drain_pending = (fun () ->
+      drain deps);
+    replay_stashed_while_safe = (fun ~source ->
+      replay_while_safe deps ~source);
+  }

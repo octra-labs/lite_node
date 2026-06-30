@@ -205,9 +205,6 @@ let program_routes h =
     route_aliases "contract_saveAbi" "octra_programSaveAbi" h.program_save_abi;
     route_aliases "contract_source" "octra_programSource" h.program_source;
     route_aliases "octra_contractBytecode" "octra_programBytecode" h.program_bytecode;
-    route "octra_compileAssembly" h.program_compile_assembly;
-    route "octra_compileAml" h.program_compile_aml;
-    route "octra_compileAmlMulti" h.program_compile_aml_multi;
     route "octra_tokensByAddress" h.program_tokens_by_address;
   ]
 
@@ -250,7 +247,7 @@ let handle_request meta req ctx routes =
     if elapsed > slow_warn_s then
       Log.warn
         "rpc"
-        "SLOW method=%s took=%.2fs from=%s id=%s params=%s body_bytes=%d ua=%s"
+        "SLOW method = %s took=%.2fs from=%s id=%s params=%s body_bytes =%d ua=%s"
         req.method_
         elapsed
         meta.Rpc_http.rpc_peer

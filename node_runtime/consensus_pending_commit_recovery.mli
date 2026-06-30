@@ -47,6 +47,10 @@ type deps = {
   delete_pending_commit : epoch_id:int -> round:int -> unit;
 }
 
+val head_epoch_of_manifest :
+  Octra_core.Head_manifest.t option ->
+  int
+
 val run_once :
   deps ->
   validator_count:int ->

@@ -15,6 +15,8 @@ Include at startup:
 
 module Transaction = Octra_core.Transaction
 module C_types = Octra_consensus.C_types
+module C_engine = Octra_consensus.C_engine
+module C_hash = Octra_consensus.C_hash
 
 type encoded = string list * string list * string list
 
@@ -163,6 +165,43 @@ let cached t pid =
     match decode raw with
     | Ok bundle -> Cached bundle
     | Error e -> Decode_error e
+
+let pid_label pid =
+  Digestif.SHA256.(to_hex (of_raw_string pid))
+  |> fun hex -> String.sub hex 0 16
+
+let log_summary (stats : stats) =
+  Octra_log.info "bundle_cache"
+    "summary stores = %d hits = %d misses = %d evictions = %d cache_size = %d fifo_size = %d"
+    stats.stores stats.hits stats.misses stats.evictions
+    stats.cache_size stats.fifo_size
+
+let store_with_log t ~pid ~tx_hashes ~txs ~receipts_json =
+  match store t ~pid ~tx_hashes ~txs ~receipts_json with
+  | None -> ()
+  | Some stats -> log_summary stats
+
+let cached_with_log t pid =
+  match cached t pid with
+  | Missing -> None
+  | Cached bundle -> Some bundle
+  | Decode_error e ->
+    Octra_log.error "bundle_cache"
+      "cached bundle decode failed pid = %s error = %s"
+      (pid_label pid)
+      e;
+    None
+
+let receipt_root_matches header receipts_json =
+  C_hash.receipt_root receipts_json = header.C_types.receipt_root
+
+let header_has_empty_bundle header =
+  header.C_types.tx_list_hash = C_engine.tx_list_hash_for_header []
+  && header.C_types.receipt_root = C_hash.receipt_root []
+
+let store_empty_header_with_log t header =
+  let pid = C_hash.proposal_id header in
+  store_with_log t ~pid ~tx_hashes:[] ~txs:[] ~receipts_json:[]
 
 let freeze_key ~epoch_id ~round =
   Printf.sprintf "%Ld:%d" epoch_id round

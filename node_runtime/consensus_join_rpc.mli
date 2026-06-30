@@ -77,6 +77,22 @@ type ready_marker = {
   records_verified : int;
 }
 
+type ready_marker_config = {
+  data_dir : string;
+  consensus_role : string;
+  chain_id : string;
+  validator : string;
+  validator_pubkey : string;
+  priv_b64 : string;
+  generated_at : unit -> float;
+}
+
+type ready_marker_write_deps = {
+  write_text : path:string -> contents:string -> unit;
+  rename : src:string -> dst:string -> unit;
+  log_written : ready_marker -> unit;
+}
+
 type apply_deps = {
   current_epoch : unit -> int;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
@@ -114,9 +130,97 @@ type run_deps = {
   log_applied : applied:int -> unit;
 }
 
+type node_deps = {
+  fetch_json : string -> Yojson.Safe.t Lwt.t;
+  current_epoch : unit -> int;
+  local_root : unit -> string;
+  base_eic_root : unit -> string;
+  next_txid : unit -> int64;
+  put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  put_root : int -> string -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  local_eic : unit -> string option;
+  write_ready :
+    base:string ->
+    ready_epoch:int64 ->
+    state_root:string ->
+    records_verified:int ->
+    unit;
+  sleep : float -> unit Lwt.t;
+  now : unit -> float;
+}
+
+type node_runtime_deps = {
+  env : string -> string option;
+  fetch_json : string -> Yojson.Safe.t Lwt.t;
+  current_epoch : unit -> int;
+  head : unit -> Octra_core.Head_manifest.t option;
+  next_txid : unit -> int64;
+  put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
+  put_root_raw : int -> string -> unit;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  sleep : float -> unit Lwt.t;
+  now : unit -> float;
+  data_dir : string;
+  consensus_role : string;
+  chain_id : string;
+  validator : string;
+  validator_pubkey : string;
+  priv_b64 : string;
+}
+
+type node_runtime_wiring = {
+  env : string -> string option;
+  fetch_json : string -> Yojson.Safe.t Lwt.t;
+  current_epoch : unit -> int;
+  head : unit -> Octra_core.Head_manifest.t option;
+  next_txid : unit -> int64;
+  finality : Consensus_finality_state.callbacks;
+  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  apply :
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    proposer_info:Octra_core.Epochlog.proposer_info option ->
+    unit Lwt.t;
+  sleep : float -> unit Lwt.t;
+  now : unit -> float;
+  data_dir : string;
+  consensus_role : string;
+  chain_id : string;
+  validator : string;
+  validator_pubkey : string;
+  priv_b64 : string;
+}
+
+val configured_base :
+  string option ->
+  string option
+
 val normalize_base : string -> string
 
 val root_hex64 : string -> string
+
+val local_root_from_head :
+  Octra_core.Head_manifest.t option ->
+  string
+
+val base_eic_root_from_head :
+  Octra_core.Head_manifest.t option ->
+  string
+
+val local_eic_from_head :
+  Octra_core.Head_manifest.t option ->
+  string option
 
 val head_url : string -> string
 
@@ -125,6 +229,10 @@ val range_url :
   from_epoch:int64 ->
   max_epochs:int ->
   string
+
+val http_get_json :
+  string ->
+  Yojson.Safe.t Lwt.t
 
 val parse_head : Yojson.Safe.t -> head
 
@@ -154,6 +262,23 @@ val run_catchup :
   string ->
   unit Lwt.t
 
+val run_node_catchup :
+  node_deps ->
+  string ->
+  unit Lwt.t
+
+val node_deps_of_runtime :
+  node_runtime_deps ->
+  node_deps
+
+val node_runtime_deps :
+  node_runtime_wiring ->
+  node_runtime_deps
+
+val run_configured_node_catchup :
+  node_runtime_deps ->
+  unit Lwt.t
+
 val ready_marker :
   data_dir:string ->
   consensus_role:string ->
@@ -167,3 +292,20 @@ val ready_marker :
   records_verified:int ->
   generated_at:float ->
   ready_marker
+
+val ready_marker_payload_text :
+  ready_marker ->
+  string
+
+val write_ready_marker_with :
+  ready_marker_write_deps ->
+  ready_marker ->
+  unit
+
+val write_ready_marker :
+  ready_marker_config ->
+  base:string ->
+  ready_epoch:int64 ->
+  state_root:string ->
+  records_verified:int ->
+  unit

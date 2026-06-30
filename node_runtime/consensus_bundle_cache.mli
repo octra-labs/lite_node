@@ -64,6 +64,33 @@ val lookup_raw : t -> string -> encoded option
 
 val cached : t -> string -> cached
 
+val store_with_log :
+  t ->
+  pid:string ->
+  tx_hashes:string list ->
+  txs:Transaction.t list ->
+  receipts_json:string list ->
+  unit
+
+val cached_with_log :
+  t ->
+  string ->
+  decoded option
+
+val receipt_root_matches :
+  Octra_consensus.C_types.epoch_header ->
+  string list ->
+  bool
+
+val header_has_empty_bundle :
+  Octra_consensus.C_types.epoch_header ->
+  bool
+
+val store_empty_header_with_log :
+  t ->
+  Octra_consensus.C_types.epoch_header ->
+  unit
+
 val decode : encoded -> (decoded, string) result
 
 val parse_txs : encoded -> (Transaction.t list, string) result
