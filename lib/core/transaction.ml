@@ -115,10 +115,7 @@ let bft_admits_op = function
   | ValidatorSetUpdate | ValidatorReady -> true
   | op -> bft_lab_op_allowed op
 
-let bft_reject_reason op =
-  Printf.sprintf
-    "BFT mode currently admits standard transfers only by default; op_type=%s is disabled until canonical BFT proposal/execution support exists or OCTRA_BFT_ADMIT_OPS explicitly enables a lab-safe class"
-    (op_type_to_string op)
+  (*  included *)
 
 let op_type_of_string = function
   | "encrypt" -> Ok EncryptOp | "decrypt" -> Ok DecryptOp
