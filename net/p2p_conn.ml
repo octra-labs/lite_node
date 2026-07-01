@@ -45,6 +45,16 @@ let create fd ~peer_id ~addr ~direction = {
 
 let is_connected t = t.connected
 
+let log_conn addr fmt =
+  Printf.ksprintf
+    (fun msg -> Octra_log.stdout "component = p2p conn = %s %s\n%!" addr msg)
+    fmt
+
+let err_conn addr fmt =
+  Printf.ksprintf
+    (fun msg -> Octra_log.stderr "component = p2p conn = %s %s\n%!" addr msg)
+    fmt
+
 let close t =
   if t.connected then begin
     t.connected <- false;
@@ -91,13 +101,13 @@ let read_loop t ~on_message =
           let* () = on_message t frame in
           loop ())
         (fun exn ->
-          Octra_log.stderr "P2P CONN [%s]: read_loop error: %s\n%!" t.addr (Printexc.to_string exn);
+          err_conn t.addr "event = read_loop_error error = %s" (Printexc.to_string exn);
           let* () = close t in
           Lwt.return_unit)
   in
   loop ()
 
 let start t ~on_message =
-  Octra_log.stdout "P2P CONN [%s]: starting read+write loops\n%!" t.addr;
+  log_conn t.addr "event = start_loops";
   Lwt.async (fun () -> write_loop t);
   read_loop t ~on_message

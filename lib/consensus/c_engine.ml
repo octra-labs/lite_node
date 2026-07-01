@@ -40,6 +40,18 @@ let log_pending_header_quorum () =
     v = "1" || v = "true" || v = "yes"
   | None -> false
 
+let log_node addr fmt =
+  Printf.ksprintf
+    (fun msg ->
+      Octra_log.stdout "component = consensus node = %s module = engine %s\n%!" addr msg)
+    fmt
+
+let err_node addr fmt =
+  Printf.ksprintf
+    (fun msg ->
+      Octra_log.stderr "component = consensus node = %s module = engine %s\n%!" addr msg)
+    fmt
+
 let tx_list_hash_for_header tx_hashes =
   Octra_net.Hash_domain.hash
     "octra:tx_list:v1"
@@ -204,9 +216,8 @@ let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
   | Some prior when prior.proposal_id = proposal_id ->
     LocalVoteAlreadySame
   | Some prior ->
-    Octra_log.stderr
-      "CONSENSUS [%s]: REFUSE conflicting local %s h = %Ld r = %d prior = %s next = %s\n%!"
-      t.my_addr
+    err_node t.my_addr
+      "event = refuse_conflicting_local_vote type = %s height = %Ld round = %d prior = %s next = %s"
       (vote_type_name vote_type)
       t.state.height
       t.state.round
@@ -322,9 +333,9 @@ let try_round_skip t =
     | None -> ()
     | Some evidence_round ->
       let target = evidence_round in
-      Octra_log.stdout
-        "CONSENSUS [%s]: round-skip h = %Ld %d -> %d on f+1 evidence best = %d\n%!"
-        t.my_addr t.state.height t.state.round target evidence_round;
+      log_node t.my_addr
+        "event = round_skip height = %Ld old_round = %d new_round = %d evidence_round = %d"
+        t.state.height t.state.round target evidence_round;
       t.higher_round_evidence <- Hashtbl.create 4;
       start_round t target
   end
@@ -355,19 +366,19 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
   if not (local_voting_allowed t) then ()
   else if not (am_i_leader t) then ()
   else if header.epoch_id <> t.state.height then begin
-    Octra_log.stderr
-      "CONSENSUS [%s]: WARN drop stale do_propose header.epoch = %Ld != state.height = %Ld\n%!"
-      t.my_addr header.epoch_id t.state.height
+    err_node t.my_addr
+      "event = drop_do_propose reason = stale_header header_epoch = %Ld state_height = %Ld"
+      header.epoch_id t.state.height
   end
   else if header.chain_id <> t.chain_id then begin
-    Octra_log.stderr
-      "CONSENSUS [%s]: WARN drop do_propose chain_id mismatch header = %s ours = %s\n%!"
-      t.my_addr header.chain_id t.chain_id
+    err_node t.my_addr
+      "event = drop_do_propose reason = chain_id_mismatch header = %s ours = %s"
+      header.chain_id t.chain_id
   end
   else if t.state.step <> ProposeStep then begin
-    Octra_log.stderr
-      "CONSENSUS [%s]: WARN drop do_propose at non-ProposeStep h = %Ld r = %d\n%!"
-      t.my_addr t.state.height t.state.round
+    err_node t.my_addr
+      "event = drop_do_propose reason = non_propose_step height = %Ld round = %d"
+      t.state.height t.state.round
   end
   else begin
     let resolved =
@@ -377,22 +388,21 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
           let v_pid = C_hash.proposal_id v in
           (match find_tx_hashes t v_pid with
            | None ->
-             Octra_log.stderr
-               "CONSENSUS [%s]: REFUSE re-propose valid_value (vr = %d) — tx_hashes for pid = %s missing in cache\n%!"
-               t.my_addr t.state.valid_round
+             err_node t.my_addr
+               "event = refuse_repropose_valid_value reason = missing_tx_hashes valid_round = %d pid = %s"
+               t.state.valid_round
                (Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string v_pid));
              None
            | Some cached_hashes ->
              let recomputed = tx_list_hash_for_header cached_hashes in
              if recomputed <> v.tx_list_hash then begin
-               Octra_log.stderr
-                 "CONSENSUS [%s]: REFUSE re-propose valid_value — cached tx_hashes do not hash to v.tx_list_hash\n%!"
-                 t.my_addr;
+               err_node t.my_addr
+                 "event = refuse_repropose_valid_value reason = tx_list_hash_mismatch";
                None
              end else begin
-               Octra_log.stdout
-                 "CONSENSUS [%s]: re-proposing valid_value vr = %d (locked at r = %d)\n%!"
-                 t.my_addr t.state.valid_round t.state.locked_round;
+               log_node t.my_addr
+                 "event = repropose_valid_value valid_round = %d locked_round = %d"
+                 t.state.valid_round t.state.locked_round;
                Some (v, cached_hashes, Some t.state.valid_round)
              end)
         | _ -> Some (header, tx_hashes, None)
@@ -438,9 +448,9 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
        in
        (match pc_outcome with
         | LocalVoteCast (`QuorumOf _) ->
-          Octra_log.stdout
-            "CONSENSUS [%s]: LOCAL_FINALIZE_SELF h = %Ld r = %d pid = %s creator = %s lock_r = %d valid_r = %d\n%!"
-            t.my_addr t.state.height t.state.round
+          log_node t.my_addr
+            "event = local_finalize_self height = %Ld round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
+            t.state.height t.state.round
             (short_hex_raw proposal_id)
             (short_addr header.creator_addr)
             t.state.locked_round t.state.valid_round;
@@ -509,9 +519,9 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
        in
        (match pc_outcome with
         | LocalVoteCast (`QuorumOf _) ->
-          Octra_log.stdout
-            "CONSENSUS [%s]: LOCAL_FINALIZE_PROPOSE h = %Ld r = %d pid = %s creator = %s lock_r = %d valid_r = %d\n%!"
-            t.my_addr t.state.height t.state.round
+          log_node t.my_addr
+            "event = local_finalize_propose height = %Ld round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
+            t.state.height t.state.round
             (short_hex_raw vote_proposal_id)
             (short_addr hdr.creator_addr)
             t.state.locked_round t.state.valid_round;
@@ -608,12 +618,13 @@ let on_vote t (v : vote) ~sign_fn =
          (match find_header_or_fallback t proposal_id with
           | None ->
             if log_pending_header_quorum () then
-              Octra_log.stdout "CONSENSUS [%s]: pending precommit quorum without local header pid = %s — awaiting finalize batch\n%!"
-                t.my_addr (String.sub proposal_id 0 (min 16 (String.length proposal_id)))
+              log_node t.my_addr
+                "event = pending_precommit_quorum reason = missing_local_header pid = %s"
+                (String.sub proposal_id 0 (min 16 (String.length proposal_id)))
           | Some header ->
-            Octra_log.stdout
-              "CONSENSUS [%s]: LOCAL_FINALIZE_VOTE h = %Ld r = %d pid = %s creator = %s lock_r = %d valid_r = %d\n%!"
-              t.my_addr t.state.height t.state.round
+            log_node t.my_addr
+              "event = local_finalize_vote height = %Ld round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
+              t.state.height t.state.round
               (short_hex_raw proposal_id)
               (short_addr header.creator_addr)
               t.state.locked_round t.state.valid_round;
@@ -639,9 +650,9 @@ let accept_finalize_batch t (f : finalize) =
       in
       if lock_conflict then false
       else begin
-        Octra_log.stdout
-          "CONSENSUS [%s]: ACCEPT_FINALIZE_BATCH h = %Ld cur_r = %d commit_r = %d pid = %s creator = %s lock_r = %d valid_r = %d\n%!"
-          t.my_addr f.epoch_id t.state.round f.commit_round
+        log_node t.my_addr
+          "event = accept_finalize_batch height = %Ld current_round = %d commit_round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
+          f.epoch_id t.state.round f.commit_round
           (short_hex_raw proposal_id)
           (short_addr f.header.creator_addr)
           t.state.locked_round t.state.valid_round;

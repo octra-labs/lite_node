@@ -134,6 +134,17 @@ let raw_to_hex s =
   String.concat "" (List.init (String.length s)
     (fun i -> Printf.sprintf "%02x" (Char.code s.[i])))
 
+let log_node addr fmt =
+  Printf.ksprintf
+    (fun msg ->
+      Octra_log.stdout "component = consensus node = %s module = driver %s\n%!" addr msg)
+    fmt
+
+let log fmt =
+  Printf.ksprintf
+    (fun msg -> Octra_log.stdout "component = consensus module = driver %s\n%!" msg)
+    fmt
+
 let catchup_response_key (rec_ : catchup_range_response_record) =
   let records_root = C_hash.catchup_records_root rec_.records in
   let next_epoch_s =
@@ -296,8 +307,7 @@ let vote_still_relevant t (v : C_types.vote) =
 
 let broadcast_vote t (v : C_types.vote) =
   let open Lwt.Syntax in
-  Octra_log.stdout "CONSENSUS [%s]: → SendVote %s epoch = %Ld round = %d pid = %s\n%!"
-    t.config.my_addr
+  log_node t.config.my_addr "event = send_vote type = %s epoch = %Ld round = %d pid = %s"
     (vote_step_label v.vote_type)
     v.epoch_id v.round
     (let h = Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string v.proposal_id) in
@@ -338,8 +348,8 @@ let flush_pending_votes t =
     match votes with
     | [] -> Lwt.return_unit
     | _ ->
-      Octra_log.stdout "CONSENSUS [%s]: flushing %d pending votes after voting-ready\n%!"
-        t.config.my_addr (List.length votes);
+      log_node t.config.my_addr "event = flush_pending_votes count = %d"
+        (List.length votes);
       Lwt_list.iter_s (broadcast_vote t) votes
   end
 
@@ -405,16 +415,15 @@ let maybe_activate_scheduled_validator_set t ~target_epoch =
       C_engine.replace_validator_set t.engine cfg.validator_set;
       t.n_validators <- cfg.validator_set.C_types.n;
       Hashtbl.replace t.activated_validator_set_fingerprints cfg.fingerprint true;
-      Octra_log.stdout
-        "CONSENSUS [%s]: validator_set activated target_epoch = %Ld n = %d quorum = %d fingerprint = %s\n%!"
-        t.config.my_addr target_epoch cfg.validator_set.n cfg.validator_set.quorum
-        cfg.fingerprint;
+      log_node t.config.my_addr
+        "event = validator_set_activated target_epoch = %Ld n = %d quorum = %d fingerprint = %s"
+        target_epoch cfg.validator_set.n cfg.validator_set.quorum cfg.fingerprint;
       if C_types.is_validator cfg.validator_set t.config.my_addr then
         Lwt.return_unit
       else begin
-        Octra_log.stdout
-          "CONSENSUS [%s]: validator_set activated as non-voting observer target_epoch = %Ld\n%!"
-          t.config.my_addr target_epoch;
+        log_node t.config.my_addr
+          "event = validator_set_observer target_epoch = %Ld"
+          target_epoch;
         Lwt.return_unit
       end
     end
@@ -447,25 +456,25 @@ let maybe_activate_resource_committee t ~target_epoch =
               | Some snapshot
                 when not (Resource_attestation_flow.ready_for_voting
                   ~minimum_weight:cfg.minimum_weight snapshot) ->
-                  Octra_log.stdout
-                    "CONSENSUS [%s]: resource_committee pending target_epoch = %Ld source_epoch = %Ld weight = %Ld minimum = %Ld\n%!"
-                    t.config.my_addr target_epoch snapshot.source_epoch snapshot.total_weight cfg.minimum_weight;
+                  log_node t.config.my_addr
+                    "event = resource_committee_pending target_epoch = %Ld source_epoch = %Ld weight = %Ld minimum = %Ld"
+                    target_epoch snapshot.source_epoch snapshot.total_weight cfg.minimum_weight;
                   Lwt.return_unit
               | Some snapshot ->
                   match Resource_attestation_flow.validator_set_of_committee
                     ~pubkey_of_node:cfg.pubkey_of_node snapshot.committee with
                   | None ->
-                      Octra_log.stdout
-                        "CONSENSUS [%s]: resource_committee rejected target_epoch = %Ld reason = missing_pubkey\n%!"
-                        t.config.my_addr target_epoch;
+                      log_node t.config.my_addr
+                        "event = resource_committee_rejected target_epoch = %Ld reason = missing_pubkey"
+                        target_epoch;
                       Lwt.return_unit
                   | Some validator_set ->
                       C_engine.replace_validator_set t.engine validator_set;
                       t.n_validators <- validator_set.C_types.n;
                       let root_hex = raw_to_hex snapshot.committee_root in
-                      Octra_log.stdout
-                        "CONSENSUS [%s]: resource_committee activated target_epoch = %Ld source_epoch = %Ld n = %d quorum = %d weight = %Ld root = %s\n%!"
-                        t.config.my_addr target_epoch snapshot.source_epoch
+                      log_node t.config.my_addr
+                        "event = resource_committee_activated target_epoch = %Ld source_epoch = %Ld n = %d quorum = %d weight = %Ld root = %s"
+                        target_epoch snapshot.source_epoch
                         validator_set.n validator_set.quorum snapshot.total_weight
                         (String.sub root_hex 0 (min 16 (String.length root_hex)));
                       cfg.on_committee_selected snapshot
@@ -500,12 +509,13 @@ let try_current_leader_proposal t =
         C_engine.do_propose t.engine hdr txs ~sign_fn:t.config.sign_fn;
         Lwt.return (t.engine.state.step <> step)
       | None ->
-        Octra_log.stdout "CONSENSUS [%s]: make_proposal returned None at h = %Ld r = %d\n%!"
-          t.config.my_addr height round;
+        log_node t.config.my_addr "event = make_proposal_none height = %Ld round = %d"
+          height round;
         Lwt.return_false
     else begin
-      Octra_log.stdout "CONSENSUS [%s]: stale make_proposal result dropped (state moved h = %Ld->%Ld r = %d->%d)\n%!"
-        t.config.my_addr height t.engine.state.height round t.engine.state.round;
+      log_node t.config.my_addr
+        "event = make_proposal_stale old_height = %Ld new_height = %Ld old_round = %d new_round = %d"
+        height t.engine.state.height round t.engine.state.round;
       Lwt.return_false
     end
   end else
@@ -539,9 +549,9 @@ let rec process_outputs_once t =
     if Int64.compare epoch t.engine.C_engine.finalized_height <= 0 then None
     else if Int64.compare epoch current_height = 0 then begin
       let accepted = C_engine.accept_finalize_batch t.engine finalize in
-      Octra_log.stdout
-        "CONSENSUS [%s]: pending finalize for current height epoch = %Ld accepted = %b\n%!"
-        t.config.my_addr epoch accepted;
+      log_node t.config.my_addr
+        "event = pending_finalize_current epoch = %Ld accepted = %b"
+        epoch accepted;
       None
     end else
       Some finalize
@@ -560,18 +570,20 @@ let rec process_outputs_once t =
       | C_engine.SendFinalize _ -> "SendFinalize"
       | C_engine.ScheduleTimeout _ -> "ScheduleTimeout"
       | C_engine.Finalized _ -> "Finalized" in
-    Octra_log.stdout "CONSENSUS [%s]: output → %s\n%!" t.config.my_addr name
+    log_node t.config.my_addr "event = engine_output output = %s" name
   ) outputs;
   let* () = flush_pending_votes t in
   let* () = Lwt_list.iter_s (fun output ->
     match output with
     | C_engine.SendPropose p ->
-      Octra_log.stdout "CONSENSUS [%s]: → SendPropose epoch = %Ld round = %d\n%!" t.config.my_addr p.epoch_id p.round;
+      log_node t.config.my_addr "event = send_propose epoch = %Ld round = %d"
+        p.epoch_id p.round;
       let payload = C_codec.encode_propose p in
       Octra_net.P2p_swarm.broadcast t.swarm { msg_type = Frame.msg_cons_propose; payload }
     | C_engine.SendFinalize f ->
-      Octra_log.stdout "CONSENSUS [%s]: → SendFinalize epoch = %Ld round = %d pid = %s creator = %s precommits = %d\n%!"
-        t.config.my_addr f.epoch_id f.commit_round
+      log_node t.config.my_addr
+        "event = send_finalize epoch = %Ld round = %d pid = %s creator = %s precommits = %d"
+        f.epoch_id f.commit_round
         (let h = Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string f.proposal_id) in
          if String.length h >= 16 then String.sub h 0 16 else h)
         (String.sub f.header.creator_addr 0 (min 14 (String.length f.header.creator_addr)))
@@ -586,16 +598,16 @@ let rec process_outputs_once t =
           else if step = C_types.ProposeStep
                   && proposal_build_active t ~generation ~round ~step
                   && proposal_build_grace_left t ~generation ~round ~step then begin
-            Octra_log.stdout
-              "CONSENSUS [%s]: defer propose timeout h = %Ld r = %d while proposal build is active\n%!"
-              t.config.my_addr t.engine.state.height round;
+            log_node t.config.my_addr
+              "event = defer_propose_timeout reason = proposal_build_active height = %Ld round = %d"
+              t.engine.state.height round;
             let* () = Lwt_unix.sleep 0.5 in
             fire ()
           end else if step = C_types.ProposeStep
                   && proposal_verify_grace_left t ~generation ~round ~step then begin
-            Octra_log.stdout
-              "CONSENSUS [%s]: defer propose timeout h = %Ld r = %d while proposal verify is active\n%!"
-              t.config.my_addr t.engine.state.height round;
+            log_node t.config.my_addr
+              "event = defer_propose_timeout reason = proposal_verify_active height = %Ld round = %d"
+              t.engine.state.height round;
             let* () = Lwt_unix.sleep 0.5 in
             fire ()
           end else begin
@@ -608,8 +620,8 @@ let rec process_outputs_once t =
     | C_engine.SendVote v ->
       if not (t.config.can_vote ()) then begin
         queue_vote t v;
-        Octra_log.stdout "CONSENSUS [%s]: queued vote while local state is not voting-ready %s epoch = %Ld round = %d pending = %d\n%!"
-          t.config.my_addr
+        log_node t.config.my_addr
+          "event = queue_vote_not_ready type = %s epoch = %Ld round = %d pending = %d"
           (vote_step_label v.vote_type)
           v.epoch_id v.round
           (pending_vote_count t);
@@ -619,8 +631,8 @@ let rec process_outputs_once t =
     | C_engine.Finalized { epoch_id; finalize } ->
       let header = finalize.header in
       let round = finalize.commit_round in
-      Octra_log.stdout "CONSENSUS [%s]: FINALIZED epoch = %Ld round = %d creator = %s root = %s\n%!"
-        t.config.my_addr epoch_id round
+      log_node t.config.my_addr "event = finalized epoch = %Ld round = %d creator = %s root = %s"
+        epoch_id round
         (String.sub header.creator_addr 0 (min 14 (String.length header.creator_addr)))
         (let h = Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string header.proposed_state_root) in
          if String.length h >= 16 then String.sub h 0 16 else h);
@@ -673,8 +685,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch (fun () ->
         let p = C_codec.decode_propose frame.payload in
         if p.chain_id <> t.config.chain_id then begin
-          Octra_log.stdout "CONSENSUS [%s]: REJECTED propose chain_id mismatch (got = %s ours = %s)\n%!"
-            t.config.my_addr p.chain_id t.config.chain_id;
+          log_node t.config.my_addr
+            "event = reject_propose reason = chain_id_mismatch got = %s ours = %s"
+            p.chain_id t.config.chain_id;
           Lwt.return_unit
         end else
         let valid = match C_types.pubkey_of_addr t.engine.vs p.proposer with
@@ -682,8 +695,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           | None -> false
         in
         if not valid then begin
-          Octra_log.stdout "CONSENSUS [%s]: REJECTED propose from %s (bad sig or unknown)\n%!"
-            t.config.my_addr (String.sub p.proposer 0 (min 12 (String.length p.proposer)));
+          log_node t.config.my_addr
+            "event = reject_propose reason = bad_signature_or_unknown from = %s"
+            (String.sub p.proposer 0 (min 12 (String.length p.proposer)));
           Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"bad_signature_propose";
           Lwt.return_unit
         end else
@@ -725,15 +739,17 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           process_outputs t
         )
       (fun exn ->
-        Octra_log.stdout "CONSENSUS [%s]: bad propose: %s\n%!" t.config.my_addr (Printexc.to_string exn);
+        log_node t.config.my_addr "event = bad_propose error = %s"
+          (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"invalid_frame_propose";
         Lwt.return_unit)
     | t' when t' = Frame.msg_cons_vote ->
       Lwt.catch (fun () ->
         let v = C_codec.decode_vote frame.payload in
         if v.chain_id <> t.config.chain_id then begin
-          Octra_log.stdout "CONSENSUS [%s]: REJECTED vote chain_id mismatch (got = %s ours = %s)\n%!"
-            t.config.my_addr v.chain_id t.config.chain_id;
+          log_node t.config.my_addr
+            "event = reject_vote reason = chain_id_mismatch got = %s ours = %s"
+            v.chain_id t.config.chain_id;
           Lwt.return_unit
         end else
         let valid = match C_types.pubkey_of_addr t.engine.vs v.validator with
@@ -743,21 +759,24 @@ let on_p2p_message t _conn (frame : Frame.frame) =
         if valid then
           C_engine.on_vote t.engine v ~sign_fn:t.config.sign_fn;
         if not valid then
-          Octra_log.stdout "CONSENSUS [%s]: REJECTED vote from %s (bad sig or unknown validator)\n%!"
-            t.config.my_addr (String.sub v.validator 0 (min 12 (String.length v.validator)));
+          log_node t.config.my_addr
+            "event = reject_vote reason = bad_signature_or_unknown_validator from = %s"
+            (String.sub v.validator 0 (min 12 (String.length v.validator)));
         if not valid then
           Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"bad_signature_vote";
         Lwt.return_unit)
       (fun exn ->
-        Octra_log.stdout "CONSENSUS [%s]: bad vote: %s\n%!" t.config.my_addr (Printexc.to_string exn);
+        log_node t.config.my_addr "event = bad_vote error = %s"
+          (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"invalid_frame_vote";
         Lwt.return_unit)
     | t' when t' = Frame.msg_cons_finalize ->
       Lwt.catch (fun () ->
         let f = C_codec.decode_finalize frame.payload in
         if f.chain_id <> t.config.chain_id then begin
-          Octra_log.stdout "CONSENSUS [%s]: REJECTED finalize chain_id mismatch (got = %s ours = %s)\n%!"
-            t.config.my_addr f.chain_id t.config.chain_id;
+          log_node t.config.my_addr
+            "event = reject_finalize reason = chain_id_mismatch got = %s ours = %s"
+            f.chain_id t.config.chain_id;
           Lwt.return_unit
         end else
         if f.epoch_id <= t.engine.finalized_height then Lwt.return_unit
@@ -774,8 +793,8 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             f
           with
           | C_qc.Invalid reason ->
-            Octra_log.stdout "CONSENSUS [%s]: REJECTED finalize — qc_%s\n%!"
-              t.config.my_addr reason;
+            log_node t.config.my_addr
+              "event = reject_finalize reason = qc_%s" reason;
             let peer_reason =
               if reason = "signature" then "bad_signature_finalize"
               else "invalid_frame_finalize_qc_" ^ reason
@@ -784,38 +803,41 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             Lwt.return_unit
           | C_qc.Valid ->
             let expected_pid = C_hash.proposal_id f.header in
-          Octra_log.stdout
-            "CONSENSUS [%s]: RECV finalize epoch = %Ld commit_r = %d pid = %s creator = %s precommits = %d\n%!"
-            t.config.my_addr f.epoch_id f.commit_round
+          log_node t.config.my_addr
+            "event = recv_finalize epoch = %Ld commit_round = %d pid = %s creator = %s precommits = %d"
+            f.epoch_id f.commit_round
             (let h = Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string f.proposal_id) in
              if String.length h >= 16 then String.sub h 0 16 else h)
             (String.sub f.header.creator_addr 0 (min 14 (String.length f.header.creator_addr)))
             (List.length f.precommits);
               let accepted = C_engine.accept_finalize_batch t.engine f in
               if accepted then begin
-                Octra_log.stdout "CONSENSUS [%s]: FINALIZE via batch: epoch = %Ld round = %d (%d/%d valid precommits)\n%!"
-                  t.config.my_addr f.epoch_id f.commit_round
+                log_node t.config.my_addr
+                  "event = finalize_batch epoch = %Ld round = %d valid_precommits = %d total_precommits = %d"
+                  f.epoch_id f.commit_round
                   (List.length f.precommits)
                   (List.length f.precommits);
                 let* () = Octra_net.P2p_swarm.broadcast t.swarm
                   { msg_type = Frame.msg_cons_finalize; payload = frame.payload } in
                 process_outputs t
               end else begin
-                Octra_log.stdout "CONSENSUS [%s]: finalize rejected by engine state epoch = %Ld round = %d pid = %s\n%!"
-                  t.config.my_addr f.epoch_id f.commit_round
+                log_node t.config.my_addr
+                  "event = reject_finalize reason = engine_state epoch = %Ld round = %d pid = %s"
+                  f.epoch_id f.commit_round
                   (String.sub expected_pid 0 (min 16 (String.length expected_pid)));
                 if Int64.compare f.epoch_id t.engine.state.height > 0 then begin
                   queue_future_finalize t f;
-                  Octra_log.stdout
-                    "CONSENSUS [%s]: queued future finalize epoch = %Ld current = %Ld pending = %d\n%!"
-                    t.config.my_addr f.epoch_id t.engine.state.height
+                  log_node t.config.my_addr
+                    "event = queue_future_finalize epoch = %Ld current = %Ld pending = %d"
+                    f.epoch_id t.engine.state.height
                     (pending_finalize_count t)
                 end;
                 Lwt.return_unit
               end
         end)
       (fun exn ->
-        Octra_log.stdout "CONSENSUS [%s]: bad finalize: %s\n%!" t.config.my_addr (Printexc.to_string exn);
+        log_node t.config.my_addr "event = bad_finalize error = %s"
+          (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"invalid_frame_finalize";
         Lwt.return_unit)
     | t' when t' = Frame.msg_query_epoch_root ->
@@ -844,16 +866,17 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             { msg_type = Frame.msg_epoch_root_response; payload }
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad epoch_root_query: %s\n%!"
-            t.config.my_addr (Printexc.to_string exn);
+          log_node t.config.my_addr "event = bad_epoch_root_query error = %s"
+            (Printexc.to_string exn);
           Lwt.return_unit)
     | t' when t' = Frame.msg_epoch_root_response ->
       Lwt.catch (fun () ->
         let r = C_codec.decode_epoch_root_response frame.payload in
         if r.chain_id <> t.config.chain_id then Lwt.return_unit
         else if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
-          Octra_log.stdout "CONSENSUS [%s]: ignored epoch_root_response from non-validator %s\n%!"
-            t.config.my_addr (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+          log_node t.config.my_addr
+            "event = ignore_epoch_root_response reason = non_validator from = %s"
+            (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
           Lwt.return_unit
         end else begin
           let sign_bytes = C_hash.epoch_root_response_sign_bytes
@@ -861,8 +884,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             ~state_root:r.state_root ~responder_addr:r.responder_addr
             ~responder_head_epoch:r.responder_head_epoch in
           if not (verify_engine_signature t r.responder_addr sign_bytes r.signature) then begin
-            Octra_log.stdout "CONSENSUS [%s]: ignored epoch_root_response with BAD SIGNATURE from %s\n%!"
-              t.config.my_addr (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+            log_node t.config.my_addr
+              "event = ignore_epoch_root_response reason = bad_signature from = %s"
+              (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
             Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"bad_signature_epoch_root";
             Lwt.return_unit
           end else begin
@@ -886,8 +910,8 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           end
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad epoch_root_response: %s\n%!"
-            t.config.my_addr (Printexc.to_string exn);
+          log_node t.config.my_addr "event = bad_epoch_root_response error = %s"
+            (Printexc.to_string exn);
           Lwt.return_unit)
     | t' when t' = Frame.msg_query_bundle ->
       Lwt.catch (fun () ->
@@ -912,20 +936,22 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               { msg_type = Frame.msg_bundle_response; payload }
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad bundle_query: %s\n%!"
-            t.config.my_addr (Printexc.to_string exn);
+          log_node t.config.my_addr "event = bad_bundle_query error = %s"
+            (Printexc.to_string exn);
           Lwt.return_unit)
     | t' when t' = Frame.msg_bundle_response ->
       Lwt.catch (fun () ->
         let r = C_codec.decode_bundle_response frame.payload in
         if r.chain_id <> t.config.chain_id then Lwt.return_unit
         else if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
-          Octra_log.stdout "CONSENSUS [%s]: ignored bundle_response from non-validator %s\n%!"
-            t.config.my_addr (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+          log_node t.config.my_addr
+            "event = ignore_bundle_response reason = non_validator from = %s"
+            (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
           Lwt.return_unit
         end else if List.length r.tx_hashes <> List.length r.txs_json then begin
-          Octra_log.stdout "CONSENSUS [%s]: ignored bundle_response with mismatched lengths from %s\n%!"
-            t.config.my_addr (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+          log_node t.config.my_addr
+            "event = ignore_bundle_response reason = mismatched_lengths from = %s"
+            (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
           Lwt.return_unit
         end else begin
           let record = {
@@ -942,8 +968,8 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           Lwt.return_unit
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad bundle_response: %s\n%!"
-            t.config.my_addr (Printexc.to_string exn);
+          log_node t.config.my_addr "event = bad_bundle_response error = %s"
+            (Printexc.to_string exn);
           Lwt.return_unit)
     | t' when t' = Frame.msg_query_catchup_range
               || t' = Frame.msg_query_catchup_range_v2 ->
@@ -994,8 +1020,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             { msg_type = response_msg_type; payload }
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad catchup_query_range (v2 = %b): %s\n%!"
-            t.config.my_addr is_v2 (Printexc.to_string exn);
+          log_node t.config.my_addr
+            "event = bad_catchup_query_range v2 = %b error = %s"
+            is_v2 (Printexc.to_string exn);
           Lwt.return_unit)
     | t' when t' = Frame.msg_catchup_range_response
               || t' = Frame.msg_catchup_range_response_v2 ->
@@ -1007,8 +1034,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
         in
         if r.chain_id <> t.config.chain_id then Lwt.return_unit
         else if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
-          Octra_log.stdout "CONSENSUS [%s]: ignored catchup_range_response (v2 = %b) from non-validator %s\n%!"
-            t.config.my_addr is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+          log_node t.config.my_addr
+            "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
+            is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
           Lwt.return_unit
         end else begin
 
@@ -1022,8 +1050,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           in
           match from_epoch_opt with
           | None ->
-            Octra_log.stdout "CONSENSUS [%s]: ignored catchup_range_response (v2 = %b) request_id unknown + empty records (cannot determine from_epoch for sig verify)\n%!"
-              t.config.my_addr is_v2;
+            log_node t.config.my_addr
+              "event = ignore_catchup_range_response v2 = %b reason = unknown_request_empty_records"
+              is_v2;
             Lwt.return_unit
           | Some from_epoch ->
             let records_root =
@@ -1036,12 +1065,14 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               ~from_epoch
               ~records_root in
             if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
-              Octra_log.stdout "CONSENSUS [%s]: ignored catchup_range_response (v2 = %b) from non-validator %s\n%!"
-                t.config.my_addr is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+              log_node t.config.my_addr
+                "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
+                is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
               Lwt.return_unit
             end else if not (verify_engine_signature t r.responder_addr sign_bytes r.signature) then begin
-              Octra_log.stdout "CONSENSUS [%s]: ignored catchup_range_response (v2 = %b) BAD SIGNATURE from %s\n%!"
-                t.config.my_addr is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
+              log_node t.config.my_addr
+                "event = ignore_catchup_range_response v2 = %b reason = bad_signature from = %s"
+                is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
               Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"bad_signature_catchup_range";
               Lwt.return_unit
             end else begin
@@ -1075,8 +1106,9 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             end
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad catchup_range_response (v2 = %b): %s\n%!"
-            t.config.my_addr is_v2 (Printexc.to_string exn);
+          log_node t.config.my_addr
+            "event = bad_catchup_range_response v2 = %b error = %s"
+            is_v2 (Printexc.to_string exn);
           Lwt.return_unit)
     | t' when t' = Frame.msg_resource_attestation ->
       Lwt.catch (fun () ->
@@ -1084,9 +1116,8 @@ let on_p2p_message t _conn (frame : Frame.frame) =
         if gossip.chain_id <> t.config.chain_id then Lwt.return_unit
         else begin
           let decision = admit_resource_attestation t gossip.attestation in
-          Octra_log.stdout
-            "CONSENSUS [%s]: resource_attestation decision = %s seen_epoch = %Ld node = %s\n%!"
-            t.config.my_addr
+          log_node t.config.my_addr
+            "event = resource_attestation decision = %s seen_epoch = %Ld resource_node = %s"
             (Resource_attestation_admission.decision_to_string decision)
             gossip.seen_epoch
             (String.sub gossip.attestation.Resource_attestations.node_id 0
@@ -1103,8 +1134,8 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               Lwt.return_unit
         end)
         (fun exn ->
-          Octra_log.stdout "CONSENSUS [%s]: bad resource_attestation: %s\n%!"
-            t.config.my_addr (Printexc.to_string exn);
+          log_node t.config.my_addr "event = bad_resource_attestation error = %s"
+            (Printexc.to_string exn);
           Lwt.return_unit)
     | _ -> Lwt.return_unit)
   end |> fun p ->
@@ -1150,9 +1181,8 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
       else if validate rec_ then true
       else begin
         Hashtbl.replace rejected rec_.responder_addr ();
-        Octra_log.stdout
-          "CONSENSUS [%s]: bundle_response from %s rejected by validate\n%!"
-          t.config.my_addr
+        log_node t.config.my_addr
+          "event = reject_bundle_response reason = validate from = %s"
           (String.sub rec_.responder_addr 0 (min 14 (String.length rec_.responder_addr)));
         false
       end
@@ -1251,9 +1281,8 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
           end
         end else begin
           Hashtbl.replace rejected rec_.responder_addr ();
-          Octra_log.stdout
-            "CONSENSUS [%s]: catchup_range_response from %s rejected by validate\n%!"
-            t.config.my_addr
+          log_node t.config.my_addr
+            "event = reject_catchup_range_response reason = validate from = %s"
             (String.sub rec_.responder_addr 0 (min 14 (String.length rec_.responder_addr)));
         end
       end
@@ -1281,18 +1310,18 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     | Some (count, repr), _ when count >= required ->
       let records_root_hex =
         raw_to_hex (C_hash.catchup_records_root repr.records) in
-      Octra_log.stdout
-        "CONSENSUS [%s]: catchup_range agreed responders = %d required = %d status = %s root = %s records = %d\n%!"
-        t.config.my_addr count required repr.status
+      log_node t.config.my_addr
+        "event = catchup_range_agreed responders = %d required = %d status = %s root = %s records = %d"
+        count required repr.status
         (String.sub records_root_hex 0 (min 16 (String.length records_root_hex)))
         (List.length repr.records);
       Some repr
     | _, Some (count, prefix_len, repr) when count >= required ->
       let records_root_hex =
         raw_to_hex (C_hash.catchup_records_root repr.records) in
-      Octra_log.stdout
-        "CONSENSUS [%s]: catchup_range agreed PREFIX responders = %d required = %d prefix_records = %d root = %s\n%!"
-        t.config.my_addr count required prefix_len
+      log_node t.config.my_addr
+        "event = catchup_range_prefix_agreed responders = %d required = %d prefix_records = %d root = %s"
+        count required prefix_len
         (String.sub records_root_hex 0 (min 16 (String.length records_root_hex)));
       Some repr
     | _ -> None
@@ -1325,8 +1354,9 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     cleanup ();
     Lwt.return r
   | None ->
-    Octra_log.stdout "CONSENSUS [%s]: catchup v2 (0x3a) no response within %.1fs, falling back to v1 (0x38)\n%!"
-      t.config.my_addr v2_budget;
+    log_node t.config.my_addr
+      "event = catchup_v2_timeout timeout_s = %.1f action = fallback_v1"
+      v2_budget;
 
     let rejected_v1 : (string, unit) Hashtbl.t = Hashtbl.create 4 in
     let* () = Octra_net.P2p_swarm.broadcast t.swarm
@@ -1398,14 +1428,13 @@ let start_height t height =
   process_outputs t
 
 let realign_height t height =
-  Octra_log.stdout "realign height = %Ld\n%!"
-    t.config.my_addr height;
+  log_node t.config.my_addr "event = realign_height height = %Ld" height;
   start_height t height
 
 let start t =
   t.running <- true;
   let open Lwt.Syntax in
-  Octra_log.stdout "driver started addr = %s height = %Ld n = %d quorum = %d\n%!"
+  log "event = driver_start node = %s height = %Ld n = %d quorum = %d"
     t.config.my_addr t.engine.state.height t.engine.vs.n t.engine.vs.quorum;
   let min_peers =
     if t.n_validators <= 1 then 0
@@ -1414,20 +1443,25 @@ let start t =
     let pc = Octra_net.P2p_swarm.connected_count t.swarm in
     if pc >= min_peers || tries <= 0 then Lwt.return_unit
     else begin
-      Octra_log.stdout "waiting for peers (%d/%d, need %d)...\n%!" t.config.my_addr pc t.n_validators min_peers;
+      log_node t.config.my_addr
+        "event = wait_peers connected = %d validators = %d min = %d"
+        pc t.n_validators min_peers;
       let* () = Lwt_unix.sleep 1.0 in
       wait_peers (tries - 1)
     end
   in
   let* () = wait_peers 60 in
-  Octra_log.stdout "peers = %d/%d (min = %d), starting consensus\n%!" t.config.my_addr (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
+  log_node t.config.my_addr
+    "event = start_consensus connected = %d validators = %d min = %d"
+    (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
 
   let* () = Lwt_unix.sleep 3.0 in
   if C_engine.is_pristine t.engine then
     C_engine.start_height t.engine t.engine.state.height;
 
   let* () = if C_engine.am_i_leader t.engine then begin
-    Octra_log.stdout "proposing height = %Ld\n%!" t.config.my_addr t.engine.state.height;
+    log_node t.config.my_addr "event = local_leader_propose height = %Ld"
+      t.engine.state.height;
     let* proposal_opt = t.config.make_proposal t.engine.state.height in
     (match proposal_opt with
     | Some (hdr, txs) ->

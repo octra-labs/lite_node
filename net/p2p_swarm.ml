@@ -83,15 +83,25 @@ let find_peer t peer_id =
 let peer_key conn =
   P2p_peer_guard.host_of_addr conn.P2p_conn.addr
 
+let log_node addr fmt =
+  Printf.ksprintf
+    (fun msg -> Octra_log.stdout "component = p2p node = %s %s\n%!" addr msg)
+    fmt
+
+let err_node addr fmt =
+  Printf.ksprintf
+    (fun msg -> Octra_log.stderr "component = p2p node = %s %s\n%!" addr msg)
+    fmt
+
 let report_bad_peer t conn ~reason =
   let key = peer_key conn in
   match P2p_peer_guard.report_bad t.peer_guard
     ~now:(Unix.gettimeofday ()) ~key ~reason with
   | P2p_peer_guard.Noted count ->
-    Octra_log.stderr "P2P: bad peer noted key=%s count=%d reason=%s\n%!"
+    err_node t.config.node_addr "event = bad_peer_noted key = %s count = %d reason = %s"
       key count reason
   | P2p_peer_guard.Banned until_ts ->
-    Octra_log.stderr "P2P: peer banned key=%s until=%.0f reason=%s\n%!"
+    err_node t.config.node_addr "event = peer_banned key = %s until = %.0f reason = %s"
       key until_ts reason
 
 let is_peer_connected t peer_id =
@@ -277,7 +287,7 @@ let dial t host port =
   if n_connected >= t.config.max_peers then
     Lwt.return_none
   else begin
-  Octra_log.stdout "P2P [%s]: dialing %s:%d\n%!" t.config.node_addr host port;
+  log_node t.config.node_addr "event = dial host = %s port = %d" host port;
   let fd_ref = ref None in
   Lwt.catch
     (fun () ->
@@ -295,7 +305,9 @@ let dial t host port =
         let* hs_result = P2p_handshake.dial_handshake fd ~my_hello ~allowed_pubkeys:t.config.allowed_pubkeys in
         match hs_result with
         | P2p_handshake.Error reason ->
-          Octra_log.stderr "P2P: dial handshake failed %s:%d — %s\n%!" host port reason;
+          err_node t.config.node_addr
+            "event = dial_handshake_failed host = %s port = %d reason = %s"
+            host port reason;
           (try let* () = Lwt_unix.close fd in Lwt.return_none with _ -> Lwt.return_none)
         | P2p_handshake.Ok peer_hello ->
           let peer_id = peer_hello.node_id in
@@ -303,7 +315,9 @@ let dial t host port =
           let conn = P2p_conn.create fd ~peer_id ~addr:addr_str
             ~direction:P2p_conn.Outbound in
           if add_peer t conn then begin
-            Octra_log.stdout "P2P [%s]: connected to %s (%s)\n%!" t.config.node_addr peer_id addr_str;
+            log_node t.config.node_addr
+              "event = connected peer = %s addr = %s"
+              peer_id addr_str;
             Lwt.async (fun () -> P2p_conn.start conn ~on_message:t.on_message);
             Lwt.async (fun () -> exchange_peers t conn);
             Lwt.return_some conn
@@ -316,7 +330,9 @@ let dial t host port =
       (match !fd_ref with
        | Some fd -> (try Lwt_unix.close fd |> ignore with _ -> ())
        | None -> ());
-      Octra_log.stderr "P2P: dial exception %s:%d — %s\n%!" host port (Printexc.to_string exn);
+      err_node t.config.node_addr
+        "event = dial_exception host = %s port = %d error = %s"
+        host port (Printexc.to_string exn);
       Lwt.return_none)
   end
 
@@ -381,7 +397,8 @@ let accept t fd addr =
         match P2p_peer_guard.admit_conn t.peer_guard
           ~now:(Unix.gettimeofday ()) ~key with
         | P2p_peer_guard.Drop reason ->
-          Octra_log.stderr "P2P: inbound peer rejected key=%s reason=%s\n%!"
+          err_node t.config.node_addr
+            "event = inbound_peer_rejected key = %s reason = %s"
             key reason;
           (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
         | P2p_peer_guard.Accept ->

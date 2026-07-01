@@ -60,7 +60,7 @@ let encode_frame (f : frame) : string =
   let payload_len = String.length f.payload in
   let frame_len = 1 + payload_len in
   if frame_len > max_frame_size then
-    failwith (Printf.sprintf "P2P frame too large: %d > %d" frame_len max_frame_size);
+    failwith (Printf.sprintf "frame_too_large size = %d max = %d" frame_len max_frame_size);
   let buf = Bytes.create (4 + frame_len) in
 
   Bytes.set buf 0 (Char.chr ((frame_len lsr 24) land 0xFF));
@@ -80,7 +80,7 @@ let read_exact fd n =
     else
       let open Lwt.Syntax in
       let* count = Lwt_unix.read fd buf off (n - off) in
-      if count = 0 then Lwt.fail (Failure "P2P: connection closed")
+      if count = 0 then Lwt.fail (Failure "connection_closed")
       else loop (off + count)
   in
   let open Lwt.Syntax in
@@ -94,7 +94,7 @@ let write_all fd s =
     else
       let open Lwt.Syntax in
       let* count = Lwt_unix.write_string fd s off (len - off) in
-      if count = 0 then Lwt.fail (Failure "P2P: write failed")
+      if count = 0 then Lwt.fail (Failure "write_failed")
       else loop (off + count)
   in
   loop 0
@@ -107,9 +107,9 @@ let read_frame fd =
   let b2 = Char.code header.[2] in
   let b3 = Char.code header.[3] in
   let frame_len = (b0 lsl 24) lor (b1 lsl 16) lor (b2 lsl 8) lor b3 in
-  if frame_len < 1 then Lwt.fail (Failure "P2P: empty frame")
+  if frame_len < 1 then Lwt.fail (Failure "empty_frame")
   else if frame_len > max_frame_size then
-    Lwt.fail (Failure (Printf.sprintf "P2P: frame too large: %d" frame_len))
+    Lwt.fail (Failure (Printf.sprintf "frame_too_large size = %d" frame_len))
   else
     let* data = read_exact fd frame_len in
     let msg_type = Char.code data.[0] in
