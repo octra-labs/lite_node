@@ -38,16 +38,26 @@ let msg_catchup_range_response_v2 = 0x3b
 let msg_resource_attestation = 0x3c
 
 let msg_type_name = function
-  | 0x01 -> "HELLO" | 0x02 -> "HELLO_ACK"
-  | 0x03 -> "PING" | 0x04 -> "PONG"
-  | 0x10 -> "GET_PEERS" | 0x11 -> "PEERS"
-  | 0x20 -> "TX_GOSSIP" | 0x21 -> "PROOFCERT_GOSSIP"
-  | 0x30 -> "CONS_PROPOSE" | 0x31 -> "CONS_VOTE"
-  | 0x32 -> "CONS_FINALIZE" | 0x33 -> "CONS_TIMEOUT"
-  | 0x34 -> "QUERY_EPOCH_ROOT" | 0x35 -> "EPOCH_ROOT_RESPONSE"
-  | 0x36 -> "QUERY_BUNDLE" | 0x37 -> "BUNDLE_RESPONSE"
-  | 0x38 -> "QUERY_CATCHUP_RANGE_V1" | 0x39 -> "CATCHUP_RANGE_RESPONSE_V1"
-  | 0x3a -> "QUERY_CATCHUP_RANGE_V2" | 0x3b -> "CATCHUP_RANGE_RESPONSE_V2"
+  | 0x01 -> "HELLO"
+  | 0x02 -> "HELLO_ACK"
+  | 0x03 -> "PING"
+  | 0x04 -> "PONG"
+  | 0x10 -> "GET_PEERS"
+  | 0x11 -> "PEERS"
+  | 0x20 -> "TX_GOSSIP"
+  | 0x21 -> "PROOFCERT_GOSSIP"
+  | 0x30 -> "CONS_PROPOSE"
+  | 0x31 -> "CONS_VOTE"
+  | 0x32 -> "CONS_FINALIZE"
+  | 0x33 -> "CONS_TIMEOUT"
+  | 0x34 -> "QUERY_EPOCH_ROOT"
+  | 0x35 -> "EPOCH_ROOT_RESPONSE"
+  | 0x36 -> "QUERY_BUNDLE"
+  | 0x37 -> "BUNDLE_RESPONSE"
+  | 0x38 -> "QUERY_CATCHUP_RANGE_V1"
+  | 0x39 -> "CATCHUP_RANGE_RESPONSE_V1"
+  | 0x3a -> "QUERY_CATCHUP_RANGE_V2"
+  | 0x3b -> "CATCHUP_RANGE_RESPONSE_V2"
   | 0x3c -> "RESOURCE_ATTESTATION"
   | n -> Printf.sprintf "UNKNOWN(0x%02x)" n
 
@@ -62,14 +72,11 @@ let encode_frame (f : frame) : string =
   if frame_len > max_frame_size then
     failwith (Printf.sprintf "frame_too_large size = %d max = %d" frame_len max_frame_size);
   let buf = Bytes.create (4 + frame_len) in
-
   Bytes.set buf 0 (Char.chr ((frame_len lsr 24) land 0xFF));
   Bytes.set buf 1 (Char.chr ((frame_len lsr 16) land 0xFF));
   Bytes.set buf 2 (Char.chr ((frame_len lsr 8) land 0xFF));
   Bytes.set buf 3 (Char.chr (frame_len land 0xFF));
-
   Bytes.set buf 4 (Char.chr f.msg_type);
-
   Bytes.blit_string f.payload 0 buf 5 payload_len;
   Bytes.unsafe_to_string buf
 

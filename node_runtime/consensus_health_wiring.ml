@@ -195,7 +195,7 @@ let peer_state_label (record : Octra_consensus.C_driver.peer_state_record) =
     | Some s -> Consensus_proposal.raw_hex8 s
     | None -> "-"
   in
-  Printf.sprintf "%s@head=%Ld check=%Ld root=%s src=%s"
+  Printf.sprintf "peer = %s head = %Ld check = %Ld root = %s source = %s"
     (String.sub
        record.responder_addr
        0

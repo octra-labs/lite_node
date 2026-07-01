@@ -45,7 +45,51 @@ type 'a launch_tasks = {
   tick_loop : unit -> 'a;
 }
 
-let launch_tasks deps =
+type node_launch_deps = {
+  p2p : unit -> unit Lwt.t;
+  rpc : unit -> unit Lwt.t;
+  observer : bool;
+  tick_loop : unit -> unit Lwt.t;
+  swarm : Octra_net.P2p_swarm.t option;
+  swarm_deps : P2p_swarm_lifecycle.node_deps;
+}
+
+let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
+    ~now ~max_drift ~driver_ref =
+  P2p_swarm_lifecycle.{
+    observer;
+    guard;
+    find_tx;
+    find_account;
+    add_tx;
+    now;
+    max_drift;
+    driver_ref;
+  }
+
+let make_node_launch_deps ~p2p ~rpc ~observer ~tick_loop ~swarm ~swarm_deps =
+  { p2p; rpc; observer; tick_loop; swarm; swarm_deps }
+
+let make_node_launch_deps_with_swarm ~p2p ~rpc ~observer ~tick_loop ~swarm
+    ~guard ~find_tx ~find_account ~add_tx ~now ~max_drift ~driver_ref =
+  make_node_launch_deps
+    ~p2p
+    ~rpc
+    ~observer
+    ~tick_loop
+    ~swarm
+    ~swarm_deps:
+      (make_node_swarm_deps
+         ~observer
+         ~guard
+         ~find_tx
+         ~find_account
+         ~add_tx
+         ~now
+         ~max_drift
+         ~driver_ref)
+
+let launch_tasks (deps : 'a launch_tasks) =
   node_tasks
     ~p2p_task:(deps.p2p ())
     ~rpc_task:(deps.rpc ())
@@ -63,11 +107,25 @@ let optional_ref_async ref_value ~dispatch a b =
 let p2p_swarm_task ~swarm ~deps =
   Option.map (P2p_swarm_lifecycle.start deps) swarm
 
+let node_swarm_task ~swarm ~deps =
+  P2p_swarm_lifecycle.node_task ~swarm deps
+
 let observer_loop () =
   let rec loop () =
     Lwt_unix.sleep 60.0 >>= fun () -> loop ()
   in
   loop ()
+
+let node_launch_tasks (deps : node_launch_deps) =
+  launch_tasks
+    {
+      p2p = deps.p2p;
+      rpc = deps.rpc;
+      observer = deps.observer;
+      observer_loop;
+      tick_loop = deps.tick_loop;
+      swarm = (fun () -> node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps);
+    }
 
 let run_join ~tasks ~close_chaindata ~exit_fatal =
   Lwt.catch
@@ -83,8 +141,16 @@ let run_join ~tasks ~close_chaindata ~exit_fatal =
       exit_fatal ();
       Lwt.return_unit)
 
-let run_launch_tasks deps ~close_chaindata ~exit_fatal =
+let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~close_chaindata
+    ~exit_fatal =
   run_join
     ~tasks:(launch_tasks deps)
+    ~close_chaindata
+    ~exit_fatal
+
+let run_node_launch_tasks (deps : node_launch_deps) ~close_chaindata
+    ~exit_fatal =
+  run_join
+    ~tasks:(node_launch_tasks deps)
     ~close_chaindata
     ~exit_fatal

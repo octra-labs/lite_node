@@ -40,6 +40,55 @@ type deps = {
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
+type node_deps = {
+  write_finality : C_types.finalize -> unit;
+  chaos_after_finality_log : unit -> unit;
+  cached_bundle : proposal_id:string -> bool;
+  cached_bundle_len : proposal_id:string -> int;
+  header_has_empty_bundle : C_types.epoch_header -> bool;
+  store_empty_bundle : C_types.epoch_header -> unit;
+  driver : unit -> C_driver.t option;
+  set_proposal : Octra_core.Transaction.t list -> string list -> unit;
+  store_proposal_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
+}
+
+let node_deps input =
+  {
+    write_finality = input.write_finality;
+    chaos_after_finality_log = input.chaos_after_finality_log;
+    cached_bundle = input.cached_bundle;
+    cached_bundle_len = input.cached_bundle_len;
+    header_has_empty_bundle = input.header_has_empty_bundle;
+    store_empty_bundle = input.store_empty_bundle;
+    query_bundle = (fun ~epoch_id ~proposal_id ~validate ->
+      match input.driver () with
+      | None -> Lwt.return_none
+      | Some driver ->
+        C_driver.query_bundle
+          driver
+          ~epoch_id
+          ~proposal_id
+          ~timeout_seconds:5.0
+          ~validate);
+    store_accepted_bundle = (fun ~proposal_id accepted ->
+      let bundle = accepted.Bundle_fetch.bundle in
+      input.set_proposal bundle.txs bundle.tx_hashes;
+      input.store_proposal_bundle
+        ~proposal_id
+        ~tx_hashes:bundle.tx_hashes
+        ~txs:bundle.txs
+        ~receipts_json:bundle.receipts_json);
+    queue_missing_bundle = input.queue_missing_bundle;
+    post_finalize = input.post_finalize;
+  }
+
 let bundle_deps (deps : deps) header proposal_id =
   Bundle_fetch.{
     cached_bundle = (fun () ->

@@ -37,4 +37,27 @@ type deps = {
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
+type node_deps = {
+  write_finality : C_types.finalize -> unit;
+  chaos_after_finality_log : unit -> unit;
+  cached_bundle : proposal_id:string -> bool;
+  cached_bundle_len : proposal_id:string -> int;
+  header_has_empty_bundle : C_types.epoch_header -> bool;
+  store_empty_bundle : C_types.epoch_header -> unit;
+  driver : unit -> C_driver.t option;
+  set_proposal : Octra_core.Transaction.t list -> string list -> unit;
+  store_proposal_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
+}
+
+val node_deps :
+  node_deps ->
+  deps
+
 val run : deps -> C_types.finalize -> unit Lwt.t

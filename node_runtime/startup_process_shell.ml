@@ -67,6 +67,36 @@ let network_config ~env =
     chain_id = string_env env "OCTRA_CHAIN_ID" "octra-mainnet";
   }
 
+let node_start_messages ~version ~validator ~storage ~store_path
+    ~epoch_duration config =
+  [
+    Printf.sprintf
+      "node version = %s validator = %s storage = %s"
+      version
+      validator
+      storage;
+    Printf.sprintf
+      "api = http://localhost:%d p2p = localhost:%d consensus = %d"
+      config.api_port
+      config.p2p_port
+      config.consensus_port;
+    Printf.sprintf
+      "path = %s epoch_duration = %.0fs"
+      store_path
+      epoch_duration;
+  ]
+
+let log_node_start ~info ~version ~validator ~storage ~store_path
+    ~epoch_duration config =
+  node_start_messages
+    ~version
+    ~validator
+    ~storage
+    ~store_path
+    ~epoch_duration
+    config
+  |> List.iter info
+
 let data_dir ~env =
   string_env env "OCTRA_DATA_DIR" "data"
 

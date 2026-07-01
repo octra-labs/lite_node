@@ -49,6 +49,50 @@ type 'a launch_tasks = {
   tick_loop : unit -> 'a;
 }
 
+type node_launch_deps = {
+  p2p : unit -> unit Lwt.t;
+  rpc : unit -> unit Lwt.t;
+  observer : bool;
+  tick_loop : unit -> unit Lwt.t;
+  swarm : Octra_net.P2p_swarm.t option;
+  swarm_deps : P2p_swarm_lifecycle.node_deps;
+}
+
+val make_node_swarm_deps :
+  observer:bool ->
+  guard:Octra_net.P2p_tx_gossip_guard.t ->
+  find_tx:(string -> Octra_core.Transaction.t option) ->
+  find_account:(string -> Octra_core.Ledger.account option) ->
+  add_tx:(Octra_core.Transaction.t -> (string, string) result) ->
+  now:(unit -> float) ->
+  max_drift:float ->
+  driver_ref:Octra_consensus.C_driver.t option ref ->
+  P2p_swarm_lifecycle.node_deps
+
+val make_node_launch_deps :
+  p2p:(unit -> unit Lwt.t) ->
+  rpc:(unit -> unit Lwt.t) ->
+  observer:bool ->
+  tick_loop:(unit -> unit Lwt.t) ->
+  swarm:Octra_net.P2p_swarm.t option ->
+  swarm_deps:P2p_swarm_lifecycle.node_deps ->
+  node_launch_deps
+
+val make_node_launch_deps_with_swarm :
+  p2p:(unit -> unit Lwt.t) ->
+  rpc:(unit -> unit Lwt.t) ->
+  observer:bool ->
+  tick_loop:(unit -> unit Lwt.t) ->
+  swarm:Octra_net.P2p_swarm.t option ->
+  guard:Octra_net.P2p_tx_gossip_guard.t ->
+  find_tx:(string -> Octra_core.Transaction.t option) ->
+  find_account:(string -> Octra_core.Ledger.account option) ->
+  add_tx:(Octra_core.Transaction.t -> (string, string) result) ->
+  now:(unit -> float) ->
+  max_drift:float ->
+  driver_ref:Octra_consensus.C_driver.t option ref ->
+  node_launch_deps
+
 val launch_tasks :
   'a launch_tasks ->
   'a list
@@ -65,6 +109,15 @@ val p2p_swarm_task :
   deps:P2p_swarm_lifecycle.deps ->
   unit Lwt.t option
 
+val node_swarm_task :
+  swarm:Octra_net.P2p_swarm.t option ->
+  deps:P2p_swarm_lifecycle.node_deps ->
+  unit Lwt.t option
+
+val node_launch_tasks :
+  node_launch_deps ->
+  unit Lwt.t list
+
 val observer_loop :
   unit ->
   unit Lwt.t
@@ -77,6 +130,12 @@ val run_join :
 
 val run_launch_tasks :
   unit Lwt.t launch_tasks ->
+  close_chaindata:(unit -> unit) ->
+  exit_fatal:(unit -> unit) ->
+  unit Lwt.t
+
+val run_node_launch_tasks :
+  node_launch_deps ->
   close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t

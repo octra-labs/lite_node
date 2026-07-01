@@ -42,6 +42,25 @@ val network_config :
   env:(string -> string option) ->
   network_config
 
+val node_start_messages :
+  version:string ->
+  validator:string ->
+  storage:string ->
+  store_path:string ->
+  epoch_duration:float ->
+  network_config ->
+  string list
+
+val log_node_start :
+  info:(string -> unit) ->
+  version:string ->
+  validator:string ->
+  storage:string ->
+  store_path:string ->
+  epoch_duration:float ->
+  network_config ->
+  unit
+
 val data_dir :
   env:(string -> string option) ->
   string
