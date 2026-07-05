@@ -54,6 +54,23 @@ type node_launch_deps = {
   swarm_deps : P2p_swarm_lifecycle.node_deps;
 }
 
+type node_launch_runtime = {
+  p2p : unit -> unit Lwt.t;
+  rpc : unit -> unit Lwt.t;
+  observer : bool;
+  tick_loop : unit -> unit Lwt.t;
+  swarm : Octra_net.P2p_swarm.t option;
+  guard : Octra_net.P2p_tx_gossip_guard.t;
+  find_tx : string -> Octra_core.Transaction.t option;
+  find_account : string -> Octra_core.Ledger.account option;
+  add_tx : Octra_core.Transaction.t -> (string, string) result;
+  now : unit -> float;
+  max_drift : float;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  close_chaindata : unit -> unit;
+  exit_fatal : unit -> unit;
+}
+
 let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
     ~now ~max_drift ~driver_ref =
   P2p_swarm_lifecycle.{
@@ -154,3 +171,21 @@ let run_node_launch_tasks (deps : node_launch_deps) ~close_chaindata
     ~tasks:(node_launch_tasks deps)
     ~close_chaindata
     ~exit_fatal
+
+let run_node_runtime (runtime : node_launch_runtime) =
+  run_node_launch_tasks
+    (make_node_launch_deps_with_swarm
+       ~p2p:runtime.p2p
+       ~rpc:runtime.rpc
+       ~observer:runtime.observer
+       ~tick_loop:runtime.tick_loop
+       ~swarm:runtime.swarm
+       ~guard:runtime.guard
+       ~find_tx:runtime.find_tx
+       ~find_account:runtime.find_account
+       ~add_tx:runtime.add_tx
+       ~now:runtime.now
+       ~max_drift:runtime.max_drift
+       ~driver_ref:runtime.driver_ref)
+    ~close_chaindata:runtime.close_chaindata
+    ~exit_fatal:runtime.exit_fatal

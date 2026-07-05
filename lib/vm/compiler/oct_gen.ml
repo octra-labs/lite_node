@@ -900,8 +900,7 @@ let rec typ_of_expr env = function
      | Some t -> t
      | None -> gerr env.line (Printf.sprintf "unknown storage path: %s" (storage_path_to_string field [sf])))
   | EEnumVariant _ -> TInt
-  | EArray _ -> TString
-  | ETuple _ -> TString
+  | EArray _ | ETuple _ -> TString
   | ETernary (_, then_e, _) -> typ_of_expr env then_e
 
 let gen_some_key_field name = name ^ "_some"
@@ -974,8 +973,151 @@ and gen_unwrap env args =
      | None -> rd)
   | _ -> gerr env.line "unwrap: argument must be self.field or self.map[key]"
 
-and gen_builtin env name args =
+and emit_split_builtin env rd str_r delim_r =
+  let count_r = alloc_reg env in
+  emit env (Contract_vm.LDI (count_r, VInt Z.zero));
+  let remaining_r = alloc_reg env in
+  emit env (Contract_vm.MOV (remaining_r, str_r));
+  let base_slot = alloc_reg env in
+  emit env (Contract_vm.LDI (base_slot, VInt (Z.of_int 100)));
+  let test_l = alloc_label env in
+  let loop_l = alloc_label env in
+  let done_l = alloc_label env in
+  let delim_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (delim_len, delim_r));
+  emit env (Contract_vm.JDEST test_l);
+  let pos = alloc_reg env in
+  emit env (Contract_vm.INDEXOF (pos, remaining_r, delim_r));
+  let neg1 = alloc_reg env in
+  emit env (Contract_vm.LDI (neg1, VInt (Z.of_int (-1))));
+  let found = alloc_reg env in
+  emit env (Contract_vm.NEQ (found, pos, neg1));
+  emit env (Contract_vm.JIF (found, loop_l));
+  let slot_r = alloc_reg env in
+  emit env (Contract_vm.ADD (slot_r, base_slot, count_r));
+  emit env (Contract_vm.MSTORER (slot_r, remaining_r));
+  let one2 = alloc_reg env in
+  emit env (Contract_vm.LDI (one2, VInt Z.one));
+  emit env (Contract_vm.ADD (count_r, count_r, one2));
+  emit env (Contract_vm.JMP done_l);
+  emit env (Contract_vm.JDEST loop_l);
+  let part_r = alloc_reg env in
+  let zero2 = alloc_reg env in
+  emit env (Contract_vm.LDI (zero2, VInt Z.zero));
+  emit env (Contract_vm.SUBSTR (part_r, remaining_r, zero2, pos));
+  let slot_r2 = alloc_reg env in
+  emit env (Contract_vm.ADD (slot_r2, base_slot, count_r));
+  emit env (Contract_vm.MSTORER (slot_r2, part_r));
+  let one3 = alloc_reg env in
+  emit env (Contract_vm.LDI (one3, VInt Z.one));
+  emit env (Contract_vm.ADD (count_r, count_r, one3));
+  let next_start = alloc_reg env in
+  emit env (Contract_vm.ADD (next_start, pos, delim_len));
+  let total_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (total_len, remaining_r));
+  let rem_len = alloc_reg env in
+  emit env (Contract_vm.SUB (rem_len, total_len, next_start));
+  emit env (Contract_vm.SUBSTR (remaining_r, remaining_r, next_start, rem_len));
+  emit env (Contract_vm.JMP test_l);
+  emit env (Contract_vm.JDEST done_l);
+  emit env (Contract_vm.MOV (rd, count_r))
 
+and emit_join_builtin env rd n_r delim_r =
+  emit env (Contract_vm.LDI (rd, VString ""));
+  let i_r = alloc_reg env in
+  emit env (Contract_vm.LDI (i_r, VInt Z.zero));
+  let base_slot = alloc_reg env in
+  emit env (Contract_vm.LDI (base_slot, VInt (Z.of_int 100)));
+  let test_l = alloc_label env in
+  let loop_l = alloc_label env in
+  emit env (Contract_vm.JMP test_l);
+  emit env (Contract_vm.JDEST loop_l);
+  let zero3 = alloc_reg env in
+  emit env (Contract_vm.LDI (zero3, VInt Z.zero));
+  let is_first = alloc_reg env in
+  emit env (Contract_vm.EQ (is_first, i_r, zero3));
+  let skip_delim = alloc_label env in
+  emit env (Contract_vm.JIF (is_first, skip_delim));
+  emit env (Contract_vm.CONCAT (rd, rd, delim_r));
+  emit env (Contract_vm.JDEST skip_delim);
+  let slot_r = alloc_reg env in
+  emit env (Contract_vm.ADD (slot_r, base_slot, i_r));
+  let part_r = alloc_reg env in
+  emit env (Contract_vm.MLOADR (part_r, slot_r));
+  emit env (Contract_vm.CONCAT (rd, rd, part_r));
+  let one4 = alloc_reg env in
+  emit env (Contract_vm.LDI (one4, VInt Z.one));
+  emit env (Contract_vm.ADD (i_r, i_r, one4));
+  emit env (Contract_vm.JDEST test_l);
+  let cmp = alloc_reg env in
+  emit env (Contract_vm.LT (cmp, i_r, n_r));
+  emit env (Contract_vm.JIF (cmp, loop_l))
+
+and emit_replace_builtin env rd str_r old_r new_r =
+  let pos_r = alloc_reg env in
+  emit env (Contract_vm.INDEXOF (pos_r, str_r, old_r));
+  let neg1 = alloc_reg env in
+  emit env (Contract_vm.LDI (neg1, VInt (Z.of_int (-1))));
+  let found = alloc_reg env in
+  emit env (Contract_vm.NEQ (found, pos_r, neg1));
+  let do_replace = alloc_label env in
+  let done_l = alloc_label env in
+  emit env (Contract_vm.JIF (found, do_replace));
+  emit env (Contract_vm.MOV (rd, str_r));
+  emit env (Contract_vm.JMP done_l);
+  emit env (Contract_vm.JDEST do_replace);
+  let zero_r = alloc_reg env in
+  emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
+  let before_r = alloc_reg env in
+  emit env (Contract_vm.SUBSTR (before_r, str_r, zero_r, pos_r));
+  let old_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (old_len, old_r));
+  let after_start = alloc_reg env in
+  emit env (Contract_vm.ADD (after_start, pos_r, old_len));
+  let total_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (total_len, str_r));
+  let after_len = alloc_reg env in
+  emit env (Contract_vm.SUB (after_len, total_len, after_start));
+  let after_r = alloc_reg env in
+  emit env (Contract_vm.SUBSTR (after_r, str_r, after_start, after_len));
+  emit env (Contract_vm.CONCAT (rd, before_r, new_r));
+  emit env (Contract_vm.CONCAT (rd, rd, after_r));
+  emit env (Contract_vm.JDEST done_l)
+
+and emit_replace_all_builtin env rd str_r old_r new_r =
+  emit env (Contract_vm.MOV (rd, str_r));
+  let loop_l = alloc_label env in
+  let unused_replace_label = alloc_label env in
+  let done_l = alloc_label env in
+  emit env (Contract_vm.JDEST loop_l);
+  let pos_r = alloc_reg env in
+  emit env (Contract_vm.INDEXOF (pos_r, rd, old_r));
+  let neg1 = alloc_reg env in
+  emit env (Contract_vm.LDI (neg1, VInt (Z.of_int (-1))));
+  let not_found = alloc_reg env in
+  emit env (Contract_vm.EQ (not_found, pos_r, neg1));
+  emit env (Contract_vm.JIF (not_found, done_l));
+  let zero_r = alloc_reg env in
+  emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
+  let before_r = alloc_reg env in
+  emit env (Contract_vm.SUBSTR (before_r, rd, zero_r, pos_r));
+  let old_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (old_len, old_r));
+  let after_start = alloc_reg env in
+  emit env (Contract_vm.ADD (after_start, pos_r, old_len));
+  let total_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (total_len, rd));
+  let after_len = alloc_reg env in
+  emit env (Contract_vm.SUB (after_len, total_len, after_start));
+  let after_r = alloc_reg env in
+  emit env (Contract_vm.SUBSTR (after_r, rd, after_start, after_len));
+  emit env (Contract_vm.CONCAT (rd, before_r, new_r));
+  emit env (Contract_vm.CONCAT (rd, rd, after_r));
+  emit env (Contract_vm.JMP loop_l);
+  ignore unused_replace_label;
+  emit env (Contract_vm.JDEST done_l)
+
+and gen_builtin env name args =
   match name with
   | "some" ->
     (match args with
@@ -1267,7 +1409,6 @@ and gen_builtin env name args =
      if nargs = 1 then
        emit env (Contract_vm.SPAWN (rd, nth 0))
      else begin
-
        let base = nth 1 in
        emit env (Contract_vm.SPAWN2 (rd, nth 0, base, nargs - 1))
      end
@@ -1368,170 +1509,10 @@ and gen_builtin env name args =
      let zero = alloc_reg env in
      emit env (Contract_vm.LDI (zero, VInt Z.zero));
      emit env (Contract_vm.EQ (rd, idx_r, zero))
-   | "split" ->
-
-     let str_r = nth 0 in
-     let delim_r = nth 1 in
-     let count_r = alloc_reg env in
-     emit env (Contract_vm.LDI (count_r, VInt Z.zero));
-     let remaining_r = alloc_reg env in
-     emit env (Contract_vm.MOV (remaining_r, str_r));
-     let base_slot = alloc_reg env in
-     emit env (Contract_vm.LDI (base_slot, VInt (Z.of_int 100)));
-     let test_l = alloc_label env in
-     let loop_l = alloc_label env in
-     let done_l = alloc_label env in
-     let delim_len = alloc_reg env in
-     emit env (Contract_vm.STRLEN (delim_len, delim_r));
-     emit env (Contract_vm.JDEST test_l);
-     let pos = alloc_reg env in
-     emit env (Contract_vm.INDEXOF (pos, remaining_r, delim_r));
-     let neg1 = alloc_reg env in
-     emit env (Contract_vm.LDI (neg1, VInt (Z.of_int (-1))));
-     let found = alloc_reg env in
-     emit env (Contract_vm.NEQ (found, pos, neg1));
-     emit env (Contract_vm.JIF (found, loop_l));
-
-     let slot_r = alloc_reg env in
-     emit env (Contract_vm.ADD (slot_r, base_slot, count_r));
-     emit env (Contract_vm.MSTORER (slot_r, remaining_r));
-     let one2 = alloc_reg env in
-     emit env (Contract_vm.LDI (one2, VInt Z.one));
-     emit env (Contract_vm.ADD (count_r, count_r, one2));
-     emit env (Contract_vm.JMP done_l);
-     emit env (Contract_vm.JDEST loop_l);
-
-     let part_r = alloc_reg env in
-     let zero2 = alloc_reg env in
-     emit env (Contract_vm.LDI (zero2, VInt Z.zero));
-     emit env (Contract_vm.SUBSTR (part_r, remaining_r, zero2, pos));
-     let slot_r2 = alloc_reg env in
-     emit env (Contract_vm.ADD (slot_r2, base_slot, count_r));
-     emit env (Contract_vm.MSTORER (slot_r2, part_r));
-     let one3 = alloc_reg env in
-     emit env (Contract_vm.LDI (one3, VInt Z.one));
-     emit env (Contract_vm.ADD (count_r, count_r, one3));
-
-     let next_start = alloc_reg env in
-     emit env (Contract_vm.ADD (next_start, pos, delim_len));
-     let total_len = alloc_reg env in
-     emit env (Contract_vm.STRLEN (total_len, remaining_r));
-     let rem_len = alloc_reg env in
-     emit env (Contract_vm.SUB (rem_len, total_len, next_start));
-     emit env (Contract_vm.SUBSTR (remaining_r, remaining_r, next_start, rem_len));
-     emit env (Contract_vm.JMP test_l);
-     emit env (Contract_vm.JDEST done_l);
-     emit env (Contract_vm.MOV (rd, count_r))
-   | "join" ->
-
-     let n_r = nth 0 in
-     let delim_r = nth 1 in
-     emit env (Contract_vm.LDI (rd, VString ""));
-     let i_r = alloc_reg env in
-     emit env (Contract_vm.LDI (i_r, VInt Z.zero));
-     let base_slot = alloc_reg env in
-     emit env (Contract_vm.LDI (base_slot, VInt (Z.of_int 100)));
-     let test_l = alloc_label env in
-     let loop_l = alloc_label env in
-     emit env (Contract_vm.JMP test_l);
-     emit env (Contract_vm.JDEST loop_l);
-
-     let zero3 = alloc_reg env in
-     emit env (Contract_vm.LDI (zero3, VInt Z.zero));
-     let is_first = alloc_reg env in
-     emit env (Contract_vm.EQ (is_first, i_r, zero3));
-     let skip_delim = alloc_label env in
-     emit env (Contract_vm.JIF (is_first, skip_delim));
-     emit env (Contract_vm.CONCAT (rd, rd, delim_r));
-     emit env (Contract_vm.JDEST skip_delim);
-
-     let slot_r = alloc_reg env in
-     emit env (Contract_vm.ADD (slot_r, base_slot, i_r));
-     let part_r = alloc_reg env in
-     emit env (Contract_vm.MLOADR (part_r, slot_r));
-     emit env (Contract_vm.CONCAT (rd, rd, part_r));
-     let one4 = alloc_reg env in
-     emit env (Contract_vm.LDI (one4, VInt Z.one));
-     emit env (Contract_vm.ADD (i_r, i_r, one4));
-     emit env (Contract_vm.JDEST test_l);
-     let cmp = alloc_reg env in
-     emit env (Contract_vm.LT (cmp, i_r, n_r));
-     emit env (Contract_vm.JIF (cmp, loop_l))
-   | "replace" ->
-
-     let str_r = nth 0 in
-     let old_r = nth 1 in
-     let new_r = nth 2 in
-     let pos_r = alloc_reg env in
-     emit env (Contract_vm.INDEXOF (pos_r, str_r, old_r));
-     let neg1 = alloc_reg env in
-     emit env (Contract_vm.LDI (neg1, VInt (Z.of_int (-1))));
-     let found = alloc_reg env in
-     emit env (Contract_vm.NEQ (found, pos_r, neg1));
-     let do_replace = alloc_label env in
-     let done_l = alloc_label env in
-     emit env (Contract_vm.JIF (found, do_replace));
-     emit env (Contract_vm.MOV (rd, str_r));
-     emit env (Contract_vm.JMP done_l);
-     emit env (Contract_vm.JDEST do_replace);
-     let zero_r = alloc_reg env in
-     emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
-     let before_r = alloc_reg env in
-     emit env (Contract_vm.SUBSTR (before_r, str_r, zero_r, pos_r));
-     let old_len = alloc_reg env in
-     emit env (Contract_vm.STRLEN (old_len, old_r));
-     let after_start = alloc_reg env in
-     emit env (Contract_vm.ADD (after_start, pos_r, old_len));
-     let total_len = alloc_reg env in
-     emit env (Contract_vm.STRLEN (total_len, str_r));
-     let after_len = alloc_reg env in
-     emit env (Contract_vm.SUB (after_len, total_len, after_start));
-     let after_r = alloc_reg env in
-     emit env (Contract_vm.SUBSTR (after_r, str_r, after_start, after_len));
-     emit env (Contract_vm.CONCAT (rd, before_r, new_r));
-     emit env (Contract_vm.CONCAT (rd, rd, after_r));
-     emit env (Contract_vm.JDEST done_l)
-   | "replace_all" ->
-
-     let str_r = nth 0 in
-     let old_r = nth 1 in
-     let new_r = nth 2 in
-
-     emit env (Contract_vm.MOV (rd, str_r));
-
-     let loop_l = alloc_label env in
-     let do_replace = alloc_label env in
-     let done_l = alloc_label env in
-     emit env (Contract_vm.JDEST loop_l);
-     let pos_r = alloc_reg env in
-     emit env (Contract_vm.INDEXOF (pos_r, rd, old_r));
-     let neg1 = alloc_reg env in
-     emit env (Contract_vm.LDI (neg1, VInt (Z.of_int (-1))));
-
-     let not_found = alloc_reg env in
-     emit env (Contract_vm.EQ (not_found, pos_r, neg1));
-
-     emit env (Contract_vm.JIF (not_found, done_l));
-
-     let zero_r = alloc_reg env in
-     emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
-     let before_r = alloc_reg env in
-     emit env (Contract_vm.SUBSTR (before_r, rd, zero_r, pos_r));
-     let old_len = alloc_reg env in
-     emit env (Contract_vm.STRLEN (old_len, old_r));
-     let after_start = alloc_reg env in
-     emit env (Contract_vm.ADD (after_start, pos_r, old_len));
-     let total_len = alloc_reg env in
-     emit env (Contract_vm.STRLEN (total_len, rd));
-     let after_len = alloc_reg env in
-     emit env (Contract_vm.SUB (after_len, total_len, after_start));
-     let after_r = alloc_reg env in
-     emit env (Contract_vm.SUBSTR (after_r, rd, after_start, after_len));
-     emit env (Contract_vm.CONCAT (rd, before_r, new_r));
-     emit env (Contract_vm.CONCAT (rd, rd, after_r));
-     emit env (Contract_vm.JMP loop_l);
-     ignore do_replace;
-     emit env (Contract_vm.JDEST done_l)
+   | "split" -> emit_split_builtin env rd (nth 0) (nth 1)
+   | "join" -> emit_join_builtin env rd (nth 0) (nth 1)
+   | "replace" -> emit_replace_builtin env rd (nth 0) (nth 1) (nth 2)
+   | "replace_all" -> emit_replace_all_builtin env rd (nth 0) (nth 1) (nth 2)
    | "pow" ->
      let base_r = nth 0 in
      let exp_r = nth 1 in
@@ -1623,6 +1604,25 @@ and gen_storage_path_write env field keys path expr =
 and gen_field_prop env field prop =
   gen_storage_path_read env field [] [prop]
 
+and emit_netstring_pack_element env packed_r expr =
+  let er = gen_expr env expr in
+  let str_r = alloc_reg env in
+  emit env (Contract_vm.LDI (str_r, VString ""));
+  emit env (Contract_vm.CONCAT (str_r, str_r, er));
+  let len_r = alloc_reg env in
+  emit env (Contract_vm.STRLEN (len_r, str_r));
+  let hash_r = alloc_reg env in
+  emit env (Contract_vm.LDI (hash_r, VString "#"));
+  emit env (Contract_vm.CONCAT (packed_r, packed_r, len_r));
+  emit env (Contract_vm.CONCAT (packed_r, packed_r, hash_r));
+  emit env (Contract_vm.CONCAT (packed_r, packed_r, str_r))
+
+and gen_netstring_pack env elems =
+  let packed_r = alloc_reg env in
+  emit env (Contract_vm.LDI (packed_r, VString ""));
+  List.iter (emit_netstring_pack_element env packed_r) elems;
+  packed_r
+
 and gen_expr env expr =
   match expr with
   | EInt z ->
@@ -1698,27 +1698,7 @@ and gen_expr env expr =
          r
        end else r
      | None -> gerr env.line (Printf.sprintf "undefined field: %s" name))
-  | EArray elems | ETuple elems ->
-
-    let r = alloc_reg env in
-    emit env (Contract_vm.LDI (r, VString ""));
-    List.iter (fun e ->
-      let er = gen_expr env e in
-
-      let str_r = alloc_reg env in
-      emit env (Contract_vm.LDI (str_r, VString ""));
-      emit env (Contract_vm.CONCAT (str_r, str_r, er));
-
-      let len_r = alloc_reg env in
-      emit env (Contract_vm.STRLEN (len_r, str_r));
-
-      let hash_r = alloc_reg env in
-      emit env (Contract_vm.LDI (hash_r, VString "#"));
-      emit env (Contract_vm.CONCAT (r, r, len_r));
-      emit env (Contract_vm.CONCAT (r, r, hash_r));
-      emit env (Contract_vm.CONCAT (r, r, str_r))
-    ) elems;
-    r
+  | EArray elems | ETuple elems -> gen_netstring_pack env elems
   | ECall (name, args) -> gen_builtin env name args
   | EStoragePath (field, keys, path) -> gen_storage_path_read env field keys path
   | EFieldProp (field, prop) -> gen_field_prop env field prop
@@ -1816,7 +1796,168 @@ and gen_short_circuit_or env l r_expr =
   emit env (Contract_vm.JDEST end_label);
   result
 
-let rec gen_stmt env stmt =
+and reserve_local_slot env =
+  let r = env.base_reg in
+  if r > 63 then gerr env.line "too many local variables (max 63 registers)";
+  env.base_reg <- r + 1;
+  env.next_reg <- env.base_reg;
+  r
+
+and tuple_element_types env expr names =
+  match typ_of_expr env expr with
+  | TTuple ts -> ts
+  | _ -> List.map (fun _ -> TString) names
+
+and next_tuple_type types_ref =
+  match !types_ref with
+  | t :: rest ->
+    types_ref := rest;
+    t
+  | [] -> TString
+
+and emit_netstring_unpack_next env ~hash_r ~remaining_r ~local_r =
+  let hash_pos = alloc_reg env in
+  emit env (Contract_vm.INDEXOF (hash_pos, remaining_r, hash_r));
+  let zero_r = alloc_reg env in
+  emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
+  let len_str = alloc_reg env in
+  emit env (Contract_vm.SUBSTR (len_str, remaining_r, zero_r, hash_pos));
+  let elem_len = alloc_reg env in
+  emit env (Contract_vm.ADD (elem_len, zero_r, len_str));
+  let one_r = alloc_reg env in
+  emit env (Contract_vm.LDI (one_r, VInt Z.one));
+  let payload_start = alloc_reg env in
+  emit env (Contract_vm.ADD (payload_start, hash_pos, one_r));
+  emit env (Contract_vm.SUBSTR (local_r, remaining_r, payload_start, elem_len));
+  let next_start = alloc_reg env in
+  emit env (Contract_vm.ADD (next_start, payload_start, elem_len));
+  let total_len = alloc_reg env in
+  emit env (Contract_vm.STRLEN (total_len, remaining_r));
+  let rem_len = alloc_reg env in
+  emit env (Contract_vm.SUB (rem_len, total_len, next_start));
+  emit env (Contract_vm.SUBSTR (remaining_r, remaining_r, next_start, rem_len))
+
+and bind_tuple_element env ~hash_r ~remaining_r ~types_ref name =
+  let elem_t = next_tuple_type types_ref in
+  let local_r = reserve_local_slot env in
+  emit_netstring_unpack_next env ~hash_r ~remaining_r ~local_r;
+  env.locals <- (name, local_r, elem_t) :: env.locals
+
+and gen_tuple_unpack env names expr =
+  let elem_types = tuple_element_types env expr names in
+  let hash_r = reserve_local_slot env in
+  let remaining_r = reserve_local_slot env in
+  let src_r = gen_expr env expr in
+  emit env (Contract_vm.LDI (hash_r, VString "#"));
+  emit env (Contract_vm.MOV (remaining_r, src_r));
+  let types_ref = ref elem_types in
+  List.iter (bind_tuple_element env ~hash_r ~remaining_r ~types_ref) names
+
+and emit_list_push_method env field args =
+  let len_r = alloc_reg env in
+  emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
+  ignore (gen_int_from_storage env len_r);
+  let val_r = gen_expr env (List.hd args) in
+  let kr = alloc_reg env in
+  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
+  emit env (Contract_vm.CONCAT (kr, kr, len_r));
+  emit env (Contract_vm.SSTOREK (kr, val_r));
+  let one = alloc_reg env in
+  emit env (Contract_vm.LDI (one, VInt Z.one));
+  emit env (Contract_vm.ADD (len_r, len_r, one));
+  emit env (Contract_vm.SSTORE (field ^ "_len", len_r))
+
+and emit_list_delete_method env field args =
+  let key_r = gen_expr env (List.hd args) in
+  let kr = alloc_reg env in
+  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
+  emit env (Contract_vm.CONCAT (kr, kr, key_r));
+  emit env (Contract_vm.SDELK kr)
+
+and emit_list_len_method env field =
+  let r = alloc_reg env in
+  emit env (Contract_vm.SLOAD (r, field ^ "_len"));
+  ignore (gen_int_from_storage env r);
+  emit env (Contract_vm.MOV (0, r))
+
+and emit_list_pop_method env field =
+  let len_r = alloc_reg env in
+  emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
+  ignore (gen_int_from_storage env len_r);
+  let one = alloc_reg env in
+  emit env (Contract_vm.LDI (one, VInt Z.one));
+  emit env (Contract_vm.SUB (len_r, len_r, one));
+  let kr = alloc_reg env in
+  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
+  emit env (Contract_vm.CONCAT (kr, kr, len_r));
+  let val_r = alloc_reg env in
+  emit env (Contract_vm.SLOADK (val_r, kr));
+  emit env (Contract_vm.SDELK kr);
+  emit env (Contract_vm.SSTORE (field ^ "_len", len_r));
+  emit env (Contract_vm.MOV (0, val_r))
+
+let is_pseudo_event name =
+  name = "Log" || name = "Require"
+
+let guard_pure_while env =
+  if env.fn_is_pure then
+    gerr env.line "pure function cannot use while loops (use for..in with bounded range)"
+
+let reserve_foreach_slot env =
+  let r = env.base_reg in
+  if r > 63 then gerr env.line "too many local variables";
+  env.base_reg <- r + 1;
+  env.next_reg <- env.base_reg;
+  r
+
+let emit_foreach_item_load env field iter_r item_r =
+  let kr = alloc_reg env in
+  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
+  emit env (Contract_vm.CONCAT (kr, kr, iter_r));
+  emit env (Contract_vm.SLOADK (item_r, kr))
+
+let check_match_exhaustive env arms =
+  match arms with
+  | (enum_name, _, _) :: _ ->
+    (match find_enum env enum_name with
+     | Some ed ->
+       let covered = List.map (fun (_, v, _) -> v) arms in
+       let missing = List.filter (fun v -> not (List.mem v covered)) ed.en_variants in
+       if missing <> [] then
+         gerr env.line (Printf.sprintf "non-exhaustive match on %s: missing %s"
+           enum_name (String.concat ", " missing))
+     | None -> ())
+  | [] -> gerr env.line "empty match expression"
+
+let rec gen_foreach_loop env var_name field body =
+  let len_r = reserve_foreach_slot env in
+  let iter_r = reserve_foreach_slot env in
+  emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
+  ignore (gen_int_from_storage env len_r);
+  emit env (Contract_vm.LDI (iter_r, VInt Z.zero));
+  let saved_locals = env.locals in
+  let test_label = alloc_label env in
+  let loop_label = alloc_label env in
+  emit env (Contract_vm.JMP test_label);
+  emit env (Contract_vm.JDEST loop_label);
+  let item_r = reserve_foreach_slot env in
+  emit_foreach_item_load env field iter_r item_r;
+  env.locals <- (var_name, item_r, TString) :: env.locals;
+  List.iter (gen_stmt env) body;
+  env.next_reg <- env.base_reg;
+  let one = alloc_reg env in
+  emit env (Contract_vm.LDI (one, VInt Z.one));
+  emit env (Contract_vm.ADD (iter_r, iter_r, one));
+  emit env (Contract_vm.JDEST test_label);
+  env.next_reg <- env.base_reg;
+  let cmp = alloc_reg env in
+  emit env (Contract_vm.LT (cmp, iter_r, len_r));
+  emit env (Contract_vm.JIF (cmp, loop_label));
+  env.locals <- saved_locals;
+  env.base_reg <- len_r;
+  env.next_reg <- env.base_reg
+
+and gen_stmt env stmt =
   env.next_reg <- env.base_reg;
   match stmt with
   | SLet (name, typ_ann, expr) ->
@@ -1833,61 +1974,7 @@ let rec gen_stmt env stmt =
     env.next_reg <- env.base_reg;
     env.locals <- (name, local_r, t) :: env.locals
 
-  | SLetTuple (names, expr) ->
-
-    let _n = List.length names in
-
-    let elem_types = match typ_of_expr env expr with
-      | TTuple ts -> ts
-      | _ -> List.map (fun _ -> TString) names
-    in
-
-    let hash_r = env.base_reg in
-    if hash_r > 63 then gerr env.line "too many local variables (max 63 registers)";
-    env.base_reg <- hash_r + 1;
-    let remaining_r = env.base_reg in
-    if remaining_r > 63 then gerr env.line "too many local variables (max 63 registers)";
-    env.base_reg <- remaining_r + 1;
-    env.next_reg <- env.base_reg;
-
-    let src_r = gen_expr env expr in
-    emit env (Contract_vm.LDI (hash_r, VString "#"));
-    emit env (Contract_vm.MOV (remaining_r, src_r));
-    let types_ref = ref elem_types in
-    List.iter (fun name ->
-      let elem_t = match !types_ref with t :: rest -> types_ref := rest; t | [] -> TString in
-      let local_r = env.base_reg in
-      if local_r > 63 then gerr env.line "too many local variables (max 63 registers)";
-      env.base_reg <- local_r + 1;
-      env.next_reg <- env.base_reg;
-
-      let hash_pos = alloc_reg env in
-      emit env (Contract_vm.INDEXOF (hash_pos, remaining_r, hash_r));
-
-      let zero_r = alloc_reg env in
-      emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
-      let len_str = alloc_reg env in
-      emit env (Contract_vm.SUBSTR (len_str, remaining_r, zero_r, hash_pos));
-
-      let elem_len = alloc_reg env in
-      emit env (Contract_vm.ADD (elem_len, zero_r, len_str));
-
-      let one_r = alloc_reg env in
-      emit env (Contract_vm.LDI (one_r, VInt Z.one));
-      let payload_start = alloc_reg env in
-      emit env (Contract_vm.ADD (payload_start, hash_pos, one_r));
-
-      emit env (Contract_vm.SUBSTR (local_r, remaining_r, payload_start, elem_len));
-
-      let next_start = alloc_reg env in
-      emit env (Contract_vm.ADD (next_start, payload_start, elem_len));
-      let total_len = alloc_reg env in
-      emit env (Contract_vm.STRLEN (total_len, remaining_r));
-      let rem_len = alloc_reg env in
-      emit env (Contract_vm.SUB (rem_len, total_len, next_start));
-      emit env (Contract_vm.SUBSTR (remaining_r, remaining_r, next_start, rem_len));
-      env.locals <- (name, local_r, elem_t) :: env.locals
-    ) names
+  | SLetTuple (names, expr) -> gen_tuple_unpack env names expr
 
   | SAssign (name, expr) ->
     (match find_local env name with
@@ -2011,8 +2098,7 @@ let rec gen_stmt env stmt =
 
   | SEmit (name, args) ->
     check_no_emit env;
-    if name = "Log" || name = "Require" then begin
-
+    if is_pseudo_event name then begin
       let regs = List.map (gen_expr env) args in
       emit env (Contract_vm.EMIT (name, regs))
     end else
@@ -2036,9 +2122,7 @@ let rec gen_stmt env stmt =
     emit env (Contract_vm.JDEST end_label)
 
   | SWhile (cond, body) ->
-
-    if env.fn_is_pure then
-      gerr env.line "pure function cannot use while loops (use for..in with bounded range)";
+    guard_pure_while env;
     let test_label = alloc_label env in
     let loop_label = alloc_label env in
     emit env (Contract_vm.JMP test_label);
@@ -2077,60 +2161,10 @@ let rec gen_stmt env stmt =
     env.base_reg <- iter_r;
     env.next_reg <- env.base_reg
 
-  | SForEach (var_name, field, body) ->
-
-    let len_r = env.base_reg in
-    if len_r > 63 then gerr env.line "too many local variables";
-    env.base_reg <- len_r + 1;
-    let iter_r = env.base_reg in
-    if iter_r > 63 then gerr env.line "too many local variables";
-    env.base_reg <- iter_r + 1;
-    env.next_reg <- env.base_reg;
-    emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
-    ignore (gen_int_from_storage env len_r);
-    emit env (Contract_vm.LDI (iter_r, VInt Z.zero));
-    let saved_locals = env.locals in
-    let test_label = alloc_label env in
-    let loop_label = alloc_label env in
-    emit env (Contract_vm.JMP test_label);
-    emit env (Contract_vm.JDEST loop_label);
-
-    let item_r = env.base_reg in
-    if item_r > 63 then gerr env.line "too many local variables";
-    env.base_reg <- item_r + 1;
-    env.next_reg <- env.base_reg;
-    let kr = alloc_reg env in
-    emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-    emit env (Contract_vm.CONCAT (kr, kr, iter_r));
-    emit env (Contract_vm.SLOADK (item_r, kr));
-    env.locals <- (var_name, item_r, TString) :: env.locals;
-    List.iter (gen_stmt env) body;
-    env.next_reg <- env.base_reg;
-    let one = alloc_reg env in
-    emit env (Contract_vm.LDI (one, VInt Z.one));
-    emit env (Contract_vm.ADD (iter_r, iter_r, one));
-    emit env (Contract_vm.JDEST test_label);
-    env.next_reg <- env.base_reg;
-    let cmp = alloc_reg env in
-    emit env (Contract_vm.LT (cmp, iter_r, len_r));
-    emit env (Contract_vm.JIF (cmp, loop_label));
-    env.locals <- saved_locals;
-    env.base_reg <- len_r;
-    env.next_reg <- env.base_reg
+  | SForEach (var_name, field, body) -> gen_foreach_loop env var_name field body
 
   | SMatch (expr, arms) ->
-
-    (match arms with
-     | (enum_name, _, _) :: _ ->
-       (match find_enum env enum_name with
-        | Some ed ->
-          let covered = List.map (fun (_, v, _) -> v) arms in
-          let missing = List.filter (fun v -> not (List.mem v covered)) ed.en_variants in
-          if missing <> [] then
-            gerr env.line (Printf.sprintf "non-exhaustive match on %s: missing %s"
-              enum_name (String.concat ", " missing))
-        | None -> ())
-     | [] -> gerr env.line "empty match expression");
+    check_match_exhaustive env arms;
     let rv = gen_expr env expr in
     let match_r = env.base_reg in
     if rv <> match_r then emit env (Contract_vm.MOV (match_r, rv));
@@ -2167,52 +2201,10 @@ let rec gen_stmt env stmt =
 
   | SFieldCall (field, method_name, args) ->
     (match method_name with
-     | "push" ->
-       let len_r = alloc_reg env in
-       emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
-       ignore (gen_int_from_storage env len_r);
-       let val_r = gen_expr env (List.hd args) in
-       let kr = alloc_reg env in
-       emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-       emit env (Contract_vm.CONCAT (kr, kr, len_r));
-       emit env (Contract_vm.SSTOREK (kr, val_r));
-       let one = alloc_reg env in
-       emit env (Contract_vm.LDI (one, VInt Z.one));
-       emit env (Contract_vm.ADD (len_r, len_r, one));
-       emit env (Contract_vm.SSTORE (field ^ "_len", len_r))
-     | "delete" ->
-       let key_r = gen_expr env (List.hd args) in
-       let kr = alloc_reg env in
-       emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-       emit env (Contract_vm.CONCAT (kr, kr, key_r));
-       emit env (Contract_vm.SDELK kr)
-     | "len" ->
-
-       let r = alloc_reg env in
-       emit env (Contract_vm.SLOAD (r, field ^ "_len"));
-       ignore (gen_int_from_storage env r);
-       emit env (Contract_vm.MOV (0, r))
-     | "pop" ->
-
-       let len_r = alloc_reg env in
-       emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
-       ignore (gen_int_from_storage env len_r);
-       let one = alloc_reg env in
-       emit env (Contract_vm.LDI (one, VInt Z.one));
-       emit env (Contract_vm.SUB (len_r, len_r, one));
-
-       let kr = alloc_reg env in
-       emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-       emit env (Contract_vm.CONCAT (kr, kr, len_r));
-
-       let val_r = alloc_reg env in
-       emit env (Contract_vm.SLOADK (val_r, kr));
-
-       emit env (Contract_vm.SDELK kr);
-
-       emit env (Contract_vm.SSTORE (field ^ "_len", len_r));
-
-       emit env (Contract_vm.MOV (0, val_r))
+     | "push" -> emit_list_push_method env field args
+     | "delete" -> emit_list_delete_method env field args
+     | "len" -> emit_list_len_method env field
+     | "pop" -> emit_list_pop_method env field
      | _ -> gerr env.line (Printf.sprintf "unknown method: %s" method_name))
 
   | SExpr e ->
@@ -2288,6 +2280,44 @@ let gen_dispatcher env (funcs : func_def list) =
     end
   ) funcs;
   emit env Contract_vm.REVERT
+
+let should_emit_nonpayable_guard env f =
+  env.has_payable && not f.fn_payable && f.fn_vis = Public
+
+let emit_nonpayable_guard env =
+  let vr = alloc_reg env in
+  emit env (Contract_vm.VALUE vr);
+  let zero_r = alloc_reg env in
+  emit env (Contract_vm.LDI (zero_r, Contract_vm.VInt Z.zero));
+  let cmp_r = alloc_reg env in
+  emit env (Contract_vm.EQ (cmp_r, vr, zero_r));
+  let ok_label = alloc_label env in
+  emit env (Contract_vm.JIF (cmp_r, ok_label));
+  emit env Contract_vm.REVERT;
+  emit env (Contract_vm.JDEST ok_label);
+  env.next_reg <- env.base_reg
+
+let emit_nonreentrant_enter env =
+  let lock_r = alloc_reg env in
+  emit env (Contract_vm.SLOAD (lock_r, "_lock"));
+  let one_r = alloc_reg env in
+  emit env (Contract_vm.LDI (one_r, VString "1"));
+  let locked = alloc_reg env in
+  emit env (Contract_vm.EQ (locked, lock_r, one_r));
+  let ok_label = alloc_label env in
+  let not_locked = alloc_reg env in
+  emit env (Contract_vm.LDI (not_locked, VBool true));
+  emit env (Contract_vm.NEQ (not_locked, locked, not_locked));
+  emit env (Contract_vm.JIF (not_locked, ok_label));
+  emit env Contract_vm.REVERT;
+  emit env (Contract_vm.JDEST ok_label);
+  emit env (Contract_vm.SSTORE ("_lock", one_r));
+  env.next_reg <- env.base_reg
+
+let emit_nonreentrant_exit env =
+  let zero_r = alloc_reg env in
+  emit env (Contract_vm.LDI (zero_r, VString "0"));
+  emit env (Contract_vm.SSTORE ("_lock", zero_r))
 
 let gen_function env (f : func_def) label =
   let saved_locals = env.locals in
@@ -2365,48 +2395,11 @@ let gen_function env (f : func_def) label =
             emit env (Contract_vm.JDEST ok_label))
        | None -> ())
   ) f.fn_params;
-
-  if env.has_payable && not f.fn_payable && f.fn_vis = Public then begin
-    let vr = alloc_reg env in
-    emit env (Contract_vm.VALUE vr);
-    let zero_r = alloc_reg env in
-    emit env (Contract_vm.LDI (zero_r, Contract_vm.VInt Z.zero));
-    let cmp_r = alloc_reg env in
-    emit env (Contract_vm.EQ (cmp_r, vr, zero_r));
-    let ok_label = alloc_label env in
-    emit env (Contract_vm.JIF (cmp_r, ok_label));
-    emit env Contract_vm.REVERT;
-    emit env (Contract_vm.JDEST ok_label);
-    env.next_reg <- env.base_reg
-  end;
-
-  if f.fn_nonreentrant then begin
-    let lock_r = alloc_reg env in
-    emit env (Contract_vm.SLOAD (lock_r, "_lock"));
-    let one_r = alloc_reg env in
-    emit env (Contract_vm.LDI (one_r, VString "1"));
-    let locked = alloc_reg env in
-    emit env (Contract_vm.EQ (locked, lock_r, one_r));
-    let ok_label = alloc_label env in
-
-    let not_locked = alloc_reg env in
-    emit env (Contract_vm.LDI (not_locked, VBool true));
-    emit env (Contract_vm.NEQ (not_locked, locked, not_locked));
-    emit env (Contract_vm.JIF (not_locked, ok_label));
-    emit env Contract_vm.REVERT;
-    emit env (Contract_vm.JDEST ok_label);
-
-    emit env (Contract_vm.SSTORE ("_lock", one_r));
-    env.next_reg <- env.base_reg
-  end;
+  if should_emit_nonpayable_guard env f then emit_nonpayable_guard env;
+  if f.fn_nonreentrant then emit_nonreentrant_enter env;
   env.in_nonreentrant <- f.fn_nonreentrant;
   List.iter (gen_stmt env) f.fn_body;
-
-  if f.fn_nonreentrant then begin
-    let zero_r = alloc_reg env in
-    emit env (Contract_vm.LDI (zero_r, VString "0"));
-    emit env (Contract_vm.SSTORE ("_lock", zero_r))
-  end;
+  if f.fn_nonreentrant then emit_nonreentrant_exit env;
   (match List.rev env.code with
    | Contract_vm.STOP :: _ -> ()
    | _ -> emit env Contract_vm.STOP);
@@ -2416,6 +2409,35 @@ let gen_function env (f : func_def) label =
   env.locals <- saved_locals;
   env.base_reg <- saved_base;
   env.next_reg <- saved_next
+
+let check_interface_arity iface_name im f =
+  let expected_n = List.length im.im_params in
+  let actual_n = List.length f.fn_params in
+  if expected_n <> actual_n then
+    raise (GenError (Printf.sprintf "%s.%s: expected %d params, got %d"
+      iface_name im.im_name expected_n actual_n, 0))
+
+let check_interface_params iface_name im f =
+  List.iter2 (fun ep ap ->
+    if ep.p_typ <> ap.p_typ then
+      raise (GenError (Printf.sprintf "%s.%s: param '%s' type mismatch: expected %s, got %s"
+        iface_name im.im_name ap.p_name (typ_to_string ep.p_typ) (typ_to_string ap.p_typ), 0))
+  ) im.im_params f.fn_params
+
+let check_interface_return iface_name im f =
+  if im.im_ret <> f.fn_ret then
+    raise (GenError (Printf.sprintf "%s.%s: return type mismatch: expected %s, got %s"
+      iface_name im.im_name (typ_to_string im.im_ret) (typ_to_string f.fn_ret), 0))
+
+let check_interface_visibility iface_name im f =
+  if f.fn_vis <> Public then
+    raise (GenError (Printf.sprintf "%s.%s must be public" iface_name im.im_name, 0))
+
+let check_interface_method iface_name im f =
+  check_interface_arity iface_name im f;
+  check_interface_params iface_name im f;
+  check_interface_return iface_name im f;
+  check_interface_visibility iface_name im f
 
 let check_interfaces (ct : contract) =
   List.iter (fun iface_name ->
@@ -2428,24 +2450,7 @@ let check_interfaces (ct : contract) =
       | None ->
         raise (GenError (Printf.sprintf "contract %s implements %s but missing method: %s"
           ct.name iface_name im.im_name, 0))
-      | Some f ->
-        let expected_n = List.length im.im_params in
-        let actual_n = List.length f.fn_params in
-        if expected_n <> actual_n then
-          raise (GenError (Printf.sprintf "%s.%s: expected %d params, got %d"
-            iface_name im.im_name expected_n actual_n, 0));
-
-        List.iter2 (fun ep ap ->
-          if ep.p_typ <> ap.p_typ then
-            raise (GenError (Printf.sprintf "%s.%s: param '%s' type mismatch: expected %s, got %s"
-              iface_name im.im_name ap.p_name (typ_to_string ep.p_typ) (typ_to_string ap.p_typ), 0))
-        ) im.im_params f.fn_params;
-
-        if im.im_ret <> f.fn_ret then
-          raise (GenError (Printf.sprintf "%s.%s: return type mismatch: expected %s, got %s"
-            iface_name im.im_name (typ_to_string im.im_ret) (typ_to_string f.fn_ret), 0));
-        if f.fn_vis <> Public then
-          raise (GenError (Printf.sprintf "%s.%s must be public" iface_name im.im_name, 0))
+      | Some f -> check_interface_method iface_name im f
     ) iface.if_methods
   ) ct.implements
 

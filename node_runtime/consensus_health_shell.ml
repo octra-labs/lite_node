@@ -127,7 +127,7 @@ let repair_empty_fork (deps : fork_repair_deps) ~target_epoch ~target_root ~requ
         deps.set_catchup_in_progress false;
         deps.clear_quarantine "fork_empty_rollback";
         Log.warn "catchup"
-          "fork_empty_rollback target = %d old_head = %d required = %d finality_dropped = %d root = %s"
+          "event = fork_empty_rollback target = %d old_head = %d required = %d finality_dropped = %d root = %s"
           r.target r.old_head required dropped (short_hex8 r.root);
         let* () = deps.start_height (Int64.succ target_epoch) in
         let* () = deps.wake_ready () in
@@ -190,14 +190,14 @@ let run ?(stale_retries = 1) cfg deps =
     let our_head = Int64.of_int our_head_int in
     let already_attested = deps.attested_head our_head_int in
     let query_log = if already_attested then Log.trace else Log.info in
-    query_log "catchup" "querying peers at our_head = %d" our_head_int;
+    query_log "catchup" "event = query_peers head = %d" our_head_int;
     let* responses =
       deps.query_epoch_root ~epoch_id:our_head ~timeout_seconds:5.0
     in
     let head_after_query = deps.committed_head_epoch () in
     if head_after_query <> our_head_int then begin
       Log.trace "catchup"
-        "state_attestation moving head during query start_head = %d head_after_query = %d retries_left = %d"
+        "event = moving_head phase = query start_head = %d head_after_query = %d retries_left = %d"
         our_head_int head_after_query stale_retries;
       match H.moving_head_plan ~stale_retries with
       | H.Retry_probe next_retries -> attempt next_retries
@@ -208,7 +208,7 @@ let run ?(stale_retries = 1) cfg deps =
         let has_head = deps.attested_head our_head_int in
         let log = if has_head then Log.trace else Log.warn in
         log "catchup"
-          "peer responses below state_attest_required responses = %d required = %d head = %d attested = %b"
+          "event = low_peer_responses responses = %d required = %d head = %d attested = %b"
           n_resp state_attest_required our_head_int has_head;
         deps.set_catchup_in_progress false;
         if not has_head then deps.clear_state_attested ();
@@ -223,7 +223,7 @@ let run ?(stale_retries = 1) cfg deps =
                 ~live_head:live_epoch_before_root with
         | C_catchup.Stale _ ->
           Log.trace "catchup"
-            "state_attestation stale sample start_head = %d live_head = %d responses = %d retries_left = %d"
+            "event = stale_sample phase = query start_head = %d live_head = %d responses = %d retries_left = %d"
             our_head_int live_epoch_before_root n_resp stale_retries;
           begin
             match H.stale_sample_plan
@@ -237,7 +237,7 @@ let run ?(stale_retries = 1) cfg deps =
           let head_after_root = deps.committed_head_epoch () in
           if head_after_root <> our_head_int then begin
             Log.trace "catchup"
-              "state_attestation moving head during root read start_head = %d head_after_root = %d retries_left = %d"
+              "event = moving_head phase = root_read start_head = %d head_after_root = %d retries_left = %d"
               our_head_int head_after_root stale_retries;
             match H.moving_head_plan ~stale_retries with
             | H.Retry_probe next_retries -> attempt next_retries
@@ -249,7 +249,7 @@ let run ?(stale_retries = 1) cfg deps =
                     ~live_head:live_epoch_after_root with
             | C_catchup.Stale _ ->
               Log.trace "catchup"
-                "state_attestation stale root sample start_head = %d live_head = %d responses = %d retries_left = %d"
+                "event = stale_sample phase = root_read start_head = %d live_head = %d responses = %d retries_left = %d"
                 our_head_int live_epoch_after_root n_resp stale_retries;
               begin
                 match H.stale_sample_plan
@@ -264,7 +264,7 @@ let run ?(stale_retries = 1) cfg deps =
               match committed_root_opt with
               | Some committed_root when committed_root <> live_root ->
                 Log.error "catchup"
-                  "local_state_root_mismatch head = %d live = %s committed = %s peers = %s"
+                  "event = local_root_mismatch head = %d live = %s committed = %s peers = %s"
                   our_head_int (short_hex8 live_root) (short_hex8 committed_root)
                   peer_snapshot;
                 deps.mark_quarantine
@@ -295,7 +295,7 @@ let run ?(stale_retries = 1) cfg deps =
                   if already_attested then Log.trace else Log.info
                 in
                 attestation_log "catchup"
-                  "state_attestation head = %d live = %s committed = %s responses = %d required = %d target = %Ld majority = %s peers = %s"
+                  "event = state_attestation head = %d live = %s committed = %s responses = %d required = %d target = %Ld majority = %s peers = %s"
                   our_head_int
                   (short_hex8 live_root)
                   (match committed_root_opt with Some r -> short_hex8 r | None -> "-")
@@ -322,7 +322,7 @@ let run ?(stale_retries = 1) cfg deps =
                         "genesis_in_sync"
                     | H.Missing_peer_root_quorum count ->
                       Log.warn "catchup"
-                        "peer root quorum missing at head = %d count = %d required = %d"
+                        "event = missing_peer_root_quorum head = %d count = %d required = %d"
                         our_head_int count state_attest_required;
                       clear_unattested_current_head deps our_head_int;
                       deps.set_catchup_in_progress false;
@@ -336,7 +336,7 @@ let run ?(stale_retries = 1) cfg deps =
                   deps.set_catchup_in_progress false;
                   if not (H.root_quorum_has_quorum peer_root_quorum) then begin
                     Log.warn "catchup"
-                      "ahead_of_target by %d without peer root quorum count = %d required = %d"
+                      "event = ahead_no_quorum ahead = %d count = %d required = %d"
                       n peer_root_quorum_count state_attest_required;
                     match H.ahead_no_quorum_plan
                             ~head:our_head_int
@@ -345,7 +345,7 @@ let run ?(stale_retries = 1) cfg deps =
                             ~drift_tolerance:cfg.quarantine_ahead_drift_tolerance with
                     | H.Wait_current_head ->
                       Log.warn "catchup"
-                        "ahead_of_target ahead = %d head = %d current_quorum = false grace = %d tolerance = %d action = wait_current_head"
+                        "event = ahead_wait_current_head ahead = %d head = %d current_quorum = false grace = %d tolerance = %d"
                         n our_head_int cfg.quarantine_ahead_grace_epochs
                         cfg.quarantine_ahead_drift_tolerance;
                       accept_current_root deps ~head:our_head_int ~root:live_root
@@ -369,7 +369,7 @@ let run ?(stale_retries = 1) cfg deps =
                       | H.Current_root_mismatch { root; count } ->
                         quarantine_peer_root_mismatch deps ~head:our_head_int count;
                         Log.error "catchup"
-                          "fresh head root mismatch head = %d live = %s peer = %s count = %d"
+                          "event = fresh_root_mismatch head = %d live = %s peer = %s count = %d"
                           our_head_int (short_hex8 live_root) (short_hex8 root) count;
                         Lwt.return_unit
                       | H.Probe_target_root ->
@@ -411,14 +411,14 @@ let run ?(stale_retries = 1) cfg deps =
                             ~quarantine_active:(deps.quarantine_active ()) with
                     | H.Stay_active { wake_ready } ->
                       Log.warn "catchup"
-                        "ahead_of_target ahead = %d head = %d grace = %d tolerance = %d streak = %d action = stay_active"
+                        "event = ahead_stay_active ahead = %d head = %d grace = %d tolerance = %d streak = %d"
                         n our_head_int cfg.quarantine_ahead_grace_epochs
                         cfg.quarantine_ahead_drift_tolerance
                         (deps.ahead_streak ());
                       wake_if_ready deps wake_ready
                     | H.Delay_quarantine { wake_ready } ->
                       Log.warn "catchup"
-                        "ahead_of_target ahead = %d head = %d streak = %d threshold = %d action = delay_quarantine"
+                        "event = ahead_delay_quarantine ahead = %d head = %d streak = %d threshold = %d"
                         n our_head_int (deps.ahead_streak ())
                         cfg.quarantine_ahead_streak_threshold;
                       wake_if_ready deps wake_ready

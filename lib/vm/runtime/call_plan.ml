@@ -268,10 +268,14 @@ let parse_deploy_payload ~bytecode_b64 ~deployer ~nonce ~target =
   | Error err -> Deploy_invalid_bytecode err
   | Ok bytecode ->
     let expected_addr = Contract.addr_from_code bytecode_raw deployer nonce in
-    if String.equal expected_addr target then
-      Deploy_ready { bytecode_raw; bytecode }
-    else
+    if not (String.equal expected_addr target) then
       Deploy_address_mismatch
+    else
+      match Opcode_policy.require_consensus_safe bytecode with
+      | Ok () ->
+        Deploy_ready { bytecode_raw; bytecode }
+      | Error hit ->
+        Deploy_invalid_bytecode (Opcode_policy.error_message hit)
 
 let deploy_missing_bytecode_reject = {
   deploy_error_type = "missing_bytecode";

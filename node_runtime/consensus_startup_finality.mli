@@ -52,6 +52,27 @@ type deps = {
   mark_quarantine : string -> unit;
 }
 
+type node_runtime = {
+  chain_id : string;
+  committed_head_epoch : unit -> int;
+  current_epoch : int ref;
+  root_to_raw32 : string -> string;
+  raw_to_hex : string -> string;
+  warn_normalize :
+    source:string ->
+    current:int ->
+    committed_head:int ->
+    expected_next:int ->
+    unit;
+  last_finality : unit -> Finality_log.entry option;
+  cached_head : unit -> Head_manifest.t option;
+  finality : Consensus_finality_state.callbacks;
+  store_empty_bundle : proposal_id:string -> unit;
+  reset_proposal_state : unit -> unit;
+  set_consensus_finalized : bool -> unit;
+  mark_quarantine : string -> unit;
+}
+
 val plan_empty_replay :
   chain_id:string ->
   codec:codec ->
@@ -60,3 +81,16 @@ val plan_empty_replay :
   empty_replay_plan
 
 val handle_startup : deps -> unit
+
+val node_normalizer :
+  node_runtime ->
+  source:string ->
+  unit
+
+val node_deps :
+  node_runtime ->
+  deps
+
+val run_node_startup :
+  node_runtime ->
+  unit

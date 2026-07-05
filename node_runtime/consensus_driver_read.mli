@@ -60,6 +60,11 @@ val root_to_raw32_or_zero :
   string ->
   string
 
+val eic_root_to_raw32_or_zero :
+  hex_to_raw32:(string -> string) ->
+  string ->
+  string
+
 val ledger_root_or_zero :
   root_to_raw32:(string -> string) ->
   string option ->

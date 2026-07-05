@@ -43,8 +43,36 @@ type request = {
   disk_epoch : Epochlog.epoch_header option;
 }
 
+type runtime_deps = {
+  env_fee_recipient : unit -> string option;
+  pending_proposer : unit -> Epochlog.proposer_info option;
+  finalized : unit -> Octra_consensus.C_types.finalize option;
+  disk_epoch : unit -> Epochlog.epoch_header option;
+  log : string -> unit;
+  fatal : string -> unit;
+  short : string -> string;
+}
+
+type runtime_request = {
+  runtime_epoch_id : int;
+  runtime_consensus_mode : bool;
+  runtime_active_validators : string list;
+  runtime_override_proposer : Epochlog.proposer_info option;
+}
+
 val source_label : source -> string
 val valid_proposer : Epochlog.proposer_info -> bool
 val proposer_from_addr : ?commit_round:int -> string -> Epochlog.proposer_info option
 val proposer_from_disk_epoch : Epochlog.epoch_header -> Epochlog.proposer_info option
+val proposer_from_finalized : Octra_consensus.C_types.finalize -> Epochlog.proposer_info option
+val selected_log_line :
+  epoch_id:int ->
+  short:(string -> string) ->
+  selected ->
+  string option
+val missing_line : epoch_id:int -> missing -> string
 val choose : request -> (selected, missing) result
+val choose_runtime :
+  runtime_deps ->
+  runtime_request ->
+  (selected, missing) result

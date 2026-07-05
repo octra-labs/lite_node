@@ -241,6 +241,30 @@ type driver_runner_wiring = {
   drain_pending_finalized : unit -> unit Lwt.t;
 }
 
+type driver_runner_node_wiring = {
+  catchup_active : bool ref;
+  queue : Consensus_catchup_queue.t;
+  committed_head_epoch : unit -> int;
+  normalize : source:string -> unit;
+  env_timeout : unit -> string option;
+  read_local_root : unit -> string Lwt.t;
+  cached_root : unit -> Consensus_driver_read.cached_root;
+  next_txid : unit -> int64;
+  finality : Consensus_finality_state.callbacks;
+  write_finality :
+    Octra_consensus.C_codec.catchup_epoch_record ->
+    unit;
+  apply_record :
+    validated_record ->
+    unit Lwt.t;
+  base_eic : unit -> string;
+  set_state_attested : head:int -> root:string -> unit;
+  clear_quarantine : string -> unit;
+  mark_quarantine : string -> unit;
+  observer : bool;
+  drain_pending_finalized : unit -> unit Lwt.t;
+}
+
 val range_plan :
   env_timeout:string option ->
   from_epoch:int64 ->
@@ -369,6 +393,14 @@ val driver_io_of_driver :
   Octra_consensus.C_driver.t ->
   driver_io
 
+val cached_apply_head_of_driver_root :
+  Consensus_driver_read.cached_root ->
+  cached_apply_head
+
+val driver_runner_wiring_of_node :
+  driver_runner_node_wiring ->
+  driver_runner_wiring
+
 val run_driver_wired :
   driver_runner_wiring ->
   driver_io ->
@@ -392,6 +424,21 @@ val queue_gap_event :
 
 val log_queue_event :
   queue_event ->
+  unit
+
+val queue_target_and_log :
+  Consensus_catchup_queue.t ->
+  active:(unit -> bool) ->
+  target_epoch:int64 ->
+  reason:string ->
+  unit
+
+val queue_gap_and_log :
+  Consensus_catchup_queue.t ->
+  active:(unit -> bool) ->
+  clear_state_attested:(unit -> unit) ->
+  target_epoch:int64 ->
+  reason:string ->
   unit
 
 val run_wired :

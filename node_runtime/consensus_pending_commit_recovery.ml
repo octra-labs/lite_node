@@ -82,9 +82,37 @@ type deps = {
   delete_pending_commit : epoch_id:int -> round:int -> unit;
 }
 
+type 'driver driver_runtime = {
+  read_pending_commits : unit -> Wal.pending_commit list;
+  head : unit -> Head_manifest.t option;
+  query_epoch_root :
+    'driver ->
+    epoch_id:int64 ->
+    C_driver.epoch_root_response_record list Lwt.t;
+  run_catchup_to_target :
+    'driver ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+  delete_pending_commit : epoch_id:int -> round:int -> unit;
+  validator_count : int;
+  peer_quorum : int;
+}
+
 let head_epoch_of_manifest = function
   | Some head -> head.Head_manifest.epoch_id
   | None -> -1
+
+let deps_of_driver_runtime (runtime : 'driver driver_runtime) driver =
+  {
+    read_pending_commits = runtime.read_pending_commits;
+    head_epoch = (fun () -> head_epoch_of_manifest (runtime.head ()));
+    query_epoch_root = (fun ~epoch_id ->
+      runtime.query_epoch_root driver ~epoch_id);
+    run_catchup_to_target = (fun ~target_epoch ~reason ->
+      runtime.run_catchup_to_target driver ~target_epoch ~reason);
+    delete_pending_commit = runtime.delete_pending_commit;
+  }
 
 let unresolved (deps : deps) =
   let head = deps.head_epoch () in
@@ -101,7 +129,7 @@ let run_confirmed (deps : deps) p ~agreed ~quorum =
   let open Lwt.Syntax in
   let epoch = Int64.of_int p.Wal.epoch_id in
   Octra_log.warn "consensus"
-    "pending_commit epoch = %d peer_root_match = %d quorum = %d action = catchup_recovery"
+    "event = pending_commit action = catchup_recovery epoch = %d peer_root_match = %d quorum = %d"
     p.epoch_id agreed quorum;
   let* () = deps.run_catchup_to_target
     ~target_epoch:epoch
@@ -110,26 +138,26 @@ let run_confirmed (deps : deps) p ~agreed ~quorum =
   if head_after >= p.epoch_id then begin
     delete deps p;
     Octra_log.info "consensus"
-      "pending_commit epoch = %d head = %d action = recovery_applied"
+      "event = pending_commit action = recovery_applied epoch = %d head = %d"
       p.epoch_id head_after;
     Lwt.return_unit
   end else begin
     Octra_log.warn "consensus"
-      "pending_commit epoch = %d head = %d action = keep_breadcrumb reason = catchup_no_advance"
+      "event = pending_commit action = keep_breadcrumb epoch = %d head = %d reason = catchup_no_advance"
       p.epoch_id head_after;
     Lwt.return_unit
   end
 
 let run_all_missing deps p ~responses =
   Octra_log.info "consensus"
-    "pending_commit epoch = %d responses = %d action = drop_breadcrumb reason = peers_missing_epoch"
+    "event = pending_commit action = drop_breadcrumb epoch = %d responses = %d reason = peers_missing_epoch"
     p.Wal.epoch_id responses;
   delete deps p;
   Lwt.return_unit
 
 let run_inconclusive p ~agreed ~peers ~responses ~quorum =
   Octra_log.warn "consensus"
-    "pending_commit epoch = %d agreed = %d peers = %d responses = %d quorum = %d action = keep_breadcrumb reason = inconclusive"
+    "event = pending_commit action = keep_breadcrumb epoch = %d agreed = %d peers = %d responses = %d quorum = %d reason = inconclusive"
     p.Wal.epoch_id agreed peers responses quorum;
   Lwt.return_unit
 
@@ -151,9 +179,15 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
   if pending = [] then Lwt.return_unit
   else begin
     Octra_log.warn "consensus"
-      "pending_commit recovery_records = %d head = %d action = query_peers"
+      "event = pending_commit_recovery action = query_peers records = %d head = %d"
       (List.length pending) head;
     Lwt_list.iter_s
       (run_pending deps ~validator_count ~peer_quorum)
       pending
   end
+
+let run_with_driver runtime driver =
+  run_once
+    (deps_of_driver_runtime runtime driver)
+    ~validator_count:runtime.validator_count
+    ~peer_quorum:runtime.peer_quorum

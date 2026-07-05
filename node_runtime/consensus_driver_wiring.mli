@@ -43,6 +43,76 @@ type node_gates_input = {
   clear_quarantine : string -> unit;
 }
 
+type node_gates_runtime = {
+  consensus_mode : bool;
+  voting : bool;
+  consensus_config_hash : string;
+  p2p_config : P2p_config.t;
+  current_epoch : unit -> int;
+  log_blocked : string -> int -> unit;
+  catchup_active : bool ref;
+  catchup_queue : Consensus_catchup_queue.t;
+  runtime_state : Consensus_runtime_state.t;
+  mark_quarantine : string -> unit;
+  clear_quarantine : string -> unit;
+}
+
+type epoch_normalizer_runtime = {
+  current_epoch : int ref;
+  committed_head_epoch : unit -> int;
+  warn :
+    source:string ->
+    current:int ->
+    committed_head:int ->
+    expected_next:int ->
+    unit;
+}
+
+type node_standard_adapter_runtime = {
+  getenv : string -> string option;
+  get_meta : string -> string option;
+  wallet_addr : string;
+  wallet_pub : string;
+  find_account : string -> Octra_core.Ledger.account option;
+  cached_head : unit -> Octra_core.Head_manifest.t option;
+  read_prev_ledger_root : unit -> string option Lwt.t;
+  next_txid : unit -> int64;
+  proposal_state : Consensus_proposal_state.t;
+  catchup_active : bool ref;
+  staging_epoch_capacity : Z.t;
+  write_pending : Octra_core.Wal.pending_commit -> unit;
+  validator_pubkeys_for_epoch :
+    wallet_addr:string ->
+    wallet_pub:string ->
+    epoch:int ->
+    (string * string) list;
+}
+
+type standard_adapters = {
+  layera_diag_live : unit -> bool;
+  layera_env : unit -> string option;
+  layera_fallback_addr : string;
+  layera_meta : string -> string;
+  public_key_for_tx : Octra_core.Transaction.t -> string option;
+  verify_address_pubkey : addr:string -> pubkey:string -> bool;
+  verify_tx_signature : Octra_core.Transaction.t -> pubkey:string -> bool;
+  validator_pubkeys_fallback : int64 -> (string * string) list;
+  prev_eic_root : unit -> string;
+  next_txid : unit -> int64;
+  read_prev_ledger_root : unit -> string option Lwt.t;
+  staging_txs : unit -> Octra_core.Transaction.t list;
+  staging_epoch_txs : unit -> Octra_core.Transaction.t list;
+  staging_total : unit -> int;
+  remove_rejected : string list -> unit;
+  proposer : unit -> string;
+  head_txid_hi : unit -> int64 option;
+  set_proposal : Octra_core.Transaction.t list -> string list -> unit;
+  current_tx_hashes : unit -> string list;
+  mark_unsynced : unit -> unit;
+  write_pending : Octra_core.Wal.pending_commit -> unit;
+  set_catchup_active : bool -> unit;
+}
+
 type deps = {
   chain_id : string;
   my_addr : string;
@@ -114,6 +184,58 @@ type deps = {
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
 }
 
+type config_with_standard_input = {
+  standard : standard_adapters;
+  chain_id : string;
+  my_addr : string;
+  sign_fn : string -> string;
+  validator_set : Octra_consensus.C_types.validator_set;
+  gates : gates;
+  proposal_limits : Consensus_proposal.limits;
+  read_local_root_raw : unit -> string Lwt.t;
+  read_local_ledger_root_raw : unit -> string Lwt.t;
+  sleep : float -> unit Lwt.t;
+  quarantine_mismatch_threshold : int;
+  notify_staging_update : unit -> unit;
+  run_preverify :
+    Octra_core.Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
+  proposal_bundles : Consensus_bundle_cache.t;
+  store_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  proposal_preview :
+    ?catch_exn:bool ->
+    Consensus_proposal.build_preview_request ->
+    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+  root_to_raw32 : string -> string;
+  current_epoch : unit -> int;
+  current_round : unit -> int;
+  committed_head_epoch : unit -> int;
+  finality : Consensus_finality_state.callbacks;
+  cached_head : unit -> Octra_core.Head_manifest.t option;
+  now : unit -> float;
+  observer_mode : bool;
+  queue_catchup_target : target_epoch:int64 -> reason:string -> unit;
+  run_catchup_to_target :
+    Octra_consensus.C_driver.t ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  replay_stashed_while_safe : source:string -> unit Lwt.t;
+  driver_read_deps : Consensus_driver_read.deps;
+  scheduled_validator_set_config :
+    Octra_consensus.C_driver.scheduled_validator_set_config option;
+  load_scheduled_validator_set_config :
+    unit ->
+    Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+}
+
 val can_vote :
   deps ->
   bool
@@ -122,6 +244,34 @@ val node_gates :
   node_gates_input ->
   gates
 
+val p2p_upgrade_ready_of_runtime :
+  node_gates_runtime ->
+  unit ->
+  bool
+
+val node_gates_of_runtime :
+  node_gates_runtime ->
+  gates
+
+val normalize_next_epoch_for_head :
+  epoch_normalizer_runtime ->
+  source:string ->
+  unit
+
+val node_standard_adapters :
+  node_standard_adapter_runtime ->
+  standard_adapters
+
+val preview_with_optional_catch :
+  catch_exn:bool ->
+  warn:(string -> unit) ->
+  (unit -> ('a, string) result Lwt.t) ->
+  ('a, string) result Lwt.t
+
 val config :
   deps ->
+  Octra_consensus.C_driver.config
+
+val config_with_standard :
+  config_with_standard_input ->
   Octra_consensus.C_driver.config

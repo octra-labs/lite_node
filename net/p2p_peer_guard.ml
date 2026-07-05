@@ -27,6 +27,7 @@ type entry = {
   mutable conn_start : float;
   mutable conn_count : int;
   mutable ban_until : float;
+  mutable last_seen : float;
   mutable last_reason : string;
   mutable invalid_frame_count : int;
   mutable bad_signature_count : int;
@@ -62,6 +63,10 @@ let default = {
   max_conn = 64;
 }
 
+let entry_ttl_s = 600.0
+
+let max_entries = 4096
+
 let create () =
   Hashtbl.create 64
 
@@ -71,6 +76,7 @@ let make_entry now = {
   conn_start = now;
   conn_count = 0;
   ban_until = 0.0;
+  last_seen = now;
   last_reason = "";
   invalid_frame_count = 0;
   bad_signature_count = 0;
@@ -102,16 +108,50 @@ let count_reason (e : entry) reason =
      || contains reason "stale" then
     e.stale_root_count <- e.stale_root_count + 1
 
+let banned (e : entry) now =
+  e.ban_until > now
+
+let entry_until now (e : entry) =
+  if banned e now then max e.last_seen e.ban_until else e.last_seen
+
+let take n xs =
+  let rec loop left acc = function
+    | _ when left <= 0 -> List.rev acc
+    | [] -> List.rev acc
+    | x :: rest -> loop (left - 1) (x :: acc) rest
+  in
+  loop n [] xs
+
+let prune ?(ttl = entry_ttl_s) ?(max_entries = max_entries) t ~now =
+  Hashtbl.fold
+    (fun key e acc ->
+      if not (banned e now) && now -. e.last_seen > ttl then key :: acc
+      else acc)
+    t
+    []
+  |> List.iter (Hashtbl.remove t);
+  let overflow = Hashtbl.length t - max_entries in
+  if overflow > 0 then
+    Hashtbl.fold
+      (fun key e acc -> (entry_until now e, key) :: acc)
+      t
+      []
+    |> List.sort (fun (ta, ka) (tb, kb) ->
+      let by_time = compare ta tb in
+      if by_time <> 0 then by_time else String.compare ka kb)
+    |> take overflow
+    |> List.iter (fun (_, key) -> Hashtbl.remove t key)
+
 let entry t key now =
+  prune t ~now;
   match Hashtbl.find_opt t key with
-  | Some e -> e
+  | Some e ->
+    e.last_seen <- now;
+    e
   | None ->
     let e = make_entry now in
     Hashtbl.replace t key e;
     e
-
-let banned (e : entry) now =
-  e.ban_until > now
 
 let host_of_addr addr =
   match String.rindex_opt addr ':' with
@@ -168,12 +208,13 @@ let report_bad ?(cfg=default) t ~now ~key ~reason =
   end else
     Noted e.bad_count
 
-let is_banned t ~now ~key =
+let is_banned (t : t) ~now ~key =
+  prune t ~now;
   match Hashtbl.find_opt t key with
   | Some e -> banned e now
   | None -> false
 
-let score t key =
+let score (t : t) key =
   match Hashtbl.find_opt t key with
   | None -> None
   | Some e -> Some (e.bad_count, e.conn_count, e.ban_until, e.last_reason)

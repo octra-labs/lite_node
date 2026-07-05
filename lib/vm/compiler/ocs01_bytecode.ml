@@ -13,46 +13,15 @@ Include at startup:
 *)
 
 
-type arg = Bytes | Text | Credits | Flag | Account
+open Ocs01_model
 
-type fn_sig = { inputs : arg list; outputs : arg list; effort : Z.t; pure : bool; payable : bool }
-
-type ev_sig = (string * arg) list
-
-type abi = { fns : (string * fn_sig) list; events : (string * ev_sig) list }
-
-type token_info = { name : string; symbol : string; decimals : int; supply : Z.t }
-
-let ocs01_abi : abi =
-  let z n = Z.of_int n in
-  { fns = [
-      "name", {inputs=[]; outputs=[Text]; effort=z 8; pure=true; payable=false};
-      "symbol", {inputs=[]; outputs=[Text]; effort=z 8; pure=true; payable=false};
-      "total_supply", {inputs=[]; outputs=[Credits]; effort=z 8; pure=true; payable=false};
-      "decimals", {inputs=[]; outputs=[Credits]; effort=z 8; pure=true; payable=false};
-      "balance_of", {inputs=[Account]; outputs=[Credits]; effort=z 16; pure=true; payable=false};
-      "limit", {inputs=[Account;Account]; outputs=[Credits]; effort=z 16; pure=true; payable=false};
-      "transfer", {inputs=[Account;Credits]; outputs=[Flag]; effort=z 45; pure=false; payable=false};
-      "grant", {inputs=[Account;Credits]; outputs=[Flag]; effort=z 35; pure=false; payable=false};
-      "pull", {inputs=[Account;Account;Credits]; outputs=[Flag]; effort=z 60; pure=false; payable=false};
-      "mint", {inputs=[Account;Credits]; outputs=[Flag]; effort=z 50; pure=false; payable=false};
-      "burn", {inputs=[Credits]; outputs=[Flag]; effort=z 40; pure=false; payable=false};
-    ];
-    events = [
-      "Transfer", ["from",Account; "to",Account; "amount",Credits];
-      "Grant", ["owner",Account; "spender",Account; "amount",Credits];
-      "Mint", ["to",Account; "amount",Credits];
-      "Burn", ["from",Account; "amount",Credits];
-    ] }
-
-let make_full_bytecode (ti : token_info) =
+let constructor_code ti =
   let open Contract_vm in
   [|
     MLOAD (0, 999);
     LDI (1, VString "constructor");
     NEQ (2, 0, 1);
     JIF (2, 100);
-
     LDI (0, VString ti.name);
     SSTORE ("name", 0);
     LDI (0, VString ti.symbol);
@@ -69,10 +38,13 @@ let make_full_bytecode (ti : token_info) =
     SSTOREK (3, 4);
     EMIT ("Transfer", [1; 1; 4]);
     STOP;
+  |]
 
+let dispatch_code =
+  let open Contract_vm in
+  [|
     JDEST 100;
     MLOAD (0, 1000);
-
     LDI (1, VString "name");
     EQ (2, 0, 1);
     JIF (2, 200);
@@ -107,30 +79,29 @@ let make_full_bytecode (ti : token_info) =
     EQ (2, 0, 1);
     JIF (2, 700);
     REVERT;
+  |]
 
+let view_code =
+  let open Contract_vm in
+  [|
     JDEST 200;
     SLOAD (0, "name");
     STOP;
-
     JDEST 210;
     SLOAD (0, "symbol");
     STOP;
-
     JDEST 220;
     SLOAD (0, "total_supply");
     STOP;
-
     JDEST 225;
     SLOAD (0, "decimals");
     STOP;
-
     JDEST 230;
     MLOAD (1, 1001);
     LDI (2, VString "balances:");
     CONCAT (3, 2, 1);
     SLOADK (0, 3);
     STOP;
-
     JDEST 240;
     MLOAD (1, 1001);
     MLOAD (2, 1002);
@@ -141,7 +112,11 @@ let make_full_bytecode (ti : token_info) =
     CONCAT (4, 4, 2);
     SLOADK (0, 4);
     STOP;
+  |]
 
+let transfer_code =
+  let open Contract_vm in
+  [|
     JDEST 300;
     MLOAD (10, 1001);
     MLOAD (11, 1002);
@@ -169,7 +144,11 @@ let make_full_bytecode (ti : token_info) =
     EMIT ("Transfer", [15; 10; 11]);
     LDI (0, VBool true);
     STOP;
+  |]
 
+let grant_code =
+  let open Contract_vm in
+  [|
     JDEST 400;
     MLOAD (10, 1001);
     MLOAD (11, 1002);
@@ -183,7 +162,11 @@ let make_full_bytecode (ti : token_info) =
     EMIT ("Grant", [13; 10; 11]);
     LDI (0, VBool true);
     STOP;
+  |]
 
+let pull_code =
+  let open Contract_vm in
+  [|
     JDEST 500;
     MLOAD (10, 1001);
     MLOAD (11, 1002);
@@ -223,7 +206,11 @@ let make_full_bytecode (ti : token_info) =
     EMIT ("Transfer", [10; 11; 12]);
     LDI (0, VBool true);
     STOP;
+  |]
 
+let mint_code =
+  let open Contract_vm in
+  [|
     JDEST 600;
     CALLER 10;
     SLOAD (11, "owner");
@@ -246,7 +233,11 @@ let make_full_bytecode (ti : token_info) =
     EMIT ("Mint", [13; 14]);
     LDI (0, VBool true);
     STOP;
+  |]
 
+let burn_code =
+  let open Contract_vm in
+  [|
     JDEST 700;
     MLOAD (10, 1001);
     LDI (11, VString "balances:");
@@ -270,3 +261,15 @@ let make_full_bytecode (ti : token_info) =
     LDI (0, VBool true);
     STOP;
   |]
+
+let make ti =
+  Array.concat [
+    constructor_code ti;
+    dispatch_code;
+    view_code;
+    transfer_code;
+    grant_code;
+    pull_code;
+    mint_code;
+    burn_code;
+  ]

@@ -56,6 +56,27 @@ type deps = {
   mark_quarantine : string -> unit;
 }
 
+type node_runtime = {
+  chain_id : string;
+  committed_head_epoch : unit -> int;
+  current_epoch : int ref;
+  root_to_raw32 : string -> string;
+  raw_to_hex : string -> string;
+  warn_normalize :
+    source:string ->
+    current:int ->
+    committed_head:int ->
+    expected_next:int ->
+    unit;
+  last_finality : unit -> Finality_log.entry option;
+  cached_head : unit -> Head_manifest.t option;
+  finality : Consensus_finality_state.callbacks;
+  store_empty_bundle : proposal_id:string -> unit;
+  reset_proposal_state : unit -> unit;
+  set_consensus_finalized : bool -> unit;
+  mark_quarantine : string -> unit;
+}
+
 let zero_root =
   String.make 32 '\x00'
 
@@ -65,13 +86,13 @@ let short16 s =
 let empty_tx_hash () =
   Octra_net.Hash_domain.hash "octra:tx_list:v1" ""
 
-let empty_replay_head_matches codec entry head =
+let empty_replay_head_matches (codec : codec) entry head =
   entry.Finality_log.height = head.Head_manifest.epoch_id + 1
   && head.Head_manifest.ledger_state_root <> None
   && entry.txid_hi = head.Head_manifest.txid_hi
   && entry.tx_list_hash = codec.raw_to_hex (empty_tx_hash ())
 
-let plan_empty_replay ~chain_id ~codec ~head entry =
+let plan_empty_replay ~chain_id ~(codec : codec) ~head entry =
   match head with
   | Some head when empty_replay_head_matches codec entry head ->
     let tx_list_hash = empty_tx_hash () in
@@ -144,7 +165,7 @@ let arm_empty_replay deps entry plan =
   | Not_empty_replayable ->
     false
 
-let handle_pending deps head action entry =
+let handle_pending (deps : deps) head action entry =
   Log.warn "finality"
     "startup finality log pending height = %d head = %d"
     entry.Finality_log.height head;
@@ -158,7 +179,7 @@ let handle_pending deps head action entry =
   if not (arm_empty_replay deps entry replay_plan) then
     deps.mark_quarantine (Finality_recovery.reason ~head action)
 
-let handle_startup deps =
+let handle_startup (deps : deps) =
   let head = deps.head () in
   let action = Finality_recovery.decide ~head (deps.last_finality ()) in
   match action with
@@ -170,3 +191,35 @@ let handle_startup deps =
       "startup finality log gap height = %d head = %d"
       entry.Finality_log.height head;
     deps.mark_quarantine (Finality_recovery.reason ~head action)
+
+let node_normalizer runtime =
+  Consensus_driver_wiring.normalize_next_epoch_for_head
+    {
+      current_epoch = runtime.current_epoch;
+      committed_head_epoch = runtime.committed_head_epoch;
+      warn = runtime.warn_normalize;
+    }
+
+let node_deps runtime =
+  {
+    chain_id = runtime.chain_id;
+    head = runtime.committed_head_epoch;
+    last_finality = runtime.last_finality;
+    cached_head = runtime.cached_head;
+    codec =
+      {
+        root_to_raw32 = runtime.root_to_raw32;
+        raw_to_hex = runtime.raw_to_hex;
+      };
+    store_finalized = runtime.finality.store_finalized;
+    store_proposer = runtime.finality.store_flow_proposer;
+    store_expected_root = runtime.finality.store_expected_root;
+    store_empty_bundle = runtime.store_empty_bundle;
+    reset_proposal_state = runtime.reset_proposal_state;
+    set_consensus_finalized = runtime.set_consensus_finalized;
+    normalize_next_epoch_for_head = node_normalizer runtime;
+    mark_quarantine = runtime.mark_quarantine;
+  }
+
+let run_node_startup runtime =
+  handle_startup (node_deps runtime)

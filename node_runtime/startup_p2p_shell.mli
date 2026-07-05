@@ -89,6 +89,38 @@ type node_view = {
   swarm : Octra_net.P2p_swarm.t;
 }
 
+type node_start_runtime = {
+  getenv : string -> string option;
+  info : string -> unit;
+  warn : string -> unit;
+  fatal : string -> unit;
+  current_epoch : unit -> int;
+  read_pending_validator_meta : unit -> string option;
+  read_head_hash : unit -> string option;
+  root_of_head_hash : string -> string;
+  install : install;
+  activation_epoch : unit -> int64 option;
+  chain_id : string;
+  consensus_mode : bool;
+  consensus_port : int;
+  consensus_peers : string list;
+  address : string;
+  priv_b64 : string;
+  pub_b64 : string;
+  voting : bool;
+  role_label : string;
+  read_persistent_pending : unit -> string option Lwt.t;
+  read_persistent_marker : string -> string option Lwt.t;
+  current_height : unit -> int64;
+}
+
+type node_start = {
+  view : node_view;
+  load_scheduled_validator_set_config :
+    unit ->
+    Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+}
+
 val raw32_zero : string
 
 val current_height :
@@ -135,6 +167,10 @@ val build_node_view :
   node_request ->
   (node_view, string) result
 
+val request_of_runtime :
+  node_start_runtime ->
+  node_request
+
 val admit_validator_startup :
   admission_deps ->
   address:string ->
@@ -148,6 +184,23 @@ val load_persistent_update :
   runtime:Octra_core.Validator_ready_policy.runtime ->
   requirements:Octra_core.Validator_ready_policy.requirements ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
+
+val admission_deps_of_runtime :
+  node_start_runtime ->
+  admission_deps
+
+val persistent_update_deps_of_runtime :
+  node_start_runtime ->
+  persistent_update_deps
+
+val load_runtime_persistent_update :
+  node_start_runtime ->
+  node_view ->
+  Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
+
+val start_node :
+  node_start_runtime ->
+  node_start
 
 val load_irmin_persistent_update :
   store:Octra_core.Store_irmin.t ->

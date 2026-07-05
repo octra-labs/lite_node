@@ -229,6 +229,26 @@ type driver_runner_wiring = {
   drain_pending_finalized : unit -> unit Lwt.t;
 }
 
+type driver_runner_node_wiring = {
+  catchup_active : bool ref;
+  queue : Consensus_catchup_queue.t;
+  committed_head_epoch : unit -> int;
+  normalize : source:string -> unit;
+  env_timeout : unit -> string option;
+  read_local_root : unit -> string Lwt.t;
+  cached_root : unit -> Consensus_driver_read.cached_root;
+  next_txid : unit -> int64;
+  finality : Consensus_finality_state.callbacks;
+  write_finality : Octra_consensus.C_codec.catchup_epoch_record -> unit;
+  apply_record : validated_record -> unit Lwt.t;
+  base_eic : unit -> string;
+  set_state_attested : head:int -> root:string -> unit;
+  clear_quarantine : string -> unit;
+  mark_quarantine : string -> unit;
+  observer : bool;
+  drain_pending_finalized : unit -> unit Lwt.t;
+}
+
 let short_hex8 s =
   String.concat ""
     (List.init
@@ -264,7 +284,7 @@ let query_range deps ~attempts ~retry_delay ~from_epoch ~max_epochs
       Lwt.return result
     | None when attempts > 1 ->
       Log.warn "catchup"
-        "query_catchup_range failed from = %Ld retries_left = %d reason = %s"
+        "event = query_retry from = %Ld retries_left = %d reason = %s"
         from_epoch (attempts - 1) reason;
       let* () = deps.sleep retry_delay in
       loop (attempts - 1)
@@ -283,7 +303,7 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
   in
   if range_plan.log_progress then
     Log.info "catchup"
-      "CATCHUP_PROGRESS at epoch = %d remain = %d target = %Ld reason = %s"
+      "event = progress epoch = %d remain = %d target = %Ld reason = %s"
       (Int64.to_int from_epoch) range_plan.remain target_epoch reason;
   let* local_root = deps.read_query_root () in
   let validate r =
@@ -315,7 +335,7 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
     Lwt.return (Query_chunk chunk)
   | None ->
     Log.error "catchup"
-      "no valid response after 3 attempts for from = %Ld reason = %s"
+      "event = query_failed attempts = 3 from = %Ld reason = %s"
       from_epoch reason;
     Lwt.return (Query_failed ("catchup_failed:" ^ reason))
 
@@ -331,17 +351,17 @@ let base_gate ~target_epoch ~start_head ~current_head ~from_epoch ~reason
             ~current_head with
     | C_catchup.Base_gate_already_applied ->
       Log.info "catchup"
-        "chunk apply base gate skipped after local progress from = %Ld target = %Ld reason = %s err = %s"
+        "event = base_gate_skip from = %Ld target = %Ld reason = %s error = %s"
         from_epoch target_epoch reason e;
       Gate_finish ("already_advanced:" ^ reason)
     | C_catchup.Base_gate_retry ->
       Log.warn "catchup"
-        "chunk apply base gate moved head from = %Ld current = %Ld target = %Ld reason = %s err = %s"
+        "event = base_gate_retry from = %Ld current = %Ld target = %Ld reason = %s error = %s"
         start_head current_head target_epoch reason e;
       Gate_retry
     | C_catchup.Base_gate_quarantine ->
       Log.error "catchup"
-        "chunk apply base gate failed from = %Ld reason = %s err = %s"
+        "event = base_gate_fail from = %Ld reason = %s error = %s"
         from_epoch reason e;
       Gate_fail ("catchup_base_gate_failed:" ^ reason)
 
@@ -351,7 +371,7 @@ let continuity_gate ~records ~from_epoch ~prev_root ~reason =
     Gate_continue
   | Error e ->
     Log.error "catchup"
-      "chunk continuity/base mismatch before apply from = %Ld reason = %s local_root = %s err = %s"
+      "event = continuity_fail from = %Ld reason = %s local_root = %s error = %s"
       from_epoch reason (short_hex8 prev_root) e;
     Gate_fail ("catchup_base_mismatch:" ^ reason)
 
@@ -509,7 +529,7 @@ let assert_already_applied ~head_before_record validated point =
          "catchup already-applied txid mismatch epoch = %Ld"
          record.epoch_id);
   Log.warn "catchup"
-    "record already applied during catchup epoch = %Ld head = %d"
+    "event = record_skip_applied epoch = %Ld head = %d"
     record.epoch_id head_before_record
 
 let assert_post_apply validated point =
@@ -541,7 +561,7 @@ let apply_validated_record (deps : record_apply_deps) ~head_before_record
   | Record_apply ->
     if validated.proposer = None then
       Log.warn "catchup"
-        "record epoch = %Ld missing proposer metadata; apply will rely on finalized_header/disk fallback"
+        "event = record_missing_proposer epoch = %Ld fallback = finalized_header"
         record.epoch_id;
     deps.write_finality record;
     let* () = deps.apply_record validated in
@@ -600,17 +620,17 @@ let apply_result_gate ~gap_active ~target_epoch ~start_head ~current_head
             ~current_head with
     | C_catchup.Apply_already_applied ->
       Log.info "catchup"
-        "apply gap skipped after local progress from = %Ld target = %Ld reason = %s err = %s"
+        "event = apply_gap_skip from = %Ld target = %Ld reason = %s error = %s"
         from_epoch target_epoch reason e;
       Apply_finish ("apply_already_advanced:" ^ reason)
     | C_catchup.Apply_retry ->
       Log.warn "catchup"
-        "apply gap moved head from = %Ld current = %Ld target = %Ld reason = %s err = %s"
+        "event = apply_gap_retry from = %Ld current = %Ld target = %Ld reason = %s error = %s"
         start_head current_head target_epoch reason e;
       Apply_retry
     | C_catchup.Apply_quarantine ->
       Log.error "catchup"
-        "apply failed during catchup from = %Ld target = %Ld reason = %s err = %s"
+        "event = apply_fail from = %Ld target = %Ld reason = %s error = %s"
         from_epoch target_epoch reason e;
       Apply_fail ("catchup_apply_failed:" ^ reason)
 
@@ -694,7 +714,7 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
     let rec loop ~from_epoch =
       if Int64.compare from_epoch target_epoch > 0 then begin
         Log.info "catchup"
-          "CATCHUP_COMPLETE at epoch = %Ld reason = %s"
+          "event = complete epoch = %Ld reason = %s"
           target_epoch
           reason;
         finish_success reason
@@ -727,13 +747,13 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
     in
     if Int64.compare target_epoch our_head <= 0 then begin
       Log.info "catchup"
-        "CATCHUP_COMPLETE already in sync target = %Ld reason = %s"
+        "event = complete status = already_in_sync target = %Ld reason = %s"
         target_epoch
         reason;
       finish_success ("already_in_sync:" ^ reason)
     end else begin
       Log.warn "catchup"
-        "CATCHUP_START local = %d target = %Ld lag = %d reason = %s"
+        "event = start local = %d target = %Ld lag = %d reason = %s"
         our_head_int
         target_epoch
         (Int64.to_int (Int64.sub target_epoch our_head))
@@ -746,7 +766,7 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
 let queue_active (deps : deps) ~target_epoch ~reason =
   let queued = deps.queue_target ~target_epoch ~reason in
   Log.warn "catchup"
-    "queued catchup target = %Ld reason = %s active = %b queued = %s"
+    "event = queue_target target = %Ld reason = %s active = %b queued = %s"
     target_epoch reason true queued;
   Lwt.return_unit
 
@@ -761,7 +781,7 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
     | Some queued ->
       deps.set_catchup_active true;
       Log.warn "catchup"
-        "CATCHUP_CONTINUE active_reason = %s next_target = %Ld next_reason = %s head = %Ld"
+        "event = continue active_reason = %s next_target = %Ld next_reason = %s head = %Ld"
         active_reason queued.target_epoch queued.reason head;
       run_queued queued
     | None ->
@@ -906,7 +926,37 @@ let driver_io_of_driver driver =
     };
   }
 
-let node_deps_of_driver_runner wiring io =
+let cached_apply_head_of_driver_root root =
+  {
+    cached_root = root.Consensus_driver_read.root;
+    cached_eic = root.Consensus_driver_read.eic;
+  }
+
+let driver_runner_wiring_of_node wiring =
+  {
+    catchup_active = wiring.catchup_active;
+    queue = wiring.queue;
+    committed_head_epoch = wiring.committed_head_epoch;
+    normalize = wiring.normalize;
+    env_timeout = wiring.env_timeout;
+    read_local_root = wiring.read_local_root;
+    cached_head = (fun () ->
+      cached_apply_head_of_driver_root (wiring.cached_root ()));
+    next_txid = wiring.next_txid;
+    finality = wiring.finality;
+    write_finality = wiring.write_finality;
+    apply_record = wiring.apply_record;
+    base_eic = wiring.base_eic;
+    current_head = (fun () ->
+      Int64.of_int (wiring.committed_head_epoch ()));
+    set_state_attested = wiring.set_state_attested;
+    clear_quarantine = wiring.clear_quarantine;
+    mark_quarantine = wiring.mark_quarantine;
+    observer = wiring.observer;
+    drain_pending_finalized = wiring.drain_pending_finalized;
+  }
+
+let node_deps_of_driver_runner (wiring : driver_runner_wiring) io =
   node_deps
     {
       catchup_active = wiring.catchup_active;
@@ -922,7 +972,7 @@ let node_deps_of_driver_runner wiring io =
       wake_ready = io.wake_ready;
     }
 
-let target_wiring_of_driver_runner wiring io =
+let target_wiring_of_driver_runner (wiring : driver_runner_wiring) io =
   target_wiring_of_node
     {
       normalize = wiring.normalize;
@@ -940,7 +990,7 @@ let target_wiring_of_driver_runner wiring io =
       current_head = wiring.current_head;
     }
 
-let run_driver_wired wiring io ~target_epoch ~reason =
+let run_driver_wired (wiring : driver_runner_wiring) io ~target_epoch ~reason =
   run_with_target
     (node_deps_of_driver_runner wiring io)
     ~target:(target_wiring_of_driver_runner wiring io |> target_of_wiring)
@@ -965,11 +1015,21 @@ let queue_gap_event queue ~active ~target_epoch ~reason =
 
 let log_queue_event event =
   Log.warn "catchup"
-    "queued catchup target = %Ld reason = %s active = %b queued = %s"
+    "event = queue_target target = %Ld reason = %s active = %b queued = %s"
     event.queued_target_epoch
     event.queued_reason
     event.queued_active
     event.queued_label
+
+let queue_target_and_log queue ~active ~target_epoch ~reason =
+  queue_target_event queue ~active:(active ()) ~target_epoch ~reason
+  |> log_queue_event
+
+let queue_gap_and_log queue ~active ~clear_state_attested ~target_epoch
+    ~reason =
+  let event = queue_gap_event queue ~active:(active ()) ~target_epoch ~reason in
+  clear_state_attested ();
+  log_queue_event event
 
 let run_wired deps ~target ~target_epoch ~reason =
   run_with_target

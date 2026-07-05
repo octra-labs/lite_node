@@ -57,6 +57,12 @@ let raw_zero = String.make 32 '\x00'
 let root_to_raw32_or_zero ~root_to_raw32 root =
   try root_to_raw32 root with _ -> raw_zero
 
+let eic_root_to_raw32_or_zero ~hex_to_raw32 root =
+  try
+    hex_to_raw32 (Octra_core.Epoch_index_commitment.root_hex root)
+  with _ ->
+    raw_zero
+
 let root_to_raw32_opt ~root_to_raw32 root =
   try Some (root_to_raw32 root) with _ -> None
 

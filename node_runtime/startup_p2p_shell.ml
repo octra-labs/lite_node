@@ -89,6 +89,38 @@ type node_view = {
   swarm : Octra_net.P2p_swarm.t;
 }
 
+type node_start_runtime = {
+  getenv : string -> string option;
+  info : string -> unit;
+  warn : string -> unit;
+  fatal : string -> unit;
+  current_epoch : unit -> int;
+  read_pending_validator_meta : unit -> string option;
+  read_head_hash : unit -> string option;
+  root_of_head_hash : string -> string;
+  install : install;
+  activation_epoch : unit -> int64 option;
+  chain_id : string;
+  consensus_mode : bool;
+  consensus_port : int;
+  consensus_peers : string list;
+  address : string;
+  priv_b64 : string;
+  pub_b64 : string;
+  voting : bool;
+  role_label : string;
+  read_persistent_pending : unit -> string option Lwt.t;
+  read_persistent_marker : string -> string option Lwt.t;
+  current_height : unit -> int64;
+}
+
+type node_start = {
+  view : node_view;
+  load_scheduled_validator_set_config :
+    unit ->
+    Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+}
+
 let raw32_zero = String.make 32 '\x00'
 
 let current_height (deps : deps) =
@@ -184,7 +216,27 @@ let build_node_view (request : node_request) =
   | Ok stack -> Ok (stack_view stack)
   | Error e -> Error e
 
-let admit_validator_startup deps ~address ~voting ~role_label validator =
+let request_of_runtime runtime =
+  {
+    getenv = runtime.getenv;
+    info = runtime.info;
+    warn = runtime.warn;
+    current_epoch = runtime.current_epoch;
+    read_pending_validator_meta = runtime.read_pending_validator_meta;
+    read_head_hash = runtime.read_head_hash;
+    root_of_head_hash = runtime.root_of_head_hash;
+    install = runtime.install;
+    chain_id = runtime.chain_id;
+    consensus_mode = runtime.consensus_mode;
+    consensus_port = runtime.consensus_port;
+    consensus_peers = runtime.consensus_peers;
+    address = runtime.address;
+    priv_b64 = runtime.priv_b64;
+    pub_b64 = runtime.pub_b64;
+  }
+
+let admit_validator_startup (deps : admission_deps) ~address ~voting
+    ~role_label validator =
   Validator_config.node_startup_admission
     ~getenv:deps.getenv
     ~activation_epoch:deps.activation_epoch
@@ -226,3 +278,47 @@ let load_irmin_persistent_update ~store ~warn ~current_height ~runtime
     }
     ~runtime
     ~requirements
+
+let admission_deps_of_runtime runtime =
+  {
+    getenv = runtime.getenv;
+    activation_epoch = runtime.activation_epoch;
+    info = runtime.info;
+    warn = runtime.warn;
+    refuse = (fun messages ->
+      List.iter runtime.fatal messages;
+      failwith "p2p_start_refused");
+  }
+
+let persistent_update_deps_of_runtime runtime =
+  {
+    read_pending = runtime.read_persistent_pending;
+    read_marker = runtime.read_persistent_marker;
+    warn = runtime.warn;
+    current_height = runtime.current_height;
+  }
+
+let load_runtime_persistent_update runtime view =
+  load_persistent_update
+    (persistent_update_deps_of_runtime runtime)
+    ~runtime:view.readiness_runtime
+    ~requirements:view.readiness_requirements
+
+let start_node runtime =
+  match build_node_view (request_of_runtime runtime) with
+  | Error e ->
+    runtime.fatal e;
+    failwith e
+  | Ok view ->
+    if runtime.consensus_mode then
+      admit_validator_startup
+        (admission_deps_of_runtime runtime)
+        ~address:runtime.address
+        ~voting:runtime.voting
+        ~role_label:runtime.role_label
+        view.validator_config;
+    {
+      view;
+      load_scheduled_validator_set_config = (fun () ->
+        load_runtime_persistent_update runtime view);
+    }

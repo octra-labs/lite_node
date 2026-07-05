@@ -36,6 +36,21 @@ type state_refs = {
   quarantine : bool ref;
 }
 
+type runtime_state_ops_deps = {
+  state : Consensus_runtime_state.t;
+  current_epoch : unit -> int;
+  warn_quarantine : epoch:int -> reason:string -> unit;
+  info_quarantine : epoch:int -> reason:string -> unit;
+}
+
+type runtime_state_ops = {
+  clear_state_attested : unit -> unit;
+  set_state_attested : head:int -> root:string -> unit;
+  attested_head : int -> bool;
+  mark_quarantine : string -> unit;
+  clear_quarantine : string -> unit;
+}
+
 type 'driver driver_deps = {
   sleep : float -> unit Lwt.t;
   state : state_refs;
@@ -86,6 +101,47 @@ type driver_probe_deps = {
     unit Lwt.t;
 }
 
+type fork_repair_runtime = {
+  committed_head_epoch : unit -> int;
+  target_matches : target:int -> root:string -> bool;
+  empty_after : target:int -> head:int -> bool;
+  run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  drop_finality_after : int -> int;
+  prune_after_epoch : int -> unit;
+  set_current_epoch : int -> unit;
+  set_state_attested : head:int -> root:string -> unit;
+  set_catchup_in_progress : bool -> unit;
+  clear_quarantine : string -> unit;
+  mark_quarantine : string -> unit;
+}
+
+type node_driver_probe_runtime = {
+  env_int : string -> int -> int;
+  getenv : string -> string option;
+  soft_catchup_max_lag : int;
+  quarantine_ahead_streak_threshold : int;
+  quarantine_ahead_grace_epochs : int;
+  quarantine_ahead_drift_tolerance : int;
+  normalize_next_epoch_for_head : source:string -> unit;
+  committed_head_epoch : unit -> int;
+  current_epoch : unit -> int;
+  catchup_queue : Consensus_catchup_queue.t;
+  catchup_active : bool ref;
+  runtime_state : Consensus_runtime_state.t;
+  set_state_attested : head:int -> root:string -> unit;
+  clear_quarantine : string -> unit;
+  mark_quarantine : string -> unit;
+  read_local_root_raw : unit -> string Lwt.t;
+  committed_epoch_root_raw : int -> string option;
+  drain_pending_finalized : unit -> unit Lwt.t;
+  fork_repair : fork_repair_runtime;
+  run_catchup_to_target :
+    Octra_consensus.C_driver.t ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+}
+
 type 'driver liveness_deps = {
   state : Consensus_liveness.state ref;
   snapshot : 'driver -> Consensus_liveness.driver_snapshot;
@@ -125,6 +181,44 @@ type consensus_driver_runtime = {
   pending_delay : float;
   log_started : unit -> unit;
 }
+
+type node_consensus_driver_runtime = {
+  sleep : float -> unit Lwt.t;
+  catchup_active : bool ref;
+  runtime_state : Consensus_runtime_state.t;
+  replay_stashed : source:string -> unit Lwt.t;
+  probe : driver_probe_deps;
+  liveness : Octra_consensus.C_driver.t liveness_deps;
+  pending_recovery : Octra_consensus.C_driver.t -> unit Lwt.t;
+  poll_interval : float;
+  pending_delay : float;
+  role_label : string;
+  validator_count : int;
+  quorum : int;
+}
+
+let runtime_state_ops (deps : runtime_state_ops_deps) =
+  {
+    clear_state_attested = (fun () ->
+      Consensus_runtime_state.clear_state_attested deps.state);
+    set_state_attested = (fun ~head ~root ->
+      Consensus_runtime_state.set_state_attested deps.state ~head ~root);
+    attested_head = Consensus_runtime_state.attested_head deps.state;
+    mark_quarantine = (fun reason ->
+      let epoch = deps.current_epoch () in
+      if
+        Consensus_runtime_state.enter_quarantine
+          deps.state
+          ~epoch
+          ~reason
+      then
+        deps.warn_quarantine ~epoch ~reason);
+    clear_quarantine = (fun reason ->
+      let epoch = deps.current_epoch () in
+      if Consensus_runtime_state.quarantine_active deps.state then
+        deps.info_quarantine ~epoch ~reason;
+      Consensus_runtime_state.clear_quarantine deps.state);
+  }
 
 let maybe_reset_liveness (deps : 'driver liveness_deps) driver ~source =
   let result =
@@ -209,6 +303,80 @@ let peer_snapshot_text records =
   records
   |> List.map peer_state_label
   |> String.concat ","
+
+let fork_repair_deps (runtime : fork_repair_runtime) driver =
+  Consensus_health_shell.{
+    committed_head_epoch = runtime.committed_head_epoch;
+    target_matches = runtime.target_matches;
+    empty_after = runtime.empty_after;
+    run_empty = runtime.run_empty;
+    drop_finality_after = runtime.drop_finality_after;
+    prune_after_epoch = runtime.prune_after_epoch;
+    set_current_epoch = runtime.set_current_epoch;
+    set_state_attested = runtime.set_state_attested;
+    set_catchup_in_progress = runtime.set_catchup_in_progress;
+    clear_quarantine = runtime.clear_quarantine;
+    mark_quarantine = runtime.mark_quarantine;
+    start_height = Octra_consensus.C_driver.start_height driver;
+    wake_ready = (fun () ->
+      Octra_consensus.C_driver.wake_ready driver);
+  }
+
+let repair_empty_fork_with_driver (runtime : fork_repair_runtime) driver
+    ~target_epoch ~target_root ~required ~current_root_quorum =
+  Consensus_health_shell.repair_empty_fork
+    (fork_repair_deps runtime driver)
+    ~target_epoch
+    ~target_root
+    ~required
+    ~current_root_quorum
+
+let node_driver_probe_deps runtime =
+  {
+    env_int = runtime.env_int;
+    getenv = runtime.getenv;
+    soft_catchup_max_lag = runtime.soft_catchup_max_lag;
+    quarantine_ahead_streak_threshold =
+      runtime.quarantine_ahead_streak_threshold;
+    quarantine_ahead_grace_epochs =
+      runtime.quarantine_ahead_grace_epochs;
+    quarantine_ahead_drift_tolerance =
+      runtime.quarantine_ahead_drift_tolerance;
+    normalize_next_epoch_for_head =
+      runtime.normalize_next_epoch_for_head;
+    committed_head_epoch = runtime.committed_head_epoch;
+    current_epoch = runtime.current_epoch;
+    catchup_next_target = (fun () ->
+      Consensus_catchup_queue.target runtime.catchup_queue);
+    attested_head = Consensus_runtime_state.attested_head runtime.runtime_state;
+    clear_state_attested = (fun () ->
+      Consensus_runtime_state.clear_state_attested runtime.runtime_state);
+    set_catchup_in_progress = (fun active ->
+      runtime.catchup_active := active);
+    set_state_attested = runtime.set_state_attested;
+    clear_quarantine = runtime.clear_quarantine;
+    mark_quarantine = runtime.mark_quarantine;
+    read_local_root_raw = runtime.read_local_root_raw;
+    committed_epoch_root_raw = runtime.committed_epoch_root_raw;
+    drain_pending_finalized = runtime.drain_pending_finalized;
+    quarantine_active = (fun () ->
+      Consensus_runtime_state.quarantine_active runtime.runtime_state);
+    ahead_streak = (fun () ->
+      Consensus_runtime_state.ahead_streak runtime.runtime_state);
+    incr_ahead_streak = (fun () ->
+      Consensus_runtime_state.incr_ahead_streak runtime.runtime_state);
+    repair_empty_fork = (fun driver ~target_epoch ~target_root ~required
+        ~current_root_quorum ->
+      repair_empty_fork_with_driver
+        runtime.fork_repair
+        driver
+        ~target_epoch
+        ~target_root
+        ~required
+        ~current_root_quorum);
+    run_catchup_to_target = (fun driver ~target_epoch ~reason ->
+      runtime.run_catchup_to_target driver ~target_epoch ~reason);
+  }
 
 let driver_probe_config (deps : driver_probe_deps) driver =
   let vs =
@@ -346,7 +514,7 @@ let launch_driver (deps : 'driver driver_deps) driver =
     ~pending_recovery:(fun () -> deps.pending_recovery driver)
     ~log_started:deps.log_started
 
-let consensus_driver_deps deps =
+let consensus_driver_deps (deps : consensus_driver_runtime) =
   {
     sleep = deps.sleep;
     state = deps.state;
@@ -360,6 +528,28 @@ let consensus_driver_deps deps =
     poll_interval = deps.poll_interval;
     pending_delay = deps.pending_delay;
     log_started = deps.log_started;
+  }
+
+let node_consensus_driver_runtime runtime =
+  {
+    sleep = runtime.sleep;
+    state = {
+      catchup = runtime.catchup_active;
+      quarantine =
+        Consensus_runtime_state.quarantine_active_ref runtime.runtime_state;
+    };
+    replay_stashed = runtime.replay_stashed;
+    probe = runtime.probe;
+    liveness = runtime.liveness;
+    pending_recovery = runtime.pending_recovery;
+    poll_interval = runtime.poll_interval;
+    pending_delay = runtime.pending_delay;
+    log_started = (fun () ->
+      Octra_log.info "init"
+        "event = consensus_start role = %s validators = %d quorum = %d"
+        runtime.role_label
+        runtime.validator_count
+        runtime.quorum);
   }
 
 let launch_consensus_driver deps driver =

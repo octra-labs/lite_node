@@ -58,6 +58,23 @@ type node_launch_deps = {
   swarm_deps : P2p_swarm_lifecycle.node_deps;
 }
 
+type node_launch_runtime = {
+  p2p : unit -> unit Lwt.t;
+  rpc : unit -> unit Lwt.t;
+  observer : bool;
+  tick_loop : unit -> unit Lwt.t;
+  swarm : Octra_net.P2p_swarm.t option;
+  guard : Octra_net.P2p_tx_gossip_guard.t;
+  find_tx : string -> Octra_core.Transaction.t option;
+  find_account : string -> Octra_core.Ledger.account option;
+  add_tx : Octra_core.Transaction.t -> (string, string) result;
+  now : unit -> float;
+  max_drift : float;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  close_chaindata : unit -> unit;
+  exit_fatal : unit -> unit;
+}
+
 val make_node_swarm_deps :
   observer:bool ->
   guard:Octra_net.P2p_tx_gossip_guard.t ->
@@ -138,4 +155,8 @@ val run_node_launch_tasks :
   node_launch_deps ->
   close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->
+  unit Lwt.t
+
+val run_node_runtime :
+  node_launch_runtime ->
   unit Lwt.t

@@ -236,12 +236,22 @@ let exec_result_to_result r =
   else
     Error (trim_error (Option.value r.error ~default:"execution failed"))
 
+let consensus_safety_error code =
+  match Opcode_policy.require_consensus_safe code with
+  | Ok () -> None
+  | Error hit -> Some (Opcode_policy.error_message hit)
+
 let deploy ?(ctx=Contract_vm.default_ctx) ?(params=[]) store deployer ctype code bytecode_raw nonce =
   let addr = addr_from_code bytecode_raw deployer nonce in
   let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
   Octra_log.stdout "info [contract] deploying addr = %s deployer = %s size = %d hash = %s\n%!"
     addr (String.sub deployer 0 (min 12 (String.length deployer)))
     (String.length bytecode_raw) (String.sub hash 0 16);
+  match consensus_safety_error code with
+  | Some error ->
+    (addr, { success = false; return_value = None; effort_used = 0;
+             events = []; error = Some error; storage_writes = 0 })
+  | None ->
   let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
   if exists then (
     Octra_log.stdout "warn [contract] already exists addr = %s\n%!" addr;
@@ -337,6 +347,9 @@ let deploy_internal ~ctx ~depth ?(params=[]) store ~deployer ~bytecode_raw ~nonc
     (match Contract_vm.Verifier.verify code with
     | Error _ -> Error "verify failed"
     | Ok () ->
+      match consensus_safety_error code with
+      | Some error -> Error error
+      | None ->
       let addr = addr_from_code bytecode_raw deployer nonce in
       let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
       let already_pending = List.exists (fun pd -> pd.pd_address = addr) !pending_deploys in

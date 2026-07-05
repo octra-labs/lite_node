@@ -38,6 +38,25 @@ let reward_plan ~validator_count ~confirmed_fees meta =
     ~confirmed_fees
     ~prev_supply:meta.prev_supply
 
+let replay_proposer_line ~epoch_id ~proposer_source ~proposer ~validators_sha =
+  Printf.sprintf
+    "event = replay_proposer epoch = %d proposer_source = %s proposer = %s validators_sha = %s"
+    epoch_id
+    proposer_source
+    proposer
+    validators_sha
+
+let reward_line ~fees ~proposer ~short ~validator_count plan =
+  Printf.sprintf
+    "event = reward base = %s fees = %s total = %s proposer = %s proposer_total = %s each = %s validators = %d"
+    (Z.to_string plan.Epoch_exec.base_reward)
+    (Z.to_string fees)
+    (Z.to_string plan.total_reward)
+    (short proposer)
+    (Z.to_string plan.proposer_total)
+    (Z.to_string plan.each_validator)
+    validator_count
+
 let env ~epoch_id ~proposer_addr ~validator_pubkeys ~ready_state_root_at
     ~ready_max_lag =
   Epoch_exec.{

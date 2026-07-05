@@ -26,6 +26,7 @@ type bucket = {
   mutable start : float;
   mutable msgs : int;
   mutable bytes : int;
+  mutable last_seen : float;
 }
 
 type t = (string, bucket) Hashtbl.t
@@ -43,19 +44,56 @@ let default = {
   max_get_reply = 64;
 }
 
+let bucket_ttl_s = 300.0
+
+let max_buckets = 4096
+
 let create () =
   Hashtbl.create 64
 
 let reset b now =
   b.start <- now;
   b.msgs <- 0;
-  b.bytes <- 0
+  b.bytes <- 0;
+  b.last_seen <- now
+
+let rec take n xs =
+  if n <= 0 then []
+  else
+    match xs with
+    | [] -> []
+    | x :: rest -> x :: take (n - 1) rest
+
+let prune ?(ttl = bucket_ttl_s) ?(max_entries = max_buckets) t ~now =
+  Hashtbl.fold
+    (fun peer b acc ->
+      if now -. b.last_seen > ttl then peer :: acc else acc)
+    t
+    []
+  |> List.iter (Hashtbl.remove t);
+  let overflow = Hashtbl.length t - max_entries in
+  if overflow > 0 then
+    Hashtbl.fold
+      (fun peer b acc -> (b.last_seen, peer) :: acc)
+      t
+      []
+    |> List.sort (fun (ta, pa) (tb, pb) ->
+      let by_time = compare ta tb in
+      if by_time <> 0 then by_time else String.compare pa pb)
+    |> take overflow
+    |> List.iter (fun (_, peer) -> Hashtbl.remove t peer)
+
+let size t =
+  Hashtbl.length t
 
 let get_bucket t peer now =
+  prune t ~now;
   match Hashtbl.find_opt t peer with
-  | Some b -> b
+  | Some b ->
+    b.last_seen <- now;
+    b
   | None ->
-    let b = { start = now; msgs = 0; bytes = 0 } in
+    let b = { start = now; msgs = 0; bytes = 0; last_seen = now } in
     Hashtbl.replace t peer b;
     b
 
@@ -77,13 +115,6 @@ let admit ?(cfg=default) t ~now ~peer ~bytes =
       b.bytes <- next_bytes;
       Accept
     end
-
-let rec take n xs =
-  if n <= 0 then []
-  else
-    match xs with
-    | [] -> []
-    | x :: rest -> x :: take (n - 1) rest
 
 let uniq xs =
   let seen = Hashtbl.create (List.length xs) in

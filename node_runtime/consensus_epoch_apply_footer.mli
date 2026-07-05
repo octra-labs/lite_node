@@ -27,6 +27,19 @@ val reward_plan :
   confirmed_fees:Z.t ->
   meta ->
   Epoch_exec.reward_plan
+val replay_proposer_line :
+  epoch_id:int ->
+  proposer_source:string ->
+  proposer:string ->
+  validators_sha:string ->
+  string
+val reward_line :
+  fees:Z.t ->
+  proposer:string ->
+  short:(string -> string) ->
+  validator_count:int ->
+  Epoch_exec.reward_plan ->
+  string
 val env :
   epoch_id:int ->
   proposer_addr:string ->
