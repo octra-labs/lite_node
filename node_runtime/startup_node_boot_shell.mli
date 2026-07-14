@@ -1,0 +1,64 @@
+(*
+Octra Labs 2026
+
+Lite node, for internal use only (pre-release build 0x1067dzc2)
+
+Include at startup:
+- compiler
+- env-constructor
+- binary-proto consensus for updates
+- PVAC (optimized version, build 0f24dd-2025)
+- libp2p
+- gRPC (version 9738fdy44-2025)
+*)
+
+
+type wallet = {
+  address : string;
+  pub : string;
+}
+
+type store_deps = {
+  data_dir : string;
+  store : Octra_core.Store_irmin.t;
+  exit_fatal : unit -> unit;
+}
+
+type deps = {
+  data_dir : string;
+  store : Octra_core.Store_irmin.t;
+  ledger : Octra_core.Ledger.t;
+  chaindata : Octra_core.Store_chaindata.t;
+  total_tx_count : int ref;
+  observer_mode : bool;
+  wallet : wallet;
+  consensus_mode : bool;
+  voting_consensus_mode : bool;
+  consensus_port_configured : unit -> bool;
+  validators : unit -> (string * string) list;
+  int_value : string -> int -> int;
+  env : string -> string option;
+  exit_fatal : unit -> unit;
+}
+
+val meta_int :
+  default:int ->
+  string option ->
+  int
+
+val last_epoch_id :
+  Octra_core.Epochlog.epoch_header option ->
+  int option
+
+val last_epoch_or :
+  default:int ->
+  Octra_core.Epochlog.epoch_header option ->
+  int
+
+val run_store :
+  store_deps ->
+  unit
+
+val run_node :
+  deps ->
+  int
