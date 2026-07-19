@@ -17,22 +17,13 @@ type t = Z.t
 
 let frac_bits = 16
 let scale = Z.of_int (1 lsl frac_bits)
-let step = Z.shift_right scale 1
-let min_exp = Z.neg (Z.mul (Z.of_int 8) scale)
+let min_exp = Z.neg (Z.mul (Z.of_int 16) scale)
 let max_exp = Z.mul (Z.of_int 8) scale
 let max_raw = Z.sub (Z.shift_left Z.one 63) Z.one
 let pi = Z.of_int 205887
 let half_pi = Z.of_int 102944
 let two_pi = Z.of_int 411775
 let ln_two = Z.of_int 45426
-
-let exp_table = Array.map Z.of_int [|
-  22; 36; 60; 99; 162; 268; 442; 728; 1200; 1979; 3263;
-  5380; 8869; 14623; 24109; 39750; 65536; 108051; 178145;
-  293712; 484249; 798392; 1316326; 2170254; 3578144; 5899363;
-  9726405; 16036130; 26439109; 43590722; 71868951; 118491868;
-  195360063
-|]
 
 let trunc_mul (a : t) (b : t) =
   Z.shift_right (Z.mul a b) frac_bits
@@ -56,22 +47,34 @@ let make_round bits =
       else
         Z.neg (Z.shift_right (Z.add (Z.neg value) half) bits))
 
+let round_div numerator denominator =
+  let half = Z.shift_right denominator 1 in
+  if Z.sign numerator >= 0 then
+    Z.div (Z.add numerator half) denominator
+  else
+    Z.neg (Z.div (Z.add (Z.neg numerator) half) denominator)
+
 let exp value =
   let value =
     if Z.compare value min_exp < 0 then min_exp
     else if Z.compare value max_exp > 0 then max_exp
     else value
   in
-  let offset = Z.add value (Z.neg min_exp) in
-  let index = Z.to_int (Z.div offset step) in
-  if index >= Array.length exp_table - 1 then
-    exp_table.(Array.length exp_table - 1)
+  let exponent = round_div value ln_two in
+  let reduced = Z.sub value (Z.mul exponent ln_two) in
+  let rec series index term total =
+    if index = 13 then total
+    else
+      let next = Z.div (trunc_mul term reduced) (Z.of_int index) in
+      series (index + 1) next (Z.add total next)
+  in
+  let base = series 1 scale scale in
+  if Z.sign exponent >= 0 then
+    let shifted = Z.shift_left base (Z.to_int exponent) in
+    if Z.compare shifted max_raw > 0 then max_raw else shifted
   else
-    let rem = Z.rem offset step in
-    let lower = exp_table.(index) in
-    let delta = Z.sub exp_table.(index + 1) lower in
-    let scaled = Z.mul delta rem in
-    Z.add lower (Z.div (Z.add scaled (Z.shift_right step 1)) step)
+    let shift = Z.to_int (Z.neg exponent) in
+    Z.shift_right (Z.add base (Z.shift_left Z.one (shift - 1))) shift
 
 let scale_floor value total =
   if Z.sign value < 0 || Z.sign total <= 0 then None

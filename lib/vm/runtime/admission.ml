@@ -48,16 +48,23 @@ let admit ~program code =
   match Contract_vm.Verifier.verify code with
   | Error err -> Error (Verify_error (verifier_error err))
   | Ok () ->
-    let policy =
-      if program then Opcode_policy.require_program_safe code
-      else Opcode_policy.require_legacy_safe code
+    let policy_error =
+      if program then
+        Option.map
+          (fun hit -> `Consensus_unsafe hit)
+          (Opcode_policy.first_host_float code)
+      else
+        match Opcode_policy.legacy_error code with
+        | Some (Opcode_policy.Program_only hit) -> Some (`Program_only hit)
+        | Some (Opcode_policy.Consensus_unsafe hit) -> Some (`Consensus_unsafe hit)
+        | None -> None
     in
-    match policy with
-    | Error hit ->
-      Error (Unsafe_error (
-        if program then Opcode_policy.error_message hit
-        else Opcode_policy.program_only_error_message hit))
-    | Ok () ->
+    match policy_error with
+    | Some (`Program_only hit) ->
+      Error (Unsafe_error (Opcode_policy.program_only_error_message hit))
+    | Some (`Consensus_unsafe hit) ->
+      Error (Unsafe_error (Opcode_policy.error_message hit))
+    | None ->
       Ok {
         admitted_code = Array.copy code;
         admitted_effects = Program_effects.scan code;

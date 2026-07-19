@@ -851,6 +851,16 @@ let canonical_facts facts =
 let facts_hash facts =
   Digestif.SHA256.(digest_string (canonical_facts facts) |> to_hex)
 
+let runtime_entry code =
+  let rec find pc =
+    if pc = Array.length code then 0
+    else
+      match code.(pc) with
+      | Contract_vm.JDEST 100 -> pc
+      | _ -> find (pc + 1)
+  in
+  find 0
+
 let check ?(facts = empty_facts) code =
   let len = Array.length code in
   if len = 0 then Error (Unsupported 0)
@@ -862,7 +872,8 @@ let check ?(facts = empty_facts) code =
       | Contract_vm.JDEST label -> Hashtbl.replace labels label pc
       | _ -> ()) code;
     let states = Array.make len None in
-    states.(0) <- Some {
+    let entry = runtime_entry code in
+    states.(entry) <- Some {
       regs = Array.make 64 Unset;
       mem = mem_facts facts.root;
       consts = Array.make 64 None;
@@ -905,4 +916,4 @@ let check ?(facts = empty_facts) code =
               in
               add_targets rest (successors labels pc code.(pc) len)
     in
-    visit [0]
+    visit [entry]

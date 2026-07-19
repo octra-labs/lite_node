@@ -656,6 +656,12 @@ let read_int st reg =
 let valid_mem_span addr n =
   addr >= 0 && n > 0 && n <= 131072 && addr <= max_int - n
 
+let checked_product left right =
+  if left < 0 || right < 0 then None
+  else if left = 0 || right = 0 then Some 0
+  else if left > max_int / right then None
+  else Some (left * right)
+
 let read_q16 st addr n =
   if not (valid_mem_span addr n) then None
   else
@@ -1379,38 +1385,33 @@ let exec_one st op =
     end
   | SOFTMAX_Q16_INPLACE (rs_addr, rs_n) ->
     (match read_int st rs_addr, read_int st rs_n with
-     | Some addr, Some n when addr >= 0 && n > 0 && n <= 131072 ->
+     | Some addr, Some n when valid_mem_span addr n ->
        if not (add_dyn_product st [n; 8] 1) then revert st
-       else begin
-         let get a =
-           match Hashtbl.find_opt st.memory.data a with
-           | Some value -> to_z value
-           | None -> Z.zero
-         in
-         let values = Array.init n (fun i -> get (addr + i)) in
-         let max_value = Array.fold_left Z.max values.(0) values in
-         let exps = Array.map (fun value -> Fixed_q16.exp (Z.sub value max_value)) values in
-         let total = Array.fold_left Z.add Z.zero exps in
-         if Z.sign total <= 0 then revert st
-         else begin
-           let probs = Array.map (fun value -> Fixed_q16.scale_floor value total) exps in
-           if not (Array.for_all Option.is_some probs) then revert st
-           else begin
-             let result = Array.map Option.get probs in
-             let max_index = ref 0 in
-             for i = 1 to n - 1 do
-               if Z.compare exps.(i) exps.(!max_index) > 0 then max_index := i
-             done;
-             let current = Array.fold_left Z.add Z.zero result in
-             result.(!max_index) <-
-               Z.add result.(!max_index) (Z.sub Fixed_q16.scale current);
-             for i = 0 to n - 1 do
-               Hashtbl.replace st.memory.data (addr + i) (VInt result.(i))
-             done;
-             true
-           end
-         end
-       end
+       else
+         (match read_q16 st addr n with
+          | None -> revert st
+          | Some values ->
+            let max_value = Array.fold_left Z.max values.(0) values in
+            let exps = Array.map (fun value -> Fixed_q16.exp (Z.sub value max_value)) values in
+            let total = Array.fold_left Z.add Z.zero exps in
+            if Z.sign total <= 0 then revert st
+            else
+              let probs = Array.map (fun value -> Fixed_q16.scale_floor value total) exps in
+              if not (Array.for_all Option.is_some probs) then revert st
+              else
+                let result = Array.map Option.get probs in
+                let max_index = ref 0 in
+                for i = 1 to n - 1 do
+                  if Z.compare exps.(i) exps.(!max_index) > 0 then max_index := i
+                done;
+                let current = Array.fold_left Z.add Z.zero result in
+                result.(!max_index) <-
+                  Z.add result.(!max_index) (Z.sub Fixed_q16.scale current);
+                if not (Array.for_all Fixed_q16.in_range result) then revert st
+                else begin
+                  write_q16 st addr result;
+                  true
+                end)
      | _ -> revert st)
   | LAYERNORM_Q16_INPLACE (rs_addr, rs_n, rs_gamma, rs_beta) ->
     (match read_int st rs_addr, read_int st rs_n,
@@ -1646,38 +1647,36 @@ let exec_one st op =
           | _ -> revert st)
      | _ -> revert st)
   | MATMUL_Q16 (rd_addr, rs_lhs, rs_rhs, rs_m, rs_k, rs_n) ->
-    let dst_addr = Z.to_int (to_z (getr st rd_addr)) in
-    let lhs_addr = Z.to_int (to_z (getr st rs_lhs)) in
-    let rhs_addr = Z.to_int (to_z (getr st rs_rhs)) in
-    let m = Z.to_int (to_z (getr st rs_m)) in
-    let k = Z.to_int (to_z (getr st rs_k)) in
-    let n = Z.to_int (to_z (getr st rs_n)) in
-    if m <= 0 || k <= 0 || n <= 0 || m > 32768 || k > 32768 || n > 32768 then revert st
-    else begin
-      if not (add_dyn_product st [m; n; k] 1024) then revert st
-      else begin
-        let mem_get a =
-          match Hashtbl.find_opt st.memory.data a with
-          | Some v -> to_z v
-          | None -> Z.zero
-        in
-        for r = 0 to m - 1 do
-          for c = 0 to n - 1 do
-            let acc = ref Z.zero in
-            for i = 0 to k - 1 do
-              let lv = mem_get (lhs_addr + r * k + i) in
-              let rv = mem_get (rhs_addr + i * n + c) in
-              acc := Z.add !acc (Z.mul lv rv)
-            done;
-            let rounded = Fixed_q16.round16 !acc in
-            let cell = dst_addr + r * n + c in
-            Hashtbl.replace st.memory.data cell (VInt rounded);
-            if cell >= st.memory.size then st.memory.size <- cell + 1
-          done
-        done;
-        true
-      end
-    end
+    (match read_int st rd_addr, read_int st rs_lhs, read_int st rs_rhs,
+           read_int st rs_m, read_int st rs_k, read_int st rs_n with
+     | Some dst_addr, Some lhs_addr, Some rhs_addr, Some m, Some k, Some n
+       when m > 0 && k > 0 && n > 0 && m <= 32768 && k <= 32768 && n <= 32768 ->
+       (match checked_product m k, checked_product k n, checked_product m n with
+        | Some lhs_n, Some rhs_n, Some dst_n
+          when valid_mem_span lhs_addr lhs_n && valid_mem_span rhs_addr rhs_n &&
+               valid_mem_span dst_addr dst_n ->
+          if not (add_dyn_product st [m; n; k] 1024) then revert st
+          else
+            (match read_q16 st lhs_addr lhs_n, read_q16 st rhs_addr rhs_n with
+             | Some lhs, Some rhs ->
+               let result = Array.init dst_n (fun cell ->
+                 let row = cell / n in
+                 let col = cell mod n in
+                 let acc = ref Z.zero in
+                 for i = 0 to k - 1 do
+                   let left = lhs.(row * k + i) in
+                   let right = rhs.(i * n + col) in
+                   acc := Z.add !acc (Z.mul left right)
+                 done;
+                 Fixed_q16.round16 !acc) in
+               if not (Array.for_all Fixed_q16.in_range result) then revert st
+               else begin
+                 write_q16 st dst_addr result;
+                 true
+               end
+             | _ -> revert st)
+        | _ -> revert st)
+     | _ -> revert st)
   | SHIFT_ROUND_INPLACE (rs_addr, rs_n, rs_bits) ->
     let addr = Z.to_int (to_z (getr st rs_addr)) in
     let n = Z.to_int (to_z (getr st rs_n)) in

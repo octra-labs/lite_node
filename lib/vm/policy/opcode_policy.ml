@@ -92,6 +92,15 @@ let require_legacy_safe code =
   | Some hit -> Error hit
   | None -> require_consensus_safe code
 
+type legacy_error =
+  | Program_only of host_float_hit
+  | Consensus_unsafe of host_float_hit
+
+let legacy_error code =
+  match first_program_only code with
+  | Some hit -> Some (Program_only hit)
+  | None -> Option.map (fun hit -> Consensus_unsafe hit) (first_host_float code)
+
 let require_program_safe = require_consensus_safe
 
 let error_message hit =
