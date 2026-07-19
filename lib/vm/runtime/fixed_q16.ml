@@ -187,7 +187,9 @@ let dot left left_offset right right_offset length =
   Array.fold_left Z.add Z.zero products
 
 let map2_checked f left right =
-  if Array.length left <> Array.length right then None
+  if Array.length left <> Array.length right ||
+     not (Array.for_all in_range left) ||
+     not (Array.for_all in_range right) then None
   else
     let result = Array.map2 f left right in
     if Array.for_all in_range result then Some result else None
