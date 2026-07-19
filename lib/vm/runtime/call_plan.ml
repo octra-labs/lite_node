@@ -262,20 +262,25 @@ let plan_readonly_call ~method_name ~params ~caller_addr ~include_storage =
       bool_json ~default:(readonly_storage_default method_name) include_storage;
   }
 
-let parse_deploy_payload ~bytecode_b64 ~deployer ~nonce ~target =
+let parse_deploy_payload_with_keys ~trusted ~bytecode_b64 ~deployer ~nonce ~target =
   let bytecode_raw = Base64.decode_exn bytecode_b64 in
-  match Bytecode.decode bytecode_raw with
-  | Error err -> Deploy_invalid_bytecode err
-  | Ok bytecode ->
+  match Admission.decode_deploy ~trusted bytecode_raw with
+  | Error err -> Deploy_invalid_bytecode (Admission.error_message err)
+  | Ok admitted ->
+    let bytecode = Admission.code admitted in
     let expected_addr = Contract.addr_from_code bytecode_raw deployer nonce in
     if not (String.equal expected_addr target) then
       Deploy_address_mismatch
     else
-      match Opcode_policy.require_consensus_safe bytecode with
-      | Ok () ->
-        Deploy_ready { bytecode_raw; bytecode }
-      | Error hit ->
-        Deploy_invalid_bytecode (Opcode_policy.error_message hit)
+      Deploy_ready { bytecode_raw; bytecode }
+
+let parse_deploy_payload ~bytecode_b64 ~deployer ~nonce ~target =
+  parse_deploy_payload_with_keys
+    ~trusted:[]
+    ~bytecode_b64
+    ~deployer
+    ~nonce
+    ~target
 
 let deploy_missing_bytecode_reject = {
   deploy_error_type = "missing_bytecode";
@@ -325,13 +330,14 @@ let deploy_payload_reject = function
       deploy_consume_nonce = false;
     }
 
-let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
+let plan_deploy_input_with_keys ~trusted ~bytecode_b64_opt ~deployer ~nonce ~target =
   match bytecode_b64_opt with
   | None ->
     Deploy_input_rejected deploy_missing_bytecode_reject
   | Some bytecode_b64 ->
     try
-      match parse_deploy_payload ~bytecode_b64 ~deployer ~nonce ~target with
+      match parse_deploy_payload_with_keys
+        ~trusted ~bytecode_b64 ~deployer ~nonce ~target with
       | Deploy_ready deploy ->
         Deploy_input_ready {
           bytecode_raw = deploy.bytecode_raw;
@@ -342,6 +348,14 @@ let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
     with e ->
       Deploy_input_exception
         (Printf.sprintf "Deploy error: %s" (Printexc.to_string e))
+
+let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
+  plan_deploy_input_with_keys
+    ~trusted:[]
+    ~bytecode_b64_opt
+    ~deployer
+    ~nonce
+    ~target
 
 let parse_call index = function
   | `Assoc fields ->

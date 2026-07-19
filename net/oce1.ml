@@ -38,8 +38,10 @@ let put_u64 buf v =
 let put_bool buf v =
   put_u8 buf (if v then 1 else 0)
 
+
 let put_raw buf s =
   Buffer.add_string buf s
+
 
 let put_bytes buf s =
   put_u32_int buf (String.length s);
@@ -70,6 +72,8 @@ let put_option put_inner buf = function
 let put_list put_inner buf lst =
   put_u32_int buf (List.length lst);
   List.iter (put_inner buf) lst
+
+
 
 type cursor = { data : string; mutable pos : int }
 
@@ -116,6 +120,7 @@ let get_u64 c =
 let get_bool c =
   get_u8 c <> 0
 
+
 let get_raw c n =
   check_len c n;
   let s = String.sub c.data c.pos n in
@@ -155,6 +160,8 @@ let get_list get_inner c =
   let count = get_u32_int c in
   if count < 0 || count > 1_000_000 then failwith "OCE1: list count out of range";
   List.init count (fun _ -> get_inner c)
+
+
 
 let encode f =
   let buf = Buffer.create 256 in

@@ -42,6 +42,25 @@ val network_config :
   env:(string -> string option) ->
   network_config
 
+val parse_int :
+  default:int ->
+  string ->
+  int
+
+val parse_int64 :
+  default:int64 ->
+  string ->
+  int64
+
+val parse_float :
+  default:float ->
+  string ->
+  float
+
+val epoch_duration :
+  env:(string -> string option) ->
+  float
+
 val node_start_messages :
   version:string ->
   validator:string ->

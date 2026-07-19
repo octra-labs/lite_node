@@ -430,6 +430,63 @@ let restrict_runtime_exec_ctx (ctx : ContractVM.exec_ctx) =
     deploy_contract = (fun _ _ _ _ _ -> Error "circle runtime spawn disabled");
   }
 
+let with_circle_spawn ctx circle_id caller spawns =
+  let deploy_contract parent payload_json _nonce _depth params =
+    if not (String.equal parent circle_id) then
+      Error "circle spawn parent mismatch"
+    else if String.equal ctx.ContractVM.tx_hash "" then
+      Error "circle spawn requires transaction hash"
+    else if List.length !spawns >= spawn_cap then
+      Error "circle spawn cap exceeded"
+    else
+      match params with
+      | [ContractVM.VString owner_raw] ->
+        begin
+          match Octra_core.Circles.spawn_owner_of_string owner_raw with
+          | Error error -> Error error
+          | Ok owner_mode ->
+            begin
+              match Octra_core.Circle_deploy.decode_spawn_payload_json payload_json with
+              | Error (_, error) -> Error error
+              | Ok payload ->
+                let spawn_nonce = List.length !spawns in
+                let source =
+                  Octra_core.Circle_deploy.Spawn
+                    {
+                      parent = circle_id;
+                      caller;
+                      tx_hash = ctx.tx_hash;
+                      spawn_nonce;
+                      owner_mode;
+                      payload_json;
+                    }
+                in
+                begin
+                  match Octra_core.Circle_deploy.prepare source payload with
+                  | Error (_, error) -> Error error
+                  | Ok prepared ->
+                    let spawn =
+                      {
+                        Octra_core.Circle_wasm_host.circle_id = prepared.circle_id;
+                        owner_mode;
+                        spawn_nonce;
+                        payload_json;
+                      }
+                    in
+                    spawns := !spawns @ [spawn];
+                    Ok
+                      {
+                        ContractVM.spawned_addr = prepared.circle_id;
+                        effort_used = 0;
+                        events = [];
+                      }
+                end
+            end
+        end
+      | _ -> Error "circle spawn owner mode missing"
+  in
+  { ctx with ContractVM.deploy_contract }
+
 let empty_runtime_hfhe_details (ctx : ContractVM.exec_ctx) owner = {
   exec_ctx =
     {
@@ -693,7 +750,21 @@ let wasm_hfhe_active_key_of_runtime_ctx
         None
     end
 
-let rec execute_view_call_direct ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+let prepare_octb_call ~ctx ~depth ~limit ~caller ~address ~value ~method_name ~params
+    ~bytecode ~profile ~storage_tbl =
+  let fixed = Contract.fix_jumps bytecode in
+  match Contract.extract_method_target fixed method_name with
+  | None -> Error "method not found"
+  | Some target ->
+    match Contract.runtime_params profile target params with
+    | Error error -> Error (Octra_vm.Program_input.error_message error)
+    | Ok values ->
+      Ok (fixed, Contract.setup_call_state_values
+        ~ctx ~depth ~limit ~strict_values:(Contract.strict_values profile)
+        ~caller ~address ~value ~storage_tbl
+        ~method_name ~params:values ())
+
+let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
     store circle_id method_name params caller =
   let timing_enabled = wasm_view_method_timing_enabled method_name in
   let timing_started_at = if timing_enabled then Some (Unix.gettimeofday ()) else None in
@@ -732,14 +803,14 @@ let rec execute_view_call_direct ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limi
         phases
     end;
     Lwt.return receipt in
-  let* loaded_result = Circle_program.load store circle_id in
+  let* loaded_result = Circle_program.load ~trusted store circle_id in
   timing_mark "load_program";
   match loaded_result with
   | Error e -> finish (failed_receipt e)
   | Ok loaded ->
     begin
       match loaded.code with
-      | Circle_program.Octb bytecode ->
+      | Circle_program.Octb { bytecode; profile } ->
         let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
         timing_mark "load_storage";
         begin
@@ -754,23 +825,26 @@ let rec execute_view_call_direct ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limi
                 finish (failed_receipt e)
               | Ok runtime_hfhe ->
                 let storage_copy = Hashtbl.copy storage_tbl in
-                let state =
-                  Contract.setup_call_state
-                    ~ctx:runtime_hfhe.exec_ctx
-                    ~depth
-                    ~limit
-                    ~caller
-                    ~address:circle_id
-                    ~value:Z.zero
-                    ~storage_tbl:storage_copy
-                    ~method_name
-                    ~params
-                    ()
-                in
-                state.ContractVM.is_view <- true;
-                let receipt = Contract.run_from_dispatcher state bytecode in
-                timing_mark "run_dispatcher";
-                finish receipt
+                begin
+                  match prepare_octb_call
+                      ~ctx:runtime_hfhe.exec_ctx
+                      ~depth
+                      ~limit
+                      ~caller
+                      ~address:circle_id
+                      ~value:Z.zero
+                      ~method_name
+                      ~params
+                      ~bytecode
+                      ~profile
+                      ~storage_tbl:storage_copy with
+                  | Error error -> finish (failed_receipt error)
+                  | Ok (fixed, state) ->
+                    state.ContractVM.is_view <- true;
+                    let receipt = Contract.run_fixed_from_dispatcher state fixed in
+                    timing_mark "run_dispatcher";
+                    finish receipt
+                end
             end
         end
       | Circle_program.Wasm_v1 wasm ->
@@ -900,11 +974,11 @@ and maybe_prefetch_preview ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_00
           Lwt.return_unit)
       end
 
-and execute_view_call ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
     store circle_id method_name params caller =
   match preview_request_of_call method_name params with
   | None ->
-    execute_view_call_direct ~ctx ~depth ~limit store circle_id method_name params caller
+    execute_view_call_direct ~trusted ~ctx ~depth ~limit store circle_id method_name params caller
   | Some (prompt_csv, prompt_tokens, n_tokens) ->
     let cache_key = preview_cache_key circle_id caller prompt_csv in
     begin
@@ -952,9 +1026,9 @@ and execute_view_call ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000
         Lwt.return receipt
     end
 
-let execute_call ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=1_000_000)
+let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=1_000_000)
     store circle_id method_name params caller value =
-  let* loaded_result = Circle_program.load store circle_id in
+  let* loaded_result = Circle_program.load ~trusted store circle_id in
   match loaded_result with
   | Error e -> Lwt.return (failed_call_result e)
   | Ok loaded ->
@@ -966,37 +1040,48 @@ let execute_call ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=1_000_000)
         let baseline_storage_tbl = Hashtbl.copy storage_tbl in
         begin
           match loaded.code with
-          | Circle_program.Octb bytecode ->
+          | Circle_program.Octb { bytecode; profile } ->
             let* runtime_ctx_result = load_runtime_hfhe_ctx ctx store circle_id caller in
             begin
               match runtime_ctx_result with
               | Error e ->
                 Lwt.return (failed_call_result e)
               | Ok runtime_hfhe ->
-                let state =
-                  Contract.setup_call_state
-                    ~ctx:runtime_hfhe.exec_ctx
-                    ~depth
-                    ~limit
-                    ~caller
-                    ~address:circle_id
-                    ~value
-                    ~storage_tbl
-                    ~method_name
-                    ~params
-                    ()
+                let spawns = ref [] in
+                let exec_ctx =
+                  with_circle_spawn
+                    runtime_hfhe.exec_ctx
+                    circle_id
+                    caller
+                    spawns
                 in
-                let receipt = Contract.run_from_dispatcher state bytecode in
-                Lwt.return {
-                  receipt;
-                  storage_tbl;
-                  baseline_storage_tbl;
-                  spawns = [];
-                  assets = [];
-                  encrypted_assets = [];
-                  caller;
-                  tx_hash = runtime_hfhe.exec_ctx.tx_hash;
-                }
+                begin
+                  match prepare_octb_call
+                      ~ctx:exec_ctx
+                      ~depth
+                      ~limit
+                      ~caller
+                      ~address:circle_id
+                      ~value
+                      ~method_name
+                      ~params
+                      ~bytecode
+                      ~profile
+                      ~storage_tbl with
+                  | Error error -> Lwt.return (failed_call_result error)
+                  | Ok (fixed, state) ->
+                    let receipt = Contract.run_fixed_from_dispatcher state fixed in
+                    Lwt.return {
+                      receipt;
+                      storage_tbl;
+                      baseline_storage_tbl;
+                      spawns = !spawns;
+                      assets = [];
+                      encrypted_assets = [];
+                      caller;
+                      tx_hash = exec_ctx.tx_hash;
+                    }
+                end
             end
           | Circle_program.Wasm_v1 wasm ->
             begin

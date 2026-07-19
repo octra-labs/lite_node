@@ -96,6 +96,7 @@ let parse_line line =
     | "ORIGIN", [_] -> Contract_vm.ORIGIN (r 0)
     | "SELF", [_] -> Contract_vm.SELF (r 0)
     | "EPOCH", [_] -> Contract_vm.EPOCH (r 0)
+    | "EPOCH_TIME", [_] -> Contract_vm.EPOCH_TIME (r 0)
     | "VALUE", [_] -> Contract_vm.VALUE (r 0)
     | "BALANCE", [_;_] -> Contract_vm.BALANCE (r 0, r 1)
     | "TREEHASH", [_] -> Contract_vm.TREEHASH (r 0)
@@ -144,11 +145,28 @@ let parse_line line =
     | "SSTOREN", [_;_;_] -> Contract_vm.SSTOREN (r 0, r 1, r 2)
     | "FSTORE", [_;_] -> Contract_vm.FSTORE (r 0, r 1)
     | "FLOAD", [_;_] -> Contract_vm.FLOAD (r 0, r 1)
+    | "EXP_Q16", [_;_] -> Contract_vm.EXP_Q16 (r 0, r 1)
+    | "SOFTMAX_Q16_INPLACE", [_;_] -> Contract_vm.SOFTMAX_Q16_INPLACE (r 0, r 1)
+    | "LAYERNORM_Q16_INPLACE", [_;_;_;_] ->
+      Contract_vm.LAYERNORM_Q16_INPLACE (r 0, r 1, r 2, r 3)
+    | "RMSNORM_Q16_INPLACE", [_;_;_] ->
+      Contract_vm.RMSNORM_Q16_INPLACE (r 0, r 1, r 2)
+    | "SILU_Q16_INPLACE", [_;_] -> Contract_vm.SILU_Q16_INPLACE (r 0, r 1)
+    | "ROPE_APPLY_Q16", [_;_;_;_] -> Contract_vm.ROPE_APPLY_Q16 (r 0, r 1, r 2, r 3)
+    | "ATTENTION_KV_Q16", [_;_;_;_;_;_;_;_] ->
+      Contract_vm.ATTENTION_KV_Q16 (r 0, r 1, r 2, r 3, r 4, r 5, r 6, r 7)
+    | "VECDOT_Q16", [_;_;_;_] -> Contract_vm.VECDOT_Q16 (r 0, r 1, r 2, r 3)
+    | "ELEMWISE_MUL_Q16", [_;_;_] -> Contract_vm.ELEMWISE_MUL_Q16 (r 0, r 1, r 2)
+    | "RESIDUAL_ADD_Q16", [_;_;_] -> Contract_vm.RESIDUAL_ADD_Q16 (r 0, r 1, r 2)
+    | "LOAD_INT8_Q16", [_;_;_;_;_] -> Contract_vm.LOAD_INT8_Q16 (r 0, r 1, r 2, r 3, r 4)
+    | "APPEND_VEC_Q16", [_;_;_;_] -> Contract_vm.APPEND_VEC_Q16 (r 0, r 1, r 2, r 3)
+    | "ARGMAX_Q16", [_;_;_] -> Contract_vm.ARGMAX_Q16 (r 0, r 1, r 2)
     | "FHE_LOAD_PK", [_;_] -> Contract_vm.FHE_LOAD_PK (r 0, r 1)
     | "FHE_ADD", [_;_;_;_] -> Contract_vm.FHE_ADD (r 0, r 1, r 2, r 3)
     | "FHE_SUB", [_;_;_;_] -> Contract_vm.FHE_SUB (r 0, r 1, r 2, r 3)
     | "FHE_MUL", [_;_;_;_] -> Contract_vm.FHE_MUL (r 0, r 1, r 2, r 3)
     | "FHE_SCALE", [_;_;_;_] -> Contract_vm.FHE_SCALE (r 0, r 1, r 2, r 3)
+    | "FHE_DIV_CONST", [_;_;_;_] -> Contract_vm.FHE_DIV_CONST (r 0, r 1, r 2, r 3)
     | "FHE_ADD_CONST", [_;_;_;_] -> Contract_vm.FHE_ADD_CONST (r 0, r 1, r 2, r 3)
     | "FHE_SUB_CONST", [_;_;_;_] -> Contract_vm.FHE_SUB_CONST (r 0, r 1, r 2, r 3)
     | "FHE_VERIFY_ZERO", [_;_;_;_] -> Contract_vm.FHE_VERIFY_ZERO (r 0, r 1, r 2, r 3)
@@ -177,7 +195,7 @@ let emit_v = function
   | Contract_vm.VString s -> Printf.sprintf "\"%s\"" s
   | Contract_vm.VBytes b -> Printf.sprintf "\"%s\"" b
   | Contract_vm.VBytes32 b -> Printf.sprintf "\"%s\"" b
-  | Contract_vm.VU64 n -> Int64.to_string n
+  | Contract_vm.VU64 z -> Z.to_string z
   | Contract_vm.VU128 z -> Z.to_string z
   | Contract_vm.VU256 z -> Z.to_string z
   | Contract_vm.VAddr a -> Printf.sprintf "\"%s\"" a
@@ -217,6 +235,7 @@ let emit_instr = function
   | Contract_vm.ORIGIN d -> Printf.sprintf "ORIGIN %s" (emit_reg d)
   | Contract_vm.SELF d -> Printf.sprintf "SELF %s" (emit_reg d)
   | Contract_vm.EPOCH d -> Printf.sprintf "EPOCH %s" (emit_reg d)
+  | Contract_vm.EPOCH_TIME d -> Printf.sprintf "EPOCH_TIME %s" (emit_reg d)
   | Contract_vm.VALUE d -> Printf.sprintf "VALUE %s" (emit_reg d)
   | Contract_vm.BALANCE (d,s) -> Printf.sprintf "BALANCE %s, %s" (emit_reg d) (emit_reg s)
   | Contract_vm.TREEHASH d -> Printf.sprintf "TREEHASH %s" (emit_reg d)
@@ -296,6 +315,8 @@ let emit_instr = function
     Printf.sprintf "FHE_MUL %s, %s, %s, %s" (emit_reg d) (emit_reg pk) (emit_reg a) (emit_reg b)
   | Contract_vm.FHE_SCALE (d,pk,ct,sc) ->
     Printf.sprintf "FHE_SCALE %s, %s, %s, %s" (emit_reg d) (emit_reg pk) (emit_reg ct) (emit_reg sc)
+  | Contract_vm.FHE_DIV_CONST (d,pk,ct,divisor) ->
+    Printf.sprintf "FHE_DIV_CONST %s, %s, %s, %s" (emit_reg d) (emit_reg pk) (emit_reg ct) (emit_reg divisor)
   | Contract_vm.FHE_ADD_CONST (d,pk,ct,c) ->
     Printf.sprintf "FHE_ADD_CONST %s, %s, %s, %s" (emit_reg d) (emit_reg pk) (emit_reg ct) (emit_reg c)
   | Contract_vm.FHE_SUB_CONST (d,pk,ct,c) ->
@@ -319,15 +340,21 @@ let emit_instr = function
   | Contract_vm.MATMUL (d,l,r,m,k,n) -> Printf.sprintf "MATMUL %s, %s, %s, %s, %s, %s" (emit_reg d) (emit_reg l) (emit_reg r) (emit_reg m) (emit_reg k) (emit_reg n)
   | Contract_vm.VECDOT (d,a,b,n) -> Printf.sprintf "VECDOT %s, %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg b) (emit_reg n)
   | Contract_vm.EXP_LUT (d,x) -> Printf.sprintf "EXP_LUT %s, %s" (emit_reg d) (emit_reg x)
+  | Contract_vm.EXP_Q16 (d,x) -> Printf.sprintf "EXP_Q16 %s, %s" (emit_reg d) (emit_reg x)
   | Contract_vm.SOFTMAX_INPLACE (a,n) -> Printf.sprintf "SOFTMAX_INPLACE %s, %s" (emit_reg a) (emit_reg n)
+  | Contract_vm.SOFTMAX_Q16_INPLACE (a,n) -> Printf.sprintf "SOFTMAX_Q16_INPLACE %s, %s" (emit_reg a) (emit_reg n)
   | Contract_vm.LAYERNORM_INPLACE (a,n,g,b) -> Printf.sprintf "LAYERNORM_INPLACE %s, %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg g) (emit_reg b)
+  | Contract_vm.LAYERNORM_Q16_INPLACE (a,n,g,b) -> Printf.sprintf "LAYERNORM_Q16_INPLACE %s, %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg g) (emit_reg b)
   | Contract_vm.RELU_INPLACE (a,n) -> Printf.sprintf "RELU_INPLACE %s, %s" (emit_reg a) (emit_reg n)
   | Contract_vm.RMSNORM_INPLACE (a,n,g) -> Printf.sprintf "RMSNORM_INPLACE %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg g)
+  | Contract_vm.RMSNORM_Q16_INPLACE (a,n,g) -> Printf.sprintf "RMSNORM_Q16_INPLACE %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg g)
+  | Contract_vm.SILU_Q16_INPLACE (a,n) -> Printf.sprintf "SILU_Q16_INPLACE %s, %s" (emit_reg a) (emit_reg n)
   | Contract_vm.SILU_INPLACE (a,n) -> Printf.sprintf "SILU_INPLACE %s, %s" (emit_reg a) (emit_reg n)
   | Contract_vm.ELEMWISE_MUL_INPLACE (d,s,n) -> Printf.sprintf "ELEMWISE_MUL_INPLACE %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg n)
   | Contract_vm.LOAD_INT8_BYTES_TO_MEM (d,s,o,n,sc) -> Printf.sprintf "LOAD_INT8_BYTES_TO_MEM %s, %s, %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg o) (emit_reg n) (emit_reg sc)
   | Contract_vm.RESIDUAL_ADD (d,s,n) -> Printf.sprintf "RESIDUAL_ADD %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg n)
   | Contract_vm.ROPE_APPLY (a,n,p,b) -> Printf.sprintf "ROPE_APPLY %s, %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg p) (emit_reg b)
+  | Contract_vm.ROPE_APPLY_Q16 (a,n,p,b) -> Printf.sprintf "ROPE_APPLY_Q16 %s, %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg p) (emit_reg b)
   | Contract_vm.LOAD_INT8_B64_TO_MEM (d,s,o,n,sc) -> Printf.sprintf "LOAD_INT8_B64_TO_MEM %s, %s, %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg o) (emit_reg n) (emit_reg sc)
   | Contract_vm.MATMUL_Q16 (d,l,r,m,k,n) -> Printf.sprintf "MATMUL_Q16 %s, %s, %s, %s, %s, %s" (emit_reg d) (emit_reg l) (emit_reg r) (emit_reg m) (emit_reg k) (emit_reg n)
   | Contract_vm.SHIFT_ROUND_INPLACE (a,n,b) -> Printf.sprintf "SHIFT_ROUND_INPLACE %s, %s, %s" (emit_reg a) (emit_reg n) (emit_reg b)
@@ -341,6 +368,13 @@ let emit_instr = function
   | Contract_vm.VECDOT_FP (d,a,b,n) -> Printf.sprintf "VECDOT_FP %s, %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg b) (emit_reg n)
   | Contract_vm.ARGMAX_FP (d,a,n) -> Printf.sprintf "ARGMAX_FP %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg n)
   | Contract_vm.ATTENTION_KV_FP (q,k,v,c,t,nq,nk,hd) -> Printf.sprintf "ATTENTION_KV_FP %s, %s, %s, %s, %s, %s, %s, %s" (emit_reg q) (emit_reg k) (emit_reg v) (emit_reg c) (emit_reg t) (emit_reg nq) (emit_reg nk) (emit_reg hd)
+  | Contract_vm.ATTENTION_KV_Q16 (q,k,v,c,t,nq,nk,hd) -> Printf.sprintf "ATTENTION_KV_Q16 %s, %s, %s, %s, %s, %s, %s, %s" (emit_reg q) (emit_reg k) (emit_reg v) (emit_reg c) (emit_reg t) (emit_reg nq) (emit_reg nk) (emit_reg hd)
+  | Contract_vm.VECDOT_Q16 (d,a,b,n) -> Printf.sprintf "VECDOT_Q16 %s, %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg b) (emit_reg n)
+  | Contract_vm.ELEMWISE_MUL_Q16 (d,s,n) -> Printf.sprintf "ELEMWISE_MUL_Q16 %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg n)
+  | Contract_vm.RESIDUAL_ADD_Q16 (d,s,n) -> Printf.sprintf "RESIDUAL_ADD_Q16 %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg n)
+  | Contract_vm.LOAD_INT8_Q16 (d,s,o,n,sc) -> Printf.sprintf "LOAD_INT8_Q16 %s, %s, %s, %s, %s" (emit_reg d) (emit_reg s) (emit_reg o) (emit_reg n) (emit_reg sc)
+  | Contract_vm.APPEND_VEC_Q16 (d,p,s,n) -> Printf.sprintf "APPEND_VEC_Q16 %s, %s, %s, %s" (emit_reg d) (emit_reg p) (emit_reg s) (emit_reg n)
+  | Contract_vm.ARGMAX_Q16 (d,a,n) -> Printf.sprintf "ARGMAX_Q16 %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg n)
   | Contract_vm.APPEND_VEC_FP (d,p,s,n) -> Printf.sprintf "APPEND_VEC_FP %s, %s, %s, %s" (emit_reg d) (emit_reg p) (emit_reg s) (emit_reg n)
 
 let emit instrs =

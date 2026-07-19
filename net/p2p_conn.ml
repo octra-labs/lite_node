@@ -31,6 +31,8 @@ type t = {
   mutable last_seen : float;
 }
 
+let read_idle_timeout_s = 60.0
+
 let create fd ~peer_id ~addr ~direction = {
   fd;
   peer_id;
@@ -63,11 +65,13 @@ let close t =
   end else
     Lwt.return_unit
 
+
 let send t (frame : P2p_frame.frame) =
   if t.connected then
     Lwt_mvar.put t.write_queue frame
   else
     Lwt.return_unit
+
 
 let write_loop t =
   let open Lwt.Syntax in
@@ -88,6 +92,7 @@ let write_loop t =
   in
   loop ()
 
+
 let read_loop t ~on_message =
   let open Lwt.Syntax in
   let rec loop () =
@@ -95,7 +100,7 @@ let read_loop t ~on_message =
     else
       Lwt.catch
         (fun () ->
-          let* frame = P2p_frame.read_frame t.fd in
+          let* frame = P2p_frame.read_frame ~timeout_s:read_idle_timeout_s t.fd in
           t.msg_count_in <- t.msg_count_in + 1;
           t.last_seen <- Unix.gettimeofday ();
           let* () = on_message t frame in
@@ -106,6 +111,7 @@ let read_loop t ~on_message =
           Lwt.return_unit)
   in
   loop ()
+
 
 let start t ~on_message =
   log_conn t.addr "event = start_loops";

@@ -445,12 +445,22 @@ let run ?(stale_retries = 1) cfg deps =
                             ~lag
                             ~soft_lag:cfg.soft_catchup_max_lag with
                     | H.Lagging_soft lag ->
-                      Log.info "catchup"
-                        "soft_catchup lag = %d target = %Ld head = %Ld"
-                        lag target_epoch our_head;
-                      deps.run_catchup_to_target
-                        ~target_epoch
-                        ~reason:"lagging"
+                      begin
+                        match peer_root_quorum with
+                        | H.Matching_quorum _ when lag = 1 && not already_attested ->
+                          Log.info "catchup"
+                            "event = soft_lag_current_root lag = %d target = %Ld head = %Ld"
+                            lag target_epoch our_head;
+                          accept_current_root deps ~head:our_head_int ~root:live_root
+                            "soft_lag_current_root"
+                        | _ ->
+                          Log.info "catchup"
+                            "event = soft_catchup lag = %d target = %Ld head = %Ld"
+                            lag target_epoch our_head;
+                          deps.run_catchup_to_target
+                            ~target_epoch
+                            ~reason:"lagging"
+                      end
                     | H.Lagging_quarantine lag ->
                       deps.mark_quarantine (Printf.sprintf "lag_%d" lag);
                       deps.run_catchup_to_target

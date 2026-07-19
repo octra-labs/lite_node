@@ -99,6 +99,52 @@ type 'driver driver_runtime = {
   peer_quorum : int;
 }
 
+type node_driver_runtime = {
+  data_dir : string;
+  query_timeout : float;
+  run_catchup_to_target :
+    C_driver.t ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+  validator_count : int;
+  quorum : int;
+}
+
+let driver_runtime
+    ~read_pending_commits
+    ~head
+    ~query_epoch_root
+    ~run_catchup_to_target
+    ~delete_pending_commit
+    ~validator_count
+    ~quorum =
+  {
+    read_pending_commits;
+    head;
+    query_epoch_root;
+    run_catchup_to_target;
+    delete_pending_commit;
+    validator_count;
+    peer_quorum = max 0 (quorum - 1);
+  }
+
+let node_driver_runtime runtime =
+  driver_runtime
+    ~read_pending_commits:(fun () ->
+      Wal.read_pending_commits runtime.data_dir)
+    ~head:Head_manifest.get_cached
+    ~query_epoch_root:(fun driver ~epoch_id ->
+      C_driver.query_epoch_root
+        driver
+        ~epoch_id
+        ~timeout_seconds:runtime.query_timeout)
+    ~run_catchup_to_target:runtime.run_catchup_to_target
+    ~delete_pending_commit:(fun ~epoch_id ~round ->
+      Wal.delete_pending_commit runtime.data_dir epoch_id round)
+    ~validator_count:runtime.validator_count
+    ~quorum:runtime.quorum
+
 let head_epoch_of_manifest = function
   | Some head -> head.Head_manifest.epoch_id
   | None -> -1

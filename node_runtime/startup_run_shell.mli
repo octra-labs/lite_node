@@ -75,6 +75,11 @@ type node_launch_runtime = {
   exit_fatal : unit -> unit;
 }
 
+type join_log = {
+  fatal : string -> unit;
+  warn : string -> unit;
+}
+
 val make_node_swarm_deps :
   observer:bool ->
   guard:Octra_net.P2p_tx_gossip_guard.t ->
@@ -131,6 +136,12 @@ val node_swarm_task :
   deps:P2p_swarm_lifecycle.node_deps ->
   unit Lwt.t option
 
+val p2p_listen_task :
+  listen:(port:int -> callback:('a -> unit Lwt.t) -> unit Lwt.t) ->
+  port:int ->
+  unit ->
+  unit Lwt.t
+
 val node_launch_tasks :
   node_launch_deps ->
   unit Lwt.t list
@@ -139,7 +150,11 @@ val observer_loop :
   unit ->
   unit Lwt.t
 
+val default_join_log :
+  join_log
+
 val run_join :
+  log:join_log ->
   tasks:unit Lwt.t list ->
   close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->

@@ -84,12 +84,23 @@ let discard t =
   Hashtbl.reset t.deltas
 
 let commit t ~debit ~credit =
-  List.iter
-    (fun transfer ->
-      debit transfer.from_addr transfer.amount;
-      credit transfer.to_addr transfer.amount)
-    (List.rev !(t.transfers));
-  discard t
+  let rec apply = function
+    | [] -> Ok ()
+    | transfer :: rest ->
+      begin
+        match debit transfer.from_addr transfer.amount with
+        | Error error -> Error error
+        | Ok () ->
+          match credit transfer.to_addr transfer.amount with
+          | Error error -> Error error
+          | Ok () -> apply rest
+      end
+  in
+  match apply (List.rev !(t.transfers)) with
+  | Error _ as error -> error
+  | Ok () as result ->
+    discard t;
+    result
 
 let snapshot t =
   {

@@ -69,6 +69,7 @@ let handle_marker_phase ~data_dir ~store m =
     Epoch_commit_marker.clear_marker data_dir;
     Lwt.return_unit
 
+
 let schema_check chaindata ~irmin_last_epoch =
   let idx = Store_chaindata.index chaindata in
   let stored_version = Chaindata_index.get_meta idx schema_meta_key in
@@ -295,6 +296,7 @@ let recover ~data_dir ~chaindata ~store =
     | Some m -> handle_marker_phase ~data_dir ~store m
   in
 
+
   let head =
     match Head_manifest.load_result data_dir with
     | Head_manifest.Missing ->
@@ -320,6 +322,7 @@ let recover ~data_dir ~chaindata ~store =
       end;
       Some h
   in
+
 
   let journal = Commit_journal.read_all data_dir in
   let head_commit_id = match head with
@@ -368,6 +371,7 @@ let recover ~data_dir ~chaindata ~store =
       Some "HEAD-consistent uncommitted residue"
     else None
   in
+
 
   let pending_wal = Wal.read_pending data_dir in
   if pending_wal <> [] then begin

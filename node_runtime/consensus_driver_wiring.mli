@@ -113,6 +113,17 @@ type standard_adapters = {
   set_catchup_active : bool -> unit;
 }
 
+type proposal_preview_runtime = {
+  chain_id : string;
+  ready_state_root_at : int -> string option Lwt.t;
+  ready_max_lag : int;
+  warn : string -> unit;
+  run_preview :
+    Consensus_proposal.build_preview_request ->
+    env:Octra_core.Epoch_exec.env ->
+    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+}
+
 type deps = {
   chain_id : string;
   my_addr : string;
@@ -236,6 +247,58 @@ type config_with_standard_input = {
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
 }
 
+type node_driver_config_runtime = {
+  standard : node_standard_adapter_runtime;
+  chain_id : string;
+  my_addr : string;
+  sign_fn : string -> string;
+  validator_set : Octra_consensus.C_types.validator_set;
+  gates : gates;
+  proposal_limits : Consensus_proposal.limits;
+  read_local_root_raw : unit -> string Lwt.t;
+  read_local_ledger_root_raw : unit -> string Lwt.t;
+  sleep : float -> unit Lwt.t;
+  quarantine_mismatch_threshold : int;
+  notify_staging_update : unit -> unit;
+  run_preverify :
+    Octra_core.Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
+  proposal_bundles : Consensus_bundle_cache.t;
+  store_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  proposal_preview :
+    ?catch_exn:bool ->
+    Consensus_proposal.build_preview_request ->
+    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+  root_to_raw32 : string -> string;
+  current_epoch : unit -> int;
+  current_round : unit -> int;
+  committed_head_epoch : unit -> int;
+  finality : Consensus_finality_state.callbacks;
+  cached_head : unit -> Octra_core.Head_manifest.t option;
+  now : unit -> float;
+  observer_mode : bool;
+  queue_catchup_target : target_epoch:int64 -> reason:string -> unit;
+  run_catchup_to_target :
+    Octra_consensus.C_driver.t ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  replay_stashed_while_safe : source:string -> unit Lwt.t;
+  driver_read_deps : Consensus_driver_read.deps;
+  scheduled_validator_set_config :
+    Octra_consensus.C_driver.scheduled_validator_set_config option;
+  load_scheduled_validator_set_config :
+    unit ->
+    Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+}
+
 val can_vote :
   deps ->
   bool
@@ -268,10 +331,20 @@ val preview_with_optional_catch :
   (unit -> ('a, string) result Lwt.t) ->
   ('a, string) result Lwt.t
 
+val node_proposal_preview :
+  proposal_preview_runtime ->
+  ?catch_exn:bool ->
+  Consensus_proposal.build_preview_request ->
+  (Octra_core.Epoch_exec.exec_result, string) result Lwt.t
+
 val config :
   deps ->
   Octra_consensus.C_driver.config
 
 val config_with_standard :
   config_with_standard_input ->
+  Octra_consensus.C_driver.config
+
+val node_driver_config :
+  node_driver_config_runtime ->
   Octra_consensus.C_driver.config

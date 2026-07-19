@@ -60,6 +60,20 @@ type runtime_request = {
   runtime_override_proposer : Epochlog.proposer_info option;
 }
 
+type runtime_result = {
+  source_label : string;
+  proposer : Epochlog.proposer_info;
+}
+
+type node_deps = {
+  env : string -> string option;
+  finality : Consensus_finality_state.t;
+  epoch_json : int -> string option;
+  log : string -> unit;
+  fatal : string -> unit;
+  short : string -> string;
+}
+
 val source_label : source -> string
 val valid_proposer : Epochlog.proposer_info -> bool
 val proposer_from_addr : ?commit_round:int -> string -> Epochlog.proposer_info option
@@ -76,3 +90,13 @@ val choose_runtime :
   runtime_deps ->
   runtime_request ->
   (selected, missing) result
+val run_runtime :
+  runtime_deps ->
+  runtime_request ->
+  exit:(unit -> runtime_result) ->
+  runtime_result
+val run_node :
+  node_deps ->
+  runtime_request ->
+  exit:(unit -> runtime_result) ->
+  runtime_result

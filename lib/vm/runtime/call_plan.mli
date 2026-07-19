@@ -197,6 +197,14 @@ val parse_deploy_payload :
   target:string ->
   deploy_payload
 
+val parse_deploy_payload_with_keys :
+  trusted:Program_attestation.key list ->
+  bytecode_b64:string ->
+  deployer:string ->
+  nonce:int ->
+  target:string ->
+  deploy_payload
+
 val deploy_missing_bytecode_reject :
   deploy_reject
 
@@ -210,6 +218,14 @@ val deploy_payload_reject :
   deploy_reject
 
 val plan_deploy_input :
+  bytecode_b64_opt:string option ->
+  deployer:string ->
+  nonce:int ->
+  target:string ->
+  deploy_input_plan
+
+val plan_deploy_input_with_keys :
+  trusted:Program_attestation.key list ->
   bytecode_b64_opt:string option ->
   deployer:string ->
   nonce:int ->

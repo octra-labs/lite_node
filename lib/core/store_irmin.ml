@@ -34,6 +34,8 @@ type t = {
   pvac_dir : string;
 }
 
+type batch_savepoint = Store.tree
+
 let rec strip_trailing_slash path =
   let n = String.length path in
   if n > 1 && path.[n - 1] = Filename.dir_sep.[0] then
@@ -160,6 +162,18 @@ let commit_epoch_batch t msg =
 
 let abort_epoch_batch t =
   t.batch_tree <- None
+
+let save_batch t =
+  match t.batch_tree with
+  | Some tree -> Ok tree
+  | None -> Error "store batch is not active"
+
+let restore_batch t savepoint =
+  match t.batch_tree with
+  | Some _ ->
+    t.batch_tree <- Some savepoint;
+    Ok ()
+  | None -> Error "store batch is not active"
 
 let json_of_account (a : Ledger_types.account) =
   Yojson.Safe.to_string (Ledger_types.account_to_yojson a)
@@ -577,15 +591,35 @@ let load_contract_storage t addr =
        tree () in
   Lwt.return tbl
 
+let sorted_storage_pairs storage_tbl =
+  Hashtbl.fold (fun k v acc -> (k, v) :: acc) storage_tbl []
+  |> List.sort (fun (left, _) (right, _) -> String.compare left right)
+
 let save_contract_storage t addr storage_tbl =
-  let* () = remove_path t ["contracts"; addr; "storage"] in
-  let pairs =
-    Hashtbl.fold (fun k v acc -> (k, v) :: acc) storage_tbl []
-    |> List.sort (fun (left, _) (right, _) -> String.compare left right)
+  let* current_tbl = load_contract_storage t addr in
+  let removals =
+    Hashtbl.fold
+      (fun key _ acc ->
+        if Hashtbl.mem storage_tbl key then acc else key :: acc)
+      current_tbl
+      []
+    |> List.sort String.compare
   in
-  Lwt_list.iter_s (fun (k, v) ->
-    write t ["contracts"; addr; "storage"; k] v
-  ) pairs
+  let writes =
+    sorted_storage_pairs storage_tbl
+    |> List.filter (fun (key, value) ->
+      match Hashtbl.find_opt current_tbl key with
+      | Some current -> not (String.equal current value)
+      | None -> true)
+  in
+  let* () =
+    Lwt_list.iter_s
+      (fun key -> remove_path t ["contracts"; addr; "storage"; key])
+      removals
+  in
+  Lwt_list.iter_s
+    (fun (key, value) -> write t ["contracts"; addr; "storage"; key] value)
+    writes
 
 let deploy_contract t ~address ~code_hash ~version ~owner ~ctype ~bytecode_b64 =
   let meta = Yojson.Safe.to_string (`Assoc [
@@ -601,6 +635,7 @@ let deploy_contract t ~address ~code_hash ~version ~owner ~ctype ~bytecode_b64 =
 let contract_exists t addr =
   let* v = read t ["contracts"; addr; "meta"] in
   Lwt.return (v <> None)
+
 
 let save_contract_abi t addr abi_json =
   write t ["contracts"; addr; "abi"] abi_json
@@ -1125,6 +1160,7 @@ let dump_batch_meta_pairs t =
         let* v = Store.Tree.find meta_tree [name] in
         Lwt.return (name, Option.value ~default:"<none>" v)
       ) entries
+
 
 let get_commit_hash t =
   let* head = Store.Head.find t.store in

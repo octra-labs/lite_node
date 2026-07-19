@@ -279,6 +279,10 @@ val run_configured_node_catchup :
   node_runtime_deps ->
   unit Lwt.t
 
+val run_configured_node_wiring :
+  node_runtime_wiring ->
+  unit Lwt.t
+
 val ready_marker :
   data_dir:string ->
   consensus_role:string ->

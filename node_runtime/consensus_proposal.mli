@@ -160,6 +160,7 @@ type frozen_proposal = {
 
 type build_preview_request = {
   epoch_id : int64;
+  epoch_ts : float;
   proposal_id : string;
   expected_prev_root : string;
   prev_state_root : string;
@@ -207,6 +208,8 @@ type make_proposal_deps = {
 }
 
 type verify_proposal_deps = {
+  now : unit -> float;
+  previous_epoch_ts : int64 -> float option;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   mark_quarantine : string -> unit;
@@ -373,6 +376,7 @@ val validator_pubkeys :
 val epoch_exec_env :
   chain_id:string ->
   epoch_id:int64 ->
+  epoch_ts:float ->
   proposer:string ->
   validator_pubkeys:validator_pubkeys ->
   prev_state_root:string ->

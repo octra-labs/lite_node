@@ -201,3 +201,18 @@ let node_root_deps readers =
         ~root_to_raw32:readers.root_to_raw32
         (readers.cached_head ()));
   }
+
+let node_store_root_deps ~chaindata ~store ~current_epoch ~root_to_raw32
+    ~cached_head =
+  node_root_deps
+    {
+      current_epoch;
+      root_to_raw32;
+      read_head_hash = (fun () ->
+        Octra_core.Store_irmin.get_head_hash store);
+      cached_head;
+      get_epoch_json = (fun epoch_id ->
+        Octra_core.Chaindata_index.get_epoch
+          (Octra_core.Store_chaindata.index chaindata)
+          epoch_id);
+    }

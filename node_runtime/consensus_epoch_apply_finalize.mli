@@ -25,6 +25,7 @@ type effects = {
 type input = {
   tree_ref : Octra_core.Tree.t ref;
   epoch_id : int;
+  epoch_ts : float;
   epoch_start : float;
   proposer_addr : string;
   validator_addr : string;

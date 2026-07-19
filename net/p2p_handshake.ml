@@ -33,6 +33,7 @@ let short_hash h =
   String.concat "" (List.init (min 8 (String.length h)) (fun i ->
     Printf.sprintf "%02x" (Char.code h.[i])))
 
+
 let hello_sign_bytes (h : hello) =
   Hash_domain.hash_encoded "octra:p2p_hello:v1" (fun buf ->
     Oce1.put_string buf h.chain_id;
@@ -45,6 +46,7 @@ let hello_sign_bytes (h : hello) =
     Oce1.put_u64 buf h.best_epoch;
     Oce1.put_hash32 buf h.best_root;
     Oce1.put_hash32 buf h.nonce)
+
 
 let encode_hello (h : hello) =
   Oce1.encode (fun buf ->
@@ -59,6 +61,7 @@ let encode_hello (h : hello) =
     Oce1.put_hash32 buf h.best_root;
     Oce1.put_hash32 buf h.nonce;
     Oce1.put_bytes buf h.signature)
+
 
 let decode_hello payload =
   let c = Oce1.make_cursor payload in
@@ -76,11 +79,14 @@ let decode_hello payload =
   { chain_id; proto_version; node_id; node_addr; pubkey; consensus_config_hash;
     listen_port; best_epoch; best_root; nonce; signature }
 
+
 let random_nonce () =
   Mirage_crypto_rng.generate 32
 
+
 let node_id_of_pubkey (pubkey_raw : string) =
   Hash_domain.hash_hex "octra:node_id:v1" pubkey_raw
+
 
 let verify_hello_signature (h : hello) : bool =
   try
@@ -91,8 +97,10 @@ let verify_hello_signature (h : hello) : bool =
     | Error _ -> false
   with _ -> false
 
+
 let verify_node_id (h : hello) : bool =
   h.node_id = node_id_of_pubkey h.pubkey
+
 
 let make_hello ~chain_id ~node_addr ~pubkey_raw ~consensus_config_hash
     ~listen_port ~best_epoch ~best_root ~sign_fn =
@@ -112,6 +120,7 @@ type handshake_result =
   | Ok of hello
   | Error of string
 
+
 let validate_hello ~my_chain_id ~my_config_hash ~allowed_pubkeys (h : hello) : (unit, string) result =
   if h.chain_id <> my_chain_id then
     Result.Error (Printf.sprintf "chain_id mismatch: %s vs %s" h.chain_id my_chain_id)
@@ -128,6 +137,7 @@ let validate_hello ~my_chain_id ~my_config_hash ~allowed_pubkeys (h : hello) : (
     Result.Error (Printf.sprintf "unknown validator pubkey (node_id=%s)" (String.sub h.node_id 0 12))
   else
     Result.Ok ()
+
 
 let dial_handshake fd ~my_hello ~allowed_pubkeys =
   let open Lwt.Syntax in
@@ -148,6 +158,7 @@ let dial_handshake fd ~my_hello ~allowed_pubkeys =
         | Result.Ok () -> Lwt.return (Ok peer_hello))
     (fun exn ->
       Lwt.return (Error (Printf.sprintf "handshake failed: %s" (Printexc.to_string exn))))
+
 
 let accept_handshake fd ~my_hello ~allowed_pubkeys =
   let open Lwt.Syntax in

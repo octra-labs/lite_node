@@ -120,8 +120,75 @@ type gate_deps = {
   fhe_gate : unit -> Private_gate.reject option;
 }
 
+type live_tx_args = {
+  stealth_count : int;
+  max_stealth_per_epoch : int;
+  max_stealth_defer : int;
+  inline_verify_allowed : bool;
+  expected_kat : unit -> string;
+  stored_kat : string -> string option;
+  set_kat : string -> string -> unit;
+  log_backfill : string -> unit;
+  debit_gate : unit -> Private_gate.reject option;
+  fhe_gate : unit -> Private_gate.reject option;
+  defer_count : string -> int;
+  set_defer_count : string -> int -> unit;
+  clear_defer_count : string -> unit;
+  defer_tx : Transaction.t -> unit Lwt.t;
+  reject : string -> string -> unit Lwt.t;
+  plan :
+    Transaction.t ->
+    (Private_ledger.stealth_plan, Private_ledger.failure) result Lwt.t;
+  trace_cipher : string -> string -> string -> string -> unit;
+  inline_range :
+    Transaction.t ->
+    Private_ledger.stealth_plan ->
+    (Private_ledger.stealth_range, Private_ledger.failure) result Lwt.t;
+  accept_range : Private_ledger.stealth_range -> (unit, Private_ledger.failure) result;
+  binding :
+    Transaction.t ->
+    Private_ledger.stealth_plan ->
+    (unit, Private_ledger.failure) result Lwt.t;
+  debit : Transaction.t -> Z.t -> int -> (unit, string) result;
+  update : Transaction.t -> string -> (unit, string) result;
+  create_output :
+    tx_hash:string ->
+    Transaction.t ->
+    Private_ledger.stealth_plan ->
+    (int64, string) result Lwt.t;
+  accept :
+    Transaction.t ->
+    int64 ->
+    Private_ledger.stealth_plan ->
+    unit Lwt.t;
+}
+
+type live_ledger_tx_args = {
+  ledger : Octra_core.Ledger.t;
+  current_epoch : unit -> int;
+  stealth_count : int;
+  max_stealth_per_epoch : int;
+  max_stealth_defer : int;
+  inline_verify_allowed : bool;
+  debit_gate : unit -> Private_gate.reject option;
+  fhe_gate : unit -> Private_gate.reject option;
+  defer_count : string -> int;
+  set_defer_count : string -> int -> unit;
+  clear_defer_count : string -> unit;
+  defer_tx : Transaction.t -> unit Lwt.t;
+  reject : string -> string -> unit Lwt.t;
+  trace_cipher : string -> string -> string -> string -> unit;
+  short_addr : string -> string;
+  mark_debit : unit -> unit;
+  incr_stealth : unit -> unit;
+  incr_fhe : unit -> unit;
+  confirm : unit -> unit Lwt.t;
+}
+
 val run : deps -> unit Lwt.t
 val run_tx : tx_deps -> Transaction.t -> unit Lwt.t
+val live_tx_deps : live_tx_args -> tx_deps
+val live_ledger_tx_deps : live_ledger_tx_args -> tx_deps
 val gate_reject : gate_deps -> Transaction.t -> Private_gate.reject option
 val log_cap_defer : count:int -> max:int -> tx:string -> unit
 val log_defer : count:int -> max:int -> status:string -> tx:string -> unit

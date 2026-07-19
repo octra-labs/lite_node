@@ -160,6 +160,7 @@ type frozen_proposal = {
 
 type build_preview_request = {
   epoch_id : int64;
+  epoch_ts : float;
   proposal_id : string;
   expected_prev_root : string;
   prev_state_root : string;
@@ -207,6 +208,8 @@ type make_proposal_deps = {
 }
 
 type verify_proposal_deps = {
+  now : unit -> float;
+  previous_epoch_ts : int64 -> float option;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   mark_quarantine : string -> unit;
@@ -504,7 +507,7 @@ let validator_pubkeys ~driver ~fallback =
   | Some driver -> validator_pubkeys_from_driver driver
   | None -> fallback ()
 
-let epoch_exec_env ~chain_id ~epoch_id ~proposer ~validator_pubkeys
+let epoch_exec_env ~chain_id ~epoch_id ~epoch_ts ~proposer ~validator_pubkeys
     ~prev_state_root ~ready_state_root_at ~ready_max_lag =
   Octra_core.Epoch_exec.{
     chain_id;
@@ -513,7 +516,7 @@ let epoch_exec_env ~chain_id ~epoch_id ~proposer ~validator_pubkeys
     validator_addrs = List.map fst validator_pubkeys;
     validator_pubkeys;
     prev_state_root;
-    epoch_ts = float_of_int (Int64.to_int epoch_id * 10);
+    epoch_ts;
     ready_state_root_at = Some ready_state_root_at;
     ready_max_lag;
   }
@@ -1126,13 +1129,44 @@ let handle_proposal_admission ~start_height ~epoch_id ~current_epoch
 let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
-  if deps.quarantine_active () then begin
+  let previous =
+    if propose.epoch_id <= 0L then Ok None
+    else
+      match deps.previous_epoch_ts (Int64.pred propose.epoch_id) with
+      | None -> Error "previous epoch time unavailable"
+      | Some value ->
+        begin
+          match Octra_consensus.Epoch_time.of_seconds value with
+          | Ok time -> Ok (Some time)
+          | Error reason -> Error reason
+        end
+  in
+  match previous with
+  | Error reason ->
     Octra_log.warn "consensus"
-      "reject proposal reason = self_quarantine epoch = %Ld detail = %s"
-      propose.epoch_id
-      (deps.quarantine_reason ());
+      "reject proposal reason = invalid_epoch_time detail = %s"
+      reason;
     Lwt.return_false
-  end else
+  | Ok previous ->
+    match
+      Octra_consensus.Epoch_time.check
+        ~now:(deps.now ())
+        ~previous
+        ~candidate:propose.header.ts
+    with
+  | Error reason ->
+    Octra_log.warn "consensus"
+      "reject proposal reason = invalid_epoch_time detail = %s"
+      reason;
+    Lwt.return_false
+  | Ok _ when deps.quarantine_active () -> begin
+      Octra_log.warn "consensus"
+        "reject proposal reason = self_quarantine epoch = %Ld detail = %s"
+        propose.epoch_id
+        (deps.quarantine_reason ());
+      Lwt.return_false
+    end
+  | Ok _ ->
     let target = propose.header.prev_state_root in
     let* root_sample =
       wait_for_prev_root
@@ -1286,6 +1320,7 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
           let* preview_result =
             deps.preview {
               epoch_id = propose.epoch_id;
+              epoch_ts = propose.header.ts;
               proposal_id = Printf.sprintf "verify-%Ld" propose.epoch_id;
               expected_prev_root = local_ledger_root_for_preview;
               prev_state_root = our_root;
@@ -1425,9 +1460,11 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
       let proposer = deps.proposer () in
       let validator_pubkeys = deps.validator_pubkeys epoch_id in
       let preverify = Octra_core.Preverify_commit.create pre_shape.receipts in
+      let epoch_ts = deps.now () in
       let* preview_result =
         deps.preview {
           epoch_id;
+          epoch_ts;
           proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
           expected_prev_root = prev_ledger_root;
           prev_state_root = prev_root;
@@ -1475,7 +1512,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
           ~creator_addr:proposer
           ~next_txid:(deps.next_txid ())
           ~head_txid_hi:(deps.head_txid_hi ())
-          ~ts:(deps.now ())
+          ~ts:epoch_ts
       in
       Octra_log.info "consensus"
         "proposing epoch = %Ld txs = %d txid_hi = %Ld"

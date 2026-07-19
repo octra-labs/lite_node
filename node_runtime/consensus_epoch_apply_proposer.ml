@@ -61,6 +61,20 @@ type runtime_request = {
   runtime_override_proposer : Epochlog.proposer_info option;
 }
 
+type runtime_result = {
+  source_label : string;
+  proposer : Epochlog.proposer_info;
+}
+
+type node_deps = {
+  env : string -> string option;
+  finality : Consensus_finality_state.t;
+  epoch_json : int -> string option;
+  log : string -> unit;
+  fatal : string -> unit;
+  short : string -> string;
+}
+
 let source_label = function
   | Env -> "env"
   | Override -> "override"
@@ -190,3 +204,35 @@ let choose_runtime deps request =
   | Error missing ->
     deps.fatal (missing_line ~epoch_id:request.runtime_epoch_id missing);
     Error missing
+
+let run_runtime deps request ~exit =
+  match choose_runtime deps request with
+  | Ok selected ->
+    {
+      source_label = source_label selected.source;
+      proposer = selected.proposer;
+    }
+  | Error _ ->
+    exit ()
+
+let node_runtime_deps deps epoch_id =
+  {
+    env_fee_recipient = (fun () -> deps.env "OCTRA_FEE_RECIPIENT");
+    pending_proposer = (fun () ->
+      Consensus_finality_state.find_proposer deps.finality epoch_id);
+    finalized = (fun () ->
+      Consensus_finality_state.find_finalized deps.finality epoch_id);
+    disk_epoch = (fun () ->
+      match deps.epoch_json epoch_id with
+      | Some raw -> Epochlog.epoch_of_json raw
+      | None -> None);
+    log = deps.log;
+    fatal = deps.fatal;
+    short = deps.short;
+  }
+
+let run_node deps request ~exit =
+  run_runtime
+    (node_runtime_deps deps request.runtime_epoch_id)
+    request
+    ~exit

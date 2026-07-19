@@ -25,6 +25,17 @@ type queue_event = {
   queued_label : string;
 }
 
+type node_queue_runtime = {
+  queue : Consensus_catchup_queue.t;
+  catchup_active : bool ref;
+  clear_state_attested : unit -> unit;
+}
+
+type node_queue = {
+  queue_catchup_target : target_epoch:int64 -> reason:string -> unit;
+  queue_finalized_gap : target_epoch:int64 -> reason:string -> unit;
+}
+
 type deps = {
   catchup_active : unit -> bool;
   set_catchup_active : bool -> unit;
@@ -401,6 +412,13 @@ val driver_runner_wiring_of_node :
   driver_runner_node_wiring ->
   driver_runner_wiring
 
+val node_driver_runner :
+  driver_runner_node_wiring ->
+  Octra_consensus.C_driver.t ->
+  target_epoch:int64 ->
+  reason:string ->
+  unit Lwt.t
+
 val run_driver_wired :
   driver_runner_wiring ->
   driver_io ->
@@ -440,6 +458,10 @@ val queue_gap_and_log :
   target_epoch:int64 ->
   reason:string ->
   unit
+
+val node_queue :
+  node_queue_runtime ->
+  node_queue
 
 val run_wired :
   deps ->

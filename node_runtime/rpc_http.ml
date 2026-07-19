@@ -19,6 +19,8 @@ module Server = Cohttp_lwt_unix.Server
 
 open Lwt.Infix
 
+let max_body_bytes = Octra_net.P2p_tx_gossip.max_tx_json + 65_536
+
 type meta = {
   rpc_peer : string;
   rpc_user_agent : string;
@@ -50,11 +52,52 @@ let respond_json data =
     ~body:(Yojson.Safe.to_string data)
     ()
 
+let respond_error status message =
+  Server.respond_string
+    ~status
+    ~headers:(Header.of_list [
+      "Content-Type", "application/json";
+      "Access-Control-Allow-Origin", "*"
+    ])
+    ~body:(Yojson.Safe.to_string (`Assoc ["error", `String message]))
+    ()
+
+let content_length_too_large req =
+  match Header.get (Request.headers req) "content-length" with
+  | None -> false
+  | Some value ->
+    match Int64.of_string_opt (String.trim value) with
+    | None -> false
+    | Some n -> Int64.compare n (Int64.of_int max_body_bytes) > 0
+
+let body_to_string_limited body =
+  let stream = Cohttp_lwt.Body.to_stream body in
+  let buf = Buffer.create 4096 in
+  let rec loop total =
+    Lwt_stream.get stream >>= function
+    | None -> Lwt.return (Ok (Buffer.contents buf))
+    | Some chunk ->
+      let n = String.length chunk in
+      if n > max_body_bytes - total then
+        Lwt.return (Error "request body too large")
+      else begin
+        Buffer.add_string buf chunk;
+        loop (total + n)
+      end
+  in
+  loop 0
+
 let handle_rpc_post ~process req body =
-  Cohttp_lwt.Body.to_string body >>= fun body_str ->
-  let meta = meta_of_request ~body_bytes:(String.length body_str) req in
-  process meta body_str >>= fun result ->
-  respond_json result
+  if content_length_too_large req then
+    respond_error `Request_entity_too_large "request body too large"
+  else
+    body_to_string_limited body >>= function
+    | Error message ->
+      respond_error `Request_entity_too_large message
+    | Ok body_str ->
+      let meta = meta_of_request ~body_bytes:(String.length body_str) req in
+      process meta body_str >>= fun result ->
+      respond_json result
 
 let route_rpc_or_fallback ~rpc_handler ~fallback_handler _conn req body =
   match Request.meth req, Uri.path (Request.uri req) with

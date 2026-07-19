@@ -127,3 +127,11 @@ val node_store_deps :
 val node_root_deps :
   node_root_readers ->
   node_root_deps
+
+val node_store_root_deps :
+  chaindata:Octra_core.Store_chaindata.t ->
+  store:Octra_core.Store_irmin.t ->
+  current_epoch:(unit -> int) ->
+  root_to_raw32:(string -> string) ->
+  cached_head:(unit -> Octra_core.Head_manifest.t option) ->
+  node_root_deps

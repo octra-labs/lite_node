@@ -23,13 +23,22 @@ type compile_result = {
   version : string;
   verification_json : string;
   certificate_json : string;
+  program_envelope : string option;
+  program_facts : Program_type_flow.facts option;
+}
+
+type xcall_abi = {
+  method_name : string;
+  inputs : Program_type_flow.kind list;
+  output : Program_type_flow.kind;
+  capabilities : Program_type_flow.capability list;
 }
 
 let error_result msg =
-  { bytecode = ""; abi_json = ""; instructions = 0; error = Some msg; version = lang_version; verification_json = ""; certificate_json = "" }
+  { bytecode = ""; abi_json = ""; instructions = 0; error = Some msg; version = lang_version; verification_json = ""; certificate_json = ""; program_envelope = None; program_facts = None }
 
 let ok_result ~bytecode ~abi_json ~instructions ~verification_json ~certificate_json =
-  { bytecode; abi_json; instructions; error = None; version = lang_version; verification_json; certificate_json }
+  { bytecode; abi_json; instructions; error = None; version = lang_version; verification_json; certificate_json; program_envelope = None; program_facts = None }
 
 let verification_json ast =
   Aml_verify.verify_ast ast
@@ -45,12 +54,143 @@ let canonical_sources sources =
   |> List.map (fun (path, source) -> `Assoc ["path", `String path; "source_hash", `String (sha256_hex source)])
   |> fun values -> Yojson.Safe.to_string (`List values)
 
-let certificate_json ~source_mode ~source_material ~bytecode ~verification_json =
+let flow_kind = function
+  | Oct_lang.TInt -> Program_type_flow.Int
+  | Oct_lang.TBool -> Program_type_flow.Bool
+  | Oct_lang.TString -> Program_type_flow.String
+  | Oct_lang.TAddress -> Program_type_flow.Addr
+  | Oct_lang.TBytes -> Program_type_flow.Bytes
+  | Oct_lang.TBytes32 -> Program_type_flow.Bytes32
+  | Oct_lang.TU64 -> Program_type_flow.U64
+  | Oct_lang.TU128 -> Program_type_flow.U128
+  | Oct_lang.TU256 -> Program_type_flow.U256
+  | Oct_lang.TCipher -> Program_type_flow.Cipher
+  | Oct_lang.TPubKey -> Program_type_flow.PubKey
+  | Oct_lang.TMap _
+  | Oct_lang.TList _
+  | Oct_lang.TStruct _
+  | Oct_lang.TEnum _
+  | Oct_lang.TOption _
+  | Oct_lang.TTuple _
+  | Oct_lang.TVoid -> Program_type_flow.Unknown
+
+let param_facts params =
+  params
+  |> List.mapi (fun i param -> (1001 + i, flow_kind param.Oct_lang.p_typ))
+
+let facts_of_ast ast code =
+  let label_pc label =
+    Array.to_list code
+    |> List.mapi (fun pc op ->
+      match op with
+      | Contract_vm.JDEST value when value = label -> Some pc
+      | _ -> None)
+    |> List.find_map (fun value -> value)
+  in
+  let root =
+    match ast.Oct_lang.ctor with
+    | Some ctor -> param_facts ctor.Oct_lang.fn_params
+    | None -> []
+  in
+  let entries =
+    ast.Oct_lang.funcs
+    |> List.mapi (fun i fn ->
+      match label_pc (200 + i * 100) with
+      | Some target ->
+        Some { Program_type_flow.target; mem = param_facts fn.Oct_lang.fn_params; effects = [] }
+      | None -> None)
+    |> List.filter_map (fun value -> value)
+  in
+  let calls =
+    let owner_pc entries pc =
+      entries
+      |> List.fold_left (fun owner (entry : Program_type_flow.entry) ->
+        if entry.Program_type_flow.target <= pc then Some entry.target else owner)
+        None
+    in
+    Array.to_list code
+    |> List.mapi (fun pc op ->
+      match op with
+      | Contract_vm.CALL_INT (_, label) ->
+        (match label_pc label, owner_pc entries pc,
+               List.mapi (fun i fn -> (200 + i * 100, fn)) ast.Oct_lang.funcs
+               |> List.find_opt (fun (value, _) -> value = label) with
+         | Some target, Some owner, Some (_, fn) ->
+           Some { Program_type_flow.owner; pc; target; kind = flow_kind fn.Oct_lang.fn_ret }
+         | _ -> None)
+      | _ -> None)
+    |> List.filter_map (fun value -> value)
+  in
+  { Program_type_flow.root; entries; calls; xcalls = [] }
+
+let fact_json key (slot, kind) =
+  `Assoc [key, `Int slot; "kind", `String (Program_type_flow.kind_name kind)]
+
+let facts_json facts =
+  let root = List.map (fact_json "slot") facts.Program_type_flow.root in
+  let entries =
+    List.map (fun (entry : Program_type_flow.entry) ->
+      `Assoc [
+        "target", `Int entry.Program_type_flow.target;
+        "memory", `List (List.map (fact_json "slot") entry.Program_type_flow.mem);
+        "effects", `List (List.map (fun value -> `String value) entry.Program_type_flow.effects)
+      ]) facts.Program_type_flow.entries
+  in
+  let calls =
+    List.map (fun (call : Program_type_flow.call) ->
+      `Assoc [
+        "owner", `Int call.Program_type_flow.owner;
+        "pc", `Int call.Program_type_flow.pc;
+        "target", `Int call.Program_type_flow.target;
+        "kind", `String (Program_type_flow.kind_name call.Program_type_flow.kind)
+      ]) facts.Program_type_flow.calls
+  in
+  let xcalls =
+    facts.Program_type_flow.xcalls
+    |> List.sort (fun (left : Program_type_flow.xcall) right -> compare left.pc right.pc)
+    |> List.map (fun (call : Program_type_flow.xcall) ->
+      let kind_json kind = `String (Program_type_flow.kind_name kind) in
+      `Assoc [
+        "pc", `Int call.pc;
+        "method", `String call.method_name;
+        "inputs", `List (List.map kind_json call.inputs);
+        "output", kind_json call.output;
+        "capabilities", `List (List.map (fun value -> `String (Program_type_flow.capability_name value)) call.capabilities)
+      ])
+  in
+  `Assoc [
+    "root", `List root;
+    "entries", `List entries;
+    "calls", `List calls;
+    "xcalls", `List xcalls
+  ]
+
+let program_certificate raw effects facts =
+  try
+    match Yojson.Safe.from_string raw with
+    | `Assoc fields ->
+      let fields =
+        List.filter
+          (fun (key, _) -> key <> "schema" && key <> "effects" && key <> "facts")
+          fields
+      in
+      let effect_json = `List (List.map (fun name -> `String name) effects) in
+      Ok (Yojson.Safe.to_string (`Assoc (
+        ("schema", `String "aml_bytecode_certificate_v2")
+        :: ("effects", effect_json)
+        :: ("facts_hash", `String (Program_type_flow.facts_hash facts))
+        :: ("facts", facts_json facts)
+        :: fields)))
+    | _ -> Error "program certificate must be an object"
+  with _ -> Error "invalid program certificate"
+
+let certificate_json ~declaration ~source_mode ~source_material ~bytecode ~verification_json =
   let verification_hash = sha256_hex verification_json in
   `Assoc [
     "schema", `String "aml_bytecode_certificate_v1";
     "compiler", `String "octra_aml";
     "compiler_version", `String lang_version;
+    "declaration", `String declaration;
     "verification_schema", `String Aml_verify.schema;
     "source_mode", `String source_mode;
     "source_hash", `String (sha256_hex source_material);
@@ -101,7 +241,7 @@ let abi_event_json (name, fields) =
   in
   Printf.sprintf "{\"name\":%S,\"fields\":[%s]}" name fields_json
 
-let abi_json abi =
+let abi_json declaration abi =
   let fns =
     abi.Ocs01.fns
     |> List.map abi_function_json
@@ -112,15 +252,18 @@ let abi_json abi =
     |> List.map abi_event_json
     |> String.concat ","
   in
-  Printf.sprintf "{\"functions\":[%s],\"events\":[%s]}" fns events
+  Printf.sprintf "{\"declaration\":%S,\"functions\":[%s],\"events\":[%s]}" declaration fns events
 
 let compile_ast ~source_mode ~source_material ast =
+  let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
   let code = Oct_gen.generate ast in
-  let abi_json = Oct_gen.to_abi ast |> abi_json in
+  let abi_json = Oct_gen.to_abi ast |> abi_json declaration in
   let bytecode = Bytecode.encode code in
   let verification_json = verification_json ast in
-  let certificate_json = certificate_json ~source_mode ~source_material ~bytecode ~verification_json in
-  ok_result ~bytecode ~abi_json ~instructions:(Array.length code) ~verification_json ~certificate_json
+  let certificate_json = certificate_json ~declaration ~source_mode ~source_material ~bytecode ~verification_json in
+  let program_facts = facts_of_ast ast code in
+  { (ok_result ~bytecode ~abi_json ~instructions:(Array.length code) ~verification_json ~certificate_json) with
+    program_facts = Some program_facts }
 
 let load_required load path =
   match load path with
@@ -156,7 +299,7 @@ let compile source =
   | e ->
     error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
 
-let compile_multi (resolver : string -> string option) main_path =
+let compile_multi_mode ~program_only (resolver : string -> string option) main_path =
   try
     let loaded_sources = ref [] in
     let load path =
@@ -168,11 +311,13 @@ let compile_multi (resolver : string -> string option) main_path =
     in
     let main_source = load_required load main_path in
     let ast = Oct_parse.parse main_source in
-    let source_material = canonical_sources !loaded_sources in
-    ast
-    |> imported_interfaces load
-    |> merge_interfaces ast
-    |> compile_ast ~source_mode:"multi" ~source_material
+    if program_only && ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
+      error_result "Program declaration required"
+    else
+      let interfaces = imported_interfaces load ast in
+      let source_material = canonical_sources !loaded_sources in
+      let merged_ast = merge_interfaces ast interfaces in
+      compile_ast ~source_mode:"multi" ~source_material merged_ast
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
@@ -182,3 +327,127 @@ let compile_multi (resolver : string -> string option) main_path =
     error_result (Printf.sprintf "line %d: %s" line msg)
   | e ->
     error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+
+let compile_multi resolver main_path =
+  compile_multi_mode ~program_only:false resolver main_path
+
+let external_pcs code =
+  Array.to_list code
+  |> List.mapi (fun pc op ->
+    match op with
+    | Contract_vm.XCALL _ -> Some pc
+    | _ -> None)
+  |> List.filter_map (fun value -> value)
+
+let attach_xcalls code facts specs =
+  let pcs = external_pcs code in
+  if List.length pcs <> List.length specs then
+    Error "external ABI count does not match XCALL count"
+  else
+    let xcalls =
+      List.map2 (fun pc spec ->
+        {
+          Program_type_flow.pc;
+          method_name = spec.method_name;
+          inputs = spec.inputs;
+          output = spec.output;
+          capabilities = spec.capabilities;
+        })
+        pcs specs
+    in
+    Ok { facts with Program_type_flow.xcalls }
+
+let emit_program_with_facts result facts =
+  match result.error with
+  | Some _ -> result
+  | None ->
+    (match Bytecode.decode result.bytecode with
+     | Error error -> error_result ("Program bytecode: " ^ error)
+     | Ok code ->
+       (match Program_policy.complete code facts with
+        | Error error -> error_result ("Program effect policy: " ^ error)
+        | Ok facts ->
+          (match Program_policy.effects code facts with
+           | Error error -> error_result ("Program effect policy: " ^ error)
+           | Ok effects ->
+             match Admission.of_program ~facts code with
+             | Error error -> error_result ("Program admission: " ^ Admission.error_message error)
+             | Ok _ ->
+               (match program_certificate result.certificate_json effects facts with
+                | Error error -> error_result error
+                | Ok cert ->
+                  match Program_envelope.encode ~code:result.bytecode ~cert with
+                  | Error error -> error_result ("Program envelope: " ^ Program_envelope.error_message error)
+                  | Ok envelope -> { result with certificate_json = cert; program_envelope = Some envelope }))))
+
+let emit_program result =
+  match result.program_facts with
+  | None -> error_result "Program facts missing"
+  | Some facts -> emit_program_with_facts result facts
+
+let attest_program ~key_id ~private_key result =
+  match result.error, result.program_envelope with
+  | Some _, _ -> result
+  | None, None -> error_result "Program envelope missing"
+  | None, Some _ ->
+    (match Program_attestation.attach ~key_id ~private_key result.certificate_json with
+     | Error error -> error_result (Program_attestation.error_message error)
+     | Ok certificate_json ->
+       (match Program_envelope.encode ~code:result.bytecode ~cert:certificate_json with
+        | Error error -> error_result ("Program envelope: " ^ Program_envelope.error_message error)
+        | Ok program_envelope -> { result with certificate_json; program_envelope = Some program_envelope }))
+
+let compile_program source =
+  try
+    let ast = Oct_parse.parse source in
+    if ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
+      error_result "Program declaration required"
+    else
+      emit_program (compile source)
+  with
+  | Oct_lex.LexError (msg, line, _col) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | Oct_parse.ParseError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | e ->
+    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+
+let compile_program_with_xcalls source specs =
+  try
+    let ast = Oct_parse.parse source in
+    if ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
+      error_result "Program declaration required"
+    else
+      let result = compile source in
+      match result.error, result.program_facts with
+      | Some _, _ -> result
+      | None, None -> error_result "Program facts missing"
+      | None, Some facts ->
+        (match Bytecode.decode result.bytecode with
+         | Error error -> error_result ("Program bytecode: " ^ error)
+         | Ok code ->
+           (match attach_xcalls code facts specs with
+            | Error error -> error_result error
+            | Ok facts -> emit_program_with_facts result facts))
+  with
+  | Oct_lex.LexError (msg, line, _col) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | Oct_parse.ParseError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | e ->
+    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+
+let admit_program_source source raw =
+  let result = compile_program source in
+  match result.error, result.program_envelope with
+  | Some error, _ -> Error error
+  | None, None -> Error "Program source admission envelope missing"
+  | None, Some expected when not (String.equal expected raw) ->
+    Error "Program source does not match envelope"
+  | None, Some _ ->
+    (match Admission.decode_program_source raw with
+     | Ok admitted -> Ok admitted
+     | Error error -> Error (Admission.error_message error))
+
+let compile_program_multi resolver main_path =
+  emit_program (compile_multi_mode ~program_only:true resolver main_path)

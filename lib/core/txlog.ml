@@ -278,6 +278,7 @@ let scan_all t f =
 let current_position t =
   (t.current_seg, t.current_offset)
 
+
 let truncate_to t ~seg_id ~offset =
   Unix.close t.current_fd;
   let later = ref (seg_id + 1) in

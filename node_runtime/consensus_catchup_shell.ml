@@ -29,6 +29,17 @@ type queue_event = {
   queued_label : string;
 }
 
+type node_queue_runtime = {
+  queue : Consensus_catchup_queue.t;
+  catchup_active : bool ref;
+  clear_state_attested : unit -> unit;
+}
+
+type node_queue = {
+  queue_catchup_target : target_epoch:int64 -> reason:string -> unit;
+  queue_finalized_gap : target_epoch:int64 -> reason:string -> unit;
+}
+
 type deps = {
   catchup_active : unit -> bool;
   set_catchup_active : bool -> unit;
@@ -997,6 +1008,13 @@ let run_driver_wired (wiring : driver_runner_wiring) io ~target_epoch ~reason =
     ~target_epoch
     ~reason
 
+let node_driver_runner wiring driver ~target_epoch ~reason =
+  run_driver_wired
+    (driver_runner_wiring_of_node wiring)
+    (driver_io_of_driver driver)
+    ~target_epoch
+    ~reason
+
 let queue_event_of_snapshot ~active ~target_epoch ~reason snapshot =
   {
     queued_target_epoch = target_epoch;
@@ -1030,6 +1048,25 @@ let queue_gap_and_log queue ~active ~clear_state_attested ~target_epoch
   let event = queue_gap_event queue ~active:(active ()) ~target_epoch ~reason in
   clear_state_attested ();
   log_queue_event event
+
+let node_queue (runtime : node_queue_runtime) =
+  {
+    queue_catchup_target =
+      (fun ~target_epoch ~reason ->
+        queue_target_and_log
+          runtime.queue
+          ~active:(fun () -> !(runtime.catchup_active))
+          ~target_epoch
+          ~reason);
+    queue_finalized_gap =
+      (fun ~target_epoch ~reason ->
+        queue_gap_and_log
+          runtime.queue
+          ~active:(fun () -> !(runtime.catchup_active))
+          ~clear_state_attested:runtime.clear_state_attested
+          ~target_epoch
+          ~reason);
+  }
 
 let run_wired deps ~target ~target_epoch ~reason =
   run_with_target

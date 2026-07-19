@@ -65,21 +65,30 @@ let addr_from_code code deployer nonce =
   assert (Octra_core.Crypto.is_octra_address addr);
   addr
 
-let load_bytecode store contract_addr =
+type loaded = {
+  code : Contract_vm.instr array;
+  profile : Admission.profile;
+}
+
+let decode_loaded ?(trusted = []) raw =
+  try
+    match Admission.decode_deploy ~trusted raw with
+    | Ok admitted ->
+      Some { code = Admission.code admitted; profile = Admission.profile admitted }
+    | Error _ -> None
+  with _ -> None
+
+let load_loaded ?(trusted = []) store contract_addr =
   match run_s (Octra_core.Store_irmin.load_bytecode store contract_addr) with
   | None -> None
   | Some b64 ->
-    (try
-       match Bytecode.decode (Base64.decode_exn b64) with
-       | Ok code -> Some code
-       | Error _ -> None
-     with _ -> None)
+    (try decode_loaded ~trusted (Base64.decode_exn b64) with _ -> None)
+
+let load_bytecode ?(trusted = []) store contract_addr =
+  Option.map (fun loaded -> loaded.code) (load_loaded ~trusted store contract_addr)
 
 let load_storage store contract_addr =
   run_s (Octra_core.Store_irmin.load_contract_storage store contract_addr)
-
-let save_storage store contract_addr storage_tbl =
-  run_s (Octra_core.Store_irmin.save_contract_storage store contract_addr storage_tbl)
 
 let fix_jumps bytecode =
   let jump_table = Hashtbl.create 10 in
@@ -180,6 +189,24 @@ let extract_method_arity bytecode method_name =
     in
     scan (entry + 1)
 
+let extract_method_target bytecode method_name =
+  match find_dispatcher bytecode with
+  | None -> None
+  | Some entry ->
+    let len = Array.length bytecode in
+    let rec scan pc =
+      if pc >= len then None
+      else match bytecode.(pc) with
+      | Contract_vm.LDI (_, Contract_vm.VString name)
+        when String.equal name method_name && pc + 2 < len ->
+        (match bytecode.(pc + 1), bytecode.(pc + 2) with
+         | Contract_vm.EQ _, Contract_vm.JIF (_, target) -> Some target
+         | _ -> scan (pc + 1))
+      | Contract_vm.REVERT | Contract_vm.STOP -> None
+      | _ -> scan (pc + 1)
+    in
+    scan (entry + 1)
+
 let parse_param = function
   | `String s -> Contract_vm.VString s
   | `Bool b -> Contract_vm.VBool b
@@ -187,19 +214,58 @@ let parse_param = function
   | `Intlit s -> Contract_vm.VInt (Z.of_string s)
   | _ -> Contract_vm.VString ""
 
+let entry_kinds facts target =
+  let slots =
+    if target = 0 then facts.Program_type_flow.root
+    else
+      match List.find_opt
+        (fun (entry : Program_type_flow.entry) -> entry.target = target)
+        facts.entries with
+      | Some entry -> entry.mem
+      | None -> []
+  in
+  slots
+  |> List.sort (fun (left, _) (right, _) -> compare left right)
+  |> List.map snd
+
+let runtime_params profile target params =
+  match profile with
+  | Admission.Legacy -> Ok (List.map parse_param params)
+  | Admission.Program facts -> Program_input.parse (entry_kinds facts target) params
+
+let runtime_values profile target values =
+  match profile with
+  | Admission.Legacy -> Ok values
+  | Admission.Program facts ->
+    (match Program_input.validate (entry_kinds facts target) values with
+     | Ok () -> Ok values
+     | Error error -> Error error)
+
+let strict_values = function
+  | Admission.Legacy -> false
+  | Admission.Program _ -> true
+
 let count_storage_writes state =
   List.fold_left (fun acc e -> match e with
     | Contract_vm.UndoWrite _ -> acc + 1
     | Contract_vm.UndoMarker _ -> acc
   ) 0 state.Contract_vm.undo_stack
 
-let setup_call_state ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000) ~caller ~address ~value ~storage_tbl ~method_name ~params () =
-  let state = Contract_vm.create_state ~ctx ~depth ~limit ~caller ~origin:caller ~address ~value ~storage:storage_tbl () in
+let setup_call_state_values ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
+    ?(strict_values=false)
+    ~caller ~address ~value ~storage_tbl ~method_name ~params () =
+  let state = Contract_vm.create_state ~ctx ~depth ~limit ~strict_values
+    ~caller ~origin:caller ~address ~value ~storage:storage_tbl () in
   state.memory.data <- Hashtbl.create 1024;
   Hashtbl.add state.memory.data 999 (Contract_vm.VString "call");
   Hashtbl.add state.memory.data 1000 (Contract_vm.VString method_name);
-  List.iteri (fun i p -> Hashtbl.add state.memory.data (1001 + i) (parse_param p)) params;
+  List.iteri (fun i value -> Hashtbl.add state.memory.data (1001 + i) value) params;
   state
+
+let setup_call_state ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
+    ~caller ~address ~value ~storage_tbl ~method_name ~params () =
+  setup_call_state_values ~ctx ~depth ~limit ~caller ~address ~value ~storage_tbl
+    ~method_name ~params:(List.map parse_param params) ()
 
 let run_fixed_from_dispatcher state fixed =
   let ok = match find_dispatcher fixed with
@@ -236,184 +302,148 @@ let exec_result_to_result r =
   else
     Error (trim_error (Option.value r.error ~default:"execution failed"))
 
-let consensus_safety_error code =
-  match Opcode_policy.require_consensus_safe code with
-  | Ok () -> None
-  | Error hit -> Some (Opcode_policy.error_message hit)
-
-let deploy ?(ctx=Contract_vm.default_ctx) ?(params=[]) store deployer ctype code bytecode_raw nonce =
+let deploy ~journal ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(params=[]) store deployer
+    ctype _code bytecode_raw nonce =
   let addr = addr_from_code bytecode_raw deployer nonce in
   let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
   Octra_log.stdout "info [contract] deploying addr = %s deployer = %s size = %d hash = %s\n%!"
     addr (String.sub deployer 0 (min 12 (String.length deployer)))
     (String.length bytecode_raw) (String.sub hash 0 16);
-  match consensus_safety_error code with
-  | Some error ->
+  match Admission.decode_deploy ~trusted bytecode_raw with
+  | Error error ->
     (addr, { success = false; return_value = None; effort_used = 0;
-             events = []; error = Some error; storage_writes = 0 })
-  | None ->
+             events = []; error = Some (Admission.error_message error); storage_writes = 0 })
+| Ok admitted ->
+  let code = Admission.code admitted in
+  let strict_values = strict_values (Admission.profile admitted) in
   let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
-  if exists then (
+  let staged = Program_journal.has_deploy journal addr in
+  if exists || staged then (
     Octra_log.stdout "warn [contract] already exists addr = %s\n%!" addr;
     (addr, { success = true; return_value = None; effort_used = 0;
              events = []; error = None; storage_writes = 0 })
-  ) else (
-    let storage_tbl = Hashtbl.create 100 in
-    let state = Contract_vm.create_state ~ctx ~caller:deployer ~origin:deployer
-      ~address:addr ~value:Z.zero ~storage:storage_tbl () in
-    state.memory.data <- Hashtbl.create 1024;
-    Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
-    Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
-    List.iteri (fun i p -> Hashtbl.add state.memory.data (1001 + i) (parse_param p)) params;
-    Octra_log.stdout "info [contract] running constructor addr = %s params = %d\n%!" addr (List.length params);
-    let fixed = fix_jumps code in
-    let success = Contract_vm.run state fixed in
-    let result = {
-      success = success && not state.reverted;
-      return_value = None;
-      effort_used = state.effort_used;
-      events = List.rev !(state.logs);
-      error = if success && not state.reverted then None
-              else Some "constructor failed";
-      storage_writes = count_storage_writes state;
-    } in
-    if result.success then (
-      Octra_log.stdout "info [contract] constructor ok addr = %s effort = %d\n%!" addr result.effort_used;
-      run_s (Octra_core.Store_irmin.deploy_contract store
-        ~address:addr ~code_hash:hash ~version:Oct_compile.lang_version
-        ~owner:deployer ~ctype ~bytecode_b64:(Base64.encode_exn bytecode_raw));
-      save_storage store addr storage_tbl;
-      (try
-         let abi_json = Yojson.Safe.to_string (`Assoc [
-           "contract_type", `String ctype; "address", `String addr;
-           "deployer", `String deployer; "version", `String Oct_compile.lang_version]) in
-         run_s (Octra_core.Store_irmin.save_contract_abi store addr abi_json);
-         Octra_log.stdout "info [contract] abi saved addr = %s\n%!" addr
-       with e ->
-         Octra_log.stdout "warn [contract] abi save failed addr = %s err = %s\n%!" addr (Printexc.to_string e));
-      (addr, result)
-    ) else (
-      Octra_log.stdout "error [contract] constructor failed addr = %s effort = %d\n%!" addr result.effort_used;
-      (addr, result)
-    )
-  )
+  ) else
+    match runtime_params (Admission.profile admitted) 0 params with
+    | Error error ->
+      (addr, { success = false; return_value = None; effort_used = 0;
+               events = []; error = Some (Program_input.error_message error); storage_writes = 0 })
+    | Ok values ->
+      let storage_tbl = Hashtbl.create 100 in
+      let state = Contract_vm.create_state ~ctx ~strict_values ~caller:deployer ~origin:deployer
+        ~address:addr ~value:Z.zero ~storage:storage_tbl () in
+      state.memory.data <- Hashtbl.create 1024;
+      Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
+      Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
+      List.iteri (fun i value -> Hashtbl.add state.memory.data (1001 + i) value) values;
+      Octra_log.stdout "info [contract] running constructor addr = %s params = %d\n%!" addr (List.length params);
+      let fixed = fix_jumps code in
+      let success = Contract_vm.run state fixed in
+      let result = {
+        success = success && not state.reverted;
+        return_value = None;
+        effort_used = state.effort_used;
+        events = List.rev !(state.logs);
+        error = if success && not state.reverted then None
+                else Some "constructor failed";
+        storage_writes = count_storage_writes state;
+      } in
+      if result.success then (
+        Program_journal.add_deploy journal {
+          address = addr;
+          code_hash = hash;
+          bytecode_b64 = Base64.encode_exn bytecode_raw;
+          owner = deployer;
+          ctype;
+          storage = storage_tbl;
+        };
+        Octra_log.stdout
+          "info [contract] constructor ok addr = %s effort = %d persistence = deferred\n%!"
+          addr result.effort_used;
+        (addr, result)
+      ) else (
+        Octra_log.stdout "error [contract] constructor failed addr = %s effort = %d\n%!" addr result.effort_used;
+        (addr, result)
+      )
 
-type pending_deploy = {
-  pd_address : string;
-  pd_code_hash : string;
-  pd_bytecode_b64 : string;
-  pd_owner : string;
-  pd_storage : (string, string) Hashtbl.t;
-}
-
-let pending_deploys : pending_deploy list ref = ref []
-
-let pending_storage : (string, (string, string) Hashtbl.t) Hashtbl.t = Hashtbl.create 16
-
-let commit_pending_deploys store =
-  List.iter (fun pd ->
-    run_s (Octra_core.Store_irmin.deploy_contract store
-      ~address:pd.pd_address ~code_hash:pd.pd_code_hash
-      ~version:Oct_compile.lang_version
-      ~owner:pd.pd_owner ~ctype:"CUSTOM" ~bytecode_b64:pd.pd_bytecode_b64);
-    save_storage store pd.pd_address pd.pd_storage;
-    (try
-       let abi_json = Yojson.Safe.to_string (`Assoc [
-         "contract_type", `String "CUSTOM"; "address", `String pd.pd_address;
-         "deployer", `String pd.pd_owner; "version", `String Oct_compile.lang_version]) in
-       run_s (Octra_core.Store_irmin.save_contract_abi store pd.pd_address abi_json)
-     with _ -> ())
-  ) (List.rev !pending_deploys);
-  pending_deploys := []
-
-let commit_pending_storage store =
-  let pending =
-    Hashtbl.fold (fun addr tbl acc -> (addr, tbl) :: acc) pending_storage []
-    |> List.sort (fun (left, _) (right, _) -> String.compare left right)
-  in
-  List.iter (fun (addr, tbl) -> save_storage store addr tbl) pending;
-  Hashtbl.clear pending_storage
-
-let discard_pending_deploys () =
-  pending_deploys := []
-
-let discard_pending_storage () =
-  Hashtbl.clear pending_storage
-
-let deploy_internal ~ctx ~depth ?(params=[]) store ~deployer ~bytecode_raw ~nonce =
-  match Bytecode.decode bytecode_raw with
-  | Error e -> Error (Printf.sprintf "bad bytecode: %s" e)
-  | Ok code ->
-    (match Contract_vm.Verifier.verify code with
-    | Error _ -> Error "verify failed"
-    | Ok () ->
-      match consensus_safety_error code with
-      | Some error -> Error error
-      | None ->
+let deploy_internal ~journal ?(trusted = []) ~ctx ~depth ?(params=[]) store ~deployer
+    ~bytecode_raw ~nonce =
+  match Admission.decode_deploy ~trusted bytecode_raw with
+  | Error (Admission.Decode_error error) -> Error (Printf.sprintf "bad bytecode: %s" error)
+  | Error (Admission.Verify_error _) -> Error "verify failed"
+  | Error (Admission.Unsafe_error error) -> Error error
+  | Ok admitted ->
+      let code = Admission.code admitted in
+      let strict_values = strict_values (Admission.profile admitted) in
       let addr = addr_from_code bytecode_raw deployer nonce in
       let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
-      let already_pending = List.exists (fun pd -> pd.pd_address = addr) !pending_deploys in
+      let already_pending = Program_journal.has_deploy journal addr in
       if exists || already_pending then Error (Printf.sprintf "collision: %s" addr)
       else
-        let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
-        Octra_log.stdout "info [contract] spawn addr = %s deployer = %s nonce = %d depth = %d\n%!"
-          addr (String.sub deployer 0 (min 12 (String.length deployer))) nonce depth;
-        let storage_tbl = Hashtbl.create 100 in
-        let state = Contract_vm.create_state ~ctx ~caller:deployer ~origin:deployer
-          ~address:addr ~value:Z.zero ~storage:storage_tbl () in
-        state.memory.data <- Hashtbl.create 1024;
-        Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
-        Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
-        List.iteri (fun i p -> Hashtbl.replace state.memory.data (1001 + i) p) params;
-        let fixed = fix_jumps code in
-        let success = Contract_vm.run state fixed in
-        if success && not state.reverted then (
-          pending_deploys := {
-            pd_address = addr;
-            pd_code_hash = hash;
-            pd_bytecode_b64 = Base64.encode_exn bytecode_raw;
-            pd_owner = deployer;
-            pd_storage = storage_tbl;
-          } :: !pending_deploys;
-          Hashtbl.replace pending_storage addr (Hashtbl.copy storage_tbl);
-          Octra_log.stdout "info [contract] spawn ok addr = %s effort = %d (deferred)\n%!" addr state.effort_used;
-          Ok {
-            Contract_vm.spawned_addr = addr;
-            effort_used = state.effort_used;
-            events = List.rev !(state.logs);
-          }
-        ) else (
-          Octra_log.stdout "error [contract] spawn constructor failed addr = %s\n%!" addr;
-          Error "constructor failed"
-        ))
+        match runtime_values (Admission.profile admitted) 0 params with
+        | Error error -> Error (Program_input.error_message error)
+        | Ok values ->
+          let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
+          Octra_log.stdout "info [contract] spawn addr = %s deployer = %s nonce = %d depth = %d\n%!"
+            addr (String.sub deployer 0 (min 12 (String.length deployer))) nonce depth;
+          let storage_tbl = Hashtbl.create 100 in
+          let state = Contract_vm.create_state ~ctx ~strict_values ~caller:deployer ~origin:deployer
+            ~address:addr ~value:Z.zero ~storage:storage_tbl () in
+          state.memory.data <- Hashtbl.create 1024;
+          Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
+          Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
+          List.iteri (fun i value -> Hashtbl.replace state.memory.data (1001 + i) value) values;
+          let fixed = fix_jumps code in
+          let success = Contract_vm.run state fixed in
+          if success && not state.reverted then (
+            Program_journal.add_deploy journal {
+              address = addr;
+              code_hash = hash;
+              bytecode_b64 = Base64.encode_exn bytecode_raw;
+              owner = deployer;
+              ctype = "CUSTOM";
+              storage = storage_tbl;
+            };
+            Octra_log.stdout "info [contract] spawn ok addr = %s effort = %d (deferred)\n%!" addr state.effort_used;
+            Ok {
+              Contract_vm.spawned_addr = addr;
+              effort_used = state.effort_used;
+              events = List.rev !(state.logs);
+            }
+          ) else (
+            Octra_log.stdout "error [contract] spawn constructor failed addr = %s\n%!" addr;
+            Error "constructor failed"
+          )
 
-let load_storage_with_overlay store contract_addr =
-  match Hashtbl.find_opt pending_storage contract_addr with
-  | Some tbl -> Hashtbl.copy tbl
-  | None -> load_storage store contract_addr
+let load_storage_with_overlay journal store program_addr =
+  match Program_journal.load_storage journal program_addr with
+  | Some storage -> storage
+  | None -> load_storage store program_addr
 
-let load_bytecode_with_overlay store contract_addr =
-  match List.find_opt (fun pd -> pd.pd_address = contract_addr) !pending_deploys with
-  | Some pd ->
+let load_loaded_with_overlay ?(trusted = []) journal store program_addr =
+  match Program_journal.find_deploy journal program_addr with
+  | Some deploy ->
     (try
-       match Bytecode.decode (Base64.decode_exn pd.pd_bytecode_b64) with
-       | Ok code -> Some code
-       | Error _ -> None
+       decode_loaded ~trusted (Base64.decode_exn deploy.bytecode_b64)
      with _ -> None)
-  | None -> load_bytecode store contract_addr
+  | None -> load_loaded ~trusted store program_addr
 
-let contract_exists_with_overlay store contract_addr =
-  if List.exists (fun pd -> pd.pd_address = contract_addr) !pending_deploys then true
-  else run_s (Octra_core.Store_irmin.contract_exists store contract_addr)
+let load_bytecode_with_overlay ?(trusted = []) journal store program_addr =
+  Option.map (fun loaded -> loaded.code)
+    (load_loaded_with_overlay ~trusted journal store program_addr)
 
-let execute_call ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000) store contract_addr method_name params caller value =
-  Octra_log.stdout "info [contract] call addr = %s method = %s depth = %d limit = %d\n%!" contract_addr method_name depth limit;
-  match load_bytecode_with_overlay store contract_addr with
+let contract_exists_with_overlay journal store program_addr =
+  if Program_journal.has_deploy journal program_addr then true
+  else run_s (Octra_core.Store_irmin.contract_exists store program_addr)
+
+let execute_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
+    ~journal store program_addr method_name params caller value =
+  Octra_log.stdout "info [contract] call addr = %s method = %s depth = %d limit = %d\n%!" program_addr method_name depth limit;
+  match load_loaded_with_overlay ~trusted journal store program_addr with
   | None ->
     { success = false; return_value = None; effort_used = 0;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }
-  | Some bytecode ->
-    let fixed = fix_jumps bytecode in
+  | Some loaded ->
+    let fixed = fix_jumps loaded.code in
     match extract_method_arity fixed method_name with
     | Some arity when arity <> List.length params ->
       { success = false; return_value = None; effort_used = 0;
@@ -422,20 +452,32 @@ let execute_call ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000) st
           method_name arity (List.length params));
         storage_writes = 0 }
     | _ ->
-    let storage_tbl = load_storage_with_overlay store contract_addr in
-    let state = setup_call_state ~ctx ~depth ~limit ~caller ~address:contract_addr
-      ~value ~storage_tbl ~method_name ~params () in
-    let result = run_fixed_from_dispatcher state fixed in
-    if result.success then Hashtbl.replace pending_storage contract_addr storage_tbl;
-    result
+      (match extract_method_target fixed method_name with
+       | None ->
+         { success = false; return_value = None; effort_used = 0;
+           events = []; error = Some "method not found"; storage_writes = 0 }
+       | Some target ->
+         match runtime_params loaded.profile target params with
+         | Error error ->
+           { success = false; return_value = None; effort_used = 0;
+             events = []; error = Some (Program_input.error_message error); storage_writes = 0 }
+         | Ok values ->
+           let storage_tbl =
+             Program_journal.checkout_storage journal program_addr
+               ~fallback:(fun () -> load_storage store program_addr)
+           in
+           let state = setup_call_state_values ~ctx ~depth ~limit ~caller
+             ~strict_values:(strict_values loaded.profile)
+             ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
+           run_fixed_from_dispatcher state fixed)
 
-let execute_view_call ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=2_000_000_000) store contract_addr method_name params caller =
-  match load_bytecode_with_overlay store contract_addr with
+let execute_view_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=2_000_000_000) store contract_addr method_name params caller =
+  match load_loaded ~trusted store contract_addr with
   | None ->
     { success = false; return_value = None; effort_used = 0;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }
-  | Some bytecode ->
-    let fixed = fix_jumps bytecode in
+  | Some loaded ->
+    let fixed = fix_jumps loaded.code in
     match extract_method_arity fixed method_name with
     | Some arity when arity <> List.length params ->
       { success = false; return_value = None; effort_used = 0;
@@ -444,12 +486,24 @@ let execute_view_call ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=2_000_00
           method_name arity (List.length params));
         storage_writes = 0 }
     | _ ->
-    let storage_tbl = load_storage store contract_addr in
-    let storage_copy = Hashtbl.copy storage_tbl in
-    let state = setup_call_state ~ctx ~depth ~limit ~caller ~address:contract_addr
-      ~value:Z.zero ~storage_tbl:storage_copy ~method_name ~params () in
-    state.is_view <- true;
-    run_fixed_from_dispatcher state fixed
+      (match extract_method_target fixed method_name with
+       | None ->
+         { success = false; return_value = None; effort_used = 0;
+           events = []; error = Some "method not found"; storage_writes = 0 }
+       | Some target ->
+         match runtime_params loaded.profile target params with
+         | Error error ->
+           { success = false; return_value = None; effort_used = 0;
+             events = []; error = Some (Program_input.error_message error); storage_writes = 0 }
+         | Ok values ->
+           let storage_tbl = load_storage store contract_addr in
+           let storage_copy = Hashtbl.copy storage_tbl in
+           let state = setup_call_state_values ~ctx ~depth ~limit ~caller
+             ~strict_values:(strict_values loaded.profile)
+             ~address:contract_addr ~value:Z.zero ~storage_tbl:storage_copy
+             ~method_name ~params:values () in
+           state.is_view <- true;
+           run_fixed_from_dispatcher state fixed)
 
 let contract_exists store addr =
   run_s (Octra_core.Store_irmin.contract_exists store addr)

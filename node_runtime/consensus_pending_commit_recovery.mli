@@ -64,6 +64,32 @@ type 'driver driver_runtime = {
   peer_quorum : int;
 }
 
+type node_driver_runtime = {
+  data_dir : string;
+  query_timeout : float;
+  run_catchup_to_target :
+    Octra_consensus.C_driver.t ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+  validator_count : int;
+  quorum : int;
+}
+
+val driver_runtime :
+  read_pending_commits:(unit -> Octra_core.Wal.pending_commit list) ->
+  head:(unit -> Octra_core.Head_manifest.t option) ->
+  query_epoch_root:('driver -> epoch_id:int64 -> Octra_consensus.C_driver.epoch_root_response_record list Lwt.t) ->
+  run_catchup_to_target:('driver -> target_epoch:int64 -> reason:string -> unit Lwt.t) ->
+  delete_pending_commit:(epoch_id:int -> round:int -> unit) ->
+  validator_count:int ->
+  quorum:int ->
+  'driver driver_runtime
+
+val node_driver_runtime :
+  node_driver_runtime ->
+  Octra_consensus.C_driver.t driver_runtime
+
 val head_epoch_of_manifest :
   Octra_core.Head_manifest.t option ->
   int

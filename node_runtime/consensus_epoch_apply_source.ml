@@ -48,6 +48,23 @@ type deps = {
   staging_txs : unit -> Transaction.t list;
 }
 
+type node_deps = {
+  check_override_receipts :
+    epoch_id:int ->
+    receipts:string list ->
+    Transaction.t list ->
+    (unit, string) result;
+  find_finalized : int -> C_types.finalize option;
+  cached_bundle : string -> cached_bundle option;
+  receipt_root_matches : C_types.epoch_header -> string list -> bool;
+  header_has_empty_bundle : C_types.epoch_header -> bool;
+  staging_txs : unit -> Transaction.t list;
+  remove_processed : string list -> unit;
+  store_empty_bundle : C_types.epoch_header -> unit;
+  fatal : string -> unit;
+  exit : unit -> Transaction.t list * string list;
+}
+
 type request = {
   epoch_id : int;
   override_ordered_txs : Transaction.t list option;
@@ -95,7 +112,7 @@ let fatal_lines ~epoch_id = function
 let selected ?(effects = []) txs receipts_json =
   { txs; receipts_json; effects }
 
-let choose_override deps request txs =
+let choose_override (deps : deps) request txs =
   let receipts =
     Option.value request.override_receipts_json ~default:[]
   in
@@ -103,7 +120,7 @@ let choose_override deps request txs =
   | Ok () -> Ok (selected txs receipts)
   | Error e -> Error (Override_preverify_failed e)
 
-let choose_consensus deps request =
+let choose_consensus (deps : deps) request =
   match deps.find_finalized request.epoch_id with
   | None -> Error Missing_finalized_header
   | Some finalize ->
@@ -122,8 +139,42 @@ let choose_consensus deps request =
       else
         Error (Missing_canonical_bundle { proposal_id })
 
-let choose deps request =
+let choose (deps : deps) request =
   match request.override_ordered_txs with
   | Some txs -> choose_override deps request txs
   | None when request.consensus_mode -> choose_consensus deps request
   | None -> Ok (selected (deps.staging_txs ()) [])
+
+let run (deps : deps) request ~apply_effect ~fatal ~exit =
+  match choose deps request with
+  | Ok selected ->
+    List.iter apply_effect selected.effects;
+    selected.txs, selected.receipts_json
+  | Error error ->
+    fatal_lines ~epoch_id:request.epoch_id error
+    |> List.iter fatal;
+    exit ()
+
+let deps_of_node (deps : node_deps) =
+  {
+    check_override_receipts = deps.check_override_receipts;
+    find_finalized = deps.find_finalized;
+    cached_bundle = deps.cached_bundle;
+    receipt_root_matches = deps.receipt_root_matches;
+    header_has_empty_bundle = deps.header_has_empty_bundle;
+    staging_txs = deps.staging_txs;
+  }
+
+let apply_node_effect (deps : node_deps) = function
+  | Remove_processed tx_hashes ->
+    deps.remove_processed tx_hashes
+  | Store_empty_bundle header ->
+    deps.store_empty_bundle header
+
+let run_node (deps : node_deps) request =
+  run
+    (deps_of_node deps)
+    request
+    ~apply_effect:(apply_node_effect deps)
+    ~fatal:deps.fatal
+    ~exit:deps.exit

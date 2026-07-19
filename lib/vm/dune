@@ -10,6 +10,7 @@
   lwt
   sqlite3
   base64
+  mirage-crypto-ec
   yojson
   octra_log
   digestif digestif.c))

@@ -29,7 +29,7 @@ let const_of_v = function
   | Contract_vm.VString s -> CStr s
   | Contract_vm.VBytes b -> CBytes b
   | Contract_vm.VBytes32 b -> CBytes b
-  | Contract_vm.VU64 n -> CInt (Int64.to_string n)
+  | Contract_vm.VU64 z -> CInt (Z.to_string z)
   | Contract_vm.VU128 z -> CInt (Z.to_string z)
   | Contract_vm.VU256 z -> CInt (Z.to_string z)
   | Contract_vm.VAddr a -> CAddr a
@@ -111,6 +111,7 @@ let op_tag = function
   | Contract_vm.REVERT -> 0x18   | Contract_vm.CALLER _ -> 0x19
   | Contract_vm.ORIGIN _ -> 0x1A | Contract_vm.SELF _ -> 0x1B
   | Contract_vm.EPOCH _ -> 0x1C  | Contract_vm.VALUE _ -> 0x1D
+  | Contract_vm.EPOCH_TIME _ -> 0x7B
   | Contract_vm.BALANCE _ -> 0x1E | Contract_vm.TREEHASH _ -> 0x1F
   | Contract_vm.NODEID _ -> 0x20  | Contract_vm.XCALL _ -> 0x21
   | Contract_vm.TXHASH _ -> 0x7A
@@ -159,13 +160,27 @@ let op_tag = function
   | Contract_vm.FHE_DESER_PK _ -> 0x3E
   | Contract_vm.GROTH16_VERIFY_BN254 _ -> 0x3F
   | Contract_vm.FHE_MUL _ -> 0x5B
+  | Contract_vm.FHE_DIV_CONST _ -> 0x5C
   | Contract_vm.MATMUL _ -> 0x60
   | Contract_vm.VECDOT _ -> 0x61
   | Contract_vm.EXP_LUT _ -> 0x62
+  | Contract_vm.EXP_Q16 _ -> 0x7C
   | Contract_vm.SOFTMAX_INPLACE _ -> 0x63
+  | Contract_vm.SOFTMAX_Q16_INPLACE _ -> 0x7D
   | Contract_vm.LAYERNORM_INPLACE _ -> 0x64
+  | Contract_vm.LAYERNORM_Q16_INPLACE _ -> 0x7E
   | Contract_vm.RELU_INPLACE _ -> 0x65
   | Contract_vm.RMSNORM_INPLACE _ -> 0x66
+  | Contract_vm.RMSNORM_Q16_INPLACE _ -> 0x7F
+  | Contract_vm.SILU_Q16_INPLACE _ -> 0x80
+  | Contract_vm.ROPE_APPLY_Q16 _ -> 0x81
+  | Contract_vm.ATTENTION_KV_Q16 _ -> 0x82
+  | Contract_vm.VECDOT_Q16 _ -> 0x83
+  | Contract_vm.ELEMWISE_MUL_Q16 _ -> 0x84
+  | Contract_vm.RESIDUAL_ADD_Q16 _ -> 0x85
+  | Contract_vm.LOAD_INT8_Q16 _ -> 0x86
+  | Contract_vm.APPEND_VEC_Q16 _ -> 0x87
+  | Contract_vm.ARGMAX_Q16 _ -> 0x88
   | Contract_vm.SILU_INPLACE _ -> 0x67
   | Contract_vm.ELEMWISE_MUL_INPLACE _ -> 0x68
   | Contract_vm.LOAD_INT8_BYTES_TO_MEM _ -> 0x69
@@ -229,7 +244,7 @@ let encode_instr buf pool instr =
   | Contract_vm.JIF (r,addr) -> put_u8 buf r; put_u32le buf addr
   | Contract_vm.JDEST addr -> put_u32le buf addr
   | Contract_vm.CALLER d | Contract_vm.ORIGIN d | Contract_vm.SELF d
-  | Contract_vm.EPOCH d | Contract_vm.VALUE d | Contract_vm.TREEHASH d
+  | Contract_vm.EPOCH d | Contract_vm.EPOCH_TIME d | Contract_vm.VALUE d | Contract_vm.TREEHASH d
   | Contract_vm.NODEID d | Contract_vm.TXHASH d | Contract_vm.EFFORT d | Contract_vm.ASSERT d
   | Contract_vm.ASSERT_ADDR d ->
     put_u8 buf d
@@ -241,7 +256,8 @@ let encode_instr buf pool instr =
     List.iter (put_u8 buf) regs
   | Contract_vm.FHE_ADD (d,pk,a,b) | Contract_vm.FHE_SUB (d,pk,a,b)
   | Contract_vm.FHE_MUL (d,pk,a,b)
-  | Contract_vm.FHE_SCALE (d,pk,a,b) | Contract_vm.FHE_ADD_CONST (d,pk,a,b)
+  | Contract_vm.FHE_SCALE (d,pk,a,b) | Contract_vm.FHE_DIV_CONST (d,pk,a,b)
+  | Contract_vm.FHE_ADD_CONST (d,pk,a,b)
   | Contract_vm.FHE_SUB_CONST (d,pk,a,b)
   | Contract_vm.FHE_VERIFY_ZERO (d,pk,a,b) | Contract_vm.FHE_VERIFY_RANGE (d,pk,a,b)
   | Contract_vm.GROTH16_VERIFY_BN254 (d,pk,a,b)
@@ -299,14 +315,39 @@ let encode_instr buf pool instr =
     put_u8 buf d; put_u8 buf a; put_u8 buf b; put_u8 buf n
   | Contract_vm.EXP_LUT (d,x) ->
     put_u8 buf d; put_u8 buf x
+  | Contract_vm.EXP_Q16 (d,x) ->
+    put_u8 buf d; put_u8 buf x
   | Contract_vm.SOFTMAX_INPLACE (a,n) ->
     put_u8 buf a; put_u8 buf n
+  | Contract_vm.SOFTMAX_Q16_INPLACE (a,n) ->
+    put_u8 buf a; put_u8 buf n
   | Contract_vm.LAYERNORM_INPLACE (a,n,g,b) ->
+    put_u8 buf a; put_u8 buf n; put_u8 buf g; put_u8 buf b
+  | Contract_vm.LAYERNORM_Q16_INPLACE (a,n,g,b) ->
     put_u8 buf a; put_u8 buf n; put_u8 buf g; put_u8 buf b
   | Contract_vm.RELU_INPLACE (a,n) ->
     put_u8 buf a; put_u8 buf n
   | Contract_vm.RMSNORM_INPLACE (a,n,g) ->
     put_u8 buf a; put_u8 buf n; put_u8 buf g
+  | Contract_vm.RMSNORM_Q16_INPLACE (a,n,g) ->
+    put_u8 buf a; put_u8 buf n; put_u8 buf g
+  | Contract_vm.SILU_Q16_INPLACE (a,n) ->
+    put_u8 buf a; put_u8 buf n
+  | Contract_vm.ROPE_APPLY_Q16 (a,n,p,b) ->
+    put_u8 buf a; put_u8 buf n; put_u8 buf p; put_u8 buf b
+  | Contract_vm.ATTENTION_KV_Q16 (q,k,v,c,t,nq,nk,hd) ->
+    put_u8 buf q; put_u8 buf k; put_u8 buf v; put_u8 buf c;
+    put_u8 buf t; put_u8 buf nq; put_u8 buf nk; put_u8 buf hd
+  | Contract_vm.VECDOT_Q16 (d,a,b,n) ->
+    put_u8 buf d; put_u8 buf a; put_u8 buf b; put_u8 buf n
+  | Contract_vm.ELEMWISE_MUL_Q16 (d,s,n) | Contract_vm.RESIDUAL_ADD_Q16 (d,s,n) ->
+    put_u8 buf d; put_u8 buf s; put_u8 buf n
+  | Contract_vm.LOAD_INT8_Q16 (d,s,o,n,sc) ->
+    put_u8 buf d; put_u8 buf s; put_u8 buf o; put_u8 buf n; put_u8 buf sc
+  | Contract_vm.APPEND_VEC_Q16 (d,p,s,n) ->
+    put_u8 buf d; put_u8 buf p; put_u8 buf s; put_u8 buf n
+  | Contract_vm.ARGMAX_Q16 (d,a,n) ->
+    put_u8 buf d; put_u8 buf a; put_u8 buf n
   | Contract_vm.SILU_INPLACE (a,n) ->
     put_u8 buf a; put_u8 buf n
   | Contract_vm.ELEMWISE_MUL_INPLACE (d,s,n) ->
@@ -437,6 +478,7 @@ let decode_instr s pos consts =
   | 0x1B -> (Contract_vm.SELF (get_u8 s p), p+1)
   | 0x1C -> (Contract_vm.EPOCH (get_u8 s p), p+1)
   | 0x1D -> (Contract_vm.VALUE (get_u8 s p), p+1)
+  | 0x7B -> (Contract_vm.EPOCH_TIME (get_u8 s p), p+1)
   | 0x1E -> (Contract_vm.BALANCE (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x1F -> (Contract_vm.TREEHASH (get_u8 s p), p+1)
   | 0x20 -> (Contract_vm.NODEID (get_u8 s p), p+1)
@@ -478,6 +520,7 @@ let decode_instr s pos consts =
   | 0x3E -> (Contract_vm.FHE_DESER_PK (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x3F -> (Contract_vm.GROTH16_VERIFY_BN254 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
   | 0x5B -> (Contract_vm.FHE_MUL (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
+  | 0x5C -> (Contract_vm.FHE_DIV_CONST (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
   | 0x40 -> (Contract_vm.PARSE_INTS (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
   | 0x41 -> (Contract_vm.ISADDR (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x56 -> (Contract_vm.STATE_PATH_KEY (get_u8 s p, get_u8 s (p+1)), p+2)
@@ -526,10 +569,23 @@ let decode_instr s pos consts =
   | 0x60 -> (Contract_vm.MATMUL (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3), get_u8 s (p+4), get_u8 s (p+5)), p+6)
   | 0x61 -> (Contract_vm.VECDOT (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
   | 0x62 -> (Contract_vm.EXP_LUT (get_u8 s p, get_u8 s (p+1)), p+2)
+  | 0x7C -> (Contract_vm.EXP_Q16 (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x63 -> (Contract_vm.SOFTMAX_INPLACE (get_u8 s p, get_u8 s (p+1)), p+2)
+  | 0x7D -> (Contract_vm.SOFTMAX_Q16_INPLACE (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x64 -> (Contract_vm.LAYERNORM_INPLACE (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
+  | 0x7E -> (Contract_vm.LAYERNORM_Q16_INPLACE (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
   | 0x65 -> (Contract_vm.RELU_INPLACE (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x66 -> (Contract_vm.RMSNORM_INPLACE (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
+  | 0x7F -> (Contract_vm.RMSNORM_Q16_INPLACE (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
+  | 0x80 -> (Contract_vm.SILU_Q16_INPLACE (get_u8 s p, get_u8 s (p+1)), p+2)
+  | 0x81 -> (Contract_vm.ROPE_APPLY_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
+  | 0x82 -> (Contract_vm.ATTENTION_KV_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3), get_u8 s (p+4), get_u8 s (p+5), get_u8 s (p+6), get_u8 s (p+7)), p+8)
+  | 0x83 -> (Contract_vm.VECDOT_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
+  | 0x84 -> (Contract_vm.ELEMWISE_MUL_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
+  | 0x85 -> (Contract_vm.RESIDUAL_ADD_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
+  | 0x86 -> (Contract_vm.LOAD_INT8_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3), get_u8 s (p+4)), p+5)
+  | 0x87 -> (Contract_vm.APPEND_VEC_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3)), p+4)
+  | 0x88 -> (Contract_vm.ARGMAX_Q16 (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
   | 0x67 -> (Contract_vm.SILU_INPLACE (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x68 -> (Contract_vm.ELEMWISE_MUL_INPLACE (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2)), p+3)
   | 0x69 -> (Contract_vm.LOAD_INT8_BYTES_TO_MEM (get_u8 s p, get_u8 s (p+1), get_u8 s (p+2), get_u8 s (p+3), get_u8 s (p+4)), p+5)
@@ -564,7 +620,8 @@ let decode raw =
     if len < 12 then failwith "OCTB too short";
     let m = Bytes.sub_string s 0 4 in
     if m <> magic then failwith "bad OCTB magic";
-    let _ver = get_u16le s 4 in
+    let ver = get_u16le s 4 in
+    if ver <> version then failwith (Printf.sprintf "unsupported OCTB version: %d" ver);
     let n_consts = get_u16le s 6 in
     let n_instrs = get_u32le s 8 in
     if n_consts > max_consts then failwith (Printf.sprintf "OCTB too many constants: %d" n_consts);
@@ -574,11 +631,13 @@ let decode raw =
       let (c, next) = decode_const s !pos len in
       pos := next; c
     ) in
-    Ok (Array.init n_instrs (fun _ ->
+    let code = Array.init n_instrs (fun _ ->
       if !pos >= len then failwith "OCTB truncated instruction stream";
       let (instr, next) = decode_instr s !pos consts in
       pos := next; instr
-    ))
+    ) in
+    if !pos <> len then failwith "OCTB trailing bytes";
+    Ok code
   with Failure msg -> Error (trim_error msg)
     | exn -> Error (trim_error (Printexc.to_string exn))
 

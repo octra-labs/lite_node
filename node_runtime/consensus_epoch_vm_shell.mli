@@ -21,14 +21,15 @@ module Multi_exec = Octra_vm.Multi_exec
 module Receipt_view = Octra_vm.Receipt_view
 module Transaction = Octra_core.Transaction
 module Circle_exec = Octra_circle_runtime.Circle_exec
+module Program_journal = Octra_vm.Program_journal
 
-type ('journal_snapshot, 'pending_snapshot) deps = {
+type ('value_snapshot, 'program_snapshot) deps = {
   get_balance : string -> Z.t;
   transfer : from_addr:string -> to_addr:string -> amount:Z.t -> bool;
-  snapshot_journal : unit -> 'journal_snapshot;
-  restore_journal : 'journal_snapshot -> unit;
-  snapshot_pending : unit -> 'pending_snapshot;
-  restore_pending : 'pending_snapshot -> unit;
+  snapshot_value : unit -> 'value_snapshot;
+  restore_value : 'value_snapshot -> unit;
+  snapshot_program : unit -> 'program_snapshot;
+  restore_program : 'program_snapshot -> unit;
   execute_call :
     ctx:ContractVM.exec_ctx ->
     depth:int ->
@@ -48,6 +49,7 @@ type ('journal_snapshot, 'pending_snapshot) deps = {
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   current_epoch : int;
+  epoch_time_ms : int64;
   tree_hash : string;
   node_id : string;
   tx_hash : string;
@@ -165,6 +167,7 @@ type call_runtime = {
 
 type vm_tx_deps = {
   runtime : call_runtime;
+  trusted_program_keys : Octra_vm.Program_trust.t;
   deploy_balance : Transaction.t -> Z.t option;
   deploy_and_save :
     Transaction.t ->
@@ -229,37 +232,112 @@ type vm_tx_deps = {
 
 type live_vm_tx_args = {
   runtime : call_runtime;
+  trusted_program_keys : Octra_vm.Program_trust.t;
+  program_journal : Program_journal.t;
   ledger : Octra_core.Ledger.t;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   receipt_epoch : unit -> int;
   ctx_for_hash : string -> ContractVM.exec_ctx;
+  ensure_account : string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   epoch : int;
   now : unit -> float;
 }
 
+type live_call_runtime_args = {
+  reject : tx_reject;
+  debit : string -> Z.t -> int -> (unit, string) result;
+  tx : Transaction.t;
+  make_ctx : string -> ContractVM.exec_ctx;
+  balance : string -> Z.t;
+  apply_value_effect : Call_plan.value_effect -> unit;
+  discard_effects : unit -> unit;
+  discard_fee : Z.t -> unit;
+  commit_effects : unit -> unit;
+  confirm : unit -> unit Lwt.t;
+}
+
 type live_contract_ctx_args = {
-  journal : Octra_vm.Value_journal.t;
+  value_journal : Octra_vm.Value_journal.t;
+  program_journal : Program_journal.t;
+  trusted_program_keys : Octra_vm.Program_trust.t;
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   current_epoch : int;
+  epoch_time_ms : int64;
   tree_hash : string;
   node_id : string;
   tx_hash : string;
+}
+
+type live_value_effects = {
+  value_journal : Octra_vm.Value_journal.t;
+  program_journal : Program_journal.t;
+  balance : string -> Z.t;
+  ensure_account : string -> unit;
+  discard : unit -> unit;
+  discard_fee : Z.t -> unit;
+  commit : unit -> unit;
+  apply : Call_plan.value_effect -> unit;
+}
+
+type live_value_effect_args = {
+  ledger : Octra_core.Ledger.t;
+  store : Octra_core.Store_irmin.t;
+  add_fee : Z.t -> unit;
+}
+
+type live_sender_vm_tx_args = {
+  value_journal : Octra_vm.Value_journal.t;
+  program_journal : Program_journal.t;
+  trusted_program_keys : Octra_vm.Program_trust.t;
+  ledger : Octra_core.Ledger.t;
+  store : Octra_core.Store_irmin.t;
+  chaindata : Octra_core.Store_chaindata.t;
+  tx : Transaction.t;
+  current_epoch : unit -> int;
+  epoch_time_ms : int64;
+  pre_state_hash : string;
+  node_id : string;
+  reject : tx_reject;
+  balance : string -> Z.t;
+  ensure_account : string -> unit;
+  apply_value_effect : Call_plan.value_effect -> unit;
+  discard_effects : unit -> unit;
+  discard_fee : Z.t -> unit;
+  commit_effects : unit -> unit;
+  confirm : unit -> unit Lwt.t;
 }
 
 val make_live_vm_tx_deps :
   live_vm_tx_args ->
   vm_tx_deps
 
+val make_live_call_runtime :
+  live_call_runtime_args ->
+  call_runtime
+
 val make_live_contract_ctx :
   live_contract_ctx_args ->
   ContractVM.exec_ctx
 
+val live_fhe_pubkey :
+  Octra_core.Store_irmin.t ->
+  string ->
+  Pvac_ffi.pubkey option
+
+val make_live_value_effects :
+  live_value_effect_args ->
+  live_value_effects
+
+val make_live_sender_vm_tx_deps :
+  live_sender_vm_tx_args ->
+  vm_tx_deps
+
 val make_contract_ctx :
-  ('journal_snapshot, 'pending_snapshot) deps ->
+  ('value_snapshot, 'program_snapshot) deps ->
   ContractVM.exec_ctx
 
 val direct_exec_spec_of_tx :
@@ -334,6 +412,7 @@ val make_multi_exec_deps :
   multi_exec_deps
 
 val run_contract_deploy :
+  trusted_program_keys:Octra_vm.Program_trust.t ->
   fee:Z.t ->
   balance:Z.t option ->
   bytecode_b64_opt:string option ->
@@ -357,6 +436,7 @@ val run_contract_deploy :
   unit Lwt.t
 
 val run_deploy_tx :
+  trusted_program_keys:Octra_vm.Program_trust.t ->
   balance:Z.t option ->
   Transaction.t ->
   handle_reject:(Call_plan.deploy_reject -> unit Lwt.t) ->
@@ -375,6 +455,7 @@ val run_deploy_tx :
   unit Lwt.t
 
 val run_deploy_tx_runtime :
+  trusted_program_keys:Octra_vm.Program_trust.t ->
   call_runtime ->
   balance:Z.t option ->
   Transaction.t ->

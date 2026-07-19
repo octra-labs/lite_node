@@ -651,6 +651,7 @@ let get_visible_epoch_index_status t epoch_id =
              ~start_txid:h.Epochlog.start_txid
              ~tx_count:h.Epochlog.tx_count))
 
+
 let verify_and_repair_tx_loc_only t ~max_epoch =
   let checked = ref 0 in
   let repaired = ref 0 in
@@ -1439,6 +1440,7 @@ let txs_by_epoch_full t epoch_id =
        done;
        List.rev !results)
 
+
 let txs_by_address t addr ~limit ~offset =
   let (_total, all_txids) = Chaindata_index.addr_txids_rev t.index addr ~limit:max_int ~offset:0 in
   let resolved = List.filter_map (fun txid ->
@@ -1704,7 +1706,9 @@ let read_all_epochs t = Epochlog.read_all t.epochlog
 
 let index t = t.index
 
+
 let txlog t = t.txlog
+
 
 let txlog_position t = Txlog.current_position t.txlog
 
@@ -1722,6 +1726,7 @@ let epochs_empty_after t ~from_epoch ~to_epoch =
       | _ -> false
   in
   loop (from_epoch + 1)
+
 
 let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
                        ~head_epochlog_off ~inflight_start_txid ~inflight_tx_count =

@@ -71,6 +71,11 @@ type node_launch_runtime = {
   exit_fatal : unit -> unit;
 }
 
+type join_log = {
+  fatal : string -> unit;
+  warn : string -> unit;
+}
+
 let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
     ~now ~max_drift ~driver_ref =
   P2p_swarm_lifecycle.{
@@ -127,6 +132,9 @@ let p2p_swarm_task ~swarm ~deps =
 let node_swarm_task ~swarm ~deps =
   P2p_swarm_lifecycle.node_task ~swarm deps
 
+let p2p_listen_task ~listen ~port =
+  fun () -> listen ~port ~callback:(fun _ -> Lwt.return_unit)
+
 let observer_loop () =
   let rec loop () =
     Lwt_unix.sleep 60.0 >>= fun () -> loop ()
@@ -144,23 +152,32 @@ let node_launch_tasks (deps : node_launch_deps) =
       swarm = (fun () -> node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps);
     }
 
-let run_join ~tasks ~close_chaindata ~exit_fatal =
+let default_join_log =
+  {
+    fatal = Octra_log.fatal "init" "%s";
+    warn = Octra_log.warn "init" "%s";
+  }
+
+let run_join ~log ~tasks ~close_chaindata ~exit_fatal =
   Lwt.catch
     (fun () -> Lwt.join tasks)
     (fun e ->
-      Octra_log.fatal "init" "lwt_main = failed reason = %s"
-        (Printexc.to_string e);
+      log.fatal
+        (Printf.sprintf "event = lwt_main_failed reason = %s"
+           (Printexc.to_string e));
       (try close_chaindata ()
        with close_error ->
-         Octra_log.warn "init" "chaindata_close = failed reason = %s"
-           (Printexc.to_string close_error));
-      Octra_log.warn "init" "irmin_close = skipped reason = lwt_main_unwinding";
+         log.warn
+           (Printf.sprintf "event = chaindata_close_failed reason = %s"
+              (Printexc.to_string close_error)));
+      log.warn "event = irmin_close_skipped reason = lwt_main_unwinding";
       exit_fatal ();
       Lwt.return_unit)
 
 let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~close_chaindata
     ~exit_fatal =
   run_join
+    ~log:default_join_log
     ~tasks:(launch_tasks deps)
     ~close_chaindata
     ~exit_fatal
@@ -168,6 +185,7 @@ let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~close_chaindata
 let run_node_launch_tasks (deps : node_launch_deps) ~close_chaindata
     ~exit_fatal =
   run_join
+    ~log:default_join_log
     ~tasks:(node_launch_tasks deps)
     ~close_chaindata
     ~exit_fatal

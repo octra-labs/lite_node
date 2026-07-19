@@ -32,7 +32,21 @@ type deps = {
   sleep : float -> unit Lwt.t;
 }
 
-let tick_state deps ~consensus_mode ~current_epoch =
+type node_runtime = {
+  now : unit -> float;
+  last_epoch_time : float ref;
+  current_epoch : int ref;
+  consensus_finalized : bool ref;
+  finality : Consensus_finality_state.callbacks;
+  bundle : Consensus_bundle_cache.node_runtime;
+  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  warn : string -> unit;
+  info : string -> unit;
+  apply : now:float -> elapsed:float -> unit Lwt.t;
+  sleep : float -> unit Lwt.t;
+}
+
+let tick_state (deps : deps) ~consensus_mode ~current_epoch =
   Plan.finalized_state
     ~consensus_mode
     ~consensus_finalized:(deps.consensus_finalized ())
@@ -41,12 +55,12 @@ let tick_state deps ~consensus_mode ~current_epoch =
     ~cached_bundle_for_pid:deps.cached_bundle_for_pid
     ~header_has_empty_bundle:deps.header_has_empty_bundle
 
-let store_empty_bundle deps prepared =
+let store_empty_bundle (deps : deps) prepared =
   match prepared.Plan.empty_bundle_header with
   | Some header -> deps.store_empty_bundle_for_header header
   | None -> ()
 
-let step deps ~consensus_mode ~epoch_duration =
+let step (deps : deps) ~consensus_mode ~epoch_duration =
   let now = deps.now () in
   let current_epoch = deps.current_epoch () in
   let elapsed = now -. deps.last_epoch_time () in
@@ -80,10 +94,32 @@ let step deps ~consensus_mode ~epoch_duration =
        Lwt.return_unit)
     (fun () -> Lwt.return tick_plan.next_sleep)
 
-let rec run deps ~consensus_mode ~epoch_duration =
+let rec run (deps : deps) ~consensus_mode ~epoch_duration =
   Lwt.bind
     (step deps ~consensus_mode ~epoch_duration)
     (fun next_sleep ->
       Lwt.bind
         (deps.sleep next_sleep)
         (fun () -> run deps ~consensus_mode ~epoch_duration))
+
+let node_deps runtime =
+  {
+    now = runtime.now;
+    last_epoch_time = (fun () -> !(runtime.last_epoch_time));
+    current_epoch = (fun () -> !(runtime.current_epoch));
+    consensus_finalized = (fun () -> !(runtime.consensus_finalized));
+    find_finalized = runtime.finality.find_finalized;
+    cached_bundle_for_pid = (fun pid ->
+      runtime.bundle.cached_bundle pid <> None);
+    header_has_empty_bundle = runtime.bundle.header_has_empty_bundle;
+    store_empty_bundle_for_header = runtime.bundle.store_empty_bundle;
+    queue_missing_bundle = runtime.queue_missing_bundle;
+    warn = runtime.warn;
+    info = runtime.info;
+    clear_finalized = (fun () -> runtime.consensus_finalized := false);
+    apply = runtime.apply;
+    sleep = runtime.sleep;
+  }
+
+let run_node runtime ~consensus_mode ~epoch_duration =
+  run (node_deps runtime) ~consensus_mode ~epoch_duration

@@ -80,10 +80,13 @@ let add_commit_signature t addr signature =
   if not (List.exists (fun (a, _) -> a = addr) t.commit_signatures) then
     t.commit_signatures <- (addr, signature) :: t.commit_signatures
 
-let finalize t validator perf =
+let finalize ?finalized_at t validator perf =
+  let finalized_at =
+    Option.value finalized_at ~default:(float_of_int (t.epoch_id * 10))
+  in
   { t with finalized_by = validator; performance_summary = perf;
     commit_signatures = List.sort (fun (a,_) (b,_) -> String.compare a b) t.commit_signatures;
-    finalized_at = float_of_int (t.epoch_id * 10);
+    finalized_at;
     recent_tx_count = Map.fold (fun _ n acc -> acc + List.length n.Node.txs) t.nodes 0 }
 
 let to_yojson t =

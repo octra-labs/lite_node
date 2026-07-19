@@ -19,6 +19,8 @@ type meta = {
   rpc_body_bytes : int;
 }
 
+val max_body_bytes : int
+
 val meta_of_request :
   body_bytes:int ->
   Cohttp.Request.t ->

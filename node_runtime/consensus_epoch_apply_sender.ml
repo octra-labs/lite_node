@@ -25,6 +25,18 @@ type deps = {
   fatal : sender:string -> exn -> unit;
 }
 
+type tx_context = {
+  tx : Transaction.t;
+  confirm : unit -> unit Lwt.t;
+  reject :
+    ?consume_nonce:bool ->
+    ?notify_reason:string ->
+    string ->
+    string ->
+    unit Lwt.t;
+  continue_after_reject : consume_nonce:bool -> unit Lwt.t;
+}
+
 type rejected_record = {
   hash : string;
   from_addr : string;
@@ -48,6 +60,36 @@ type confirmed_record = {
   fee : Z.t;
 }
 
+type tx_sink_refs = {
+  pending_tx_saves : (Transaction.t * int) list ref;
+  total_tx_count : int ref;
+  confirmed_fees : Z.t ref;
+  processed_hashes : string list ref;
+}
+
+type tx_sink_effects = {
+  now : unit -> float;
+  epoch : unit -> int;
+  save_rejected : rejected_record -> unit;
+  save_tx : confirmed_record -> epoch_id:int -> unit;
+  record_tx : Transaction.t -> unit;
+  warn_rejected : string -> unit;
+}
+
+type tx_sink = {
+  reject : Transaction.t -> string -> string -> unit;
+  confirm : Transaction.t -> unit;
+}
+
+type live_tx_sink_deps = {
+  chaindata : Octra_core.Store_chaindata.t;
+  current_epoch : unit -> int;
+  pending_tx_saves : (Transaction.t * int) list ref;
+  total_tx_count : int ref;
+  confirmed_fees : Z.t ref;
+  processed_hashes : string list ref;
+}
+
 type ('backend, 'env) epoch_exec_deps = {
   backend : unit -> 'backend;
   standard_env : unit -> 'env;
@@ -62,6 +104,14 @@ type public_deps = {
   confirm : unit -> unit Lwt.t;
   log_burn : Transaction.t -> unit;
 }
+
+let live_epoch_exec_deps ~backend ~standard_env ~reject ~confirm =
+  {
+    backend;
+    standard_env;
+    reject;
+    confirm;
+  }
 
 let nonce_order txs =
   List.sort
@@ -122,6 +172,75 @@ let confirmed_record (tx : Transaction.t) =
     fee = tx.ou;
   }
 
+let make_tx_sink (refs : tx_sink_refs) (effects : tx_sink_effects) =
+  let reject tx error_type reason =
+    let rejected =
+      rejected_record
+        ~epoch_id:(effects.epoch ())
+        ~ts:(effects.now ())
+        ~error_type
+        ~reason
+        tx
+    in
+    effects.save_rejected rejected;
+    refs.processed_hashes := rejected.hash :: !(refs.processed_hashes);
+    effects.warn_rejected
+      (rejected_line
+         ~hash:rejected.hash
+         ~error_type:rejected.error_type
+         ~reason:rejected.reason)
+  in
+  let confirm tx =
+    let confirmed = confirmed_record tx in
+    let epoch_id = effects.epoch () in
+    effects.save_tx confirmed ~epoch_id;
+    refs.pending_tx_saves := (tx, epoch_id) :: !(refs.pending_tx_saves);
+    effects.record_tx tx;
+    incr refs.total_tx_count;
+    refs.confirmed_fees := Z.add !(refs.confirmed_fees) confirmed.fee;
+    refs.processed_hashes := confirmed.hash :: !(refs.processed_hashes)
+  in
+  {
+    reject;
+    confirm;
+  }
+
+let live_tx_sink deps =
+  make_tx_sink
+    ({
+      pending_tx_saves = deps.pending_tx_saves;
+      total_tx_count = deps.total_tx_count;
+      confirmed_fees = deps.confirmed_fees;
+      processed_hashes = deps.processed_hashes;
+    } : tx_sink_refs)
+    ({
+      now = Unix.gettimeofday;
+      epoch = deps.current_epoch;
+      save_rejected = (fun rejected ->
+        Octra_core.Store_chaindata.save_rejected deps.chaindata
+          ~hash:rejected.hash
+          ~from_addr:rejected.from_addr
+          ~to_addr:rejected.to_addr
+          ~amount:rejected.amount
+          ~nonce:rejected.nonce
+          ~error_type:rejected.error_type
+          ~reason:rejected.reason
+          ~epoch_id:rejected.epoch_id
+          ~ts:rejected.ts);
+      save_tx = (fun confirmed ~epoch_id ->
+        Octra_core.Store_chaindata.save_tx deps.chaindata
+          ~hash:confirmed.hash
+          ~epoch_id
+          ~from_addr:confirmed.from_addr
+          ~to_addr:confirmed.to_addr
+          ~tx_json:confirmed.tx_json
+          ~op_type:confirmed.op_type
+          ~encrypted_data:confirmed.encrypted_data
+          ~message:confirmed.message);
+      record_tx = Octra_core.Metrics.record_tx;
+      warn_rejected = Log.warn "tx" "%s";
+    } : tx_sink_effects)
+
 let nonce_mismatch_reason ~expected ~got =
   Printf.sprintf "expected_nonce = %d got_nonce = %d" expected got
 
@@ -135,6 +254,42 @@ let initial_nonce ~account_nonce = function
       match account_nonce tx.Transaction.from with
       | Some nonce -> nonce + 1
       | None -> 1)
+
+let run_nonce_loop ~account_nonce ~nonce_mismatch ~confirm ~reject ~handle txs =
+  let rec loop expected_nonce = function
+    | [] ->
+      Lwt.return_unit
+    | tx :: rest ->
+      if tx.Transaction.nonce <> expected_nonce then
+        let open Lwt.Syntax in
+        let* () =
+          nonce_mismatch tx ~expected:expected_nonce ~got:tx.Transaction.nonce
+        in
+        loop expected_nonce rest
+      else
+        let confirm () =
+          let open Lwt.Syntax in
+          let* () = confirm tx in
+          loop (expected_nonce + 1) rest
+        in
+        let continue_after_reject ~consume_nonce =
+          loop (next_nonce ~expected:expected_nonce ~consume:consume_nonce) rest
+        in
+        let reject ?(consume_nonce = false) ?notify_reason error_type reason =
+          let open Lwt.Syntax in
+          let* () = reject tx ~notify_reason ~error_type ~reason in
+          continue_after_reject ~consume_nonce
+        in
+        handle {
+          tx;
+          confirm;
+          reject;
+          continue_after_reject;
+        }
+  in
+  match initial_nonce ~account_nonce txs with
+  | None -> Lwt.return_unit
+  | Some expected -> loop expected txs
 
 let handle_public_result ~notify_created ~reject ~confirm ~log_burn = function
   | Octra_core.Ledger_apply.Rejected r ->
@@ -153,6 +308,15 @@ let log_op01_burn ~short (tx : Transaction.t) =
   Log.info "op01_burn" "event = op01_burn amount = %s signer = %s"
     (Z.to_string tx.amount)
     (short tx.from)
+
+let live_public_deps ~apply ~notify_created ~reject ~confirm ~short =
+  {
+    apply;
+    notify_created;
+    reject;
+    confirm;
+    log_burn = log_op01_burn ~short;
+  }
 
 let run_public_tx deps tx =
   handle_public_result
@@ -190,6 +354,12 @@ let run_standard_epoch_exec (deps : ('backend, 'env) epoch_exec_deps) ~process t
       process ~backend ~env tx)
     ~reject:deps.reject
     ~confirm:deps.confirm
+
+let reject_contract_upgrade ~reject =
+  reject
+    ~notify_reason:"Contract upgrade not implemented"
+    "contract_upgrade_unsupported"
+    "not implemented"
 
 let fatal_lines ~short ~epoch_id ~sender exn =
   [

@@ -36,9 +36,29 @@ type local_wallet_admission =
   | Pubkey_mismatch_voting
   | Pubkey_mismatch_non_voting
 
+let parse_int ~default raw =
+  match int_of_string_opt raw with
+  | Some value -> value
+  | None -> default
+
+let parse_int64 ~default raw =
+  match Int64.of_string_opt raw with
+  | Some value -> value
+  | None -> default
+
+let parse_float ~default raw =
+  match float_of_string_opt raw with
+  | Some value -> value
+  | None -> default
+
 let int_env env name fallback =
   match env name with
-  | Some raw -> (try int_of_string raw with _ -> fallback)
+  | Some raw -> parse_int ~default:fallback raw
+  | None -> fallback
+
+let float_env env name fallback =
+  match env name with
+  | Some raw -> parse_float ~default:fallback raw
   | None -> fallback
 
 let string_env env name fallback =
@@ -66,6 +86,9 @@ let network_config ~env =
     consensus_peers = csv_env env "OCTRA_PEERS";
     chain_id = string_env env "OCTRA_CHAIN_ID" "octra-mainnet";
   }
+
+let epoch_duration ~env =
+  float_env env "OCTRA_EPOCH_DURATION" 10.0
 
 let node_start_messages ~version ~validator ~storage ~store_path
     ~epoch_duration config =

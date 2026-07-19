@@ -74,6 +74,9 @@ let peer_ids t =
 let peer_scores t =
   P2p_peer_guard.snapshot t.peer_guard
 
+let has_inbound_capacity t =
+  connected_count t < t.config.max_peers
+
 let peer_records t =
   P2p_peer_registry.values ~now:(Unix.gettimeofday ()) t.registry
 
@@ -104,6 +107,7 @@ let report_bad_peer t conn ~reason =
     err_node t.config.node_addr "event = peer_banned key = %s until = %.0f reason = %s"
       key until_ts reason
 
+
 let is_peer_connected t peer_id =
   match Hashtbl.find_opt t.peers peer_id with
   | Some conn -> P2p_conn.is_connected conn
@@ -117,6 +121,7 @@ let preferred_direction t peer_id =
 
 let is_preferred t (conn : P2p_conn.t) =
   conn.direction = preferred_direction t conn.peer_id
+
 
 let add_peer t (conn : P2p_conn.t) =
   let peer_id = conn.peer_id in
@@ -148,6 +153,7 @@ let add_peer t (conn : P2p_conn.t) =
         Hashtbl.replace t.peers peer_id conn;
         true
       end
+
 
 let remove_peer t peer_id =
   (match Hashtbl.find_opt t.peers peer_id with
@@ -193,11 +199,13 @@ let broadcast_except t ~except (frame : P2p_frame.frame) =
   |> List.filter (fun conn -> conn.P2p_conn.peer_id <> except)
   |> Lwt_list.iter_p (fun conn -> send_with_timeout conn frame 2.0)
 
+
 let send_to t ~peer_id (frame : P2p_frame.frame) =
   match Hashtbl.find_opt t.peers peer_id with
   | Some conn when P2p_conn.is_connected conn ->
     P2p_conn.send conn frame
   | _ -> Lwt.return_unit
+
 
 let make_my_hello t =
   let consensus_config_hash =
@@ -279,6 +287,7 @@ let accept_record t r =
       | P2p_peer_registry.Added -> Ok true
       | P2p_peer_registry.Refreshed -> Ok false
       | P2p_peer_registry.Rejected reason -> Error reason
+
 
 let dial t host port =
   let open Lwt.Syntax in
@@ -388,6 +397,7 @@ let handle_frame t user_handler conn frame =
 let bootstrap_endpoints t =
   P2p_endpoint.bootstrap t.config.bootstrap_peers
 
+
 let accept t fd addr =
   let open Lwt.Syntax in
   Lwt.async (fun () ->
@@ -402,6 +412,12 @@ let accept t fd addr =
             key reason;
           (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
         | P2p_peer_guard.Accept ->
+        if not (has_inbound_capacity t) then begin
+          err_node t.config.node_addr
+            "event = inbound_peer_rejected key = %s reason = peer_capacity"
+            key;
+          (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
+        end else
         let my_hello = make_my_hello t in
         let* hs_result = P2p_handshake.accept_handshake fd ~my_hello ~allowed_pubkeys:t.config.allowed_pubkeys in
         match hs_result with
@@ -433,6 +449,7 @@ let accept t fd addr =
         (try Lwt_unix.close fd |> ignore with _ -> ());
         Lwt.return_unit))
 
+
 let listen t =
   let open Lwt.Syntax in
   let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
@@ -447,6 +464,7 @@ let listen t =
       accept_loop ()
   in
   accept_loop ()
+
 
 let dial_bootstrap t =
   let open Lwt.Syntax in
@@ -481,6 +499,7 @@ let dial_bootstrap t =
   in
   Lwt_list.iter_p dial_one endpoints
 
+
 let reconnect_loop t =
   let open Lwt.Syntax in
   let rec loop () =
@@ -510,6 +529,7 @@ let peer_exchange_loop t =
       loop ()
   in
   loop ()
+
 
 let start t ~on_message =
   t.running <- true;

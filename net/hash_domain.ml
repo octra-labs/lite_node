@@ -26,6 +26,7 @@ let hash_hex tag payload =
   String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02x" (Char.code c))) raw;
   Buffer.contents buf
 
+
 let hash_encoded tag encode_fn =
   let payload = Oce1.encode encode_fn in
   hash tag payload
@@ -33,6 +34,7 @@ let hash_encoded tag encode_fn =
 let hash_encoded_hex tag encode_fn =
   let payload = Oce1.encode encode_fn in
   hash_hex tag payload
+
 
 let nil_hash = String.make 32 '\x00'
 

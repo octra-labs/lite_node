@@ -19,6 +19,7 @@ type deps = {
   ledger : Octra_core.Ledger.t;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
+  program_trust : Octra_vm.Program_trust.t;
   wallet_addr : string;
   pre_state_hash : string;
   standard_env : unit -> Octra_core.Epoch_exec.env;

@@ -46,6 +46,28 @@ type cached =
 
 type t
 
+type node_runtime = {
+  cached_bundle : string -> (string list * Transaction.t list * string list) option;
+  store_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  receipt_root_matches :
+    Octra_consensus.C_types.epoch_header ->
+    string list ->
+    bool;
+  header_has_empty_bundle :
+    Octra_consensus.C_types.epoch_header ->
+    bool;
+  store_empty_bundle :
+    Octra_consensus.C_types.epoch_header ->
+    unit;
+  store_empty_proposal : proposal_id:string -> unit;
+  lookup_raw : string -> encoded option;
+}
+
 val create : cap:int -> t
 
 val stats : t -> stats
@@ -90,6 +112,10 @@ val store_empty_header_with_log :
   t ->
   Octra_consensus.C_types.epoch_header ->
   unit
+
+val node_runtime :
+  t ->
+  node_runtime
 
 val decode : encoded -> (decoded, string) result
 

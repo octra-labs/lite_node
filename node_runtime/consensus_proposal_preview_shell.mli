@@ -26,13 +26,17 @@ type backend = {
 
 type deps = {
   chain_id : string;
+  program_trust : Octra_vm.Program_trust.t;
   backend : backend;
   ready_state_root_at : int -> string option Lwt.t;
   ready_max_lag : int;
   warn : string -> unit;
 }
 
-val node_backend : Octra_core.Store_irmin.t -> backend
+val node_backend :
+  program_trust:Octra_vm.Program_trust.t ->
+  Octra_core.Store_irmin.t ->
+  backend
 
 val run :
   deps ->

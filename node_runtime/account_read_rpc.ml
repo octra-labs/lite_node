@@ -62,6 +62,18 @@ let ok value =
 let account_cipher account =
   Option.value ~default:"0" account.Ledger.encrypted_balance
 
+let public_cipher cipher =
+  Octra_core.Crypto.FheBalance.public_cipher cipher
+
+let public_output_cipher = function
+  | name, `String cipher when name = "delta_cipher_stored" ->
+    name, `String (public_cipher cipher)
+  | field -> field
+
+let public_stealth_output = function
+  | `Assoc fields -> `Assoc (List.map public_output_cipher fields)
+  | output -> output
+
 let balance ledger ~params =
   Lwt.return
     (Account_rpc.balance
@@ -114,7 +126,7 @@ let pvac_migration_status chaindata ~addr ~account =
   ok (Rpc_view.pvac_migration_status ~addr status legacy_public_replay)
 
 let encrypted_cipher ~addr ~account =
-  ok (Rpc_view.encrypted_cipher ~addr ~cipher:(account_cipher account))
+  ok (Rpc_view.encrypted_cipher ~addr ~cipher:(public_cipher (account_cipher account)))
 
 let encrypted_balance store ledger ~params ~addr =
   match Tx_view.encrypted_balance_auth params ~addr with
@@ -168,7 +180,7 @@ let stealth_outputs store ~params =
   let from_epoch = stealth_from_epoch params in
   let open Lwt.Syntax in
   let* outputs = Octra_core.Store_irmin.get_stealth_outputs_since store from_epoch in
-  ok (Rpc_view.stealth_outputs ~from_epoch ~outputs)
+  ok (Rpc_view.stealth_outputs ~from_epoch ~outputs:(List.map public_stealth_output outputs))
 
 let account chaindata ~params ~profile_enabled ~started_at ~addr ~account =
   let t0 = started_at in

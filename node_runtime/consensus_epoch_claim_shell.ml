@@ -50,6 +50,31 @@ type tx_deps = {
   confirm : unit -> unit Lwt.t;
 }
 
+type live_tx_args = {
+  claim_plan :
+    Transaction.t ->
+    (Private_ledger.claim_plan, Private_ledger.failure) result Lwt.t;
+  debit : Transaction.t -> Z.t -> int -> (unit, string) result;
+  balance_plan :
+    Transaction.t ->
+    Private_ledger.claim_plan ->
+    (Private_ledger.balance_plan, Private_ledger.failure) result Lwt.t;
+  trace_cipher : string -> string -> string -> string -> unit;
+  update : Transaction.t -> string -> (unit, string) result;
+  mark : int -> string -> (unit, string) result Lwt.t;
+  short_addr : string -> string;
+  reject : string -> string -> unit Lwt.t;
+  confirm : unit -> unit Lwt.t;
+}
+
+type live_ledger_tx_args = {
+  ledger : Octra_core.Ledger.t;
+  trace_cipher : string -> string -> string -> string -> unit;
+  short_addr : string -> string;
+  reject : string -> string -> unit Lwt.t;
+  confirm : unit -> unit Lwt.t;
+}
+
 let run (deps : deps) =
   let open Lwt.Syntax in
   let* claim_result = deps.claim_plan () in
@@ -80,7 +105,7 @@ let run (deps : deps) =
             deps.log_accept claim.claim_output_id;
             deps.confirm ()
 
-let run_tx deps tx =
+let run_tx (deps : tx_deps) tx =
   run {
     fee = tx.Transaction.ou;
     nonce = tx.nonce;
@@ -99,3 +124,37 @@ let run_tx deps tx =
 let log_accept claimant output_id =
   Log.info "epoch" "event = stealth_claim_v5 claimant = %s output_id = %d"
     claimant output_id
+
+let live_tx_deps args =
+  {
+    claim_plan = args.claim_plan;
+    debit = args.debit;
+    balance_plan = args.balance_plan;
+    trace = (fun tx plan ->
+      args.trace_cipher
+        "claim_private"
+        tx.Transaction.from
+        plan.Private_ledger.current_cipher
+        plan.next_cipher);
+    update = args.update;
+    mark = args.mark;
+    log_accept = (fun tx output_id ->
+      log_accept (args.short_addr tx.Transaction.from) output_id);
+    reject = args.reject;
+    confirm = args.confirm;
+  }
+
+let live_ledger_tx_deps args =
+  live_tx_deps {
+    claim_plan = Octra_core.Private_ledger.claim_plan args.ledger;
+    debit = (fun tx fee nonce ->
+      Octra_core.Ledger.debit args.ledger tx.Transaction.from fee nonce);
+    balance_plan = Octra_core.Private_ledger.claim_balance_plan args.ledger;
+    trace_cipher = args.trace_cipher;
+    update = (fun tx cipher ->
+      Octra_core.Ledger.update_enc_balance args.ledger tx.Transaction.from cipher);
+    mark = Octra_core.Ledger.mark_stealth_claimed args.ledger;
+    short_addr = args.short_addr;
+    reject = args.reject;
+    confirm = args.confirm;
+  }

@@ -195,58 +195,6 @@ let update_enc_balance l addr cipher =
    | None -> ());
   Ok ()
 
-let get_encrypted_balance l addr priv =
-  if not (Crypto.EncryptedBalance.verify_privkey_for_address addr priv) then Error "Bad privkey"
-  else
-    let c = match get_account_internal l addr with
-      | Some a -> Option.value ~default:"0" a.encrypted_balance
-      | None -> "0"
-    in
-    if c = "0" then Ok Z.zero else Crypto.EncryptedBalance.decrypt_balance c priv
-
-let validate_cipher_change ~old_cipher ~new_cipher ~delta ~privkey =
-  if not (Crypto.EncryptedBalance.cipher_valid new_cipher) then Error "Cipher malformed"
-  else match Crypto.EncryptedBalance.decrypt_balance old_cipher privkey,
-             Crypto.EncryptedBalance.decrypt_balance new_cipher privkey with
-  | Ok old_z, Ok new_z when Z.equal new_z (Z.add old_z delta) -> Ok ()
-  | Ok _, Ok _ -> Error "Delta mismatch"
-  | Error e, _ | _, Error e -> Error e
-
-let encrypt_balance l addr amt priv =
-  match get_account_internal l addr with
-  | None -> Error "Account missing"
-  | Some a when Z.lt a.balance amt -> Error "Not enough public balance"
-  | Some a ->
-    (match get_encrypted_balance l addr priv with
-     | Error e -> Error e
-     | Ok curr ->
-       let new_enc = Crypto.EncryptedBalance.encrypt_balance (Z.add curr amt) priv in
-       let old_cipher = Option.value ~default:"0" a.encrypted_balance in
-       match validate_cipher_change ~old_cipher ~new_cipher:new_enc ~delta:amt ~privkey:priv with
-       | Error e -> Error e
-       | Ok () ->
-         set_account_internal l addr { a with balance = Z.sub a.balance amt; encrypted_balance = Some new_enc };
-         ignore (update_enc_balance l addr new_enc);
-         Ok ())
-
-let decrypt_balance l addr amt priv =
-  match get_account_internal l addr with
-  | None -> Error "Account missing"
-  | Some a ->
-    (match get_encrypted_balance l addr priv with
-     | Error e -> Error e
-     | Ok curr ->
-       if Z.lt curr amt then Error "Encrypted balance too small"
-       else
-         let new_enc = Crypto.EncryptedBalance.encrypt_balance (Z.sub curr amt) priv in
-         let old_cipher = Option.value ~default:"0" a.encrypted_balance in
-         match validate_cipher_change ~old_cipher ~new_cipher:new_enc ~delta:(Z.neg amt) ~privkey:priv with
-         | Error e -> Error e
-         | Ok () ->
-           set_account_internal l addr { a with balance = Z.add a.balance amt; encrypted_balance = Some new_enc };
-           ignore (update_enc_balance l addr new_enc);
-           Ok ())
-
 let create_private_transfer _l ~from_addr:_ ~to_addr:_ ~amount:_ ~from_priv:_ =
   Error "PrivateOp V1 is disabled — use StealthOp V5"
 
@@ -364,7 +312,7 @@ let fhe_encrypt_with_cipher l addr amt ~delta_cipher_str =
                Lwt.return (Ok ()))))
 
 let fhe_get_encrypted_balance l addr priv_b64 =
-  if not (Crypto.EncryptedBalance.verify_privkey_for_address addr priv_b64) then Error "Bad privkey"
+  if not (Crypto.WalletKey.verify_privkey_for_address addr priv_b64) then Error "Bad privkey"
   else
     let c = match get_account_internal l addr with
       | Some a -> Option.value ~default:"0" a.encrypted_balance
@@ -375,7 +323,7 @@ let fhe_get_encrypted_balance l addr priv_b64 =
       let (pk, sk) = Crypto.FheBalance.derive_pvac_keys priv_b64 in
       Crypto.FheBalance.get_balance pk sk c
     else
-      Crypto.EncryptedBalance.decrypt_balance c priv_b64
+      Error "Legacy encrypted balance is disabled"
 
 let hash_with_contracts l =
   Store_irmin.state_hash l.store

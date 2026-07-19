@@ -63,6 +63,7 @@ let ensure_dir data_dir =
   if not (Sys.file_exists dir) then
     (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
 
+
 let write data_dir entry =
   ensure_dir data_dir;
   let path = entry_path data_dir entry.epoch_id in
@@ -86,6 +87,7 @@ let delete data_dir epoch_id =
   if Sys.file_exists path then
     (try Sys.remove path with _ -> ())
 
+
 let read_pending data_dir =
   let dir = wal_dir data_dir in
   if not (Sys.file_exists dir) then []
@@ -104,6 +106,7 @@ let read_pending data_dir =
           Some (of_json (Bytes.to_string buf))
         with _ -> None)
     |> List.sort (fun a b -> compare a.epoch_id b.epoch_id)
+
 
 type recovery_action =
   | Skip

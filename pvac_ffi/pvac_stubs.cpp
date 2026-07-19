@@ -25,7 +25,7 @@ extern "C" {
 
 #include "pvac/pvac.hpp"
 #include "pvac/ops/recrypt_legacy.hpp"
-#include "pvac_serialize.hpp"
+#include <pvac_serialize.hpp>
 
 #include <cstring>
 #include <stdexcept>
@@ -211,7 +211,7 @@ static size_t agg_range_proof_mem(const pvac::AggregatedRangeProof& arp) {
 
 static const char* cipher_structure_error(const pvac::Cipher& cipher);
 
-static bool read_layer_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Layer& layer) {
+static bool read_layer_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Layer& layer, size_t slots) {
     layer = pvac::Layer{};
     layer.rule = static_cast<pvac::RRule>(r.u8());
     if (layer.rule == pvac::RRule::BASE) {
@@ -222,8 +222,9 @@ static bool read_layer_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Layer& layer
         layer.pa = r.u32();
         layer.pb = r.u32();
     }
-    r.raw(layer.R_com.data(), 32);
-    if (ver >= pvac_ser::VERSION_V3) {
+    if (ver < pvac_ser::VERSION_V4)
+        r.raw(layer.R_com.data(), 32);
+    if (ver >= pvac_ser::VERSION_V3 && ver < pvac_ser::VERSION_V4) {
         size_t n_rpc = r.u64();
         r.check_count(n_rpc, 32);
         if (r.failed)
@@ -235,7 +236,7 @@ static bool read_layer_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Layer& layer
                 return false;
         }
     }
-    if (ver >= pvac_ser::VERSION_V2) {
+    if (ver >= pvac_ser::VERSION_V2 && ver < pvac_ser::VERSION_V4) {
         size_t n_pc = r.u64();
         r.check_count(n_pc, 32);
         if (r.failed)
@@ -247,6 +248,8 @@ static bool read_layer_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Layer& layer
                 return false;
         }
     }
+    if (ver >= pvac_ser::VERSION_V4)
+        pvac_ser::mark_public_base_layer(layer, slots);
     return !r.failed;
 }
 
@@ -259,7 +262,7 @@ static bool read_cipher_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Cipher& cip
         return false;
     cipher.L.resize(n_l);
     for (size_t i = 0; i < n_l; ++i)
-        if (!read_layer_safe(r, ver, cipher.L[i]))
+        if (!read_layer_safe(r, ver, cipher.L[i], cipher.slots))
             return false;
     size_t n_c = r.u64();
     r.check_count(n_c, 16);
@@ -817,9 +820,11 @@ CAMLprim value caml_pvac_ct_div_const(value v_pk, value v_ct, value v_lo, value 
     k.lo = lo;
     k.hi = hi;
 
+    if ((k.lo | k.hi) == 0) caml_failwith("pvac: zero divisor");
+
     pvac::Cipher* result = new pvac::Cipher();
     try {
-        *result = pvac::ct_scale(pk, ct, pvac::fp_inv(k));
+        *result = pvac::ct_div_const(pk, ct, k);
     } catch (const std::exception& e) {
         delete result;
         caml_failwith(e.what());
@@ -1051,40 +1056,6 @@ CAMLprim value caml_pvac_cipher_is_key_bound_extension(value v_legacy, value v_b
     CAMLreturn(Val_bool(cipher_is_key_bound_extension_impl(legacy, bound)));
 }
 
-CAMLprim value caml_pvac_bind_legacy_cipher_material(value v_pk, value v_sk, value v_ct) {
-    CAMLparam3(v_pk, v_sk, v_ct);
-    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
-    pvac::SecKey& sk = *Handle_val(pvac::SecKey, v_sk);
-    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
-    if (cipher_structure_error(ct) != nullptr)
-        caml_failwith("bind_legacy_cipher_material: invalid cipher structure");
-    auto* out = new pvac::Cipher(ct);
-    try {
-        for (auto& layer : out->L) {
-            if (layer.rule != pvac::RRule::BASE)
-                continue;
-            if (!layer.R_PC.empty() && layer.R_PC.size() != out->slots)
-                throw std::runtime_error("bind_legacy_cipher_material: invalid R_PC size");
-            if (!layer.PC.empty() && layer.PC.size() != out->slots)
-                throw std::runtime_error("bind_legacy_cipher_material: invalid PC size");
-            layer.R_PC.resize(out->slots);
-            layer.PC.resize(out->slots);
-            for (size_t j = 0; j < out->slots; ++j) {
-                pvac::Fp r = pvac::circuit_prf_R(pk, sk, layer.seed, j);
-                pvac::Fp rinv = pvac::fp_inv(r);
-                pvac::Scalar alpha = pvac::derive_r_alpha(sk, layer, j);
-                pvac::Scalar rho = pvac::derive_rho(sk, layer, j);
-                layer.R_PC[j] = pvac::pedersen_commit(pvac::sc_from_fp_signed(r), alpha);
-                layer.PC[j] = pvac::pedersen_commit(pvac::sc_from_fp_signed(rinv), rho);
-            }
-        }
-    } catch (...) {
-        delete out;
-        throw;
-    }
-    CAMLreturn(wrap_cipher(out));
-}
-
 CAMLprim value caml_pvac_serialize_cipher(value v_ct) {
     CAMLparam1(v_ct);
     CAMLlocal1(v_bytes);
@@ -1109,6 +1080,28 @@ CAMLprim value caml_pvac_serialize_cipher(value v_ct) {
     CAMLreturn(v_bytes);
 }
 
+CAMLprim value caml_pvac_serialize_cipher_public(value v_ct) {
+    CAMLparam1(v_ct);
+    CAMLlocal1(v_bytes);
+    DBG_ENTER("serialize_cipher_public");
+
+    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+
+    std::vector<uint8_t> buf;
+    try {
+        buf = pvac_ser::serialize_cipher_public(ct);
+    } catch (const std::exception& e) {
+        caml_failwith(e.what());
+    }
+
+    DBG_SIZE("buf_bytes", buf.size());
+    v_bytes = caml_alloc_string(buf.size());
+    std::memcpy(Bytes_val(v_bytes), buf.data(), buf.size());
+
+    DBG_EXIT("serialize_cipher_public");
+    CAMLreturn(v_bytes);
+}
+
 CAMLprim value caml_pvac_deserialize_cipher(value v_bytes) {
     CAMLparam1(v_bytes);
     DBG_ENTER("deserialize_cipher");
@@ -1126,7 +1119,7 @@ CAMLprim value caml_pvac_deserialize_cipher(value v_bytes) {
         if (!r.failed) {
             ct->L.resize(nL);
             for (size_t i = 0; i < nL && !r.failed; ++i)
-                ct->L[i] = pvac_ser::read_layer(r, ver);
+                ct->L[i] = pvac_ser::read_layer(r, ver, ct->slots);
         }
         size_t nc = r.u64();
         r.check_count(nc, 16);
@@ -1629,6 +1622,8 @@ CAMLprim value caml_pvac_deserialize_range_proof(value v_bytes) {
     CAMLreturn(wrap_range_proof(rp));
 }
 
+
+
 CAMLprim value caml_pvac_make_aggregated_range_proof(value v_pk, value v_sk, value v_ct, value v_value) {
     CAMLparam4(v_pk, v_sk, v_ct, v_value);
     DBG_ENTER("make_aggregated_range_proof");
@@ -1694,9 +1689,12 @@ CAMLprim value caml_pvac_verify_range_any(value v_pk, value v_ct, value v_proof_
     CAMLreturn(Val_bool(ok));
 }
 
+
+
 CAMLprim value caml_pvac_aes_kat(value v_unit) {
     CAMLparam1(v_unit);
     CAMLlocal1(v_out);
+
 
     pvac::Sha256 h;
     h.init();
@@ -1704,6 +1702,7 @@ CAMLprim value caml_pvac_aes_kat(value v_unit) {
     h.update(label, std::strlen(label));
     uint8_t key[32];
     h.finish(key);
+
 
     pvac::AesCtr256 prg;
     prg.init(key, 0);

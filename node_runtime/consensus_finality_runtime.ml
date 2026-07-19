@@ -57,6 +57,25 @@ type node_deps = {
   finality : Consensus_finality_state.callbacks;
 }
 
+type node_runtime = {
+  data_dir : string;
+  bundles : Consensus_bundle_cache.node_runtime;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  proposal_state : Consensus_proposal_state.t;
+  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  catchup_queue : Consensus_catchup_queue.t;
+  consensus_finalized : bool ref;
+  current_epoch : int ref;
+  sleep : float -> unit Lwt.t;
+  read_pre_finalize_root : unit -> string option;
+  read_commit_root : unit -> string option Lwt.t;
+  read_local_root_raw : unit -> string Lwt.t;
+  fatal_exit : unit -> unit;
+  catchup_active : bool ref;
+  runtime_state : Consensus_runtime_state.t;
+  finality : Consensus_finality_state.callbacks;
+}
+
 type t = {
   apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
   drain_pending : unit -> unit Lwt.t;
@@ -127,5 +146,39 @@ let create_node deps =
           quarantine_active = deps.quarantine_active;
           finality = deps.finality;
           read_local_root_raw = deps.read_local_root_raw;
-        };
+      };
     }
+
+let node_deps_of_runtime runtime =
+  {
+    write_finality = (fun finalize ->
+      Octra_consensus.Finality_log.write runtime.data_dir
+        (Octra_consensus.Finality_log.of_finalize finalize));
+    chaos_after_finality_log = (fun () ->
+      Octra_core.Chaos.inject "after_finality_log");
+    cached_bundle_for_pid = runtime.bundles.cached_bundle;
+    header_has_empty_bundle = runtime.bundles.header_has_empty_bundle;
+    store_empty_bundle = runtime.bundles.store_empty_bundle;
+    driver = (fun () -> !(runtime.driver_ref));
+    set_proposal = Consensus_proposal_state.set runtime.proposal_state;
+    store_proposal_bundle = runtime.bundles.store_bundle;
+    queue_missing_bundle = runtime.queue_missing_bundle;
+    deactivate_gap = (fun () ->
+      Consensus_catchup_queue.deactivate_gap runtime.catchup_queue);
+    set_consensus_finalized = (fun finalized ->
+      runtime.consensus_finalized := finalized);
+    current_epoch = (fun () -> !(runtime.current_epoch));
+    sleep = runtime.sleep;
+    read_pre_finalize_root = runtime.read_pre_finalize_root;
+    read_commit_root = runtime.read_commit_root;
+    read_local_root_raw = runtime.read_local_root_raw;
+    remove_pending_finalized = runtime.finality.remove_finalized;
+    fatal_exit = runtime.fatal_exit;
+    catchup_active = (fun () -> !(runtime.catchup_active));
+    quarantine_active = (fun () ->
+      Consensus_runtime_state.quarantine_active runtime.runtime_state);
+    finality = runtime.finality;
+  }
+
+let create_node_runtime runtime =
+  create_node (node_deps_of_runtime runtime)

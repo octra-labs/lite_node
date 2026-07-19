@@ -298,6 +298,7 @@ val program_params :
   rpc_result Lwt.t
 
 val view_call :
+  ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
   circle_id:string ->
@@ -308,6 +309,7 @@ val view_call :
   rpc_result Lwt.t
 
 val view_call_public :
+  ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
   circle_id:string ->
@@ -317,12 +319,14 @@ val view_call_public :
   rpc_result Lwt.t
 
 val view_call_public_params :
+  ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
   rpc_result Lwt.t
 
 val view_call_auth :
+  ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->

@@ -205,7 +205,7 @@ let list_saved_epochs chaindata =
 let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     ~consensus_config_hash ~consensus_validator_set ~scheduled_validator_set
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
-    ~chaindata ~consensus_driver_ref =
+    ~program_trust ~chaindata ~consensus_driver_ref =
   let deps = Node_rpc_server.{
     validate = validate_and_submit_tx runtime ledger;
     encrypted_supply = encrypted_supply_aggregate;
@@ -229,7 +229,33 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     total_tx_count;
     validator_view_sk;
     validator_view_pub;
+    program_trust;
     chaindata;
     consensus_driver_ref;
     deps;
   }
+
+let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
+    ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
+    ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
+    ~validator_view_sk ~validator_view_pub ~program_trust ~chaindata
+    ~consensus_driver_ref () =
+  start
+    runtime
+    ~port
+    ~data_dir
+    ~store
+    ~ledger
+    ~tree_ref
+    ~wallet
+    ~chain_id
+    ~consensus_config_hash:!consensus_config_hash_ref
+    ~consensus_validator_set:!consensus_validator_set_ref
+    ~scheduled_validator_set:!scheduled_validator_set_ref
+    ~current_epoch
+    ~total_tx_count
+    ~validator_view_sk
+    ~validator_view_pub
+    ~program_trust
+    ~chaindata
+    ~consensus_driver_ref

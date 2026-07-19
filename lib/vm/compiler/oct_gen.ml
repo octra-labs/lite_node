@@ -38,9 +38,10 @@ type env = {
   mutable in_nonreentrant : bool;
   mutable fn_is_view : bool;
   mutable fn_is_pure : bool;
+  declaration : declaration;
 }
 
-let make_env structs enums consts state events errors funcs = {
+let make_env declaration structs enums consts state events errors funcs = {
   structs; enums; consts; state; events; errors; funcs;
   func_labels = Hashtbl.create 16;
   locals = [];
@@ -50,6 +51,7 @@ let make_env structs enums consts state events errors funcs = {
   in_nonreentrant = false;
   fn_is_view = false;
   fn_is_pure = false;
+  declaration;
 }
 
 let check_no_storage_write env =
@@ -742,7 +744,7 @@ let rec typ_of_expr env = function
   | EBool _ -> TBool
   | EString _ -> TString
   | ECaller | EOrigin | ESelfAddr -> TAddress
-  | EEpoch | EValue -> TInt
+  | EEpoch | EEpochTime | EValue -> TInt
   | EBalance _ -> TInt
   | ETreeHash | ENodeId | ETxHash -> TString
   | EVar name ->
@@ -788,7 +790,7 @@ let rec typ_of_expr env = function
      | "len" | "index_of" | "bit_and" | "bit_or" | "bit_xor"
      | "bit_shl" | "bit_shr" -> TInt
      | "fhe_load_pk" | "fhe_deser_pk" -> TPubKey
-     | "fhe_add" | "fhe_sub" | "fhe_mul" | "fhe_scale"
+     | "fhe_add" | "fhe_sub" | "fhe_mul" | "fhe_scale" | "fhe_div_const"
      | "fhe_add_const" | "fhe_sub_const" | "fhe_deser" -> TCipher
      | "fhe_verify_zero" | "fhe_verify_range" | "fhe_verify_bound"
      | "groth16_verify_bn254"
@@ -869,20 +871,21 @@ let rec typ_of_expr env = function
      | "circle_balance_workflow_record"
      | "circle_register_workflow_record" -> TBool
      | "min" | "max" | "abs" | "to_int" | "parse_ints" | "mget" | "pow"
-     | "vecdot" | "vecdot_fp" | "argmax_fp" | "exp_lut"
+     | "vecdot" | "vecdot_fp" | "vecdot_q16" | "argmax_fp" | "argmax_q16" | "exp_lut" | "exp_q16"
      | "unwrap" | "split" -> TInt
      | "some" -> (match call_args with [e] -> typ_of_expr env e | _ -> TInt)
      | "none" -> TString
      | "transfer" | "checkpoint" | "rollback" | "commit" | "mset"
-     | "matmul" | "softmax" | "layernorm" | "relu"
-     | "rmsnorm" | "silu" | "elemwise_mul"
-     | "load_int8" | "load_int8_b64" | "residual_add" | "rope_apply"
+     | "matmul" | "softmax" | "softmax_q16" | "layernorm" | "layernorm_q16"
+     | "relu" | "rmsnorm" | "rmsnorm_q16" | "silu" | "silu_q16" | "elemwise_mul"
+     | "load_int8" | "load_int8_b64" | "residual_add" | "rope_apply" | "rope_apply_q16"
      | "matmul_q16" | "shift_round"
      | "matmul_fp" | "rmsnorm_fp" | "silu_fp" | "elemwise_mul_fp"
      | "residual_add_fp" | "rope_apply_fp" | "load_int8_fp"
-     | "attention_kv_fp" | "append_vec_fp" -> TBool
+     | "attention_kv_fp" | "attention_kv_q16" | "append_vec_fp"
+     | "load_int8_q16" | "append_vec_q16" -> TBool
      | "call" -> TString
-     | "deploy" -> TAddress
+     | "deploy" | "circle_spawn" -> TAddress
      | _ ->
        (match List.find_opt (fun f -> f.fn_name = name) env.funcs with
         | Some f -> f.fn_ret
@@ -1157,6 +1160,7 @@ and gen_builtin env name args =
    | "fhe_sub" -> emit env (Contract_vm.FHE_SUB (rd, nth 0, nth 1, nth 2))
    | "fhe_mul" -> emit env (Contract_vm.FHE_MUL (rd, nth 0, nth 1, nth 2))
    | "fhe_scale" -> emit env (Contract_vm.FHE_SCALE (rd, nth 0, nth 1, nth 2))
+   | "fhe_div_const" -> emit env (Contract_vm.FHE_DIV_CONST (rd, nth 0, nth 1, nth 2))
    | "fhe_add_const" -> emit env (Contract_vm.FHE_ADD_CONST (rd, nth 0, nth 1, nth 2))
    | "fhe_sub_const" -> emit env (Contract_vm.FHE_SUB_CONST (rd, nth 0, nth 1, nth 2))
    | "fhe_verify_zero" -> emit env (Contract_vm.FHE_VERIFY_ZERO (rd, nth 0, nth 1, nth 2))
@@ -1412,6 +1416,10 @@ and gen_builtin env name args =
        let base = nth 1 in
        emit env (Contract_vm.SPAWN2 (rd, nth 0, base, nargs - 1))
      end
+   | "circle_spawn" ->
+     if nargs <> 2 then
+       gerr env.line "circle_spawn: need (payload_json, owner_mode)";
+     emit env (Contract_vm.SPAWN2 (rd, nth 0, nth 1, 1))
    | "mget" -> emit env (Contract_vm.MLOADR (rd, nth 0))
    | "mset" ->
      emit env (Contract_vm.MSTORER (nth 0, nth 1));
@@ -1433,37 +1441,115 @@ and gen_builtin env name args =
      emit env (Contract_vm.MATMUL (nth 0, nth 1, nth 2, nth 3, nth 4, nth 5));
      emit env (Contract_vm.LDI (rd, VBool true))
    | "vecdot" -> emit env (Contract_vm.VECDOT (rd, nth 0, nth 1, nth 2))
+   | "vecdot_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "vecdot_q16 is available only in Program"
+     else
+       emit env (Contract_vm.VECDOT_Q16 (rd, nth 0, nth 1, nth 2))
    | "exp_lut" -> emit env (Contract_vm.EXP_LUT (rd, nth 0))
+   | "exp_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "exp_q16 is available only in Program"
+     else
+       emit env (Contract_vm.EXP_Q16 (rd, nth 0))
    | "softmax" ->
      emit env (Contract_vm.SOFTMAX_INPLACE (nth 0, nth 1));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "softmax_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "softmax_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.SOFTMAX_Q16_INPLACE (nth 0, nth 1));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "layernorm" ->
      emit env (Contract_vm.LAYERNORM_INPLACE (nth 0, nth 1, nth 2, nth 3));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "layernorm_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "layernorm_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.LAYERNORM_Q16_INPLACE (nth 0, nth 1, nth 2, nth 3));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "relu" ->
      emit env (Contract_vm.RELU_INPLACE (nth 0, nth 1));
      emit env (Contract_vm.LDI (rd, VBool true))
    | "rmsnorm" ->
      emit env (Contract_vm.RMSNORM_INPLACE (nth 0, nth 1, nth 2));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "rmsnorm_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "rmsnorm_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.RMSNORM_Q16_INPLACE (nth 0, nth 1, nth 2));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
+   | "silu_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "silu_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.SILU_Q16_INPLACE (nth 0, nth 1));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "silu" ->
      emit env (Contract_vm.SILU_INPLACE (nth 0, nth 1));
      emit env (Contract_vm.LDI (rd, VBool true))
    | "elemwise_mul" ->
      emit env (Contract_vm.ELEMWISE_MUL_INPLACE (nth 0, nth 1, nth 2));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "elemwise_mul_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "elemwise_mul_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.ELEMWISE_MUL_Q16 (nth 0, nth 1, nth 2));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "load_int8" ->
      emit env (Contract_vm.LOAD_INT8_BYTES_TO_MEM (nth 0, nth 1, nth 2, nth 3, nth 4));
      emit env (Contract_vm.LDI (rd, VBool true))
    | "residual_add" ->
      emit env (Contract_vm.RESIDUAL_ADD (nth 0, nth 1, nth 2));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "residual_add_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "residual_add_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.RESIDUAL_ADD_Q16 (nth 0, nth 1, nth 2));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "rope_apply" ->
      emit env (Contract_vm.ROPE_APPLY (nth 0, nth 1, nth 2, nth 3));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "rope_apply_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "rope_apply_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.ROPE_APPLY_Q16 (nth 0, nth 1, nth 2, nth 3));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "load_int8_b64" ->
      emit env (Contract_vm.LOAD_INT8_B64_TO_MEM (nth 0, nth 1, nth 2, nth 3, nth 4));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "load_int8_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "load_int8_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.LOAD_INT8_Q16 (nth 0, nth 1, nth 2, nth 3, nth 4));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
+   | "append_vec_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "append_vec_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.APPEND_VEC_Q16 (nth 0, nth 1, nth 2, nth 3));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
+   | "argmax_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "argmax_q16 is available only in Program"
+     else
+       emit env (Contract_vm.ARGMAX_Q16 (rd, nth 0, nth 1))
    | "matmul_q16" ->
      emit env (Contract_vm.MATMUL_Q16 (nth 0, nth 1, nth 2, nth 3, nth 4, nth 5));
      emit env (Contract_vm.LDI (rd, VBool true))
@@ -1498,6 +1584,13 @@ and gen_builtin env name args =
    | "attention_kv_fp" ->
      emit env (Contract_vm.ATTENTION_KV_FP (nth 0, nth 1, nth 2, nth 3, nth 4, nth 5, nth 6, nth 7));
      emit env (Contract_vm.LDI (rd, VBool true))
+   | "attention_kv_q16" ->
+     if env.declaration <> ProgramDecl then
+       gerr env.line "attention_kv_q16 is available only in Program"
+     else begin
+       emit env (Contract_vm.ATTENTION_KV_Q16 (nth 0, nth 1, nth 2, nth 3, nth 4, nth 5, nth 6, nth 7));
+       emit env (Contract_vm.LDI (rd, VBool true))
+     end
    | "append_vec_fp" ->
      emit env (Contract_vm.APPEND_VEC_FP (nth 0, nth 1, nth 2, nth 3));
      emit env (Contract_vm.LDI (rd, VBool true))
@@ -1646,6 +1739,12 @@ and gen_expr env expr =
   | EEpoch ->
     let r = alloc_reg env in
     emit env (Contract_vm.EPOCH r); r
+  | EEpochTime ->
+    if env.declaration <> ProgramDecl then
+      gerr env.line "epoch_time is available only in Program"
+    else
+      let r = alloc_reg env in
+      emit env (Contract_vm.EPOCH_TIME r); r
   | EValue ->
     let r = alloc_reg env in
     emit env (Contract_vm.VALUE r); r
@@ -2456,7 +2555,7 @@ let check_interfaces (ct : contract) =
 
 let generate (ct : contract) =
   check_interfaces ct;
-  let env = make_env ct.structs ct.enums ct.consts ct.state ct.events ct.errors ct.funcs in
+  let env = make_env ct.declaration ct.structs ct.enums ct.consts ct.state ct.events ct.errors ct.funcs in
   List.iteri (fun i f ->
     Hashtbl.replace env.func_labels f.fn_name (200 + i * 100)
   ) ct.funcs;

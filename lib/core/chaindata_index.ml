@@ -221,6 +221,7 @@ let buffer_meta t key value =
 
 exception Index_commit_failed of string
 
+
 let set_tx_loc_only t hash ~seg_id ~offset ~len ~epoch_id =
   let loc = encode_tx_loc ~seg_id ~offset ~len ~epoch_id in
   match
@@ -230,12 +231,14 @@ let set_tx_loc_only t hash ~seg_id ~offset ~len ~epoch_id =
   | Some () -> ()
   | None -> raise (Index_commit_failed "set_tx_loc_only: Txn.go returned None")
 
+
 let buffer_tx_loc_only t ~hash ~seg_id ~offset ~len ~epoch_id =
   match t.batch with
   | None -> failwith "history_index: no batch active"
   | Some b ->
     b.txs <- { hash; seg_id; offset; len; epoch_id; txid = 0L;
                from_addr = ""; to_addr = ""; extra_addrs = [] } :: b.txs
+
 
 let commit_tx_loc_only t =
   match t.batch with
@@ -567,6 +570,7 @@ let get_meta t key =
   try Some (copy (Lmdb.Map.get t.meta key))
   with Not_found -> None
 
+
 let get_meta_string t key = get_meta t key
 
 let get_meta_int t key =
@@ -578,6 +582,7 @@ let get_meta_int64 t key =
   match get_meta t key with
   | None -> None
   | Some s -> (try Some (Int64.of_string s) with _ -> None)
+
 
 let cleanup_after_epoch t ~max_epoch ~start_txid_inflight ~tx_count_inflight:_ =
   let to_del_hashes = ref [] in
@@ -685,6 +690,7 @@ let set_meta_direct t key value =
     Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
     raise (Index_commit_failed msg)
 
+
 let set_meta_many_direct t kvs =
   let result =
     try
@@ -698,6 +704,8 @@ let set_meta_many_direct t kvs =
   | Some () -> ()
   | None ->
     raise (Index_commit_failed "set_meta_many_direct: Txn.go returned None")
+
+
 
 let repair_tx_full t ~hash ~seg_id ~offset ~len ~epoch_id ~txid
     ~from_addr ~to_addr =
@@ -754,6 +762,7 @@ let remove_addr_tx_direct t ~addr ~txid =
   | Some () -> ()
   | None -> raise (Index_commit_failed "remove_addr_tx_direct: Txn.go returned None")
 
+
 let find_txid_for_epoch_pointer t ~epoch_id ~seg_id ~offset =
   let em_v = try Some (copy (Lmdb.Map.get t.epoch_meta (Int32.of_int epoch_id)))
              with Not_found -> None in
@@ -792,6 +801,7 @@ let find_txid_for_epoch_pointer t ~epoch_id ~seg_id ~offset =
       !found
     with _ -> None)
 
+
 let repair_class_b t ~hash ~seg_id ~offset ~len ~epoch_id ~txid
     ~from_addr ~to_addr =
   let result =
@@ -824,6 +834,7 @@ let set_epoch_meta_json t epoch_id json =
   match result with
   | Some () -> ()
   | None -> raise (Index_commit_failed "set_epoch_meta_json: Txn.go returned None")
+
 
 type delta_row = {
   d_txid : int64;
@@ -861,6 +872,7 @@ let apply_delta_atomic t ~rows ~epoch_meta_updates ~meta_kvs =
   match result with
   | Some () -> ()
   | None -> raise (Index_commit_failed "apply_delta_atomic: Txn.go returned None")
+
 
 let clear_rebuild_tables t =
   let result =

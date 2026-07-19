@@ -30,6 +30,20 @@ type deps = {
   sleep : float -> unit Lwt.t;
 }
 
+type node_runtime = {
+  now : unit -> float;
+  last_epoch_time : float ref;
+  current_epoch : int ref;
+  consensus_finalized : bool ref;
+  finality : Consensus_finality_state.callbacks;
+  bundle : Consensus_bundle_cache.node_runtime;
+  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  warn : string -> unit;
+  info : string -> unit;
+  apply : now:float -> elapsed:float -> unit Lwt.t;
+  sleep : float -> unit Lwt.t;
+}
+
 val step :
   deps ->
   consensus_mode:bool ->
@@ -38,6 +52,16 @@ val step :
 
 val run :
   deps ->
+  consensus_mode:bool ->
+  epoch_duration:float ->
+  unit Lwt.t
+
+val node_deps :
+  node_runtime ->
+  deps
+
+val run_node :
+  node_runtime ->
   consensus_mode:bool ->
   epoch_duration:float ->
   unit Lwt.t

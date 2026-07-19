@@ -19,7 +19,7 @@ type v =
   | VString of string
   | VBytes of string
   | VBytes32 of string
-  | VU64 of int64
+  | VU64 of Z.t
   | VU128 of Z.t
   | VU256 of Z.t
   | VAddr of string
@@ -59,6 +59,7 @@ type instr =
   | ORIGIN of reg
   | SELF of reg
   | EPOCH of reg
+  | EPOCH_TIME of reg
   | VALUE of reg
   | BALANCE of reg * reg
   | TREEHASH of reg
@@ -82,6 +83,7 @@ type instr =
   | FHE_SUB of reg * reg * reg * reg
   | FHE_MUL of reg * reg * reg * reg
   | FHE_SCALE of reg * reg * reg * reg
+  | FHE_DIV_CONST of reg * reg * reg * reg
   | FHE_ADD_CONST of reg * reg * reg * reg
   | FHE_SUB_CONST of reg * reg * reg * reg
   | FHE_VERIFY_ZERO of reg * reg * reg * reg
@@ -124,17 +126,29 @@ type instr =
   | FLOAD of reg * reg
   | MATMUL of reg * reg * reg * reg * reg * reg
   | VECDOT of reg * reg * reg * reg
+  | VECDOT_Q16 of reg * reg * reg * reg
   | EXP_LUT of reg * reg
+  | EXP_Q16 of reg * reg
   | SOFTMAX_INPLACE of reg * reg
+  | SOFTMAX_Q16_INPLACE of reg * reg
   | LAYERNORM_INPLACE of reg * reg * reg * reg
+  | LAYERNORM_Q16_INPLACE of reg * reg * reg * reg
   | RELU_INPLACE of reg * reg
   | RMSNORM_INPLACE of reg * reg * reg
+  | RMSNORM_Q16_INPLACE of reg * reg * reg
   | SILU_INPLACE of reg * reg
+  | SILU_Q16_INPLACE of reg * reg
   | ELEMWISE_MUL_INPLACE of reg * reg * reg
+  | ELEMWISE_MUL_Q16 of reg * reg * reg
   | LOAD_INT8_BYTES_TO_MEM of reg * reg * reg * reg * reg
   | RESIDUAL_ADD of reg * reg * reg
+  | RESIDUAL_ADD_Q16 of reg * reg * reg
   | ROPE_APPLY of reg * reg * reg * reg
+  | ROPE_APPLY_Q16 of reg * reg * reg * reg
   | LOAD_INT8_B64_TO_MEM of reg * reg * reg * reg * reg
+  | LOAD_INT8_Q16 of reg * reg * reg * reg * reg
+  | APPEND_VEC_Q16 of reg * reg * reg * reg
+  | ARGMAX_Q16 of reg * reg * reg
   | MATMUL_Q16 of reg * reg * reg * reg * reg * reg
   | SHIFT_ROUND_INPLACE of reg * reg * reg
   | MATMUL_FP of reg * reg * reg * reg * reg * reg
@@ -147,6 +161,7 @@ type instr =
   | VECDOT_FP of reg * reg * reg * reg
   | ARGMAX_FP of reg * reg * reg
   | ATTENTION_KV_FP of reg * reg * reg * reg * reg * reg * reg * reg
+  | ATTENTION_KV_Q16 of reg * reg * reg * reg * reg * reg * reg * reg
   | APPEND_VEC_FP of reg * reg * reg * reg
 
 type mem = { mutable data : (int, v) Hashtbl.t; mutable size : int }
@@ -199,6 +214,7 @@ type exec_ctx = {
   circle_hfhe_intent_id : string option;
   circle_hfhe_active_relay_id : string option;
   current_epoch : int;
+  epoch_time_ms : int64;
   tree_hash : string;
   node_id : string;
   tx_hash : string;
@@ -217,6 +233,7 @@ let default_ctx = {
   circle_hfhe_intent_id = None;
   circle_hfhe_active_relay_id = None;
   current_epoch = 0;
+  epoch_time_ms = 0L;
   tree_hash = String.make 64 '0';
   node_id = "node_001";
 }
@@ -241,6 +258,7 @@ type s = {
   mutable return_stack : (int * int * v array) list;
   blobs : (string, string) Hashtbl.t;
   mutable is_view : bool;
+  strict_values : bool;
   decoded_chunk_cache : (int, string) Hashtbl.t;
 }
 
@@ -252,7 +270,7 @@ let is_reserved_key k =
 let effort_cost = function
   | LDI _ | MOV _ | JMP _ | JDEST _ | STOP | REVERT | NOP | EFFORT _ | CALL_INT _ -> 1
   | EQ _ | LT _ | GT _ | NEQ _ -> 2
-  | CALLER _ | ORIGIN _ | SELF _ | EPOCH _ | VALUE _ -> 2
+  | CALLER _ | ORIGIN _ | SELF _ | EPOCH _ | EPOCH_TIME _ | VALUE _ -> 2
   | ADD _ | SUB _ | MUL _ | MLOAD _ | MSTORE _ | MLOADR _ | MSTORER _ | CONCAT _ | STRLEN _ | ISADDR _ | ISHEX _ | STATE_PATH_KEY _ -> 3
   | DIV _ | MOD _ | NEG _ | ABS _ -> 5
   | OBJECT_HAS_MEMBER _ -> 30
@@ -269,7 +287,7 @@ let effort_cost = function
   | FHE_LOAD_PK _ | FHE_SER _ | FHE_DESER _ -> 100
   | FHE_COMMIT _ | FHE_PEDERSEN _ -> 200
   | FHE_ADD _ | FHE_SUB _ | FHE_ADD_CONST _ | FHE_SUB_CONST _ -> 500
-  | FHE_SCALE _ -> 1000
+  | FHE_SCALE _ | FHE_DIV_CONST _ -> 1000
   | FHE_MUL _ -> 10000
   | FHE_VERIFY_ZERO _ | FHE_VERIFY_BOUND _ -> 50000
   | PARSE_INTS _ -> 10
@@ -289,17 +307,29 @@ let effort_cost = function
   | OBJECT_TRANSITION_APPLY _ -> 300
   | MATMUL _ -> 100
   | VECDOT _ -> 10
+  | VECDOT_Q16 _ -> 10
   | EXP_LUT _ -> 5
+  | EXP_Q16 _ -> 8
   | SOFTMAX_INPLACE _ -> 20
+  | SOFTMAX_Q16_INPLACE _ -> 25
   | LAYERNORM_INPLACE _ -> 30
+  | LAYERNORM_Q16_INPLACE _ -> 30
   | RELU_INPLACE _ -> 5
   | RMSNORM_INPLACE _ -> 25
+  | RMSNORM_Q16_INPLACE _ -> 25
   | SILU_INPLACE _ -> 10
+  | SILU_Q16_INPLACE _ -> 10
   | ELEMWISE_MUL_INPLACE _ -> 5
+  | ELEMWISE_MUL_Q16 _ -> 5
   | LOAD_INT8_BYTES_TO_MEM _ -> 10
   | RESIDUAL_ADD _ -> 5
+  | RESIDUAL_ADD_Q16 _ -> 5
   | ROPE_APPLY _ -> 50
+  | ROPE_APPLY_Q16 _ -> 50
   | LOAD_INT8_B64_TO_MEM _ -> 30
+  | LOAD_INT8_Q16 _ -> 30
+  | APPEND_VEC_Q16 _ -> 5
+  | ARGMAX_Q16 _ -> 5
   | MATMUL_Q16 _ -> 100
   | SHIFT_ROUND_INPLACE _ -> 5
   | MATMUL_FP _ -> 200
@@ -312,6 +342,7 @@ let effort_cost = function
   | VECDOT_FP _ -> 20
   | ARGMAX_FP _ -> 5
   | ATTENTION_KV_FP _ -> 200
+  | ATTENTION_KV_Q16 _ -> 200
   | APPEND_VEC_FP _ -> 5
 
 let is_valid_addr s =
@@ -326,7 +357,8 @@ let is_valid_addr s =
       else false
     in check 3
 
-let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=false) ~caller ~origin ~address ~value ~storage () =
+let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=false)
+    ?(strict_values=false) ~caller ~origin ~address ~value ~storage () =
   {
     regs = Array.make 64 (VInt Z.zero);
     memory = { data = Hashtbl.create 1024; size = 0 };
@@ -344,12 +376,13 @@ let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=fals
     return_stack = [];
     blobs = Hashtbl.create 16;
     is_view;
+    strict_values;
     decoded_chunk_cache = Hashtbl.create 512;
   }
 
 let to_z = function
   | VInt z -> z
-  | VU64 n -> Z.of_int64 n
+  | VU64 z -> z
   | VU128 z -> z
   | VU256 z -> z
   | VBool b -> if b then Z.one else Z.zero
@@ -368,7 +401,7 @@ let to_string = function
   | VBool b -> if b then "true" else "false"
   | VBytes b -> b
   | VBytes32 b -> b
-  | VU64 n -> Int64.to_string n
+  | VU64 z -> Z.to_string z
   | VU128 z -> Z.to_string z
   | VU256 z -> Z.to_string z
   | VAddr a -> a
@@ -413,7 +446,7 @@ let mem_set_fp64 mem a f =
   Hashtbl.replace mem a (VInt (fp64_to_z f))
 
 let make_u64 z =
-  if validate_u64 z then Some (VU64 (Z.to_int64 z)) else None
+  if validate_u64 z then Some (VU64 z) else None
 
 let make_u128 z =
   if validate_u128 z then Some (VU128 z) else None
@@ -466,18 +499,207 @@ let view_guard st =
 let getr st r = st.regs.(r)
 let setr st r v = st.regs.(r) <- v
 
+let is_numeric = function
+  | VInt _ | VU64 _ | VU128 _ | VU256 _ -> true
+  | _ -> false
+
+let is_text = function
+  | VString _ | VBytes _ | VBytes32 _ -> true
+  | _ -> false
+
+let is_address = function
+  | VString _ | VAddr _ -> true
+  | _ -> false
+
+let comparable left right =
+  match left, right with
+  | VInt _, (VInt _ | VU64 _ | VU128 _ | VU256 _)
+  | VU64 _, (VInt _ | VU64 _ | VU128 _ | VU256 _)
+  | VU128 _, (VInt _ | VU64 _ | VU128 _ | VU256 _)
+  | VU256 _, (VInt _ | VU64 _ | VU128 _ | VU256 _) -> true
+  | VBool _, VBool _
+  | VString _, VString _
+  | VBytes _, VBytes _
+  | VBytes32 _, VBytes32 _
+  | VAddr _, VAddr _
+  | VCipher _, VCipher _
+  | VPubKey _, VPubKey _ -> true
+  | _ -> false
+
+let strict_operands st = function
+  | ADD (_, a, b) | SUB (_, a, b) | MUL (_, a, b)
+  | DIV (_, a, b) | MOD (_, a, b)
+  | LT (_, a, b) | GT (_, a, b)
+  | BITAND (_, a, b) | BITOR (_, a, b) | BITXOR (_, a, b)
+  | BITSHL (_, a, b) | BITSHR (_, a, b) ->
+    is_numeric (getr st a) && is_numeric (getr st b)
+  | NEG (_, a) | ABS (_, a) | MLOADR (_, a) | MSTORER (a, _) ->
+    is_numeric (getr st a)
+  | VECDOT_Q16 (_, a, b, n) ->
+    is_numeric (getr st a) && is_numeric (getr st b) && is_numeric (getr st n)
+  | ELEMWISE_MUL_Q16 (a, b, n) | RESIDUAL_ADD_Q16 (a, b, n) ->
+    is_numeric (getr st a) && is_numeric (getr st b) && is_numeric (getr st n)
+  | EXP_Q16 (_, source) ->
+    is_numeric (getr st source)
+  | SOFTMAX_Q16_INPLACE (addr, count) ->
+    is_numeric (getr st addr) && is_numeric (getr st count)
+  | LAYERNORM_Q16_INPLACE (addr, count, gamma, beta) ->
+    is_numeric (getr st addr) && is_numeric (getr st count) &&
+    is_numeric (getr st gamma) && is_numeric (getr st beta)
+  | RMSNORM_Q16_INPLACE (addr, count, gamma) ->
+    is_numeric (getr st addr) && is_numeric (getr st count) &&
+    is_numeric (getr st gamma)
+  | SILU_Q16_INPLACE (addr, count) ->
+    is_numeric (getr st addr) && is_numeric (getr st count)
+  | ROPE_APPLY_Q16 (addr, count, position, base) ->
+    is_numeric (getr st addr) && is_numeric (getr st count) &&
+    is_numeric (getr st position) && is_numeric (getr st base)
+  | ATTENTION_KV_Q16 (query, key, value, context, total, query_heads, key_heads, head_dim) ->
+    List.for_all (fun reg -> is_numeric (getr st reg))
+      [query; key; value; context; total; query_heads; key_heads; head_dim]
+  | EQ (_, a, b) | NEQ (_, a, b) -> comparable (getr st a) (getr st b)
+  | JIF (a, _) | ASSERT a ->
+    (match getr st a with VBool _ -> true | _ -> false)
+  | BALANCE (_, a) | SLOADK (_, a) | SDELK a | ISADDR (_, a)
+  | ISHEX (_, a) | STATE_PATH_KEY (_, a) | ASSERT_ADDR a ->
+    is_address (getr st a)
+  | SSTORE (_, a) -> is_text (getr st a)
+  | SSTOREK (key, value) ->
+    is_address (getr st key) && is_text (getr st value)
+  | PARSE_INTS (_, text, base) ->
+    is_text (getr st text) && is_numeric (getr st base)
+  | OBJECT_MEMBER_COUNT (_, object_ref) -> is_text (getr st object_ref)
+  | OBJECT_HAS_MEMBER (_, object_ref, member_ref) ->
+    is_text (getr st object_ref) && is_text (getr st member_ref)
+  | OBJECT_MEMBER_REF_AT (_, object_ref, index) ->
+    is_text (getr st object_ref) && is_numeric (getr st index)
+  | OBJECT_TRANSITION_APPLY
+      (_, transition_ref, object_ref, previous_ref, next_ref, member_bundle,
+       touched_hash, proof_kind, proof_hash, status, intent_id) ->
+    List.for_all (fun reg -> is_text (getr st reg))
+      [transition_ref; object_ref; previous_ref; next_ref; member_bundle;
+       touched_hash; proof_kind; proof_hash; status; intent_id]
+  | SUBSTR (_, text, start, length) ->
+    is_text (getr st text) && is_numeric (getr st start) && is_numeric (getr st length)
+  | INDEXOF (_, text, needle) ->
+    is_text (getr st text) && is_text (getr st needle)
+  | SHA256 (_, text) | KECCAK256 (_, text) | FSTORE (_, text)
+  | FLOAD (_, text) -> is_text (getr st text)
+  | SKEYS (_, prefix, base) ->
+    is_text (getr st prefix) && is_numeric (getr st base)
+  | SKEYS_PAGE (_, _, prefix, after, base) ->
+    is_text (getr st prefix) && is_text (getr st after) && is_numeric (getr st base)
+  | SLOADN (base_key, base_value, count)
+  | SSTOREN (base_key, base_value, count) ->
+    List.for_all (fun reg -> is_numeric (getr st reg)) [base_key; base_value; count]
+  | CONCAT (_, left, right) -> is_text (getr st left) && is_text (getr st right)
+  | STRLEN (_, text) -> is_text (getr st text)
+  | XCALL (_, target, method_name, _, _) ->
+    is_address (getr st target) && is_text (getr st method_name)
+  | SPAWN (_, code) | SPAWN2 (_, code, _, _) -> is_text (getr st code)
+  | TRANSFER (_, target, value) ->
+    is_address (getr st target) && is_numeric (getr st value)
+  | FHE_LOAD_PK (_, address) -> is_address (getr st address)
+  | FHE_ADD (_, key, left, right) | FHE_SUB (_, key, left, right)
+  | FHE_MUL (_, key, left, right) ->
+    (match getr st key, getr st left, getr st right with
+     | VPubKey _, VCipher _, VCipher _ -> true
+     | _ -> false)
+  | FHE_SCALE (_, key, cipher, scalar)
+  | FHE_DIV_CONST (_, key, cipher, scalar)
+  | FHE_ADD_CONST (_, key, cipher, scalar)
+  | FHE_SUB_CONST (_, key, cipher, scalar) ->
+    (match getr st key, getr st cipher with
+     | VPubKey _, VCipher _ -> is_numeric (getr st scalar)
+     | _ -> false)
+  | FHE_VERIFY_ZERO (_, key, cipher, proof)
+  | FHE_VERIFY_RANGE (_, key, cipher, proof) ->
+    (match getr st key, getr st cipher with
+     | VPubKey _, VCipher _ -> is_text (getr st proof)
+     | _ -> false)
+  | FHE_VERIFY_BOUND (_, key, cipher, proof, commitment) ->
+    (match getr st key, getr st cipher with
+     | VPubKey _, VCipher _ -> is_text (getr st proof) && is_text (getr st commitment)
+     | _ -> false)
+  | FHE_COMMIT (_, key, cipher) ->
+    (match getr st key, getr st cipher with VPubKey _, VCipher _ -> true | _ -> false)
+  | FHE_PEDERSEN (_, amount, blinding) ->
+    is_numeric (getr st amount) && is_text (getr st blinding)
+  | FHE_SER (_, cipher) -> (match getr st cipher with VCipher _ -> true | _ -> false)
+  | FHE_DESER (_, bytes) | FHE_DESER_PK (_, bytes) -> is_text (getr st bytes)
+  | FHE_SER_PK (_, key) -> (match getr st key with VPubKey _ -> true | _ -> false)
+  | GROTH16_VERIFY_BN254 (_, key, proof, inputs) ->
+    List.for_all (fun reg -> is_text (getr st reg)) [key; proof; inputs]
+  | ED25519_OK (_, key, message, signature) ->
+    List.for_all (fun reg -> is_text (getr st reg)) [key; message; signature]
+  | LOAD_INT8_BYTES_TO_MEM (dst, source, offset, length, scale)
+  | LOAD_INT8_B64_TO_MEM (dst, source, offset, length, scale) ->
+    is_numeric (getr st dst) && is_text (getr st source)
+    && is_numeric (getr st offset) && is_numeric (getr st length)
+    && is_numeric (getr st scale)
+  | LOAD_INT8_Q16 (dst, source, offset, length, scale) ->
+    is_numeric (getr st dst) && is_text (getr st source)
+    && is_numeric (getr st offset) && is_numeric (getr st length)
+    && is_numeric (getr st scale)
+  | APPEND_VEC_Q16 (dst, pos, source, length) ->
+    List.for_all (fun reg -> is_numeric (getr st reg)) [dst; pos; source; length]
+  | ARGMAX_Q16 (dest, addr, length) ->
+    is_numeric (getr st dest) && is_numeric (getr st addr) && is_numeric (getr st length)
+  | _ -> true
+
+let strict_ok st op = not st.strict_values || strict_operands st op
+
+let read_int st reg =
+  let value = to_z (getr st reg) in
+  if Z.fits_int value then Some (Z.to_int value) else None
+
+let valid_mem_span addr n =
+  addr >= 0 && n > 0 && n <= 131072 && addr <= max_int - n
+
+let read_q16 st addr n =
+  if not (valid_mem_span addr n) then None
+  else
+    let values = Array.init n (fun i ->
+      match Hashtbl.find_opt st.memory.data (addr + i) with
+      | None -> Some Z.zero
+      | Some value when is_numeric value && Fixed_q16.in_range (to_z value) ->
+        Some (to_z value)
+      | Some _ -> None)
+    in
+    if Array.for_all Option.is_some values then
+      Some (Array.map Option.get values)
+    else None
+
+let write_q16 st addr values =
+  Array.iteri (fun i value ->
+    let cell = addr + i in
+    Hashtbl.replace st.memory.data cell (VInt value);
+    if cell >= st.memory.size then st.memory.size <- cell + 1) values
+
+let valid_reg_span base count =
+  count >= 0 && base >= 0 && base <= 63 && count <= 64 - base
+
 let add_dyn_effort st cost =
-  st.effort_used <- st.effort_used + cost;
-  st.effort_used <= st.effort_limit
+  match Cost.charge ~used:st.effort_used ~cost ~limit:st.effort_limit with
+  | None -> false
+  | Some effort -> st.effort_used <- effort; true
+
+let add_dyn_product st factors divisor =
+  match Cost.scaled_product factors ~divisor with
+  | None -> false
+  | Some cost -> add_dyn_effort st cost
 
 let object_apply_dyn_cost writes =
   List.fold_left
-    (fun acc -> function
+    (fun acc write ->
+      let cost = match write with
       | Octra_core.Circle_object_apply.Set (_key, value) ->
-        acc + 10 + (String.length value / 32)
+        10 + (String.length value / 32)
       | Octra_core.Circle_object_apply.Del _ ->
-        acc + 5)
-    0
+        5
+      in
+      Option.bind acc (fun total -> Cost.add total cost))
+    (Some 0)
     writes
 
 let apply_object_write st = function
@@ -502,8 +724,8 @@ let rec apply_object_writes st = function
       false
 
 let exec_one st op =
-  st.effort_used <- st.effort_used + effort_cost op;
-  if st.effort_used > st.effort_limit then revert st
+  if not (add_dyn_effort st (effort_cost op)) then revert st
+  else if not (strict_ok st op) then revert st
   else match op with
   | ADD (rd, rs1, rs2) ->
     setr st rd (VInt (Z.add (to_z (getr st rs1)) (to_z (getr st rs2)))); true
@@ -581,8 +803,7 @@ let exec_one st op =
        let len = String.length s in
        if len > max_storage_value_len then revert st
        else begin
-         st.effort_used <- st.effort_used + len / 32;
-         if st.effort_used > st.effort_limit then revert st
+         if not (add_dyn_effort st (len / 32)) then revert st
          else begin
            let old_val = Hashtbl.find_opt st.storage key in
            st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
@@ -625,8 +846,7 @@ let exec_one st op =
        let len = String.length s in
        if len > max_storage_value_len then revert st
        else begin
-         st.effort_used <- st.effort_used + len / 32;
-         if st.effort_used > st.effort_limit then revert st
+         if not (add_dyn_effort st (len / 32)) then revert st
          else begin
            let old_val = Hashtbl.find_opt st.storage key in
            st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
@@ -634,9 +854,10 @@ let exec_one st op =
          end
        end)
   | MLOAD (rd, idx) ->
-    let v = match Hashtbl.find_opt st.memory.data idx with
-      | Some x -> x | None -> VInt Z.zero in
-    setr st rd v; true
+    (match Hashtbl.find_opt st.memory.data idx with
+     | Some value -> setr st rd value; true
+     | None when st.strict_values -> revert st
+     | None -> setr st rd (VInt Z.zero); true)
   | MSTORE (idx, rs) ->
     Hashtbl.replace st.memory.data idx (getr st rs);
     if idx >= st.memory.size then st.memory.size <- idx + 1;
@@ -645,9 +866,10 @@ let exec_one st op =
     let idx = Z.to_int (to_z (getr st rs_idx)) in
     if idx < 0 || idx > 16_777_216 then revert st
     else begin
-      let v = match Hashtbl.find_opt st.memory.data idx with
-        | Some x -> x | None -> VInt Z.zero in
-      setr st rd v; true
+      (match Hashtbl.find_opt st.memory.data idx with
+       | Some value -> setr st rd value; true
+       | None when st.strict_values -> revert st
+       | None -> setr st rd (VInt Z.zero); true)
     end
   | MSTORER (rs_idx, rs_val) ->
     let idx = Z.to_int (to_z (getr st rs_idx)) in
@@ -675,7 +897,8 @@ let exec_one st op =
               (try
                 Hashtbl.replace st.memory.data idx (VInt (Z.of_string trimmed))
               with _ ->
-                Hashtbl.replace st.memory.data idx (VInt Z.zero));
+                if st.strict_values then ok := false
+                else Hashtbl.replace st.memory.data idx (VInt Z.zero));
               if idx >= st.memory.size then st.memory.size <- idx + 1;
               if not (add_dyn_effort st 2) then ok := false
               else count := !count + 1
@@ -776,7 +999,11 @@ let exec_one st op =
         | Error _ ->
           revert st
         | Ok result ->
-          if not (add_dyn_effort st (object_apply_dyn_cost result.writes)) then
+          match object_apply_dyn_cost result.writes with
+          | None ->
+            revert st
+          | Some cost ->
+          if not (add_dyn_effort st cost) then
             revert st
           else if
             List.exists
@@ -820,8 +1047,7 @@ let exec_one st op =
     let search = to_string (getr st rsearch) in
     let slen = String.length s in
     let plen = String.length search in
-
-    if not (add_dyn_effort st ((slen * (max plen 1)) / 1024)) then revert st
+    if not (add_dyn_product st [slen; max plen 1] 1024) then revert st
     else if plen = 0 then (setr st rd (VInt Z.zero); true)
     else if plen > slen then (setr st rd (VInt (Z.of_int (-1))); true)
     else begin
@@ -1038,8 +1264,7 @@ let exec_one st op =
     let n = Z.to_int (to_z (getr st rs_n)) in
     if m <= 0 || k <= 0 || n <= 0 || m > 32768 || k > 32768 || n > 32768 then revert st
     else begin
-      let dyn_cost = (m * n * k) / 1024 in
-      if not (add_dyn_effort st dyn_cost) then revert st
+      if not (add_dyn_product st [m; n; k] 1024) then revert st
       else begin
         let mem_get a =
           match Hashtbl.find_opt st.memory.data a with
@@ -1085,6 +1310,21 @@ let exec_one st op =
         true
       end
     end
+  | VECDOT_Q16 (rd, rs_a, rs_b, rs_n) ->
+    (match read_int st rs_a, read_int st rs_b, read_int st rs_n with
+     | Some a_addr, Some b_addr, Some n
+       when valid_mem_span a_addr n && valid_mem_span b_addr n ->
+       if not (add_dyn_effort st (n / 16)) then revert st
+       else
+         (match read_q16 st a_addr n, read_q16 st b_addr n with
+          | Some left, Some right ->
+            let value = Fixed_q16.dot left 0 right 0 n in
+            if Fixed_q16.in_range value then begin
+              setr st rd (VInt value);
+              true
+            end else revert st
+          | _ -> revert st)
+     | _ -> revert st)
   | EXP_LUT (rd, rs_x) ->
     let x = to_z (getr st rs_x) in
     let q_one = 65536 in
@@ -1097,12 +1337,19 @@ let exec_one st op =
     let result = round_float_to_int (e *. float_of_int q_one) in
     setr st rd (VInt (Z.of_int result));
     true
+  | EXP_Q16 (rd, rs_x) ->
+    let x = to_z (getr st rs_x) in
+    if not (add_dyn_effort st 8) then revert st
+    else begin
+      setr st rd (VInt (Fixed_q16.exp x));
+      true
+    end
   | SOFTMAX_INPLACE (rs_addr, rs_n) ->
     let addr = Z.to_int (to_z (getr st rs_addr)) in
     let n = Z.to_int (to_z (getr st rs_n)) in
     if n <= 0 || n > 131072 then revert st
     else begin
-      if not (add_dyn_effort st (n * 8)) then revert st
+      if not (add_dyn_product st [n; 8] 1) then revert st
       else begin
         let q_one = 65536.0 in
         let mem_get a =
@@ -1130,6 +1377,57 @@ let exec_one st op =
         end
       end
     end
+  | SOFTMAX_Q16_INPLACE (rs_addr, rs_n) ->
+    (match read_int st rs_addr, read_int st rs_n with
+     | Some addr, Some n when addr >= 0 && n > 0 && n <= 131072 ->
+       if not (add_dyn_product st [n; 8] 1) then revert st
+       else begin
+         let get a =
+           match Hashtbl.find_opt st.memory.data a with
+           | Some value -> to_z value
+           | None -> Z.zero
+         in
+         let values = Array.init n (fun i -> get (addr + i)) in
+         let max_value = Array.fold_left Z.max values.(0) values in
+         let exps = Array.map (fun value -> Fixed_q16.exp (Z.sub value max_value)) values in
+         let total = Array.fold_left Z.add Z.zero exps in
+         if Z.sign total <= 0 then revert st
+         else begin
+           let probs = Array.map (fun value -> Fixed_q16.scale_floor value total) exps in
+           if not (Array.for_all Option.is_some probs) then revert st
+           else begin
+             let result = Array.map Option.get probs in
+             let max_index = ref 0 in
+             for i = 1 to n - 1 do
+               if Z.compare exps.(i) exps.(!max_index) > 0 then max_index := i
+             done;
+             let current = Array.fold_left Z.add Z.zero result in
+             result.(!max_index) <-
+               Z.add result.(!max_index) (Z.sub Fixed_q16.scale current);
+             for i = 0 to n - 1 do
+               Hashtbl.replace st.memory.data (addr + i) (VInt result.(i))
+             done;
+             true
+           end
+         end
+       end
+     | _ -> revert st)
+  | LAYERNORM_Q16_INPLACE (rs_addr, rs_n, rs_gamma, rs_beta) ->
+    (match read_int st rs_addr, read_int st rs_n,
+           read_int st rs_gamma, read_int st rs_beta with
+     | Some addr, Some n, Some gamma_addr, Some beta_addr
+       when valid_mem_span addr n && valid_mem_span gamma_addr n &&
+            valid_mem_span beta_addr n ->
+       if not (add_dyn_product st [n; 4] 1) then revert st
+       else
+         (match read_q16 st addr n, read_q16 st gamma_addr n,
+                read_q16 st beta_addr n with
+          | Some values, Some gamma, Some beta ->
+            (match Fixed_q16.layer values gamma beta with
+             | Some result -> write_q16 st addr result; true
+             | None -> revert st)
+          | _ -> revert st)
+     | _ -> revert st)
   | LAYERNORM_INPLACE (rs_addr, rs_n, rs_gamma, rs_beta) ->
     let addr = Z.to_int (to_z (getr st rs_addr)) in
     let n = Z.to_int (to_z (getr st rs_n)) in
@@ -1137,7 +1435,7 @@ let exec_one st op =
     let beta_addr = Z.to_int (to_z (getr st rs_beta)) in
     if n <= 0 || n > 131072 then revert st
     else begin
-      if not (add_dyn_effort st (n * 4)) then revert st
+      if not (add_dyn_product st [n; 4] 1) then revert st
       else begin
         let q_one = 65536.0 in
         let mem_get_f a =
@@ -1187,7 +1485,7 @@ let exec_one st op =
     let gamma_addr = Z.to_int (to_z (getr st rs_gamma)) in
     if n <= 0 || n > 131072 then revert st
     else begin
-      if not (add_dyn_effort st (n * 3)) then revert st
+      if not (add_dyn_product st [n; 3] 1) then revert st
       else begin
         let q_one = 65536.0 in
         let mem_get_f a =
@@ -1210,12 +1508,25 @@ let exec_one st op =
         true
       end
     end
+  | RMSNORM_Q16_INPLACE (rs_addr, rs_n, rs_gamma) ->
+    (match read_int st rs_addr, read_int st rs_n, read_int st rs_gamma with
+     | Some addr, Some n, Some gamma_addr
+       when valid_mem_span addr n && valid_mem_span gamma_addr n ->
+       if not (add_dyn_product st [n; 3] 1) then revert st
+       else
+         (match read_q16 st addr n, read_q16 st gamma_addr n with
+          | Some values, Some gamma ->
+            (match Fixed_q16.rms values gamma with
+             | Some result -> write_q16 st addr result; true
+             | None -> revert st)
+          | _ -> revert st)
+     | _ -> revert st)
   | SILU_INPLACE (rs_addr, rs_n) ->
     let addr = Z.to_int (to_z (getr st rs_addr)) in
     let n = Z.to_int (to_z (getr st rs_n)) in
     if n <= 0 || n > 131072 then revert st
     else begin
-      if not (add_dyn_effort st (n * 2)) then revert st
+      if not (add_dyn_product st [n; 2] 1) then revert st
       else begin
         let q_one = 65536.0 in
         for i = 0 to n - 1 do
@@ -1235,6 +1546,21 @@ let exec_one st op =
         true
       end
     end
+  | SILU_Q16_INPLACE (rs_addr, rs_n) ->
+    (match read_int st rs_addr, read_int st rs_n with
+     | Some addr, Some n when valid_mem_span addr n ->
+       if not (add_dyn_product st [n; 2] 1) then revert st
+       else
+         (match read_q16 st addr n with
+          | None -> revert st
+          | Some values ->
+            let result = Array.map Fixed_q16.silu values in
+            if not (Array.for_all Option.is_some result) then revert st
+            else begin
+              write_q16 st addr (Array.map Option.get result);
+              true
+            end)
+     | _ -> revert st)
   | ELEMWISE_MUL_INPLACE (rs_dst, rs_src, rs_n) ->
     let dst = Z.to_int (to_z (getr st rs_dst)) in
     let src = Z.to_int (to_z (getr st rs_src)) in
@@ -1243,19 +1569,30 @@ let exec_one st op =
     else begin
       if not (add_dyn_effort st (n / 2)) then revert st
       else begin
-        let q_shift = 16 in
         for i = 0 to n - 1 do
           let a_z = match Hashtbl.find_opt st.memory.data (dst + i) with
             | Some v -> to_z v | None -> Z.zero in
           let b_z = match Hashtbl.find_opt st.memory.data (src + i) with
             | Some v -> to_z v | None -> Z.zero in
-          let prod = Z.mul a_z b_z in
-          let scaled = Z.shift_right prod q_shift in
-          Hashtbl.replace st.memory.data (dst + i) (VInt scaled)
+          Hashtbl.replace st.memory.data (dst + i)
+            (VInt (Fixed_q16.trunc_mul a_z b_z))
         done;
         true
       end
     end
+  | ELEMWISE_MUL_Q16 (rs_dst, rs_src, rs_n) ->
+    (match read_int st rs_dst, read_int st rs_src, read_int st rs_n with
+     | Some dst, Some src, Some n
+       when valid_mem_span dst n && valid_mem_span src n ->
+       if not (add_dyn_effort st (n / 2)) then revert st
+       else
+         (match read_q16 st dst n, read_q16 st src n with
+          | Some left, Some right ->
+            (match Fixed_q16.elementwise_mul left right with
+             | Some result -> write_q16 st dst result; true
+             | None -> revert st)
+          | _ -> revert st)
+     | _ -> revert st)
   | LOAD_INT8_BYTES_TO_MEM (rs_dst, rs_src, rs_off, rs_n, rs_scale) ->
     let dst = Z.to_int (to_z (getr st rs_dst)) in
     let src_str = to_string (getr st rs_src) in
@@ -1295,6 +1632,19 @@ let exec_one st op =
         true
       end
     end
+  | RESIDUAL_ADD_Q16 (rs_dst, rs_src, rs_n) ->
+    (match read_int st rs_dst, read_int st rs_src, read_int st rs_n with
+     | Some dst, Some src, Some n
+       when valid_mem_span dst n && valid_mem_span src n ->
+       if not (add_dyn_effort st (n / 4)) then revert st
+       else
+         (match read_q16 st dst n, read_q16 st src n with
+          | Some left, Some right ->
+            (match Fixed_q16.residual_add left right with
+             | Some result -> write_q16 st dst result; true
+             | None -> revert st)
+          | _ -> revert st)
+     | _ -> revert st)
   | MATMUL_Q16 (rd_addr, rs_lhs, rs_rhs, rs_m, rs_k, rs_n) ->
     let dst_addr = Z.to_int (to_z (getr st rd_addr)) in
     let lhs_addr = Z.to_int (to_z (getr st rs_lhs)) in
@@ -1304,16 +1654,13 @@ let exec_one st op =
     let n = Z.to_int (to_z (getr st rs_n)) in
     if m <= 0 || k <= 0 || n <= 0 || m > 32768 || k > 32768 || n > 32768 then revert st
     else begin
-      let dyn_cost = (m * n * k) / 1024 in
-      if not (add_dyn_effort st dyn_cost) then revert st
+      if not (add_dyn_product st [m; n; k] 1024) then revert st
       else begin
         let mem_get a =
           match Hashtbl.find_opt st.memory.data a with
           | Some v -> to_z v
           | None -> Z.zero
         in
-        let half = Z.of_int 32768 in
-        let shift = 16 in
         for r = 0 to m - 1 do
           for c = 0 to n - 1 do
             let acc = ref Z.zero in
@@ -1322,12 +1669,7 @@ let exec_one st op =
               let rv = mem_get (rhs_addr + i * n + c) in
               acc := Z.add !acc (Z.mul lv rv)
             done;
-            let rounded =
-              if Z.sign !acc >= 0 then
-                Z.shift_right (Z.add !acc half) shift
-              else
-                Z.neg (Z.shift_right (Z.add (Z.neg !acc) half) shift)
-            in
+            let rounded = Fixed_q16.round16 !acc in
             let cell = dst_addr + r * n + c in
             Hashtbl.replace st.memory.data cell (VInt rounded);
             if cell >= st.memory.size then st.memory.size <- cell + 1
@@ -1344,19 +1686,15 @@ let exec_one st op =
     else begin
       if not (add_dyn_effort st (n / 4)) then revert st
       else begin
-        let half = Z.shift_left Z.one (bits - 1) in
-        for i = 0 to n - 1 do
-          let v = match Hashtbl.find_opt st.memory.data (addr + i) with
-            | Some x -> to_z x | None -> Z.zero in
-          let rounded =
-            if Z.sign v >= 0 then
-              Z.shift_right (Z.add v half) bits
-            else
-              Z.neg (Z.shift_right (Z.add (Z.neg v) half) bits)
-          in
-          Hashtbl.replace st.memory.data (addr + i) (VInt rounded)
-        done;
-        true
+        match Fixed_q16.make_round bits with
+        | None -> revert st
+        | Some round ->
+          for i = 0 to n - 1 do
+            let v = match Hashtbl.find_opt st.memory.data (addr + i) with
+              | Some x -> to_z x | None -> Z.zero in
+            Hashtbl.replace st.memory.data (addr + i) (VInt (round v))
+          done;
+          true
       end
     end
   | LOAD_INT8_B64_TO_MEM (rs_dst, rs_src, rs_off, rs_n, rs_scale) ->
@@ -1385,6 +1723,59 @@ let exec_one st op =
           end
         end
     end
+  | LOAD_INT8_Q16 (rs_dst, rs_src, rs_off, rs_n, rs_scale) ->
+    (match read_int st rs_dst, read_int st rs_off, read_int st rs_n with
+     | Some dst, Some off, Some n
+       when n > 0 && n <= 1_048_576 && valid_mem_span dst n ->
+       let src_b64 = to_string (getr st rs_src) in
+       let scale = to_z (getr st rs_scale) in
+       if not (Fixed_q16.in_range scale) then revert st
+       else
+         (match Base64.decode src_b64 with
+          | Error _ -> revert st
+          | Ok decoded ->
+            let dlen = String.length decoded in
+            if off < 0 || off > dlen || n > dlen - off then revert st
+            else if not (add_dyn_effort st (n + dlen / 4)) then revert st
+            else
+              let values = Array.init n (fun i ->
+                let byte = Char.code decoded.[off + i] in
+                let signed = if byte >= 128 then byte - 256 else byte in
+                Z.mul (Z.of_int signed) scale) in
+              if Array.for_all Fixed_q16.in_range values then begin
+                write_q16 st dst values;
+                true
+              end else revert st)
+     | _ -> revert st)
+  | APPEND_VEC_Q16 (rs_dst, rs_pos, rs_src, rs_n) ->
+    (match read_int st rs_dst, read_int st rs_pos, read_int st rs_src, read_int st rs_n with
+     | Some dst, Some pos, Some src, Some n
+       when pos >= 0 && pos <= 16_777_216 && valid_mem_span src n ->
+       if pos > max_int / n then revert st
+       else
+         let target = dst + pos * n in
+         if target < dst || not (valid_mem_span target n) then revert st
+         else if not (add_dyn_effort st n) then revert st
+         else
+           (match read_q16 st src n with
+            | Some values -> write_q16 st target values; true
+            | None -> revert st)
+     | _ -> revert st)
+  | ARGMAX_Q16 (rd, rs_addr, rs_n) ->
+    (match read_int st rs_addr, read_int st rs_n with
+     | Some addr, Some n when valid_mem_span addr n ->
+       if not (add_dyn_effort st (n / 2)) then revert st
+       else
+         (match read_q16 st addr n with
+          | Some values ->
+            let best = ref 0 in
+            for index = 1 to n - 1 do
+              if Z.compare values.(index) values.(!best) > 0 then best := index
+            done;
+            setr st rd (VInt (Z.of_int !best));
+            true
+          | None -> revert st)
+     | _ -> revert st)
   | ROPE_APPLY (rs_addr, rs_n_dim, rs_pos, rs_base) ->
     let addr = Z.to_int (to_z (getr st rs_addr)) in
     let n_dim = Z.to_int (to_z (getr st rs_n_dim)) in
@@ -1393,7 +1784,7 @@ let exec_one st op =
     if n_dim <= 0 || n_dim > 131072 || (n_dim land 1) <> 0 then revert st
     else if pos < 0 then revert st
     else begin
-      if not (add_dyn_effort st (n_dim * 4)) then revert st
+      if not (add_dyn_product st [n_dim; 4] 1) then revert st
       else begin
         let q_one = 65536.0 in
         let base_f =
@@ -1427,6 +1818,20 @@ let exec_one st op =
         true
       end
     end
+  | ROPE_APPLY_Q16 (rs_addr, rs_n_dim, rs_pos, rs_base) ->
+    (match read_int st rs_addr, read_int st rs_n_dim, read_int st rs_pos with
+     | Some addr, Some n_dim, Some pos
+       when pos >= 0 && n_dim > 0 && n_dim mod 2 = 0 && valid_mem_span addr n_dim ->
+       let base = to_z (getr st rs_base) in
+       if not (add_dyn_product st [n_dim; 4] 1) then revert st
+       else
+         (match read_q16 st addr n_dim with
+          | Some values ->
+            (match Fixed_q16.rope values base pos with
+             | Some result -> write_q16 st addr result; true
+             | None -> revert st)
+          | None -> revert st)
+     | _ -> revert st)
   | MATMUL_FP (rd_addr, rs_lhs, rs_rhs, rs_m, rs_k, rs_n) ->
     let dst = Z.to_int (to_z (getr st rd_addr)) in
     let lhs = Z.to_int (to_z (getr st rs_lhs)) in
@@ -1436,7 +1841,7 @@ let exec_one st op =
     let n = Z.to_int (to_z (getr st rs_n)) in
     if m <= 0 || k <= 0 || n <= 0 || m > 32768 || k > 32768 || n > 32768 then revert st
     else begin
-      if not (add_dyn_effort st (m * n * k / 512)) then revert st
+      if not (add_dyn_product st [m; n; k] 512) then revert st
       else begin
         let lhs_arr = Array.make (m * k) 0.0 in
         for i = 0 to m * k - 1 do
@@ -1471,7 +1876,7 @@ let exec_one st op =
     let gamma = Z.to_int (to_z (getr st rs_gamma)) in
     if n <= 0 || n > 131072 then revert st
     else begin
-      if not (add_dyn_effort st (n * 4)) then revert st
+      if not (add_dyn_product st [n; 4] 1) then revert st
       else begin
         let arr = Array.init n (fun i -> mem_get_fp64 st.memory.data (addr + i)) in
         let sum_sq = Array.fold_left (fun acc v -> acc +. v *. v) 0.0 arr in
@@ -1489,7 +1894,7 @@ let exec_one st op =
     let n = Z.to_int (to_z (getr st rs_n)) in
     if n <= 0 || n > 131072 then revert st
     else begin
-      if not (add_dyn_effort st (n * 3)) then revert st
+      if not (add_dyn_product st [n; 3] 1) then revert st
       else begin
         for i = 0 to n - 1 do
           let x = mem_get_fp64 st.memory.data (addr + i) in
@@ -1539,7 +1944,7 @@ let exec_one st op =
     if n_dim <= 0 || n_dim > 131072 || (n_dim land 1) <> 0 then revert st
     else if pos < 0 then revert st
     else begin
-      if not (add_dyn_effort st (n_dim * 8)) then revert st
+      if not (add_dyn_product st [n_dim; 8] 1) then revert st
       else begin
         let base_f = z_to_fp64 base_z in
         let half = n_dim / 2 in
@@ -1640,8 +2045,7 @@ let exec_one st op =
        || n_kv_heads <= 0 || n_kv_heads > 256 || head_dim <= 0 || head_dim > 1024
        || n_q_heads mod n_kv_heads <> 0 then revert st
     else begin
-      let cost = n_q_heads * t_total * head_dim * 4 in
-      if not (add_dyn_effort st cost) then revert st
+      if not (add_dyn_product st [n_q_heads; t_total; head_dim; 4] 1) then revert st
       else begin
         let kv_dim = n_kv_heads * head_dim in
         let group = n_q_heads / n_kv_heads in
@@ -1686,6 +2090,36 @@ let exec_one st op =
         true
       end
     end
+  | ATTENTION_KV_Q16 (rs_q, rs_k, rs_v, rs_ctx, rs_T, rs_n_q_heads, rs_n_kv_heads, rs_head_dim) ->
+    (match read_int st rs_q, read_int st rs_k, read_int st rs_v, read_int st rs_ctx,
+           read_int st rs_T, read_int st rs_n_q_heads, read_int st rs_n_kv_heads,
+           read_int st rs_head_dim with
+     | Some q_addr, Some k_addr, Some v_addr, Some ctx_addr, Some total_tokens,
+       Some query_heads, Some key_heads, Some head_dim
+       when total_tokens > 0 && total_tokens <= 8192 && query_heads > 0 &&
+            query_heads <= 256 && key_heads > 0 && key_heads <= 256 &&
+            head_dim > 0 && head_dim <= 1024 && query_heads mod key_heads = 0 &&
+            query_heads <= max_int / head_dim &&
+            key_heads <= max_int / head_dim &&
+            total_tokens <= max_int / (key_heads * head_dim) ->
+       let query_size = query_heads * head_dim in
+       let key_size = total_tokens * key_heads * head_dim in
+       if not (valid_mem_span q_addr query_size) ||
+          not (valid_mem_span k_addr key_size) ||
+          not (valid_mem_span v_addr key_size) ||
+          not (valid_mem_span ctx_addr query_size) then revert st
+       else if not (add_dyn_product st [query_heads; total_tokens; head_dim; 4] 1) then
+         revert st
+       else
+         (match read_q16 st q_addr query_size, read_q16 st k_addr key_size,
+                read_q16 st v_addr key_size with
+          | Some query, Some key, Some value ->
+            (match Fixed_q16.attention query key value total_tokens query_heads
+                     key_heads head_dim with
+             | Some result -> write_q16 st ctx_addr result; true
+             | None -> revert st)
+          | _ -> revert st)
+     | _ -> revert st)
   | APPEND_VEC_FP (rs_dst, rs_pos, rs_src, rs_n) ->
     let dst = Z.to_int (to_z (getr st rs_dst)) in
     let pos = Z.to_int (to_z (getr st rs_pos)) in
@@ -1742,6 +2176,7 @@ let exec_one st op =
   | ORIGIN rd -> setr st rd (VAddr st.origin); true
   | SELF rd -> setr st rd (VAddr st.address); true
   | EPOCH rd -> setr st rd (VInt (Z.of_int st.ctx.current_epoch)); true
+  | EPOCH_TIME rd -> setr st rd (VInt (Z.of_int64 st.ctx.epoch_time_ms)); true
   | VALUE rd -> setr st rd (VInt st.value); true
   | BALANCE (rd, rs) ->
     (match getr st rs with
@@ -1751,7 +2186,8 @@ let exec_one st op =
   | NODEID rd -> setr st rd (VString st.ctx.node_id); true
   | TXHASH rd -> setr st rd (VString st.ctx.tx_hash); true
   | XCALL (rd, rt, rm, ra, nargs) ->
-    if st.call_depth >= 8 then revert st
+    if not (valid_reg_span ra nargs) then revert st
+    else if st.call_depth >= 8 then revert st
     else
       let target = to_string (getr st rt) in
       let method_name = to_string (getr st rm) in
@@ -1796,7 +2232,8 @@ let exec_one st op =
            Octra_log.stdout "SPAWN revert: %s (bytecode %d bytes)\n%!" e (String.length bytecode_raw);
            Hashtbl.replace st.storage nonce_key (string_of_int nonce); revert st)
   | SPAWN2 (rd, rs, base, nargs) ->
-    if not (view_guard st) then false
+    if not (valid_reg_span base nargs) then revert st
+    else if not (view_guard st) then false
     else if st.call_depth >= 8 then revert st
     else
       let input = to_string (getr st rs) in
@@ -1929,6 +2366,21 @@ let exec_one st op =
             let s = Z.to_int64 (to_z (getr st rscalar)) in
             setr st rd (VCipher (Pvac_ffi.ct_scale pk ct s)); true
           with _ -> revert st)
+       | _ -> revert st)
+  | FHE_DIV_CONST (rd, rpk, rct, rdivisor) ->
+    if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
+      revert st
+    else
+      (match to_pubkey (getr st rpk), to_cipher (getr st rct) with
+       | Some pk, Some ct ->
+         let divisor = to_z (getr st rdivisor) in
+         if Z.sign divisor <= 0 || Z.gt divisor (Z.of_int64 Int64.max_int) then
+           revert_with_reason st "fhe_div_const divisor out of range"
+         else
+           (try
+              let lo = Z.to_int64 divisor in
+              setr st rd (VCipher (Pvac_ffi.ct_div_const pk ct lo 0L)); true
+            with _ -> revert st)
        | _ -> revert st)
   | FHE_ADD_CONST (rd, rpk, rct, rconst) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2111,17 +2563,27 @@ let exec_one st op =
     end
 
 let run state program =
-  let len = Array.length program in
-  while state.pc < len && not state.reverted do
-    let op = program.(state.pc) in
-    state.pc <- state.pc + 1;
-    if not (exec_one state op) then state.pc <- len
-  done;
-  not state.reverted
+  try
+    let len = Array.length program in
+    while state.pc < len && not state.reverted do
+      let op = program.(state.pc) in
+      state.pc <- state.pc + 1;
+      if not (exec_one state op) then state.pc <- len
+    done;
+    not state.reverted
+  with
+  | Z.Overflow
+  | Invalid_argument _
+  | Failure _
+  | Not_found
+  | Division_by_zero ->
+    state.reverted <- true;
+    false
 
 module Verifier = struct
   type err =
     | InvalidReg of int * int
+    | InvalidRegSpan of int * int * int
     | InvalidJumpDest of int
     | DuplicateJDest of int
     | CodeTooLarge of int
@@ -2135,6 +2597,11 @@ module Verifier = struct
 
   let check_regs pc regs =
     List.find_map (check_reg pc) regs
+
+  let check_reg_span pc base count =
+    if not (valid_reg_span base count) then
+      Some (InvalidRegSpan (pc, base, count))
+    else None
 
   let verify code =
     if Array.length code = 0 then Error EmptyCode
@@ -2164,7 +2631,7 @@ module Verifier = struct
             | STRLEN (d,s) -> check_regs pc [d;s]
             | SDELK s -> check_reg pc s
             | LDI (d,_) | SLOAD (d,_) | MLOAD (d,_)
-            | CALLER d | ORIGIN d | SELF d | EPOCH d | VALUE d
+            | CALLER d | ORIGIN d | SELF d | EPOCH d | EPOCH_TIME d | VALUE d
             | TREEHASH d | NODEID d | TXHASH d | EFFORT d -> check_reg pc d
             | SSTORE (k,s) ->
               if is_reserved_key k then Some (ReservedKey (pc, k))
@@ -2176,12 +2643,13 @@ module Verifier = struct
             | TRANSFER (d,a,v) -> check_regs pc [d;a;v]
             | XCALL (d,t,m,a,n) -> check_regs pc [d;t;m] |> (function
               | Some e -> Some e
-              | None -> check_regs pc (List.init n (fun i -> a + i)))
+              | None -> check_reg_span pc a n)
             | SPAWN2 (d,s,a,n) -> check_regs pc [d;s] |> (function
               | Some e -> Some e
-              | None -> check_regs pc (List.init n (fun i -> a + i)))
+              | None -> check_reg_span pc a n)
             | FHE_ADD (d,pk,a,b) | FHE_SUB (d,pk,a,b) | FHE_MUL (d,pk,a,b)
-            | FHE_SCALE (d,pk,a,b) | FHE_ADD_CONST (d,pk,a,b)
+            | FHE_SCALE (d,pk,a,b) | FHE_DIV_CONST (d,pk,a,b)
+            | FHE_ADD_CONST (d,pk,a,b)
             | FHE_SUB_CONST (d,pk,a,b)
             | FHE_VERIFY_ZERO (d,pk,a,b) | FHE_VERIFY_RANGE (d,pk,a,b) ->
               check_regs pc [d;pk;a;b]
@@ -2215,17 +2683,29 @@ module Verifier = struct
             | FLOAD (d,s) -> check_regs pc [d;s]
             | MATMUL (d,l,r,m,k,n) -> check_regs pc [d;l;r;m;k;n]
             | VECDOT (d,a,b,n) -> check_regs pc [d;a;b;n]
+            | VECDOT_Q16 (d,a,b,n) -> check_regs pc [d;a;b;n]
             | EXP_LUT (d,x) -> check_regs pc [d;x]
+            | EXP_Q16 (d,x) -> check_regs pc [d;x]
             | SOFTMAX_INPLACE (a,n) -> check_regs pc [a;n]
+            | SOFTMAX_Q16_INPLACE (a,n) -> check_regs pc [a;n]
             | LAYERNORM_INPLACE (a,n,g,b) -> check_regs pc [a;n;g;b]
+            | LAYERNORM_Q16_INPLACE (a,n,g,b) -> check_regs pc [a;n;g;b]
             | RELU_INPLACE (a,n) -> check_regs pc [a;n]
             | RMSNORM_INPLACE (a,n,g) -> check_regs pc [a;n;g]
+            | RMSNORM_Q16_INPLACE (a,n,g) -> check_regs pc [a;n;g]
             | SILU_INPLACE (a,n) -> check_regs pc [a;n]
+            | SILU_Q16_INPLACE (a,n) -> check_regs pc [a;n]
             | ELEMWISE_MUL_INPLACE (d,s,n) -> check_regs pc [d;s;n]
+            | ELEMWISE_MUL_Q16 (d,s,n) -> check_regs pc [d;s;n]
             | LOAD_INT8_BYTES_TO_MEM (d,s,o,n,sc) -> check_regs pc [d;s;o;n;sc]
             | RESIDUAL_ADD (d,s,n) -> check_regs pc [d;s;n]
+            | RESIDUAL_ADD_Q16 (d,s,n) -> check_regs pc [d;s;n]
             | ROPE_APPLY (a,n,p,b) -> check_regs pc [a;n;p;b]
+            | ROPE_APPLY_Q16 (a,n,p,b) -> check_regs pc [a;n;p;b]
             | LOAD_INT8_B64_TO_MEM (d,s,o,n,sc) -> check_regs pc [d;s;o;n;sc]
+            | LOAD_INT8_Q16 (d,s,o,n,sc) -> check_regs pc [d;s;o;n;sc]
+            | APPEND_VEC_Q16 (d,p,s,n) -> check_regs pc [d;p;s;n]
+            | ARGMAX_Q16 (d,a,n) -> check_regs pc [d;a;n]
             | MATMUL_Q16 (d,l,r,m,k,n) -> check_regs pc [d;l;r;m;k;n]
             | SHIFT_ROUND_INPLACE (a,n,b) -> check_regs pc [a;n;b]
             | MATMUL_FP (d,l,r,m,k,n) -> check_regs pc [d;l;r;m;k;n]
@@ -2238,6 +2718,7 @@ module Verifier = struct
             | VECDOT_FP (d,a,b,n) -> check_regs pc [d;a;b;n]
             | ARGMAX_FP (d,a,n) -> check_regs pc [d;a;n]
             | ATTENTION_KV_FP (q,k,v,c,t,nq,nk,hd) -> check_regs pc [q;k;v;c;t;nq;nk;hd]
+            | ATTENTION_KV_Q16 (q,k,v,c,t,nq,nk,hd) -> check_regs pc [q;k;v;c;t;nq;nk;hd]
             | APPEND_VEC_FP (d,p,s,n) -> check_regs pc [d;p;s;n]
             | EMIT (_,rs) -> check_regs pc rs
             | JIF (s, dest) ->

@@ -19,6 +19,7 @@ module Epoch_exec = Octra_core.Epoch_exec
 module Epoch_index_commitment = Octra_core.Epoch_index_commitment
 module Epochlog = Octra_core.Epochlog
 module Head_manifest = Octra_core.Head_manifest
+module Store_irmin = Octra_core.Store_irmin
 module Store_chaindata = Octra_core.Store_chaindata
 module Transaction = Octra_core.Transaction
 module Wal = Octra_core.Wal
@@ -138,6 +139,32 @@ type rollback_plan =
   | Rollback_refused of rollback_refusal
   | Rollback_missing_head
 
+type prepare_effects = {
+  head : unit -> Head_manifest.t option;
+  irmin_last_epoch : unit -> int;
+  next_txid : unit -> int64;
+  now : unit -> float;
+  commit_id : int -> string;
+}
+
+type prepare_input = {
+  epoch_id : int;
+  pre_state_hash : string;
+  confirmed_count : int;
+  confirmed_txs : Transaction.t list;
+}
+
+type prepared_commit = {
+  head_before_commit : Head_manifest.t option;
+  boundary : Epoch_boundary.plan;
+  irmin_last_before : int;
+  log : boundary_log option;
+  finalized_at : float;
+  commit_id : string;
+  index : index_plan;
+  rollback : rollback_plan;
+}
+
 type rollback_effects = {
   rollback_to_head : rollback_offsets -> int * int * int * int;
   delete_wal : unit -> unit;
@@ -159,6 +186,69 @@ type failure_effects = {
   abort_irmin : unit -> unit;
   log : string -> unit;
   exit_later : unit -> unit Lwt.t;
+}
+
+type commit_effects = {
+  append_journal : Commit_journal.record -> unit;
+  chaos : string -> unit;
+  write_marker : int -> string -> unit;
+  write_wal : Wal.entry -> unit;
+  write_receipts : epoch_id:int -> receipts:string list -> unit;
+  set_epoch : Epochlog.epoch_header -> unit;
+  set_epoch_index_commitment :
+    epoch_id:int -> epoch_hash:string -> root:string -> unit;
+  fsync_chaindata : unit -> unit;
+  commit_chaindata_batch : unit -> unit;
+  verify_history :
+    epoch_id:int -> start_txid:int64 -> tx_count:int ->
+    Store_chaindata.epoch_index_status;
+  commit_irmin_batch : string -> unit Lwt.t;
+  tag_epoch : int -> unit Lwt.t;
+  irmin_commit_hash : unit -> string option Lwt.t;
+  txlog_position : unit -> int * int;
+  epochlog_offset : unit -> int;
+  write_head : Head_manifest.t -> unit;
+  cache_head : Head_manifest.t -> unit;
+  delete_wal : int -> unit;
+  delete_pending_commits : int -> unit;
+  clear_marker : unit -> unit;
+  trace : string -> unit;
+  fatal : string -> unit;
+  now : unit -> float;
+}
+
+type live_effects = {
+  data_dir : string;
+  store : Store_irmin.t;
+  chaindata : Store_chaindata.t;
+  trace : string -> unit;
+  fatal : string -> unit;
+  log : string -> unit;
+  exit : unit -> unit;
+}
+
+type commit_request = {
+  epoch_id : int;
+  pre_state_root : string;
+  post_state_root : string;
+  post_consensus_root : string;
+  prev_state_root : string;
+  parent_commit : string;
+  start_txid : int64;
+  tx_count : int;
+  finalized_by : string;
+  finalized_at : float;
+  proposer : Epochlog.proposer_info;
+  confirmed_fees : Z.t;
+  plan : Epoch_exec.reward_plan;
+  reward_recipients : Epochlog.reward_recipient list;
+  epoch_receipts_json : string list;
+  commit_id : string;
+  prev_generation : int;
+  planned_txid_hi : int64;
+  epoch_index_hash : string;
+  epoch_index_root : string;
+  progress : commit_progress;
 }
 
 let short16 value =
@@ -259,6 +349,39 @@ let rollback_plan ~commit_epoch ~(boundary : Epoch_boundary.plan) = function
   | None ->
     Rollback_missing_head
 
+let prepare_commit (effects : prepare_effects) (input : prepare_input) =
+  let head_before_commit = effects.head () in
+  let irmin_last_before_meta = effects.irmin_last_epoch () in
+  let boundary =
+    commit_boundary
+      ~commit_epoch:input.epoch_id
+      ~pre_state_hash:input.pre_state_hash
+      ~irmin_last_before_meta
+      ~head_before_commit
+  in
+  let index =
+    index_plan
+      ~next_txid:(effects.next_txid ())
+      ~confirmed_count:input.confirmed_count
+      ~confirmed_txs:input.confirmed_txs
+      ~epoch_id:input.epoch_id
+      head_before_commit
+  in
+  {
+    head_before_commit;
+    boundary = boundary.boundary;
+    irmin_last_before = boundary.irmin_last_before;
+    log = boundary.log;
+    finalized_at = effects.now ();
+    commit_id = effects.commit_id input.epoch_id;
+    index;
+    rollback =
+      rollback_plan
+        ~commit_epoch:input.epoch_id
+        ~boundary:boundary.boundary
+        head_before_commit;
+  }
+
 let rollback_start_log (r : rollback_offsets) =
   Printf.sprintf
     "event = rollback action = start head_epoch = %d txlog_seg = %d txlog_off = %d epochlog_off = %d"
@@ -319,7 +442,7 @@ let rollback_needed progress =
   && not state.irmin_commit_started
   && not state.head_committed
 
-let handle_failure ~progress ~epoch_id ~effects exn =
+let handle_failure ~progress ~epoch_id ~(effects : failure_effects) exn =
   let reason = Printexc.to_string exn in
   commit_failed_logs ~epoch_id ~reason
   |> List.iter effects.log;
@@ -376,6 +499,69 @@ let run_rollback ~(effects : rollback_effects) = function
     effects.log (rollback_failed_log "missing_head");
     false
 
+let live_rollback_effects deps ~commit_epoch ~start_txid ~tx_count =
+  {
+    rollback_to_head = (fun r ->
+      Store_chaindata.rollback_to_head deps.chaindata
+        ~head_epoch:r.head_epoch
+        ~head_txlog_seg:r.txlog_seg
+        ~head_txlog_off:r.txlog_off
+        ~head_epochlog_off:r.epochlog_off
+        ~inflight_start_txid:start_txid
+        ~inflight_tx_count:tx_count);
+    delete_wal = (fun () -> Wal.delete deps.data_dir commit_epoch);
+    clear_marker = (fun () ->
+      Octra_core.Epoch_commit_marker.clear_marker deps.data_dir);
+    log = deps.log;
+  }
+
+let live_commit_effects deps =
+  {
+    append_journal = Commit_journal.append deps.data_dir;
+    chaos = Octra_core.Chaos.inject;
+    write_marker = Octra_core.Epoch_commit_marker.write_marker deps.data_dir;
+    write_wal = Wal.write deps.data_dir;
+    write_receipts = Octra_core.Preverify_receipt_store.write deps.data_dir;
+    set_epoch = Store_chaindata.set_epoch deps.chaindata;
+    set_epoch_index_commitment =
+      Store_chaindata.set_epoch_index_commitment deps.chaindata;
+    fsync_chaindata = (fun () -> Store_chaindata.fsync deps.chaindata);
+    commit_chaindata_batch = (fun () ->
+      Store_chaindata.commit_batch deps.chaindata);
+    verify_history = (fun ~epoch_id ~start_txid ~tx_count ->
+      Store_chaindata.verify_epoch_index_complete_raw deps.chaindata
+        ~epoch_id
+        ~start_txid
+        ~tx_count);
+    commit_irmin_batch = Store_irmin.commit_epoch_batch deps.store;
+    tag_epoch = Store_irmin.tag_epoch deps.store;
+    irmin_commit_hash = (fun () -> Store_irmin.get_commit_hash deps.store);
+    txlog_position = (fun () -> Store_chaindata.txlog_position deps.chaindata);
+    epochlog_offset = (fun () -> Store_chaindata.epochlog_offset deps.chaindata);
+    write_head = Head_manifest.atomic_write deps.data_dir;
+    cache_head = Head_manifest.set_cached;
+    delete_wal = Wal.delete deps.data_dir;
+    delete_pending_commits = Wal.delete_pending_commits_for_epoch deps.data_dir;
+    clear_marker = (fun () ->
+      Octra_core.Epoch_commit_marker.clear_marker deps.data_dir);
+    trace = deps.trace;
+    fatal = deps.fatal;
+    now = Unix.gettimeofday;
+  }
+
+let live_failure_effects deps ~rollback =
+  {
+    rollback;
+    abort_chaindata = (fun () -> Store_chaindata.abort_batch deps.chaindata);
+    abort_irmin = (fun () -> Store_irmin.abort_epoch_batch deps.store);
+    log = deps.log;
+    exit_later = (fun () ->
+      let open Lwt.Syntax in
+      let* () = Lwt_unix.sleep 0.5 in
+      deps.exit ();
+      Lwt.return_unit);
+  }
+
 let epoch_header ~epoch_id ~state_root ~prev_state_root ~parent_commit
     ~start_txid ~tx_count ~finalized_by ~finalized_at ~proposer
     ~confirmed_fees ~(plan : Epoch_exec.reward_plan) ~reward_recipients =
@@ -417,3 +603,131 @@ let head_manifest ~generation ~state_root ~ledger_root ~irmin_commit
     epoch_index_hash = Some epoch_index_hash;
     epoch_index_root = Some epoch_index_root;
   }
+
+let history_incomplete_failure epoch_id =
+  Printf.sprintf "history_incomplete epoch = %d" epoch_id
+
+let run_commit_effects (effects : commit_effects) (request : commit_request) =
+  let open Lwt.Syntax in
+  let wal_entry =
+    wal_entry
+      ~epoch_id:request.epoch_id
+      ~pre_state_root:request.pre_state_root
+      ~post_state_root:request.post_state_root
+      ~parent_commit:request.parent_commit
+      ~start_txid:request.start_txid
+      ~tx_count:request.tx_count
+      ~finalized_by:request.finalized_by
+      ~finalized_at:request.finalized_at
+      ~irmin_last_epoch_before:request.prev_generation
+  in
+  effects.append_journal
+    (prepare_record
+       ~commit_id:request.commit_id
+       ~prev_generation:request.prev_generation
+       ~epoch_id:request.epoch_id
+       ~planned_txid_hi:request.planned_txid_hi
+       ~planned_state_root:request.post_consensus_root
+       ~ts:request.finalized_at);
+  effects.chaos "after_prepare";
+  effects.write_wal wal_entry;
+  effects.chaos "after_wal";
+  effects.write_marker request.epoch_id "wal_written";
+  effects.write_marker request.epoch_id "begin";
+  effects.write_receipts
+    ~epoch_id:request.epoch_id
+    ~receipts:request.epoch_receipts_json;
+  effects.set_epoch
+    (epoch_header
+       ~epoch_id:request.epoch_id
+       ~state_root:request.post_consensus_root
+       ~prev_state_root:request.prev_state_root
+       ~parent_commit:request.parent_commit
+       ~start_txid:request.start_txid
+       ~tx_count:request.tx_count
+       ~finalized_by:request.finalized_by
+       ~finalized_at:request.finalized_at
+       ~proposer:request.proposer
+       ~confirmed_fees:request.confirmed_fees
+       ~plan:request.plan
+       ~reward_recipients:request.reward_recipients);
+  effects.set_epoch_index_commitment
+    ~epoch_id:request.epoch_id
+    ~epoch_hash:request.epoch_index_hash
+    ~root:request.epoch_index_root;
+  effects.fsync_chaindata ();
+  effects.trace "event = commit_batch";
+  effects.write_marker request.epoch_id "chaindata_begin";
+  effects.chaos "after_chaindata_begin";
+  effects.commit_chaindata_batch ();
+  mark_chaindata_committed request.progress;
+  effects.write_marker request.epoch_id "chaindata_committed";
+  let history_status =
+    effects.verify_history
+      ~epoch_id:request.epoch_id
+      ~start_txid:request.start_txid
+      ~tx_count:request.tx_count
+  in
+  if not (Store_chaindata.epoch_index_status_ok history_status) then begin
+    history_incomplete_lines
+      ~epoch_id:request.epoch_id
+      ~start_txid:request.start_txid
+      ~tx_count:request.tx_count
+      history_status
+    |> List.iter effects.fatal;
+    failwith (history_incomplete_failure request.epoch_id)
+  end;
+  effects.chaos "after_chaindata_committed";
+  effects.trace "event = commit_epoch_batch";
+  effects.write_marker request.epoch_id "irmin_begin";
+  mark_irmin_commit_started request.progress;
+  let* () =
+    effects.commit_irmin_batch
+      (Printf.sprintf "epoch_%d" request.epoch_id)
+  in
+  effects.write_marker request.epoch_id "irmin_committed";
+  effects.chaos "after_irmin_committed";
+  effects.trace "event = tag_epoch";
+  let* () = effects.tag_epoch request.epoch_id in
+  let* irmin_commit_hash = effects.irmin_commit_hash () in
+  let txlog_seg, txlog_off = effects.txlog_position () in
+  let epochlog_off_now = effects.epochlog_offset () in
+  let new_head =
+    head_manifest
+      ~generation:request.epoch_id
+      ~state_root:request.post_consensus_root
+      ~ledger_root:request.post_state_root
+      ~irmin_commit:irmin_commit_hash
+      ~txid_hi:request.planned_txid_hi
+      ~txlog_seg
+      ~txlog_off
+      ~epochlog_off:epochlog_off_now
+      ~commit_id:request.commit_id
+      ~ts:request.finalized_at
+      ~epoch_index_hash:request.epoch_index_hash
+      ~epoch_index_root:request.epoch_index_root
+  in
+  effects.chaos "before_head_write";
+  effects.write_head new_head;
+  effects.cache_head new_head;
+  mark_head_committed request.progress;
+  effects.chaos "after_head_write";
+  effects.append_journal
+    (commit_record
+       ~commit_id:request.commit_id
+       ~generation:request.epoch_id
+       ~ts:(effects.now ()));
+  effects.delete_wal request.epoch_id;
+  effects.delete_pending_commits request.epoch_id;
+  effects.clear_marker ();
+  Lwt.return_unit
+
+let run_commit ~effects ~failure_effects request =
+  Lwt.catch
+    (fun () -> run_commit_effects effects request)
+    (fun exn ->
+      handle_failure
+        ~progress:request.progress
+        ~epoch_id:request.epoch_id
+        ~effects:failure_effects
+        exn)

@@ -26,13 +26,14 @@ type backend = {
 
 type deps = {
   chain_id : string;
+  program_trust : Octra_vm.Program_trust.t;
   backend : backend;
   ready_state_root_at : int -> string option Lwt.t;
   ready_max_lag : int;
   warn : string -> unit;
 }
 
-let node_backend store =
+let node_backend ~program_trust store =
   {
     run = (fun ~epoch_id ~proposal_id ~expected_prev_root ~preverify ~env ~txs ->
       Octra_core.State_preview.with_preview
@@ -46,7 +47,7 @@ let node_backend store =
             ~backend
             ~env
             ~txs
-            ~process_tx:Octra_core.Epoch_exec.process_standard_tx));
+            ~process_tx:(Consensus_circle_preview.process_tx ~program_trust)));
   }
 
 let run (deps : deps) =

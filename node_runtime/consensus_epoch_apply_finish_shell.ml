@@ -117,11 +117,19 @@ let run (deps : deps) (request : request) =
     ~proposer:proposer_addr
     ~validators_sha;
   let confirmed_txs = List.rev_map fst !(request.pending_tx_saves) in
+  let epoch_ts =
+    match request.epoch_env.epoch_ts epoch_id with
+    | Some value -> value
+    | None when request.consensus_mode ->
+      invalid_arg "missing finalized epoch timestamp"
+    | None -> 0.
+  in
   let* finalized =
     deps.finalize
       Finalize.{
         tree_ref = request.tree_ref;
         epoch_id;
+        epoch_ts;
         epoch_start = request.epoch_start;
         proposer_addr;
         validator_addr = request.validator_addr;

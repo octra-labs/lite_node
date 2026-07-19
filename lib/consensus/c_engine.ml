@@ -15,6 +15,7 @@ Include at startup:
 
 open C_types
 
+
 type validator_info = C_types.validator_info
 type validator_set = C_types.validator_set
 
@@ -57,6 +58,7 @@ let tx_list_hash_for_header tx_hashes =
     "octra:tx_list:v1"
     (String.concat "" (List.map hash32_to_hex tx_hashes))
 
+
 type vote_set = {
   votes : (string, vote) Hashtbl.t;
   by_pid : (string, int) Hashtbl.t;
@@ -76,6 +78,7 @@ let create_vote_set () = {
   count_nil = 0;
   count_total = 0;
 }
+
 
 let count_for_pid vs pid =
   match Hashtbl.find_opt vs.by_pid pid with Some c -> c | None -> 0
@@ -100,12 +103,14 @@ let add_vote vs (v : vote) ~quorum =
     end
   end
 
+
 type output =
   | SendPropose of propose
   | SendVote of vote
   | SendFinalize of finalize
   | ScheduleTimeout of { step : round_step; round : int; delay_ms : int; generation : int }
   | Finalized of { epoch_id : int64; finalize : finalize }
+
 
 let int_env name fallback =
   match Sys.getenv_opt name with
@@ -126,6 +131,7 @@ type proposal_cache_entry = {
   header : epoch_header;
   tx_hashes : string list option;
 }
+
 
 type t = {
   chain_id : string;
@@ -262,6 +268,7 @@ let emit_finalized ?(send = true) t finalize =
   if send then emit t (SendFinalize finalize);
   emit t (Finalized { epoch_id = finalize.epoch_id; finalize })
 
+
 let am_i_leader t =
   let l = leader_of t.vs ~epoch_id:t.state.height ~round:t.state.round in
   l.address = t.my_addr
@@ -277,6 +284,7 @@ let can_prevote t =
   | ProposeStep | PrevoteStep -> true
   | PrecommitStep -> false
 
+
 let start_round t round =
   t.state <- { t.state with round; step = ProposeStep };
   t.prevotes <- create_vote_set ();
@@ -288,6 +296,7 @@ let start_round t round =
     delay_ms = timeout_ms ~round ~step:ProposeStep;
     generation = t.generation;
   })
+
 
 let start_height t height =
   t.generation <- t.generation + 1;
@@ -361,6 +370,7 @@ let lock_allows t (proposal_id : string) (valid_round : int option) : bool =
 
 let allow_valid_value_reuse t =
   t.vs.quorum >= 1
+
 
 let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
   if not (local_voting_allowed t) then ()
@@ -472,6 +482,7 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
      | LocalVoteConflict _ -> ())
   end
 
+
 let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
   if p.epoch_id <= t.finalized_height then ()
   else if p.epoch_id <> t.state.height then ()
@@ -560,6 +571,7 @@ let find_header_or_fallback t proposal_id =
         match t.state.valid_value with
         | Some h when C_hash.proposal_id h = proposal_id -> Some h
         | _ -> None
+
 
 let on_vote t (v : vote) ~sign_fn =
   if v.epoch_id <= t.finalized_height then ()
@@ -670,6 +682,7 @@ let accept_finalize_batch t (f : finalize) =
       end
     end
   end
+
 
 let on_timeout t ~step ~round ~generation ~sign_fn =
   if generation <> t.generation then ()

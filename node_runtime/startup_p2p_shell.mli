@@ -123,6 +123,13 @@ type node_start = {
 
 val raw32_zero : string
 
+val install_refs :
+  consensus_config_hash:string ref ->
+  consensus_validator_set:Octra_consensus.C_types.validator_set ref ->
+  scheduled_validator_set:Octra_consensus.C_config.scheduled option ref ->
+  set_swarm:(Octra_net.P2p_swarm.t -> unit) ->
+  install
+
 val current_height :
   deps ->
   int64

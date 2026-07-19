@@ -20,6 +20,7 @@ type deps = {
   ledger : Octra_core.Ledger.t;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
+  program_trust : Octra_vm.Program_trust.t;
   wallet_addr : string;
   pre_state_hash : string;
   standard_env : unit -> Octra_core.Epoch_exec.env;
@@ -51,18 +52,18 @@ let trace_enc_balance ~short op_name addr current_str new_str =
 let run deps sender_txs =
   Octra_core.Chaos.inject "process_sender_txs:enter";
   let had_encrypted_debit = ref false in
-  let vm_value =
-    Consensus_epoch_vm_shell.make_live_value_effects
-      {
-        ledger = deps.ledger;
-        store = deps.store;
-        add_fee = (fun fee ->
-          deps.confirmed_fees := Z.add !(deps.confirmed_fees) fee);
-      }
-  in
   let handle_sender_tx (ctx : Sender.tx_context) =
     let tx = ctx.tx in
     let open Transaction in
+    let vm_value =
+      Consensus_epoch_vm_shell.make_live_value_effects
+        {
+          ledger = deps.ledger;
+          store = deps.store;
+          add_fee = (fun fee ->
+            deps.confirmed_fees := Z.add !(deps.confirmed_fees) fee);
+        }
+    in
     let confirm_current_tx = ctx.confirm in
     let reject_current_tx = ctx.reject in
     let reject_private_gate (r : Consensus_epoch_apply_private_gate.reject) =
@@ -83,16 +84,24 @@ let run deps sender_txs =
     let vm_tx_deps =
       Consensus_epoch_vm_shell.make_live_sender_vm_tx_deps
         Consensus_epoch_vm_shell.{
-          journal = vm_value.journal;
+          value_journal = vm_value.value_journal;
+          program_journal = vm_value.program_journal;
+          trusted_program_keys = deps.program_trust;
           ledger = deps.ledger;
           store = deps.store;
           chaindata = deps.chaindata;
           tx;
           current_epoch = deps.current_epoch;
+          epoch_time_ms =
+            (match Octra_consensus.Epoch_time.of_seconds
+               (deps.standard_env ()).Octra_core.Epoch_exec.epoch_ts with
+             | Ok value -> value
+             | Error _ -> 0L);
           pre_state_hash = deps.pre_state_hash;
           node_id = deps.wallet_addr;
           reject = reject_vm;
           balance = vm_value.balance;
+          ensure_account = vm_value.ensure_account;
           apply_value_effect = vm_value.apply;
           discard_effects = vm_value.discard;
           discard_fee = vm_value.discard_fee;

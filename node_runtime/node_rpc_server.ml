@@ -45,6 +45,7 @@ type config = {
   total_tx_count : int ref;
   validator_view_sk : string;
   validator_view_pub : string;
+  program_trust : Octra_vm.Program_trust.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   deps : deps;
@@ -64,6 +65,7 @@ type ctx = {
   total_tx_count : int ref;
   validator_view_sk : string;
   validator_view_pub : string;
+  program_trust : Octra_vm.Program_trust.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   deps : deps;
 } [@@warning "-69"]
@@ -271,11 +273,15 @@ let contract_call params ctx =
 
 let circle_view params ctx =
   let view_ctx = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
-  Circle_read_rpc.view_call_public_params ctx.store params ~view_ctx
+  Circle_read_rpc.view_call_public_params
+    ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
+    ctx.store params ~view_ctx
 
 let circle_view_auth params ctx =
   let view_ctx = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
-  Circle_read_rpc.view_call_auth ctx.store params ~view_ctx
+  Circle_read_rpc.view_call_auth
+    ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
+    ctx.store params ~view_ctx
 
 let octra_register_pvac_pubkey params ctx =
   Registration_rpc.pvac_pubkey
@@ -399,6 +405,7 @@ let start (cfg : config) =
     total_tx_count = cfg.total_tx_count;
     validator_view_sk = cfg.validator_view_sk;
     validator_view_pub = cfg.validator_view_pub;
+    program_trust = cfg.program_trust;
     consensus_driver_ref = cfg.consensus_driver_ref;
     deps = cfg.deps;
   } in

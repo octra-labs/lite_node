@@ -24,14 +24,17 @@ module Circle_exec = Octra_circle_runtime.Circle_exec
 module Ledger = Octra_core.Ledger
 module Store_chaindata = Octra_core.Store_chaindata
 module Value_journal = Octra_vm.Value_journal
+module Program_journal = Octra_vm.Program_journal
+module Program_trust = Octra_vm.Program_trust
+module Tx_effects = Octra_vm.Tx_effects
 
-type ('journal_snapshot, 'pending_snapshot) deps = {
+type ('value_snapshot, 'program_snapshot) deps = {
   get_balance : string -> Z.t;
   transfer : from_addr:string -> to_addr:string -> amount:Z.t -> bool;
-  snapshot_journal : unit -> 'journal_snapshot;
-  restore_journal : 'journal_snapshot -> unit;
-  snapshot_pending : unit -> 'pending_snapshot;
-  restore_pending : 'pending_snapshot -> unit;
+  snapshot_value : unit -> 'value_snapshot;
+  restore_value : 'value_snapshot -> unit;
+  snapshot_program : unit -> 'program_snapshot;
+  restore_program : 'program_snapshot -> unit;
   execute_call :
     ctx:ContractVM.exec_ctx ->
     depth:int ->
@@ -51,6 +54,7 @@ type ('journal_snapshot, 'pending_snapshot) deps = {
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   current_epoch : int;
+  epoch_time_ms : int64;
   tree_hash : string;
   node_id : string;
   tx_hash : string;
@@ -168,6 +172,7 @@ type call_runtime = {
 
 type vm_tx_deps = {
   runtime : call_runtime;
+  trusted_program_keys : Program_trust.t;
   deploy_balance : Transaction.t -> Z.t option;
   deploy_and_save :
     Transaction.t ->
@@ -232,25 +237,83 @@ type vm_tx_deps = {
 
 type live_vm_tx_args = {
   runtime : call_runtime;
+  trusted_program_keys : Program_trust.t;
+  program_journal : Program_journal.t;
   ledger : Ledger.t;
   store : Octra_core.Store_irmin.t;
   chaindata : Store_chaindata.t;
   receipt_epoch : unit -> int;
   ctx_for_hash : string -> ContractVM.exec_ctx;
+  ensure_account : string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   epoch : int;
   now : unit -> float;
 }
 
+type live_call_runtime_args = {
+  reject : tx_reject;
+  debit : string -> Z.t -> int -> (unit, string) result;
+  tx : Transaction.t;
+  make_ctx : string -> ContractVM.exec_ctx;
+  balance : string -> Z.t;
+  apply_value_effect : Call_plan.value_effect -> unit;
+  discard_effects : unit -> unit;
+  discard_fee : Z.t -> unit;
+  commit_effects : unit -> unit;
+  confirm : unit -> unit Lwt.t;
+}
+
 type live_contract_ctx_args = {
-  journal : Value_journal.t;
+  value_journal : Value_journal.t;
+  program_journal : Program_journal.t;
+  trusted_program_keys : Program_trust.t;
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   current_epoch : int;
+  epoch_time_ms : int64;
   tree_hash : string;
   node_id : string;
   tx_hash : string;
+}
+
+type live_value_effects = {
+  value_journal : Value_journal.t;
+  program_journal : Program_journal.t;
+  balance : string -> Z.t;
+  ensure_account : string -> unit;
+  discard : unit -> unit;
+  discard_fee : Z.t -> unit;
+  commit : unit -> unit;
+  apply : Call_plan.value_effect -> unit;
+}
+
+type live_value_effect_args = {
+  ledger : Ledger.t;
+  store : Octra_core.Store_irmin.t;
+  add_fee : Z.t -> unit;
+}
+
+type live_sender_vm_tx_args = {
+  value_journal : Value_journal.t;
+  program_journal : Program_journal.t;
+  trusted_program_keys : Program_trust.t;
+  ledger : Ledger.t;
+  store : Octra_core.Store_irmin.t;
+  chaindata : Store_chaindata.t;
+  tx : Transaction.t;
+  current_epoch : unit -> int;
+  epoch_time_ms : int64;
+  pre_state_hash : string;
+  node_id : string;
+  reject : tx_reject;
+  balance : string -> Z.t;
+  ensure_account : string -> unit;
+  apply_value_effect : Call_plan.value_effect -> unit;
+  discard_effects : unit -> unit;
+  discard_fee : Z.t -> unit;
+  commit_effects : unit -> unit;
+  confirm : unit -> unit Lwt.t;
 }
 
 let make_circle_call_deps (runtime : call_runtime) ~exec ~save ~commit ~log_ok :
@@ -307,9 +370,9 @@ let make_multi_exec_deps (runtime : call_runtime) ~execute_call
     now;
   }
 
-let restore deps journal pending =
-  deps.restore_journal journal;
-  deps.restore_pending pending
+let restore deps value program =
+  deps.restore_value value;
+  deps.restore_program program
 
 let subcall_result (r : Contract.exec_result) =
   match Contract.exec_result_to_result r with
@@ -330,8 +393,8 @@ let make_contract_ctx deps =
       do_transfer = (fun from_addr to_addr amount ->
         deps.transfer ~from_addr ~to_addr ~amount);
       call_contract = (fun caller target method_name args depth ->
-        let journal = deps.snapshot_journal () in
-        let pending = deps.snapshot_pending () in
+        let value = deps.snapshot_value () in
+        let program = deps.snapshot_program () in
         let params = List.map Receipt_view.nested_call_arg_json args in
         let r =
           deps.execute_call
@@ -344,11 +407,11 @@ let make_contract_ctx deps =
             ~amount:Z.zero
         in
         if not r.success then
-          restore deps journal pending;
+          restore deps value program;
         subcall_result r);
       deploy_contract = (fun deployer bytecode_raw nonce depth params ->
-        let journal = deps.snapshot_journal () in
-        let pending = deps.snapshot_pending () in
+        let value = deps.snapshot_value () in
+        let program = deps.snapshot_program () in
         match
           deps.deploy_internal
             ~ctx
@@ -361,12 +424,13 @@ let make_contract_ctx deps =
         | Ok spawn ->
           Ok spawn
         | Error e ->
-          restore deps journal pending;
+          restore deps value program;
           Error e);
       get_fhe_pubkey = deps.get_fhe_pubkey;
       get_fhe_keypair = (fun _ -> None);
       allow_fhe_capability = (fun _ -> true);
       current_epoch = deps.current_epoch;
+      epoch_time_ms = deps.epoch_time_ms;
       tree_hash = deps.tree_hash;
       node_id = deps.node_id;
       tx_hash = deps.tx_hash;
@@ -374,35 +438,69 @@ let make_contract_ctx deps =
   in
   ctx
 
-let make_live_contract_ctx args =
-  make_contract_ctx
+let make_live_contract_ctx (args : live_contract_ctx_args) =
+  let ctx = make_contract_ctx
     {
-      get_balance = Value_journal.effective args.journal;
+      get_balance = Value_journal.effective args.value_journal;
       transfer = (fun ~from_addr ~to_addr ~amount ->
-        Value_journal.transfer args.journal ~from_addr ~to_addr ~amount);
-      snapshot_journal = (fun () -> Value_journal.snapshot args.journal);
-      restore_journal = (fun snapshot ->
-        Value_journal.restore args.journal snapshot);
-      snapshot_pending = (fun () ->
-        !(Contract.pending_deploys), Hashtbl.copy Contract.pending_storage);
-      restore_pending = (fun (pending, storage) ->
-        Contract.pending_deploys := pending;
-        Hashtbl.reset Contract.pending_storage;
-        Hashtbl.iter (Hashtbl.replace Contract.pending_storage) storage);
+        Value_journal.transfer args.value_journal ~from_addr ~to_addr ~amount);
+      snapshot_value = (fun () -> Value_journal.snapshot args.value_journal);
+      restore_value = (fun snapshot ->
+        Value_journal.restore args.value_journal snapshot);
+      snapshot_program = (fun () ->
+        Program_journal.snapshot args.program_journal);
+      restore_program = (fun snapshot ->
+        Program_journal.restore args.program_journal snapshot);
       execute_call = (fun ~ctx ~depth ~target ~method_name ~params ~caller
           ~amount ->
-        Contract.execute_call ~ctx ~depth args.store target method_name params
-          caller amount);
+        Contract.execute_call
+          ~trusted:(Program_trust.keys args.trusted_program_keys)
+          ~journal:args.program_journal ~ctx ~depth
+          args.store target method_name params caller amount);
       deploy_internal = (fun ~ctx ~depth ~params ~deployer ~bytecode_raw
           ~nonce ->
-        Contract.deploy_internal ~ctx ~depth ~params args.store ~deployer
-          ~bytecode_raw ~nonce);
+        Contract.deploy_internal
+          ~trusted:(Program_trust.keys args.trusted_program_keys)
+          ~journal:args.program_journal ~ctx ~depth
+          ~params args.store ~deployer ~bytecode_raw ~nonce);
       get_fhe_pubkey = args.get_fhe_pubkey;
       current_epoch = args.current_epoch;
+      epoch_time_ms = args.epoch_time_ms;
       tree_hash = args.tree_hash;
       node_id = args.node_id;
       tx_hash = args.tx_hash;
     }
+  in
+  { ctx with epoch_time_ms = args.epoch_time_ms }
+
+let live_fhe_pubkey store addr =
+  match Node_rest_facade.run_s (Octra_core.Store_irmin.get_pvac_pubkey store addr) with
+  | None -> None
+  | Some blob ->
+    match Octra_core.Pvac_registry.load_pubkey blob with
+    | Ok pk -> Some pk
+    | Error _ -> None
+
+let make_live_value_effects (args : live_value_effect_args) =
+  let tx = Tx_effects.create ~ledger:args.ledger ~store:args.store in
+  let value_journal = Tx_effects.value tx in
+  let program_journal = Tx_effects.program tx in
+  let discard () = Tx_effects.discard tx in
+  {
+    value_journal;
+    program_journal;
+    balance = Tx_effects.balance tx;
+    ensure_account = (fun address ->
+      match Tx_effects.ensure_account tx address with
+      | Ok () -> ()
+      | Error error -> raise (Tx_effects.Commit_failed error));
+    discard;
+    discard_fee = (fun fee ->
+      discard ();
+      args.add_fee fee);
+    commit = (fun () -> Tx_effects.commit_exn tx);
+    apply = (fun effect -> ignore (Tx_effects.apply tx effect));
+  }
 
 let direct_exec_spec_of_tx ~domain ~reject_domain ~balance (tx : Transaction.t) =
   {
@@ -506,7 +604,7 @@ let run_program_call_tx (deps : program_call_deps) tx =
     ~reject_domain:Call_plan.Program_exec
     tx
 
-let run_contract_deploy ~fee ~balance ~bytecode_b64_opt ~deployer ~nonce
+let run_contract_deploy ~trusted_program_keys ~fee ~balance ~bytecode_b64_opt ~deployer ~nonce
     ~target ~message ~handle_reject ~with_debited_fee ~reject_after_fee
     ~deploy_and_save ~ensure_account ~commit_effects ~log_deployed
     ~log_constructor_failed ~confirm =
@@ -516,7 +614,8 @@ let run_contract_deploy ~fee ~balance ~bytecode_b64_opt ~deployer ~nonce
   | Call_plan.Deploy_fee_ready ->
     with_debited_fee fee (fun () ->
       match
-        Call_plan.plan_deploy_input
+        Call_plan.plan_deploy_input_with_keys
+          ~trusted:(Program_trust.keys trusted_program_keys)
           ~bytecode_b64_opt
           ~deployer
           ~nonce
@@ -548,10 +647,11 @@ let run_contract_deploy ~fee ~balance ~bytecode_b64_opt ~deployer ~nonce
           log_constructor_failed result.contract_addr err;
           reject_after_fee fee "constructor_failed" err)
 
-let run_deploy_tx ~balance (tx : Transaction.t) ~handle_reject
+let run_deploy_tx ~trusted_program_keys ~balance (tx : Transaction.t) ~handle_reject
     ~with_debited_fee ~reject_after_fee ~deploy_and_save ~ensure_account
     ~commit_effects ~log_deployed ~log_constructor_failed ~confirm =
   run_contract_deploy
+    ~trusted_program_keys
     ~fee:tx.ou
     ~balance
     ~bytecode_b64_opt:tx.encrypted_data
@@ -569,9 +669,10 @@ let run_deploy_tx ~balance (tx : Transaction.t) ~handle_reject
     ~log_constructor_failed
     ~confirm
 
-let run_deploy_tx_runtime (runtime : call_runtime) ~balance tx ~deploy_and_save
+let run_deploy_tx_runtime ~trusted_program_keys (runtime : call_runtime) ~balance tx ~deploy_and_save
     ~ensure_account =
   run_deploy_tx
+    ~trusted_program_keys
     ~balance
     tx
     ~handle_reject:runtime.handle_deploy_reject
@@ -636,8 +737,11 @@ let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
             deps.save_receipt_raw ~tx_hash ~json:(receipt_json false (Some err));
             deps.log_failed err;
             deps.reject_after_fee fee "multi_exec_failed" err
-        with e ->
-          deps.reject_after_fee fee "multi_exec_exception" (Printexc.to_string e))
+        with
+        | Tx_effects.Commit_failed _ as error -> raise error
+        | error ->
+          deps.reject_after_fee fee "multi_exec_exception"
+            (Printexc.to_string error))
 
 let run_multi_exec_tx deps ~max_calls ~epoch (tx : Transaction.t) =
   run_multi_exec
@@ -721,7 +825,33 @@ let log_circle_call_ok target meta call call_result =
   log_direct_call_ok meta target call.Call_plan.method_name
     call_result.Circle_exec.receipt.Contract.effort_used
 
-let make_live_vm_tx_deps args =
+let make_live_call_runtime (args : live_call_runtime_args) =
+  {
+    handle_deploy_reject = handle_deploy_reject ~reject:args.reject;
+    with_debited_fee =
+      with_debited_fee
+        ~debit:args.debit
+        ~reject:(fun tag reason -> args.reject tag reason)
+        args.tx;
+    make_ctx = args.make_ctx;
+    balance = args.balance;
+    apply_value_effect = args.apply_value_effect;
+    log_failed = log_direct_call_failed;
+    reject_after_fee =
+      reject_after_fee
+        ~discard_fee:args.discard_fee
+        ~reject:args.reject;
+    reject =
+      handle_direct_exec_reject
+        ~discard:args.discard_effects
+        ~reject:args.reject;
+    commit_effects = args.commit_effects;
+    confirm = args.confirm;
+    log_deployed;
+    log_constructor_failed;
+  }
+
+let make_live_vm_tx_deps (args : live_vm_tx_args) =
   let save_receipt =
     save_receipt
       {
@@ -731,6 +861,7 @@ let make_live_vm_tx_deps args =
   in
   {
     runtime = args.runtime;
+    trusted_program_keys = args.trusted_program_keys;
     deploy_balance = (fun tx ->
       Option.map (fun acc -> acc.Ledger.balance)
         (Ledger.find_opt args.ledger tx.Transaction.from));
@@ -738,16 +869,19 @@ let make_live_vm_tx_deps args =
       let tx_hash = Transaction.hash tx in
       let ctx_for_tx = args.ctx_for_hash tx_hash in
       let contract_addr, receipt =
-        Contract.deploy ~ctx:ctx_for_tx ~params args.store tx.from "CUSTOM"
-          bytecode bytecode_raw tx.nonce
+        Contract.deploy
+          ~trusted:(Program_trust.keys args.trusted_program_keys)
+          ~journal:args.program_journal ~ctx:ctx_for_tx ~params
+          args.store tx.from "CUSTOM" bytecode bytecode_raw tx.nonce
       in
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       { contract_addr; receipt });
-    ensure_account = (fun addr ->
-      if not (Ledger.mem args.ledger addr) then
-        ignore (Ledger.add_account args.ledger addr Z.zero));
+    ensure_account = args.ensure_account;
     circle_exec = (fun tx ~ctx call ->
-      Circle_exec.execute_call ~ctx ~limit:call.effort_limit args.store tx.to_
+      let ctx = { ctx with ContractVM.node_id = tx.to_ } in
+      Circle_exec.execute_call
+        ~trusted:(Program_trust.keys args.trusted_program_keys)
+        ~ctx ~limit:call.effort_limit args.store tx.to_
         call.method_name call.params tx.from tx.amount);
     circle_save = (fun tx ~tx_hash call call_result ->
       save_receipt ~tx_hash ~contract_addr:tx.to_
@@ -757,16 +891,21 @@ let make_live_vm_tx_deps args =
     circle_log_ok = (fun tx -> log_circle_call_ok tx.to_);
     program_exec = (fun tx ~ctx call ->
       Lwt.return
-        (Contract.execute_call ~ctx ~limit:call.effort_limit args.store tx.to_
-           call.method_name call.params tx.from tx.amount));
+        (Contract.execute_call
+           ~trusted:(Program_trust.keys args.trusted_program_keys)
+           ~journal:args.program_journal ~ctx
+           ~limit:call.effort_limit args.store tx.to_ call.method_name
+           call.params tx.from tx.amount));
     program_save = (fun tx ~tx_hash call receipt ->
       save_receipt ~program:true ~tx_hash ~contract_addr:tx.to_
         ~method_name:call.method_name receipt);
     program_log_ok = (fun tx -> log_program_call_ok tx.to_);
     multi_execute_call = (fun ~ctx ~limit ~target ~method_name ~params ~caller
         ~amount ->
-      Contract.execute_call ~ctx ~limit args.store target method_name params caller
-        amount);
+      Contract.execute_call
+        ~trusted:(Program_trust.keys args.trusted_program_keys)
+        ~journal:args.program_journal ~ctx ~limit args.store
+        target method_name params caller amount);
     save_receipt_raw = Store_chaindata.save_receipt_raw args.chaindata;
     reject_malformed = args.reject_malformed;
     max_multi_exec_calls = args.max_multi_exec_calls;
@@ -778,6 +917,7 @@ let run_vm_tx (deps : vm_tx_deps) tx =
   match tx.Transaction.op_type with
   | Transaction.ContractDeploy ->
     run_deploy_tx_runtime
+      ~trusted_program_keys:deps.trusted_program_keys
       deps.runtime
       ~balance:(deps.deploy_balance tx)
       tx
@@ -822,3 +962,50 @@ let max_multi_exec_calls ~env =
     (try max 1 (int_of_string s) with _ -> 8)
   | None ->
     8
+
+let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
+  let ctx_for_hash tx_hash =
+    make_live_contract_ctx
+      {
+        value_journal = args.value_journal;
+        program_journal = args.program_journal;
+        trusted_program_keys = args.trusted_program_keys;
+        store = args.store;
+        get_fhe_pubkey = live_fhe_pubkey args.store;
+        current_epoch = args.current_epoch ();
+        epoch_time_ms = args.epoch_time_ms;
+        tree_hash = args.pre_state_hash;
+        node_id = args.node_id;
+        tx_hash;
+      }
+  in
+  let runtime =
+    make_live_call_runtime {
+      reject = args.reject;
+      debit = Ledger.debit args.ledger;
+      tx = args.tx;
+      make_ctx = ctx_for_hash;
+      balance = args.balance;
+      apply_value_effect = args.apply_value_effect;
+      discard_effects = args.discard_effects;
+      discard_fee = args.discard_fee;
+      commit_effects = args.commit_effects;
+      confirm = args.confirm;
+    }
+  in
+  make_live_vm_tx_deps {
+    runtime;
+    trusted_program_keys = args.trusted_program_keys;
+    program_journal = args.program_journal;
+    ledger = args.ledger;
+    store = args.store;
+    chaindata = args.chaindata;
+    receipt_epoch = args.current_epoch;
+    ctx_for_hash;
+    ensure_account = args.ensure_account;
+    reject_malformed = (fun reason ->
+      args.reject "malformed_transaction" reason);
+    max_multi_exec_calls = max_multi_exec_calls ~env:Sys.getenv_opt;
+    epoch = args.current_epoch ();
+    now = Unix.gettimeofday;
+  }

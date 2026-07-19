@@ -58,6 +58,21 @@ type t = {
   mutable evictions : int;
 }
 
+type node_runtime = {
+  cached_bundle : string -> (string list * Transaction.t list * string list) option;
+  store_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  receipt_root_matches : C_types.epoch_header -> string list -> bool;
+  header_has_empty_bundle : C_types.epoch_header -> bool;
+  store_empty_bundle : C_types.epoch_header -> unit;
+  store_empty_proposal : proposal_id:string -> unit;
+  lookup_raw : string -> encoded option;
+}
+
 let create ~cap =
   {
     cache = Hashtbl.create 8;
@@ -202,6 +217,24 @@ let header_has_empty_bundle header =
 let store_empty_header_with_log t header =
   let pid = C_hash.proposal_id header in
   store_with_log t ~pid ~tx_hashes:[] ~txs:[] ~receipts_json:[]
+
+let node_runtime t =
+  {
+    cached_bundle = (fun pid ->
+      cached_with_log t pid
+      |> Option.map (fun (bundle : decoded) ->
+        bundle.tx_hashes,
+        bundle.txs,
+        bundle.receipts_json));
+    store_bundle = (fun ~proposal_id ~tx_hashes ~txs ~receipts_json ->
+      store_with_log t ~pid:proposal_id ~tx_hashes ~txs ~receipts_json);
+    receipt_root_matches;
+    header_has_empty_bundle;
+    store_empty_bundle = store_empty_header_with_log t;
+    store_empty_proposal = (fun ~proposal_id ->
+      store_with_log t ~pid:proposal_id ~tx_hashes:[] ~txs:[] ~receipts_json:[]);
+    lookup_raw = lookup_raw t;
+  }
 
 let freeze_key ~epoch_id ~round =
   Printf.sprintf "%Ld:%d" epoch_id round

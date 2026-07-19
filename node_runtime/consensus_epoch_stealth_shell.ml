@@ -120,6 +120,71 @@ type gate_deps = {
   fhe_gate : unit -> Private_gate.reject option;
 }
 
+type live_tx_args = {
+  stealth_count : int;
+  max_stealth_per_epoch : int;
+  max_stealth_defer : int;
+  inline_verify_allowed : bool;
+  expected_kat : unit -> string;
+  stored_kat : string -> string option;
+  set_kat : string -> string -> unit;
+  log_backfill : string -> unit;
+  debit_gate : unit -> Private_gate.reject option;
+  fhe_gate : unit -> Private_gate.reject option;
+  defer_count : string -> int;
+  set_defer_count : string -> int -> unit;
+  clear_defer_count : string -> unit;
+  defer_tx : Transaction.t -> unit Lwt.t;
+  reject : string -> string -> unit Lwt.t;
+  plan :
+    Transaction.t ->
+    (Private_ledger.stealth_plan, Private_ledger.failure) result Lwt.t;
+  trace_cipher : string -> string -> string -> string -> unit;
+  inline_range :
+    Transaction.t ->
+    Private_ledger.stealth_plan ->
+    (Private_ledger.stealth_range, Private_ledger.failure) result Lwt.t;
+  accept_range : Private_ledger.stealth_range -> (unit, Private_ledger.failure) result;
+  binding :
+    Transaction.t ->
+    Private_ledger.stealth_plan ->
+    (unit, Private_ledger.failure) result Lwt.t;
+  debit : Transaction.t -> Z.t -> int -> (unit, string) result;
+  update : Transaction.t -> string -> (unit, string) result;
+  create_output :
+    tx_hash:string ->
+    Transaction.t ->
+    Private_ledger.stealth_plan ->
+    (int64, string) result Lwt.t;
+  accept :
+    Transaction.t ->
+    int64 ->
+    Private_ledger.stealth_plan ->
+    unit Lwt.t;
+}
+
+type live_ledger_tx_args = {
+  ledger : Octra_core.Ledger.t;
+  current_epoch : unit -> int;
+  stealth_count : int;
+  max_stealth_per_epoch : int;
+  max_stealth_defer : int;
+  inline_verify_allowed : bool;
+  debit_gate : unit -> Private_gate.reject option;
+  fhe_gate : unit -> Private_gate.reject option;
+  defer_count : string -> int;
+  set_defer_count : string -> int -> unit;
+  clear_defer_count : string -> unit;
+  defer_tx : Transaction.t -> unit Lwt.t;
+  reject : string -> string -> unit Lwt.t;
+  trace_cipher : string -> string -> string -> string -> unit;
+  short_addr : string -> string;
+  mark_debit : unit -> unit;
+  incr_stealth : unit -> unit;
+  incr_fhe : unit -> unit;
+  confirm : unit -> unit Lwt.t;
+}
+
 let failure_tag (e : Private_ledger.failure) =
   e.tag
 
@@ -139,7 +204,7 @@ let clear_preverify (deps : deps) tx_hash =
   deps.preverify_remove tx_hash;
   deps.clear_defer_count tx_hash
 
-let kat_ok deps addr =
+let kat_ok (deps : gate_deps) addr =
   let expected_kat = deps.expected_kat () in
   match deps.stored_kat addr with
   | None ->
@@ -149,7 +214,7 @@ let kat_ok deps addr =
   | Some stored_kat ->
     String.equal stored_kat expected_kat
 
-let gate_reject deps tx =
+let gate_reject_plan (deps : gate_deps) tx =
   if not (kat_ok deps tx.Transaction.from) then
     Some (Private_gate.aes_kat_mismatch ~op:"stealth")
   else
@@ -179,6 +244,108 @@ let log_cache_miss_disabled ~tx =
   Log.warn "epoch"
     "event = stealth_preverify_cache status = miss inline = disabled action = defer tx = %s"
     tx
+
+let gate_reject deps tx =
+  gate_reject_plan deps tx
+
+let live_tx_deps (args : live_tx_args) : tx_deps =
+  let gate : gate_deps = {
+    expected_kat = args.expected_kat;
+    stored_kat = args.stored_kat;
+    set_kat = args.set_kat;
+    log_backfill = args.log_backfill;
+    debit_gate = args.debit_gate;
+    fhe_gate = args.fhe_gate;
+  } in
+  {
+    stealth_count = args.stealth_count;
+    max_stealth_per_epoch = args.max_stealth_per_epoch;
+    max_stealth_defer = args.max_stealth_defer;
+    inline_verify_allowed = args.inline_verify_allowed;
+    gate_reject = gate_reject_plan gate;
+    short_hash = Consensus_epoch_apply_sender.short_hash;
+    defer_count = args.defer_count;
+    set_defer_count = args.set_defer_count;
+    clear_defer_count = args.clear_defer_count;
+    preverify_state = Preverify_cache.state;
+    preverify_remove = Preverify_cache.remove;
+    preverify_ready = Preverify_cache.ready_result;
+    log_cap_defer;
+    log_defer;
+    log_cache_hit;
+    log_cache_miss_verify;
+    log_cache_miss_disabled;
+    defer_tx = args.defer_tx;
+    reject = args.reject;
+    plan = args.plan;
+    trace = (fun tx plan ->
+      args.trace_cipher
+        "stealth_withdraw"
+        tx.Transaction.from
+        plan.Private_ledger.stealth_current_cipher
+        plan.stealth_next_cipher);
+    inline_range = args.inline_range;
+    accept_range = args.accept_range;
+    binding = args.binding;
+    debit = args.debit;
+    update = args.update;
+    create_output = args.create_output;
+    accept = args.accept;
+  }
+
+let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
+  live_tx_deps {
+    stealth_count = args.stealth_count;
+    max_stealth_per_epoch = args.max_stealth_per_epoch;
+    max_stealth_defer = args.max_stealth_defer;
+    inline_verify_allowed = args.inline_verify_allowed;
+    expected_kat = Octra_core.Pvac_registry.expected_kat;
+    stored_kat = Octra_core.Ledger.get_pvac_kat args.ledger;
+    set_kat = Octra_core.Ledger.set_pvac_kat args.ledger;
+    log_backfill = (fun addr ->
+      Log.info "pvac" "event = kat_backfill addr = %s op = stealth"
+        (args.short_addr addr));
+    debit_gate = args.debit_gate;
+    fhe_gate = args.fhe_gate;
+    defer_count = args.defer_count;
+    set_defer_count = args.set_defer_count;
+    clear_defer_count = args.clear_defer_count;
+    defer_tx = args.defer_tx;
+    reject = args.reject;
+    plan = Octra_core.Private_ledger.stealth_plan args.ledger;
+    trace_cipher = args.trace_cipher;
+    inline_range = Octra_core.Private_ledger.stealth_inline_range args.ledger;
+    accept_range = Octra_core.Private_ledger.stealth_accept_range;
+    binding = Octra_core.Private_ledger.stealth_binding args.ledger;
+    debit = (fun tx fee nonce ->
+      Octra_core.Ledger.debit args.ledger tx.Transaction.from fee nonce);
+    update = (fun tx cipher ->
+      Octra_core.Ledger.update_enc_balance args.ledger tx.Transaction.from cipher);
+    create_output = (fun ~tx_hash tx plan ->
+      Octra_core.Ledger.create_stealth_output args.ledger
+        ~stealth_tag:plan.stealth_tag
+        ~eph_pub:plan.stealth_eph_pub
+        ~enc_amount:plan.stealth_enc_amount
+        ~amount:Z.zero
+        ~epoch_id:(args.current_epoch ())
+        ~tx_hash
+        ~sender_addr:tx.Transaction.from
+        ~claim_pub:plan.stealth_claim_pub
+        ~delta_cipher_stored:plan.stealth_delta_cipher
+        ~amount_hash:Octra_core.Private_ledger.key_bound_stealth_output_marker
+        ~amount_commitment:plan.stealth_amount_commitment
+        ());
+    accept = (fun tx output_id plan ->
+      Log.info "epoch"
+        "event = stealth_v5 sender = %s tag = %s output_id = %Ld"
+        (args.short_addr tx.Transaction.from)
+        plan.stealth_tag
+        output_id;
+      args.mark_debit ();
+      args.incr_stealth ();
+      args.incr_fhe ();
+      args.confirm ());
+  }
 
 let run_ready (deps : deps) =
   let open Lwt.Syntax in
@@ -280,7 +447,7 @@ let run (deps : deps) =
       | Ready_gate ->
         run_ready deps
 
-let run_tx deps tx =
+let run_tx (deps : tx_deps) tx =
   run {
     fee = tx.Transaction.ou;
     nonce = tx.nonce;

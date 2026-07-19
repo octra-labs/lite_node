@@ -75,6 +75,29 @@ val start :
   total_tx_count:int ref ->
   validator_view_sk:string ->
   validator_view_pub:string ->
+  program_trust:Octra_vm.Program_trust.t ->
   chaindata:Store_chaindata.t ->
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->
+  unit Lwt.t
+
+val start_task :
+  runtime ->
+  port:int ->
+  data_dir:string ->
+  store:Store_irmin.t ->
+  ledger:Ledger.t ->
+  tree_ref:Tree.t ref ->
+  wallet:Wallet.t ->
+  chain_id:string ->
+  consensus_config_hash_ref:string ref ->
+  consensus_validator_set_ref:Octra_consensus.C_types.validator_set ref ->
+  scheduled_validator_set_ref:Octra_consensus.C_config.scheduled option ref ->
+  current_epoch:int ref ->
+  total_tx_count:int ref ->
+  validator_view_sk:string ->
+  validator_view_pub:string ->
+  program_trust:Octra_vm.Program_trust.t ->
+  chaindata:Store_chaindata.t ->
+  consensus_driver_ref:Octra_consensus.C_driver.t option ref ->
+  unit ->
   unit Lwt.t

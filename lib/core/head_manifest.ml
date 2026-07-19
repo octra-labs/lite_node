@@ -101,6 +101,7 @@ let of_json s =
 
 let path data_dir = Filename.concat data_dir "HEAD.json"
 
+
 let atomic_write data_dir t =
   let p = path data_dir in
   let tmp = p ^ ".tmp" in
@@ -130,6 +131,7 @@ let load data_dir =
       Some (of_json (Bytes.to_string buf))
     with _ -> None
 
+
 type load_result =
   | Missing
   | Present of t
@@ -148,6 +150,7 @@ let load_result data_dir =
       Present (of_json (Bytes.to_string buf))
     with e -> Corrupt (Printexc.to_string e)
 
+
 let cached : t option ref = ref None
 
 let set_cached h = cached := Some h
@@ -157,6 +160,8 @@ let get_cached () = !cached
 let load_to_cache data_dir =
   cached := load data_dir;
   !cached
+
+
 
 let is_epoch_visible head epoch_id =
   match head with

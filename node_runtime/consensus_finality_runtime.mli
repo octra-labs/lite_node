@@ -57,6 +57,25 @@ type node_deps = {
   finality : Consensus_finality_state.callbacks;
 }
 
+type node_runtime = {
+  data_dir : string;
+  bundles : Consensus_bundle_cache.node_runtime;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  proposal_state : Consensus_proposal_state.t;
+  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  catchup_queue : Consensus_catchup_queue.t;
+  consensus_finalized : bool ref;
+  current_epoch : int ref;
+  sleep : float -> unit Lwt.t;
+  read_pre_finalize_root : unit -> string option;
+  read_commit_root : unit -> string option Lwt.t;
+  read_local_root_raw : unit -> string Lwt.t;
+  fatal_exit : unit -> unit;
+  catchup_active : bool ref;
+  runtime_state : Consensus_runtime_state.t;
+  finality : Consensus_finality_state.callbacks;
+}
+
 type t = {
   apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
   drain_pending : unit -> unit Lwt.t;
@@ -66,3 +85,7 @@ type t = {
 val create : deps -> t
 
 val create_node : node_deps -> t
+
+val node_deps_of_runtime : node_runtime -> node_deps
+
+val create_node_runtime : node_runtime -> t

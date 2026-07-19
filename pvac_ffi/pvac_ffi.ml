@@ -47,10 +47,11 @@ external commit_ct : pubkey -> cipher -> bytes = "caml_pvac_commit_ct"
 external cipher_has_key_bound_material : cipher -> bool = "caml_pvac_cipher_has_key_bound_material"
 external pubkey_is_key_bound_extension : pubkey -> pubkey -> bool = "caml_pvac_pubkey_is_key_bound_extension"
 external cipher_is_key_bound_extension : cipher -> cipher -> bool = "caml_pvac_cipher_is_key_bound_extension"
-external bind_legacy_cipher_material : pubkey -> seckey -> cipher -> cipher = "caml_pvac_bind_legacy_cipher_material"
+
 
 external make_zero_proof : pubkey -> seckey -> cipher -> zero_proof = "caml_pvac_make_zero_proof"
 external verify_zero : pubkey -> cipher -> zero_proof -> bool = "caml_pvac_verify_zero"
+
 
 external make_zero_proof_bound : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
   = "caml_pvac_make_zero_proof_bound"
@@ -59,14 +60,17 @@ external verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
 external make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
   = "caml_pvac_make_zero_proof_bound_range"
 
+
 external pedersen_commit_amount : int64 -> bytes -> bytes
   = "caml_pvac_pedersen_commit_amount"
 external pedersen_identity : unit -> bytes = "caml_pvac_pedersen_identity"
 external pedersen_add : bytes -> bytes -> bytes = "caml_pvac_pedersen_add"
 external pedersen_sub : bytes -> bytes -> bytes = "caml_pvac_pedersen_sub"
 
+
 external make_range_proof : pubkey -> seckey -> cipher -> int64 -> range_proof = "caml_pvac_make_range_proof"
 external verify_range : pubkey -> cipher -> range_proof -> bool = "caml_pvac_verify_range"
+
 
 type agg_range_proof
 external make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> agg_range_proof
@@ -74,10 +78,12 @@ external make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> ag
 external serialize_agg_range_proof : agg_range_proof -> bytes
   = "caml_pvac_serialize_agg_range_proof"
 
+
 external verify_range_any : pubkey -> cipher -> bytes -> bool
   = "caml_pvac_verify_range_any"
 
 external serialize_cipher : cipher -> bytes = "caml_pvac_serialize_cipher"
+external serialize_cipher_public : cipher -> bytes = "caml_pvac_serialize_cipher_public"
 external deserialize_cipher : bytes -> cipher = "caml_pvac_deserialize_cipher"
 external serialize_pubkey : pubkey -> bytes = "caml_pvac_serialize_pubkey"
 external serialize_pubkey_legacy_v2 : pubkey -> bytes = "caml_pvac_serialize_pubkey_legacy_v2"
@@ -89,5 +95,6 @@ external serialize_bound_range_proof : zero_proof -> bytes = "caml_pvac_serializ
 external deserialize_zero_proof : bytes -> zero_proof = "caml_pvac_deserialize_zero_proof"
 external serialize_range_proof : range_proof -> bytes = "caml_pvac_serialize_range_proof"
 external deserialize_range_proof : bytes -> range_proof = "caml_pvac_deserialize_range_proof"
+
 
 external aes_kat : unit -> bytes = "caml_pvac_aes_kat"

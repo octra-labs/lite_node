@@ -126,6 +126,7 @@ let create_schema db =
      tx_json TEXT NOT NULL,\
      FOREIGN KEY(epoch_id) REFERENCES epochs(id))";
 
+
     "CREATE TABLE IF NOT EXISTS pending_private_transfers(\
      id INTEGER PRIMARY KEY AUTOINCREMENT,\
      recipient TEXT NOT NULL,\
@@ -335,6 +336,7 @@ let all_stmts s = [
 let close s =
   List.iter (fun stmt -> Sqlite3.finalize stmt |> ignore) (all_stmts s);
   Sqlite3.db_close s.db |> ignore
+
 
 let reset_all_stmts s =
   List.iter (fun stmt -> Sqlite3.reset stmt |> ignore) (all_stmts s)

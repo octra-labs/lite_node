@@ -123,6 +123,18 @@ type node_start = {
 
 let raw32_zero = String.make 32 '\x00'
 
+let install_refs ~consensus_config_hash ~consensus_validator_set
+    ~scheduled_validator_set ~set_swarm =
+  {
+    set_consensus_config_hash = (fun hash ->
+      consensus_config_hash := hash);
+    set_consensus_validator_set = (fun vs ->
+      consensus_validator_set := vs);
+    set_scheduled_validator_set = (fun scheduled ->
+      scheduled_validator_set := scheduled);
+    set_swarm;
+  }
+
 let current_height (deps : deps) =
   Int64.of_int (deps.current_epoch ())
 

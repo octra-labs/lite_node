@@ -15,6 +15,13 @@ Include at startup:
 
 type visibility = Public | Private | Internal
 
+type declaration = ProgramDecl | ContractDecl | InterfaceDecl
+
+let declaration_to_string = function
+  | ProgramDecl -> "program"
+  | ContractDecl -> "contract"
+  | InterfaceDecl -> "interface"
+
 type typ =
   | TInt
   | TBool
@@ -55,6 +62,7 @@ type expr =
   | EOrigin
   | ESelfAddr
   | EEpoch
+  | EEpochTime
   | EValue
   | EBalance of expr
   | ETreeHash
@@ -174,6 +182,7 @@ type interface_def = {
 }
 
 type contract = {
+  declaration : declaration;
   name : string;
   imports : import_decl list;
   structs : struct_def list;
@@ -198,9 +207,9 @@ let typ_to_string = function
   | TOption _ -> "option" | TTuple _ -> "tuple" | TVoid -> "void"
 
 type token =
-  | TkContract | TkState | TkEvent | TkConstructor | TkFn | TkView | TkPure
+  | TkProgram | TkContract | TkState | TkEvent | TkConstructor | TkFn | TkView | TkPure
   | TkLet | TkReturn | TkAssert | TkEmit | TkIf | TkElse | TkWhile
-  | TkSelf | TkCaller | TkOrigin | TkEpoch | TkValue | TkBalance
+  | TkSelf | TkCaller | TkOrigin | TkEpoch | TkEpochTime | TkValue | TkBalance
   | TkTrue | TkFalse
   | TkTyInt | TkTyBool | TkTyString | TkTyAddress | TkTyBytes | TkTyBytes32
   | TkTyU64 | TkTyU128 | TkTyU256

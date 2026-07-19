@@ -25,6 +25,7 @@ type effects = {
 type input = {
   tree_ref : Octra_core.Tree.t ref;
   epoch_id : int;
+  epoch_ts : float;
   epoch_start : float;
   proposer_addr : string;
   validator_addr : string;
@@ -86,6 +87,7 @@ let run effects input =
       effects.footer
       {
         epoch_id = input.epoch_id;
+        epoch_ts = input.epoch_ts;
         proposer_addr = input.proposer_addr;
         validator_pubkeys = input.validator_pubkeys;
         active_validators = input.active_validators;
@@ -103,6 +105,7 @@ let run effects input =
       {
         tree = input.tree_ref;
         epoch_id = input.epoch_id;
+        epoch_ts = input.epoch_ts;
         epoch_start = input.epoch_start;
         proposer_addr = input.proposer_addr;
         validator_addr = input.validator_addr;

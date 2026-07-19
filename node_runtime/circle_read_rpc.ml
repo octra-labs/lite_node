@@ -381,6 +381,7 @@ let program_params store params =
     program store ~circle_id)
 
 let view_call
+    ?(trusted=[])
     store
     ~view_ctx
     ~circle_id
@@ -391,6 +392,7 @@ let view_call
   let open Lwt.Syntax in
   let* result =
     Octra_circle_runtime.Circle_exec.execute_view_call
+      ~trusted
       ~ctx:view_ctx
       store
       circle_id
@@ -415,6 +417,7 @@ let view_call
     Lwt.return (Error (rpc_error error))
 
 let view_call_public
+    ?(trusted=[])
     store
     ~view_ctx
     ~circle_id
@@ -431,6 +434,7 @@ let view_call_public
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle view required" None))
     else
       view_call
+        ~trusted
         store
         ~view_ctx
         ~circle_id
@@ -439,12 +443,13 @@ let view_call_public
         ~caller_addr
         ~include_storage:false
 
-let view_call_public_params store params ~view_ctx =
+let view_call_public_params ?(trusted=[]) store params ~view_ctx =
   match Circle_view.view_call_params params with
   | Error e ->
     err_lwt e
   | Ok call ->
     view_call_public
+      ~trusted
       store
       ~view_ctx
       ~circle_id:call.Circle_view.circle_id
@@ -452,7 +457,7 @@ let view_call_public_params store params ~view_ctx =
       ~call_params:call.call_params
       ~caller_addr:"oct00000000000000000000000000000000000000000000"
 
-let view_call_auth store params ~view_ctx =
+let view_call_auth ?(trusted=[]) store params ~view_ctx =
   match Circle_view.view_call_params params with
   | Error e ->
     err_lwt e
@@ -481,6 +486,7 @@ let view_call_auth store params ~view_ctx =
           ~include_storage)
         (fun caller_addr ->
           view_call
+            ~trusted
             store
             ~view_ctx
             ~circle_id:call.Circle_view.circle_id

@@ -47,6 +47,23 @@ type deps = {
   staging_txs : unit -> Transaction.t list;
 }
 
+type node_deps = {
+  check_override_receipts :
+    epoch_id:int ->
+    receipts:string list ->
+    Transaction.t list ->
+    (unit, string) result;
+  find_finalized : int -> C_types.finalize option;
+  cached_bundle : string -> cached_bundle option;
+  receipt_root_matches : C_types.epoch_header -> string list -> bool;
+  header_has_empty_bundle : C_types.epoch_header -> bool;
+  staging_txs : unit -> Transaction.t list;
+  remove_processed : string list -> unit;
+  store_empty_bundle : C_types.epoch_header -> unit;
+  fatal : string -> unit;
+  exit : unit -> Transaction.t list * string list;
+}
+
 type request = {
   epoch_id : int;
   override_ordered_txs : Transaction.t list option;
@@ -59,3 +76,15 @@ val proposal_id_short : string -> string
 val fatal_lines : epoch_id:int -> fatal -> string list
 
 val choose : deps -> request -> (selected, fatal) result
+
+val run :
+  deps ->
+  request ->
+  apply_effect:(effect -> unit) ->
+  fatal:(string -> unit) ->
+  exit:(unit -> Transaction.t list * string list) ->
+  Transaction.t list * string list
+val run_node :
+  node_deps ->
+  request ->
+  Transaction.t list * string list

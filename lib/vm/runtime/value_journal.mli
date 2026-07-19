@@ -50,9 +50,9 @@ val discard :
 
 val commit :
   t ->
-  debit:(string -> Z.t -> unit) ->
-  credit:(string -> Z.t -> unit) ->
-  unit
+  debit:(string -> Z.t -> (unit, string) result) ->
+  credit:(string -> Z.t -> (unit, string) result) ->
+  (unit, string) result
 
 val snapshot :
   t ->

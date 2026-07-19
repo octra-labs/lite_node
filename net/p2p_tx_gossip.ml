@@ -23,7 +23,7 @@ let kind_inv = 1
 let kind_get = 2
 let kind_tx = 3
 let max_hashes = 512
-let max_tx_json = 1_000_000
+let max_tx_json = 5_000_000
 
 let is_hex c =
   ('0' <= c && c <= '9')

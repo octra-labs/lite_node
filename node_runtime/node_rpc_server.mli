@@ -43,6 +43,7 @@ type config = {
   total_tx_count : int ref;
   validator_view_sk : string;
   validator_view_pub : string;
+  program_trust : Octra_vm.Program_trust.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   deps : deps;

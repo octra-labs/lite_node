@@ -379,6 +379,7 @@ let remember_peer_state t ~source ~responder_addr ~head_epoch ~checked_epoch ~st
 let peer_state_snapshot t =
   Hashtbl.fold (fun _ rec_ acc -> rec_ :: acc) t.peer_states []
 
+
 let msg_id msg_type payload =
   Octra_net.Hash_domain.hash
     "octra:seen:consensus:v1"
@@ -542,6 +543,7 @@ let admit_resource_attestation t attestation =
             t.resource_admission
             attestation
 
+
 let rec process_outputs_once t =
   let open Lwt.Syntax in
   let current_height = t.engine.state.height in
@@ -673,6 +675,7 @@ and process_outputs t =
       t.output_loop_active <- false;
       Lwt.return_unit)
   end
+
 
 let on_p2p_message t _conn (frame : Frame.frame) =
   let open Lwt.Syntax in
@@ -1206,6 +1209,7 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
   Hashtbl.remove t.bundle_responses proposal_id;
   Lwt.return result
 
+
 let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     ~(validate : catchup_range_response_record -> bool) =
   let open Lwt.Syntax in
@@ -1406,6 +1410,7 @@ let query_epoch_root t ~epoch_id ~timeout_seconds =
   Hashtbl.remove t.epoch_root_responses epoch_id;
   Lwt.return collected
 
+
 let try_propose t ~header ~tx_hashes =
   C_engine.do_propose t.engine header tx_hashes ~sign_fn:t.config.sign_fn;
   process_outputs t
@@ -1430,6 +1435,7 @@ let start_height t height =
 let realign_height t height =
   log_node t.config.my_addr "event = realign_height height = %Ld" height;
   start_height t height
+
 
 let start t =
   t.running <- true;
@@ -1474,6 +1480,7 @@ let start t =
 let stop t =
   t.running <- false;
   Lwt.return_unit
+
 
 let current_height t = t.engine.state.height
 let current_round t = t.engine.state.round

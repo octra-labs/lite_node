@@ -62,12 +62,6 @@ type node_runtime = {
   current_epoch : int ref;
   root_to_raw32 : string -> string;
   raw_to_hex : string -> string;
-  warn_normalize :
-    source:string ->
-    current:int ->
-    committed_head:int ->
-    expected_next:int ->
-    unit;
   last_finality : unit -> Finality_log.entry option;
   cached_head : unit -> Head_manifest.t option;
   finality : Consensus_finality_state.callbacks;
@@ -154,12 +148,12 @@ let arm_empty_replay deps entry plan =
     deps.set_consensus_finalized true;
     deps.normalize_next_epoch_for_head ~source:"startup_empty_finality_replay";
     Log.warn "finality"
-      "startup empty-finality replay armed height = %d round = %d root = %s"
+      "event = startup_empty_finality_replay_armed height = %d round = %d root = %s"
       entry.height entry.round replay.root_short;
     true
   | Proposal_id_mismatch mismatch ->
     Log.warn "finality"
-      "startup empty-finality replay refused height = %d reason = proposal_id_mismatch log = %s computed = %s"
+      "event = startup_empty_finality_replay_refused height = %d reason = proposal_id_mismatch log = %s computed = %s"
       entry.height mismatch.logged mismatch.computed;
     false
   | Not_empty_replayable ->
@@ -167,7 +161,7 @@ let arm_empty_replay deps entry plan =
 
 let handle_pending (deps : deps) head action entry =
   Log.warn "finality"
-    "startup finality log pending height = %d head = %d"
+    "event = startup_finality_log_pending height = %d head = %d"
     entry.Finality_log.height head;
   let replay_plan =
     plan_empty_replay
@@ -188,7 +182,7 @@ let handle_startup (deps : deps) =
     handle_pending deps head action entry
   | Finality_recovery.Gap entry ->
     Log.warn "finality"
-      "startup finality log gap height = %d head = %d"
+      "event = startup_finality_log_gap height = %d head = %d"
       entry.Finality_log.height head;
     deps.mark_quarantine (Finality_recovery.reason ~head action)
 
@@ -197,7 +191,10 @@ let node_normalizer runtime =
     {
       current_epoch = runtime.current_epoch;
       committed_head_epoch = runtime.committed_head_epoch;
-      warn = runtime.warn_normalize;
+      warn = (fun ~source ~current ~committed_head ~expected_next ->
+        Log.warn "catchup"
+          "event = normalize_epoch source = %s current = %d committed_head = %d expected_next = %d"
+          source current committed_head expected_next);
     }
 
 let node_deps runtime =

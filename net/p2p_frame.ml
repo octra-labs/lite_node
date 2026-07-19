@@ -14,6 +14,7 @@ Include at startup:
 
 
 let max_frame_size = 10_000_000
+let default_read_timeout_s = 10.0
 
 let msg_hello = 0x01
 let msg_hello_ack = 0x02
@@ -36,6 +37,62 @@ let msg_catchup_range_response = 0x39
 let msg_query_catchup_range_v2 = 0x3a
 let msg_catchup_range_response_v2 = 0x3b
 let msg_resource_attestation = 0x3c
+
+let control_payload_max = 4 * 1024
+let handshake_payload_max = 64 * 1024
+let peers_payload_max = 512 * 1024
+let tx_payload_max = P2p_tx_gossip.max_tx_json + 4_096
+
+let known_msg_types = [
+  msg_hello;
+  msg_hello_ack;
+  msg_ping;
+  msg_pong;
+  msg_get_peers;
+  msg_peers;
+  msg_tx_gossip;
+  msg_proofcert_gossip;
+  msg_cons_propose;
+  msg_cons_vote;
+  msg_cons_finalize;
+  msg_cons_timeout;
+  msg_query_epoch_root;
+  msg_epoch_root_response;
+  msg_query_bundle;
+  msg_bundle_response;
+  msg_query_catchup_range;
+  msg_catchup_range_response;
+  msg_query_catchup_range_v2;
+  msg_catchup_range_response_v2;
+  msg_resource_attestation;
+]
+
+let known_msg_type n =
+  List.mem n known_msg_types
+
+let max_payload_size msg_type =
+  if msg_type = msg_hello || msg_type = msg_hello_ack then
+    handshake_payload_max
+  else if msg_type = msg_ping
+       || msg_type = msg_pong
+       || msg_type = msg_get_peers then
+    control_payload_max
+  else if msg_type = msg_peers then
+    peers_payload_max
+  else if msg_type = msg_tx_gossip then
+    tx_payload_max
+  else if known_msg_type msg_type then
+    max_frame_size - 1
+  else
+    control_payload_max
+
+let payload_error msg_type payload_len =
+  let max_payload = max_payload_size msg_type in
+  if payload_len <= max_payload then None
+  else
+    Some (Printf.sprintf
+      "frame_payload_too_large type = 0x%02x size = %d max = %d"
+      msg_type payload_len max_payload)
 
 let msg_type_name = function
   | 0x01 -> "HELLO"
@@ -71,6 +128,9 @@ let encode_frame (f : frame) : string =
   let frame_len = 1 + payload_len in
   if frame_len > max_frame_size then
     failwith (Printf.sprintf "frame_too_large size = %d max = %d" frame_len max_frame_size);
+  (match payload_error f.msg_type payload_len with
+   | Some error -> failwith error
+   | None -> ());
   let buf = Bytes.create (4 + frame_len) in
   Bytes.set buf 0 (Char.chr ((frame_len lsr 24) land 0xFF));
   Bytes.set buf 1 (Char.chr ((frame_len lsr 16) land 0xFF));
@@ -80,7 +140,7 @@ let encode_frame (f : frame) : string =
   Bytes.blit_string f.payload 0 buf 5 payload_len;
   Bytes.unsafe_to_string buf
 
-let read_exact fd n =
+let read_exact_raw fd n =
   let buf = Bytes.create n in
   let rec loop off =
     if off >= n then Lwt.return_unit
@@ -106,22 +166,27 @@ let write_all fd s =
   in
   loop 0
 
-let read_frame fd =
-  let open Lwt.Syntax in
-  let* header = read_exact fd 4 in
-  let b0 = Char.code header.[0] in
-  let b1 = Char.code header.[1] in
-  let b2 = Char.code header.[2] in
-  let b3 = Char.code header.[3] in
-  let frame_len = (b0 lsl 24) lor (b1 lsl 16) lor (b2 lsl 8) lor b3 in
-  if frame_len < 1 then Lwt.fail (Failure "empty_frame")
-  else if frame_len > max_frame_size then
-    Lwt.fail (Failure (Printf.sprintf "frame_too_large size = %d" frame_len))
-  else
-    let* data = read_exact fd frame_len in
-    let msg_type = Char.code data.[0] in
-    let payload = if frame_len > 1 then String.sub data 1 (frame_len - 1) else "" in
-    Lwt.return { msg_type; payload }
+let read_frame ?(timeout_s=default_read_timeout_s) fd =
+  Lwt_unix.with_timeout timeout_s (fun () ->
+    let open Lwt.Syntax in
+    let* header = read_exact_raw fd 4 in
+    let b0 = Char.code header.[0] in
+    let b1 = Char.code header.[1] in
+    let b2 = Char.code header.[2] in
+    let b3 = Char.code header.[3] in
+    let frame_len = (b0 lsl 24) lor (b1 lsl 16) lor (b2 lsl 8) lor b3 in
+    if frame_len < 1 then Lwt.fail (Failure "empty_frame")
+    else if frame_len > max_frame_size then
+      Lwt.fail (Failure (Printf.sprintf "frame_too_large size = %d" frame_len))
+    else
+      let* type_data = read_exact_raw fd 1 in
+      let msg_type = Char.code type_data.[0] in
+      let payload_len = frame_len - 1 in
+      match payload_error msg_type payload_len with
+      | Some error -> Lwt.fail (Failure error)
+      | None ->
+        let* payload = read_exact_raw fd payload_len in
+        Lwt.return { msg_type; payload })
 
 let write_frame fd (f : frame) =
   write_all fd (encode_frame f)

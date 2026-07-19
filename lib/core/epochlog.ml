@@ -277,6 +277,7 @@ let read_all t =
 
 let last t = t.tip
 
+
 let current_offset t =
   try Unix.lseek t.fd 0 Unix.SEEK_END
   with _ -> 0
@@ -297,6 +298,7 @@ let offset_after t epoch_id =
 
 let fsync t =
   Unix.fsync t.fd
+
 
 let truncate_to t ~offset =
   Unix.ftruncate t.fd offset;

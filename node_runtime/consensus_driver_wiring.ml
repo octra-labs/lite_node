@@ -115,6 +115,17 @@ type standard_adapters = {
   set_catchup_active : bool -> unit;
 }
 
+type proposal_preview_runtime = {
+  chain_id : string;
+  ready_state_root_at : int -> string option Lwt.t;
+  ready_max_lag : int;
+  warn : string -> unit;
+  run_preview :
+    Consensus_proposal.build_preview_request ->
+    env:Octra_core.Epoch_exec.env ->
+    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+}
+
 type deps = {
   chain_id : string;
   my_addr : string;
@@ -200,6 +211,58 @@ type config_with_standard_input = {
   quarantine_mismatch_threshold : int;
   notify_staging_update : unit -> unit;
   run_preverify : Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t;
+  proposal_bundles : Consensus_bundle_cache.t;
+  store_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Transaction.t list ->
+    receipts_json:string list ->
+    unit;
+  driver_ref : Octra_consensus.C_driver.t option ref;
+  proposal_preview :
+    ?catch_exn:bool ->
+    Consensus_proposal.build_preview_request ->
+    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+  root_to_raw32 : string -> string;
+  current_epoch : unit -> int;
+  current_round : unit -> int;
+  committed_head_epoch : unit -> int;
+  finality : Consensus_finality_state.callbacks;
+  cached_head : unit -> Octra_core.Head_manifest.t option;
+  now : unit -> float;
+  observer_mode : bool;
+  queue_catchup_target : target_epoch:int64 -> reason:string -> unit;
+  run_catchup_to_target :
+    Octra_consensus.C_driver.t ->
+    target_epoch:int64 ->
+    reason:string ->
+    unit Lwt.t;
+  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  replay_stashed_while_safe : source:string -> unit Lwt.t;
+  driver_read_deps : Consensus_driver_read.deps;
+  scheduled_validator_set_config :
+    Octra_consensus.C_driver.scheduled_validator_set_config option;
+  load_scheduled_validator_set_config :
+    unit ->
+    Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+}
+
+type node_driver_config_runtime = {
+  standard : node_standard_adapter_runtime;
+  chain_id : string;
+  my_addr : string;
+  sign_fn : string -> string;
+  validator_set : Octra_consensus.C_types.validator_set;
+  gates : gates;
+  proposal_limits : Consensus_proposal.limits;
+  read_local_root_raw : unit -> string Lwt.t;
+  read_local_ledger_root_raw : unit -> string Lwt.t;
+  sleep : float -> unit Lwt.t;
+  quarantine_mismatch_threshold : int;
+  notify_staging_update : unit -> unit;
+  run_preverify :
+    Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->
@@ -360,6 +423,26 @@ let preview_with_optional_catch ~catch_exn ~warn run =
   else
     run ()
 
+let node_proposal_preview
+    (runtime : proposal_preview_runtime)
+    ?(catch_exn = false)
+    (request : Consensus_proposal.build_preview_request) =
+  let run () =
+    let env =
+      Consensus_proposal.epoch_exec_env
+        ~chain_id:runtime.chain_id
+        ~epoch_id:request.epoch_id
+        ~epoch_ts:request.epoch_ts
+        ~proposer:request.proposer
+        ~validator_pubkeys:request.validator_pubkeys
+        ~prev_state_root:request.prev_state_root
+        ~ready_state_root_at:runtime.ready_state_root_at
+        ~ready_max_lag:runtime.ready_max_lag
+    in
+    runtime.run_preview request ~env
+  in
+  preview_with_optional_catch ~catch_exn ~warn:runtime.warn run
+
 let layera_hash_validators =
   Octra_net.Hash_domain.hash "octra:validators:v1"
 
@@ -417,6 +500,10 @@ let cached_proposal_bundle (deps : deps) ~proposal_id =
 
 let verify_proposal_deps (deps : deps) =
   Consensus_proposal.{
+    now = deps.now;
+    previous_epoch_ts = (fun epoch ->
+      deps.finality.find_finalized (Int64.to_int epoch)
+      |> Option.map (fun finalize -> finalize.Octra_consensus.C_types.header.ts));
     quarantine_active = deps.gates.quarantine_active;
     quarantine_reason = deps.gates.quarantine_reason;
     mark_quarantine = deps.gates.mark_quarantine;
@@ -641,4 +728,44 @@ let config_with_standard (input : config_with_standard_input) =
       scheduled_validator_set_config = input.scheduled_validator_set_config;
       load_scheduled_validator_set_config =
         input.load_scheduled_validator_set_config;
+    }
+
+let node_driver_config (runtime : node_driver_config_runtime) =
+  config_with_standard
+    {
+      standard = node_standard_adapters runtime.standard;
+      chain_id = runtime.chain_id;
+      my_addr = runtime.my_addr;
+      sign_fn = runtime.sign_fn;
+      validator_set = runtime.validator_set;
+      gates = runtime.gates;
+      proposal_limits = runtime.proposal_limits;
+      read_local_root_raw = runtime.read_local_root_raw;
+      read_local_ledger_root_raw = runtime.read_local_ledger_root_raw;
+      sleep = runtime.sleep;
+      quarantine_mismatch_threshold =
+        runtime.quarantine_mismatch_threshold;
+      notify_staging_update = runtime.notify_staging_update;
+      run_preverify = runtime.run_preverify;
+      proposal_bundles = runtime.proposal_bundles;
+      store_bundle = runtime.store_bundle;
+      driver_ref = runtime.driver_ref;
+      proposal_preview = runtime.proposal_preview;
+      root_to_raw32 = runtime.root_to_raw32;
+      current_epoch = runtime.current_epoch;
+      current_round = runtime.current_round;
+      committed_head_epoch = runtime.committed_head_epoch;
+      finality = runtime.finality;
+      cached_head = runtime.cached_head;
+      now = runtime.now;
+      observer_mode = runtime.observer_mode;
+      queue_catchup_target = runtime.queue_catchup_target;
+      run_catchup_to_target = runtime.run_catchup_to_target;
+      apply_finalized = runtime.apply_finalized;
+      replay_stashed_while_safe = runtime.replay_stashed_while_safe;
+      driver_read_deps = runtime.driver_read_deps;
+      scheduled_validator_set_config =
+        runtime.scheduled_validator_set_config;
+      load_scheduled_validator_set_config =
+        runtime.load_scheduled_validator_set_config;
     }

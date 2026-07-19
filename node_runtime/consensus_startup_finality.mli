@@ -58,12 +58,6 @@ type node_runtime = {
   current_epoch : int ref;
   root_to_raw32 : string -> string;
   raw_to_hex : string -> string;
-  warn_normalize :
-    source:string ->
-    current:int ->
-    committed_head:int ->
-    expected_next:int ->
-    unit;
   last_finality : unit -> Finality_log.entry option;
   cached_head : unit -> Head_manifest.t option;
   finality : Consensus_finality_state.callbacks;

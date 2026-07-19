@@ -442,14 +442,6 @@ let legacy_public_replay_amount = function
   | Some replay -> Error replay.reason
   | None -> Error "legacy public migration requires node public-history replay"
 
-let legacy_audit_allows_witness = function
-  | Some replay ->
-    (match replay.Pvac_legacy_public_replay.audit_class with
-    | Pvac_legacy_public_replay.Poisoned -> Error replay.reason
-    | Public_clean
-    | Hidden_witness -> Ok ())
-  | None -> Error "legacy ciphertext migration requires node history audit"
-
 let legacy_audit_commitment = function
   | Some replay ->
     (match replay.Pvac_legacy_public_replay.audit_class, replay.commitment_net with
@@ -467,42 +459,6 @@ let verify_legacy_public_migration new_loaded amount payload =
     | _ -> Error "new encrypted balance must be v3 key-bound")
   | _ ->
     Error "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
-
-let legacy_ct_old_pubkey_blob old_blob payload =
-  let candidate =
-    match payload.old_bound_pubkey_b64 with
-    | None -> Ok old_blob
-    | Some encoded ->
-      (match PR.decode_b64 encoded with
-      | Error e -> Error e
-      | Ok raw -> PR.canonicalize_blob raw)
-  in
-  match candidate with
-  | Error e -> Error ("old bound pubkey decode failed: " ^ e)
-  | Ok bound_blob ->
-    (match FB.pubkey_is_key_bound_extension old_blob bound_blob with
-    | Error e -> Error ("old bound pubkey extension check failed: " ^ e)
-    | Ok false -> Error "old bound pubkey is not an extension of the registered key"
-    | Ok true -> Ok bound_blob)
-
-let verify_legacy_ct_migration old_loaded new_loaded current_cipher payload =
-  match payload.old_bound_cipher, payload.new_cipher, payload.old_zero_proof, payload.new_zero_proof, payload.amount_commitment with
-  | Some old_bound_cipher, Some new_cipher, Some old_zero_proof, Some new_zero_proof, Some amount_commitment ->
-    (match FB.cipher_is_key_bound_extension current_cipher old_bound_cipher with
-    | Error e -> Error ("old bound cipher extension check failed: " ^ e)
-    | Ok false -> Error "old bound cipher is not an extension of the ledger cipher"
-    | Ok true ->
-      (match PM.classify_cipher old_bound_cipher, PM.classify_cipher new_cipher with
-      | PM.V3, PM.V3 ->
-        (match FB.verify_claim_amount_v5 old_loaded old_bound_cipher old_zero_proof amount_commitment with
-        | Error e -> Error ("old encrypted balance proof failed: " ^ e)
-        | Ok () ->
-          (match FB.verify_claim_amount_v5 new_loaded new_cipher new_zero_proof amount_commitment with
-          | Error e -> Error ("new encrypted balance proof failed: " ^ e)
-          | Ok () -> Ok ()))
-      | _ -> Error "legacy ciphertext migration requires key-bound old and new ciphers"))
-  | _ ->
-    Error "legacy ciphertext migration requires old_bound_cipher, new_cipher, old_zero_proof, new_zero_proof and amount_commitment"
 
 let verify_legacy_commitment_migration new_loaded commitment payload =
   match payload.new_cipher, payload.new_zero_proof with
@@ -559,25 +515,9 @@ let key_switch_plan ?legacy_public_replay ledger tx =
                       | Some new_cipher -> Lwt.return (Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher = Some new_cipher })
                       | None -> Lwt.return (error "key_switch_rejected" "legacy commitment migration lost new cipher"))))
               else if payload.legacy_ct_migration then
-                (match legacy_audit_allows_witness legacy_public_replay with
-                | Error e -> Lwt.return (error "key_switch_rejected" e)
-                | Ok () ->
-                (match old_pk with
-                | None -> Lwt.return (error "key_switch_rejected" "legacy ciphertext migration requires old registered pvac key")
-                | Some old_blob ->
-                  (match legacy_ct_old_pubkey_blob old_blob payload with
-                  | Error e -> Lwt.return (error "key_switch_rejected" e)
-                  | Ok old_bound_blob ->
-                  (match FB.load_pubkey_result old_bound_blob, FB.load_pubkey_result new_pubkey with
-                  | Ok old_loaded, Ok new_loaded ->
-                    (match verify_legacy_ct_migration old_loaded new_loaded current_cipher payload with
-                    | Error e -> Lwt.return (error "key_switch_rejected" ("legacy ciphertext migration failed: " ^ e))
-                    | Ok () ->
-                      (match payload.new_cipher with
-                      | Some new_cipher -> Lwt.return (Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher = Some new_cipher })
-                      | None -> Lwt.return (error "key_switch_rejected" "legacy ciphertext migration lost new cipher")))
-                  | Error e, _ -> Lwt.return (error "key_switch_rejected" ("old pubkey decode failed: " ^ e))
-                  | _, Error e -> Lwt.return (error "key_switch_rejected" ("new pubkey decode failed: " ^ e))))))
+                Lwt.return
+                  (error "key_switch_rejected"
+                    "legacy ciphertext rebinding is not statement preserving; use public or commitment history migration")
               else if payload.legacy_public_migration then
                 match legacy_public_replay_amount legacy_public_replay with
                 | Error e -> Lwt.return (error "key_switch_rejected" e)

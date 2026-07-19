@@ -714,3 +714,6 @@ let run_configured_node_catchup (deps : node_runtime_deps) =
   | None -> Lwt.return_unit
   | Some base ->
     run_node_catchup (node_deps_of_runtime deps) base
+
+let run_configured_node_wiring deps =
+  run_configured_node_catchup (node_runtime_deps deps)

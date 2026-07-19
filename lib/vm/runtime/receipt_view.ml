@@ -23,7 +23,7 @@ let call_arg_json = function
   | Contract_vm.VAddr a -> `String a
   | Contract_vm.VBytes b -> `String (Base64.encode_exn b)
   | Contract_vm.VBytes32 b -> `String (Base64.encode_exn b)
-  | Contract_vm.VU64 n -> `String (Int64.to_string n)
+  | Contract_vm.VU64 z -> `String (Z.to_string z)
   | Contract_vm.VU128 z -> `String (Z.to_string z)
   | Contract_vm.VU256 z -> `String (Z.to_string z)
   | v -> `String (Contract_vm.to_string v)
@@ -41,7 +41,7 @@ let result_json = function
   | Contract_vm.VAddr a -> `String a
   | Contract_vm.VBytes b -> `String (Base64.encode_exn b)
   | Contract_vm.VBytes32 b -> `String (Base64.encode_exn b)
-  | Contract_vm.VU64 n -> `String (Int64.to_string n)
+  | Contract_vm.VU64 z -> `String (Z.to_string z)
   | Contract_vm.VU128 z -> `String (Z.to_string z)
   | Contract_vm.VU256 z -> `String (Z.to_string z)
   | Contract_vm.VCipher _ -> `String "<cipher>"

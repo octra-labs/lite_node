@@ -27,10 +27,12 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     ?(expected_prev_root : string option) f =
   let branch_name = preview_branch_name ~epoch_id ~proposal_id in
 
+
   let* head_opt = Store_irmin.Store.Head.find base_store.store in
   match head_opt with
   | None -> Lwt.return (Error "no head commit for preview")
   | Some head_commit ->
+
 
   let head_tree = Store_irmin.Store.Commit.tree head_commit in
   let head_hash = Irmin.Type.to_string Store_irmin.Store.Hash.t
@@ -54,9 +56,12 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     Lwt.return (Error (Printf.sprintf "preview race: HEAD moved (head=%s)" (String.sub head_hash 0 16)))
   else
 
+
   let* () = Store_irmin.Store.Branch.set base_store.repo branch_name head_commit in
 
+
   let* preview_store = Store_irmin.Store.of_branch base_store.repo branch_name in
+
 
   let preview_t = {
     Store_irmin.repo = base_store.repo;
@@ -66,7 +71,9 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     pvac_dir = base_store.pvac_dir;
   } in
 
+
   let preview_ledger = Ledger.create preview_t in
+
 
   let backend = Epoch_exec.{
     store = preview_t;
@@ -79,12 +86,14 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     set_meta = (fun k v -> Store_irmin.set_meta preview_t k v);
   } in
 
+
   Lwt.finalize
     (fun () -> f backend)
     (fun () ->
 
       let* () = Store_irmin.Store.Branch.remove base_store.repo branch_name in
       Lwt.return_unit)
+
 
 let cleanup_stale_previews ~(base_store : Store_irmin.t) =
   let* branches = Store_irmin.Store.Branch.list base_store.repo in

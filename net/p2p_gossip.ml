@@ -18,6 +18,7 @@ type topic = Tx | ProofCert | Consensus
 let topic_to_u8 = function Tx -> 1 | ProofCert -> 2 | Consensus -> 3
 let topic_of_u8 = function 1 -> Tx | 2 -> ProofCert | 3 -> Consensus | _ -> failwith "bad topic"
 
+
 let seen : (string, float) Hashtbl.t = Hashtbl.create 4096
 let seen_max = 10000
 let seen_ttl = 300.0
@@ -53,6 +54,7 @@ let create swarm = { swarm; handlers = [] }
 let on_message t handler =
   t.handlers <- handler :: t.handlers
 
+
 let publish t topic payload =
   let id = msg_id topic payload in
   if is_seen id then Lwt.return_unit
@@ -65,6 +67,7 @@ let publish t topic payload =
     in
     P2p_swarm.broadcast t.swarm { msg_type; payload }
   end
+
 
 let handle_incoming t ~from_peer topic payload =
   let open Lwt.Syntax in

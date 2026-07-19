@@ -20,6 +20,8 @@ module Store_chaindata = Octra_core.Store_chaindata
 
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
+let view_effort_limit = 10_000_000
+
 let ok_lwt value =
   Lwt.return (Ok value)
 
@@ -136,11 +138,14 @@ let compile_assembly_response ~bytecode_b64 ~bytecode_size ~instructions =
 let compile_result_response (result : Oct_compile.compile_result) =
   let bytecode_b64 = Base64.encode_exn result.bytecode in
   let disasm =
-    try
-      let code = Bytecode.decode_exn result.bytecode in
-      Assembler.emit code
-    with _ ->
-      ""
+    match Admission.decode result.bytecode with
+    | Ok admitted -> Assembler.emit (Admission.code admitted)
+    | Error _ -> ""
+  in
+  let envelope =
+    match result.program_envelope with
+    | None -> []
+    | Some raw -> ["program_envelope", `String (Base64.encode_exn raw)]
   in
   `Assoc ([
     "bytecode", `String bytecode_b64;
@@ -149,35 +154,22 @@ let compile_result_response (result : Oct_compile.compile_result) =
     "abi", `String result.abi_json;
     "version", `String result.version;
     "disasm", `String disasm;
-  ] @ parse_optional_json result.verification_json
+  ] @ envelope @ parse_optional_json result.verification_json
     @ parse_certificate_json result.certificate_json)
-
-let verifier_error = function
-  | Contract_vm.Verifier.InvalidReg (pc, reg) ->
-    Printf.sprintf "invalid register r%d at pc %d" reg pc
-  | Contract_vm.Verifier.InvalidJumpDest dest ->
-    Printf.sprintf "invalid jump destination %d" dest
-  | Contract_vm.Verifier.DuplicateJDest name ->
-    Printf.sprintf "duplicate JDEST %d" name
-  | Contract_vm.Verifier.CodeTooLarge size ->
-    Printf.sprintf "code too large: %d instructions" size
-  | Contract_vm.Verifier.EmptyCode ->
-    "empty code"
-  | Contract_vm.Verifier.ReservedKey (pc, _) ->
-    Printf.sprintf "write to reserved key at pc %d" pc
 
 let compile_assembly ~source =
   try
     let instrs = Assembler.parse source in
-    match Contract_vm.Verifier.verify instrs with
-    | Error err ->
-      err_lwt (Rpc.err (-32000) (verifier_error err) None)
-    | Ok () ->
-      let bytecode_raw = Bytecode.encode instrs in
+    match Admission.of_code instrs with
+    | Error error ->
+      err_lwt (Rpc.err (-32000) (Admission.error_message error) None)
+    | Ok admitted ->
+      let code = Admission.code admitted in
+      let bytecode_raw = Bytecode.encode code in
       ok_lwt (compile_assembly_response
         ~bytecode_b64:(Base64.encode_exn bytecode_raw)
         ~bytecode_size:(String.length bytecode_raw)
-        ~instructions:(Array.length instrs))
+        ~instructions:(Array.length code))
   with exn ->
     err_lwt (Rpc.err (-32000)
       (Printf.sprintf "compile error: %s" (Printexc.to_string exn)) None)
@@ -240,14 +232,31 @@ let compile_aml_multi ~json =
       | _ ->
         "main.aml"
     in
-    let file_map = compile_file_map files_json in
-    let resolver path = Hashtbl.find_opt file_map path in
-    let result = Oct_compile.compile_multi resolver main_path in
-    match result.error with
-    | Some msg ->
-      err_lwt (Rpc.err (-32000) msg None)
-    | None ->
-      ok_lwt (compile_result_response result)
+    let program_only =
+      match obj with
+      | `Assoc fields ->
+        (match List.assoc_opt "program" fields with
+         | None -> Ok false
+         | Some (`Bool value) -> Ok value
+         | Some _ -> Error "program must be boolean")
+      | _ -> Error "expected object"
+    in
+    match program_only with
+    | Error msg -> err_lwt (Rpc.invalid_params msg)
+    | Ok program_only ->
+      let file_map = compile_file_map files_json in
+      let resolver path = Hashtbl.find_opt file_map path in
+      let result =
+        if program_only then
+          Oct_compile.compile_program_multi resolver main_path
+        else
+          Oct_compile.compile_multi resolver main_path
+      in
+      match result.error with
+      | Some msg ->
+        err_lwt (Rpc.err (-32000) msg None)
+      | None ->
+        ok_lwt (compile_result_response result)
 
 let compile_aml_params params =
   match Rpc.require_string params 0 "source" with
@@ -725,7 +734,7 @@ let make_view_ctx ~store ~ledger ~current_epoch ~get_fhe_pubkey =
         Contract.execute_view_call
           ~ctx:view_ctx
           ~depth
-          ~limit:2_000_000_000
+          ~limit:view_effort_limit
           store
           target
           method_name
@@ -780,6 +789,7 @@ let call ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
     let result =
       Contract.execute_view_call
         ~ctx:view_ctx
+        ~limit:view_effort_limit
         store
         addr
         method_name

@@ -113,12 +113,14 @@ let read_ident lx =
   in go ()
 
 let keyword_map = [
-  "contract", TkContract; "state", TkState; "event", TkEvent;
+  "program", TkProgram;
+  "contract", TkContract;
+  "state", TkState; "event", TkEvent;
   "constructor", TkConstructor; "fn", TkFn; "view", TkView; "pure", TkPure;
   "let", TkLet; "return", TkReturn; "assert", TkAssert;
   "emit", TkEmit; "if", TkIf; "else", TkElse; "while", TkWhile;
   "self", TkSelf; "caller", TkCaller; "origin", TkOrigin;
-  "epoch", TkEpoch; "value", TkValue; "balance", TkBalance;
+  "epoch", TkEpoch; "epoch_time", TkEpochTime; "value", TkValue; "balance", TkBalance;
   "true", TkTrue; "false", TkFalse;
   "int", TkTyInt; "bool", TkTyBool; "string", TkTyString;
   "address", TkTyAddress; "bytes", TkTyBytes; "bytes32", TkTyBytes32;

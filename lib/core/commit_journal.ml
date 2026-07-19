@@ -89,6 +89,7 @@ let mk_commit_id epoch_id =
     (int_of_float (Unix.gettimeofday () *. 1000.))
     (Random.bits ())
 
+
 let append data_dir rec_ =
   let p = path data_dir in
   let oc = open_out_gen [Open_append; Open_creat; Open_binary] 0o644 p in
@@ -97,6 +98,7 @@ let append data_dir rec_ =
   flush oc;
   (try Unix.fsync (Unix.descr_of_out_channel oc) with _ -> ());
   close_out oc
+
 
 let read_all data_dir =
   let p = path data_dir in
@@ -126,6 +128,7 @@ let last_commit_id_for_epoch journal epoch_id =
     | _ -> ()
   ) journal;
   !last
+
 
 let pending_prepares ?head_commit_id journal =
   let committed = Hashtbl.create 16 in

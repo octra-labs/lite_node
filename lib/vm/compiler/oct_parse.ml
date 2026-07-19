@@ -31,6 +31,7 @@ let expect_ident ts =
   | TkIdent s -> eat ts; s
   | TkValue -> eat ts; "value"
   | TkEpoch -> eat ts; "epoch"
+  | TkEpochTime -> eat ts; "epoch_time"
   | TkBalance -> eat ts; "balance"
   | _ -> perr ts "expected identifier"
 
@@ -171,6 +172,7 @@ and parse_primary ts =
   | TkCaller -> eat ts; ECaller
   | TkOrigin -> eat ts; EOrigin
   | TkEpoch -> eat ts; EEpoch
+  | TkEpochTime -> eat ts; EEpochTime
   | TkValue -> eat ts; EValue
   | TkTreeHash -> eat ts; ETreeHash
   | TkNodeId -> eat ts; ENodeId
@@ -785,12 +787,19 @@ let parse_contract ts =
 
   match peek_token ts with
   | TkEOF ->
-    { name = ""; imports = List.rev !imports;
+    { declaration = InterfaceDecl; name = ""; imports = List.rev !imports;
       structs = []; enums = []; consts = []; invariants_decl = []; state = [];
       events = []; errors = []; interfaces = List.rev !ifaces;
       implements = []; ctor = None; funcs = [] }
   | _ ->
-  expect ts TkContract;
+  let declaration =
+    match peek_token ts with
+    | TkProgram -> eat ts; ProgramDecl
+    | TkIdent "Program" -> eat ts; ProgramDecl
+    | TkContract -> eat ts; ContractDecl
+    | TkIdent "Contract" -> eat ts; ContractDecl
+    | _ -> perr ts "expected program or contract"
+  in
   let name = expect_ident ts in
   let impls = match peek_token ts with
     | TkImplements -> parse_implements ts
@@ -846,7 +855,8 @@ let parse_contract ts =
     | _ -> perr ts "expected struct, enum, const, state, event, constructor, fn, or }"
   in
   go ();
-  { name;
+  { declaration;
+    name;
     imports = List.rev !imports;
     structs = List.rev !structs;
     enums = List.rev !enums;

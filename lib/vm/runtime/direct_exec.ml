@@ -67,6 +67,9 @@ let run spec io =
         | Call_plan.Direct_exec_invalid_format) as rejected ->
         io.reject (Call_plan.direct_exec_reject spec.reject_domain rejected))
     (fun exn ->
-      io.crash
-        (Receipt_view.direct_call_meta spec.domain)
-        (Printexc.to_string exn))
+      match exn with
+      | Tx_effects.Commit_failed _ -> Lwt.fail exn
+      | _ ->
+        io.crash
+          (Receipt_view.direct_call_meta spec.domain)
+          (Printexc.to_string exn))

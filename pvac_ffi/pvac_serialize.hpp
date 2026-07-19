@@ -28,6 +28,7 @@ static constexpr uint8_t MAGIC[4] = {'P', 'V', 'A', 'C'};
 static constexpr uint8_t VERSION_V1 = 0x01;
 static constexpr uint8_t VERSION_V2 = 0x02;
 static constexpr uint8_t VERSION_V3 = 0x03;
+static constexpr uint8_t VERSION_V4 = 0x04;
 static constexpr uint8_t VERSION = VERSION_V3;
 static constexpr uint8_t TAG_CIPHER = 0;
 static constexpr uint8_t TAG_PUBKEY = 1;
@@ -93,11 +94,13 @@ struct Writer {
         for (auto w : bv.w) u64(w);
     }
 
-    void header(uint8_t tag) {
+    void header_version(uint8_t tag, uint8_t version) {
         raw(MAGIC, 4);
-        u8(VERSION);
+        u8(version);
         u8(tag);
     }
+
+    void header(uint8_t tag) { header_version(tag, VERSION); }
 };
 
 struct Reader {
@@ -220,7 +223,7 @@ struct Reader {
         if (std::memcmp(m, MAGIC, 4) != 0) { fail("pvac_ser: bad magic"); return 0; }
         uint8_t ver = u8();
         if (failed) return 0;
-        if (ver != VERSION_V1 && ver != VERSION_V2 && ver != VERSION_V3) { fail("pvac_ser: bad version"); return 0; }
+        if (ver != VERSION_V1 && ver != VERSION_V2 && ver != VERSION_V3 && ver != VERSION_V4) { fail("pvac_ser: bad version"); return 0; }
         uint8_t tag = u8();
         if (failed) return 0;
         if (tag != expected_tag) { fail("pvac_ser: wrong type tag"); return 0; }
@@ -339,7 +342,27 @@ inline void write_layer(Writer& w, const pvac::Layer& L) {
         w.raw(pc.data(), 32);
 }
 
-inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2) {
+inline void write_layer_public(Writer& w, const pvac::Layer& L) {
+    w.u8(static_cast<uint8_t>(L.rule));
+    if (L.rule == pvac::RRule::BASE) {
+        w.u64(L.seed.ztag);
+        w.u64(L.seed.nonce.lo);
+        w.u64(L.seed.nonce.hi);
+    } else {
+        w.u32(L.pa);
+        w.u32(L.pb);
+    }
+}
+
+inline void mark_public_base_layer(pvac::Layer& L, size_t slots) {
+    if (L.rule == pvac::RRule::BASE) {
+        L.R_com = {};
+        L.R_PC.assign(slots, {});
+        L.PC.clear();
+    }
+}
+
+inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2, size_t slots = 0) {
     pvac::Layer L{};
     L.rule = static_cast<pvac::RRule>(r.u8());
     if (L.rule == pvac::RRule::BASE) {
@@ -351,9 +374,10 @@ inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2) {
         L.pb = r.u32();
     }
 
-    r.raw(L.R_com.data(), 32);
+    if (ver < VERSION_V4)
+        r.raw(L.R_com.data(), 32);
 
-    if (ver >= VERSION_V3) {
+    if (ver >= VERSION_V3 && ver < VERSION_V4) {
         size_t nRPC = r.u64();
         r.check_count(nRPC, 32);
         if (r.failed) return L;
@@ -362,7 +386,7 @@ inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2) {
             L.R_PC[i] = r.rist_point();
     }
 
-    if (ver >= VERSION_V2) {
+    if (ver >= VERSION_V2 && ver < VERSION_V4) {
         size_t nPC = r.u64();
         r.check_count(nPC, 32);
         if (r.failed) return L;
@@ -370,6 +394,9 @@ inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2) {
         for (size_t i = 0; i < nPC; i++)
             L.PC[i] = r.rist_point();
     }
+
+    if (ver >= VERSION_V4)
+        mark_public_base_layer(L, slots);
 
     return L;
 }
@@ -411,6 +438,20 @@ inline std::vector<uint8_t> serialize_cipher(const pvac::Cipher& C) {
     return std::move(w.buf);
 }
 
+inline std::vector<uint8_t> serialize_cipher_public(const pvac::Cipher& C) {
+    validate_cipher_structure(C);
+    Writer w;
+    w.header_version(TAG_CIPHER, VERSION_V4);
+    w.u64(C.slots);
+    w.u64(C.L.size());
+    for (const auto& L : C.L) write_layer_public(w, L);
+    w.u64(C.c0.size());
+    for (const auto& x : C.c0) w.fp(x);
+    w.u64(C.E.size());
+    for (const auto& e : C.E) write_edge(w, e);
+    return std::move(w.buf);
+}
+
 inline pvac::Cipher deserialize_cipher(const uint8_t* data, size_t len) {
     Reader r(data, len);
     uint8_t ver = r.header(TAG_CIPHER);
@@ -420,7 +461,7 @@ inline pvac::Cipher deserialize_cipher(const uint8_t* data, size_t len) {
     r.check_count(nL, 8);
     if (!r.failed) {
         C.L.resize(nL);
-        for (size_t i = 0; i < nL; ++i) C.L[i] = read_layer(r, ver);
+        for (size_t i = 0; i < nL; ++i) C.L[i] = read_layer(r, ver, C.slots);
     }
     size_t nc = r.u64();
     r.check_count(nc, 16);
@@ -435,6 +476,7 @@ inline pvac::Cipher deserialize_cipher(const uint8_t* data, size_t len) {
         for (size_t i = 0; i < nE; ++i) C.E[i] = read_edge(r);
     }
     if (r.failed) throw std::runtime_error(r.error);
+    if (r.remaining() != 0) throw std::runtime_error("pvac_ser: trailing cipher bytes");
     validate_cipher_structure(C);
     return C;
 }
@@ -668,7 +710,7 @@ inline pvac::Cipher read_cipher_raw(Reader& r, uint8_t ver = VERSION_V2) {
     r.check_count(nL, 8);
     if (!r.failed) {
         C.L.resize(nL);
-        for (size_t i = 0; i < nL; ++i) C.L[i] = read_layer(r, ver);
+        for (size_t i = 0; i < nL; ++i) C.L[i] = read_layer(r, ver, C.slots);
     }
     size_t nc = r.u64();
     r.check_count(nc, 16);
@@ -780,6 +822,8 @@ inline pvac::AggregatedRangeProof deserialize_agg_range_proof(const uint8_t* dat
     if (r.failed) throw std::runtime_error(r.error);
     return arp;
 }
+
+
 
 enum RangeProofFormat { RP_OLD = 0, RP_AGGREGATED = 1, RP_BOUND = 2 };
 

@@ -30,8 +30,13 @@ type descriptor = {
   methods : method_info list;
 }
 
+type octb = {
+  bytecode : Octra_vm.Contract_vm.instr array;
+  profile : Octra_vm.Admission.profile;
+}
+
 type code =
-  | Octb of Octra_vm.Contract_vm.instr array
+  | Octb of octb
   | Wasm_v1 of {
       code_b64 : string;
       code_raw : string;
@@ -71,11 +76,31 @@ let prune_loaded_cache () =
   if Hashtbl.length loaded_cache > loaded_cache_limit then
     Hashtbl.reset loaded_cache
 
-let decode_bytecode code_b64 =
+let decode_bytecode ?(trusted = []) code_b64 =
   try
-    match Octra_vm.Bytecode.decode (Base64.decode_exn code_b64) with
-    | Ok bytecode -> Ok bytecode
-    | Error e -> Error e
+    match Octra_vm.Admission.decode_deploy ~trusted (Base64.decode_exn code_b64) with
+    | Ok admitted ->
+      Ok {
+        bytecode = Octra_vm.Admission.code admitted;
+        profile = Octra_vm.Admission.profile admitted;
+      }
+    | Error e -> Error (Octra_vm.Admission.error_message e)
+  with e ->
+    Error (Printexc.to_string e)
+
+let decode_descriptor_bytecode code_b64 =
+  try
+    let raw = Base64.decode_exn code_b64 in
+    if Octra_vm.Program_envelope.is_program raw then
+      match Octra_vm.Admission.decode_program_source raw with
+      | Ok admitted ->
+        Ok {
+          bytecode = Octra_vm.Admission.code admitted;
+          profile = Octra_vm.Admission.profile admitted;
+        }
+      | Error e -> Error (Octra_vm.Admission.error_message e)
+    else
+      decode_bytecode code_b64
   with e ->
     Error (Printexc.to_string e)
 
@@ -179,8 +204,8 @@ let describe store circle_id =
               match info.runtime with
               | Octra_core.Circles.Octb ->
                 begin
-                  match decode_bytecode code_b64 with
-                  | Ok bytecode ->
+                  match decode_descriptor_bytecode code_b64 with
+                  | Ok admitted ->
                     Lwt.return (Ok {
                       circle_id;
                       info;
@@ -188,7 +213,7 @@ let describe store circle_id =
                       code_hash = info.code_hash;
                       code_b64 = None;
                       code_bytes = String.length raw_code;
-                      methods = methods_of_bytecode bytecode;
+                      methods = methods_of_bytecode admitted.bytecode;
                     })
                   | Error e ->
                     Lwt.return (Error ("invalid circle bytecode: " ^ e))
@@ -216,7 +241,7 @@ let describe store circle_id =
         end
     end
 
-let load store circle_id =
+let load ?(trusted = []) store circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
   | None -> Lwt.return (Error "circle not found")
@@ -243,12 +268,12 @@ let load store circle_id =
               match info.runtime with
               | Octra_core.Circles.Octb ->
                 begin
-                  match decode_bytecode code_b64 with
-                  | Ok bytecode ->
+                  match decode_bytecode ~trusted code_b64 with
+                  | Ok admitted ->
                     Lwt.return (Ok {
                       circle_id;
                       info;
-                      code = Octb bytecode;
+                      code = Octb admitted;
                     })
                   | Error e ->
                     Lwt.return (Error ("invalid circle bytecode: " ^ e))

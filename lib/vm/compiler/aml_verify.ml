@@ -117,6 +117,7 @@ let rec expr_to_string = function
   | EOrigin -> "origin"
   | ESelfAddr -> "self_addr"
   | EEpoch -> "epoch"
+  | EEpochTime -> "epoch_time"
   | EValue -> "value"
   | EBalance value -> "balance(" ^ expr_to_string value ^ ")"
   | ETreeHash -> "tree_hash"
@@ -240,7 +241,7 @@ let rec expr_mentions name = function
     expr_mentions name cond || expr_mentions name yes_value || expr_mentions name no_value
   | EField value -> value = name
   | EBalance value -> expr_mentions name value
-  | EInt _ | EBool _ | EString _ | ECaller | EOrigin | ESelfAddr | EEpoch | EValue
+  | EInt _ | EBool _ | EString _ | ECaller | EOrigin | ESelfAddr | EEpoch | EEpochTime | EValue
   | ETreeHash | ENodeId | ETxHash | EEnumVariant _ -> false
 
 let rec expr_is_positive_guard name = function
@@ -308,7 +309,7 @@ let rec expr_typ fields env = function
   | EString _ -> Some TString
   | ECaller | EOrigin | ESelfAddr -> Some TAddress
   | EValue -> Some TU128
-  | EArray _ | ETuple _ | ECall _ | EUnop (Not, _) | EBalance _ | EEpoch
+  | EArray _ | ETuple _ | ECall _ | EUnop (Not, _) | EBalance _ | EEpoch | EEpochTime
   | ETreeHash | ENodeId | ETxHash | EEnumVariant _ -> None
 
 let rec expr_signed_source fields env = function
@@ -347,7 +348,7 @@ let rec expr_signed_source fields env = function
   | ECall (_, args) | EArray args | ETuple args -> first_signed_source fields env args
   | ETernary (cond, yes_value, no_value) ->
     first_signed_source fields env [cond; yes_value; no_value]
-  | EInt _ | EBool _ | EString _ | ECaller | EOrigin | ESelfAddr | EEpoch | EValue
+  | EInt _ | EBool _ | EString _ | ECaller | EOrigin | ESelfAddr | EEpoch | EEpochTime | EValue
   | ETreeHash | ENodeId | ETxHash | EEnumVariant _ -> None
 
 and first_signed_source fields env values =
@@ -419,7 +420,7 @@ let rec expr_has_unproven_unsigned_arithmetic fields env body = function
   | ETernary (cond, yes_value, no_value) ->
     List.exists (expr_has_unproven_unsigned_arithmetic fields env body) [cond; yes_value; no_value]
   | EInt _ | EBool _ | EString _ | EVar _ | EField _ | ECaller | EOrigin | ESelfAddr
-  | EEpoch | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _ | EEnumVariant _ -> false
+  | EEpoch | EEpochTime | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _ | EEnumVariant _ -> false
 
 let visibility_to_string = function
   | Public -> "public"
@@ -438,7 +439,7 @@ let rec expr_calls = function
   | EStoragePath (_, indexes, _) | EIndexField (_, indexes, _) -> List.concat_map expr_calls indexes
   | ETernary (cond, yes_value, no_value) -> expr_calls cond @ expr_calls yes_value @ expr_calls no_value
   | EInt _ | EBool _ | EString _ | EVar _ | EField _ | ECaller | EOrigin | ESelfAddr
-  | EEpoch | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _ | EEnumVariant _ -> []
+  | EEpoch | EEpochTime | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _ | EEnumVariant _ -> []
 
 let rec stmt_direct_calls = function
   | SLet (_, _, expr) | SAssign (_, expr) | SFieldSet (_, expr)

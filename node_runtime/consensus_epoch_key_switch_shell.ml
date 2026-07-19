@@ -48,6 +48,34 @@ type tx_deps = {
   confirm : unit -> unit Lwt.t;
 }
 
+type live_tx_args = {
+  gate : unit -> Private_gate.reject option;
+  needs_legacy_audit : Transaction.t -> bool;
+  legacy_replay : string -> Octra_core.Pvac_legacy_public_replay.decision;
+  apply_tx :
+    ?legacy_public_replay:Octra_core.Pvac_legacy_public_replay.decision ->
+    Transaction.t ->
+    Private_ledger.key_switch_outcome Lwt.t;
+  reject_gate : Private_gate.reject -> unit Lwt.t;
+  record_rejected : Transaction.t -> string -> string -> unit;
+  continue_after_reject : consume_nonce:bool -> unit Lwt.t;
+  short_addr : string -> string;
+  incr_fhe : unit -> unit;
+  confirm : unit -> unit Lwt.t;
+}
+
+type live_ledger_tx_args = {
+  ledger : Octra_core.Ledger.t;
+  chaindata : Octra_core.Store_chaindata.t;
+  gate : unit -> Private_gate.reject option;
+  reject_gate : Private_gate.reject -> unit Lwt.t;
+  record_rejected : Transaction.t -> string -> string -> unit;
+  continue_after_reject : consume_nonce:bool -> unit Lwt.t;
+  short_addr : string -> string;
+  incr_fhe : unit -> unit;
+  confirm : unit -> unit Lwt.t;
+}
+
 let rejected_event (r : Private_ledger.key_switch_rejection) =
   if String.equal r.failure.tag "key_switch_failed" then
     "key_switch_failed"
@@ -69,13 +97,13 @@ let run (deps : deps) =
       deps.incr_fhe ();
       deps.confirm ()
 
-let legacy_replay deps (tx : Transaction.t) =
+let legacy_replay (deps : tx_deps) (tx : Transaction.t) =
   if deps.needs_legacy_audit tx then
     Some (deps.legacy_replay tx.from)
   else
     None
 
-let run_tx deps tx =
+let run_tx (deps : tx_deps) tx =
   run {
     gate = deps.gate;
     apply = (fun () ->
@@ -90,3 +118,51 @@ let run_tx deps tx =
     incr_fhe = deps.incr_fhe;
     confirm = deps.confirm;
   }
+
+let live_tx_deps (args : live_tx_args) tx =
+  {
+    gate = args.gate;
+    needs_legacy_audit = args.needs_legacy_audit;
+    legacy_replay = args.legacy_replay;
+    apply_tx = args.apply_tx;
+    reject_gate = args.reject_gate;
+    reject_key_switch = (fun ~event r ->
+      Log.error "epoch" "event = %s addr = %s reason = %s"
+        event
+        (args.short_addr tx.Transaction.from)
+        r.Private_ledger.failure.reason;
+      args.record_rejected tx r.failure.tag r.failure.reason;
+      args.continue_after_reject ~consume_nonce:r.consume_nonce);
+    log_applied = (fun key_plan ->
+      Log.info "epoch"
+        "event = key_switch addr = %s old_key = %s new_key = %s"
+        (args.short_addr tx.Transaction.from)
+        key_plan.Private_ledger.old_key_hash
+        key_plan.new_key_hash);
+    incr_fhe = args.incr_fhe;
+    confirm = args.confirm;
+  }
+
+let run_live_tx args tx =
+  run_tx (live_tx_deps args tx) tx
+
+let run_live_ledger_tx args tx =
+  run_live_tx
+    {
+      gate = args.gate;
+      needs_legacy_audit = Private_ledger.key_switch_requests_legacy_audit;
+      legacy_replay = (fun addr ->
+        (Octra_core.Store_chaindata.pvac_legacy_public_replay_by_addr
+           args.chaindata
+           addr
+           ~max_txs:50_000).decision);
+      apply_tx = (fun ?legacy_public_replay tx ->
+        Private_ledger.apply_key_switch ?legacy_public_replay args.ledger tx);
+      reject_gate = args.reject_gate;
+      record_rejected = args.record_rejected;
+      continue_after_reject = args.continue_after_reject;
+      short_addr = args.short_addr;
+      incr_fhe = args.incr_fhe;
+      confirm = args.confirm;
+    }
+    tx
