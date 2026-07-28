@@ -1,0 +1,144 @@
+import argparse
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+
+from nacl.signing import VerifyKey
+
+from validator_common import FORBIDDEN_KEYS
+from validator_common import NETWORK_KEYS
+from validator_common import ValidatorError
+from validator_common import load_network
+from validator_common import load_wallet
+from validator_common import parse_env
+from validator_common import private_mode
+from validator_common import sha256_file
+from validator_common import state_ready
+from validator_common import validate_checkpoint
+from validator_common import validator_entries
+
+def emit(**fields):
+    print(" ".join(f"{key} = {value}" for key, value in fields.items()))
+
+def require_file(values, key):
+    path = Path(values.get(key, ""))
+    if not path.is_file():
+        raise ValidatorError(f"required file is missing: {key}")
+    return path
+
+def validate_ready_marker(data_dir, values, wallet):
+    path = data_dir / "ready_to_vote.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        ready_epoch = int(payload["ready_epoch"])
+        records = int(payload["catchup_records_verified"])
+        state_root = payload["state_root"]
+        signer = payload["validator"]
+        pubkey = payload["validator_pubkey"]
+        expected = (
+            f"octra:observer-ready:v1|{values['OCTRA_CHAIN_ID']}|{signer}|"
+            f"{ready_epoch}|{state_root}|{records}"
+        )
+        signature = base64.b64decode(payload["signature"], validate=True)
+        public = base64.b64decode(pubkey, validate=True)
+        VerifyKey(public).verify(expected.encode("utf-8"), signature)
+    except Exception as error:
+        raise ValidatorError("ready-to-vote marker is invalid") from error
+    if payload.get("version") != "octra-observer-ready":
+        raise ValidatorError("ready-to-vote marker version mismatch")
+    if payload.get("status") != "observer_ready":
+        raise ValidatorError("ready-to-vote marker status mismatch")
+    if payload.get("chain_id") != values["OCTRA_CHAIN_ID"]:
+        raise ValidatorError("ready-to-vote marker chain mismatch")
+    if signer != wallet["address"] or pubkey != wallet["pub"]:
+        raise ValidatorError("ready-to-vote marker identity mismatch")
+    if payload.get("sign_payload") != expected:
+        raise ValidatorError("ready-to-vote marker payload mismatch")
+    if ready_epoch < int(values["OCTRA_CHECKPOINT_EPOCH"]):
+        raise ValidatorError("ready-to-vote marker predates checkpoint")
+
+def validate(values):
+    inherited = sorted(key for key in FORBIDDEN_KEYS if key in os.environ)
+    if inherited:
+        raise ValidatorError("forbidden inherited env: " + ",".join(inherited))
+    role = values.get("OCTRA_OPERATOR_ROLE")
+    mode = values.get("OCTRA_CONSENSUS_MODE")
+    if role not in {"observer", "validator"}:
+        raise ValidatorError("invalid operator role")
+    if mode != ("bft" if role == "validator" else "observer"):
+        raise ValidatorError("operator role and consensus mode mismatch")
+    data_dir = Path(values.get("OCTRA_DATA_DIR", ""))
+    if not state_ready(data_dir):
+        raise ValidatorError("checkpoint is not ready")
+    validate_checkpoint(data_dir, values, allow_progress=True)
+    wallet_path = data_dir / "wallet.json"
+    wallet = load_wallet(wallet_path)
+    binary = require_file(values, "OCTRA_OPERATOR_BINARY")
+    if sha256_file(binary) != values.get("OCTRA_BINARY_HASH"):
+        raise ValidatorError("candidate binary hash mismatch")
+    bundle = require_file(values, "OCTRA_OPERATOR_NETWORK_BUNDLE")
+    bundle_hash = values.get("OCTRA_OPERATOR_NETWORK_SHA256", "")
+    _, _, network = load_network(bundle, bundle_hash)
+    local_network = {
+        key: values[key]
+        for key in NETWORK_KEYS
+        if key in values
+    }
+    if local_network != network:
+        mismatch = sorted(
+            key
+            for key in set(local_network) | set(network)
+            if local_network.get(key) != network.get(key)
+        )
+        raise ValidatorError("network bundle drift: " + ",".join(mismatch))
+    entitlement = require_file(values, "OCTRA_PVAC_MIGRATION_ENTITLEMENTS")
+    private_mode(entitlement)
+    members = dict(validator_entries(values.get("OCTRA_VALIDATORS", "")))
+    if role == "validator" and members.get(wallet["address"]) != wallet["pub"]:
+        raise ValidatorError("validator identity is not active")
+    if role == "validator" and values.get("OCTRA_VALIDATOR_READY_STRICT") == "1":
+        validate_ready_marker(data_dir, values, wallet)
+    if values.get("OCTRA_P2P_REQUIRE_BINARY_HASH") != "1":
+        raise ValidatorError("binary hash admission is disabled")
+    if values.get("OCTRA_BFT_RELEASE_PROFILE") != "devnet_full_v1":
+        raise ValidatorError("invalid release profile")
+    if values.get("OCTRA_FHE_MAX_PER_EPOCH") != "1":
+        raise ValidatorError("invalid first-run FHE limit")
+    for key in [
+        "OCTRA_EMISSION_ACTIVATION_EPOCH",
+        "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH",
+        "OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH",
+    ]:
+        if not values.get(key, "").isdigit():
+            raise ValidatorError(f"invalid activation epoch: {key}")
+    epochs = {
+        values["OCTRA_EMISSION_ACTIVATION_EPOCH"],
+        values["OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH"],
+        values["OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH"],
+    }
+    if len(epochs) != 1:
+        raise ValidatorError("activation epochs do not match")
+    return wallet
+
+def main():
+    parser = argparse.ArgumentParser(prog="validator_guard.py")
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    private_mode(args.config)
+    values = parse_env(args.config)
+    wallet = validate(values)
+    emit(
+        status="ready",
+        role=values["OCTRA_OPERATOR_ROLE"],
+        address=wallet["address"],
+        chain=values["OCTRA_CHAIN_ID"],
+    )
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValidatorError, OSError, KeyError) as error:
+        emit(status="refused", reason=str(error))
+        sys.exit(1)
