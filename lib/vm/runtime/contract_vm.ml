@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type v =
   | VInt of Z.t
@@ -238,6 +226,17 @@ let default_ctx = {
   node_id = "node_001";
 }
 
+type storage_kind =
+  | StorageInt
+  | StorageBool
+  | StorageString
+  | StorageBytes
+  | StorageBytes32
+  | StorageU64
+  | StorageU128
+  | StorageU256
+  | StorageAddr
+
 type s = {
   regs : v array;
   mutable memory : mem;
@@ -259,6 +258,7 @@ type s = {
   blobs : (string, string) Hashtbl.t;
   mutable is_view : bool;
   strict_values : bool;
+  storage_kinds : (string, storage_kind) Hashtbl.t;
   decoded_chunk_cache : (int, string) Hashtbl.t;
 }
 
@@ -289,7 +289,7 @@ let effort_cost = function
   | FHE_ADD _ | FHE_SUB _ | FHE_ADD_CONST _ | FHE_SUB_CONST _ -> 500
   | FHE_SCALE _ | FHE_DIV_CONST _ -> 1000
   | FHE_MUL _ -> 10000
-  | FHE_VERIFY_ZERO _ | FHE_VERIFY_BOUND _ -> 50000
+  | FHE_VERIFY_ZERO _ | FHE_VERIFY_RANGE _ | FHE_VERIFY_BOUND _ -> 5_000_000
   | PARSE_INTS _ -> 10
   | SUBSTR _ -> 5
   | INDEXOF _ -> 10
@@ -302,7 +302,6 @@ let effort_cost = function
   | SSTOREN _ -> 100
   | FSTORE _ -> 100
   | FLOAD _ -> 100
-  | FHE_VERIFY_RANGE _ -> 500000
   | GROTH16_VERIFY_BN254 _ -> 50000
   | OBJECT_TRANSITION_APPLY _ -> 300
   | MATMUL _ -> 100
@@ -358,7 +357,8 @@ let is_valid_addr s =
     in check 3
 
 let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=false)
-    ?(strict_values=false) ~caller ~origin ~address ~value ~storage () =
+    ?(strict_values=false) ?(storage_kinds=[]) ~caller ~origin ~address ~value
+    ~storage () =
   {
     regs = Array.make 64 (VInt Z.zero);
     memory = { data = Hashtbl.create 1024; size = 0 };
@@ -377,6 +377,7 @@ let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=fals
     blobs = Hashtbl.create 16;
     is_view;
     strict_values;
+    storage_kinds = Hashtbl.of_seq (List.to_seq storage_kinds);
     decoded_chunk_cache = Hashtbl.create 512;
   }
 
@@ -426,6 +427,72 @@ let validate_u256 z =
 
 let validate_bytes32 s = String.length s = 32
 
+let numeric_value = function
+  | VInt _ | VU64 _ | VU128 _ | VU256 _ -> true
+  | _ -> false
+
+let storage_value_matches kind value =
+  match kind, value with
+  | StorageInt, (VInt _ | VU64 _ | VU128 _ | VU256 _)
+  | StorageBool, VBool _
+  | StorageString, VString _
+  | StorageBytes, VBytes _
+  | StorageBytes32, VBytes32 _
+  | StorageAddr, VAddr _ -> true
+  | StorageU64, value -> numeric_value value && validate_u64 (to_z value)
+  | StorageU128, value -> numeric_value value && validate_u128 (to_z value)
+  | StorageU256, value -> numeric_value value && validate_u256 (to_z value)
+  | _ -> false
+
+let storage_default = function
+  | StorageInt -> VInt Z.zero
+  | StorageBool -> VBool false
+  | StorageString -> VString ""
+  | StorageBytes -> VBytes ""
+  | StorageBytes32 -> VBytes32 (String.make 32 '\x00')
+  | StorageU64 -> VU64 Z.zero
+  | StorageU128 -> VU128 Z.zero
+  | StorageU256 -> VU256 Z.zero
+  | StorageAddr -> VAddr ""
+
+let storage_decode kind raw =
+  try
+    match kind with
+    | StorageInt -> Some (VInt (Z.of_string raw))
+    | StorageBool ->
+      if String.equal raw "true" then Some (VBool true)
+      else if String.equal raw "false" then Some (VBool false)
+      else None
+    | StorageString -> Some (VString raw)
+    | StorageBytes -> Some (VBytes raw)
+    | StorageBytes32 ->
+      if validate_bytes32 raw then Some (VBytes32 raw) else None
+    | StorageU64 ->
+      let value = Z.of_string raw in
+      if validate_u64 value then Some (VU64 value) else None
+    | StorageU128 ->
+      let value = Z.of_string raw in
+      if validate_u128 value then Some (VU128 value) else None
+    | StorageU256 ->
+      let value = Z.of_string raw in
+      if validate_u256 value then Some (VU256 value) else None
+    | StorageAddr ->
+      if is_valid_addr raw then Some (VAddr raw) else None
+  with _ ->
+    None
+
+let load_storage_value st key =
+  match Hashtbl.find_opt st.storage_kinds key with
+  | None ->
+    Some
+      (match Hashtbl.find_opt st.storage key with
+       | Some raw -> VString raw
+       | None -> VString "0")
+  | Some kind ->
+    match Hashtbl.find_opt st.storage key with
+    | None -> Some (storage_default kind)
+    | Some raw -> storage_decode kind raw
+
 let round_float_to_int f =
   if Float.is_nan f || Float.is_integer f then int_of_float f
   else if f >= 0.0 then int_of_float (f +. 0.5)
@@ -458,11 +525,107 @@ let make_bytes32 s =
   if validate_bytes32 s then Some (VBytes32 s) else None
 let to_bytes = function VBytes b -> Some b | VBytes32 b -> Some b | VString s -> Some s | _ -> None
 
-let max_fhe_proof_bytes = 1_048_576
+let max_fhe_proof_bytes = Octra_core.Pvac_verify_policy.max_proof_raw_bytes
+let max_fhe_cipher_bytes = 1_048_576
+let max_fhe_pubkey_bytes = 18_000_000
+let fhe_decode_bytes_per_effort = 16
 
 let max_zk_vk_bytes = 131_072
 let max_zk_proof_bytes = 1_024
 let max_zk_inputs_bytes = 32_768
+let fhe_verifier_lane = Mutex.create ()
+
+let with_fhe_verifier_lane f =
+  if not (Mutex.try_lock fhe_verifier_lane) then
+    false
+  else
+    Fun.protect
+      ~finally:(fun () -> Mutex.unlock fhe_verifier_lane)
+      f
+
+let encoded_worker_pubkey pk =
+  Pvac_ffi.serialize_pubkey pk |> Bytes.to_string
+
+let encoded_worker_cipher cipher =
+  Octra_core.Crypto.FheBalance.encode_cipher cipher
+
+let fhe_verifier_cipher_allowed cipher =
+  try
+    Octra_core.Pvac_verify_policy.shape_allowed
+      (Pvac_ffi.cipher_shape cipher)
+  with _ ->
+    false
+
+let proof_raw prefix prefix_len value =
+  if
+    String.length value > prefix_len
+    && String.sub value 0 prefix_len = prefix
+  then
+    let encoded =
+      String.sub value prefix_len (String.length value - prefix_len)
+    in
+    Base64.decode encoded
+  else
+    match Base64.decode value with
+    | Ok raw -> Ok raw
+    | Error _ -> Ok value
+
+let worker_zero_proof value =
+  let module FB = Octra_core.Crypto.FheBalance in
+  match proof_raw FB.zero_proof_prefix FB.zero_proof_prefix_len value with
+  | Error _ -> None
+  | Ok raw ->
+    Some (FB.zero_proof_prefix ^ Base64.encode_exn raw)
+
+let worker_range_proof value =
+  let module FB = Octra_core.Crypto.FheBalance in
+  match proof_raw FB.range_proof_prefix FB.range_proof_prefix_len value with
+  | Error _ -> None
+  | Ok raw ->
+    Some (FB.range_proof_prefix ^ Base64.encode_exn raw)
+
+let worker_commitment value =
+  if String.length value = 32 then
+    Some (Base64.encode_exn value)
+  else
+    match Base64.decode value with
+    | Ok raw when String.length raw = 32 ->
+      Some (Base64.encode_exn raw)
+    | Ok _
+    | Error _ ->
+      None
+
+let ceil_div value divisor =
+  if value <= 0 then 0 else 1 + ((value - 1) / divisor)
+
+let decode_serialized_text s =
+  match Base64.decode s with
+  | Ok raw -> raw
+  | Error _ -> s
+
+let packed_pubkey_size raw =
+  if String.length raw = 0 || Char.code raw.[0] <> 0xec then
+    Some (String.length raw)
+  else if String.length raw < 5 then
+    None
+  else
+    let byte index = Char.code raw.[index] in
+    let size =
+      (byte 1 lsl 24)
+      lor (byte 2 lsl 16)
+      lor (byte 3 lsl 8)
+      lor byte 4
+    in
+    if size > max_fhe_pubkey_bytes then None else Some size
+
+let fhe_decode_input_cost encoded =
+  ceil_div (String.length encoded) fhe_decode_bytes_per_effort
+
+let fhe_pubkey_output_cost raw =
+  match packed_pubkey_size raw with
+  | None -> None
+  | Some size ->
+    Some (ceil_div size fhe_decode_bytes_per_effort)
 
 let deser_bytes f s =
   match Base64.decode s with
@@ -499,9 +662,7 @@ let view_guard st =
 let getr st r = st.regs.(r)
 let setr st r v = st.regs.(r) <- v
 
-let is_numeric = function
-  | VInt _ | VU64 _ | VU128 _ | VU256 _ -> true
-  | _ -> false
+let is_numeric = numeric_value
 
 let is_text = function
   | VString _ | VBytes _ | VBytes32 _ -> true
@@ -510,6 +671,26 @@ let is_text = function
 let is_address = function
   | VString _ | VAddr _ -> true
   | _ -> false
+
+let is_scalar_value value =
+  is_text value
+  || is_address value
+  || is_numeric value
+  || match value with VBool _ -> true | _ -> false
+
+let is_decimal = function
+  | VString value ->
+    (try
+       ignore (Z.of_string value);
+       true
+     with _ ->
+       false)
+  | _ -> false
+
+let is_add_operand left right =
+  is_numeric left && is_numeric right
+  || is_numeric left && Z.equal (to_z left) Z.zero && is_decimal right
+  || is_decimal left && is_numeric right && Z.equal (to_z right) Z.zero
 
 let comparable left right =
   match left, right with
@@ -527,8 +708,9 @@ let comparable left right =
   | _ -> false
 
 let strict_operands st = function
-  | ADD (_, a, b) | SUB (_, a, b) | MUL (_, a, b)
-  | DIV (_, a, b) | MOD (_, a, b)
+  | ADD (_, a, b) ->
+    is_add_operand (getr st a) (getr st b)
+  | SUB (_, a, b) | MUL (_, a, b) | DIV (_, a, b) | MOD (_, a, b)
   | LT (_, a, b) | GT (_, a, b)
   | BITAND (_, a, b) | BITOR (_, a, b) | BITXOR (_, a, b)
   | BITSHL (_, a, b) | BITSHR (_, a, b) ->
@@ -563,9 +745,12 @@ let strict_operands st = function
   | BALANCE (_, a) | SLOADK (_, a) | SDELK a | ISADDR (_, a)
   | ISHEX (_, a) | STATE_PATH_KEY (_, a) | ASSERT_ADDR a ->
     is_address (getr st a)
-  | SSTORE (_, a) -> is_text (getr st a)
+  | SSTORE (key, source) ->
+    (match Hashtbl.find_opt st.storage_kinds key with
+     | Some kind -> storage_value_matches kind (getr st source)
+     | None -> is_scalar_value (getr st source))
   | SSTOREK (key, value) ->
-    is_address (getr st key) && is_text (getr st value)
+    is_address (getr st key) && is_scalar_value (getr st value)
   | PARSE_INTS (_, text, base) ->
     is_text (getr st text) && is_numeric (getr st base)
   | OBJECT_MEMBER_COUNT (_, object_ref) -> is_text (getr st object_ref)
@@ -592,7 +777,8 @@ let strict_operands st = function
   | SLOADN (base_key, base_value, count)
   | SSTOREN (base_key, base_value, count) ->
     List.for_all (fun reg -> is_numeric (getr st reg)) [base_key; base_value; count]
-  | CONCAT (_, left, right) -> is_text (getr st left) && is_text (getr st right)
+  | CONCAT (_, left, right) ->
+    is_scalar_value (getr st left) && is_scalar_value (getr st right)
   | STRLEN (_, text) -> is_text (getr st text)
   | XCALL (_, target, method_name, _, _) ->
     is_address (getr st target) && is_text (getr st method_name)
@@ -795,9 +981,9 @@ let exec_one st op =
   | MOV (rd, rs) ->
     setr st rd (getr st rs); true
   | SLOAD (rd, key) ->
-    let v = match Hashtbl.find_opt st.storage key with
-      | Some s -> VString s | None -> VString "0" in
-    setr st rd v; true
+    (match load_storage_value st key with
+     | Some value -> setr st rd value; true
+     | None -> revert st)
   | SSTORE (key, rs) ->
     if not (view_guard st) then false
     else if is_reserved_key key then revert st
@@ -2228,7 +2414,9 @@ let exec_one st op =
              true
            end
          | Error e ->
-           Octra_log.stdout "SPAWN revert: %s (bytecode %d bytes)\n%!" e (String.length bytecode_raw);
+           Octra_log.warn "program"
+             "event = spawn_reverted error = %s bytecode_bytes = %d"
+             e (String.length bytecode_raw);
            Hashtbl.replace st.storage nonce_key (string_of_int nonce); revert st)
   | SPAWN2 (rd, rs, base, nargs) ->
     if not (valid_reg_span base nargs) then revert st
@@ -2258,7 +2446,9 @@ let exec_one st op =
              true
            end
          | Error e ->
-           Octra_log.stdout "SPAWN2 revert: %s (bytecode %d bytes, %d params)\n%!" e (String.length bytecode_raw) nargs;
+           Octra_log.warn "program"
+             "event = spawn_reverted version = 2 error = %s bytecode_bytes = %d params = %d"
+             e (String.length bytecode_raw) nargs;
            Hashtbl.replace st.storage nonce_key (string_of_int nonce); revert st)
   | TRANSFER (rd, ra, rv) ->
     if not (view_guard st) then false
@@ -2406,39 +2596,68 @@ let exec_one st op =
   | FHE_VERIFY_ZERO (rd, rpk, rct, rproof) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_zero_cap) then
       revert st
+    else if not st.is_view then
+      revert st
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct), to_bytes (getr st rproof) with
-       | Some pk, Some ct, Some proof_bytes ->
+       | Some pk, Some ct, Some proof_bytes
+         when fhe_verifier_cipher_allowed ct ->
          let raw_len = match Base64.decode proof_bytes with
            | Ok r -> String.length r | Error _ -> String.length proof_bytes in
          if raw_len > max_fhe_proof_bytes then
            (setr st rd (VBool false); true)
          else
-           (match deser_bytes Pvac_ffi.deserialize_zero_proof proof_bytes with
-            | Some proof ->
-              setr st rd (VBool (Pvac_ffi.verify_zero pk ct proof)); true
-            | None -> setr st rd (VBool false); true)
+           let ok =
+             with_fhe_verifier_lane (fun () ->
+               match worker_zero_proof proof_bytes with
+               | None -> false
+               | Some proof ->
+                 begin
+                   match
+                     Octra_core.Pvac_verify_worker.verify_zero_sync
+                       ~pubkey:(encoded_worker_pubkey pk)
+                       ~cipher:(encoded_worker_cipher ct)
+                       ~proof
+                   with
+                   | Ok () -> true
+                   | Error _ -> false
+                 end)
+           in
+           setr st rd (VBool ok);
+           true
        | _ -> revert st)
   | FHE_VERIFY_RANGE (rd, rpk, rct, rproof) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_range_cap) then
       revert st
     else if not st.is_view then
-
       revert st
     else
     (match to_pubkey (getr st rpk), to_cipher (getr st rct), to_bytes (getr st rproof) with
-     | Some pk, Some ct, Some proof_bytes ->
+     | Some pk, Some ct, Some proof_bytes
+       when fhe_verifier_cipher_allowed ct ->
        let raw_len = match Base64.decode proof_bytes with
          | Ok r -> String.length r | Error _ -> String.length proof_bytes in
        if raw_len > max_fhe_proof_bytes then
          (setr st rd (VBool false); true)
        else
-         let raw = match Base64.decode proof_bytes with
-           | Ok r -> Bytes.of_string r | Error _ -> Bytes.of_string proof_bytes in
-         (try
-            let ok = Pvac_ffi.verify_range_any pk ct raw in
-            setr st rd (VBool ok); true
-          with _ -> setr st rd (VBool false); true)
+         let ok =
+           with_fhe_verifier_lane (fun () ->
+             match worker_range_proof proof_bytes with
+             | None -> false
+             | Some proof ->
+               begin
+                 match
+                   Octra_core.Pvac_verify_worker.verify_range_sync
+                     ~pubkey:(encoded_worker_pubkey pk)
+                     ~cipher:(encoded_worker_cipher ct)
+                     ~proof
+                 with
+                 | Ok () -> true
+                 | Error _ -> false
+               end)
+         in
+         setr st rd (VBool ok);
+         true
      | _ -> revert st)
   | GROTH16_VERIFY_BN254 (rd, rvk, rproof, rinputs) ->
     if not st.is_view then
@@ -2468,24 +2687,40 @@ let exec_one st op =
   | FHE_VERIFY_BOUND (rd, rpk, rct, rproof, rcommit) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_bound_cap) then
       revert st
+    else if not st.is_view then
+      revert st
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct),
              to_bytes (getr st rproof), to_bytes (getr st rcommit) with
-       | Some pk, Some ct, Some proof_bytes, Some commit_bytes ->
+       | Some pk, Some ct, Some proof_bytes, Some commit_bytes
+         when fhe_verifier_cipher_allowed ct ->
          let raw_len = match Base64.decode proof_bytes with
            | Ok r -> String.length r | Error _ -> String.length proof_bytes in
          if raw_len > max_fhe_proof_bytes then
            (setr st rd (VBool false); true)
          else
-           let commit_raw = match Base64.decode commit_bytes with
-             | Ok r -> Bytes.of_string r | Error _ -> Bytes.of_string commit_bytes in
-           (match deser_bytes Pvac_ffi.deserialize_zero_proof proof_bytes with
-            | Some proof ->
-              (try
-                let ok = Pvac_ffi.verify_zero_bound pk ct proof commit_raw in
-                setr st rd (VBool ok); true
-               with _ -> setr st rd (VBool false); true)
-            | None -> setr st rd (VBool false); true)
+           let ok =
+             with_fhe_verifier_lane (fun () ->
+               match
+                 worker_zero_proof proof_bytes,
+                 worker_commitment commit_bytes
+               with
+               | Some proof, Some commitment ->
+                 begin
+                   match
+                     Octra_core.Pvac_verify_worker.verify_claim_sync
+                       ~pubkey:(encoded_worker_pubkey pk)
+                       ~cipher:(encoded_worker_cipher ct)
+                       ~proof
+                       ~commitment
+                   with
+                   | Ok () -> true
+                   | Error _ -> false
+                 end
+               | _ -> false)
+           in
+           setr st rd (VBool ok);
+           true
        | _ -> revert st)
   | FHE_COMMIT (rd, rpk, rct) ->
     if not (st.ctx.allow_fhe_capability Fhe_commit_cap) then
@@ -2526,10 +2761,19 @@ let exec_one st op =
       revert st
     else
       (match to_bytes (getr st rbytes) with
-       | Some b ->
-         (match deser_bytes Pvac_ffi.deserialize_cipher b with
-          | Some ct -> setr st rd (VCipher ct); true
-          | None -> revert st)
+       | Some encoded
+         when add_dyn_effort st (fhe_decode_input_cost encoded) ->
+         let raw = decode_serialized_text encoded in
+         if String.length raw > max_fhe_cipher_bytes then
+           revert st
+         else
+           (try
+              let ct = Pvac_ffi.deserialize_cipher (Bytes.of_string raw) in
+              setr st rd (VCipher ct);
+              true
+            with _ ->
+              revert st)
+       | Some _ -> revert st
        | None -> revert st)
   | FHE_SER_PK (rd, rpk) ->
     if not (st.ctx.allow_fhe_capability Fhe_pubkey_serde_cap) then
@@ -2547,10 +2791,23 @@ let exec_one st op =
       revert st
     else
       (match to_bytes (getr st rbytes) with
-       | Some b ->
-         (match deser_bytes Pvac_ffi.deserialize_pubkey b with
-          | Some pk -> setr st rd (VPubKey pk); true
-          | None -> revert st)
+       | Some encoded
+         when add_dyn_effort st (fhe_decode_input_cost encoded) ->
+         let raw = decode_serialized_text encoded in
+         if String.length raw > max_fhe_pubkey_bytes then
+           revert st
+         else
+           (match fhe_pubkey_output_cost raw with
+            | Some cost when add_dyn_effort st cost ->
+              (try
+                 let pk = Pvac_ffi.deserialize_pubkey (Bytes.of_string raw) in
+                 setr st rd (VPubKey pk);
+                 true
+               with _ ->
+                 revert st)
+            | Some _ | None ->
+              revert st)
+       | Some _ -> revert st
        | None -> revert st)
   | CALL_INT (rd, label) ->
     if List.length st.return_stack >= 8 then revert st

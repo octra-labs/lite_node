@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module C_types = Octra_consensus.C_types
@@ -54,6 +42,9 @@ let preverify receipts_json txs =
   | Ok () -> Ok ()
   | Error e -> Error ("bundle preverify: " ^ e)
 
+let response_hashes r =
+  List.map Text.hash32_hex r.C_driver.tx_hashes
+
 let finalized ~header (r : C_driver.bundle_response_record) =
   if List.length r.tx_hashes <> List.length r.txs_json then
     Error "bundle length mismatch"
@@ -61,10 +52,11 @@ let finalized ~header (r : C_driver.bundle_response_record) =
     match parse_txs r.txs_json with
     | Error _ as e -> e
     | Ok txs ->
+      let tx_hashes = response_hashes r in
       let recomputed = List.map Transaction.hash txs in
-      if recomputed <> r.tx_hashes then
+      if recomputed <> tx_hashes then
         Error "bundle tx hash mismatch"
-      else if not (tx_list_hash_matches header r.tx_hashes) then
+      else if not (tx_list_hash_matches header tx_hashes) then
         Error "bundle tx_list_hash mismatch"
       else if not (receipt_root_matches header r.receipts_json) then
         Error "bundle receipt_root mismatch"
@@ -73,7 +65,7 @@ let finalized ~header (r : C_driver.bundle_response_record) =
         | Error _ as e -> e
         | Ok () ->
           Ok {
-            tx_hashes = r.tx_hashes;
+            tx_hashes;
             txs;
             receipts_json = r.receipts_json;
           }

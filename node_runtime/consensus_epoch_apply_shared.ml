@@ -1,29 +1,25 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module Epoch_exec = Octra_core.Epoch_exec
 module Sender = Consensus_epoch_apply_sender
 module Sender_live = Consensus_epoch_apply_sender_live
 
-type process = Transaction.t -> (unit, string * string) result Lwt.t
+type process =
+  Transaction.t ->
+  (Epoch_exec.tx_effect, string * string) result Lwt.t
 
 type deps = {
   process : process;
   confirm : Transaction.t -> unit;
   reject : Transaction.t -> error_type:string -> reason:string -> unit;
+  reject_after_fee :
+    Transaction.t ->
+    fee:Z.t ->
+    error_type:string ->
+    reason:string ->
+    unit;
 }
 
 type standard_or_sender_deps = {
@@ -41,11 +37,23 @@ type runtime = {
   exit : unit -> unit;
   backend : unit -> Epoch_exec.backend;
   env : unit -> Epoch_exec.env;
+  max_fhe_per_epoch : int;
+  max_stealth_per_epoch : int;
   process_sender : Transaction.t list -> unit Lwt.t;
   confirm_tx : Transaction.t -> unit;
   reject_tx : Transaction.t -> string -> string -> unit;
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
+  program_trust : Octra_vm.Program_trust.t;
+  legacy_replay :
+    epoch:int ->
+    address:string ->
+    cipher:string ->
+    Octra_core.Pvac_legacy_public_replay.decision;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
+  add_rejected_fee : Z.t -> unit;
 }
 
 type node_runtime = {
@@ -76,6 +84,14 @@ type node_runtime = {
   notify_new_account : string -> unit;
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
+  legacy_replay :
+    epoch:int ->
+    address:string ->
+    cipher:string ->
+    Octra_core.Pvac_legacy_public_replay.decision;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
 }
 
 type node_result = {
@@ -83,14 +99,15 @@ type node_result = {
 }
 
 let is_shared_bft_tx (tx : Transaction.t) =
-  match tx.Transaction.op_type with
-  | Transaction.Standard
-  | Transaction.ValidatorSetUpdate
-  | Transaction.ValidatorReady -> true
-  | _ -> false
+  Transaction.bft_consensus_admits_op tx.Transaction.op_type
 
 let all_shared_bft txs =
   List.for_all is_shared_bft_tx txs
+
+let first_disabled_bft_tx txs =
+  List.find_opt
+    (fun tx -> not (is_shared_bft_tx tx))
+    txs
 
 let canonical_order txs =
   List.sort
@@ -112,8 +129,15 @@ let run deps txs =
        let open Lwt.Syntax in
        let* result = deps.process tx in
        match result with
-       | Ok () ->
+       | Ok (Epoch_exec.Confirmed _) ->
          deps.confirm tx;
+         Lwt.return_unit
+       | Ok (Epoch_exec.Rejected_after_fee rejected) ->
+         deps.reject_after_fee
+           tx
+           ~fee:rejected.fee
+           ~error_type:rejected.error_type
+           ~reason:rejected.reason;
          Lwt.return_unit
        | Error (error_type, reason) ->
          deps.reject tx ~error_type ~reason;
@@ -121,25 +145,72 @@ let run deps txs =
     (canonical_order txs)
 
 let run_standard_or_sender ~consensus_mode (deps : standard_or_sender_deps) txs =
-  if consensus_mode && all_shared_bft txs then begin
+  match consensus_mode, first_disabled_bft_tx txs with
+  | true, Some tx ->
+    Lwt.fail_with
+      (Transaction.bft_reject_reason tx.Transaction.op_type)
+  | true, None ->
     deps.log_shared ~tx_count:(List.length txs);
     run deps.shared txs
-  end else
+  | false, _ ->
     Sender.run deps.sender txs
 
-let runtime_shared (runtime : runtime) =
+let runtime_shared ?preverify (runtime : runtime) =
   let backend = lazy (runtime.backend ()) in
   let env = lazy (runtime.env ()) in
+  let private_transition =
+    lazy
+      (Octra_core.Private_transition.create
+        ~preverify
+        ~ledger:(Lazy.force backend).Epoch_exec.ledger
+        ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id
+        ~result_policy:
+          (runtime.private_result_policy
+             (Lazy.force env).Epoch_exec.epoch_id)
+        ~legacy_replay:runtime.legacy_replay
+        ~limits:Octra_core.Private_transition.{
+          max_fhe = runtime.max_fhe_per_epoch;
+          max_stealth = runtime.max_stealth_per_epoch;
+        })
+  in
   {
     process = (fun tx ->
-      process_standard
-        ~backend:(Lazy.force backend)
-        ~env:(Lazy.force env)
-        tx);
+      let open Lwt.Syntax in
+      let* result =
+        Octra_core.Tx_savepoint.run
+          ~ledger:(Lazy.force backend).Epoch_exec.ledger
+          ~store:(Lazy.force backend).Epoch_exec.store
+          (fun () ->
+            if Transaction.bft_crypto_active ()
+              && Transaction.bft_crypto_op tx.Transaction.op_type
+            then
+              let* private_result =
+                Octra_core.Private_transition.process
+                  (Lazy.force private_transition)
+                  ~backend:(Lazy.force backend)
+                  ~env:(Lazy.force env)
+                  tx in
+              Lwt.return
+                (Result.map
+                   (fun fee -> Epoch_exec.Confirmed fee)
+                   private_result)
+            else
+              Consensus_vm_transition.process_tx
+                ?preverify
+                ~backend:(Lazy.force backend)
+                ~env:(Lazy.force env)
+                ~program_trust:runtime.program_trust
+                tx)
+      in
+      Lwt.return result);
     confirm = (fun tx ->
       runtime.confirm_tx tx;
       runtime.notify_confirmed tx (runtime.current_epoch ()));
     reject = (fun tx ~error_type ~reason ->
+      runtime.reject_tx tx error_type reason;
+      runtime.notify_rejected tx reason);
+    reject_after_fee = (fun tx ~fee ~error_type ~reason ->
+      runtime.add_rejected_fee fee;
       runtime.reject_tx tx error_type reason;
       runtime.notify_rejected tx reason);
   }
@@ -157,20 +228,20 @@ let runtime_sender (runtime : runtime) =
       runtime.exit ());
   }
 
-let runtime_deps (runtime : runtime) =
+let runtime_deps ?preverify (runtime : runtime) =
   {
     log_shared = runtime.log_shared;
-    shared = runtime_shared runtime;
+    shared = runtime_shared ?preverify runtime;
     sender = runtime_sender runtime;
   }
 
-let run_runtime (runtime : runtime) txs =
+let run_runtime ?preverify (runtime : runtime) txs =
   run_standard_or_sender
     ~consensus_mode:runtime.consensus_mode
-    (runtime_deps runtime)
+    (runtime_deps ?preverify runtime)
     txs
 
-let run_node (runtime : node_runtime) ordered_txs =
+let run_node ?preverify (runtime : node_runtime) ordered_txs =
   let open Lwt.Syntax in
   let tx_sink =
     Sender.live_tx_sink
@@ -216,12 +287,28 @@ let run_node (runtime : node_runtime) ordered_txs =
         notify_new_account = runtime.notify_new_account;
         notify_confirmed = runtime.notify_confirmed;
         notify_rejected = runtime.notify_rejected;
+        legacy_replay = runtime.legacy_replay;
+        private_result_policy = runtime.private_result_policy;
       }
       sender_txs
   in
-  let* () =
-    run_runtime
-      {
+  let* gate =
+    match preverify with
+    | None -> Lwt.return_ok ()
+    | Some gate ->
+      Octra_core.Preverify_commit.check_bound
+        runtime.ledger
+        gate
+        ordered_txs
+  in
+  match gate with
+  | Error e ->
+    Lwt.fail_with ("finalized preverify gate failed: " ^ e)
+  | Ok () ->
+    let* () =
+      run_runtime
+        ?preverify
+        {
         consensus_mode = runtime.consensus_mode;
         current_epoch = runtime.current_epoch;
         log_shared = runtime.log_shared;
@@ -231,12 +318,19 @@ let run_node (runtime : node_runtime) ordered_txs =
         backend = (fun () ->
           Epoch_exec.make_live_backend runtime.store runtime.ledger);
         env = runtime.standard_env;
+        max_fhe_per_epoch = runtime.max_fhe_per_epoch;
+        max_stealth_per_epoch = runtime.max_stealth_per_epoch;
         process_sender;
         confirm_tx;
         reject_tx = log_rejected;
         notify_confirmed = runtime.notify_confirmed;
         notify_rejected = runtime.notify_rejected;
+        program_trust = runtime.program_trust;
+        legacy_replay = runtime.legacy_replay;
+        private_result_policy = runtime.private_result_policy;
+        add_rejected_fee = (fun fee ->
+          runtime.confirmed_fees := Z.add !(runtime.confirmed_fees) fee);
       }
-      ordered_txs
-  in
-  Lwt.return { deferred_stealth_txs }
+        ordered_txs
+    in
+    Lwt.return { deferred_stealth_txs }

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -128,3 +116,16 @@ val freeze : t -> string -> frozen -> unit
 val find_frozen : t -> string -> frozen option
 
 val prune_frozen : t -> finalized_epoch:int64 -> unit
+
+val preverify_item_key :
+  state_root:string ->
+  tx_hash:string ->
+  string
+
+val run_preverify_once :
+  t ->
+  state_root:string ->
+  tx_hashes:string list ->
+  txs:Transaction.t list ->
+  (Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t) ->
+  Octra_core.Preverify_worker.batch Lwt.t

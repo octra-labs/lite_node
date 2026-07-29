@@ -4,6 +4,7 @@
  (name octra_vm)
  (libraries
   octra_core
+  octra_crypto_guard
   pvac_ffi
   zk_ffi
   zarith

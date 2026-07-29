@@ -1,26 +1,16 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open C_types
-
 
 type validator_info = C_types.validator_info
 type validator_set = C_types.validator_set
 
 let make_validator_set = C_types.make_validator_set
 let leader_of = C_types.leader_of
+let max_round_ahead = 64
+let max_timeout_ms = 120_000
+let max_propose_timeout_ms = 300_000
 
 let short_hex_raw s =
   let hex = Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string s) in
@@ -44,13 +34,13 @@ let log_pending_header_quorum () =
 let log_node addr fmt =
   Printf.ksprintf
     (fun msg ->
-      Octra_log.stdout "component = consensus node = %s module = engine %s\n%!" addr msg)
+      Octra_log.info "consensus" "node = %s module = engine %s" addr msg)
     fmt
 
 let err_node addr fmt =
   Printf.ksprintf
     (fun msg ->
-      Octra_log.stderr "component = consensus node = %s module = engine %s\n%!" addr msg)
+      Octra_log.error "consensus" "node = %s module = engine %s" addr msg)
     fmt
 
 let tx_list_hash_for_header tx_hashes =
@@ -58,16 +48,19 @@ let tx_list_hash_for_header tx_hashes =
     "octra:tx_list:v1"
     (String.concat "" (List.map hash32_to_hex tx_hashes))
 
-
 type vote_set = {
   votes : (string, vote) Hashtbl.t;
   by_pid : (string, int) Hashtbl.t;
+  by_pid_weight : (string, Z.t) Hashtbl.t;
   mutable count_nil : int;
   mutable count_total : int;
+  mutable weight_nil : Z.t;
+  mutable weight_total : Z.t;
 }
 
 type vote_add_result =
   [ `Duplicate
+  | `Rejected
   | `Added
   | `QuorumAny
   | `QuorumOf of string ]
@@ -75,34 +68,50 @@ type vote_add_result =
 let create_vote_set () = {
   votes = Hashtbl.create 8;
   by_pid = Hashtbl.create 4;
+  by_pid_weight = Hashtbl.create 4;
   count_nil = 0;
   count_total = 0;
+  weight_nil = Z.zero;
+  weight_total = Z.zero;
 }
-
 
 let count_for_pid vs pid =
   match Hashtbl.find_opt vs.by_pid pid with Some c -> c | None -> 0
 
-let add_vote vs (v : vote) ~quorum =
+let weight_for_pid vs pid =
+  match Hashtbl.find_opt vs.by_pid_weight pid with
+  | Some weight -> weight
+  | None -> Z.zero
+
+let add_vote vs (v : vote) ~validator_set =
   if Hashtbl.mem vs.votes v.validator then `Duplicate
-  else begin
-    Hashtbl.replace vs.votes v.validator v;
-    vs.count_total <- vs.count_total + 1;
-    let is_nil = Octra_net.Hash_domain.is_nil v.proposal_id in
-    if is_nil then begin
-      vs.count_nil <- vs.count_nil + 1;
-      if vs.count_total >= quorum then `QuorumAny else `Added
-    end else begin
-
-      let prev = match Hashtbl.find_opt vs.by_pid v.proposal_id with Some c -> c | None -> 0 in
-      let next = prev + 1 in
-      Hashtbl.replace vs.by_pid v.proposal_id next;
-      if next >= quorum then `QuorumOf v.proposal_id
-      else if vs.count_total >= quorum then `QuorumAny
-      else `Added
-    end
-  end
-
+  else
+    match C_types.weight_of_addr validator_set v.validator with
+    | None -> `Rejected
+    | Some weight ->
+      Hashtbl.replace vs.votes v.validator v;
+      vs.count_total <- vs.count_total + 1;
+      vs.weight_total <- Z.add vs.weight_total weight;
+      let is_nil = Octra_net.Hash_domain.is_nil v.proposal_id in
+      if is_nil then begin
+        vs.count_nil <- vs.count_nil + 1;
+        vs.weight_nil <- Z.add vs.weight_nil weight;
+        if Z.geq vs.weight_total validator_set.quorum_weight then
+          `QuorumAny
+        else
+          `Added
+      end else begin
+        let count = count_for_pid vs v.proposal_id + 1 in
+        let proposal_weight = Z.add (weight_for_pid vs v.proposal_id) weight in
+        Hashtbl.replace vs.by_pid v.proposal_id count;
+        Hashtbl.replace vs.by_pid_weight v.proposal_id proposal_weight;
+        if Z.geq proposal_weight validator_set.quorum_weight then
+          `QuorumOf v.proposal_id
+        else if Z.geq vs.weight_total validator_set.quorum_weight then
+          `QuorumAny
+        else
+          `Added
+      end
 
 type output =
   | SendPropose of propose
@@ -111,27 +120,42 @@ type output =
   | ScheduleTimeout of { step : round_step; round : int; delay_ms : int; generation : int }
   | Finalized of { epoch_id : int64; finalize : finalize }
 
-
-let int_env name fallback =
+let int_env name ~fallback ~limit =
   match Sys.getenv_opt name with
-  | Some raw -> (try max 0 (int_of_string raw) with _ -> fallback)
+  | Some raw ->
+    (try
+       let value = int_of_string raw in
+       if value < 0 || value > limit then fallback else value
+     with _ -> fallback)
   | None -> fallback
 
-let timeout_ms ~round ~step =
-  let base = int_env "OCTRA_BFT_TIMEOUT_BASE_MS" 3000 in
-  let per_round = int_env "OCTRA_BFT_TIMEOUT_ROUND_MS" 1000 in
-  let step_mult = match step with
-    | ProposeStep -> 1
-    | PrevoteStep -> 1
-    | PrecommitStep -> 1
+let timeout_ms_with ~round ~step ~base ~propose ~per_round =
+  let step_base, cap = match step with
+    | ProposeStep -> propose, max_propose_timeout_ms
+    | PrevoteStep
+    | PrecommitStep -> base, max_timeout_ms
   in
-  (base + round * per_round) * step_mult
+  let raw =
+    Int64.add
+      (Int64.of_int step_base)
+      (Int64.mul (Int64.of_int round) (Int64.of_int per_round))
+  in
+  Int64.to_int (Int64.min (Int64.of_int cap) raw)
+
+let timeout_ms ~round ~step =
+  let base = int_env "OCTRA_BFT_TIMEOUT_BASE_MS" ~fallback:3000 ~limit:120_000 in
+  let propose =
+    int_env "OCTRA_BFT_PROPOSE_TIMEOUT_MS"
+      ~fallback:base
+      ~limit:max_propose_timeout_ms
+  in
+  let per_round = int_env "OCTRA_BFT_TIMEOUT_ROUND_MS" ~fallback:1000 ~limit:30_000 in
+  timeout_ms_with ~round ~step ~base ~propose ~per_round
 
 type proposal_cache_entry = {
   header : epoch_header;
   tx_hashes : string list option;
 }
-
 
 type t = {
   chain_id : string;
@@ -141,7 +165,9 @@ type t = {
   mutable prevotes : vote_set;
   mutable precommits : vote_set;
   mutable current_proposal : propose option;
+  mutable pending_prevote : (int64 * int * string) option;
   mutable proposal_cache : (string, proposal_cache_entry) Hashtbl.t;
+  mutable proposal_messages : ((string * int), propose) Hashtbl.t;
   mutable polc_by_round : (int, string) Hashtbl.t;
   mutable higher_round_evidence : (int, (string, unit) Hashtbl.t) Hashtbl.t;
   mutable outputs : output list;
@@ -158,7 +184,9 @@ let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote = {
   prevotes = create_vote_set ();
   precommits = create_vote_set ();
   current_proposal = None;
+  pending_prevote = None;
   proposal_cache = Hashtbl.create 8;
+  proposal_messages = Hashtbl.create 8;
   polc_by_round = Hashtbl.create 4;
   higher_round_evidence = Hashtbl.create 4;
   outputs = [];
@@ -196,6 +224,14 @@ let find_tx_hashes t pid =
   | Some e -> e.tx_hashes
   | None -> None
 
+let cache_proposal_message t (proposal : propose) =
+  let pid = C_hash.proposal_id proposal.header in
+  cache_proposal_bundle t pid proposal.header proposal.tx_hashes;
+  Hashtbl.replace t.proposal_messages (pid, proposal.round) proposal
+
+let find_proposal_message t ~proposal_id ~round =
+  Hashtbl.find_opt t.proposal_messages (proposal_id, round)
+
 let emit t o = t.outputs <- o :: t.outputs
 
 let drain_outputs t =
@@ -215,6 +251,14 @@ let vote_type_name = function
 let vote_set_for t = function
   | Prevote -> t.prevotes
   | Precommit -> t.precommits
+
+let conflicting_vote t (vote : vote) =
+  if vote.epoch_id <> t.state.height || vote.round <> t.state.round then None
+  else
+    let votes = (vote_set_for t vote.vote_type).votes in
+    match Hashtbl.find_opt votes vote.validator with
+    | Some prior when prior.proposal_id <> vote.proposal_id -> Some prior
+    | _ -> None
 
 let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
   let vs = vote_set_for t vote_type in
@@ -242,7 +286,7 @@ let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
     } in
     let sign_bytes = C_hash.vote_sign_bytes vote in
     let vote = { vote with signature = sign_fn sign_bytes } in
-    let result = add_vote vs vote ~quorum:t.vs.quorum in
+    let result = add_vote vs vote ~validator_set:t.vs in
     emit t (SendVote vote);
     LocalVoteCast result
 
@@ -254,6 +298,18 @@ let precommits_for_pid t pid =
   |> List.sort (fun (a : vote) (b : vote) -> String.compare a.validator b.validator)
 
 let make_finalize t ~header ~proposal_id ~round =
+  let parent_commit =
+    match find_proposal_message t ~proposal_id ~round with
+    | Some proposal -> proposal.parent_commit
+    | None ->
+      Option.bind
+        t.current_proposal
+        (fun proposal ->
+          if C_hash.proposal_id proposal.header = proposal_id then
+            proposal.parent_commit
+          else
+            None)
+  in
   {
     chain_id = t.chain_id;
     epoch_id = t.state.height;
@@ -261,13 +317,13 @@ let make_finalize t ~header ~proposal_id ~round =
     header;
     proposal_id;
     precommits = precommits_for_pid t proposal_id;
+    parent_commit;
   }
 
 let emit_finalized ?(send = true) t finalize =
   t.finalized_height <- finalize.epoch_id;
   if send then emit t (SendFinalize finalize);
   emit t (Finalized { epoch_id = finalize.epoch_id; finalize })
-
 
 let am_i_leader t =
   let l = leader_of t.vs ~epoch_id:t.state.height ~round:t.state.round in
@@ -284,12 +340,12 @@ let can_prevote t =
   | ProposeStep | PrevoteStep -> true
   | PrecommitStep -> false
 
-
 let start_round t round =
   t.state <- { t.state with round; step = ProposeStep };
   t.prevotes <- create_vote_set ();
   t.precommits <- create_vote_set ();
   t.current_proposal <- None;
+  t.pending_prevote <- None;
   emit t (ScheduleTimeout {
     step = ProposeStep;
     round;
@@ -297,11 +353,17 @@ let start_round t round =
     generation = t.generation;
   })
 
+let realign_round t round =
+  if round <= t.state.round then
+    invalid_arg "consensus round must advance";
+  t.generation <- t.generation + 1;
+  start_round t round
 
 let start_height t height =
   t.generation <- t.generation + 1;
   t.state <- initial_engine_state height;
   t.proposal_cache <- Hashtbl.create 8;
+  t.proposal_messages <- Hashtbl.create 8;
   t.polc_by_round <- Hashtbl.create 4;
   t.higher_round_evidence <- Hashtbl.create 4;
   start_round t 0
@@ -310,8 +372,41 @@ let record_polc t round proposal_id =
   if not (Octra_net.Hash_domain.is_nil proposal_id) then
     Hashtbl.replace t.polc_by_round round proposal_id
 
+let restore_precommit_lock t (proposal : propose) =
+  if not (is_pristine t) then
+    Error "consensus engine is not pristine"
+  else if proposal.chain_id <> t.chain_id then
+    Error "pending proposal chain mismatch"
+  else if proposal.epoch_id <> t.state.height then
+    Error "pending proposal height mismatch"
+  else if
+    proposal.header.proto_version
+    <> C_protocol.version_for_epoch proposal.epoch_id
+  then
+    Error "pending proposal protocol mismatch"
+  else if proposal.header.chain_id <> proposal.chain_id then
+    Error "pending proposal header chain mismatch"
+  else if proposal.header.epoch_id <> proposal.epoch_id then
+    Error "pending proposal header height mismatch"
+  else begin
+    let proposal_id = C_hash.proposal_id proposal.header in
+    cache_proposal_message t proposal;
+    record_polc t proposal.round proposal_id;
+    t.state <- {
+      t.state with
+      locked_round = proposal.round;
+      locked_value = Some proposal.header;
+      valid_round = proposal.round;
+      valid_value = Some proposal.header;
+    };
+    realign_round t (proposal.round + 1);
+    Ok ()
+  end
+
 let record_higher_round t ~round ~validator =
-  if round > t.state.round then begin
+  if C_types.is_validator t.vs validator
+     && round > t.state.round
+     && round <= t.state.round + max_round_ahead then begin
     let set =
       match Hashtbl.find_opt t.higher_round_evidence round with
       | Some s -> s
@@ -326,11 +421,21 @@ let record_higher_round t ~round ~validator =
 let try_round_skip t =
   if Int64.compare t.state.height t.finalized_height <= 0 then ()
   else begin
-    let threshold = t.vs.f + 1 in
+    let threshold = C_types.round_skip_weight t.vs in
     let best =
       Hashtbl.fold (fun round set acc ->
         if round <= t.state.round then acc
-        else if Hashtbl.length set < threshold then acc
+        else
+          let weight =
+            Hashtbl.fold
+              (fun validator () total ->
+                match C_types.weight_of_addr t.vs validator with
+                | None -> total
+                | Some value -> Z.add total value)
+              set
+              Z.zero
+          in
+          if Z.lt weight threshold then acc
         else
           match acc with
           | None -> Some round
@@ -347,6 +452,14 @@ let try_round_skip t =
         t.state.height t.state.round target evidence_round;
       t.higher_round_evidence <- Hashtbl.create 4;
       start_round t target
+  end
+
+let on_round_sync t ~round ~validator =
+  if C_types.is_validator t.vs validator
+     && round > t.state.round
+     && round <= t.state.round + max_round_ahead then begin
+    record_higher_round t ~round ~validator;
+    try_round_skip t
   end
 
 let lock_allows t (proposal_id : string) (valid_round : int option) : bool =
@@ -371,8 +484,117 @@ let lock_allows t (proposal_id : string) (valid_round : int option) : bool =
 let allow_valid_value_reuse t =
   t.vs.quorum >= 1
 
+let quorum_result votes ~validator_set =
+  let proposal_id =
+    Hashtbl.fold
+      (fun pid weight found ->
+        match found with
+        | Some _ -> found
+        | None when Z.geq weight validator_set.quorum_weight -> Some pid
+        | None -> None)
+      votes.by_pid_weight
+      None
+  in
+  match proposal_id with
+  | Some pid -> `QuorumOf pid
+  | None when Z.geq votes.weight_total validator_set.quorum_weight ->
+    `QuorumAny
+  | None -> `Added
 
-let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
+let remember_pending_prevote t proposal_id =
+  match t.pending_prevote with
+  | Some _ -> ()
+  | None ->
+    if Hashtbl.mem t.prevotes.votes t.my_addr then ()
+    else
+      t.pending_prevote <-
+        Some (t.state.height, t.state.round, proposal_id)
+
+let schedule_step_timeout t step =
+  emit t (ScheduleTimeout {
+    step;
+    round = t.state.round;
+    delay_ms = timeout_ms ~round:t.state.round ~step;
+    generation = t.generation;
+  })
+
+let finalize_quorum t proposal_id =
+  match find_header t proposal_id with
+  | None -> ()
+  | Some header ->
+    log_node t.my_addr
+      "event = local_finalize_ready height = %Ld round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
+      t.state.height t.state.round
+      (short_hex_raw proposal_id)
+      (short_addr header.creator_addr)
+      t.state.locked_round t.state.valid_round;
+    let finalize =
+      make_finalize t ~header ~proposal_id ~round:t.state.round
+    in
+    emit_finalized t finalize
+
+let resume_voting t ~sign_fn =
+  if not (local_voting_allowed t) then ()
+  else begin
+    (match t.pending_prevote with
+     | Some (height, round, proposal_id)
+       when height = t.state.height
+         && round = t.state.round
+         && can_prevote t ->
+       t.pending_prevote <- None;
+       t.state <- { t.state with step = PrevoteStep };
+       (match
+          cast_local_vote t ~sign_fn ~vote_type:Prevote ~proposal_id
+        with
+        | LocalVoteCast _
+        | LocalVoteAlreadySame ->
+          schedule_step_timeout t PrevoteStep
+        | LocalVoteConflict _ -> ())
+     | Some _ ->
+       t.pending_prevote <- None
+     | None -> ());
+    (match quorum_result t.prevotes ~validator_set:t.vs with
+     | `QuorumOf proposal_id
+       when t.state.step <> PrecommitStep
+         && not (Octra_net.Hash_domain.is_nil proposal_id) ->
+       (match
+          find_proposal_message
+            t
+            ~proposal_id
+            ~round:t.state.round
+        with
+        | None -> ()
+        | Some proposal ->
+          record_polc t t.state.round proposal_id;
+          t.state <- {
+            t.state with
+            locked_round = t.state.round;
+            locked_value = Some proposal.header;
+            valid_round = t.state.round;
+            valid_value = Some proposal.header;
+            step = PrecommitStep;
+          };
+          (match
+             cast_local_vote t ~sign_fn ~vote_type:Precommit ~proposal_id
+           with
+           | LocalVoteCast _
+           | LocalVoteAlreadySame ->
+             schedule_step_timeout t PrecommitStep
+           | LocalVoteConflict _ -> ()))
+     | _ -> ());
+    if Int64.compare t.state.height t.finalized_height > 0 then
+      match quorum_result t.precommits ~validator_set:t.vs with
+      | `QuorumOf proposal_id
+        when not (Octra_net.Hash_domain.is_nil proposal_id) ->
+        finalize_quorum t proposal_id
+      | _ -> ()
+  end
+
+let on_ready t ~sign_fn =
+  resume_voting t ~sign_fn
+
+let do_propose ?parent_commit t (header : epoch_header)
+    (tx_hashes : string list) ~sign_fn =
   if not (local_voting_allowed t) then ()
   else if not (am_i_leader t) then ()
   else if header.epoch_id <> t.state.height then begin
@@ -384,6 +606,14 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
     err_node t.my_addr
       "event = drop_do_propose reason = chain_id_mismatch header = %s ours = %s"
       header.chain_id t.chain_id
+  end
+  else if
+    header.proto_version <> C_protocol.version_for_epoch header.epoch_id
+  then begin
+    err_node t.my_addr
+      "event = drop_do_propose reason = protocol_mismatch height = %Ld version = %d"
+      header.epoch_id
+      header.proto_version
   end
   else if t.state.step <> ProposeStep then begin
     err_node t.my_addr
@@ -413,15 +643,35 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
                log_node t.my_addr
                  "event = repropose_valid_value valid_round = %d locked_round = %d"
                  t.state.valid_round t.state.locked_round;
-               Some (v, cached_hashes, Some t.state.valid_round)
+               let cached_parent_commit =
+                 Option.bind
+                   (find_proposal_message
+                      t
+                      ~proposal_id:v_pid
+                      ~round:t.state.valid_round)
+                   (fun proposal -> proposal.parent_commit)
+               in
+               Some
+                 (v,
+                  cached_hashes,
+                  Some t.state.valid_round,
+                  cached_parent_commit)
              end)
-        | _ -> Some (header, tx_hashes, None)
+        | _ -> Some (header, tx_hashes, None, parent_commit)
       else
-        Some (header, tx_hashes, None)
+        Some (header, tx_hashes, None, parent_commit)
     in
     match resolved with
     | None -> ()
-    | Some (header, tx_hashes, valid_round) ->
+    | Some (header, _, _, resolved_parent)
+      when
+        C_hash.parent_commit_hash_opt resolved_parent
+        <> header.parent_commit_hash ->
+      err_node t.my_addr
+        "event = drop_do_propose reason = parent_commit_hash_mismatch height = %Ld round = %d"
+        t.state.height
+        t.state.round
+    | Some (header, tx_hashes, valid_round, parent_commit) ->
     let proposal_id = C_hash.proposal_id header in
     cache_proposal_bundle t proposal_id header tx_hashes;
     let propose = {
@@ -431,11 +681,13 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
       valid_round;
       header;
       tx_hashes;
+      parent_commit;
       proposer = t.my_addr;
       signature = String.make 64 '\x00';
     } in
     let sign_bytes = C_hash.propose_sign_bytes propose in
     let propose = { propose with signature = sign_fn sign_bytes } in
+    cache_proposal_message t propose;
     t.current_proposal <- Some propose;
     emit t (SendPropose propose);
 
@@ -482,10 +734,10 @@ let do_propose t (header : epoch_header) (tx_hashes : string list) ~sign_fn =
      | LocalVoteConflict _ -> ())
   end
 
-
 let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
   if p.epoch_id <= t.finalized_height then ()
   else if p.epoch_id <> t.state.height then ()
+  else if p.round > t.state.round + max_round_ahead then ()
   else begin
     if p.round > t.state.round then begin
       record_higher_round t ~round:p.round ~validator:p.proposer;
@@ -494,27 +746,43 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
   if p.round <> t.state.round then ()
   else begin
     let proposal_id = C_hash.proposal_id p.header in
-    cache_proposal_bundle t proposal_id p.header p.tx_hashes;
-    t.current_proposal <- Some p;
     let sign_bytes = C_hash.propose_sign_bytes p in
     let proposer_valid = verify_fn p.proposer sign_bytes p.signature in
-    let expected_leader = leader_of t.vs ~epoch_id:p.epoch_id ~round:p.round in
-    let is_leader = expected_leader.address = p.proposer in
-    let root_valid = execute_fn p in
-    let lock_ok = lock_allows t proposal_id p.valid_round in
-    let accept = proposer_valid && is_leader && root_valid && lock_ok in
+    let envelope_valid =
+      proposal_is_well_formed
+        ~chain_id:t.chain_id
+        ~validator_set:t.vs
+        p
+      && C_hash.parent_commit_hash_opt p.parent_commit
+         = p.header.parent_commit_hash
+    in
+    let root_valid = envelope_valid && execute_fn p in
+    let lock_ok = envelope_valid && lock_allows t proposal_id p.valid_round in
+    let accept =
+      proposer_valid && envelope_valid && root_valid && lock_ok
+    in
+    if accept then begin
+      cache_proposal_message t p;
+      t.current_proposal <- Some p
+    end;
     let vote_proposal_id = if accept then proposal_id
       else Octra_net.Hash_domain.nil_hash in
-    if not (local_voting_allowed t) || not (can_prevote t) then ()
+    if not (can_prevote t) then ()
+    else if not (local_voting_allowed t) then
+      remember_pending_prevote t vote_proposal_id
     else begin
       t.state <- { t.state with step = PrevoteStep };
       let prevote_outcome =
         cast_local_vote t ~sign_fn ~vote_type:Prevote
           ~proposal_id:vote_proposal_id
       in
-      (match prevote_outcome with
-     | LocalVoteCast (`QuorumOf _)
-       when not (Octra_net.Hash_domain.is_nil vote_proposal_id) ->
+      let proposal_quorum =
+        match quorum_result t.prevotes ~validator_set:t.vs with
+        | `QuorumOf pid -> pid = vote_proposal_id
+        | `QuorumAny
+        | `Added -> false
+      in
+      if accept && proposal_quorum then begin
        let hdr = p.header in
        record_polc t t.state.round proposal_id;
        t.state <- { t.state with
@@ -546,14 +814,16 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
             delay_ms = timeout_ms ~round:t.state.round ~step:PrecommitStep;
             generation = t.generation;
           }))
-     | LocalVoteCast _
-     | LocalVoteAlreadySame ->
-       emit t (ScheduleTimeout {
-         step = PrevoteStep; round = t.state.round;
-         delay_ms = timeout_ms ~round:t.state.round ~step:PrevoteStep;
-         generation = t.generation;
-       })
-     | LocalVoteConflict _ -> ())
+      end else
+        match prevote_outcome with
+        | LocalVoteCast _
+        | LocalVoteAlreadySame ->
+          emit t (ScheduleTimeout {
+            step = PrevoteStep; round = t.state.round;
+            delay_ms = timeout_ms ~round:t.state.round ~step:PrevoteStep;
+            generation = t.generation;
+          })
+        | LocalVoteConflict _ -> ()
     end
   end
   end
@@ -572,10 +842,10 @@ let find_header_or_fallback t proposal_id =
         | Some h when C_hash.proposal_id h = proposal_id -> Some h
         | _ -> None
 
-
 let on_vote t (v : vote) ~sign_fn =
   if v.epoch_id <= t.finalized_height then ()
   else if v.epoch_id <> t.state.height then ()
+  else if v.round > t.state.round + max_round_ahead then ()
   else begin
     if v.round > t.state.round then begin
       record_higher_round t ~round:v.round ~validator:v.validator;
@@ -585,34 +855,50 @@ let on_vote t (v : vote) ~sign_fn =
   else
     match v.vote_type with
     | Prevote ->
-      let result = add_vote t.prevotes v ~quorum:t.vs.quorum in
+      let result = add_vote t.prevotes v ~validator_set:t.vs in
       (match result with
        | `QuorumOf proposal_id when t.state.step = PrevoteStep ->
-         (if not (Octra_net.Hash_domain.is_nil proposal_id) then begin
-           record_polc t t.state.round proposal_id;
-           let locked_header = find_header_or_fallback t proposal_id in
-           t.state <- { t.state with
-             locked_round = t.state.round;
-             locked_value = (match locked_header with Some h -> Some h | None -> t.state.locked_value);
-             valid_round = t.state.round;
-             valid_value = (match locked_header with Some h -> Some h | None -> t.state.valid_value);
-           }
-         end);
-
-         if local_voting_allowed t then begin
-           t.state <- { t.state with step = PrecommitStep };
-           match cast_local_vote t ~sign_fn ~vote_type:Precommit
-                   ~proposal_id with
-           | LocalVoteCast _
-           | LocalVoteAlreadySame ->
-             emit t (ScheduleTimeout {
-               step = PrecommitStep;
-               round = t.state.round;
-               delay_ms = timeout_ms ~round:t.state.round ~step:PrecommitStep;
-               generation = t.generation;
-             })
-           | LocalVoteConflict _ -> ()
-         end
+         let nil = Octra_net.Hash_domain.is_nil proposal_id in
+         let proposal =
+           if nil then None
+           else
+             find_proposal_message
+               t
+               ~proposal_id
+               ~round:t.state.round
+         in
+         (match nil, proposal with
+          | false, None ->
+            log_node t.my_addr
+              "event = defer_precommit reason = proposal_pending height = %Ld round = %d"
+              t.state.height
+              t.state.round
+          | _ ->
+            (match proposal with
+             | Some accepted ->
+               record_polc t t.state.round proposal_id;
+               t.state <- {
+                 t.state with
+                 locked_round = t.state.round;
+                 locked_value = Some accepted.header;
+                 valid_round = t.state.round;
+                 valid_value = Some accepted.header;
+               }
+             | None -> ());
+            if local_voting_allowed t then begin
+              t.state <- { t.state with step = PrecommitStep };
+              match cast_local_vote t ~sign_fn ~vote_type:Precommit
+                      ~proposal_id with
+              | LocalVoteCast _
+              | LocalVoteAlreadySame ->
+                emit t (ScheduleTimeout {
+                  step = PrecommitStep;
+                  round = t.state.round;
+                  delay_ms = timeout_ms ~round:t.state.round ~step:PrecommitStep;
+                  generation = t.generation;
+                })
+              | LocalVoteConflict _ -> ()
+            end)
        | `QuorumAny when t.state.step = PrevoteStep ->
 
          emit t (ScheduleTimeout {
@@ -624,7 +910,7 @@ let on_vote t (v : vote) ~sign_fn =
        | _ -> ())
 
     | Precommit ->
-      let result = add_vote t.precommits v ~quorum:t.vs.quorum in
+      let result = add_vote t.precommits v ~validator_set:t.vs in
       (match result with
        | `QuorumOf proposal_id when local_voting_allowed t ->
          (match find_header_or_fallback t proposal_id with
@@ -682,7 +968,6 @@ let accept_finalize_batch t (f : finalize) =
       end
     end
   end
-
 
 let on_timeout t ~step ~round ~generation ~sign_fn =
   if generation <> t.generation then ()

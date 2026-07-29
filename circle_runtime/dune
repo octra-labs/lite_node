@@ -5,6 +5,7 @@
  (libraries
   octra_core
   octra_vm
+  octra_crypto_guard
   lwt
   base64
   yojson

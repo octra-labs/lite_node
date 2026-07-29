@@ -1,52 +1,62 @@
-(*
-Octra Labs 2026
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-Lite node, for internal use only (pre-release build 0x1067dzc2)
+type reward_validator = {
+  address : string;
+  public_key : string option;
+  weight : Z.t;
+}
 
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+type reward_attribution = {
+  proposer_addr : string;
+  proposer_public_key : string option;
+  validators : reward_validator list;
+}
 
 type env = {
-  chain_id : string;
-  epoch_id : int;
-  proposer_addr : string;
+  chain_id        : string;
+  epoch_id        : int;
+  proposer_addr   : string;
   validator_addrs : string list;
   validator_pubkeys : (string * string) list;
   prev_state_root : string;
-  epoch_ts : float;
+  epoch_ts        : float;
   ready_state_root_at : (int -> string option Lwt.t) option;
   ready_max_lag : int;
 }
 
 type tx_reject = {
-  tx : Transaction.t;
+  tx         : Transaction.t;
   error_type : string;
   reason     : string;
 }
 
+type tx_effect =
+  | Confirmed of Z.t
+  | Rejected_after_fee of {
+      fee : Z.t;
+      error_type : string;
+      reason : string;
+    }
+
 type artifacts = {
-  confirmed : (Transaction.t * int) list;
-  rejected : tx_reject list;
+  confirmed      : (Transaction.t * int) list;
+  rejected       : tx_reject list;
   confirmed_fees : Z.t;
-  tx_count : int;
+  tx_count       : int;
 }
 
 type exec_result = {
   post_state_root : string;
-  artifacts : artifacts;
+  artifacts       : artifacts;
 }
 
 type account_ops = {
   mem : string -> bool;
   find_opt : string -> Ledger_types.account option;
+  total_supply : unit -> Z.t;
   debit : string -> Z.t -> int -> (unit, string) Stdlib.result;
+  debit_amount_only : string -> Z.t -> (unit, string) Stdlib.result;
   credit : string -> Z.t -> (unit, string) Stdlib.result;
   add_account : string -> Z.t -> (unit, string) Stdlib.result;
   add_account_with_pubkey : string -> Z.t -> string -> (unit, string) Stdlib.result;
@@ -58,7 +68,9 @@ type account_ops = {
 let ledger_ops (l : Ledger.t) : account_ops = {
   mem = (fun a -> Ledger.mem l a);
   find_opt = (fun a -> Ledger.find_opt l a);
+  total_supply = (fun () -> Ledger.get_total_supply l);
   debit = (fun a amt n -> Ledger.debit l a amt n);
+  debit_amount_only = (fun a amt -> Ledger.debit_amount_only l a amt);
   credit = (fun a amt -> Ledger.credit l a amt);
   add_account = (fun a amt -> Ledger.add_account l a amt);
   add_account_with_pubkey = (fun a amt pk -> Ledger.add_account_with_pubkey l a amt pk);
@@ -70,31 +82,58 @@ let ledger_ops (l : Ledger.t) : account_ops = {
 let overlay_ops (o : Ledger.Overlay.overlay) : account_ops = {
   mem = (fun a -> Ledger.Overlay.mem o a);
   find_opt = (fun a -> Ledger.Overlay.find_opt o a);
+  total_supply = (fun () -> Ledger.Overlay.total_supply o);
   debit = (fun a amt n -> Ledger.Overlay.debit o a amt n);
+  debit_amount_only = (fun a amt -> Ledger.Overlay.debit_amount_only o a amt);
   credit = (fun a amt -> Ledger.Overlay.credit o a amt);
   add_account = (fun a amt -> Ledger.Overlay.add_account o a amt);
   add_account_with_pubkey = (fun a amt pk -> Ledger.Overlay.add_account_with_pubkey o a amt pk);
   register_public_key = (fun a pk -> Ledger.Overlay.register_public_key o a pk);
-  apply_op01_burn = (fun ~from ~to_:_ _amt _n ->
-    ignore from;
-    Stdlib.Error "op01_burn not supported via overlay (use live ledger)");
+  apply_op01_burn = (fun ~from ~to_ amt nonce ->
+    Ledger.Overlay.apply_op01_burn o ~from ~to_ amt nonce);
 }
 
 type backend = {
-  store : Store_irmin.t;
-  ledger : Ledger.t;
-  ops : account_ops;
+  store       : Store_irmin.t;
+  ledger      : Ledger.t;
+  ops         : account_ops;
+  emission_policy : Emission_policy.t;
+  emission_schedule : Emission_schedule.t;
+  legacy_total_supply : string option;
+  sender_key_activation_epoch : int option;
+  validator_policy : Validator_policy.t;
   begin_batch : unit -> unit Lwt.t;
   commit_batch: unit -> unit Lwt.t;
   flush_dirty : unit -> unit Lwt.t;
   get_head_hash: unit -> string option Lwt.t;
-  set_meta : string -> string -> unit Lwt.t;
+  set_meta    : string -> string -> unit Lwt.t;
 }
 
-let make_live_backend store ledger = {
+let resolve_legacy_total = function
+  | Some _ as value -> value
+  | None -> Emission_policy.legacy_total Sys.getenv_opt
+
+let resolve_sender_key_activation = function
+  | Some epoch -> Some epoch
+  | None -> Sender_key_policy.activation_epoch_exn Sys.getenv_opt
+
+let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
+    ?sender_key_activation_epoch ?validator_policy store ledger = {
   store;
   ledger;
   ops = ledger_ops ledger;
+  emission_policy = Option.value emission_policy ~default:(Emission_policy.of_env Sys.getenv_opt);
+  emission_schedule =
+    Option.value
+      emission_schedule
+      ~default:(Emission_schedule.of_env_exn Sys.getenv_opt);
+  legacy_total_supply = resolve_legacy_total legacy_total_supply;
+  sender_key_activation_epoch =
+    resolve_sender_key_activation sender_key_activation_epoch;
+  validator_policy =
+    Option.value
+      validator_policy
+      ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
   begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch");
   flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
@@ -102,10 +141,24 @@ let make_live_backend store ledger = {
   set_meta = (fun k v -> Store_irmin.set_meta store k v);
 }
 
-let make_overlay_backend store ledger overlay = {
+let make_overlay_backend ?emission_policy ?emission_schedule
+    ?legacy_total_supply ?sender_key_activation_epoch ?validator_policy
+    store ledger overlay = {
   store;
   ledger;
   ops = overlay_ops overlay;
+  emission_policy = Option.value emission_policy ~default:(Emission_policy.of_env Sys.getenv_opt);
+  emission_schedule =
+    Option.value
+      emission_schedule
+      ~default:(Emission_schedule.of_env_exn Sys.getenv_opt);
+  legacy_total_supply = resolve_legacy_total legacy_total_supply;
+  sender_key_activation_epoch =
+    resolve_sender_key_activation sender_key_activation_epoch;
+  validator_policy =
+    Option.value
+      validator_policy
+      ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
   begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch_overlay");
   flush_dirty = (fun () -> Lwt.return_unit);
@@ -125,34 +178,111 @@ let compute_base_reward ~emission_remaining =
 
 type reward_plan = {
   base_reward : Z.t;
+  fees_burned : Z.t;
+  fees_rewarded : Z.t;
   total_reward : Z.t;
   proposer_total : Z.t;
   each_validator : Z.t;
   remainder : Z.t;
   new_emission_remaining : Z.t;
   new_total_supply : Z.t;
+  new_supply_retired : Z.t;
+  supply_tracking_active : bool;
 }
 
-let build_reward_plan ~validator_count ~emission_remaining ~confirmed_fees ~prev_supply =
-  let base_reward = compute_base_reward ~emission_remaining in
-  let total_reward = Z.add base_reward confirmed_fees in
-  let n = if validator_count <= 0 then 1 else validator_count in
-  let proposer_cut = Z.div (Z.mul total_reward (Z.of_int 7000)) (Z.of_int 10000) in
-  let validator_pool = Z.sub total_reward proposer_cut in
-  let each_validator = Z.div validator_pool (Z.of_int n) in
-  let remainder = Z.sub validator_pool (Z.mul each_validator (Z.of_int n)) in
-  let proposer_total = Z.add proposer_cut remainder in
-  let new_emission_remaining =
-    if Z.gt base_reward Z.zero then Z.sub emission_remaining base_reward
-    else emission_remaining in
-  let new_total_supply =
-    if Z.gt base_reward Z.zero then Z.add prev_supply base_reward
-    else prev_supply in
-  { base_reward; total_reward; proposer_total; each_validator; remainder;
-    new_emission_remaining; new_total_supply }
+let build_reward_plan_with_base ~fee_burn_active ~supply_retired
+    ~base_reward ~validator_count ~emission_remaining ~confirmed_fees
+    ~prev_supply =
+  if validator_count <= 0 then
+    Error "reward plan requires active validators"
+  else if Z.sign supply_retired < 0 then
+    Error "negative retired supply"
+  else
+    match Fee_policy.split ~active:fee_burn_active confirmed_fees with
+    | Error error -> Error error
+    | Ok fee_split ->
+      match Emission_policy.validate_state
+        ~emission_remaining
+        ~total_supply:prev_supply with
+      | Error error -> Error error
+      | Ok headroom ->
+      if Z.sign base_reward < 0 then
+        Error "negative base reward"
+      else if Z.gt base_reward emission_remaining then
+        Error "base reward exceeds emission reserve"
+      else if Z.gt base_reward headroom then
+        Error "base reward exceeds supply headroom"
+      else
+        let total_reward = Z.add base_reward fee_split.rewarded in
+        let n = Z.of_int validator_count in
+        let proposer_cut =
+          Z.div (Z.mul total_reward (Z.of_int 7000)) (Z.of_int 10000) in
+        let validator_pool = Z.sub total_reward proposer_cut in
+        let each_validator = Z.div validator_pool n in
+        let remainder = Z.sub validator_pool (Z.mul each_validator n) in
+        let proposer_total = Z.add proposer_cut remainder in
+        let new_emission_remaining = Z.sub emission_remaining base_reward in
+        let new_total_supply =
+          Z.sub
+            (Z.add prev_supply base_reward)
+            fee_split.burned
+        in
+        let new_supply_retired = Z.add supply_retired fee_split.burned in
+        if Z.sign new_total_supply < 0 then
+          Error "fee burn exceeds total supply"
+        else if fee_burn_active
+                && not
+                  (Z.equal
+                     (Z.add
+                        new_total_supply
+                        (Z.add new_emission_remaining new_supply_retired))
+                     Denomination.max_supply) then
+          Error "supply envelope transition mismatch"
+        else
+        Ok {
+          base_reward;
+          fees_burned = fee_split.burned;
+          fees_rewarded = fee_split.rewarded;
+          total_reward;
+          proposer_total;
+          each_validator;
+          remainder;
+          new_emission_remaining;
+          new_total_supply;
+          new_supply_retired;
+          supply_tracking_active = fee_burn_active;
+        }
 
-let ensure_reward_account ~backend ~env addr =
-  let known_pk = List.assoc_opt addr env.validator_pubkeys in
+let build_reward_plan ~fee_burn_active ~supply_retired ~validator_count
+    ~emission_remaining ~confirmed_fees ~prev_supply =
+  build_reward_plan_with_base
+    ~fee_burn_active
+    ~supply_retired
+    ~base_reward:(compute_base_reward ~emission_remaining)
+    ~validator_count
+    ~emission_remaining
+    ~confirmed_fees
+    ~prev_supply
+
+let reward_public_key env (reward : reward_attribution) addr =
+  if String.equal addr reward.proposer_addr then
+    reward.proposer_public_key
+  else
+    match
+      reward.validators
+      |> List.find_opt (fun validator -> String.equal validator.address addr)
+    with
+    | Some validator ->
+      begin
+        match validator.public_key with
+        | Some _ as public_key -> public_key
+        | None -> List.assoc_opt addr env.validator_pubkeys
+      end
+    | None -> List.assoc_opt addr env.validator_pubkeys
+
+let ensure_reward_account ~backend ~env
+    ~(reward : reward_attribution) addr =
+  let known_pk = reward_public_key env reward addr in
   match backend.ops.find_opt addr with
   | Some a ->
     (match a.Ledger_types.public_key, known_pk with
@@ -160,35 +290,222 @@ let ensure_reward_account ~backend ~env addr =
      | _ -> ());
     Lwt.return_unit
   | None ->
-    ignore (
+    let result =
       match known_pk with
       | Some pk -> backend.ops.add_account_with_pubkey addr Z.zero pk
       | None -> backend.ops.add_account addr Z.zero
-    );
+    in
+    match result with
+    | Ok () -> Lwt.return_unit
+    | Error error ->
+      Lwt.fail_with (Printf.sprintf "reward account failed addr = %s reason = %s" addr error)
+
+let check_reward_supply backend plan =
+  if Z.leq plan.total_reward Z.zero then
+    Lwt.return_unit
+  else if Z.gt (Z.add (backend.ops.total_supply ()) plan.total_reward)
+      Denomination.max_supply then
+    Lwt.fail_with "reward supply cap rejected"
+  else
     Lwt.return_unit
 
-let apply_epoch_footer ~backend ~env ~plan =
+let credit_reward backend addr amount =
+  if Z.leq amount Z.zero then
+    Lwt.return_unit
+  else
+    match backend.ops.credit addr amount with
+    | Ok () -> Lwt.return_unit
+    | Error error ->
+      Lwt.fail_with (Printf.sprintf "reward credit failed addr = %s reason = %s" addr error)
+
+let check_reward_credits backend ~before plan =
+  let actual = backend.ops.total_supply () in
+  let expected = Z.add before plan.total_reward in
+  if Z.equal actual expected then
+    Lwt.return_unit
+  else
+    Lwt.fail_with
+      (Printf.sprintf
+         "reward credit mismatch expected = %s actual = %s"
+         (Z.to_string expected)
+         (Z.to_string actual))
+
+type reward_credit = {
+  address : string;
+  proposer : bool;
+  validator : bool;
+  amount : Z.t;
+}
+
+let canonical_reward_validators (validators : reward_validator list) =
+  List.sort
+    (fun (left : reward_validator) (right : reward_validator) ->
+      String.compare left.address right.address)
+    validators
+
+let reward_credits (reward : reward_attribution) plan =
+  let validators = canonical_reward_validators reward.validators in
+  let addresses =
+    List.map
+      (fun (validator : reward_validator) -> validator.address)
+      validators
+  in
+  if validators = [] then
+    Error "reward distribution requires validators"
+  else if addresses <> List.sort_uniq String.compare addresses then
+    Error "reward distribution has duplicate validators"
+  else if
+    List.exists
+      (fun (validator : reward_validator) -> Z.sign validator.weight <= 0)
+      validators
+  then
+    Error "reward distribution has non-positive weight"
+  else
+    let total_weight =
+      List.fold_left
+        (fun total (validator : reward_validator) ->
+          Z.add total validator.weight)
+        Z.zero
+        validators
+    in
+    if Z.sign total_weight <= 0 then
+      Error "reward distribution total weight is not positive"
+    else
+      let validator_count = Z.of_int (List.length validators) in
+      let validator_pool =
+        Z.add
+          (Z.mul plan.each_validator validator_count)
+          plan.remainder
+      in
+      let proposer_base = Z.sub plan.proposer_total plan.remainder in
+      if Z.sign proposer_base < 0 then
+        Error "reward proposer base is negative"
+      else
+        let shares =
+          List.map
+            (fun (validator : reward_validator) ->
+              validator,
+              Z.div
+                (Z.mul validator_pool validator.weight)
+                total_weight)
+            validators
+        in
+        let distributed =
+          List.fold_left
+            (fun total (_, amount) -> Z.add total amount)
+            Z.zero
+            shares
+        in
+        let proposer_amount =
+          Z.add proposer_base (Z.sub validator_pool distributed)
+        in
+        let table = Hashtbl.create (List.length validators + 1) in
+        let add address ~proposer ~validator amount =
+          let prior =
+            Option.value
+              ~default:{
+                address;
+                proposer = false;
+                validator = false;
+                amount = Z.zero;
+              }
+              (Hashtbl.find_opt table address)
+          in
+          Hashtbl.replace table address {
+            address;
+            proposer = prior.proposer || proposer;
+            validator = prior.validator || validator;
+            amount = Z.add prior.amount amount;
+          }
+        in
+        List.iter
+          (fun ((validator : reward_validator), amount) ->
+            add
+              validator.address
+              ~proposer:false
+              ~validator:true
+              amount)
+          shares;
+        add
+          reward.proposer_addr
+          ~proposer:true
+          ~validator:false
+          proposer_amount;
+        let credits =
+          Hashtbl.to_seq_values table
+          |> List.of_seq
+          |> List.filter (fun credit -> Z.sign credit.amount > 0)
+          |> List.sort (fun left right -> String.compare left.address right.address)
+        in
+        let credited =
+          List.fold_left
+            (fun total credit -> Z.add total credit.amount)
+            Z.zero
+            credits
+        in
+        if not (Z.equal credited plan.total_reward) then
+          Error "reward distribution total mismatch"
+        else
+          Ok credits
+
+let default_reward (env : env) : reward_attribution =
+  let validators =
+    match env.validator_addrs with
+    | [] -> [env.proposer_addr]
+    | values -> values
+  in
+  {
+    proposer_addr = env.proposer_addr;
+    proposer_public_key =
+      List.assoc_opt env.proposer_addr env.validator_pubkeys;
+    validators =
+      List.map
+        (fun address -> {
+          address;
+          public_key = List.assoc_opt address env.validator_pubkeys;
+          weight = Z.one;
+        })
+        validators;
+  }
+
+let apply_epoch_footer_with_reward ~reward ~backend ~env ~plan =
   let open Lwt.Syntax in
+  let* () =
+    match Emission_policy.check_reward backend.emission_policy plan.base_reward with
+    | Ok () -> Lwt.return_unit
+    | Error error -> Lwt.fail_with error
+  in
+  let* () = check_reward_supply backend plan in
+  let supply_before_rewards = backend.ops.total_supply () in
   let* () =
     if Z.leq plan.total_reward Z.zero then Lwt.return_unit
     else begin
+      let credits =
+        match reward_credits reward plan with
+        | Ok credits -> credits
+        | Error error -> failwith error
+      in
       let reward_addrs =
-        List.sort_uniq String.compare (env.proposer_addr :: env.validator_addrs) in
-      let* () = Lwt_list.iter_s (ensure_reward_account ~backend ~env) reward_addrs in
-      let* () = Lwt_list.iter_s (fun addr ->
-        if Z.gt plan.each_validator Z.zero then
-          match backend.ops.credit addr plan.each_validator with
-          | Ok () -> Lwt.return_unit
-          | Error _ -> Lwt.return_unit
-        else Lwt.return_unit
-      ) env.validator_addrs in
-      (match backend.ops.credit env.proposer_addr plan.proposer_total with
-       | Ok () -> ()
-       | Error _ -> ());
-      if Z.gt plan.base_reward Z.zero then begin
+        List.map (fun credit -> credit.address) credits
+      in
+      let* () =
+        Lwt_list.iter_s
+          (ensure_reward_account ~backend ~env ~reward)
+          reward_addrs
+      in
+      let* () =
+        Lwt_list.iter_s
+          (fun credit -> credit_reward backend credit.address credit.amount)
+          credits
+      in
+      let* () = check_reward_credits backend ~before:supply_before_rewards plan in
+      if Z.gt plan.base_reward Z.zero || Z.gt plan.fees_burned Z.zero then begin
         let* () = backend.set_meta "emission_remaining" (Z.to_string plan.new_emission_remaining) in
         let* () = backend.set_meta "total_supply" (Z.to_string plan.new_total_supply) in
-        Lwt.return_unit
+        if plan.supply_tracking_active then
+          backend.set_meta "supply_retired" (Z.to_string plan.new_supply_retired)
+        else
+          Lwt.return_unit
       end else
         Lwt.return_unit
     end
@@ -196,6 +513,13 @@ let apply_epoch_footer ~backend ~env ~plan =
   let* () = backend.set_meta "last_epoch" (string_of_int env.epoch_id) in
   let* () = backend.set_meta "current_epoch" (string_of_int (env.epoch_id + 1)) in
   Lwt.return_unit
+
+let apply_epoch_footer ~backend ~env ~plan =
+  apply_epoch_footer_with_reward
+    ~reward:(default_reward env)
+    ~backend
+    ~env
+    ~plan
 
 let parse_circle_deploy_payload tx =
   match tx.Transaction.message with
@@ -1192,65 +1516,105 @@ let process_private_state_cell_write
               end
         end
 
-let process_circle_balance_cell_put_tx ~(backend : backend) (tx : Transaction.t) =
-  match parse_circle_balance_cell_put_payload tx, decode_circle_body_b64 tx with
-  | Stdlib.Error e, _ -> Lwt.return (Stdlib.Error e)
-  | _, Stdlib.Error e -> Lwt.return (Stdlib.Error e)
-  | Stdlib.Ok payload, Stdlib.Ok _ ->
+let circle_cell_plan ~backend ~current_epoch ~expected_transition_hash tx =
+  let open Lwt.Syntax in
+  match expected_transition_hash with
+  | None -> Lwt.return_error "circle cell preverify receipt is required"
+  | Some expected ->
+    let* plan =
+      Circle_cell_transition.prepare
+        ~store:backend.store
+        ~ledger:backend.ledger
+        ~current_epoch
+        tx
+    in
     begin
-      match Circle_balance_cell.resolve_put_payload payload with
-      | Stdlib.Error e ->
-        Lwt.return (Stdlib.Error ("invalid_circle_balance_cell", e))
-      | Stdlib.Ok request ->
-        process_private_state_cell_write
-          ~backend
-          ~tx
-          ~resolved:(object
-            method state_ref = request.state_ref
-            method content_type = request.content_type
-            method encoding = request.encoding
-            method key_id = request.key_id
-            method plaintext_hash = request.plaintext_hash
-            method padding_class = request.padding_class
-            method delivery_key_id = request.delivery_key_id
-            method activate_after_epoch = request.activate_after_epoch
-            method expire_after_epoch = request.expire_after_epoch
-            method metadata_mode = request.metadata_mode
-            method descriptor = request.descriptor
-          end)
-          ~write_cell_snapshot:(fun storage_tbl path_key ->
-            Circle_balance_cell.write_snapshot storage_tbl path_key request.cell)
+      match plan with
+      | Error error -> Lwt.return_error error
+      | Ok plan when plan.Circle_cell_transition.transition_hash = expected ->
+        Lwt.return_ok plan
+      | Ok _ -> Lwt.return_error "circle cell transition hash mismatch"
     end
 
-let process_circle_register_cell_put_tx ~(backend : backend) (tx : Transaction.t) =
-  match parse_circle_register_cell_put_payload tx, decode_circle_body_b64 tx with
-  | Stdlib.Error e, _ -> Lwt.return (Stdlib.Error e)
-  | _, Stdlib.Error e -> Lwt.return (Stdlib.Error e)
-  | Stdlib.Ok payload, Stdlib.Ok _ ->
-    begin
-      match Circle_register_cell.resolve_put_payload payload with
-      | Stdlib.Error e ->
-        Lwt.return (Stdlib.Error ("invalid_circle_register_cell", e))
-      | Stdlib.Ok request ->
-        process_private_state_cell_write
-          ~backend
-          ~tx
-          ~resolved:(object
-            method state_ref = request.state_ref
-            method content_type = request.content_type
-            method encoding = request.encoding
-            method key_id = request.key_id
-            method plaintext_hash = request.plaintext_hash
-            method padding_class = request.padding_class
-            method delivery_key_id = request.delivery_key_id
-            method activate_after_epoch = request.activate_after_epoch
-            method expire_after_epoch = request.expire_after_epoch
-            method metadata_mode = request.metadata_mode
-            method descriptor = request.descriptor
-          end)
-          ~write_cell_snapshot:(fun storage_tbl path_key ->
-            Circle_register_cell.write_snapshot storage_tbl path_key request.cell)
-    end
+let process_circle_balance_cell_put_tx
+    ~(backend : backend)
+    ~current_epoch
+    ?expected_transition_hash
+    (tx : Transaction.t) =
+  let open Lwt.Syntax in
+  let* plan =
+    circle_cell_plan
+      ~backend
+      ~current_epoch
+      ~expected_transition_hash
+      tx
+  in
+  match plan with
+  | Error error ->
+    Lwt.return (Stdlib.Error ("invalid_circle_balance_cell", error))
+  | Ok { Circle_cell_transition.cell = Register _; _ } ->
+    Lwt.return
+      (Stdlib.Error
+         ("invalid_circle_balance_cell", "circle cell plan type mismatch"))
+  | Ok { cell = Balance request; _ } ->
+    process_private_state_cell_write
+      ~backend
+      ~tx
+      ~resolved:(object
+        method state_ref = request.state_ref
+        method content_type = request.content_type
+        method encoding = request.encoding
+        method key_id = request.key_id
+        method plaintext_hash = request.plaintext_hash
+        method padding_class = request.padding_class
+        method delivery_key_id = request.delivery_key_id
+        method activate_after_epoch = request.activate_after_epoch
+        method expire_after_epoch = request.expire_after_epoch
+        method metadata_mode = request.metadata_mode
+        method descriptor = request.descriptor
+      end)
+      ~write_cell_snapshot:(fun storage_tbl path_key ->
+        Circle_balance_cell.write_snapshot storage_tbl path_key request.cell)
+
+let process_circle_register_cell_put_tx
+    ~(backend : backend)
+    ~current_epoch
+    ?expected_transition_hash
+    (tx : Transaction.t) =
+  let open Lwt.Syntax in
+  let* plan =
+    circle_cell_plan
+      ~backend
+      ~current_epoch
+      ~expected_transition_hash
+      tx
+  in
+  match plan with
+  | Error error ->
+    Lwt.return (Stdlib.Error ("invalid_circle_register_cell", error))
+  | Ok { Circle_cell_transition.cell = Balance _; _ } ->
+    Lwt.return
+      (Stdlib.Error
+         ("invalid_circle_register_cell", "circle cell plan type mismatch"))
+  | Ok { cell = Register request; _ } ->
+    process_private_state_cell_write
+      ~backend
+      ~tx
+      ~resolved:(object
+        method state_ref = request.state_ref
+        method content_type = request.content_type
+        method encoding = request.encoding
+        method key_id = request.key_id
+        method plaintext_hash = request.plaintext_hash
+        method padding_class = request.padding_class
+        method delivery_key_id = request.delivery_key_id
+        method activate_after_epoch = request.activate_after_epoch
+        method expire_after_epoch = request.expire_after_epoch
+        method metadata_mode = request.metadata_mode
+        method descriptor = request.descriptor
+      end)
+      ~write_cell_snapshot:(fun storage_tbl path_key ->
+        Circle_register_cell.write_snapshot storage_tbl path_key request.cell)
 
 let process_circle_transport_policy_put_tx ~(backend : backend) (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -1859,9 +2223,413 @@ let process_circle_ingress_commit_tx ~(backend : backend) (tx : Transaction.t) ~
           end
     end
 
+let load_validator_registry backend =
+  let open Lwt.Syntax in
+  let* stored =
+    Store_irmin.get_meta backend.store Validator_registry.meta_key
+  in
+  match stored with
+  | None -> Lwt.return (Ok Validator_registry.empty)
+  | Some raw -> Lwt.return (Validator_registry.of_string raw)
+
+let save_validator_registry backend registry =
+  backend.set_meta
+    Validator_registry.meta_key
+    (Validator_registry.to_string registry)
+
+let ensure_validator_escrow backend =
+  if backend.ops.mem Validator_registry.escrow_address then
+    Ok ()
+  else
+    backend.ops.add_account Validator_registry.escrow_address Z.zero
+
+let process_validator_bond_tx ~backend ~env tx =
+  let open Lwt.Syntax in
+  match backend.validator_policy with
+  | Validator_policy.Inactive ->
+    Lwt.return
+      (Stdlib.Error
+         ("validator_bond_rejected", "validator admission is inactive"))
+  | Validator_policy.Bonded policy ->
+    if not (String.equal tx.Transaction.to_ Validator_registry.escrow_address) then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_bond_rejected", "recipient must be validator escrow"))
+    else
+      match Validator_registry.bond_payload_of_message tx.Transaction.message with
+      | Error error ->
+        Lwt.return (Stdlib.Error ("malformed_transaction", error))
+      | Ok payload ->
+        let* registry_result = load_validator_registry backend in
+        begin
+          match registry_result with
+          | Error error ->
+            Lwt.return
+              (Stdlib.Error ("validator_registry_corrupt", error))
+          | Ok registry ->
+            begin
+              match
+                Validator_registry.apply_bond
+                  policy.parameters
+                  ~chain_id:env.chain_id
+                  ~epoch:(Int64.of_int env.epoch_id)
+                  ~address:tx.from
+                  ~sender_pubkey_b64:
+                    (Option.value tx.public_key ~default:"")
+                  ~amount:tx.amount
+                  ~nonce:tx.nonce
+                  payload
+                  registry
+              with
+              | Error error ->
+                Lwt.return
+                  (Stdlib.Error ("validator_bond_rejected", error))
+              | Ok next ->
+                let debit = Z.add tx.amount tx.ou in
+                begin
+                  match backend.ops.debit tx.from debit tx.nonce with
+                  | Error error ->
+                    Lwt.return
+                      (Stdlib.Error ("insufficient_balance", error))
+                  | Ok () ->
+                    begin
+                      match ensure_validator_escrow backend with
+                      | Error error ->
+                        Lwt.return
+                          (Stdlib.Error ("validator_escrow_rejected", error))
+                      | Ok () ->
+                        begin
+                          match
+                            backend.ops.credit
+                              Validator_registry.escrow_address
+                              tx.amount
+                          with
+                          | Error error ->
+                            Lwt.return
+                              (Stdlib.Error
+                                 ("validator_escrow_rejected", error))
+                          | Ok () ->
+                            let* () = save_validator_registry backend next in
+                            Lwt.return (Stdlib.Ok tx.ou)
+                        end
+                    end
+                end
+            end
+        end
+
+let process_validator_exit_tx ~backend ~env tx =
+  let open Lwt.Syntax in
+  match backend.validator_policy with
+  | Validator_policy.Inactive ->
+    Lwt.return
+      (Stdlib.Error
+         ("validator_exit_rejected", "validator admission is inactive"))
+  | Validator_policy.Bonded _ ->
+    if Z.sign tx.Transaction.amount <> 0 then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_exit_rejected", "amount must be zero"))
+    else if not (String.equal tx.from tx.to_) then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_exit_rejected", "validator exit must be self-directed"))
+    else
+      let* registry_result = load_validator_registry backend in
+      begin
+        match registry_result with
+        | Error error ->
+          Lwt.return (Stdlib.Error ("validator_registry_corrupt", error))
+        | Ok registry ->
+          begin
+            match
+              Validator_registry.request_exit
+                ~epoch:(Int64.of_int env.epoch_id)
+                ~address:tx.from
+                registry
+            with
+            | Error error ->
+              Lwt.return
+                (Stdlib.Error ("validator_exit_rejected", error))
+            | Ok next ->
+              begin
+                match backend.ops.debit tx.from tx.ou tx.nonce with
+                | Error error ->
+                  Lwt.return
+                    (Stdlib.Error ("insufficient_balance", error))
+                | Ok () ->
+                  let* () = save_validator_registry backend next in
+                  Lwt.return (Stdlib.Ok tx.ou)
+              end
+          end
+      end
+
+let process_validator_withdraw_tx ~backend ~env tx =
+  let open Lwt.Syntax in
+  match backend.validator_policy with
+  | Validator_policy.Inactive ->
+    Lwt.return
+      (Stdlib.Error
+         ("validator_withdraw_rejected", "validator admission is inactive"))
+  | Validator_policy.Bonded policy ->
+    if Z.sign tx.Transaction.amount <> 0 then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_withdraw_rejected", "amount must be zero"))
+    else if not (String.equal tx.from tx.to_) then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_withdraw_rejected",
+            "validator withdrawal must be self-directed"))
+    else
+      let* registry_result = load_validator_registry backend in
+      begin
+        match registry_result with
+        | Error error ->
+          Lwt.return (Stdlib.Error ("validator_registry_corrupt", error))
+        | Ok registry ->
+          begin
+            match
+              Validator_registry.withdraw
+                policy.parameters
+                ~current_epoch:(Int64.of_int env.epoch_id)
+                ~active_addresses:env.validator_addrs
+                ~address:tx.from
+                registry
+            with
+            | Error error ->
+              Lwt.return
+                (Stdlib.Error ("validator_withdraw_rejected", error))
+            | Ok (next, amount) ->
+              begin
+                match backend.ops.debit tx.from tx.ou tx.nonce with
+                | Error error ->
+                  Lwt.return
+                    (Stdlib.Error ("insufficient_balance", error))
+                | Ok () ->
+                  begin
+                    match
+                      backend.ops.debit_amount_only
+                        Validator_registry.escrow_address
+                        amount
+                    with
+                    | Error error ->
+                      Lwt.return
+                        (Stdlib.Error ("validator_escrow_rejected", error))
+                    | Ok () ->
+                      begin
+                        match backend.ops.credit tx.from amount with
+                        | Error error ->
+                          Lwt.return
+                            (Stdlib.Error
+                               ("validator_withdraw_rejected", error))
+                        | Ok () ->
+                          let* () = save_validator_registry backend next in
+                          Lwt.return (Stdlib.Ok tx.ou)
+                      end
+                  end
+              end
+          end
+      end
+
+let parse_nonnegative_meta label = function
+  | None -> Error (label ^ " is unavailable")
+  | Some raw ->
+    begin
+      try
+        let value = Z.of_string raw in
+        if Z.sign value < 0 then Error (label ^ " is negative")
+        else Ok value
+      with _ ->
+        Error ("invalid " ^ label)
+    end
+
+let load_slash_supply backend =
+  let open Lwt.Syntax in
+  let* total =
+    Store_irmin.get_meta backend.store "total_supply"
+  in
+  let* remaining =
+    Store_irmin.get_meta backend.store "emission_remaining"
+  in
+  let* retired =
+    Store_irmin.get_meta
+      backend.store
+      Emission_schedule.retired_key
+  in
+  match
+    parse_nonnegative_meta "total supply" total,
+    parse_nonnegative_meta "emission remaining" remaining,
+    parse_nonnegative_meta "retired supply" retired
+  with
+  | Ok total, Ok remaining, Ok retired ->
+    if
+      Z.equal
+        (Z.add total (Z.add remaining retired))
+        Denomination.max_supply
+    then
+      Lwt.return (Ok (total, retired))
+    else
+      Lwt.return (Error "validator slash supply envelope mismatch")
+  | Error error, _, _
+  | _, Error error, _
+  | _, _, Error error -> Lwt.return (Error error)
+
+let process_validator_evidence_tx ~backend ~env tx =
+  let open Lwt.Syntax in
+  match backend.validator_policy with
+  | Validator_policy.Inactive ->
+    Lwt.return
+      (Stdlib.Error
+         ("validator_evidence_rejected", "validator admission is inactive"))
+  | Validator_policy.Bonded policy ->
+    let current_epoch = Int64.of_int env.epoch_id in
+    if env.epoch_id < policy.activation_epoch then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_evidence_rejected",
+            "validator admission is not active"))
+    else if Z.sign tx.Transaction.amount <> 0 then
+      Lwt.return
+        (Stdlib.Error
+           ("validator_evidence_rejected", "amount must be zero"))
+    else
+      match Validator_evidence.proof_of_message tx.Transaction.message with
+      | Error error ->
+        Lwt.return (Stdlib.Error ("malformed_transaction", error))
+      | Ok proof ->
+        let* registry_result = load_validator_registry backend in
+        begin
+          match registry_result with
+          | Error error ->
+            Lwt.return
+              (Stdlib.Error ("validator_registry_corrupt", error))
+          | Ok registry ->
+            begin
+              match Validator_registry.find tx.to_ registry with
+              | None ->
+                Lwt.return
+                  (Stdlib.Error
+                     ("validator_evidence_rejected",
+                      "validator bond not found"))
+              | Some candidate ->
+                begin
+                  match
+                    Validator_evidence.verify
+                      ~chain_id:env.chain_id
+                      ~current_epoch
+                      ~evidence_epochs:policy.evidence_epochs
+                      ~bonded_epoch:
+                        candidate.Validator_admission.bonded_epoch
+                      ~address:tx.to_
+                      ~pubkey:candidate.Validator_admission.pubkey
+                      proof
+                  with
+                  | Error error ->
+                    Lwt.return
+                      (Stdlib.Error
+                         ("validator_evidence_rejected", error))
+                  | Ok evidence ->
+                    begin
+                      match
+                        Validator_registry.apply_slash
+                          ~current_epoch
+                          ~evidence_epochs:policy.evidence_epochs
+                          evidence
+                          registry
+                      with
+                      | Error error ->
+                        Lwt.return
+                          (Stdlib.Error
+                             ("validator_evidence_rejected", error))
+                      | Ok (next, amount) ->
+                        let* supply = load_slash_supply backend in
+                        begin
+                          match supply with
+                          | Error error ->
+                            Lwt.return
+                              (Stdlib.Error
+                                 ("validator_evidence_rejected", error))
+                          | Ok (total, retired) ->
+                            if Z.lt total amount then
+                              Lwt.return
+                                (Stdlib.Error
+                                   ("validator_evidence_rejected",
+                                    "validator slash exceeds total supply"))
+                            else
+                              begin
+                                match
+                                  backend.ops.debit
+                                    tx.from
+                                    tx.ou
+                                    tx.nonce
+                                with
+                                | Error error ->
+                                  Lwt.return
+                                    (Stdlib.Error
+                                       ("insufficient_balance", error))
+                                | Ok () ->
+                                  begin
+                                    match
+                                      backend.ops.debit_amount_only
+                                        Validator_registry.escrow_address
+                                        amount
+                                    with
+                                    | Error error ->
+                                      Lwt.return
+                                        (Stdlib.Error
+                                           ("validator_escrow_rejected",
+                                            error))
+                                    | Ok () ->
+                                      let next_total =
+                                        Z.sub total amount
+                                      in
+                                      let next_retired =
+                                        Z.add retired amount
+                                      in
+                                      let* () =
+                                        save_validator_registry
+                                          backend
+                                          next
+                                      in
+                                      let* () =
+                                        backend.set_meta
+                                          "total_supply"
+                                          (Z.to_string next_total)
+                                      in
+                                      let* () =
+                                        backend.set_meta
+                                          Emission_schedule.retired_key
+                                          (Z.to_string next_retired)
+                                      in
+                                      Octra_log.warn
+                                        "validator"
+                                        "event = bond_slashed offender = %s evidence = %s evidence_epoch = %Ld apply_epoch = %Ld amount = %s"
+                                        evidence.offender
+                                        evidence.id
+                                        evidence.evidence_epoch
+                                        current_epoch
+                                        (Z.to_string amount);
+                                      Lwt.return (Stdlib.Ok tx.ou)
+                                  end
+                              end
+                        end
+                    end
+                end
+            end
+        end
+
 let process_validator_set_update_tx ~backend ~env tx =
   let open Lwt.Syntax in
-  if not (List.mem tx.Transaction.from env.validator_addrs) then
+  if not
+       (Validator_policy.manual_update_allowed
+          backend.validator_policy
+          ~epoch:env.epoch_id)
+  then
+    Lwt.return
+      (Stdlib.Error
+         ("validator_set_update_rejected",
+          "manual validator updates are disabled"))
+  else if not (List.mem tx.Transaction.from env.validator_addrs) then
     Lwt.return (Stdlib.Error ("validator_set_update_rejected", "sender is not an active validator"))
   else if Z.sign tx.Transaction.amount <> 0 then
     Lwt.return (Stdlib.Error ("validator_set_update_rejected", "amount must be zero"))
@@ -1869,7 +2637,12 @@ let process_validator_set_update_tx ~backend ~env tx =
     match Validator_set_update.of_message tx.Transaction.message with
     | Error e -> Lwt.return (Stdlib.Error ("malformed_transaction", e))
     | Ok update ->
-      if Int64.compare update.Validator_set_update.activate_epoch (Int64.of_int env.epoch_id) <= 0 then
+      if update.Validator_set_update.weighted then
+        Lwt.return
+          (Stdlib.Error
+             ("validator_set_update_rejected",
+              "weighted validator updates are protocol generated"))
+      else if Int64.compare update.Validator_set_update.activate_epoch (Int64.of_int env.epoch_id) <= 0 then
         Lwt.return (Stdlib.Error ("validator_set_update_rejected", "activation epoch must be in the future"))
       else
         match backend.ops.debit tx.from tx.ou tx.nonce with
@@ -1882,16 +2655,17 @@ let process_validator_set_update_tx ~backend ~env tx =
           in
           Lwt.return (Stdlib.Ok tx.ou)
 
-let process_validator_ready_tx ~backend ~env tx =
+let normalize_ready_state_root value =
+  if String.length value = 32 then
+    String.concat "" (List.init 32 (fun index ->
+      Printf.sprintf "%02x" (Char.code value.[index])))
+  else if String.length value >= 64 then
+    String.sub value 0 64
+  else
+    value
+
+let validate_validator_ready_reference ~env ~head_epoch ~state_root =
   let open Lwt.Syntax in
-  let normalize_ready_state_root s =
-    if String.length s = 32 then
-      String.concat "" (List.init 32 (fun i ->
-        Printf.sprintf "%02x" (Char.code s.[i])))
-    else if String.length s >= 64 then
-      String.sub s 0 64
-    else s
-  in
   let current_head = env.epoch_id - 1 in
   let env_prev_state_root = normalize_ready_state_root env.prev_state_root in
   let root_for_ready_head ready_head =
@@ -1901,61 +2675,157 @@ let process_validator_ready_tx ~backend ~env tx =
       if ready_head = current_head then Lwt.return_some env_prev_state_root
       else Lwt.return_none
   in
+  let ready_head = Int64.to_int head_epoch in
+  if ready_head > current_head then
+    Lwt.return (Error "head_epoch is in the future")
+  else if env.ready_max_lag >= 0 && current_head - ready_head > env.ready_max_lag then
+    Lwt.return (Error "head_epoch too stale")
+  else
+    let* expected_root_opt = root_for_ready_head ready_head in
+    match expected_root_opt with
+    | None -> Lwt.return (Error "state_root reference unavailable")
+    | Some expected_root ->
+      if normalize_ready_state_root state_root
+         <> normalize_ready_state_root expected_root then
+        Lwt.return (Error "state_root does not match referenced chain head")
+      else
+        Lwt.return (Ok ())
+
+let process_bonded_validator_ready_tx ~backend ~env tx
+    (ready : Validator_registry.ready_payload) =
+  let open Lwt.Syntax in
+  if not (String.equal tx.Transaction.from tx.to_) then
+    Lwt.return
+      (Stdlib.Error
+         ("validator_ready_rejected",
+          "bonded validator readiness must be self-directed"))
+  else
+    let* reference =
+      validate_validator_ready_reference
+        ~env
+        ~head_epoch:ready.head_epoch
+        ~state_root:ready.state_root
+    in
+    match reference with
+    | Error error ->
+      Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
+    | Ok () ->
+      let* registry_result = load_validator_registry backend in
+      begin
+        match registry_result with
+        | Error error ->
+          Lwt.return (Stdlib.Error ("validator_registry_corrupt", error))
+        | Ok registry ->
+          begin
+            match
+              Validator_registry.mark_ready
+                ~epoch:(Int64.of_int env.epoch_id)
+                ~address:tx.from
+                ~consensus_pubkey_b64:ready.consensus_pubkey_b64
+                registry
+            with
+            | Error error ->
+              Lwt.return
+                (Stdlib.Error ("validator_ready_rejected", error))
+            | Ok next ->
+              begin
+                match backend.ops.debit tx.from tx.ou tx.nonce with
+                | Error error ->
+                  Lwt.return
+                    (Stdlib.Error ("insufficient_balance", error))
+                | Ok () ->
+                  let* () = save_validator_registry backend next in
+                  Lwt.return (Stdlib.Ok tx.ou)
+              end
+          end
+      end
+
+let process_legacy_validator_ready_tx ~backend ~env tx =
+  let open Lwt.Syntax in
+  match Validator_set_update.ready_ext_of_message tx.Transaction.message with
+  | Error error ->
+    Lwt.return (Stdlib.Error ("malformed_transaction", error))
+  | Ok ready_ext ->
+    let ready = ready_ext.Validator_set_update.ready in
+    let* pending_opt =
+      Store_irmin.get_meta backend.store Validator_set_update.pending_meta_key
+    in
+    match pending_opt with
+    | None ->
+      Lwt.return
+        (Stdlib.Error
+           ("validator_ready_rejected", "no pending validator set update"))
+    | Some pending_raw ->
+      match Validator_set_update.of_string pending_raw with
+      | Error error ->
+        Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
+      | Ok update ->
+        let in_pending =
+          List.exists
+            (fun validator ->
+              String.equal
+                validator.Validator_set_update.address
+                tx.from)
+            update.Validator_set_update.validators
+        in
+        if not in_pending then
+          Lwt.return
+            (Stdlib.Error
+               ("validator_ready_rejected",
+                "sender is not in pending validator set"))
+        else if
+          not
+            (String.equal
+               ready.Validator_set_update.fingerprint
+               update.Validator_set_update.fingerprint)
+        then
+          Lwt.return
+            (Stdlib.Error
+               ("validator_ready_rejected",
+                "fingerprint does not match pending validator set"))
+        else
+          let* reference =
+            validate_validator_ready_reference
+              ~env
+              ~head_epoch:ready.Validator_set_update.head_epoch
+              ~state_root:ready.Validator_set_update.state_root
+          in
+          match reference with
+          | Error error ->
+            Lwt.return
+              (Stdlib.Error ("validator_ready_rejected", error))
+          | Ok () ->
+            match backend.ops.debit tx.from tx.ou tx.nonce with
+            | Error error ->
+              Lwt.return (Stdlib.Error ("insufficient_balance", error))
+            | Ok () ->
+              let key =
+                Validator_set_update.ready_meta_key
+                  ~fingerprint:update.Validator_set_update.fingerprint
+                  ~address:tx.from
+              in
+              let* () =
+                backend.set_meta
+                  key
+                  (Validator_set_update.ready_ext_to_string ready_ext)
+              in
+              Lwt.return (Stdlib.Ok tx.ou)
+
+let process_validator_ready_tx ~backend ~env tx =
   if Z.sign tx.Transaction.amount <> 0 then
     Lwt.return (Stdlib.Error ("validator_ready_rejected", "amount must be zero"))
   else
-    match Validator_set_update.ready_ext_of_message tx.Transaction.message with
-    | Error e -> Lwt.return (Stdlib.Error ("malformed_transaction", e))
-    | Ok ready_ext ->
-      let ready = ready_ext.Validator_set_update.ready in
-      let* pending_opt =
-        Store_irmin.get_meta backend.store Validator_set_update.pending_meta_key
-      in
-      match pending_opt with
-      | None -> Lwt.return (Stdlib.Error ("validator_ready_rejected", "no pending validator set update"))
-      | Some pending_raw ->
-        match Validator_set_update.of_string pending_raw with
-        | Error e -> Lwt.return (Stdlib.Error ("validator_ready_rejected", e))
-        | Ok update ->
-          let in_pending =
-            List.exists
-              (fun v -> String.equal v.Validator_set_update.address tx.from)
-              update.Validator_set_update.validators
-          in
-          if not in_pending then
-            Lwt.return (Stdlib.Error ("validator_ready_rejected", "sender is not in pending validator set"))
-          else if ready.Validator_set_update.fingerprint <> update.Validator_set_update.fingerprint then
-            Lwt.return (Stdlib.Error ("validator_ready_rejected", "fingerprint does not match pending validator set"))
-          else
-            let ready_head = Int64.to_int ready.Validator_set_update.head_epoch in
-            if ready_head > current_head then
-              Lwt.return (Stdlib.Error ("validator_ready_rejected", "head_epoch is in the future"))
-            else if env.ready_max_lag >= 0 && current_head - ready_head > env.ready_max_lag then
-              Lwt.return (Stdlib.Error ("validator_ready_rejected", "head_epoch too stale"))
-            else
-              let* expected_root_opt = root_for_ready_head ready_head in
-              match expected_root_opt with
-              | None ->
-                Lwt.return (Stdlib.Error ("validator_ready_rejected", "state_root reference unavailable"))
-              | Some expected_root ->
-                if normalize_ready_state_root ready.Validator_set_update.state_root
-                   <> normalize_ready_state_root expected_root then
-                  Lwt.return (Stdlib.Error ("validator_ready_rejected", "state_root does not match referenced chain head"))
-                else
-                  match backend.ops.debit tx.from tx.ou tx.nonce with
-                  | Error err -> Lwt.return (Stdlib.Error ("insufficient_balance", err))
-                  | Ok () ->
-                    let key =
-                      Validator_set_update.ready_meta_key
-                        ~fingerprint:update.Validator_set_update.fingerprint
-                        ~address:tx.from
-                    in
-                    let* () =
-                      backend.set_meta key (Validator_set_update.ready_ext_to_string ready_ext)
-                    in
-                    Lwt.return (Stdlib.Ok tx.ou)
+    match
+      backend.validator_policy,
+      Validator_registry.ready_payload_of_message tx.Transaction.message
+    with
+    | Validator_policy.Bonded _, Ok ready ->
+      process_bonded_validator_ready_tx ~backend ~env tx ready
+    | _ ->
+      process_legacy_validator_ready_tx ~backend ~env tx
 
-let process_circle_operation_tx ~(backend : backend) ~(current_epoch : int) (tx : Transaction.t) =
+let process_circle_operation_tx ?expected_transition_hash
+    ~(backend : backend) ~(current_epoch : int) (tx : Transaction.t) =
   let open Transaction in
   match tx.op_type with
   | CircleDeploy ->
@@ -1973,9 +2843,17 @@ let process_circle_operation_tx ~(backend : backend) ~(current_epoch : int) (tx 
   | CircleStateDescriptorPut ->
     process_circle_state_descriptor_put_tx ~backend tx
   | CircleBalanceCellPut ->
-    process_circle_balance_cell_put_tx ~backend tx
+    process_circle_balance_cell_put_tx
+      ~backend
+      ~current_epoch
+      ?expected_transition_hash
+      tx
   | CircleRegisterCellPut ->
-    process_circle_register_cell_put_tx ~backend tx
+    process_circle_register_cell_put_tx
+      ~backend
+      ~current_epoch
+      ?expected_transition_hash
+      tx
   | CircleTransportPolicyPut ->
     process_circle_transport_policy_put_tx ~backend tx
   | CircleHfhePolicyPut ->
@@ -2002,7 +2880,6 @@ let process_circle_operation_tx ~(backend : backend) ~(current_epoch : int) (tx 
     Lwt.return (Stdlib.Error ("malformed_transaction", "unsupported circle operation"))
 
 let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
-  ignore env;
   let open Transaction in
   match tx.op_type with
   | Standard ->
@@ -2019,7 +2896,8 @@ let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
           Lwt.return (Stdlib.Error ("supply_violation", err))
         | Ok () ->
           Lwt.return (Stdlib.Ok fee)))
-  | ContractDeploy | ContractCall | ProgramExec | MultiExec | ContractUpgrade | CircleCall ->
+  | ContractDeploy | ProgramDeploy | ContractCall | ProgramExec | MultiExec
+  | ContractUpgrade | CircleCall ->
     let fee = tx.ou in
     (match backend.ops.debit tx.from fee tx.nonce with
      | Error err -> Lwt.return (Stdlib.Error ("insufficient_balance", err))
@@ -2035,6 +2913,14 @@ let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
     process_validator_set_update_tx ~backend ~env tx
   | ValidatorReady ->
     process_validator_ready_tx ~backend ~env tx
+  | ValidatorBond ->
+    process_validator_bond_tx ~backend ~env tx
+  | ValidatorExit ->
+    process_validator_exit_tx ~backend ~env tx
+  | ValidatorWithdraw ->
+    process_validator_withdraw_tx ~backend ~env tx
+  | ValidatorEvidence ->
+    process_validator_evidence_tx ~backend ~env tx
   | EncryptOp | DecryptOp ->
     let fee = tx.ou in
     (match backend.ops.debit tx.from fee tx.nonce with
@@ -2050,15 +2936,106 @@ let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
      | Error err -> Lwt.return (Stdlib.Error ("op01_burn_rejected", err))
      | Ok () -> Lwt.return (Stdlib.Ok tx.ou))
 
-let run_core ~preverify ~backend ~env ~(txs : Transaction.t list)
+let schedule_validator_snapshot ~backend ~env =
+  let open Lwt.Syntax in
+  let source_epoch = Int64.of_int env.epoch_id in
+  match
+    Validator_policy.snapshot_activation
+      backend.validator_policy
+      ~source_epoch
+  with
+  | None -> Lwt.return_unit
+  | Some activate_epoch ->
+    let* registry_result = load_validator_registry backend in
+    begin
+      match registry_result with
+      | Error error ->
+        failwith ("validator registry corrupt: " ^ error)
+      | Ok registry ->
+        begin
+          match backend.validator_policy with
+          | Validator_policy.Inactive -> Lwt.return_unit
+          | Validator_policy.Bonded policy ->
+            match
+              Validator_registry.snapshot
+                policy.parameters
+                ~activate_epoch
+                registry
+            with
+            | Error "validator snapshot has fewer than four eligible members" ->
+              Octra_log.info
+                "validator"
+                "event = snapshot_skipped source_epoch = %Ld activate_epoch = %Ld reason = insufficient_members"
+                source_epoch
+                activate_epoch;
+              Lwt.return_unit
+            | Error error ->
+              failwith ("validator snapshot rejected: " ^ error)
+            | Ok snapshot ->
+              begin
+                match
+                  Validator_set_update.make_weighted
+                    ~source_epoch:snapshot.Validator_admission.source_epoch
+                    ~activate_epoch:snapshot.Validator_admission.activate_epoch
+                    snapshot.Validator_admission.validators
+                with
+                | Error error ->
+                  failwith ("validator snapshot rejected: " ^ error)
+                | Ok update ->
+                  let* () =
+                    backend.set_meta
+                      Validator_set_update.pending_meta_key
+                      (Validator_set_update.to_string update)
+                  in
+                  Octra_log.info
+                    "validator"
+                    "event = snapshot_scheduled source_epoch = %Ld activate_epoch = %Ld validators = %d total_weight = %s quorum_weight = %s fingerprint = %s"
+                    snapshot.source_epoch
+                    snapshot.activate_epoch
+                    (List.length snapshot.validators)
+                    (Z.to_string snapshot.total_weight)
+                    (Z.to_string snapshot.quorum_weight)
+                    snapshot.fingerprint;
+                  Lwt.return_unit
+              end
+        end
+    end
+
+let promote_active_validator_set ~backend ~env =
+  let open Lwt.Syntax in
+  let* pending =
+    Store_irmin.get_meta
+      backend.store
+      Validator_set_update.pending_meta_key
+  in
+  match pending with
+  | None -> Lwt.return_unit
+  | Some raw ->
+    begin
+      match Validator_set_update.of_string raw with
+      | Error error ->
+        failwith ("pending validator set corrupt: " ^ error)
+      | Ok update ->
+        if update.Validator_set_update.weighted
+           && Int64.compare
+                update.activate_epoch
+                (Int64.of_int env.epoch_id) <= 0 then
+          backend.set_meta
+            Validator_set_update.active_meta_key
+            raw
+        else
+          Lwt.return_unit
+    end
+
+let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
     ~(process_tx : backend:backend -> env:env -> Transaction.t ->
-        (Z.t, string * string) Stdlib.result Lwt.t) =
+        (tx_effect, string * string) Stdlib.result Lwt.t) =
   let open Lwt.Syntax in
   Ledger.clear_spent_nonces backend.ledger;
-  let gate_ok =
+  let* gate_ok =
     match preverify with
-    | None -> Ok ()
-    | Some gate -> Preverify_commit.check gate txs in
+    | None -> Lwt.return_ok ()
+    | Some gate -> Preverify_commit.check_bound backend.ledger gate txs in
   match gate_ok with
   | Error e -> Lwt.return (Error ("preverify_commit_gate:" ^ e))
   | Ok () ->
@@ -2066,48 +3043,188 @@ let run_core ~preverify ~backend ~env ~(txs : Transaction.t list)
     let c = String.compare a.from b.from in
     if c <> 0 then c else compare a.nonce b.nonce
   ) txs in
-  let* () = backend.begin_batch () in
-  Lwt.catch
-    (fun () ->
+  match Ledger.begin_journal backend.ledger with
+  | Error error -> Lwt.return (Error error)
+  | Ok () ->
+    Lwt.catch
+      (fun () ->
+      let* () = backend.begin_batch () in
       let confirmed = ref [] in
       let rejected = ref [] in
       let confirmed_fees = ref Z.zero in
       let pos = ref 0 in
       let* () = Lwt_list.iter_s (fun tx ->
-        let* result = process_tx ~backend ~env tx in
+        let* result =
+          Tx_savepoint.run
+            ~ledger:backend.ledger
+            ~store:backend.store
+            (fun () ->
+              let* result = process_tx ~backend ~env tx in
+              begin
+                match result with
+                | Ok (Confirmed _) ->
+                  let stored =
+                    match backend.ops.find_opt tx.Transaction.from with
+                    | Some account -> account.Ledger_types.public_key
+                    | None -> None
+                  in
+                  begin
+                    match
+                      Sender_key_policy.decide
+                        ~activation_epoch:backend.sender_key_activation_epoch
+                        ~epoch:env.epoch_id
+                        ~stored
+                        ~carried:tx.public_key
+                    with
+                    | Sender_key_policy.Keep -> ()
+                    | Sender_key_policy.Register key ->
+                      backend.ops.register_public_key tx.from key
+                  end
+                | Ok (Rejected_after_fee _)
+                | Error _ -> ()
+              end;
+              Lwt.return result)
+        in
         (match result with
-         | Ok fee ->
+         | Ok (Confirmed fee) ->
            confirmed := (tx, !pos) :: !confirmed;
+           confirmed_fees := Z.add !confirmed_fees fee
+         | Ok (Rejected_after_fee { fee; error_type; reason }) ->
+           rejected := { tx; error_type; reason } :: !rejected;
            confirmed_fees := Z.add !confirmed_fees fee
          | Error (etype, reason) ->
            rejected := { tx; error_type = etype; reason } :: !rejected);
         incr pos;
         Lwt.return_unit
       ) txs_canonical in
+      let* () = promote_active_validator_set ~backend ~env in
+      let* () = schedule_validator_snapshot ~backend ~env in
       let* emission_remaining_opt = Store_irmin.get_meta backend.store "emission_remaining" in
       let emission_remaining =
-        try Z.of_string (Option.value ~default:"0" emission_remaining_opt)
-        with _ -> Z.zero in
+        match Emission_policy.remaining emission_remaining_opt with
+        | Ok value -> value
+        | Error error -> failwith error in
       let* prev_supply_opt = Store_irmin.get_meta backend.store "total_supply" in
       let prev_supply =
-        try Z.of_string (Option.value ~default:"0" prev_supply_opt)
-        with _ -> Z.zero in
-      let plan = build_reward_plan
-        ~validator_count:(List.length env.validator_addrs)
-        ~emission_remaining
-        ~confirmed_fees:!confirmed_fees
-        ~prev_supply in
-      let* () = apply_epoch_footer ~backend ~env ~plan in
+        match Emission_policy.resolve_total
+          ~policy:backend.emission_policy
+          ~stored:prev_supply_opt
+          ~legacy:backend.legacy_total_supply
+          ~public_supply:(backend.ops.total_supply ()) with
+        | Ok value -> value
+        | Error error -> failwith error in
+      let headroom = Z.sub Denomination.max_supply prev_supply in
+      let* schedule_standard =
+        Store_irmin.get_meta backend.store Emission_schedule.standard_key in
+      let* schedule_activation =
+        Store_irmin.get_meta backend.store Emission_schedule.activation_key in
+      let* schedule_initial =
+        Store_irmin.get_meta backend.store Emission_schedule.initial_key in
+      let* supply_retired =
+        Store_irmin.get_meta backend.store Emission_schedule.retired_key in
+      let schedule_binding =
+        match
+          Emission_schedule.bind
+            ~schedule:backend.emission_schedule
+            ~epoch_id:env.epoch_id
+            ~remaining:emission_remaining
+            ~headroom
+            ~stored_standard:schedule_standard
+            ~stored_activation:schedule_activation
+            ~stored_initial:schedule_initial
+            ~stored_retired:supply_retired
+        with
+        | Ok value -> value
+        | Error error -> failwith error
+      in
+      let base_reward =
+        match
+          Emission_schedule.reward
+            ~schedule:backend.emission_schedule
+            ~epoch_id:env.epoch_id
+            schedule_binding
+        with
+        | Ok value -> value
+        | Error error -> failwith error
+      in
+      let emission_remaining = schedule_binding.Emission_schedule.remaining in
+      let reward = Option.value ~default:(default_reward env) reward in
+      let plan =
+        match
+          match base_reward with
+          | Some base_reward ->
+            build_reward_plan_with_base
+              ~base_reward
+              ~fee_burn_active:schedule_binding.Emission_schedule.active
+              ~supply_retired:schedule_binding.Emission_schedule.retired
+              ~validator_count:(List.length reward.validators)
+              ~emission_remaining
+              ~confirmed_fees:!confirmed_fees
+              ~prev_supply
+          | None ->
+            build_reward_plan
+              ~fee_burn_active:schedule_binding.Emission_schedule.active
+              ~supply_retired:schedule_binding.Emission_schedule.retired
+              ~validator_count:(List.length reward.validators)
+              ~emission_remaining
+              ~confirmed_fees:!confirmed_fees
+              ~prev_supply
+        with
+        | Ok plan -> plan
+        | Error error -> failwith error in
+      let* () =
+        apply_epoch_footer_with_reward
+          ~reward
+          ~backend
+          ~env
+          ~plan
+      in
+      let* () =
+        Lwt_list.iter_s
+          (fun (key, value) -> backend.set_meta key value)
+          schedule_binding.Emission_schedule.writes
+      in
+      let* () =
+        if schedule_binding.Emission_schedule.activated
+           || Option.is_none emission_remaining_opt then
+          backend.set_meta
+            "emission_remaining"
+            (Z.to_string plan.new_emission_remaining)
+        else
+          Lwt.return_unit
+      in
+      let* () =
+        if Option.is_none prev_supply_opt then
+          backend.set_meta "total_supply" (Z.to_string plan.new_total_supply)
+        else
+          Lwt.return_unit
+      in
+      let* () =
+        if schedule_binding.Emission_schedule.active
+           && Option.is_none supply_retired then
+          backend.set_meta
+            Emission_schedule.retired_key
+            (Z.to_string plan.new_supply_retired)
+        else
+          Lwt.return_unit
+      in
       let* () = backend.flush_dirty () in
       if List.length txs > 0 then
-        Octra_log.stderr "[pv] ep=%d txs_in=%d conf=%d rej=%d fees=%s base=%s\n%!"
+        Octra_log.info "epoch"
+          "event = apply_summary epoch = %d txs = %d confirmed = %d rejected = %d fees = %s fee_burn = %s base_reward = %s"
           env.epoch_id (List.length txs) (List.length !confirmed) (List.length !rejected)
-          (Z.to_string !confirmed_fees) (Z.to_string plan.base_reward);
+          (Z.to_string !confirmed_fees) (Z.to_string plan.fees_burned)
+          (Z.to_string plan.base_reward);
       let* batch_h = Store_irmin.get_batch_tree_hash backend.store in
       let post_state_root = match batch_h with
         | Some h -> h
         | None -> "" in
       let* () = backend.commit_batch () in
+      begin
+        match Ledger.commit_journal backend.ledger with
+        | Ok () -> ()
+        | Error error -> failwith error
+      end;
       Ledger.clear_spent_nonces backend.ledger;
       Lwt.return (Ok {
         post_state_root;
@@ -2118,12 +3235,52 @@ let run_core ~preverify ~backend ~env ~(txs : Transaction.t list)
           tx_count = List.length txs;
         }
       }))
-    (fun exn ->
-      Ledger.clear_spent_nonces backend.ledger;
-      Lwt.return (Error (Printexc.to_string exn)))
+      (fun exn ->
+        Ledger.clear_spent_nonces backend.ledger;
+        Store_irmin.abort_epoch_batch backend.store;
+        ignore (Ledger.abort_journal backend.ledger);
+        Lwt.return (Error (Printexc.to_string exn)))
+
+let confirmed_process process_tx ~backend ~env tx =
+  let open Lwt.Syntax in
+  let* result = process_tx ~backend ~env tx in
+  Lwt.return (Result.map (fun fee -> Confirmed fee) result)
 
 let run ~backend ~env ~(txs : Transaction.t list) ~process_tx =
-  run_core ~preverify:None ~backend ~env ~txs ~process_tx
+  run_core
+    ~reward:None
+    ~preverify:None
+    ~backend
+    ~env
+    ~txs
+    ~process_tx:(confirmed_process process_tx)
 
-let run_checked ~preverify ~backend ~env ~(txs : Transaction.t list) ~process_tx =
-  run_core ~preverify:(Some preverify) ~backend ~env ~txs ~process_tx
+let run_checked ~preverify ~backend ~env ~(txs : Transaction.t list)
+    ~process_tx =
+  run_core
+    ~reward:None
+    ~preverify:(Some preverify)
+    ~backend
+    ~env
+    ~txs
+    ~process_tx:(confirmed_process process_tx)
+
+let run_transition_checked ~preverify ~backend ~env
+    ~(txs : Transaction.t list) ~process_tx =
+  run_core
+    ~reward:None
+    ~preverify:(Some preverify)
+    ~backend
+    ~env
+    ~txs
+    ~process_tx
+
+let run_transition_rewarded ~reward ~preverify ~backend ~env
+    ~(txs : Transaction.t list) ~process_tx =
+  run_core
+    ~reward:(Some reward)
+    ~preverify:(Some preverify)
+    ~backend
+    ~env
+    ~txs
+    ~process_tx

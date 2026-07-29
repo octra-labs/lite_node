@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type key = {
   id : string;
@@ -125,11 +113,10 @@ let verify ~trusted cert =
               | None -> Error Unknown_key
               | Some key ->
                 (try
-                   match Base64.decode encoded,
-                         Mirage_crypto_ec.Ed25519.pub_of_octets key.public_key with
-                   | Ok signature, Ok public_key
+                   match Base64.decode encoded with
+                   | Ok signature
                      when String.length signature = 64
-                          && Mirage_crypto_ec.Ed25519.verify ~key:public_key ~msg:message signature ->
+                          && Octra_ed25519.verify ~pub:key.public_key ~msg:message signature ->
                      Ok ()
                    | _ -> Error Invalid_signature
                  with _ -> Error Invalid_signature)))

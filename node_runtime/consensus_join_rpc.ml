@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module Runtime_text = Text
@@ -30,8 +18,11 @@ type record = {
   txs_json : string list;
   receipts_json : string list;
   receipt_root : string;
+  epoch_ts : float;
   creator_addr : string;
   commit_round : int;
+  reward_source : Octra_consensus.C_types.reward_source;
+  finality : Octra_consensus.C_codec.catchup_finality;
 }
 
 type range =
@@ -68,7 +59,7 @@ type prepared = {
   next_cursor : cursor;
   epoch_int : int;
   proposer_info : Octra_core.Epochlog.proposer_info option;
-  proposal_id : string;
+  reward : Consensus_reward_attribution.t;
 }
 
 type ready_marker = {
@@ -97,18 +88,22 @@ type ready_marker_write_deps = {
 }
 
 type apply_deps = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   current_epoch : unit -> int;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  stage_finality : prepared -> unit;
+  promote_finality : unit -> unit;
   apply :
     txs:Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   root : unit -> string;
   eic : unit -> string option;
-  now : unit -> float;
 }
 
 type run_deps = {
@@ -134,6 +129,8 @@ type run_deps = {
 }
 
 type node_deps = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   local_root : unit -> string;
@@ -141,11 +138,14 @@ type node_deps = {
   next_txid : unit -> int64;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  stage_finality : prepared -> unit;
+  promote_finality : unit -> unit;
   apply :
     txs:Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   local_eic : unit -> string option;
   write_ready :
@@ -160,6 +160,7 @@ type node_deps = {
 
 type node_runtime_deps = {
   env : string -> string option;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   head : unit -> Octra_core.Head_manifest.t option;
@@ -171,6 +172,8 @@ type node_runtime_deps = {
     txs:Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
@@ -184,6 +187,7 @@ type node_runtime_deps = {
 
 type node_runtime_wiring = {
   env : string -> string option;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   head : unit -> Octra_core.Head_manifest.t option;
@@ -194,6 +198,8 @@ type node_runtime_wiring = {
     txs:Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
@@ -235,7 +241,7 @@ let local_eic_from_head = function
   | None -> None
 
 let head_url base =
-  base ^ "/state-sync/v1/head"
+  base ^ "/state-sync/head"
 
 let range_url base ~from_epoch ~max_epochs =
   let query =
@@ -244,7 +250,7 @@ let range_url base ~from_epoch ~max_epochs =
       "max_epochs", [string_of_int max_epochs];
     ]
   in
-  base ^ "/state-sync/v1/range?" ^ query
+  base ^ "/state-sync/range?" ^ query
 
 let http_get_json url =
   let open Lwt.Syntax in
@@ -285,6 +291,41 @@ let optional_int_field json name default_value =
   let module U = Yojson.Safe.Util in
   try json |> U.member name |> U.to_int with _ -> default_value
 
+let epoch_ts_field json =
+  let module U = Yojson.Safe.Util in
+  let epoch_ts = json |> U.member "epoch_ts" |> U.to_number in
+  match Octra_consensus.Epoch_time.of_seconds epoch_ts with
+  | Ok _ -> epoch_ts
+  | Error error -> failwith ("join epoch timestamp: " ^ error)
+
+let reward_source_field json =
+  let module U = Yojson.Safe.Util in
+  match
+    Octra_consensus.C_reward_source.of_yojson
+      (json |> U.member "reward_source")
+  with
+  | Ok source -> source
+  | Error error -> failwith ("join reward source: " ^ error)
+
+let finality_field json =
+  let module U = Yojson.Safe.Util in
+  let value = json |> U.member "finality" in
+  let finalize =
+    value
+    |> U.member "finalize"
+    |> U.to_string
+    |> Base64.decode_exn
+    |> Octra_consensus.C_codec.decode_finalize
+  in
+  let validator_set =
+    value
+    |> U.member "validator_set"
+    |> U.to_string
+    |> Base64.decode_exn
+    |> Octra_consensus.C_codec.decode_validator_set
+  in
+  Octra_consensus.C_codec.{ finalize; validator_set }
+
 let parse_head json =
   {
     epoch = int64_field json "head_epoch";
@@ -305,8 +346,11 @@ let parse_record json =
         json
         "receipt_root"
         (Runtime_text.raw_to_hex (Octra_consensus.C_hash.receipt_root []));
+    epoch_ts = epoch_ts_field json;
     creator_addr = optional_string_field json "creator_addr" "";
     commit_round = optional_int_field json "commit_round" 0;
+    reward_source = reward_source_field json;
+    finality = finality_field json;
   }
 
 let parse_range ~from_epoch json =
@@ -349,13 +393,30 @@ let tx_list_hash tx_hashes =
 let receipt_root receipts_json =
   Octra_consensus.C_hash.receipt_root receipts_json |> Runtime_text.raw_to_hex
 
-let proposer_info creator_addr commit_round =
-  if String.length creator_addr > 3 then
-    Some { Octra_core.Epochlog.creator_addr; commit_round }
-  else
-    None
+let raw_hash name value =
+  match Octra_net.Oce1.hash32_bytes value with
+  | Ok raw -> raw
+  | Error reason ->
+    failwith (Printf.sprintf "join %s: %s" name reason)
 
-let prepare_record ~cursor record =
+let canonical_record (record : record) =
+  Octra_consensus.C_codec.{
+    epoch_id = record.epoch_id;
+    prev_state_root = raw_hash "prev_state_root" record.prev_state_root;
+    state_root = raw_hash "state_root" record.state_root;
+    tx_list_hash = raw_hash "tx_list_hash" record.tx_list_hash;
+    tx_hashes = record.tx_hashes;
+    txs_json = record.txs_json;
+    receipt_root = raw_hash "receipt_root" record.receipt_root;
+    receipts_json = record.receipts_json;
+    epoch_ts = record.epoch_ts;
+    creator_addr = record.creator_addr;
+    commit_round = record.commit_round;
+    reward_source = Some record.reward_source;
+    finality = Some record.finality;
+  }
+
+let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
   if record.epoch_id <> cursor.epoch then
     failwith
       (Printf.sprintf
@@ -377,6 +438,22 @@ let prepare_record ~cursor record =
     failwith (Printf.sprintf "join tx_list_hash mismatch epoch = %Ld" record.epoch_id);
   if receipt_root record.receipts_json <> record.receipt_root then
     failwith (Printf.sprintf "join receipt_root mismatch epoch = %Ld" record.epoch_id);
+  let reward =
+    match Consensus_reward_attribution.of_source record.reward_source with
+    | Error error -> failwith ("join reward source: " ^ error)
+    | Ok reward ->
+      begin
+        match record.finality.finalize.Octra_consensus.C_types.parent_commit with
+        | None -> reward
+        | Some parent ->
+          begin
+            match Consensus_reward_attribution.of_parent_commit parent with
+            | Error error -> failwith ("join parent reward: " ^ error)
+            | Ok expected when expected = reward -> expected
+            | Ok _ -> failwith "join reward source does not match parent commit"
+          end
+      end
+  in
   (match Octra_core.Preverify_receipt_policy.check
            ~epoch_id:(Int64.to_int record.epoch_id)
            ~receipts:record.receipts_json
@@ -401,6 +478,25 @@ let prepare_record ~cursor record =
     eic = expected_eic;
     txid = Int64.add cursor.txid (Int64.of_int (List.length record.tx_hashes));
   } in
+  begin
+    match
+      Octra_consensus.C_catchup.verify_record_finality
+        ~chain_id
+        ~expected_validator_set_hash
+        ~expected_txid:next_cursor.txid
+        ~record:(canonical_record record)
+    with
+    | Error error -> failwith ("join " ^ error)
+    | Ok _ -> ()
+  end;
+  let proposer_info =
+    match
+      Consensus_epoch_apply_proposer.proposer_from_finalized
+        record.finality.finalize
+    with
+    | Some proposer -> Some proposer
+    | None -> failwith "join finality proposer is missing"
+  in
   let epoch_int = Int64.to_int record.epoch_id in
   {
     record;
@@ -408,27 +504,15 @@ let prepare_record ~cursor record =
     expected_eic;
     next_cursor;
     epoch_int;
-    proposer_info = proposer_info record.creator_addr record.commit_round;
-    proposal_id =
-      Octra_consensus.Finality_log.id_of_parts
-        ~height:epoch_int
-        ~prev_state_root:record.prev_state_root
-        ~tx_list_hash:record.tx_list_hash
-        ~state_root:record.state_root;
+    proposer_info;
+    reward;
   }
 
-let finality_entry ~ts prepared =
-  let record = prepared.record in
-  Octra_consensus.Finality_log.make
-    ~height:prepared.epoch_int
-    ~round:record.commit_round
-    ~proposal_id:prepared.proposal_id
-    ~tx_list_hash:record.tx_list_hash
-    ~state_root:record.state_root
-    ~creator_addr:record.creator_addr
-    ~txid_hi:(-1L)
-    ~ts
-    ()
+let finality_entry ~chain_id prepared =
+  let finalize = prepared.record.finality.finalize in
+  if finalize.Octra_consensus.C_types.chain_id <> chain_id then
+    failwith "join finality chain mismatch";
+  Octra_consensus.Finality_log.of_finalize finalize
 
 let apply_prepared (deps : apply_deps) prepared =
   let open Lwt.Syntax in
@@ -441,12 +525,14 @@ let apply_prepared (deps : apply_deps) prepared =
          prepared.epoch_int);
   Option.iter (deps.put_proposer prepared.epoch_int) prepared.proposer_info;
   deps.put_root prepared.epoch_int record.state_root;
-  deps.write_entry (finality_entry ~ts:(deps.now ()) prepared);
+  deps.stage_finality prepared;
   let* () =
     deps.apply
       ~txs:prepared.txs
       ~receipts_json:record.receipts_json
       ~proposer_info:prepared.proposer_info
+      ~reward:prepared.reward
+      ~epoch_ts:record.epoch_ts
   in
   let root = deps.root () in
   if root <> record.state_root then
@@ -461,13 +547,25 @@ let apply_prepared (deps : apply_deps) prepared =
       (Printf.sprintf
          "join post-apply EIC mismatch epoch = %Ld"
          record.epoch_id);
+  deps.promote_finality ();
   Lwt.return_unit
 
 let apply_records (deps : apply_deps) ~cursor records =
   let open Lwt.Syntax in
   Lwt_list.fold_left_s
     (fun (cursor, count) record ->
-      let prepared = prepare_record ~cursor record in
+      let expected_validator_set_hash =
+        match deps.expected_validator_set_hash record.epoch_id with
+        | Ok hash -> hash
+        | Error error -> failwith error
+      in
+      let prepared =
+        prepare_record
+          ~chain_id:deps.chain_id
+          ~expected_validator_set_hash
+          ~cursor
+          record
+      in
       let* () = apply_prepared deps prepared in
       Lwt.return (prepared.next_cursor, count + 1))
     (cursor, 0)
@@ -526,14 +624,16 @@ let node_cursor (deps : node_deps) ~from_epoch =
 
 let node_apply_deps (deps : node_deps) =
   ({
+    chain_id = deps.chain_id;
+    expected_validator_set_hash = deps.expected_validator_set_hash;
     current_epoch = deps.current_epoch;
     put_proposer = deps.put_proposer;
     put_root = deps.put_root;
-    write_entry = deps.write_entry;
+    stage_finality = deps.stage_finality;
+    promote_finality = deps.promote_finality;
     apply = deps.apply;
     root = deps.local_root;
     eic = deps.local_eic;
-    now = deps.now;
   } : apply_deps)
 
 let run_node_catchup (deps : node_deps) base =
@@ -671,6 +771,8 @@ let node_deps_of_runtime (deps : node_runtime_deps) =
     generated_at = deps.now;
   } in
   {
+    chain_id = deps.chain_id;
+    expected_validator_set_hash = deps.expected_validator_set_hash;
     fetch_json = deps.fetch_json;
     current_epoch = deps.current_epoch;
     local_root = (fun () -> local_root_from_head (deps.head ()));
@@ -679,7 +781,25 @@ let node_deps_of_runtime (deps : node_runtime_deps) =
     put_proposer = deps.put_proposer;
     put_root = (fun epoch root ->
       deps.put_root_raw epoch (Runtime_text.hex_to_raw32_lossy root));
-    write_entry = deps.write_entry;
+    stage_finality = (fun prepared ->
+      let finality = prepared.record.finality in
+      let entry = finality_entry ~chain_id:deps.chain_id prepared in
+      Octra_consensus.Finality_log.check_write deps.data_dir entry;
+      Consensus_finality_journal.persist_certificate
+        deps.data_dir
+        ~validator_set:finality.validator_set
+        finality.finalize;
+      Consensus_finality_journal.persist_bundle
+        deps.data_dir
+        finality.finalize
+        Consensus_finality_journal.{
+          tx_hashes = prepared.record.tx_hashes;
+          txs = prepared.txs;
+          receipts_json = prepared.record.receipts_json;
+        };
+      deps.write_entry entry);
+    promote_finality = (fun () ->
+      Consensus_finality_journal.promote deps.data_dir);
     apply = deps.apply;
     local_eic = (fun () -> local_eic_from_head (deps.head ()));
     write_ready = write_ready_marker ready_marker_config;
@@ -690,6 +810,7 @@ let node_deps_of_runtime (deps : node_runtime_deps) =
 let node_runtime_deps (deps : node_runtime_wiring) =
   {
     env = deps.env;
+    expected_validator_set_hash = deps.expected_validator_set_hash;
     fetch_json = deps.fetch_json;
     current_epoch = deps.current_epoch;
     head = deps.head;

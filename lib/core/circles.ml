@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type runtime =
   | Octb
@@ -295,6 +283,24 @@ let default_limits = {
   max_inline_value = 65_536L;
   max_wasm_bytes = 33_554_432L;
 }
+
+let validate_limits limits =
+  let fields = [
+    "max_stable_bytes", limits.max_stable_bytes, default_limits.max_stable_bytes;
+    "max_assets_bytes", limits.max_assets_bytes, default_limits.max_assets_bytes;
+    "max_inline_value", limits.max_inline_value, default_limits.max_inline_value;
+    "max_wasm_bytes", limits.max_wasm_bytes, default_limits.max_wasm_bytes;
+  ] in
+  match
+    List.find_opt
+      (fun (_, value, cap) ->
+        Int64.compare value 0L < 0 || Int64.compare value cap > 0)
+      fields
+  with
+  | Some (name, _, _) -> Error ("circle limit out of range: " ^ name)
+  | None when Int64.compare limits.max_inline_value limits.max_stable_bytes > 0 ->
+    Error "circle max_inline_value exceeds max_stable_bytes"
+  | None -> Ok ()
 
 let zero_hash_hex = String.make 64 '0'
 

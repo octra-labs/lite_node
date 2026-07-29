@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type 'a parsed = ('a, string) result
 
@@ -62,6 +50,18 @@ let i64 name json =
     | None -> Error ("int64 expected: " ^ name)
     end
   | _ -> Error ("int64 expected: " ^ name)
+
+let z name json =
+  let* v = field name json in
+  match v with
+  | `String s
+  | `Intlit s ->
+    begin
+      try Ok (Z.of_string s)
+      with _ -> Error ("integer expected: " ^ name)
+    end
+  | `Int n -> Ok (Z.of_int n)
+  | _ -> Error ("integer expected: " ^ name)
 
 let boolv name json =
   let* v = field name json in
@@ -162,22 +162,55 @@ let signed_root json =
     signature;
   }
 
-let validator json =
+let validator ~weighted json =
   let* address = str "address" json in
   let* pubkey_b64 = str "pubkey" json in
   let* pubkey = b64 "pubkey" pubkey_b64 in
-  Ok C_light_validator_set.{ address; pubkey }
+  let* weight =
+    if weighted then z "weight" json
+    else Ok Z.one
+  in
+  Ok C_light_validator_set.{ address; pubkey; weight }
 
-let scheduled json =
+let scheduled ~weighted_proof json =
   match json with
   | `Null -> Ok None
   | _ ->
     let* activate_epoch = i64 "activate_epoch" json in
-    let* validators = list "validators" validator json in
-    Ok (Some C_light_validator_set.{ activate_epoch; validators })
+    let* weighted =
+      if weighted_proof then boolv "weighted" json
+      else Ok false
+    in
+    let* validators = list "validators" (validator ~weighted) json in
+    Ok (Some C_light_validator_set.{ activate_epoch; validators; weighted })
 
 let validator_set json =
-  let* () = version "octra-validator-set-proof-v1" json in
+  let* proof_version = str "version" json in
+  let* program_trust_hash, runtime_profile_hash, weighted_proof =
+    match proof_version with
+    | "octra-validator-set-proof-v1" -> Ok (None, None, false)
+    | "octra-validator-set-proof-v2" ->
+      let* hash_hex = str "program_trust_hash" json in
+      let* hash = raw32 "program_trust_hash" hash_hex in
+      Ok (Some hash, None, false)
+    | "octra-validator-set-proof-v3" ->
+      let* trust_hex = opt_str "program_trust_hash" json in
+      let* program_trust_hash = opt_raw32 "program_trust_hash" trust_hex in
+      let* profile_hex = str "runtime_profile_hash" json in
+      let* runtime_profile_hash = raw32 "runtime_profile_hash" profile_hex in
+      Ok (program_trust_hash, Some runtime_profile_hash, false)
+    | "octra-validator-set-proof-v4" ->
+      let* trust_hex = opt_str "program_trust_hash" json in
+      let* program_trust_hash = opt_raw32 "program_trust_hash" trust_hex in
+      let* profile_hex = opt_str "runtime_profile_hash" json in
+      let* runtime_profile_hash = opt_raw32 "runtime_profile_hash" profile_hex in
+      Ok (program_trust_hash, runtime_profile_hash, true)
+    | other -> Error ("version mismatch: " ^ other)
+  in
+  let* weighted =
+    if weighted_proof then boolv "weighted" json
+    else Ok false
+  in
   let* chain_id = str "chain_id" json in
   let* config_hash_hex = str "config_hash" json in
   let* config_hash = raw32 "config_hash" config_hash_hex in
@@ -186,9 +219,17 @@ let validator_set json =
   let* n = intv "n" json in
   let* f = intv "f" json in
   let* quorum = intv "quorum" json in
-  let* validators = list "validators" validator json in
+  let* total_weight =
+    if weighted then z "total_weight" json
+    else Ok (Z.of_int n)
+  in
+  let* quorum_weight =
+    if weighted then z "quorum_weight" json
+    else Ok (Z.of_int quorum)
+  in
+  let* validators = list "validators" (validator ~weighted) json in
   let* scheduled_json = field "scheduled" json in
-  let* scheduled = scheduled scheduled_json in
+  let* scheduled = scheduled ~weighted_proof scheduled_json in
   Ok C_light_validator_set.{
     chain_id;
     config_hash;
@@ -196,8 +237,13 @@ let validator_set json =
     n;
     f;
     quorum;
+    total_weight;
+    quorum_weight;
+    weighted;
     validators;
     scheduled;
+    program_trust_hash;
+    runtime_profile_hash;
   }
 
 let epoch json =

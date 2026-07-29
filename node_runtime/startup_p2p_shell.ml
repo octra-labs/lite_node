@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type network = {
   chain_id : string;
@@ -38,6 +26,7 @@ type deps = {
   info : string -> unit;
   warn : string -> unit;
   current_epoch : unit -> int;
+  read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   root_of_head_hash : string -> string;
@@ -49,6 +38,7 @@ type node_request = {
   info : string -> unit;
   warn : string -> unit;
   current_epoch : unit -> int;
+  read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   root_of_head_hash : string -> string;
@@ -95,6 +85,7 @@ type node_start_runtime = {
   warn : string -> unit;
   fatal : string -> unit;
   current_epoch : unit -> int;
+  read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   root_of_head_hash : string -> string;
@@ -119,6 +110,10 @@ type node_start = {
   load_scheduled_validator_set_config :
     unit ->
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+  activate_validator_set :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
 }
 
 let raw32_zero = String.make 32 '\x00'
@@ -138,22 +133,23 @@ let install_refs ~consensus_config_hash ~consensus_validator_set
 let current_height (deps : deps) =
   Int64.of_int (deps.current_epoch ())
 
-let pending_entries (deps : deps) =
-  deps.read_pending_validator_meta ()
-  |> Validator_config.pending_entries_of_raw
-
 let best_root (deps : deps) =
   match deps.read_head_hash () with
   | Some hash -> deps.root_of_head_hash hash
   | None -> raw32_zero
 
 let node_stack_deps (deps : deps) (network : network) (wallet : wallet) =
+  let active_raw = deps.read_active_validator_meta () in
+  let pending_raw = deps.read_pending_validator_meta () in
   P2p_config.{
     getenv = deps.getenv;
     chain_id = network.chain_id;
     consensus_mode = network.consensus_mode;
     current_height = current_height deps;
-    chain_pending_entries = pending_entries deps;
+    chain_active_raw = active_raw;
+    chain_pending_raw = pending_raw;
+    chain_pending_entries =
+      Validator_config.pending_entries_of_raw pending_raw;
     install = {
       info = deps.info;
       warn = deps.warn;
@@ -183,6 +179,7 @@ let deps_of_request (request : node_request) =
     info = request.info;
     warn = request.warn;
     current_epoch = request.current_epoch;
+    read_active_validator_meta = request.read_active_validator_meta;
     read_pending_validator_meta = request.read_pending_validator_meta;
     read_head_hash = request.read_head_hash;
     root_of_head_hash = request.root_of_head_hash;
@@ -234,6 +231,7 @@ let request_of_runtime runtime =
     info = runtime.info;
     warn = runtime.warn;
     current_epoch = runtime.current_epoch;
+    read_active_validator_meta = runtime.read_active_validator_meta;
     read_pending_validator_meta = runtime.read_pending_validator_meta;
     read_head_hash = runtime.read_head_hash;
     root_of_head_hash = runtime.root_of_head_hash;
@@ -316,6 +314,42 @@ let load_runtime_persistent_update runtime view =
     ~runtime:view.readiness_runtime
     ~requirements:view.readiness_requirements
 
+let validator_pubkeys validator_set =
+  validator_set.Octra_consensus.C_types.validators
+  |> List.map (fun validator ->
+    validator.Octra_consensus.C_types.pubkey)
+
+let same_validator_set left right =
+  String.equal
+    (Octra_consensus.C_config.validator_set_hash left)
+    (Octra_consensus.C_config.validator_set_hash right)
+
+let runtime_config_hash runtime view active scheduled =
+  if runtime.consensus_mode then
+    Octra_consensus.C_config.hash
+      ~chain_id:runtime.chain_id
+      ~validator_set:active
+      ?scheduled
+      ?program_trust_hash:view.validator_config.program_trust_hash
+      ?runtime_profile_hash:view.validator_config.runtime_profile_hash
+      ()
+  else
+    raw32_zero
+
+let install_runtime_validator_config runtime view active scheduled =
+  let config_hash = runtime_config_hash runtime view active scheduled in
+  match
+    Octra_net.P2p_swarm.set_validator_pubkeys
+      view.swarm
+      (validator_pubkeys active)
+  with
+  | Error error -> Lwt.fail_with error
+  | Ok () ->
+    runtime.install.set_consensus_validator_set active;
+    runtime.install.set_scheduled_validator_set scheduled;
+    runtime.install.set_consensus_config_hash config_hash;
+    Lwt.return_unit
+
 let start_node runtime =
   match build_node_view (request_of_runtime runtime) with
   | Error e ->
@@ -329,8 +363,46 @@ let start_node runtime =
         ~voting:runtime.voting
         ~role_label:runtime.role_label
         view.validator_config;
+    let active = ref view.active_vs in
+    let scheduled = ref view.scheduled_validator_set_config in
+    let install scheduled_driver =
+      let light =
+        Validator_config.light_scheduled_of_driver scheduled_driver
+      in
+      let open Lwt.Syntax in
+      let* () =
+        install_runtime_validator_config
+          runtime
+          view
+          !active
+          light
+      in
+      scheduled := scheduled_driver;
+      Lwt.return_unit
+    in
     {
       view;
       load_scheduled_validator_set_config = (fun () ->
-        load_runtime_persistent_update runtime view);
+        let open Lwt.Syntax in
+        let* loaded = load_runtime_persistent_update runtime view in
+        match loaded with
+        | None -> Lwt.return_none
+        | Some config ->
+          let next =
+            if same_validator_set !active config.validator_set then
+              None
+            else
+              Some config
+          in
+          let* () = install next in
+          Lwt.return (Some config));
+      activate_validator_set = (fun validator_set _ ->
+        let next =
+          match !scheduled with
+          | Some config when same_validator_set validator_set config.validator_set ->
+            None
+          | current -> current
+        in
+        active := validator_set;
+        install next);
     }

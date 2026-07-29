@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type epoch_seed = {
   chain_id : string;
@@ -36,6 +24,9 @@ type committee_snapshot = {
   quorum_weight : int64;
 }
 
+let max_chain_id_bytes = 128
+let max_attestation_bytes = 256 * 1024
+
 let encode_gossip (gossip : gossip) =
   Octra_net.Oce1.encode (fun buf ->
     Octra_net.Oce1.put_string buf gossip.chain_id;
@@ -43,11 +34,12 @@ let encode_gossip (gossip : gossip) =
     Octra_net.Oce1.put_string buf (Resource_attestations.encode_attestation gossip.attestation))
 
 let decode_gossip payload =
-  let cursor = Octra_net.Oce1.make_cursor payload in
-  let chain_id = Octra_net.Oce1.get_string cursor in
-  let seen_epoch = Octra_net.Oce1.get_u64 cursor in
-  let attestation = Resource_attestations.decode_attestation (Octra_net.Oce1.get_string cursor) in
-  { chain_id; seen_epoch; attestation }
+  Octra_net.Oce1.decode (fun cursor ->
+    let chain_id = Octra_net.Oce1.get_string_bounded ~max:max_chain_id_bytes cursor in
+    let seen_epoch = Octra_net.Oce1.get_u64 cursor in
+    let encoded = Octra_net.Oce1.get_string_bounded ~max:max_attestation_bytes cursor in
+    let attestation = Resource_attestations.decode_attestation encoded in
+    { chain_id; seen_epoch; attestation }) payload
 
 let challenge (seed : epoch_seed) =
   Octra_net.Hash_domain.hash_encoded "octra:resource_challenge:v1" (fun buf ->

@@ -1,23 +1,12 @@
-/*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*/
-
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 #include <caml/mlvalues.h>
 #include <caml/alloc.h>
 #include <caml/callback.h>
 #include <caml/fail.h>
 #include <caml/memory.h>
+#include <caml/threads.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -56,13 +45,21 @@ CAMLprim value caml_octra_circle_wasm_host_run_json(value v_input) {
   CAMLparam1(v_input);
   CAMLlocal1(v_output);
 
-  const uint8_t* input_ptr = (const uint8_t*)String_val(v_input);
-  size_t input_len = caml_string_length(v_input);
+  uint8_t* input_ptr = NULL;
+  size_t input_len = 0;
   uint8_t* out_ptr = NULL;
   size_t out_len = 0;
   uint8_t* err_ptr = NULL;
   size_t err_len = 0;
 
+  copy_to_malloc_string(v_input, &input_ptr, &input_len);
+  if (input_ptr == NULL) {
+    input_ptr = malloc(1);
+    if (input_ptr == NULL) {
+      caml_failwith("octra_circle_wasm_host: alloc failed");
+    }
+  }
+  caml_release_runtime_system();
   int rc =
     octra_circle_wasm_host_run_json(
       input_ptr,
@@ -72,6 +69,8 @@ CAMLprim value caml_octra_circle_wasm_host_run_json(value v_input) {
       &err_ptr,
       &err_len
     );
+  caml_acquire_runtime_system();
+  free(input_ptr);
 
   if (rc != 0) {
     if (err_ptr != NULL && err_len > 0) {
@@ -97,7 +96,7 @@ CAMLprim value caml_octra_circle_wasm_host_run_json(value v_input) {
   CAMLreturn(v_output);
 }
 
-int octra_circle_wasm_host_hfhe_call_json(
+static int hfhe_call_json_locked(
   const uint8_t* input_ptr,
   size_t input_len,
   uint8_t** out_ptr,
@@ -170,4 +169,26 @@ int octra_circle_wasm_host_hfhe_call_json(
     *err_len = 0;
   }
   CAMLreturnT(int, 0);
+}
+
+int octra_circle_wasm_host_hfhe_call_json(
+  const uint8_t* input_ptr,
+  size_t input_len,
+  uint8_t** out_ptr,
+  size_t* out_len,
+  uint8_t** err_ptr,
+  size_t* err_len
+) {
+  caml_acquire_runtime_system();
+  int rc =
+    hfhe_call_json_locked(
+      input_ptr,
+      input_len,
+      out_ptr,
+      out_len,
+      err_ptr,
+      err_len
+    );
+  caml_release_runtime_system();
+  return rc;
 }

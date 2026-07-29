@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -120,6 +108,7 @@ type proposal_preview_runtime = {
   warn : string -> unit;
   run_preview :
     Consensus_proposal.build_preview_request ->
+    reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
 }
@@ -167,6 +156,13 @@ type deps = {
   current_epoch : unit -> int;
   current_round : unit -> int;
   committed_head_epoch : unit -> int;
+  load_parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
   finality : Consensus_finality_state.callbacks;
   read_prev_ledger_root : unit -> string option Lwt.t;
   cached_head : unit -> Octra_core.Head_manifest.t option;
@@ -227,6 +223,13 @@ type config_with_standard_input = {
   current_epoch : unit -> int;
   current_round : unit -> int;
   committed_head_epoch : unit -> int;
+  load_parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
   finality : Consensus_finality_state.callbacks;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   now : unit -> float;
@@ -279,6 +282,13 @@ type node_driver_config_runtime = {
   current_epoch : unit -> int;
   current_round : unit -> int;
   committed_head_epoch : unit -> int;
+  load_parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
   finality : Consensus_finality_state.callbacks;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   now : unit -> float;

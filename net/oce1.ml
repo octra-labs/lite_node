@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let put_u8 buf v =
   Buffer.add_char buf (Char.chr (v land 0xff))
@@ -38,10 +26,8 @@ let put_u64 buf v =
 let put_bool buf v =
   put_u8 buf (if v then 1 else 0)
 
-
 let put_raw buf s =
   Buffer.add_string buf s
-
 
 let put_bytes buf s =
   put_u32_int buf (String.length s);
@@ -49,19 +35,52 @@ let put_bytes buf s =
 
 let put_string = put_bytes
 
-let put_hash32 buf h =
-  let raw =
-    if String.length h = 32 then h
-    else if String.length h = 64 then
-      String.init 32 (fun i ->
-        Char.chr (int_of_string ("0x" ^ String.sub h (i*2) 2)))
-    else h in
-  assert (String.length raw = 32);
-  Buffer.add_string buf raw
+let hex_nibble = function
+  | '0'..'9' as value -> Ok (Char.code value - Char.code '0')
+  | 'a'..'f' as value -> Ok (Char.code value - Char.code 'a' + 10)
+  | _ -> Error "hash32 contains non-hex characters"
 
-let put_sig64 buf s =
-  assert (String.length s = 64);
-  Buffer.add_string buf s
+let hash32_of_hex value =
+  if String.length value <> 64 then Error "hash32 hex length must be 64"
+  else
+    let output = Bytes.create 32 in
+    let rec loop index =
+      if index = 32 then Ok (Bytes.unsafe_to_string output)
+      else
+        match hex_nibble value.[index * 2], hex_nibble value.[(index * 2) + 1] with
+        | Ok high, Ok low ->
+            Bytes.set output index (Char.chr ((high lsl 4) lor low));
+            loop (index + 1)
+        | Error reason, _ | _, Error reason -> Error reason
+    in
+    loop 0
+
+let hash32_bytes value =
+  if String.length value = 32 then Ok value else hash32_of_hex value
+
+let put_hash32_checked buf value =
+  match hash32_bytes value with
+  | Error _ as error -> error
+  | Ok raw ->
+      Buffer.add_string buf raw;
+      Ok ()
+
+let put_hash32 buf value =
+  match put_hash32_checked buf value with
+  | Ok () -> ()
+  | Error reason -> invalid_arg reason
+
+let put_sig64_checked buf value =
+  if String.length value <> 64 then Error "sig64 length must be 64"
+  else begin
+    Buffer.add_string buf value;
+    Ok ()
+  end
+
+let put_sig64 buf value =
+  match put_sig64_checked buf value with
+  | Ok () -> ()
+  | Error reason -> invalid_arg reason
 
 let put_addr = put_string
 
@@ -72,8 +91,6 @@ let put_option put_inner buf = function
 let put_list put_inner buf lst =
   put_u32_int buf (List.length lst);
   List.iter (put_inner buf) lst
-
-
 
 type cursor = { data : string; mutable pos : int }
 
@@ -118,8 +135,10 @@ let get_u64 c =
   !v
 
 let get_bool c =
-  get_u8 c <> 0
-
+  match get_u8 c with
+  | 0 -> false
+  | 1 -> true
+  | _ -> failwith "OCE1: bad bool tag"
 
 let get_raw c n =
   check_len c n;
@@ -127,15 +146,19 @@ let get_raw c n =
   c.pos <- c.pos + n;
   s
 
-let get_bytes c =
+let get_bytes_bounded ~max c =
   let len = get_u32_int c in
-  if len < 0 || len > 10_000_000 then failwith "OCE1: bytes len out of range";
+  if len < 0 || len > max then failwith "OCE1: bytes len out of range";
   check_len c len;
   let s = String.sub c.data c.pos len in
   c.pos <- c.pos + len;
   s
 
+let get_bytes c = get_bytes_bounded ~max:10_000_000 c
+
 let get_string = get_bytes
+
+let get_string_bounded = get_bytes_bounded
 
 let get_hash32 c =
   check_len c 32;
@@ -152,16 +175,17 @@ let get_sig64 c =
 let get_addr = get_string
 
 let get_option get_inner c =
-  let tag = get_u8 c in
-  if tag = 0 then None
-  else Some (get_inner c)
+  match get_u8 c with
+  | 0 -> None
+  | 1 -> Some (get_inner c)
+  | _ -> failwith "OCE1: bad option tag"
 
-let get_list get_inner c =
+let get_list_bounded ~max get_inner c =
   let count = get_u32_int c in
-  if count < 0 || count > 1_000_000 then failwith "OCE1: list count out of range";
+  if count < 0 || count > max then failwith "OCE1: list count out of range";
   List.init count (fun _ -> get_inner c)
 
-
+let get_list get_inner c = get_list_bounded ~max:1_000_000 get_inner c
 
 let encode f =
   let buf = Buffer.create 256 in

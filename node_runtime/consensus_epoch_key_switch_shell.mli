@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Private_gate = Consensus_epoch_apply_private_gate
 module Private_ledger = Octra_core.Private_ledger
@@ -66,7 +54,7 @@ type live_tx_args = {
 
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
-  chaindata : Octra_core.Store_chaindata.t;
+  legacy_replay : string -> Octra_core.Pvac_legacy_public_replay.decision;
   gate : unit -> Private_gate.reject option;
   reject_gate : Private_gate.reject -> unit Lwt.t;
   record_rejected : Transaction.t -> string -> string -> unit;

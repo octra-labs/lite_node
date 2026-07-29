@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type account = Ledger_types.account = {
   balance : Z.t;
@@ -19,6 +7,15 @@ type account = Ledger_types.account = {
   public_key : string option;
   encrypted_balance : string option;
   decrypt_allowance : Z.t;
+}
+
+type epoch_journal = {
+  accounts : (string, account option) Hashtbl.t;
+  dirty_addrs : (string, unit) Hashtbl.t;
+  dirty : bool;
+  total_supply : Z.t;
+  active_accounts : int;
+  spent_nonces : (string * int, unit) Hashtbl.t;
 }
 
 type t = {
@@ -29,6 +26,7 @@ type t = {
   mutable total_supply : Z.t;
   mutable active_accounts : int;
   spent_nonces : (string * int, unit) Hashtbl.t;
+  mutable epoch_journals : epoch_journal list;
 }
 
 let run_s p =
@@ -49,6 +47,56 @@ let run_s p =
 let units_per_oct = Denomination.units_per_oct
 let format_balance = Denomination.format_balance
 let clear_spent_nonces l = Hashtbl.reset l.spent_nonces
+
+let begin_journal l =
+  l.epoch_journals <- {
+    accounts = Hashtbl.create 64;
+    dirty_addrs = Hashtbl.copy l.dirty_addrs;
+    dirty = l.dirty;
+    total_supply = l.total_supply;
+    active_accounts = l.active_accounts;
+    spent_nonces = Hashtbl.copy l.spent_nonces;
+  } :: l.epoch_journals;
+  Ok ()
+
+let commit_journal l =
+  match l.epoch_journals with
+  | [] -> Error "ledger journal is not active"
+  | _ :: rest ->
+    l.epoch_journals <- rest;
+    Ok ()
+
+let restore_table target source =
+  Hashtbl.reset target;
+  Hashtbl.iter (Hashtbl.replace target) source
+
+let abort_journal l =
+  match l.epoch_journals with
+  | [] -> Ok ()
+  | journal :: rest ->
+    Hashtbl.iter
+      (fun addr account ->
+        match account with
+        | Some account -> Hashtbl.replace l.cache addr account
+        | None -> Hashtbl.remove l.cache addr)
+      journal.accounts;
+    restore_table l.dirty_addrs journal.dirty_addrs;
+    restore_table l.spent_nonces journal.spent_nonces;
+    l.dirty <- journal.dirty;
+    l.total_supply <- journal.total_supply;
+    l.active_accounts <- journal.active_accounts;
+    l.epoch_journals <- rest;
+    Ok ()
+
+let journal_active l =
+  l.epoch_journals <> []
+
+let record_account l addr =
+  List.iter
+    (fun journal ->
+      if not (Hashtbl.mem journal.accounts addr) then
+        Hashtbl.add journal.accounts addr (Hashtbl.find_opt l.cache addr))
+    l.epoch_journals
 
 let empty_account = Ledger_types.empty_account
 
@@ -85,10 +133,13 @@ let create_from_store store =
     if is_active_account acc then incr active_accounts
   ) accounts;
   if !sanitized > 0 then
-    Octra_log.stdout "ledger: sanitized %d legacy encrypted_balance(s) (will flush to irmin)\n%!" !sanitized;
+    Octra_log.warn "ledger"
+      "event = legacy_cipher_sanitized count = %d persistence = pending"
+      !sanitized;
   { store; cache; dirty_addrs; dirty = !sanitized > 0; total_supply = !total_supply;
     active_accounts = !active_accounts;
-    spent_nonces = Hashtbl.create 1000 }
+    spent_nonces = Hashtbl.create 1000;
+    epoch_journals = [] }
 
 let create store =
   create_from_store store
@@ -103,6 +154,7 @@ let get_account_internal l addr =
     | None -> None
 
 let set_account_internal l addr a =
+  record_account l addr;
   let was_active =
     match Hashtbl.find_opt l.cache addr with
     | Some old -> is_active_account old
@@ -119,7 +171,8 @@ let set_account_internal l addr a =
 
 let supply_check l amount =
   if Z.gt (Z.add l.total_supply amount) Denomination.max_supply then (
-    Octra_log.stderr "SUPPLY_GUARD: rejected operation, would exceed 1B cap (current=%s, attempted +%s)\n%!"
+    Octra_log.error "supply"
+      "event = cap_rejected current = %s delta = %s"
       (Z.to_string l.total_supply) (Z.to_string amount);
     false)
   else true
@@ -210,9 +263,9 @@ let fhe_encrypt_balance l addr amt priv_b64 ~tx_hash ~epoch_id =
     (match Crypto.FheBalance.deposit pk sk ~current_cipher:(Some current) ~amount:amt ~tx_hash ~epoch_id with
      | Error e -> Error e
      | Ok new_enc ->
-       set_account_internal l addr { a with balance = Z.sub a.balance amt; encrypted_balance = Some new_enc };
-       ignore (update_enc_balance l addr new_enc);
-       Ok ())
+       match debit_amount_only l addr amt with
+       | Error e -> Error e
+       | Ok () -> update_enc_balance l addr new_enc)
 
 let fhe_decrypt_balance l addr amt priv_b64 ~tx_hash ~epoch_id =
   match get_account_internal l addr with
@@ -227,23 +280,30 @@ let fhe_decrypt_balance l addr amt priv_b64 ~tx_hash ~epoch_id =
        (match Crypto.FheBalance.withdraw pk sk ~current_cipher:(Some current) ~amount:amt ~tx_hash ~epoch_id with
         | Error e -> Error e
         | Ok new_enc ->
-          set_account_internal l addr { a with balance = Z.add a.balance amt; encrypted_balance = Some new_enc };
-          ignore (update_enc_balance l addr new_enc);
-          Ok ()))
+          match credit l addr amt with
+          | Error e -> Error e
+          | Ok () -> update_enc_balance l addr new_enc))
 
 let set_pvac_pubkey l addr pk_blob =
   let exists = Hashtbl.mem l.cache addr || get_account_internal l addr <> None in
   if not exists then
     ignore (add_account l addr Z.zero);
   let open Lwt.Syntax in
-  let* existing = Store_irmin.get_pvac_pubkey l.store addr in
-  if existing = Some pk_blob then
+  let hash = Pvac_registry.full_key_hash pk_blob in
+  let* bound = Store_irmin.get_pvac_hash l.store addr in
+  if bound = Some hash then
     Lwt.return_unit
   else
     Store_irmin.set_pvac_pubkey l.store addr pk_blob
 
 let get_pvac_pubkey l addr =
   Store_irmin.get_pvac_pubkey l.store addr
+
+let get_pvac_key_hash l addr =
+  Store_irmin.get_pvac_hash l.store addr
+
+let pvac_key_is_bound l addr =
+  Store_irmin.pvac_is_bound l.store addr
 
 let get_pvac_kat l addr =
   Store_irmin.get_pvac_kat l.store addr
@@ -307,9 +367,9 @@ let fhe_encrypt_with_cipher l addr amt ~delta_cipher_str =
             (match Crypto.FheBalance.deposit_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta_ct with
              | Error e -> Lwt.return (Error e)
              | Ok new_enc ->
-               set_account_internal l addr { a with balance = Z.sub a.balance amt; encrypted_balance = Some new_enc };
-               ignore (update_enc_balance l addr new_enc);
-               Lwt.return (Ok ()))))
+               match debit_amount_only l addr amt with
+               | Error e -> Lwt.return (Error e)
+               | Ok () -> Lwt.return (update_enc_balance l addr new_enc))))
 
 let fhe_get_encrypted_balance l addr priv_b64 =
   if not (Crypto.WalletKey.verify_privkey_for_address addr priv_b64) then Error "Bad privkey"
@@ -372,7 +432,8 @@ let audit_supply l =
   let total_accounted = Z.add cache_supply pending_stealth in
   let drift = Z.sub l.total_supply cache_supply in
   if not (Z.equal drift Z.zero) then
-    Octra_log.stderr "SUPPLY_AUDIT_DRIFT: tracked=%s cache=%s pending_stealth=%s drift=%s\n%!"
+    Octra_log.error "supply"
+      "event = audit_drift tracked = %s cache = %s pending_stealth = %s drift = %s"
       (Z.to_string l.total_supply) (Z.to_string cache_supply)
       (Z.to_string pending_stealth) (Z.to_string drift);
   l.total_supply <- cache_supply;
@@ -539,6 +600,22 @@ module Overlay = struct
     | Some a -> write o addr { a with encrypted_balance = None }
     | None -> ()
 
+  let apply_op01_burn o ~from ~to_ amount nonce =
+    if not (String.equal from op01_burn_authority) then
+      Error "op01_burn: restricted to mining pool authority"
+    else if not (String.equal from to_) then
+      Error "op01_burn: must be self-transaction (from equals to)"
+    else if Z.sign amount <= 0 then
+      Error "op01_burn: amount must be positive"
+    else if is_op01_burn_executed o.base then
+      Error "op01_burn: already executed (one-shot ceremony)"
+    else
+      match debit o from amount nonce with
+      | Error error -> Error error
+      | Ok () ->
+        mark_op01_burn_executed o.base;
+        Ok ()
+
   let length o =
     let base_count = Hashtbl.length o.base.cache in
     let new_only = Hashtbl.fold (fun addr _ acc ->
@@ -562,6 +639,7 @@ module Overlay = struct
           if c <> 0 then c else compare n1 n2) in
     List.iter (fun (addr, a) -> set_account_internal o.base addr a) sorted_promote_pairs;
     List.iter (fun addr ->
+      record_account o.base addr;
       Hashtbl.remove o.base.cache addr;
       Hashtbl.replace o.base.dirty_addrs addr ()) sorted_deleted_addrs;
     o.base.total_supply <- Z.add o.base.total_supply o.supply_delta;

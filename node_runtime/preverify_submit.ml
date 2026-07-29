@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type result = {
   delta_ok : bool;
@@ -78,12 +66,12 @@ let rec take_keys n entries =
   | _, [] -> []
   | n, entry :: rest -> entry.cache_key :: take_keys (n - 1) rest
 
-let cache_prune_plan ~now ~ttl ~max_entries ~pending_ceiling entries =
+let cache_prune_plan ~now ~ttl ~max_entries ~pending_ceiling:_ entries =
   let expired =
     List.filter
       (fun entry ->
         let age = now -. entry.cache_ts in
-        if entry.cache_pending then age > pending_ceiling else age > ttl)
+        not entry.cache_pending && age > ttl)
       entries
   in
   let expired_keys = List.map (fun entry -> entry.cache_key) expired in
@@ -92,10 +80,13 @@ let cache_prune_plan ~now ~ttl ~max_entries ~pending_ceiling entries =
       (fun entry -> not (List.mem entry.cache_key expired_keys))
       entries
   in
-  let overflow_needed = List.length remaining - max_entries in
+  let completed =
+    List.filter (fun entry -> not entry.cache_pending) remaining
+  in
+  let overflow_needed = List.length completed - max_entries in
   let overflow =
     if overflow_needed > 0 then
-      take_keys overflow_needed (oldest_non_pending remaining)
+      take_keys overflow_needed (oldest_non_pending completed)
     else []
   in
   { prune_expired = expired_keys; prune_overflow = overflow }

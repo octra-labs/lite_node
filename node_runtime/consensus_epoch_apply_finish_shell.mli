@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Env = Consensus_epoch_apply_env
 module Finalize = Consensus_epoch_apply_finalize
@@ -25,6 +13,12 @@ type deps = {
   validator_pubkeys : Env.node_env -> (string * string) list;
   validator_context : (string * string) list -> Footer.validator_context;
   proposer : Proposer.runtime_request -> Proposer.runtime_result;
+  reward :
+    consensus_mode:bool ->
+    epoch_id:int ->
+    proposer_addr:string ->
+    validator_pubkeys:(string * string) list ->
+    (Consensus_reward_attribution.t, string) result;
   trace : unit -> Footer.trace;
   emit_replay_proposer :
     Footer.trace ->
@@ -41,6 +35,7 @@ type request = {
   now : float;
   consensus_mode : bool;
   override_proposer_info : Octra_core.Epochlog.proposer_info option;
+  override_reward : Consensus_reward_attribution.t option;
   epoch_env : Env.node_env;
   tree_ref : Octra_core.Tree.t ref;
   epoch_start : float;

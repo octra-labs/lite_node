@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   admitted_code : Contract_vm.instr array;
@@ -145,6 +133,23 @@ let fact_effects value =
     read [] values
   | _ -> None
 
+let fact_storage value =
+  match value with
+  | `List values ->
+    let rec read seen acc = function
+      | [] -> Some (List.rev acc)
+      | `Assoc fields :: rest ->
+        (match cert_text "key" fields, fact_kind fields "kind" with
+         | Some key, Some kind
+           when key <> "" && kind <> Program_type_flow.Unknown
+             && not (List.mem key seen) ->
+           read (key :: seen) ((key, kind) :: acc) rest
+         | _ -> None)
+      | _ -> None
+    in
+    read [] [] values
+  | _ -> None
+
 let fact_entries value =
   match value with
   | `List values ->
@@ -245,12 +250,20 @@ let cert_facts fields =
      | Some root, Some entries, Some calls ->
        (match fact_pairs root "slot", fact_entries entries, fact_calls calls with
         | Some root, Some entries, Some calls ->
-          (match cert_field "xcalls" values with
-           | None -> Some { Program_type_flow.root; entries; calls; xcalls = [] }
-           | Some xcalls ->
-             (match fact_xcalls xcalls with
-              | Some xcalls -> Some { Program_type_flow.root; entries; calls; xcalls }
-              | None -> None))
+          let storage =
+            match cert_field "storage" values with
+            | None -> Some []
+            | Some value -> fact_storage value
+          in
+          let xcalls =
+            match cert_field "xcalls" values with
+            | None -> Some []
+            | Some value -> fact_xcalls value
+          in
+          (match storage, xcalls with
+           | Some storage, Some xcalls ->
+             Some { Program_type_flow.root; storage; entries; calls; xcalls }
+           | _ -> None)
         | _ -> None)
      | _ -> None)
   | _ -> None

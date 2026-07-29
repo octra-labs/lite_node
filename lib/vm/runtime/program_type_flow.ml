@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type kind =
   | Int
@@ -32,9 +20,9 @@ type error =
   | Uninitialized of int * int
   | Invalid_target of int * int
   | Expected of int * int * string * kind
-  | Mismatch of int * int * kind * kind
   | Xcall_abi of int * string
   | Unsupported of int
+  | Flow_limit of int
 
 let kind_name = function
   | Int -> "int"
@@ -56,21 +44,24 @@ let error_message = function
   | Invalid_target (pc, target) -> Printf.sprintf "invalid target %d at pc %d" target pc
   | Expected (pc, reg, expected, actual) ->
     Printf.sprintf "expected %s in r%d at pc %d, got %s" expected reg pc (kind_name actual)
-  | Mismatch (pc, reg, left, right) ->
-    Printf.sprintf "branch type mismatch in r%d at pc %d: %s and %s" reg pc (kind_name left) (kind_name right)
   | Xcall_abi (pc, message) -> Printf.sprintf "external call ABI mismatch at pc %d: %s" pc message
   | Unsupported pc -> Printf.sprintf "instruction at pc %d is outside the typed Program profile" pc
+  | Flow_limit steps -> Printf.sprintf "Program type flow exceeds %d steps" steps
 
 let valid_reg reg = reg >= 0 && reg < 64
 
 type slot = Unset | Set of kind
+
+type constant =
+  | Text of string
+  | Zero
 
 module IntMap = Map.Make (Int)
 
 type state = {
   regs : slot array;
   mem : slot IntMap.t;
-  consts : string option array;
+  consts : constant option array;
 }
 
 type entry = {
@@ -104,12 +95,19 @@ type xcall = {
 
 type facts = {
   root : (int * kind) list;
+  storage : (string * kind) list;
   entries : entry list;
   calls : call list;
   xcalls : xcall list;
 }
 
-let empty_facts = { root = []; entries = []; calls = []; xcalls = [] }
+let empty_facts = {
+  root = [];
+  storage = [];
+  entries = [];
+  calls = [];
+  xcalls = [];
+}
 
 let capability_name = function
   | View -> "view"
@@ -171,6 +169,9 @@ let text = function
 let address = function
   | String | Addr -> true
   | _ -> false
+
+let scalar_value kind =
+  text kind || address kind || numeric kind || kind = Bool
 
 let read pc env reg =
   if not (valid_reg reg) then Error (Invalid_reg (pc, reg))
@@ -264,11 +265,33 @@ let call_kind facts pc =
 let xcall_fact facts pc =
   List.find_opt (fun call -> call.pc = pc) facts.xcalls
 
+let storage_kind facts key =
+  List.assoc_opt key facts.storage
+
 let binary_num pc env dest left right =
   match expect_num pc env left, expect_num pc env right with
   | Error error, _
   | _, Error error -> Error error
   | Ok _, Ok _ -> write pc env dest Int
+
+let binary_add pc env dest left right =
+  match
+    read pc env left,
+    read_const pc env left,
+    read pc env right,
+    read_const pc env right
+  with
+  | Error error, _, _, _
+  | _, Error error, _, _
+  | _, _, Error error, _
+  | _, _, _, Error error -> Error error
+  | Ok left_kind, Ok left_const, Ok right_kind, Ok right_const
+    when numeric left_kind && numeric right_kind
+         || numeric left_kind && left_const = Some Zero && right_kind = String
+         || left_kind = String && numeric right_kind && right_const = Some Zero ->
+    write pc env dest Int
+  | Ok left_kind, _, Ok right_kind, _ ->
+    Error (Expected (pc, right, kind_name left_kind, right_kind))
 
 let binary_cmp pc env dest left right =
   match expect_same pc env left right with
@@ -298,7 +321,9 @@ let successors labels pc op len =
 
 let step facts pc env = function
   | Contract_vm.LDI (dest, Contract_vm.VString value) ->
-    write_const pc env dest String value
+    write_const pc env dest String (Text value)
+  | Contract_vm.LDI (dest, Contract_vm.VInt value) when Z.equal value Z.zero ->
+    write_const pc env dest Int Zero
   | Contract_vm.LDI (dest, value) -> write pc env dest (kind_of_value value)
   | Contract_vm.MOV (dest, source) ->
     (match read pc env source, read_const pc env source with
@@ -306,7 +331,8 @@ let step facts pc env = function
      | _, Error error -> Error error
      | Ok kind, Ok (Some value) -> write_const pc env dest kind value
      | Ok kind, Ok None -> write pc env dest kind)
-  | Contract_vm.ADD (dest, left, right)
+  | Contract_vm.ADD (dest, left, right) ->
+    binary_add pc env dest left right
   | Contract_vm.SUB (dest, left, right)
   | Contract_vm.MUL (dest, left, right)
   | Contract_vm.DIV (dest, left, right)
@@ -321,10 +347,10 @@ let step facts pc env = function
   | Contract_vm.LT (dest, left, right)
   | Contract_vm.GT (dest, left, right) -> binary_order pc env dest left right
   | Contract_vm.CONCAT (dest, left, right) ->
-    (match expect_text pc env left with
+    (match expect pc env left scalar_value "scalar value" with
      | Error error -> Error error
      | Ok _ ->
-       (match expect_text pc env right with
+       (match expect pc env right scalar_value "scalar value" with
         | Error error -> Error error
         | Ok _ -> write pc env dest String))
   | Contract_vm.STRLEN (dest, source) ->
@@ -399,7 +425,11 @@ let step facts pc env = function
     (match expect pc env source (function String | Addr -> true | _ -> false) "address" with
      | Error error -> Error error
      | Ok _ -> write pc env dest Int)
-  | Contract_vm.SLOAD (dest, _)
+  | Contract_vm.SLOAD (dest, key) ->
+    write pc env dest
+      (match storage_kind facts key with
+       | Some kind -> kind
+       | None -> String)
   | Contract_vm.TREEHASH dest
   | Contract_vm.NODEID dest
   | Contract_vm.TXHASH dest -> write pc env dest String
@@ -407,15 +437,22 @@ let step facts pc env = function
     (match expect_address pc env key with
      | Error error -> Error error
      | Ok _ -> write pc env dest String)
-  | Contract_vm.SSTORE (_, source) ->
-    (match expect_text pc env source with
-     | Error error -> Error error
-     | Ok _ -> Ok env)
+  | Contract_vm.SSTORE (key, source) ->
+    (match storage_kind facts key with
+     | Some expected ->
+       (match read pc env source with
+        | Ok actual when same expected actual -> Ok env
+        | Ok actual -> Error (Expected (pc, source, kind_name expected, actual))
+        | Error error -> Error error)
+     | None ->
+       (match expect pc env source scalar_value "scalar value" with
+        | Error error -> Error error
+        | Ok _ -> Ok env))
   | Contract_vm.SSTOREK (key, source) ->
     (match expect_address pc env key with
      | Error error -> Error error
      | Ok _ ->
-       (match expect_text pc env source with
+       (match expect pc env source scalar_value "scalar value" with
         | Error error -> Error error
         | Ok _ -> Ok env))
   | Contract_vm.SDELK key ->
@@ -460,7 +497,8 @@ let step facts pc env = function
           | Some abi ->
             match read_const pc env method_name with
             | Error error -> Error error
-            | Ok (Some method_name) when String.equal method_name abi.method_name ->
+            | Ok (Some (Text method_name))
+              when String.equal method_name abi.method_name ->
               if List.length abi.inputs <> count then
                 Error (Xcall_abi (pc, "argument count mismatch"))
               else
@@ -629,7 +667,7 @@ let step facts pc env = function
      | Ok _ -> write pc env dest String)
   | _ -> Error (Unsupported pc)
 
-let merge_regs pc left right =
+let merge_regs _pc left right =
   let result = Array.copy left in
   let rec loop reg =
     if reg = 64 then Ok result
@@ -644,14 +682,16 @@ let merge_regs pc left right =
       | Set left_kind, Set right_kind when numeric left_kind && numeric right_kind ->
         result.(reg) <- Set Int;
         loop (reg + 1)
-      | Set left_kind, Set right_kind -> Error (Mismatch (pc, reg, left_kind, right_kind))
+      | Set _, Set _ ->
+        result.(reg) <- Unset;
+        loop (reg + 1)
   in
   loop 0
 
 let merge_consts left right =
   Array.mapi (fun index value ->
     match value, right.(index) with
-    | Some left, Some right when String.equal left right -> Some left
+    | Some left, Some right when left = right -> Some left
     | _ -> None)
     left
 
@@ -681,6 +721,20 @@ let merge pc left right =
 
 let valid_fact (slot, _) = slot >= 0 && slot <= 16_777_216
 
+let persistable_kind = function
+  | Int
+  | Bool
+  | String
+  | Bytes
+  | Bytes32
+  | U64
+  | U128
+  | U256
+  | Addr -> true
+  | Cipher
+  | PubKey
+  | Unknown -> false
+
 let valid_effect effect =
   List.mem effect [
     "memory_read";
@@ -696,48 +750,86 @@ let valid_effect effect =
   ]
 
 let unique key values =
-  let rec loop seen = function
-    | [] -> true
-    | value :: rest ->
+  let seen = Hashtbl.create (List.length values) in
+  List.for_all
+    (fun value ->
       let item = key value in
-      not (List.mem item seen) && loop (item :: seen) rest
-  in
-  loop [] values
-
-let target_pc code label =
-  Array.to_list code
-  |> List.mapi (fun pc op ->
-    match op with
-    | Contract_vm.JDEST value when value = label -> Some pc
-    | _ -> None)
-  |> List.find_map (fun value -> value)
+      if Hashtbl.mem seen item then false
+      else begin
+        Hashtbl.add seen item ();
+        true
+      end)
+    values
 
 let call_pcs code =
-  Array.to_list code
-  |> List.mapi (fun pc op ->
-    match op with
-    | Contract_vm.CALL_INT _ -> Some pc
-    | _ -> None)
-  |> List.filter_map (fun value -> value)
+  let pcs = ref [] in
+  Array.iteri
+    (fun pc op ->
+      match op with
+      | Contract_vm.CALL_INT _ -> pcs := pc :: !pcs
+      | _ -> ())
+    code;
+  List.rev !pcs
 
 let acyclic calls =
-  let targets owner =
-    calls
-    |> List.filter_map (fun call ->
-      if call.owner = owner then Some call.target else None)
+  let edges = Hashtbl.create (List.length calls) in
+  List.iter
+    (fun call ->
+      let current = Option.value (Hashtbl.find_opt edges call.owner) ~default:[] in
+      Hashtbl.replace edges call.owner (call.target :: current))
+    calls;
+  let active = Hashtbl.create (Hashtbl.length edges) in
+  let complete = Hashtbl.create (Hashtbl.length edges) in
+  let rec visit node =
+    match Hashtbl.find_opt complete node with
+    | Some depth -> Some depth
+    | None when Hashtbl.mem active node -> None
+    | None ->
+      Hashtbl.add active node ();
+      let children =
+        Hashtbl.find_opt edges node
+        |> Option.value ~default:[]
+        |> List.rev
+      in
+      let rec deepest depth = function
+        | [] -> Some depth
+        | child :: rest ->
+          match visit child with
+          | None -> None
+          | Some child_depth -> deepest (max depth child_depth) rest
+      in
+      let result =
+        match deepest 0 children with
+        | None -> None
+        | Some child_depth ->
+          let depth = child_depth + 1 in
+          if depth > Program_limits.max_call_depth then None
+          else begin
+            Hashtbl.replace complete node depth;
+            Some depth
+          end
+      in
+      Hashtbl.remove active node;
+      result
   in
-  let rec visit stack node =
-    if List.mem node stack then false
-    else List.for_all (visit (node :: stack)) (targets node)
-  in
-  calls
-  |> List.map (fun call -> call.owner)
-  |> List.sort_uniq compare
-  |> List.for_all (visit [])
+  Hashtbl.to_seq_keys edges
+  |> List.of_seq
+  |> List.sort compare
+  |> List.for_all (fun node -> Option.is_some (visit node))
 
 let valid_facts len code facts =
   let entries = facts.entries in
-  let entry_targets = List.map (fun (entry : entry) -> entry.target) entries in
+  let labels = Hashtbl.create (List.length entries) in
+  Array.iteri
+    (fun pc op ->
+      match op with
+      | Contract_vm.JDEST label -> Hashtbl.replace labels label pc
+      | _ -> ())
+    code;
+  let entry_targets = Hashtbl.create (List.length entries) in
+  List.iter
+    (fun (entry : entry) -> Hashtbl.replace entry_targets entry.target ())
+    entries;
   let valid_memory memory =
     List.for_all valid_fact memory
     && unique (fun (slot, _) -> slot) memory
@@ -761,11 +853,12 @@ let valid_facts len code facts =
     && call.pc < len
     && call.target >= 0
     && call.target < len
-    && List.mem call.owner entry_targets
-    && List.mem call.target entry_targets
+    && Hashtbl.mem entry_targets call.owner
+    && Hashtbl.mem entry_targets call.target
     &&
     match code.(call.pc) with
-    | Contract_vm.CALL_INT (_, label) -> target_pc code label = Some call.target
+    | Contract_vm.CALL_INT (_, label) ->
+      Hashtbl.find_opt labels label = Some call.target
     | _ -> false
   in
   let valid_xcall (call : xcall) =
@@ -782,8 +875,22 @@ let valid_facts len code facts =
   in
   let expected = call_pcs code in
   let actual = List.map (fun (call : call) -> call.pc) facts.calls in
-  List.for_all valid_fact facts.root
+  len <= Program_limits.max_instructions
+  && List.length entries <= Program_limits.max_functions
+  && List.length facts.calls <= Program_limits.max_internal_calls
+  && List.length facts.xcalls <= Program_limits.max_external_calls
+  && List.length facts.root <= Program_limits.max_facts
+  && List.length facts.storage <= Program_limits.max_facts
+  && List.for_all
+       (fun (entry : entry) ->
+         List.length entry.mem <= Program_limits.max_facts)
+       entries
+  && List.for_all valid_fact facts.root
   && unique (fun (slot, _) -> slot) facts.root
+  && List.for_all
+       (fun (key, kind) -> key <> "" && persistable_kind kind)
+       facts.storage
+  && unique fst facts.storage
   && unique (fun (entry : entry) -> entry.target) entries
   && unique (fun (call : call) -> call.pc) facts.calls
   && List.for_all valid_entry entries
@@ -801,6 +908,12 @@ let canonical_facts facts =
     facts.root
     |> List.sort (fun (left, _) (right, _) -> compare left right)
     |> List.map (pair_json "slot")
+  in
+  let storage =
+    facts.storage
+    |> List.sort (fun (left, _) (right, _) -> String.compare left right)
+    |> List.map (fun (key, kind) ->
+      `Assoc ["key", `String key; "kind", `String (kind_name kind)])
   in
   let entries =
     facts.entries
@@ -841,12 +954,17 @@ let canonical_facts facts =
         "capabilities", `List (List.map (fun value -> `String (capability_name value)) call.capabilities)
       ])
   in
-  Yojson.Safe.to_string (`Assoc [
+  let fields = [
     "root", `List root;
     "entries", `List entries;
     "calls", `List calls;
-    "xcalls", `List xcalls
-  ])
+    "xcalls", `List xcalls;
+  ] in
+  let fields =
+    if storage = [] then fields
+    else ("storage", `List storage) :: fields
+  in
+  Yojson.Safe.to_string (`Assoc fields)
 
 let facts_hash facts =
   Digestif.SHA256.(digest_string (canonical_facts facts) |> to_hex)
@@ -861,9 +979,13 @@ let runtime_entry code =
   in
   find 0
 
-let check ?(facts = empty_facts) code =
+let check
+    ?(max_steps = Program_limits.max_flow_steps)
+    ?(facts = empty_facts)
+    code =
   let len = Array.length code in
   if len = 0 then Error (Unsupported 0)
+  else if max_steps <= 0 then Error (Flow_limit max_steps)
   else if not (valid_facts len code facts) then Error (Unsupported 0)
   else
     let labels = Hashtbl.create 32 in
@@ -873,6 +995,7 @@ let check ?(facts = empty_facts) code =
       | _ -> ()) code;
     let states = Array.make len None in
     let entry = runtime_entry code in
+    let steps = ref 0 in
     states.(entry) <- Some {
       regs = Array.make 64 Unset;
       mem = mem_facts facts.root;
@@ -882,38 +1005,44 @@ let check ?(facts = empty_facts) code =
       match pending with
       | [] -> Ok ()
       | pc :: rest ->
-        match states.(pc) with
-         | None -> visit rest
-         | Some env ->
-           match step facts pc {
-             env with
-             regs = Array.copy env.regs;
-             consts = Array.copy env.consts;
-           } code.(pc) with
+        if !steps >= max_steps then Error (Flow_limit max_steps)
+        else begin
+          incr steps;
+          match states.(pc) with
+          | None -> visit rest
+          | Some env ->
+            match step facts pc {
+              env with
+              regs = Array.copy env.regs;
+              consts = Array.copy env.consts;
+            } code.(pc) with
             | Error error -> Error error
             | Ok next_env ->
               let rec add_targets queue = function
                 | [] -> visit queue
                 | target :: targets ->
-                  if target < 0 || target >= len then Error (Invalid_target (pc, target))
+                  if target < 0 || target >= len then
+                    Error (Invalid_target (pc, target))
                   else
-                    (match states.(target) with
-                     | None ->
-                       let target_env = seed facts target next_env in
-                       states.(target) <- Some {
-                         target_env with
-                         regs = Array.copy target_env.regs;
-                         consts = Array.copy target_env.consts;
-                       };
-                       add_targets (target :: queue) targets
-                     | Some old ->
-                       (match merge target old next_env with
-                        | Error error -> Error error
-                        | Ok joined when joined = old -> add_targets queue targets
-                        | Ok joined ->
-                          states.(target) <- Some joined;
-                          add_targets (target :: queue) targets))
+                    let target_env = seed facts target next_env in
+                    match states.(target) with
+                    | None ->
+                      states.(target) <- Some {
+                        target_env with
+                        regs = Array.copy target_env.regs;
+                        consts = Array.copy target_env.consts;
+                      };
+                      add_targets (target :: queue) targets
+                    | Some old ->
+                      match merge target old target_env with
+                      | Error error -> Error error
+                      | Ok joined when joined = old ->
+                        add_targets queue targets
+                      | Ok joined ->
+                        states.(target) <- Some joined;
+                        add_targets (target :: queue) targets
               in
               add_targets rest (successors labels pc code.(pc) len)
+        end
     in
     visit [entry]

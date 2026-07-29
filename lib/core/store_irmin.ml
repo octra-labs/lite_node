@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Syntax
 
@@ -34,7 +22,10 @@ type t = {
   pvac_dir : string;
 }
 
-type batch_savepoint = Store.tree
+type batch_savepoint = {
+  tree : Store.tree;
+  stealth_counter : int64;
+}
 
 let rec strip_trailing_slash path =
   let n = String.length path in
@@ -54,9 +45,10 @@ let make_info msg =
   let date = Int64.of_float (Unix.gettimeofday ()) in
   fun () -> Store.Info.v ~author:"octra" ~message:msg date
 
-let open_store ?(fresh=false) path =
+let open_store ?(fresh=false) ?(readonly=false) path =
   let config = Irmin_pack.Conf.init
     ~fresh
+    ~readonly
     ~lru_size:100_000
     ~index_log_size:2_500_000
     ~indexing_strategy:Irmin_pack.Indexing_strategy.minimal
@@ -74,7 +66,9 @@ let open_store ?(fresh=false) path =
 
         let msg = Printf.sprintf "FATAL: stealth_counter corrupt value=%S: %s"
           s (Printexc.to_string e) in
-        Octra_log.stderr "[STORE_IRMIN %s]\n%!" msg;
+        Octra_log.fatal "irmin"
+          "event = stealth_counter_corrupt value = %S error = %s"
+          s (Printexc.to_string e);
         failwith msg)
    | None -> ());
   Lwt.return {
@@ -105,7 +99,9 @@ let write t path value =
        let msg = Printf.sprintf "Irmin write failed path=%s: %s"
          (String.concat "/" path)
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
-       Octra_log.stderr "[STORE_IRMIN FATAL] %s\n%!" msg;
+       Octra_log.fatal "irmin" "event = write_failed path = %s error = %s"
+         (String.concat "/" path)
+         (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e);
        Lwt.fail (Irmin_write_failed msg))
 
 let read t path =
@@ -135,7 +131,9 @@ let remove_path t path =
        let errmsg = Printf.sprintf "Irmin remove failed path=%s: %s"
          (String.concat "/" path)
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
-       Octra_log.stderr "[STORE_IRMIN FATAL] %s\n%!" errmsg;
+       Octra_log.fatal "irmin" "event = remove_failed path = %s error = %s"
+         (String.concat "/" path)
+         (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e);
        Lwt.fail (Irmin_remove_failed errmsg))
 
 let begin_epoch_batch t =
@@ -156,7 +154,10 @@ let commit_epoch_batch t msg =
      | Error e ->
        let errmsg = Printf.sprintf "Irmin commit_epoch_batch failed msg=%s: %s" msg
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
-       Octra_log.stderr "[STORE_IRMIN FATAL] %s\n%!" errmsg;
+       Octra_log.fatal "irmin"
+         "event = epoch_commit_failed message = %s error = %s"
+         msg
+         (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e);
 
        Lwt.fail (Irmin_write_failed errmsg))
 
@@ -165,13 +166,18 @@ let abort_epoch_batch t =
 
 let save_batch t =
   match t.batch_tree with
-  | Some tree -> Ok tree
+  | Some tree ->
+    Ok {
+      tree;
+      stealth_counter = !(t.stealth_counter);
+    }
   | None -> Error "store batch is not active"
 
 let restore_batch t savepoint =
   match t.batch_tree with
   | Some _ ->
-    t.batch_tree <- Some savepoint;
+    t.batch_tree <- Some savepoint.tree;
+    t.stealth_counter := savepoint.stealth_counter;
     Ok ()
   | None -> Error "store batch is not active"
 
@@ -335,31 +341,113 @@ let set_decrypt_allowance t addr v =
 let ensure_pvac_dir t =
   try Unix.mkdir t.pvac_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
 
-let pvac_path t addr = Filename.concat t.pvac_dir (addr ^ ".pk")
+let ensure_dir path =
+  try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+
+let pvac_hash blob =
+  Digestif.SHA256.digest_string blob
+  |> Digestif.SHA256.to_hex
+
+let pvac_hash_path addr =
+  ["pvac_hashes"; addr]
+
+let pvac_legacy_path t addr =
+  Filename.concat t.pvac_dir (addr ^ ".pk")
+
+let pvac_blob_dir t =
+  Filename.concat t.pvac_dir "blobs"
+
+let pvac_blob_path t hash =
+  Filename.concat (pvac_blob_dir t) (hash ^ ".pk")
+
+let read_file path =
+  if Sys.file_exists path then
+    try
+      let ic = open_in_bin path in
+      let n = in_channel_length ic in
+      let raw = Bytes.create n in
+      really_input ic raw 0 n;
+      close_in ic;
+      Some (Bytes.to_string raw)
+    with _ -> None
+  else
+    None
+
+let pvac_write_id = ref 0
+
+let fsync_dir path =
+  let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () -> Unix.fsync fd)
+
+let write_blob t hash blob =
+  ensure_pvac_dir t;
+  let dir = pvac_blob_dir t in
+  ensure_dir dir;
+  let path = pvac_blob_path t hash in
+  match read_file path with
+  | Some current when String.equal (pvac_hash current) hash -> ()
+  | Some _ -> failwith "pvac blob hash collision"
+  | None ->
+    incr pvac_write_id;
+    let tmp =
+      Printf.sprintf "%s.%d.%d.tmp" path (Unix.getpid ()) !pvac_write_id
+    in
+    let cleanup () =
+      try Unix.unlink tmp with Unix.Unix_error _ -> ()
+    in
+    try
+      let oc = open_out_bin tmp in
+      Fun.protect
+        ~finally:(fun () -> close_out_noerr oc)
+        (fun () ->
+          output_string oc blob;
+          flush oc;
+          Unix.fsync (Unix.descr_of_out_channel oc));
+      Unix.rename tmp path;
+      fsync_dir dir;
+      fsync_dir t.pvac_dir;
+      fsync_dir (Filename.dirname t.pvac_dir)
+    with e ->
+      cleanup ();
+      raise e
+
+let get_pvac_hash t addr =
+  let* value = read t (pvac_hash_path addr) in
+  match value with
+  | Some "none"
+  | None -> Lwt.return_none
+  | Some hash -> Lwt.return_some hash
+
+let pvac_is_bound t addr =
+  let* value = read t (pvac_hash_path addr) in
+  match value with
+  | Some hash when hash <> "none" -> Lwt.return true
+  | Some _
+  | None -> Lwt.return false
 
 let get_pvac_pubkey t addr =
-  let p = pvac_path t addr in
-  if Sys.file_exists p then
-    try
-      let ic = open_in_bin p in
-      let n = in_channel_length ic in
-      let s = Bytes.create n in
-      really_input ic s 0 n;
-      close_in ic;
-      Lwt.return (Some (Bytes.to_string s))
-    with _ -> Lwt.return_none
-  else
-    Lwt.return_none
+  let* bound = read t (pvac_hash_path addr) in
+  match bound with
+  | Some "none" -> Lwt.return_none
+  | Some hash ->
+    begin
+      match read_file (pvac_blob_path t hash) with
+      | Some blob when String.equal (pvac_hash blob) hash ->
+        Lwt.return_some blob
+      | Some _ ->
+        Lwt.fail_with "pvac blob hash mismatch"
+      | None ->
+        Lwt.fail_with "pvac blob unavailable"
+    end
+  | None ->
+    Lwt.return (read_file (pvac_legacy_path t addr))
 
 let set_pvac_pubkey t addr pk_blob =
-  ensure_pvac_dir t;
-  let p = pvac_path t addr in
-  let tmp = p ^ ".tmp" in
-  let oc = open_out_bin tmp in
-  output_string oc pk_blob;
-  close_out oc;
-  Unix.rename tmp p;
-  Lwt.return_unit
+  let hash = pvac_hash pk_blob in
+  write_blob t hash pk_blob;
+  write t (pvac_hash_path addr) hash
 
 let kat_path t addr = Filename.concat t.pvac_dir (addr ^ ".kat")
 
@@ -383,11 +471,7 @@ let get_pvac_kat t addr =
     None
 
 let delete_pvac_pubkey t addr =
-  let pk = pvac_path t addr in
-  let kt = kat_path t addr in
-  (try Unix.unlink pk with Unix.Unix_error _ -> ());
-  (try Unix.unlink kt with Unix.Unix_error _ -> ());
-  Lwt.return_unit
+  write t (pvac_hash_path addr) "none"
 
 let get_circle_balance t addr =
   let* v = read t ["accounts"; addr; "circle_balance"] in
@@ -413,14 +497,21 @@ let list_epoch_ids t =
     Lwt.return (List.sort (fun a b -> compare b a) !ids)
 
 let next_stealth_id t =
-  let id = !(t.stealth_counter) in
-  t.stealth_counter := Int64.add id 1L;
-  id
+  let* stored = read t ["index"; "stealth_counter"] in
+  let id =
+    match stored with
+    | Some value -> Int64.of_string value
+    | None -> 0L
+  in
+  let next = Int64.succ id in
+  t.stealth_counter := next;
+  let* () = write t ["index"; "stealth_counter"] (Int64.to_string next) in
+  Lwt.return id
 
 let insert_stealth_output t ~stealth_tag ~eph_pub ~enc_amount ~amount
     ~epoch_id ~tx_hash ~sender_addr ~claim_pub ~delta_cipher_stored
     ~amount_hash ~amount_commitment =
-  let id = next_stealth_id t in
+  let* id = next_stealth_id t in
   let so_json = Yojson.Safe.to_string (`Assoc [
     "id", `Intlit (Int64.to_string id);
     "stealth_tag", `String stealth_tag;
@@ -437,33 +528,108 @@ let insert_stealth_output t ~stealth_tag ~eph_pub ~enc_amount ~amount
     "amount_commitment", `String amount_commitment;
   ]) in
   let* () = write t ["stealth"; Int64.to_string id] so_json in
-  let* () = write t ["index"; "stealth_counter"] (Int64.to_string !(t.stealth_counter)) in
   Lwt.return (Ok id)
+
+let stealth_output_of_string ~fallback_id s =
+  try
+    let j = Yojson.Safe.from_string s in
+    let open Yojson.Safe.Util in
+    Some Ledger_types.{
+      id = (try j |> member "id" |> to_int with _ -> fallback_id);
+      stealth_tag = j |> member "stealth_tag" |> to_string;
+      eph_pub = j |> member "eph_pub" |> to_string;
+      enc_amount = j |> member "enc_amount" |> to_string;
+      amount = j |> member "amount" |> to_string;
+      epoch_id = j |> member "epoch_id" |> to_int;
+      tx_hash = j |> member "tx_hash" |> to_string;
+      sender_addr = j |> member "sender_addr" |> to_string;
+      claimed = j |> member "claimed" |> to_int;
+      claim_pub = (try j |> member "claim_pub" |> to_string with _ -> "");
+      delta_cipher_stored = (try j |> member "delta_cipher_stored" |> to_string with _ -> "");
+      amount_hash = (try j |> member "amount_hash" |> to_string with _ -> "");
+      amount_commitment = (try j |> member "amount_commitment" |> to_string with _ -> "");
+    }
+  with _ ->
+    None
 
 let get_stealth_output_by_id t output_id =
   let* v = read t ["stealth"; string_of_int output_id] in
   match v with
   | None -> Lwt.return_none
-  | Some s ->
-    (try
-       let j = Yojson.Safe.from_string s in
-       let open Yojson.Safe.Util in
-       Lwt.return (Some Ledger_types.{
-         id = (try j |> member "id" |> to_int with _ -> output_id);
-         stealth_tag = j |> member "stealth_tag" |> to_string;
-         eph_pub = j |> member "eph_pub" |> to_string;
-         enc_amount = j |> member "enc_amount" |> to_string;
-         amount = j |> member "amount" |> to_string;
-         epoch_id = j |> member "epoch_id" |> to_int;
-         tx_hash = j |> member "tx_hash" |> to_string;
-         sender_addr = j |> member "sender_addr" |> to_string;
-         claimed = j |> member "claimed" |> to_int;
-         claim_pub = (try j |> member "claim_pub" |> to_string with _ -> "");
-         delta_cipher_stored = (try j |> member "delta_cipher_stored" |> to_string with _ -> "");
-         amount_hash = (try j |> member "amount_hash" |> to_string with _ -> "");
-         amount_commitment = (try j |> member "amount_commitment" |> to_string with _ -> "");
-       })
-     with _ -> Lwt.return_none)
+  | Some s -> Lwt.return (stealth_output_of_string ~fallback_id:output_id s)
+
+type stealth_page = {
+  outputs : Ledger_types.stealth_output list;
+  next_before_id : int64 option;
+  has_more : bool;
+  scanned : int;
+}
+
+let get_stealth_outputs_page t ~from_epoch ~before_id ~limit =
+  let limit = max 1 (min limit 256) in
+  let scan_limit = max 256 (min 2048 (limit * 8)) in
+  let* tree = Store.get_tree t.store [] in
+  let* counter = Store.Tree.find tree ["index"; "stealth_counter"] in
+  let latest =
+    match counter with
+    | Some value -> Int64.of_string value
+    | None -> 0L
+  in
+  let start =
+    Option.value ~default:latest before_id
+    |> Int64.max 0L
+    |> Int64.min latest
+  in
+  let page cursor outputs scanned has_more =
+    let next_before_id = if has_more then Some cursor else None in
+    Lwt.return {outputs; next_before_id; has_more; scanned}
+  in
+  let rec scan cursor outputs found scanned =
+    if Int64.compare cursor 0L <= 0 then
+      page cursor outputs scanned false
+    else if found >= limit || scanned >= scan_limit then
+      page cursor outputs scanned true
+    else
+      let id = Int64.pred cursor in
+      let* raw = Store.Tree.find tree ["stealth"; Int64.to_string id] in
+      let scanned = scanned + 1 in
+      let* () =
+        if scanned mod 32 = 0 then Lwt.pause () else Lwt.return_unit
+      in
+      match raw with
+      | None ->
+        scan id outputs found scanned
+      | Some raw ->
+        match stealth_output_of_string ~fallback_id:(Int64.to_int id) raw with
+        | None ->
+          scan id outputs found scanned
+        | Some output when output.Ledger_types.epoch_id < from_epoch ->
+          page id outputs scanned false
+        | Some output ->
+          scan id (output :: outputs) (found + 1) scanned
+  in
+  scan start [] 0 0
+
+let get_stealth_outputs_by_ids t ids =
+  let* tree = Store.get_tree t.store [] in
+  let rec read_ids outputs = function
+    | [] -> Lwt.return (List.rev outputs)
+    | id :: rest ->
+      let* raw = Store.Tree.find tree ["stealth"; string_of_int id] in
+      let outputs =
+        match raw with
+        | Some value ->
+          begin
+            match stealth_output_of_string ~fallback_id:id value with
+            | Some output -> output :: outputs
+            | None -> outputs
+          end
+        | None ->
+          outputs
+      in
+      read_ids outputs rest
+  in
+  read_ids [] ids
 
 let get_stealth_outputs_since t from_epoch =
   let results = ref [] in
@@ -621,21 +787,35 @@ let save_contract_storage t addr storage_tbl =
     (fun (key, value) -> write t ["contracts"; addr; "storage"; key] value)
     writes
 
-let deploy_contract t ~address ~code_hash ~version ~owner ~ctype ~bytecode_b64 =
-  let meta = Yojson.Safe.to_string (`Assoc [
-    "address", `String address;
-    "code_hash", `String code_hash;
-    "version", `String version;
-    "owner", `String owner;
-    "ctype", `String ctype;
-  ]) in
+type contract_meta = {
+  address : string;
+  code_hash : string;
+  version : string;
+  owner : string;
+  ctype : string;
+  admission : string;
+}
+
+let contract_meta_json meta =
+  Yojson.Safe.to_string (`Assoc [
+    "address", `String meta.address;
+    "code_hash", `String meta.code_hash;
+    "version", `String meta.version;
+    "owner", `String meta.owner;
+    "ctype", `String meta.ctype;
+    "admission", `String meta.admission;
+  ])
+
+let deploy_contract t ~address ~code_hash ~version ~owner ~ctype ~admission
+    ~bytecode_b64 =
+  let meta =
+    contract_meta_json { address; code_hash; version; owner; ctype; admission } in
   let* () = write t ["contracts"; address; "meta"] meta in
   write t ["contracts"; address; "bytecode"] bytecode_b64
 
 let contract_exists t addr =
   let* v = read t ["contracts"; addr; "meta"] in
   Lwt.return (v <> None)
-
 
 let save_contract_abi t addr abi_json =
   write t ["contracts"; addr; "abi"] abi_json
@@ -661,7 +841,7 @@ let save_contract_certificate t addr certificate_json =
 let get_contract_certificate t addr =
   read t ["contracts"; addr; "certificate"]
 
-let get_contract_info t addr =
+let get_contract_meta t addr =
   let* v = read t ["contracts"; addr; "meta"] in
   match v with
   | None -> Lwt.return_none
@@ -669,13 +849,51 @@ let get_contract_info t addr =
     (try
        let j = Yojson.Safe.from_string s in
        let open Yojson.Safe.Util in
-       Lwt.return (Some (
-         j |> member "address" |> to_string,
-         j |> member "code_hash" |> to_string,
-         j |> member "version" |> to_string,
-         j |> member "owner" |> to_string
-       ))
+       Lwt.return_some {
+         address = j |> member "address" |> to_string;
+         code_hash = j |> member "code_hash" |> to_string;
+         version = j |> member "version" |> to_string;
+         owner = j |> member "owner" |> to_string;
+         ctype =
+           (match j |> member "ctype" with
+            | `String value -> value
+            | _ -> "CUSTOM");
+         admission =
+           (match j |> member "admission" with
+            | `String value -> value
+            | _ -> "binary");
+       }
      with _ -> Lwt.return_none)
+
+let get_contract_info t addr =
+  let* meta = get_contract_meta t addr in
+  Lwt.return
+    (Option.map
+       (fun meta ->
+         meta.address,
+         meta.code_hash,
+         meta.version,
+         meta.owner)
+       meta)
+
+let upgrade_contract t ~address ~expected_code_hash ~code_hash ~version
+    ~owner ~ctype ~admission ~bytecode_b64 =
+  let* current = get_contract_meta t address in
+  match current with
+  | None ->
+    Lwt.return_error "program not found"
+  | Some current when not (String.equal current.owner owner) ->
+    Lwt.return_error "program owner changed"
+  | Some current when not (String.equal current.code_hash expected_code_hash) ->
+    Lwt.return_error "program code hash changed"
+  | Some _ ->
+    let meta =
+      contract_meta_json
+        { address; code_hash; version; owner; ctype; admission }
+    in
+    let* () = write t ["contracts"; address; "meta"] meta in
+    let* () = write t ["contracts"; address; "bytecode"] bytecode_b64 in
+    Lwt.return_ok ()
 
 let list_contracts t =
   let* tree_opt = read_tree t ["contracts"] in
@@ -822,6 +1040,34 @@ let list_circle_stable_entries t circle_id =
     ) entries in
     Lwt.return pairs
 
+type circle_stable_page = {
+  entries : Circles.stable_entry list;
+  total : int;
+}
+
+let list_circle_stable_entries_page t circle_id ~limit =
+  let* tree_opt = read_tree t ["circles"; circle_id; "stable"; "by_hash"] in
+  match tree_opt with
+  | None -> Lwt.return { entries = []; total = 0 }
+  | Some tree ->
+    let* total = Store.Tree.length tree [] in
+    let* rows = Store.Tree.list tree ~length:(max 0 limit) [] in
+    let* entries =
+      Lwt_list.filter_map_s
+        (fun (key_hash, _) ->
+          let* value_opt =
+            read t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
+          match value_opt with
+          | None -> Lwt.return_none
+          | Some value ->
+            begin
+              match Circles.stable_entry_of_yojson (Yojson.Safe.from_string value) with
+              | Ok entry -> Lwt.return (Some entry)
+              | Error _ -> Lwt.return_none
+            end)
+        rows in
+    Lwt.return { entries; total }
+
 let read_circle_stable_key t circle_id raw_key =
   let* entry_opt = get_circle_stable_entry t circle_id (Circles.stable_key_hash raw_key) in
   match entry_opt with
@@ -845,6 +1091,24 @@ let load_circle_stable_storage t circle_id =
   ) entries;
   if !inline_only then Lwt.return (Ok tbl)
   else Lwt.return (Error "circle stable storage contains non-inline values")
+
+let load_circle_stable_storage_page t circle_id ~limit =
+  let* page = list_circle_stable_entries_page t circle_id ~limit in
+  let rec inline_pairs acc = function
+    | [] -> Ok (List.rev acc)
+    | entry :: rest ->
+      begin
+        match entry.Circles.value with
+        | Circles.Inline value ->
+          inline_pairs ((entry.raw_key, value) :: acc) rest
+        | Circles.Blob_ref _ ->
+          Error "circle stable storage contains non-inline values"
+      end
+  in
+  match inline_pairs [] page.entries with
+  | Error e -> Lwt.return (Error e)
+  | Ok pairs ->
+    Lwt.return (Ok (pairs, page.total))
 
 let save_circle_stable_storage t circle_id storage_tbl =
   let* () = remove_path t ["circles"; circle_id; "stable"; "by_hash"] in
@@ -1161,7 +1425,6 @@ let dump_batch_meta_pairs t =
         Lwt.return (name, Option.value ~default:"<none>" v)
       ) entries
 
-
 let get_commit_hash t =
   let* head = Store.Head.find t.store in
   match head with
@@ -1302,6 +1565,32 @@ let iter_subtree t path f =
         Lwt.return_unit)
       tree ()
 
+type pvac_blob_check = {
+  bound : int;
+  missing : string list;
+  corrupt : string list;
+}
+
+let inspect_pvac_blobs t =
+  let bound = ref 0 in
+  let missing = ref [] in
+  let corrupt = ref [] in
+  let* () =
+    iter_subtree t ["pvac_hashes"] (fun addr hash ->
+      if hash <> "none" then begin
+        incr bound;
+        match read_file (pvac_blob_path t hash) with
+        | None -> missing := addr :: !missing
+        | Some blob when String.equal (pvac_hash blob) hash -> ()
+        | Some _ -> corrupt := addr :: !corrupt
+      end)
+  in
+  Lwt.return {
+    bound = !bound;
+    missing = List.sort String.compare !missing;
+    corrupt = List.sort String.compare !corrupt;
+  }
+
 type bulk_tree = Store.tree
 
 let begin_bulk t =
@@ -1318,8 +1607,66 @@ let commit_bulk t tree msg =
    | Error e ->
      let errmsg = Printf.sprintf "Irmin commit_bulk failed msg=%s: %s" msg
        (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
-     Octra_log.stderr "[STORE_IRMIN FATAL] %s\n%!" errmsg;
+     Octra_log.fatal "irmin"
+       "event = bulk_commit_failed message = %s error = %s"
+       msg
+       (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e);
      Lwt.fail (Irmin_write_failed errmsg))
+
+type compact_store_result = {
+  commit_hash : string;
+  tree_hash : string;
+}
+
+let create_compact_store t ~expected_commit ~target =
+  let* head = Store.Head.find t.store in
+  match head with
+  | None -> Lwt.return (Error "source Irmin store has no head")
+  | Some commit ->
+    let commit_hash =
+      Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit)
+    in
+    if commit_hash <> expected_commit then
+      Lwt.return (Error "source Irmin commit does not match checkpoint")
+    else if Sys.file_exists target then
+      Lwt.return (Error "compact Irmin target already exists")
+    else
+      let tree_hash =
+        Irmin.Type.to_string Store.Hash.t
+          (Store.Tree.hash (Store.Commit.tree commit))
+      in
+      Lwt.catch
+        (fun () ->
+          let* () =
+            Store.create_one_commit_store
+              t.repo
+              (Store.Commit.key commit)
+              target
+          in
+          let* compact = open_store target in
+          Lwt.finalize
+            (fun () ->
+              let* restored =
+                Store.Commit.of_hash compact.repo (Store.Commit.hash commit)
+              in
+              match restored with
+              | None ->
+                Lwt.return (Error "compact Irmin commit is unavailable")
+              | Some restored ->
+                let restored_tree_hash =
+                  Irmin.Type.to_string Store.Hash.t
+                    (Store.Tree.hash (Store.Commit.tree restored))
+                in
+                if restored_tree_hash <> tree_hash then
+                  Lwt.return (Error "compact Irmin tree hash mismatch")
+                else
+                  let* () = Store.Head.set compact.store restored in
+                  Store.flush compact.repo;
+                  Lwt.return (Ok { commit_hash; tree_hash }))
+            (fun () -> close compact))
+        (fun exn ->
+          Lwt.return
+            (Error ("compact Irmin export failed: " ^ Printexc.to_string exn)))
 
 let tag_epoch t epoch_id =
   let* head = Store.Head.find t.store in

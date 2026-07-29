@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let run task =
   match Lwt.state task with
@@ -34,15 +22,15 @@ let run task =
     in
     pump 0
 
-let abi deploy =
+let abi ~ctype ~address ~owner ~version =
   Yojson.Safe.to_string (`Assoc [
-    "contract_type", `String deploy.Program_journal.ctype;
-    "address", `String deploy.address;
-    "deployer", `String deploy.owner;
-    "version", `String Oct_compile.lang_version;
+    "contract_type", `String ctype;
+    "address", `String address;
+    "deployer", `String owner;
+    "version", `String version;
   ])
 
-let stage_deploy store deploy =
+let stage_deploy store (deploy : Program_journal.deploy) =
   run
     (Octra_core.Store_irmin.deploy_contract store
        ~address:deploy.Program_journal.address
@@ -50,12 +38,48 @@ let stage_deploy store deploy =
        ~version:Oct_compile.lang_version
        ~owner:deploy.owner
        ~ctype:deploy.ctype
+       ~admission:deploy.admission
        ~bytecode_b64:deploy.bytecode_b64);
-  run (Octra_core.Store_irmin.save_contract_abi store deploy.address (abi deploy))
+  run
+    (Octra_core.Store_irmin.save_contract_abi
+       store
+       deploy.address
+       (abi
+          ~ctype:deploy.ctype
+          ~address:deploy.address
+          ~owner:deploy.owner
+          ~version:Oct_compile.lang_version))
+
+let stage_upgrade store (upgrade : Program_journal.upgrade) =
+  match
+    run
+      (Octra_core.Store_irmin.upgrade_contract
+         store
+         ~address:upgrade.Program_journal.address
+         ~expected_code_hash:upgrade.expected_code_hash
+         ~code_hash:upgrade.code_hash
+         ~version:upgrade.version
+         ~owner:upgrade.owner
+         ~ctype:upgrade.ctype
+         ~admission:upgrade.admission
+         ~bytecode_b64:upgrade.bytecode_b64)
+  with
+  | Error error -> failwith error
+  | Ok () ->
+    run
+      (Octra_core.Store_irmin.save_contract_abi
+         store
+         upgrade.address
+         (abi
+            ~ctype:upgrade.ctype
+            ~address:upgrade.address
+            ~owner:upgrade.owner
+            ~version:upgrade.version))
 
 let stage_storage store (address, storage) =
   run (Octra_core.Store_irmin.save_contract_storage store address storage)
 
 let stage store journal =
   Program_journal.deploys journal |> List.iter (stage_deploy store);
+  Program_journal.upgrades journal |> List.iter (stage_upgrade store);
   Program_journal.storage_entries journal |> List.iter (stage_storage store)

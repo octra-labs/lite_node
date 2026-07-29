@@ -1,40 +1,15 @@
-# === OCaml / Dune ===
 _build/
-_opam/
-.merlin
-*.install
-*.cmi
-*.cmo
-*.cmx
-*.cmt
-*.cmti
-*.cma
-*.cmxa
-*.cmxs
-*.annot
-*.byte
-*.native
-*.exe
-.dune/
-
-# === C / C++ / Rust build artifacts ===
-*.o
+_cargo_target/
+target/
+data/
+tmp/
+.keys/
 *.a
+*.bc
+*.exe
+*.o
 *.so
 *.dylib
-target/
-
-# === scratch / tooling (not part of the repo) ===
-tmp/
-scripts/
-_coverage/
-bisect*.coverage
-_doc/
-
-# === Editor / OS ===
-.DS_Store
-*~
-.*.swp
-\#*\#
-.vscode/
-.idea/
+*.log
+*.pyc
+*.wasm

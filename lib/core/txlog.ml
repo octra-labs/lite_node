@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let magic = "OTXL"
 let version = 1
@@ -20,6 +8,7 @@ let max_segment_size = 1_073_741_824
 
 type t = {
   dir : string;
+  readonly : bool;
   mutable current_seg : int;
   mutable current_fd : Unix.file_descr;
   mutable current_offset : int;
@@ -63,13 +52,16 @@ let validate_header fd =
   if v <> version then failwith (Printf.sprintf "txlog: version %d != %d" v version);
   read_u32_le buf 6
 
-let open_segment dir seg_id =
+let open_segment ?(readonly=false) dir seg_id =
   let path = seg_path dir seg_id in
   if Sys.file_exists path then begin
-    let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
+    let flags = if readonly then [Unix.O_RDONLY] else [Unix.O_RDWR] in
+    let fd = Unix.openfile path flags 0o644 in
     let _seg = validate_header fd in
     let off = Unix.lseek fd 0 Unix.SEEK_END in
     (fd, off)
+  end else if readonly then begin
+    failwith "txlog: read-only segment is missing"
   end else begin
     let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
     write_header fd seg_id;
@@ -100,10 +92,13 @@ let looks_like_segment_filename filename =
   && String.sub filename 0 3 = "seg"
   && String.sub filename (len - 4) 4 = ".dat"
 
-let find_latest_segment dir =
+let find_latest_segment ?(readonly=false) dir =
   if not (Sys.file_exists dir) then begin
-    Unix.mkdir dir 0o755;
-    0
+    if readonly then failwith "txlog: read-only directory is missing"
+    else begin
+      Unix.mkdir dir 0o755;
+      0
+    end
   end else
     let files = Sys.readdir dir in
     let max_seg = ref (-1) in
@@ -121,10 +116,10 @@ let find_latest_segment dir =
            (String.concat ", " (List.rev !malformed)));
     if !max_seg < 0 then 0 else !max_seg
 
-let open_log dir =
-  let seg_id = find_latest_segment dir in
-  let (fd, off) = open_segment dir seg_id in
-  { dir; current_seg = seg_id; current_fd = fd; current_offset = off }
+let open_log ?(readonly=false) dir =
+  let seg_id = find_latest_segment ~readonly dir in
+  let (fd, off) = open_segment ~readonly dir seg_id in
+  { dir; readonly; current_seg = seg_id; current_fd = fd; current_offset = off }
 
 let close t =
   Unix.close t.current_fd
@@ -145,6 +140,7 @@ let ensure_physical_eof_matches t =
       t.current_seg t.current_offset actual)
 
 let rec append t ~epoch_id ~payload =
+  if t.readonly then failwith "txlog: append on read-only log";
   ensure_physical_eof_matches t;
   if t.current_offset >= max_segment_size then rotate t;
   ensure_physical_eof_matches t;
@@ -243,7 +239,7 @@ let read_record_prefix t ~seg_id ~offset ~len ~prefix_len =
     raise e
 
 let fsync t =
-  Unix.fsync t.current_fd
+  if not t.readonly then Unix.fsync t.current_fd
 
 let scan_all t f =
   let seg_id = ref 0 in
@@ -278,8 +274,8 @@ let scan_all t f =
 let current_position t =
   (t.current_seg, t.current_offset)
 
-
 let truncate_to t ~seg_id ~offset =
+  if t.readonly then failwith "txlog: truncate on read-only log";
   Unix.close t.current_fd;
   let later = ref (seg_id + 1) in
   while Sys.file_exists (seg_path t.dir !later) do

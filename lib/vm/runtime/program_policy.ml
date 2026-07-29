@@ -1,23 +1,15 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type node = {
   target : int;
   start : int;
   stop : int;
 }
+
+type summary_state =
+  | Visiting
+  | Complete of string list * int
 
 let add name names =
   if List.mem name names then names else names @ [name]
@@ -84,42 +76,73 @@ let direct code (facts : Program_type_flow.facts) node =
   in
   add_xcalls node.start names
 
-let calls_from (facts : Program_type_flow.facts) target =
-  facts.calls
-  |> List.filter_map (fun (call : Program_type_flow.call) ->
-    if call.owner = target then Some call.target else None)
-
 let compute code (facts : Program_type_flow.facts) =
   let graph = nodes code facts in
-  let rec summary stack target =
-    if List.mem target stack then
+  let graph_by_target = Hashtbl.create (List.length graph) in
+  List.iter (fun node -> Hashtbl.replace graph_by_target node.target node) graph;
+  let children = Hashtbl.create (List.length graph) in
+  List.iter
+    (fun (call : Program_type_flow.call) ->
+      let current =
+        Option.value (Hashtbl.find_opt children call.owner) ~default:[]
+      in
+      Hashtbl.replace children call.owner (call.target :: current))
+    facts.calls;
+  let states = Hashtbl.create (List.length graph) in
+  let rec summary target =
+    match Hashtbl.find_opt states target with
+    | Some Visiting ->
       Error (Printf.sprintf "effect graph cycle at entry %d" target)
-    else
-      match List.find_opt (fun node -> node.target = target) graph with
+    | Some (Complete (effects, depth)) -> Ok (effects, depth)
+    | None ->
+      match Hashtbl.find_opt graph_by_target target with
       | None -> Error (Printf.sprintf "effect graph target %d is missing" target)
       | Some node ->
+        Hashtbl.replace states target Visiting;
         (match direct code facts node with
          | Error error -> Error error
          | Ok names ->
-           let rec inherit_effects current = function
-             | [] -> Ok current
+           let rec inherit_effects current max_depth = function
+             | [] ->
+               let depth = max_depth + 1 in
+               if depth > Program_limits.max_call_depth then
+                 Error
+                   (Printf.sprintf
+                      "effect graph depth exceeds limit at entry %d"
+                      target)
+               else begin
+                 Hashtbl.replace states target (Complete (current, depth));
+                 Ok (current, depth)
+               end
              | child :: rest ->
-               (match summary (target :: stack) child with
+               (match summary child with
                 | Error error -> Error error
-                | Ok inherited -> inherit_effects (union current inherited) rest)
+                | Ok (inherited, depth) ->
+                  inherit_effects
+                    (union current inherited)
+                    (max max_depth depth)
+                    rest)
            in
-           (match inherit_effects names (calls_from facts target) with
-            | Error error -> Error error
-            | Ok effects -> Ok effects))
+           let targets =
+             Hashtbl.find_opt children target
+             |> Option.value ~default:[]
+             |> List.rev
+           in
+           inherit_effects names 0 targets)
   in
   let rec collect summaries = function
     | [] -> Ok summaries
     | node :: rest ->
-      (match summary [] node.target with
+      (match summary node.target with
        | Error error -> Error error
-       | Ok effects -> collect ((node.target, effects) :: summaries) rest)
+       | Ok (effects, _) ->
+         collect ((node.target, effects) :: summaries) rest)
   in
-  match missing_xcall_abi code facts with
+  if List.length graph > Program_limits.max_functions then
+    Error "effect graph function limit exceeded"
+  else if List.length facts.calls > Program_limits.max_internal_calls then
+    Error "effect graph call limit exceeded"
+  else match missing_xcall_abi code facts with
   | pc :: _ -> Error (Printf.sprintf "external XCALL at pc %d has no checked ABI" pc)
   | [] ->
     (match collect [] graph with

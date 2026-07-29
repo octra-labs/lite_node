@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type status =
   | Pending
@@ -68,10 +56,15 @@ let mem hash (t : t) =
   List.exists (fun (item : item) -> item.hash = hash) t.items
 
 let needs_preverify tx =
-  match Resource_lanes.of_op tx.Transaction.op_type with
+  match tx.Transaction.op_type with
+  | Transaction.CircleCall -> true
+  | _ ->
+    match Resource_lanes.of_op tx.Transaction.op_type with
   | Resource_lanes.Pvac | Resource_lanes.Fhe -> true
   | Resource_lanes.Standard
+  | Resource_lanes.Program_deploy
   | Resource_lanes.Program
+  | Resource_lanes.Circle_compute
   | Resource_lanes.Circle_metadata
   | Resource_lanes.Circle_assets -> false
 

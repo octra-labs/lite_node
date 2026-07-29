@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 
@@ -41,12 +29,7 @@ type 'handler dispatch_adapters = {
   account_lwt_read :
     (addr:string -> account:Octra_core.Ledger.account -> rpc_result Lwt.t) ->
     'handler;
-  account_chaindata_lwt_read :
-    (Octra_core.Store_chaindata.t ->
-     addr:string ->
-     account:Octra_core.Ledger.account ->
-     rpc_result Lwt.t) ->
-    'handler;
+  pvac_migration_status : 'handler;
   account : 'handler;
   supply : 'handler;
   total_transactions : 'handler;
@@ -72,6 +55,7 @@ val validate_address :
   rpc_result Lwt.t
 
 val supply :
+  Octra_core.Store_irmin.t ->
   Octra_core.Ledger.t ->
   encrypted:Z.t ->
   rpc_result Lwt.t
@@ -91,7 +75,8 @@ val pvac_status :
   rpc_result Lwt.t
 
 val pvac_migration_status :
-  Octra_core.Store_chaindata.t ->
+  Octra_core.Pvac_migration_entitlement.t ->
+  epoch:int ->
   addr:string ->
   account:Octra_core.Ledger.account ->
   rpc_result Lwt.t

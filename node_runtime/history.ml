@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let recent_txs_of_summary_rows rows =
   List.map (fun row ->
@@ -217,7 +205,7 @@ let epoch_page_request ~limit_max params =
   | Ok epoch_page_id ->
     let epoch_page_limit =
       match Octra_core.Rpc.param_int params 1 with
-      | Some limit -> min limit limit_max
+      | Some limit -> max 0 (min limit limit_max)
       | None -> min 50 limit_max
     in
     let epoch_page_offset =
@@ -234,6 +222,38 @@ let epoch_page_request ~limit_max params =
 let epoch_page_cache_ttl ~current_epoch_id ~recent_ttl ~old_ttl ~epoch_id =
   if epoch_id >= current_epoch_id - 2 then recent_ttl
   else old_ttl
+
+let epoch_page_cache_key ~epoch_id ~start_txid ~tx_count ~limit ~offset =
+  Printf.sprintf "%d:%Ld:%d:%d:%d"
+    epoch_id start_txid tx_count limit offset
+
+let epoch_page_cache_plan ~current_epoch_id ~recent_ttl ~old_ttl ~epoch_id
+    ~header ~limit ~offset =
+  Option.map
+    (fun (start_txid, tx_count) ->
+      let key =
+        epoch_page_cache_key
+          ~epoch_id
+          ~start_txid
+          ~tx_count
+          ~limit
+          ~offset
+      in
+      let ttl =
+        epoch_page_cache_ttl
+          ~current_epoch_id
+          ~recent_ttl
+          ~old_ttl
+          ~epoch_id
+      in
+      key, ttl)
+    header
+
+let epoch_page_cache_deadline ~now ~ttl =
+  now +. ttl
+
+let epoch_page_cache_live ~now ~deadline =
+  now <= deadline
 
 let epoch_page_status_without_heal status =
   {
@@ -293,7 +313,7 @@ let epoch_page_status_with_heal
 let rpc_page ?(limit_index = 1) ?(offset_index = 2) ?(limit_max = 500) ?(default_limit = 50) params =
   let limit =
     match Octra_core.Rpc.param_int params limit_index with
-    | Some value -> min value limit_max
+    | Some value -> max 0 (min value limit_max)
     | None -> default_limit in
   let offset =
     match Octra_core.Rpc.param_int params offset_index with

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Syntax
 
@@ -83,32 +71,38 @@ let prepare source (payload : Circles.deploy_payload) =
       | None -> ""
     in
     let code_size = Int64.of_int (String.length code_raw) in
-    if Int64.compare code_size payload.limits.max_wasm_bytes > 0 then
-      Error ("circle_code_too_large", "circle code exceeds declared max_wasm_bytes")
-    else if payload.resource_mode = Circles.Sealed_read && payload.browser_mode <> Circles.Native_sealed then
-      Error ("circle_mode_invalid", "sealed_read circles require native_sealed browser mode")
-    else
-      let circle_id = circle_id_of_source source payload in
-      let owner = owner_of_source source in
-      let info = {
-        Circles.circle_id;
-        runtime = payload.runtime;
-        version = 1L;
-        owner;
-        code_hash =
-          if String.length code_raw = 0 then Circles.zero_hash_hex
-          else Circles.sha256_hex code_raw;
-        stable_root = Circles.zero_hash_hex;
-        assets_root = Circles.zero_hash_hex;
-        privacy_class = payload.privacy_class;
-        browser_mode = payload.browser_mode;
-        resource_mode = payload.resource_mode;
-        policy_hash = payload.policy_hash;
-        members_root = payload.members_root;
-        export_policy = payload.export_policy;
-        limits = payload.limits;
-      } in
-      Ok { circle_id; owner; code_raw; info }
+    match Circles.validate_limits payload.limits with
+    | Error reason -> Error ("circle_limits_invalid", reason)
+    | Ok () ->
+      if Int64.compare code_size payload.limits.max_wasm_bytes > 0 then
+        Error ("circle_code_too_large", "circle code exceeds declared max_wasm_bytes")
+      else if
+        payload.resource_mode = Circles.Sealed_read
+        && payload.browser_mode <> Circles.Native_sealed
+      then
+        Error ("circle_mode_invalid", "sealed_read circles require native_sealed browser mode")
+      else
+        let circle_id = circle_id_of_source source payload in
+        let owner = owner_of_source source in
+        let info = {
+          Circles.circle_id;
+          runtime = payload.runtime;
+          version = 1L;
+          owner;
+          code_hash =
+            if String.length code_raw = 0 then Circles.zero_hash_hex
+            else Circles.sha256_hex code_raw;
+          stable_root = Circles.zero_hash_hex;
+          assets_root = Circles.zero_hash_hex;
+          privacy_class = payload.privacy_class;
+          browser_mode = payload.browser_mode;
+          resource_mode = payload.resource_mode;
+          policy_hash = payload.policy_hash;
+          members_root = payload.members_root;
+          export_policy = payload.export_policy;
+          limits = payload.limits;
+        } in
+        Ok { circle_id; owner; code_raw; info }
   with e ->
     Error ("malformed_transaction", Printexc.to_string e)
 
@@ -125,10 +119,18 @@ let validate_runtime (payload : Circles.deploy_payload) =
              ("circle_program_missing", "wasm_v1 circles require program code"))
       | Some code_b64 ->
         let* validate_result =
-          Circle_wasm_host.validate code_b64 in
+          Circle_wasm_host.describe code_b64 in
         begin
           match validate_result with
-          | Ok _ -> Lwt.return (Ok ())
+          | Ok descriptor ->
+            begin
+              match
+                Circle_wasm_public_read.declarations_of_manifest
+                  descriptor.Circle_wasm_host.manifest
+              with
+              | Ok _ -> Lwt.return (Ok ())
+              | Error e -> Lwt.return (Error ("circle_runtime_invalid", e))
+            end
           | Error e -> Lwt.return (Error ("circle_runtime_invalid", e))
         end
     end

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   chain_id : string;
@@ -32,6 +20,14 @@ type verdict =
   | Invalid of string
 
 let proto = 1
+
+let max_chain_id_bytes = 128
+let max_node_id_bytes = 64
+let max_node_addr_bytes = 128
+let max_host_bytes = 255
+let max_features = 32
+let max_feature_bytes = 64
+let max_records = 32
 
 let node_id_of_pubkey pubkey =
   Hash_domain.hash_hex "octra:node_id:v1" pubkey
@@ -89,17 +85,20 @@ let put buf r =
 let get c =
   let got_proto = Oce1.get_u16 c in
   if got_proto <> proto then failwith "peer record proto mismatch";
-  let chain_id = Oce1.get_string c in
-  let node_id = Oce1.get_string c in
-  let node_addr = Oce1.get_string c in
+  let chain_id = Oce1.get_string_bounded ~max:max_chain_id_bytes c in
+  let node_id = Oce1.get_string_bounded ~max:max_node_id_bytes c in
+  let node_addr = Oce1.get_string_bounded ~max:max_node_addr_bytes c in
   let pubkey = Oce1.get_raw c 32 in
   let binary_hash = Oce1.get_hash32 c in
   let config_hash = Oce1.get_hash32 c in
-  let host = Oce1.get_string c in
+  let host = Oce1.get_string_bounded ~max:max_host_bytes c in
   let port = Oce1.get_u16 c in
-  let features = Oce1.get_list Oce1.get_string c in
+  let features = Oce1.get_list_bounded ~max:max_features
+    (Oce1.get_string_bounded ~max:max_feature_bytes) c in
   let ts = Oce1.get_u64 c in
   let signature = Oce1.get_sig64 c in
+  if String.length node_id <> max_node_id_bytes then
+    failwith "peer record node id length";
   { chain_id; node_id; node_addr; pubkey; binary_hash; config_hash; host; port; features; ts; signature }
 
 let encode r =
@@ -112,17 +111,13 @@ let encode_list records =
   Oce1.encode (fun buf -> Oce1.put_list put buf records)
 
 let decode_list payload =
-  Oce1.decode (fun c -> Oce1.get_list get c) payload
+  Oce1.decode (fun c -> Oce1.get_list_bounded ~max:max_records get c) payload
 
 let endpoint r =
   Printf.sprintf "%s:%d" r.host r.port
 
 let verify_signature r =
-  try
-    match Mirage_crypto_ec.Ed25519.pub_of_octets r.pubkey with
-    | Ok pk -> Mirage_crypto_ec.Ed25519.verify ~key:pk ~msg:(sign_bytes r) r.signature
-    | Error _ -> false
-  with _ -> false
+  Octra_ed25519.verify ~pub:r.pubkey ~msg:(sign_bytes r) r.signature
 
 let valid_host host =
   let n = String.length host in

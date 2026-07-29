@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type head = {
   epoch : int64;
@@ -27,8 +15,11 @@ type record = {
   txs_json : string list;
   receipts_json : string list;
   receipt_root : string;
+  epoch_ts : float;
   creator_addr : string;
   commit_round : int;
+  reward_source : Octra_consensus.C_types.reward_source;
+  finality : Octra_consensus.C_codec.catchup_finality;
 }
 
 type range =
@@ -65,7 +56,7 @@ type prepared = {
   next_cursor : cursor;
   epoch_int : int;
   proposer_info : Octra_core.Epochlog.proposer_info option;
-  proposal_id : string;
+  reward : Consensus_reward_attribution.t;
 }
 
 type ready_marker = {
@@ -94,18 +85,22 @@ type ready_marker_write_deps = {
 }
 
 type apply_deps = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   current_epoch : unit -> int;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  stage_finality : prepared -> unit;
+  promote_finality : unit -> unit;
   apply :
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   root : unit -> string;
   eic : unit -> string option;
-  now : unit -> float;
 }
 
 type run_deps = {
@@ -131,6 +126,8 @@ type run_deps = {
 }
 
 type node_deps = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   local_root : unit -> string;
@@ -138,11 +135,14 @@ type node_deps = {
   next_txid : unit -> int64;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  write_entry : Octra_consensus.Finality_log.entry -> unit;
+  stage_finality : prepared -> unit;
+  promote_finality : unit -> unit;
   apply :
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   local_eic : unit -> string option;
   write_ready :
@@ -157,6 +157,7 @@ type node_deps = {
 
 type node_runtime_deps = {
   env : string -> string option;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   head : unit -> Octra_core.Head_manifest.t option;
@@ -168,6 +169,8 @@ type node_runtime_deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
@@ -181,6 +184,7 @@ type node_runtime_deps = {
 
 type node_runtime_wiring = {
   env : string -> string option;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   head : unit -> Octra_core.Head_manifest.t option;
@@ -191,6 +195,8 @@ type node_runtime_wiring = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
@@ -244,10 +250,15 @@ val sync_plan :
   head ->
   sync_plan
 
-val prepare_record : cursor:cursor -> record -> prepared
+val prepare_record :
+  chain_id:string ->
+  expected_validator_set_hash:string ->
+  cursor:cursor ->
+  record ->
+  prepared
 
 val finality_entry :
-  ts:float ->
+  chain_id:string ->
   prepared ->
   Octra_consensus.Finality_log.entry
 

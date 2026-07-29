@@ -1,17 +1,5 @@
-/*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*/
-
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 import {createHash} from 'node:crypto'
 import {execFileSync} from 'node:child_process'
@@ -28,6 +16,8 @@ const maxSpawnPayloadJsonBytes = 2 * 1024 * 1024
 const maxAssetEffectBodyB64Bytes = 1398104
 const pageBytes = 65536
 const maxInitialPages = 512
+const maxHfheReceiptEntries = 16
+const maxHfheVerifierEntries = 2
 const hfheHelperEnvVar = 'OCTRA_CIRCLE_HFHE_HOST'
 const wasmModuleDir = path.dirname(fileURLToPath(import.meta.url))
 
@@ -256,6 +246,8 @@ const responseNull = () => responseFrame(0)
 const responseInt = (value) => responseFrame(3, utf8.encode(String(value)))
 const responseString = (value) => responseFrame(4, utf8.encode(value))
 const responseBool = (value) => responseFrame(value ? 2 : 1)
+const bytesEqual = (left, right) =>
+  left.length === right.length && left.every((value, index) => value === right[index])
 const responseValue = (value) => {
   if (value === null || value === undefined) {
     return responseNull()
@@ -516,7 +508,98 @@ const hfheCapabilityName = (method) => {
   }
 }
 
-const executeHfheInvoke = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
+const isHfheVerifyMethod = (method) =>
+  ['fhe_verify_zero', 'fhe_verify_range', 'fhe_verify_bound'].includes(method)
+
+const hfheReceiptHash = (domain, value) =>
+  createHash('sha256')
+    .update(domain)
+    .update(Buffer.from([0]))
+    .update(Buffer.from(value))
+    .digest('hex')
+
+const hfheResponseBool = (response) => {
+  if (bytesEqual(response, responseBool(false))) {
+    return false
+  }
+  if (bytesEqual(response, responseBool(true))) {
+    return true
+  }
+  return null
+}
+
+const hfheReceiptEntry = (method, request, response) => {
+  const result = isHfheVerifyMethod(method) ? hfheResponseBool(response) : null
+  if (isHfheVerifyMethod(method) && result === null) {
+    throw new Error('invalid hfhe verifier response')
+  }
+  return {
+    method,
+    request_hash: hfheReceiptHash('octra:circle_hfhe_request:v1', request),
+    response_hash: hfheReceiptHash('octra:circle_hfhe_response:v1', response),
+    result
+  }
+}
+
+const validHfheReceiptEntry = (entry) =>
+  entry
+  && typeof entry.method === 'string'
+  && entry.method.length > 0
+  && entry.method.length <= 64
+  && typeof entry.request_hash === 'string'
+  && /^[0-9a-f]{64}$/.test(entry.request_hash)
+  && typeof entry.response_hash === 'string'
+  && /^[0-9a-f]{64}$/.test(entry.response_hash)
+  && (isHfheVerifyMethod(entry.method) === (typeof entry.result === 'boolean'))
+  && (isHfheVerifyMethod(entry.method) || entry.result === null)
+
+const makeHfheReceiptState = (payload) => {
+  const mode = payload.hfhe_receipt_mode || 'direct'
+  const expected = Array.isArray(payload.hfhe_receipt_entries)
+    ? payload.hfhe_receipt_entries.map((entry) => ({...entry}))
+    : []
+  if (!['direct', 'capture', 'consume'].includes(mode)) {
+    throw new Error('invalid hfhe receipt mode')
+  }
+  if (expected.length > maxHfheReceiptEntries) {
+    throw new Error('hfhe receipt entry limit exceeded')
+  }
+  if (mode !== 'consume' && expected.length !== 0) {
+    throw new Error('hfhe receipt entries require consume mode')
+  }
+  if (expected.filter((entry) => isHfheVerifyMethod(entry.method)).length > maxHfheVerifierEntries) {
+    throw new Error('hfhe verifier entry limit exceeded')
+  }
+  if (!expected.every(validHfheReceiptEntry)) {
+    throw new Error('invalid hfhe receipt entry')
+  }
+  return {
+    mode,
+    expected,
+    captured: [],
+    index: 0
+  }
+}
+
+const matchingHfheReceiptEntry = (expected, actual) =>
+  expected.method === actual.method
+  && expected.request_hash === actual.request_hash
+  && expected.response_hash === actual.response_hash
+  && expected.result === actual.result
+
+const consumeHfheReceiptEntry = (state, entry) => {
+  const expected = state.expected[state.index]
+  if (!expected) {
+    throw new Error('hfhe receipt exhausted')
+  }
+  if (!matchingHfheReceiptEntry(expected, entry)) {
+    throw new Error('hfhe receipt entry mismatch')
+  }
+  state.index += 1
+  state.captured.push(entry)
+}
+
+const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
   const request = parseRequestFrame(reqBytes)
   const capability = hfheCapabilityName(request.method)
   if (!capability || !hfheCaps.has(capability)) {
@@ -635,7 +718,8 @@ const executeHfheInvoke = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const proof = parseStringParam(params, 2, 'proof')
-      const value = callHfheHelper('verify_range', {pubkey_b64: pubkeyB64, ciphertext, proof})
+      const amountCommitment = parseStringParam(params, 3, 'amount_commitment')
+      const value = callHfheHelper('verify_range', {pubkey_b64: pubkeyB64, ciphertext, proof, amount_commitment: amountCommitment})
       return responseBool(Boolean(value))
     }
     case 'fhe_verify_bound': {
@@ -649,6 +733,53 @@ const executeHfheInvoke = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
     default:
       throw new Error(`unsupported hfhe host method: ${request.method}`)
   }
+}
+
+const executeHfheInvoke = (hfheCaps, hfhePubkeys, hfheActiveKey, isView, receiptState, reqBytes) => {
+  const request = parseRequestFrame(reqBytes)
+  const capability = hfheCapabilityName(request.method)
+  if (!capability || !hfheCaps.has(capability)) {
+    throw new Error(`hfhe capability denied: ${request.method}`)
+  }
+  const isVerify = isHfheVerifyMethod(request.method)
+  if (receiptState.mode === 'capture' && receiptState.captured.length >= maxHfheReceiptEntries) {
+    throw new Error('hfhe receipt entry limit exceeded')
+  }
+  if (
+    receiptState.mode === 'capture'
+    && isVerify
+    && receiptState.captured.filter((entry) => isHfheVerifyMethod(entry.method)).length >= maxHfheVerifierEntries
+  ) {
+    throw new Error('hfhe verifier entry limit exceeded')
+  }
+  if (receiptState.mode === 'consume') {
+    const expected = receiptState.expected[receiptState.index]
+    if (!expected) {
+      throw new Error('hfhe receipt exhausted')
+    }
+    const requestHash = hfheReceiptHash('octra:circle_hfhe_request:v1', reqBytes)
+    if (expected.method !== request.method || expected.request_hash !== requestHash) {
+      throw new Error('hfhe receipt request mismatch')
+    }
+    if (isVerify) {
+      const response = responseBool(expected.result)
+      consumeHfheReceiptEntry(
+        receiptState,
+        hfheReceiptEntry(request.method, reqBytes, response)
+      )
+      return response
+    }
+  } else if (!isView && isVerify && receiptState.mode !== 'capture') {
+    throw new Error(`hfhe proof verification requires a preverified receipt: ${request.method}`)
+  }
+  const response = executeHfheDirect(hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes)
+  const entry = hfheReceiptEntry(request.method, reqBytes, response)
+  if (receiptState.mode === 'capture') {
+    receiptState.captured.push(entry)
+  } else if (receiptState.mode === 'consume') {
+    consumeHfheReceiptEntry(receiptState, entry)
+  }
+  return response
 }
 
 const readStatePolicyField = (storage, stateRef, field) => {
@@ -1260,18 +1391,30 @@ const parseRequestFrame = (rawBytes) => {
     throw new Error('invalid request magic')
   }
   let offset = requestMagic.length
+  if (offset + 2 > rawBytes.length) {
+    throw new Error('request method length missing')
+  }
   const methodLen = (rawBytes[offset] << 8) | rawBytes[offset + 1]
   offset += 2
+  if (offset + methodLen + 2 > rawBytes.length) {
+    throw new Error('request method out of bounds')
+  }
   const method = Buffer.from(rawBytes.slice(offset, offset + methodLen)).toString('utf8')
   offset += methodLen
   const paramCount = (rawBytes[offset] << 8) | rawBytes[offset + 1]
   offset += 2
   const params = []
   for (let i = 0; i < paramCount; i += 1) {
+    if (offset + 5 > rawBytes.length) {
+      throw new Error('request param header out of bounds')
+    }
     const tag = rawBytes[offset]
     offset += 1
     const size = getU32(rawBytes, offset)
     offset += 4
+    if (offset + size > rawBytes.length) {
+      throw new Error('request param out of bounds')
+    }
     const payload = rawBytes.slice(offset, offset + size)
     offset += size
     switch (tag) {
@@ -1293,6 +1436,9 @@ const parseRequestFrame = (rawBytes) => {
       default:
         throw new Error(`unsupported request param tag: ${tag}`)
     }
+  }
+  if (offset !== rawBytes.length) {
+    throw new Error('request has trailing bytes')
   }
   return {method, params}
 }
@@ -1390,6 +1536,7 @@ const instantiate = async (wasmBytes, payload) => {
           seckey_b64: payload.hfhe_active_key.seckey_b64,
         }
       : null
+  const hfheReceiptState = makeHfheReceiptState(payload)
   const callerBytes = utf8.encode(payload.caller || '')
   const selfBytes = utf8.encode(payload.address || '')
   let instance = null
@@ -1480,7 +1627,14 @@ const instantiate = async (wasmBytes, payload) => {
       },
       host_hfhe_invoke_len(reqPtr, reqLen) {
         const requestBytes = readGuestBytes(reqPtr, reqLen)
-        const responseBytes = executeHfheInvoke(hfheCaps, hfhePubkeys, hfheActiveKey, requestBytes)
+        const responseBytes = executeHfheInvoke(
+          hfheCaps,
+          hfhePubkeys,
+          hfheActiveKey,
+          Boolean(payload.is_view),
+          hfheReceiptState,
+          requestBytes
+        )
         hfheInvokeCache = responseBytes
         hfheInvokeToken = b64OfBytes(requestBytes)
         return responseBytes.length
@@ -1491,7 +1645,14 @@ const instantiate = async (wasmBytes, payload) => {
         const responseBytes =
           hfheInvokeCache && hfheInvokeToken === requestToken
             ? hfheInvokeCache
-            : executeHfheInvoke(hfheCaps, hfhePubkeys, hfheActiveKey, requestBytes)
+            : executeHfheInvoke(
+                hfheCaps,
+                hfhePubkeys,
+                hfheActiveKey,
+                Boolean(payload.is_view),
+                hfheReceiptState,
+                requestBytes
+              )
         if (outCap < responseBytes.length) {
           return -2
         }
@@ -1598,6 +1759,7 @@ const instantiate = async (wasmBytes, payload) => {
     spawns,
     assets,
     encryptedAssets,
+    hfheReceiptState,
     getResponseBytes: () => {
       const total = responseChunks.reduce((sum, part) => sum + part.length, 0)
       const out = new Uint8Array(total)
@@ -1683,6 +1845,12 @@ const runExecute = async (payload) => {
   const requestBytes = bytesOfB64(payload.request_b64)
   const runtime = await instantiate(wasmBytes, payload)
   const {code, responseBytes} = callExport(runtime, payload.export_name, requestBytes)
+  if (
+    runtime.hfheReceiptState.mode === 'consume'
+    && runtime.hfheReceiptState.index !== runtime.hfheReceiptState.expected.length
+  ) {
+    throw new Error('hfhe receipt was not fully consumed')
+  }
   writeJson({
     success: code === 0,
     status_code: runtime.getResponseStatus(),
@@ -1692,6 +1860,7 @@ const runExecute = async (payload) => {
     spawns: runtime.spawns,
     assets: runtime.assets,
     encrypted_assets: runtime.encryptedAssets,
+    hfhe_receipt_entries: runtime.hfheReceiptState.captured,
     error: code === 0 ? null : `wasm export returned ${code}`
   })
 }

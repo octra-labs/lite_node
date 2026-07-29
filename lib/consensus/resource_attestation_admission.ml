@@ -1,19 +1,9 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type reason =
+  | Disabled
+  | Capacity
   | ChainMismatch
   | EpochTooOld
   | EpochTooNew
@@ -50,6 +40,9 @@ type pool = {
   quarantined : (string, evidence) Hashtbl.t;
 }
 
+let max_accepted = 4_096
+let max_evidence = 4_096
+
 let create_pool () =
   {
     accepted = Hashtbl.create 256;
@@ -59,6 +52,8 @@ let create_pool () =
   }
 
 let reason_to_string = function
+  | Disabled -> "disabled"
+  | Capacity -> "capacity"
   | ChainMismatch -> "chain_mismatch"
   | EpochTooOld -> "epoch_too_old"
   | EpochTooNew -> "epoch_too_new"
@@ -108,6 +103,7 @@ let classify
     (attestation : Resource_attestations.attestation) =
   let attestation_id = Resource_attestations.attestation_id attestation in
   if Hashtbl.mem pool.accepted attestation_id then Accept
+  else if Hashtbl.length pool.accepted >= max_accepted then Reject Capacity
   else if attestation.chain_id <> chain_id then Reject ChainMismatch
   else if attestation.epoch_id < Int64.sub window.current_epoch window.fraud_window then Reject EpochTooOld
   else if attestation.epoch_id > Int64.add window.current_epoch window.future_window then Reject EpochTooNew
@@ -132,10 +128,12 @@ let remember pool ~window decision attestation =
       Hashtbl.replace pool.identity_index (identity_key attestation) attestation_id
   | Reject reason ->
       let record = evidence ~window reason attestation in
-      Hashtbl.replace pool.rejected (evidence_id record) record
+      if Hashtbl.length pool.rejected < max_evidence then
+        Hashtbl.replace pool.rejected (evidence_id record) record
   | Quarantine reason ->
       let record = evidence ~window reason attestation in
-      Hashtbl.replace pool.quarantined (evidence_id record) record
+      if Hashtbl.length pool.quarantined < max_evidence then
+        Hashtbl.replace pool.quarantined (evidence_id record) record
 
 let ingest ~chain_id ~challenge ~window ~pubkey_of_node pool attestation =
   let decision = classify ~chain_id ~challenge ~window ~pubkey_of_node pool attestation in

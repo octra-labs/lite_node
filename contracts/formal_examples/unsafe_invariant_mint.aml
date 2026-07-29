@@ -1,0 +1,20 @@
+contract UnsafeInvariantMint {
+  invariant supply_conserved = sum(balances) == total_supply
+
+  state {
+    balances: map[address]u128
+    total_supply: u128
+  }
+
+  constructor(supply: u128) {
+    require(supply > 0, "supply must be positive")
+    self.balances[origin] = supply
+    self.total_supply = supply
+  }
+
+  fn faucet(to: address, amount: u128): bool {
+    require(amount > 0, "amount must be positive")
+    self.balances[to] = self.balances[to] + amount
+    return true
+  }
+}

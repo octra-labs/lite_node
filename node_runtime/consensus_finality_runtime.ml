@@ -1,17 +1,7 @@
-(*
-Octra Labs 2026
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+module Log = Octra_log
 
 type replay_deps = {
   current_epoch : unit -> int;
@@ -27,7 +17,15 @@ type deps = {
 }
 
 type node_deps = {
+  check_finality : Octra_consensus.C_types.finalize -> unit;
   write_finality : Octra_consensus.C_types.finalize -> unit;
+  persist_finality_certificate :
+    Octra_consensus.C_types.finalize ->
+    unit;
+  persist_finality_bundle :
+    Octra_consensus.C_types.finalize ->
+    Consensus_finality_journal.bundle ->
+    unit;
   chaos_after_finality_log : unit -> unit;
   cached_bundle_for_pid :
     string ->
@@ -46,11 +44,14 @@ type node_deps = {
   deactivate_gap : unit -> unit;
   set_consensus_finalized : bool -> unit;
   current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   sleep : float -> unit Lwt.t;
   read_pre_finalize_root : unit -> string option;
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
+  commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
+  apply_timeout_seconds : float;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
@@ -59,6 +60,7 @@ type node_deps = {
 
 type node_runtime = {
   data_dir : string;
+  validator_set : unit -> Octra_consensus.C_types.validator_set;
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
   proposal_state : Consensus_proposal_state.t;
@@ -66,10 +68,12 @@ type node_runtime = {
   catchup_queue : Consensus_catchup_queue.t;
   consensus_finalized : bool ref;
   current_epoch : int ref;
+  committed_head_epoch : unit -> int;
   sleep : float -> unit Lwt.t;
   read_pre_finalize_root : unit -> string option;
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
+  apply_timeout_seconds : float;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
   runtime_state : Consensus_runtime_state.t;
@@ -82,10 +86,13 @@ type t = {
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }
 
-let create deps =
+let create_with_failure deps on_failure =
   let apply_deps = Consensus_finalized_apply.node_deps deps.apply in
   let apply_finalized finalize =
-    Consensus_finalized_apply.run apply_deps finalize
+    Lwt.catch
+      (fun () ->
+        Consensus_finalized_apply.run apply_deps finalize)
+      (on_failure finalize)
   in
   let replay =
     Consensus_finalized_replay.node_runner
@@ -104,15 +111,27 @@ let create deps =
     replay_stashed_while_safe = replay.replay_stashed_while_safe;
   }
 
+let create deps =
+  create_with_failure deps (fun _ exn -> Lwt.fail exn)
+
+let stop_after_fatal () =
+  let pending, _ = Lwt.wait () in
+  pending
+
 let create_node deps =
-  create
+  create_with_failure
     {
       apply =
         {
+          check_finality = deps.check_finality;
           write_finality = deps.write_finality;
+          persist_finality_certificate = deps.persist_finality_certificate;
+          persist_finality_bundle = deps.persist_finality_bundle;
           chaos_after_finality_log = deps.chaos_after_finality_log;
           cached_bundle = (fun ~proposal_id ->
             deps.cached_bundle_for_pid proposal_id <> None);
+          cached_bundle_data = (fun ~proposal_id ->
+            deps.cached_bundle_for_pid proposal_id);
           cached_bundle_len = (fun ~proposal_id ->
             match deps.cached_bundle_for_pid proposal_id with
             | Some (_tx_hashes, txs, _receipts_json) -> List.length txs
@@ -128,12 +147,14 @@ let create_node deps =
               {
                 deactivate_gap = deps.deactivate_gap;
                 set_consensus_finalized = deps.set_consensus_finalized;
-                current_epoch = deps.current_epoch;
+                committed_head_epoch = deps.committed_head_epoch;
                 sleep = deps.sleep;
                 read_pre_finalize_root = deps.read_pre_finalize_root;
                 read_commit_root = deps.read_commit_root;
                 read_local_root_raw = deps.read_local_root_raw;
+                commit_finality_journal = deps.commit_finality_journal;
                 remove_pending_finalized = deps.remove_pending_finalized;
+                apply_timeout_seconds = deps.apply_timeout_seconds;
                 fatal_exit = deps.fatal_exit;
               }
               ~epoch_id
@@ -148,12 +169,33 @@ let create_node deps =
           read_local_root_raw = deps.read_local_root_raw;
       };
     }
+    (fun finalize exn ->
+      Log.fatal "consensus"
+        "event = finalized_apply_failure epoch = %Ld reason = %s action = exit"
+        finalize.Octra_consensus.C_types.epoch_id
+        (Printexc.to_string exn);
+      deps.fatal_exit ();
+      stop_after_fatal ())
 
 let node_deps_of_runtime runtime =
   {
+    check_finality = (fun finalize ->
+      Octra_consensus.Finality_log.check_write
+        runtime.data_dir
+        (Octra_consensus.Finality_log.of_finalize finalize));
     write_finality = (fun finalize ->
       Octra_consensus.Finality_log.write runtime.data_dir
         (Octra_consensus.Finality_log.of_finalize finalize));
+    persist_finality_certificate = (fun finalize ->
+      Consensus_finality_journal.persist_certificate
+        runtime.data_dir
+        ~validator_set:(runtime.validator_set ())
+        finalize);
+    persist_finality_bundle = (fun finalize bundle ->
+      Consensus_finality_journal.persist_bundle
+        runtime.data_dir
+        finalize
+        bundle);
     chaos_after_finality_log = (fun () ->
       Octra_core.Chaos.inject "after_finality_log");
     cached_bundle_for_pid = runtime.bundles.cached_bundle;
@@ -168,10 +210,14 @@ let node_deps_of_runtime runtime =
     set_consensus_finalized = (fun finalized ->
       runtime.consensus_finalized := finalized);
     current_epoch = (fun () -> !(runtime.current_epoch));
+    committed_head_epoch = runtime.committed_head_epoch;
     sleep = runtime.sleep;
     read_pre_finalize_root = runtime.read_pre_finalize_root;
     read_commit_root = runtime.read_commit_root;
     read_local_root_raw = runtime.read_local_root_raw;
+    commit_finality_journal = (fun () ->
+      Consensus_finality_journal.promote runtime.data_dir);
+    apply_timeout_seconds = runtime.apply_timeout_seconds;
     remove_pending_finalized = runtime.finality.remove_finalized;
     fatal_exit = runtime.fatal_exit;
     catchup_active = (fun () -> !(runtime.catchup_active));

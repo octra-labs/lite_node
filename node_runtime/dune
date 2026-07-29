@@ -1,3 +1,3 @@
 (library
  (name octra_node_runtime)
- (libraries octra_log unix yojson base64 digestif digestif.c mirage-crypto-ec octra_core octra_bootstrap octra_circle_runtime octra_vm octra_consensus octra_net lwt cohttp-lwt-unix uri))
+ (libraries octra_log unix yojson base64 digestif digestif.c mirage-crypto-ec octra_crypto_guard octra_core octra_bootstrap octra_circle_runtime octra_vm octra_consensus octra_net lwt cohttp-lwt-unix uri))

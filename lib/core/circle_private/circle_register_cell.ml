@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   ciphertext_commitment : string option;
@@ -204,11 +192,11 @@ let proof_kind_allowed = function
   | None
   | Some Circle_hfhe_proof.Zero_receipt_v1
   | Some Circle_hfhe_proof.Range_v1
-  | Some Circle_hfhe_proof.Range_receipt_v1 ->
-    true
-  | Some Circle_hfhe_proof.No_proof
+  | Some Circle_hfhe_proof.Range_receipt_v1
   | Some Circle_hfhe_proof.Bound_zero_v1
   | Some Circle_hfhe_proof.Bound_zero_receipt_v1 ->
+    true
+  | Some Circle_hfhe_proof.No_proof ->
     false
 
 let ensure_descriptor_compatible (descriptor : Circle_state_descriptor.t) =

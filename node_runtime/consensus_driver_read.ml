@@ -1,32 +1,37 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type deps = {
+  chain_id : string;
   get_epoch_json : int -> string option;
+  epoch_time : int -> float option;
   get_tx_by_txid : int64 -> (string * string) option;
   read_receipts : int -> string list;
   root_to_raw32 : string -> string;
+  reward_source :
+    int ->
+    Octra_core.Epochlog.epoch_header ->
+    (Octra_consensus.C_types.reward_source, string) result;
+  read_finality :
+    int ->
+    Octra_consensus.C_codec.catchup_finality option;
   head_epoch : unit -> int option;
   lookup_bundle : string -> Consensus_bundle_cache.encoded option;
 }
 
 type node_readers = {
+  chain_id : string;
   get_epoch_json : int -> string option;
   get_tx_by_txid : int64 -> (string * string) option;
   read_receipts_opt : int -> string list option;
   root_to_raw32 : string -> string;
+  reward_source :
+    int ->
+    Octra_core.Epochlog.epoch_header ->
+    (Octra_consensus.C_types.reward_source, string) result;
+  read_finality :
+    int ->
+    Octra_consensus.C_codec.catchup_finality option;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   lookup_bundle : string -> Consensus_bundle_cache.encoded option;
 }
@@ -118,6 +123,9 @@ let epoch_root (deps : deps) epoch_id =
     ~root_to_raw32:deps.root_to_raw32
     (deps.get_epoch_json (Int64.to_int epoch_id))
 
+let epoch_time (deps : deps) epoch_id =
+  deps.epoch_time (Int64.to_int epoch_id)
+
 let local_head_epoch (deps : deps) =
   match deps.head_epoch () with
   | Some epoch -> Int64.of_int epoch
@@ -128,22 +136,41 @@ let bundle (deps : deps) proposal_id =
 
 let catchup_range (deps : deps) ~from_epoch ~max_epochs =
   let read_deps = Consensus_catchup_read.{
+    chain_id = deps.chain_id;
     get_epoch_json = deps.get_epoch_json;
+    epoch_time = deps.epoch_time;
     get_tx_by_txid = deps.get_tx_by_txid;
     read_receipts = deps.read_receipts;
     root_to_raw32 = deps.root_to_raw32;
+    reward_source = deps.reward_source;
+    read_finality = deps.read_finality;
   } in
   Consensus_catchup_read.range read_deps ~from_epoch ~max_epochs
 
 let node_deps (readers : node_readers) =
   {
+    chain_id = readers.chain_id;
     get_epoch_json = readers.get_epoch_json;
+    epoch_time = (fun epoch_id ->
+      match readers.get_epoch_json epoch_id with
+      | Some json ->
+        begin
+          match Octra_core.Epochlog.epoch_of_json json with
+          | Some header when header.Octra_core.Epochlog.id = epoch_id ->
+            Some header.finalized_at
+          | _ ->
+            None
+        end
+      | None ->
+        None);
     get_tx_by_txid = readers.get_tx_by_txid;
     read_receipts = (fun epoch ->
       match readers.read_receipts_opt epoch with
       | Some receipts -> receipts
       | None -> []);
     root_to_raw32 = readers.root_to_raw32;
+    reward_source = readers.reward_source;
+    read_finality = readers.read_finality;
     head_epoch = (fun () ->
       match readers.cached_head () with
       | Some h -> Some h.Octra_core.Head_manifest.epoch_id
@@ -151,21 +178,65 @@ let node_deps (readers : node_readers) =
     lookup_bundle = readers.lookup_bundle;
   }
 
-let node_store_deps ~chaindata ~data_dir ~root_to_raw32 ~cached_head
-    ~lookup_bundle =
-  node_deps
-    {
-      get_epoch_json = (fun epoch ->
-        Octra_core.Chaindata_index.get_epoch
-          (Octra_core.Store_chaindata.index chaindata)
-          epoch);
-      get_tx_by_txid = Octra_core.Store_chaindata.get_tx_by_txid chaindata;
-      read_receipts_opt = (fun epoch ->
-        Octra_core.Preverify_receipt_store.read data_dir ~epoch_id:epoch);
-      root_to_raw32;
-      cached_head;
-      lookup_bundle;
-    }
+let node_store_deps ~chain_id ~chaindata ~data_dir ~root_to_raw32 ~reward_source
+    ~cached_head ~lookup_bundle =
+  let finality_index = Octra_consensus.Finality_log.index data_dir in
+  let deps =
+    node_deps
+      {
+        chain_id;
+        get_epoch_json = (fun epoch ->
+          Octra_core.Chaindata_index.get_epoch
+            (Octra_core.Store_chaindata.index chaindata)
+            epoch);
+        get_tx_by_txid = Octra_core.Store_chaindata.get_tx_by_txid chaindata;
+        read_receipts_opt = (fun epoch ->
+          Octra_core.Preverify_receipt_store.read data_dir ~epoch_id:epoch);
+        root_to_raw32;
+        reward_source;
+        read_finality = (fun epoch ->
+          match
+            Consensus_finality_journal.read_committed_epoch
+              ~chain_id
+              ~epoch:(Int64.of_int epoch)
+              data_dir
+          with
+          | Consensus_finality_journal.Valid record ->
+            Some Octra_consensus.C_codec.{
+              finalize = record.finalize;
+              validator_set = record.validator_set;
+            }
+          | Consensus_finality_journal.Missing ->
+            None
+          | Consensus_finality_journal.Invalid reason ->
+            Log.error "catchup"
+              "event = finality_read_failed epoch = %d reason = %s"
+              epoch
+              reason;
+            None);
+        cached_head;
+        lookup_bundle;
+      }
+  in
+  {
+    deps with
+    epoch_time = (fun epoch_id ->
+      match Octra_core.Store_chaindata.get_bound_epoch_header chaindata epoch_id with
+      | Ok header ->
+        begin
+          match Octra_consensus.Finality_log.find finality_index epoch_id with
+          | Some entry
+            when entry.state_root = header.Octra_core.Epochlog.state_root
+              && entry.creator_addr = header.proposer.creator_addr
+              && entry.round = header.proposer.commit_round ->
+            Some entry.ts
+          | Some _ ->
+            None
+          | None ->
+            Some header.finalized_at
+        end
+      | Error _ -> None);
+  }
 
 let node_root_deps readers =
   let read_local_ledger_root_raw () =

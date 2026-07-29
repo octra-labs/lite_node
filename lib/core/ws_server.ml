@@ -1,45 +1,43 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type client_id = string
 
 type client = {
-  id : client_id;
   send : Yojson.Safe.t -> unit Lwt.t;
-  subscriptions : string list ref;
-  connected_at : float;
+  subscriptions : string list;
+  mutable sending : bool;
 }
 
 let clients : (client_id, client) Hashtbl.t = Hashtbl.create 100
 let next_id = ref 0
+let max_clients = 256
+let max_subscriptions = 8
+let event_types = ["new_tx"; "new_epoch"; "staging_update"; "*"]
 
 let generate_id () =
   incr next_id;
   Printf.sprintf "ws_client_%d" !next_id
 
 let add_client send subscriptions =
-  let id = generate_id () in
-  let client = { id; send; subscriptions = ref subscriptions;
-                 connected_at = Unix.gettimeofday () } in
-  Hashtbl.add clients id client;
-  Octra_log.stdout "info [ws] connected client = %s\n%!" id;
-  id
+  let subscriptions = List.sort_uniq String.compare subscriptions in
+  if Hashtbl.length clients >= max_clients then
+    Error "websocket client cap reached"
+  else if List.length subscriptions > max_subscriptions then
+    Error "websocket subscription cap reached"
+  else if not (List.for_all (fun event -> List.mem event event_types) subscriptions) then
+    Error "unsupported websocket subscription"
+  else
+    let id = generate_id () in
+    Hashtbl.add clients id {
+      send;
+      subscriptions;
+      sending = false;
+    };
+    Ok id
 
 let remove_client id =
-  Hashtbl.remove clients id;
-  Octra_log.stdout "info [ws] disconnected client = %s\n%!" id
+  Hashtbl.remove clients id
 
 let broadcast event_type data =
   let message = `Assoc [
@@ -48,9 +46,22 @@ let broadcast event_type data =
     "timestamp", `Float (Unix.gettimeofday ())
   ] in
   Hashtbl.iter (fun _ client ->
-    if List.mem event_type !(client.subscriptions) || List.mem "*" !(client.subscriptions) then
+    if
+      not client.sending
+      && (List.mem event_type client.subscriptions
+          || List.mem "*" client.subscriptions)
+    then begin
+      client.sending <- true;
       Lwt.async (fun () ->
-        Lwt.catch (fun () -> client.send message) (fun _ -> Lwt.return_unit))
+        Lwt.finalize
+          (fun () ->
+            Lwt.catch
+              (fun () -> client.send message)
+              (fun _ -> Lwt.return_unit))
+          (fun () ->
+            client.sending <- false;
+            Lwt.return_unit))
+    end
   ) clients
 
 let notify_new_tx (tx : Transaction.t) =
@@ -80,12 +91,5 @@ let notify_staging_update ~total_txs ~total_ou ~max_ou =
 let get_client_stats () =
   `Assoc [
     "connected_clients", `Int (Hashtbl.length clients);
-    "subscriptions", `List (
-      Hashtbl.fold (fun _ client acc ->
-        `Assoc [
-          "client_id", `String client.id;
-          "subscribed_to", `List (List.map (fun s -> `String s) !(client.subscriptions));
-          "connected_at", `Float client.connected_at;
-        ] :: acc
-      ) clients []);
+    "max_clients", `Int max_clients;
   ]

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Wallet = Octra_core.Crypto.Wallet
 module Ledger = Octra_core.Ledger
@@ -46,8 +34,10 @@ type config = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
+  migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
+  epoch_visibility : Epoch_visibility.t;
   deps : deps;
 }
 
@@ -66,6 +56,7 @@ type ctx = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
+  migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   deps : deps;
 } [@@warning "-69"]
@@ -98,6 +89,10 @@ let with_account =
     ~find_account:(fun ctx addr -> Ledger.find_opt ctx.ledger addr)
 
 let status_read_ctx (ctx : ctx) =
+  let runtime_profile_hash =
+    if ctx.consensus_config_hash = String.make 32 '\x00' then None
+    else Some (Consensus_profile.hash Sys.getenv_opt)
+  in
   Status_read_rpc.{
     ledger = ctx.ledger;
     store = ctx.store;
@@ -107,7 +102,8 @@ let status_read_ctx (ctx : ctx) =
     validator_pubkey = ctx.wallet.Wallet.pub;
     validator_priv_b64 = ctx.wallet.Wallet.priv;
     chain_id = ctx.chain_id;
-    config_hash = ctx.consensus_config_hash;
+    program_trust_hash = Octra_vm.Program_trust.config_hash ctx.program_trust;
+    runtime_profile_hash;
     validator_view_pub = ctx.validator_view_pub;
     validator_set = ctx.consensus_validator_set;
     scheduled_validator_set = ctx.scheduled_validator_set;
@@ -133,7 +129,10 @@ let octra_account params ctx =
       ~account)
 
 let octra_supply _params ctx =
-  Account_read_rpc.supply ctx.ledger ~encrypted:(ctx.deps.encrypted_supply ())
+  Account_read_rpc.supply
+    ctx.store
+    ctx.ledger
+    ~encrypted:(ctx.deps.encrypted_supply ())
 
 let octra_total_transactions _params ctx =
   Account_read_rpc.total_transactions ~confirmed:!(ctx.total_tx_count)
@@ -204,11 +203,6 @@ let ledger_chaindata_params_read =
 let account_lwt_read =
   Rpc_read_adapters.account_lwt_read ~with_account
 
-let account_chaindata_lwt_read =
-  Rpc_read_adapters.account_chaindata_lwt_read
-    ~chaindata:ctx_chaindata
-    ~with_account
-
 let store_label_read =
   Rpc_read_adapters.store_label_read ~store:ctx_store
 
@@ -242,10 +236,13 @@ let circle_asset_public_read f params ctx =
     ~current_epoch:!(ctx.current_epoch)
     ~reveal_sensitive_fields:false
 
-let contract_save_abi params ctx =
-  Program_effect_rpc.save_abi
-    ~save_abi:(Store_irmin.save_contract_abi ctx.store)
-    params
+let contract_save_abi _params _ctx =
+  Lwt.return
+    (Error
+       (Rpc.err
+          (-32601)
+          "program ABI writes are disabled; use program verification"
+          None))
 
 let fhe_pubkey_loader store addr =
   match run_s (Store_irmin.get_pvac_pubkey store addr) with
@@ -301,6 +298,14 @@ let octra_register_public_key params ctx =
     ~register:(Ledger.register_public_key ctx.ledger)
     params
 
+let octra_pvac_migration_status params ctx =
+  with_account params ctx (fun addr account ->
+    Account_read_rpc.pvac_migration_status
+      ctx.migration_entitlements
+      ~epoch:!(ctx.current_epoch)
+      ~addr
+      ~account)
+
 let status_dispatch_adapters =
   Status_read_rpc.{ status_read }
 
@@ -313,7 +318,7 @@ let account_dispatch_adapters =
     store_params_lwt_read;
     store_ledger_address_lwt_read;
     account_lwt_read;
-    account_chaindata_lwt_read;
+    pvac_migration_status = octra_pvac_migration_status;
     account = octra_account;
     supply = octra_supply;
     total_transactions = octra_total_transactions;
@@ -374,20 +379,67 @@ let effect_dispatch =
     private_transfer = octra_private_transfer;
   }
 
-let dispatch : (string * (Yojson.Safe.t -> ctx -> rpc_result Lwt.t)) list =
-  Rpc_dispatch.node_routes Rpc_dispatch.{
-    status_core = Status_read_rpc.core_dispatch status_dispatch_adapters;
-    account_public = Account_read_rpc.public_dispatch account_dispatch_adapters;
-    submission = effect_dispatch.submission;
-    history = history_dispatch;
-    rest = rest_dispatch;
-    staging = effect_dispatch.staging;
-    circle = circle_dispatch;
-    program = program_dispatch;
-    mutation = effect_dispatch.mutation;
-    account_pvac = Account_read_rpc.pvac_dispatch account_dispatch_adapters;
-    status_proof = Status_read_rpc.proof_dispatch status_dispatch_adapters;
-  }
+let read_error =
+  Rpc.err
+    (-32012)
+    "committed state changed during read; retry"
+    None
+
+let stable_read visibility handler params ctx =
+  let open Lwt.Syntax in
+  let* result =
+    Epoch_visibility.read visibility (fun () -> handler params ctx)
+  in
+  match result with
+  | Some value -> Lwt.return value
+  | None -> Lwt.return (Error read_error)
+
+let guard_reads visibility routes =
+  List.map
+    (fun (name, handler) ->
+      name, stable_read visibility handler)
+    routes
+
+let dispatch visibility :
+    (string * (Yojson.Safe.t -> ctx -> rpc_result Lwt.t)) list =
+  let reads =
+    Status_read_rpc.core_dispatch status_dispatch_adapters
+    @ Account_read_rpc.public_dispatch account_dispatch_adapters
+    @ history_dispatch
+    @ rest_dispatch
+    @ circle_dispatch
+    @ program_dispatch
+    @ Account_read_rpc.pvac_dispatch account_dispatch_adapters
+    @ Status_read_rpc.proof_dispatch status_dispatch_adapters
+    |> guard_reads visibility
+  in
+  let effects =
+    effect_dispatch.submission
+    @ effect_dispatch.staging
+    @ effect_dispatch.mutation
+  in
+  reads @ effects
+
+let stable_http visibility handler req body =
+  let open Lwt.Syntax in
+  let* response =
+    Epoch_visibility.read visibility (fun () -> handler req body)
+  in
+  match response with
+  | Some value -> Lwt.return value
+  | None ->
+    Cohttp_lwt_unix.Server.respond_string
+      ~status:`Service_unavailable
+      ~body:"committed state changed during read; retry"
+      ()
+
+let state_sensitive_http req =
+  match Cohttp.Request.meth req, Uri.path (Cohttp.Request.uri req) with
+  | `GET, "/"
+  | `GET, "/status"
+  | `GET, "/state-sync/head"
+  | `GET, "/state-sync/range" -> true
+  | _ -> false
 
 let start (cfg : config) =
   let { Wallet.address; _ } = cfg.wallet in
@@ -406,23 +458,34 @@ let start (cfg : config) =
     validator_view_sk = cfg.validator_view_sk;
     validator_view_pub = cfg.validator_view_pub;
     program_trust = cfg.program_trust;
+    migration_entitlements = cfg.migration_entitlements;
     consensus_driver_ref = cfg.consensus_driver_ref;
     deps = cfg.deps;
   } in
+  let routes = dispatch cfg.epoch_visibility in
   let rpc_handler =
     Rpc_http.handle_rpc_post
       ~process:(fun meta body_str ->
-        Rpc_dispatch.process_body meta body_str rpc_ctx dispatch)
+        Rpc_dispatch.process_body meta body_str rpc_ctx routes)
   in
-  let fallback_handler =
+  let fallback =
     State_sync_http.handle
       ~data_dir:cfg.data_dir
       ~ledger:cfg.ledger
       ~tree_ref:cfg.tree_ref
       ~validator:address
+      ~chain_id:cfg.chain_id
+      ~config_hash:cfg.consensus_config_hash
+      ~validator_set:cfg.consensus_validator_set
       ~current_epoch:cfg.current_epoch
       ~chaindata:cfg.chaindata
       ~encrypted_supply:cfg.deps.encrypted_supply
+  in
+  let fallback_handler req body =
+    if state_sensitive_http req then
+      stable_http cfg.epoch_visibility fallback req body
+    else
+      fallback req body
   in
   let callback =
     Rpc_http.route_rpc_or_fallback ~rpc_handler ~fallback_handler

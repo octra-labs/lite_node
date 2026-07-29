@@ -1,0 +1,5 @@
+(library
+ (name octra_crypto_guard)
+ (wrapped false)
+ (modules octra_ed25519)
+ (libraries zarith mirage-crypto-ec))

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let max_ou = Z.of_int 10_000_000_000
 let max_staging_txs = 100_000
@@ -377,7 +365,7 @@ let staging_usage_pct () =
 let min_relay_fee tx =
   let usage = staging_usage_pct () in
   let base = Transaction.ou_cost tx in
-  if usage < 50 then Z.one
+  if usage < 50 then base
   else if usage < 80 then base
   else if usage < 95 then Z.mul base (Z.of_int 2)
   else Z.mul base (Z.of_int 5)

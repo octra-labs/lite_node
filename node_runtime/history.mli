@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val recent_txs_of_summary_rows : Yojson.Safe.t list -> (int * string) list
 
@@ -137,6 +125,34 @@ val epoch_page_cache_ttl :
   old_ttl:float ->
   epoch_id:int ->
   float
+
+val epoch_page_cache_key :
+  epoch_id:int ->
+  start_txid:int64 ->
+  tx_count:int ->
+  limit:int ->
+  offset:int ->
+  string
+
+val epoch_page_cache_plan :
+  current_epoch_id:int ->
+  recent_ttl:float ->
+  old_ttl:float ->
+  epoch_id:int ->
+  header:(int64 * int) option ->
+  limit:int ->
+  offset:int ->
+  (string * float) option
+
+val epoch_page_cache_deadline :
+  now:float ->
+  ttl:float ->
+  float
+
+val epoch_page_cache_live :
+  now:float ->
+  deadline:float ->
+  bool
 
 val epoch_page_status_without_heal :
   'a ->

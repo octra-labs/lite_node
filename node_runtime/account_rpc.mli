@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val account_of_params :
   Yojson.Safe.t ->
@@ -42,6 +30,8 @@ val supply :
   true_total:Z.t ->
   encrypted:Z.t ->
   max_supply:Z.t ->
+  emission_remaining:Z.t ->
+  retired_supply:Z.t ->
   Yojson.Safe.t
 
 val total_transactions :

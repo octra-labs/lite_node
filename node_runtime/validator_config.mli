@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type transition =
   | No_transition
@@ -27,6 +15,9 @@ type transition =
 
 type t = {
   allowed_pubkeys : string list;
+  identity_errors : string list;
+  program_trust_hash : string option;
+  runtime_profile_hash : string option;
   current_validator_list : Octra_consensus.C_types.validator_info list;
   next_validator_list : Octra_consensus.C_types.validator_info list;
   active_validator_list : Octra_consensus.C_types.validator_info list;
@@ -121,12 +112,22 @@ val light_scheduled_of_driver :
   Octra_consensus.C_driver.scheduled_validator_set_config option ->
   Octra_consensus.C_config.scheduled option
 
+val bind_persistent_updates :
+  chain_id:string ->
+  consensus_mode:bool ->
+  current_height:int64 ->
+  active_raw:string option ->
+  pending_raw:string option ->
+  t ->
+  (t, string) result
+
 val transition_message :
   current_height:int64 ->
   t ->
   string option
 
 val self_membership :
+  ?permissionless:bool ->
   address:string ->
   voting:bool ->
   role_label:string ->
@@ -145,6 +146,7 @@ val quorum_admission :
   quorum_admission
 
 val startup_admission :
+  ?permissionless:bool ->
   address:string ->
   voting:bool ->
   role_label:string ->
@@ -175,4 +177,17 @@ val build :
   next_entries:string list ->
   chain_pending_entries:string list ->
   next_activation_epoch:int64 option ->
+  program_trust_hash:string option ->
+  t
+
+val build_bound :
+  chain_id:string ->
+  consensus_mode:bool ->
+  current_height:int64 ->
+  current_entries:string list ->
+  next_entries:string list ->
+  chain_pending_entries:string list ->
+  next_activation_epoch:int64 option ->
+  program_trust_hash:string option ->
+  runtime_profile_hash:string option ->
   t

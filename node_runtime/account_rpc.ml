@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Ledger = Octra_core.Ledger
 module Rpc = Octra_core.Rpc
@@ -64,12 +52,15 @@ let validate_address params =
       ~raw
       ~is_valid:(Rpc.sanitize_address raw <> None))
 
-let supply ~true_total ~encrypted ~max_supply =
+let supply ~true_total ~encrypted ~max_supply ~emission_remaining
+    ~retired_supply =
   let display_supply = Z.add true_total encrypted in
   Rpc_view.supply
     ~display_supply
     ~encrypted_supply:encrypted
     ~max_supply
+    ~emission_remaining
+    ~retired_supply
 
 let total_transactions ~confirmed ~staging =
   Rpc_view.total_transactions ~confirmed ~staging

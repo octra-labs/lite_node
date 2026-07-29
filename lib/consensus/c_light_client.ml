@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type root_quorum = {
   root : C_light_root.t;
@@ -52,17 +40,23 @@ let verify_root_quorum ~validator_set_proof roots =
     match roots with
     | [] -> None
     | root :: _ ->
-      let vs = C_light_validator_set.to_validator_set validator_set_proof.validators in
-      let chain_id = validator_set_proof.chain_id in
-      let config_hash = validator_set_proof.config_hash in
-      let root_ok r =
-        same_root root r
-        && C_light_root.verify ~validator_set:vs ~chain_id ~config_hash r in
-      if not (List.for_all root_ok roots) then None
-      else
-        let signers = root_signers roots in
-        if List.length signers < validator_set_proof.quorum then None
-        else Some { root; signers }
+      match
+        C_light_validator_set.validator_set
+          ~weighted:validator_set_proof.weighted
+          validator_set_proof.validators
+      with
+      | Error _ -> None
+      | Ok vs ->
+        let chain_id = validator_set_proof.chain_id in
+        let config_hash = validator_set_proof.config_hash in
+        let root_ok r =
+          same_root root r
+          && C_light_root.verify ~validator_set:vs ~chain_id ~config_hash r in
+        if not (List.for_all root_ok roots) then None
+        else
+          let signers = root_signers roots in
+          if not (C_types.has_quorum vs signers) then None
+          else Some { root; signers }
 
 let rec verify_chain = function
   | [] | [_] -> true

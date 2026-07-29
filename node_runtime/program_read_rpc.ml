@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
@@ -33,6 +21,30 @@ type 'handler dispatch_adapters = {
   program_call : 'handler;
   program_save_abi : 'handler;
 }
+
+let compile_active = ref false
+
+let immediate task =
+  match Lwt.state task with
+  | Lwt.Return value -> value
+  | Lwt.Fail error -> raise error
+  | Lwt.Sleep -> failwith "Program compiler returned a pending task"
+
+let compile_rpc handler input =
+  if !compile_active then
+    Lwt.return_error
+      (Octra_core.Rpc.err (-32005) "Program compiler busy" None)
+  else begin
+    compile_active := true;
+    Lwt.finalize
+      (fun () ->
+        Lwt_preemptive.detach
+          (fun () -> immediate (handler input))
+          ())
+      (fun () ->
+        compile_active := false;
+        Lwt.return_unit)
+  end
 
 let dispatch adapters =
   let store_label_read = adapters.store_label_read in
@@ -61,11 +73,14 @@ let dispatch adapters =
     program_bytecode =
       store_label_read Octra_vm.Contract_rpc.program_bytecode_params;
     program_compile_assembly =
-      no_ctx Octra_vm.Contract_rpc.compile_assembly_params;
+      no_ctx (compile_rpc Octra_vm.Contract_rpc.compile_assembly_params);
     program_compile_aml =
-      no_ctx Octra_vm.Contract_rpc.compile_aml_params;
+      no_ctx (compile_rpc Octra_vm.Contract_rpc.compile_aml_params);
     program_compile_aml_multi =
-      json0_read Octra_vm.Contract_rpc.compile_aml_multi;
+      json0_read (fun ~json ->
+        compile_rpc
+          (fun value -> Octra_vm.Contract_rpc.compile_aml_multi ~json:value)
+          json);
     program_tokens_by_address =
       store_label_read Octra_vm.Contract_rpc.tokens_by_address_params;
   }

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Oct_lang
 open Oct_lex
@@ -127,39 +115,41 @@ let tok_to_binop = function
   | TkAmpAmp -> And | TkPipePipe -> Or
   | _ -> failwith "not a binop"
 
-let rec parse_expr_bp ts min_bp =
-  let lhs = parse_prefix ts in
-  parse_infix ts lhs min_bp
+let rec parse_expr_bp ts depth min_bp =
+  if depth > Program_limits.max_parser_depth then
+    perr ts "expression nesting exceeds limit";
+  let lhs = parse_prefix ts depth in
+  parse_infix ts depth lhs min_bp
 
-and parse_infix ts lhs min_bp =
+and parse_infix ts depth lhs min_bp =
   let tok = peek_token ts in
 
   if tok = TkQuestion && min_bp <= 1 then begin
     eat ts;
-    let then_e = parse_expr_bp ts 1 in
+    let then_e = parse_expr_bp ts (depth + 1) 1 in
     expect ts TkColon;
-    let else_e = parse_expr_bp ts 1 in
-    parse_infix ts (ETernary (lhs, then_e, else_e)) min_bp
+    let else_e = parse_expr_bp ts (depth + 1) 1 in
+    parse_infix ts depth (ETernary (lhs, then_e, else_e)) min_bp
   end
   else
   let p = bp tok in
   if p > 0 && p >= min_bp then begin
     eat ts;
-    let rhs = parse_expr_bp ts (p + 1) in
+    let rhs = parse_expr_bp ts (depth + 1) (p + 1) in
     let node = EBinop (tok_to_binop tok, lhs, rhs) in
-    parse_infix ts node min_bp
+    parse_infix ts depth node min_bp
   end
   else lhs
 
-and parse_prefix ts =
+and parse_prefix ts depth =
   match peek_token ts with
   | TkMinus ->
     eat ts;
-    let e = parse_prefix ts in
+    let e = parse_prefix ts (depth + 1) in
     EUnop (Neg, e)
   | TkBang ->
     eat ts;
-    let e = parse_prefix ts in
+    let e = parse_prefix ts (depth + 1) in
     EUnop (Not, e)
   | _ -> parse_primary ts
 
@@ -298,7 +288,7 @@ and parse_call_expr ts name =
   in
   ECall (name, go [])
 
-and parse_expr ts = parse_expr_bp ts 1
+and parse_expr ts = parse_expr_bp ts 0 1
 
 let is_stmt_end ts =
   match peek_token ts with

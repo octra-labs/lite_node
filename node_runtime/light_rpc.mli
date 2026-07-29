@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type signer = {
   chain_id : string;
@@ -69,6 +57,13 @@ val epoch_proof_of_header :
   Octra_core.Epochlog.epoch_header ->
   string list ->
   (Octra_consensus.C_light_epoch.t, string) result
+
+val collect_epoch_tx_hashes :
+  (int64 -> (string * int * string) option) ->
+  epoch_id:int ->
+  start_txid:int64 ->
+  tx_count:int ->
+  string list option
 
 val epoch_proof :
   chain_id:string ->

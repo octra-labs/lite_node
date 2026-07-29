@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let addr_short s =
   if String.length s > 12 then String.sub s 0 12 ^ ".." else s
@@ -75,6 +63,9 @@ let raw_to_hex s =
     (List.init
        (String.length s)
        (fun i -> Printf.sprintf "%02x" (Char.code s.[i])))
+
+let hash32_hex value =
+  if String.length value = 32 then raw_to_hex value else value
 
 let hex_to_raw32_lossy hex =
   let raw =

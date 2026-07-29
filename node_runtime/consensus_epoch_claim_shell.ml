@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Private_ledger = Octra_core.Private_ledger
 module Transaction = Octra_core.Transaction
@@ -69,6 +57,10 @@ type live_tx_args = {
 
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
+  current_epoch : unit -> int;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
   trace_cipher : string -> string -> string -> string -> unit;
   short_addr : string -> string;
   reject : string -> string -> unit Lwt.t;
@@ -149,7 +141,12 @@ let live_ledger_tx_deps args =
     claim_plan = Octra_core.Private_ledger.claim_plan args.ledger;
     debit = (fun tx fee nonce ->
       Octra_core.Ledger.debit args.ledger tx.Transaction.from fee nonce);
-    balance_plan = Octra_core.Private_ledger.claim_balance_plan args.ledger;
+    balance_plan = (fun tx plan ->
+      Octra_core.Private_ledger.claim_balance_plan
+        ~result_policy:(args.private_result_policy (args.current_epoch ()))
+        args.ledger
+        tx
+        plan);
     trace_cipher = args.trace_cipher;
     update = (fun tx cipher ->
       Octra_core.Ledger.update_enc_balance args.ledger tx.Transaction.from cipher);

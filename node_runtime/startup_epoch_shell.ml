@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type source =
   | Meta of int
@@ -46,9 +34,9 @@ let log_source = function
 
 let run deps =
   let source =
-    source
-      ~last_epoch_meta:(deps.last_epoch_meta ())
-      ~saved_epochs:(deps.saved_epochs ())
+    match deps.last_epoch_meta () with
+    | Some value -> Meta (int_of_string value)
+    | None -> source ~last_epoch_meta:None ~saved_epochs:(deps.saved_epochs ())
   in
   log_source source;
   let epoch = current_epoch source in

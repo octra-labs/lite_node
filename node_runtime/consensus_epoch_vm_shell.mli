@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Contract = Octra_vm.Contract
 module ContractVM = Octra_vm.Contract_vm
@@ -77,6 +65,7 @@ type receipt_deps = {
 type tx_reject =
   ?consume_nonce:bool ->
   ?notify_reason:string ->
+  ?persist_state:bool ->
   string ->
   string ->
   unit Lwt.t
@@ -171,10 +160,14 @@ type vm_tx_deps = {
   deploy_balance : Transaction.t -> Z.t option;
   deploy_and_save :
     Transaction.t ->
+    admitted:Octra_vm.Admission.t option ->
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
     deploy_result;
+  program_prepare :
+    Transaction.t ->
+    (Octra_vm.Program_package.admitted, string) result Lwt.t;
   ensure_account : string -> unit;
   circle_exec :
     Transaction.t ->
@@ -229,6 +222,10 @@ type vm_tx_deps = {
   epoch : int;
   now : unit -> float;
 }
+
+val prepare_program_package :
+  Transaction.t ->
+  (Octra_vm.Program_package.admitted, string) result Lwt.t
 
 type live_vm_tx_args = {
   runtime : call_runtime;
@@ -375,6 +372,14 @@ val run_circle_call_tx :
 
 val run_program_call_tx :
   program_call_deps ->
+  Transaction.t ->
+  unit Lwt.t
+
+val run_program_upgrade_tx :
+  call_runtime ->
+  trusted_program_keys:Octra_vm.Program_trust.t ->
+  program_journal:Program_journal.t ->
+  store:Octra_core.Store_irmin.t ->
   Transaction.t ->
   unit Lwt.t
 

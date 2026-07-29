@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let pause_ms_default = 2000
 
@@ -24,15 +12,16 @@ let pause_at_phase phase =
   match Sys.getenv_opt "OCTRA_CHAOS_PAUSE_AT" with
   | Some target when target = phase ->
     let pause_ms = read_pause_ms () in
-    Octra_log.stdout "[CHAOS] paused at phase=%s for %dms\n%!" phase pause_ms;
+    Octra_log.warn "chaos" "event = pause phase = %s duration_ms = %d"
+      phase pause_ms;
     Unix.sleepf (float_of_int pause_ms /. 1000.0);
-    Octra_log.stdout "[CHAOS] resumed at phase=%s\n%!" phase
+    Octra_log.warn "chaos" "event = resume phase = %s" phase
   | _ -> ()
 
 let kill_at_phase phase =
   match Sys.getenv_opt "OCTRA_CHAOS_KILL_AT" with
   | Some target when target = phase ->
-    Octra_log.stdout "[CHAOS] kill at phase=%s — exit(137)\n%!" phase;
+    Octra_log.fatal "chaos" "event = kill phase = %s exit_code = 137" phase;
     exit 137
   | _ -> ()
 
@@ -41,7 +30,7 @@ exception Chaos_injected_failure of string
 let fail_at_phase phase =
   match Sys.getenv_opt "OCTRA_CHAOS_FAIL_AT" with
   | Some target when target = phase ->
-    Octra_log.stdout "[CHAOS] raising exception at phase=%s\n%!" phase;
+    Octra_log.error "chaos" "event = inject_failure phase = %s" phase;
     raise (Chaos_injected_failure phase)
   | _ -> ()
 

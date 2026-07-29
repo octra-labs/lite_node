@@ -1,17 +1,5 @@
-/*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*/
-
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -21,21 +9,37 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use wasmi::{AsContext, AsContextMut, Caller, Engine, Error as WasmiError, Extern, ExternType, Func, Instance, Linker, Module, Store};
+use wasmi::{AsContext, AsContextMut, Caller, Config, Engine, Error as WasmiError, Extern, ExternType, Func, Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SPAWN_PAYLOAD_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ASSET_EFFECT_BODY_B64_BYTES: usize = 1_398_104;
+const MAX_GUEST_READ_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GUEST_WRITE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVENT_COUNT: usize = 64;
+const MAX_EVENT_TOPIC_BYTES: usize = 256;
+const MAX_EVENT_DATA_BYTES: usize = 64 * 1024;
+const MAX_EVENT_BYTES: usize = 256 * 1024;
+const MAX_PUBLIC_READS: usize = 16;
+const MAX_PUBLIC_READ_BYTES: usize = 256 * 1024;
+const MAX_HFHE_RECEIPT_ENTRIES: usize = 16;
+const MAX_HFHE_VERIFIER_ENTRIES: usize = 2;
+const MAX_TENSOR_SESSION_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_FUEL_LIMIT: u64 = 20_000_000;
+const MAX_FUEL_LIMIT: u64 = 20_000_000;
+const CIRCLE_INVOKE_FUEL: u64 = 100_000;
+const HFHE_INVOKE_FUEL: u64 = 2_000_000;
 const PAGE_BYTES: usize = 65536;
 const MAX_INITIAL_PAGES: usize = 512;
 const SESSION_CACHE_LIMIT: usize = 128;
 const SESSION_CACHE_TTL_SECS: f64 = 300.0;
-const TENSOR_SESSION_CACHE_LIMIT: usize = 32;
+const TENSOR_SESSION_CACHE_LIMIT: usize = 8;
 const TENSOR_SESSION_CACHE_TTL_SECS: f64 = 300.0;
 const MODULE_CACHE_LIMIT: usize = 32;
 const MODULE_CACHE_TTL_SECS: f64 = 300.0;
-const RUNTIME_CACHE_LIMIT: usize = 16;
-const RUNTIME_CACHE_TTL_SECS: f64 = 300.0;
+const STORAGE_CACHE_LIMIT: usize = 16;
+const STORAGE_CACHE_TTL_SECS: f64 = 300.0;
+const STORAGE_CACHE_BYTE_LIMIT: usize = 48 * 1024 * 1024;
 const REQUEST_MAGIC: &[u8; 5] = b"OCWR1";
 const RESPONSE_MAGIC: &[u8; 5] = b"OCWS1";
 const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -82,6 +86,24 @@ const ALLOWED_IMPORTS: &[&str] = &[
     "host_tensor_top1_i8_kv",
 ];
 
+const FLOAT_IMPORTS: &[&str] = &[
+    "host_tensor_load_i8_kv",
+    "host_tensor_matmul_fp",
+    "host_tensor_rmsnorm_fp",
+    "host_tensor_silu_fp",
+    "host_tensor_elemwise_mul_fp",
+    "host_tensor_residual_add_fp",
+    "host_tensor_rope_apply_fp",
+    "host_tensor_attention_kv_fp",
+    "host_tensor_append_vec_fp",
+    "host_tensor_argmax_fp",
+    "host_tensor_linear_i8_kv",
+    "host_tensor_argmax_i8_kv",
+    "host_tensor_top1_i8_kv",
+    "host_tensor_session_append_kv_fp",
+    "host_tensor_session_attention_kv_fp",
+];
+
 #[derive(Debug, Deserialize)]
 struct Payload {
     action: Option<String>,
@@ -98,7 +120,11 @@ struct Payload {
     hfhe_caps: Option<Vec<String>>,
     hfhe_pubkeys: Option<Vec<HfhePubkeyJson>>,
     hfhe_active_key: Option<HfheActiveKey>,
+    hfhe_receipt_mode: Option<String>,
+    hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
+    public_reads: Option<Vec<PublicReadJson>>,
     is_view: Option<bool>,
+    fuel_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,6 +144,32 @@ struct HfheActiveKey {
     key_id: String,
     pubkey_b64: String,
     seckey_b64: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct HfheReceiptEntryJson {
+    method: String,
+    request_hash: String,
+    response_hash: String,
+    result: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PublicReadJson {
+    snapshot_root: String,
+    circle_id: String,
+    canonical_path: String,
+    offset: usize,
+    max_bytes: usize,
+    metadata_json: String,
+    body_b64: String,
+}
+
+#[derive(Debug)]
+struct PublicRead {
+    metadata_json: String,
+    body_b64: String,
+    body_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,10 +220,17 @@ struct EncryptedAssetPutJson {
 
 #[derive(Debug)]
 struct HostState {
+    limits: StoreLimits,
     storage: Arc<BTreeMap<String, Vec<u8>>>,
     hfhe_caps: BTreeSet<String>,
     hfhe_pubkeys: HashMap<String, String>,
     hfhe_active_key: Option<HfheActiveKey>,
+    hfhe_receipt_mode: String,
+    hfhe_receipt_expected: Vec<HfheReceiptEntryJson>,
+    hfhe_receipt_entries: Vec<HfheReceiptEntryJson>,
+    hfhe_receipt_index: usize,
+    public_reads: BTreeMap<String, PublicRead>,
+    public_read_bytes: usize,
     caller_bytes: Vec<u8>,
     self_bytes: Vec<u8>,
     tx_hash_bytes: Vec<u8>,
@@ -180,6 +239,7 @@ struct HostState {
     response_bytes: Vec<u8>,
     response_status: i32,
     events: Vec<EventJson>,
+    event_bytes: usize,
     spawns: Vec<SpawnJson>,
     assets: Vec<AssetPutJson>,
     encrypted_assets: Vec<EncryptedAssetPutJson>,
@@ -207,17 +267,19 @@ struct TensorSessionEntry {
 struct ModuleCacheEntry {
     module: Arc<Module>,
     exports: Vec<ExportInfoJson>,
+    has_float_imports: bool,
     updated_at: f64,
 }
 
-#[derive(Debug)]
-struct RuntimeCacheEntry {
-    runtime: Runtime,
+#[derive(Debug, Clone)]
+struct StorageCacheEntry {
+    storage: Arc<BTreeMap<String, Vec<u8>>>,
+    weight: usize,
     updated_at: f64,
 }
 
-fn storage_cache() -> &'static Mutex<HashMap<String, Arc<BTreeMap<String, Vec<u8>>>>> {
-    static STORAGE_CACHE: OnceLock<Mutex<HashMap<String, Arc<BTreeMap<String, Vec<u8>>>>>> =
+fn storage_cache() -> &'static Mutex<HashMap<String, StorageCacheEntry>> {
+    static STORAGE_CACHE: OnceLock<Mutex<HashMap<String, StorageCacheEntry>>> =
         OnceLock::new();
     STORAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -236,17 +298,16 @@ fn tensor_session_cache() -> &'static Mutex<HashMap<String, TensorSessionEntry>>
 
 fn shared_engine() -> &'static Engine {
     static SHARED_ENGINE: OnceLock<Engine> = OnceLock::new();
-    SHARED_ENGINE.get_or_init(Engine::default)
+    SHARED_ENGINE.get_or_init(|| {
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        Engine::new(&config)
+    })
 }
 
 fn module_cache() -> &'static Mutex<HashMap<String, ModuleCacheEntry>> {
     static MODULE_CACHE: OnceLock<Mutex<HashMap<String, ModuleCacheEntry>>> = OnceLock::new();
     MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn runtime_cache() -> &'static Mutex<HashMap<String, RuntimeCacheEntry>> {
-    static RUNTIME_CACHE: OnceLock<Mutex<HashMap<String, RuntimeCacheEntry>>> = OnceLock::new();
-    RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn now_secs() -> f64 {
@@ -261,6 +322,8 @@ struct Runtime {
     store: Store<HostState>,
     instance: Instance,
     exports: Vec<ExportInfoJson>,
+    fuel_limit: u64,
+    has_float_imports: bool,
 }
 
 #[derive(Debug)]
@@ -384,7 +447,7 @@ fn run_describe(payload: &Payload) -> Result<JsonValue, String> {
     let manifest =
         if runtime.instance.get_func(&runtime.store, "octra_manifest").is_some() {
             match runtime.call_export("octra_manifest", &[]) {
-                Ok((_code, response_bytes)) => {
+                Ok((_code, response_bytes, _effort_used)) => {
                     serde_json::from_slice::<JsonValue>(&response_bytes).ok()
                 }
                 Err(_) => None,
@@ -408,35 +471,22 @@ fn run_execute(payload: &Payload) -> Result<JsonValue, String> {
         .as_deref()
         .ok_or_else(|| "missing request_b64".to_owned())?;
     let request_bytes = decode_b64("request_b64", request_b64)?;
-    if let Some(cache_key) = runtime_cache_key(payload) {
-        let mut guard = runtime_cache()
-            .lock()
-            .map_err(|_| "runtime cache poisoned".to_owned())?;
-        prune_runtime_cache_locked(&mut guard);
-        if !guard.contains_key(&cache_key) {
-            let runtime = Runtime::instantiate(payload, false)?;
-            guard.insert(
-                cache_key.clone(),
-                RuntimeCacheEntry {
-                    runtime,
-                    updated_at: now_secs(),
-                },
-            );
-        }
-        let entry = guard
-            .get_mut(&cache_key)
-            .ok_or_else(|| "runtime cache lookup failed".to_owned())?;
-        entry.updated_at = now_secs();
-        entry.runtime.reset_for_payload(payload)?;
-        return finish_execute(&mut entry.runtime, export_name, &request_bytes);
-    }
-
     let mut runtime = Runtime::instantiate(payload, false)?;
     finish_execute(&mut runtime, export_name, &request_bytes)
 }
 
 fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]) -> Result<JsonValue, String> {
-    let (code, response_bytes) = runtime.call_export(export_name, request_bytes)?;
+    if !runtime.store.data().is_view && runtime.has_float_imports {
+        return Err("wasm_v1 float host imports are disabled for updates".to_owned());
+    }
+    let (code, response_bytes, effort_used) =
+        runtime.call_export(export_name, request_bytes)?;
+    if runtime.store.data().hfhe_receipt_mode == "consume"
+        && runtime.store.data().hfhe_receipt_index
+            != runtime.store.data().hfhe_receipt_expected.len()
+    {
+        return Err("hfhe receipt was not fully consumed".to_owned());
+    }
     let state = runtime.store.data();
     let storage_pairs =
         if state.is_view {
@@ -464,35 +514,10 @@ fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]
         "spawns": state.spawns,
         "assets": state.assets,
         "encrypted_assets": state.encrypted_assets,
+        "hfhe_receipt_entries": state.hfhe_receipt_entries,
+        "effort_used": effort_used,
         "error": if code == 0 { JsonValue::Null } else { JsonValue::String(format!("wasm export returned {}", code)) },
     }))
-}
-
-fn runtime_cache_key(payload: &Payload) -> Option<String> {
-    if !payload.is_view.unwrap_or(false) {
-        return None;
-    }
-    if payload
-        .storage_pairs
-        .as_ref()
-        .map(|pairs| !pairs.is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    let code_key = payload.code_cache_key.as_deref()?;
-    let storage_key = payload.storage_cache_key.as_deref()?;
-    let mut hasher = Sha256::new();
-    hasher.update(code_key.as_bytes());
-    hasher.update(b"|");
-    hasher.update(storage_key.as_bytes());
-    hasher.update(b"|");
-    hasher.update(payload.caller.as_deref().unwrap_or("").as_bytes());
-    hasher.update(b"|");
-    hasher.update(payload.address.as_deref().unwrap_or("").as_bytes());
-    hasher.update(b"|");
-    hasher.update(if payload.is_view.unwrap_or(false) { b"1" } else { b"0" });
-    Some(format!("{:x}", hasher.finalize()))
 }
 
 impl Runtime {
@@ -507,14 +532,18 @@ impl Runtime {
                 format!("{:x}", hasher.finalize())
             }
         };
-        let (module, exports) = {
+        let (module, exports, has_float_imports) = {
             let mut guard = module_cache()
                 .lock()
                 .map_err(|_| "module cache poisoned".to_owned())?;
             prune_module_cache_locked(&mut guard);
             if let Some(entry) = guard.get_mut(&module_key) {
                 entry.updated_at = now_secs();
-                (entry.module.clone(), entry.exports.clone())
+                (
+                    entry.module.clone(),
+                    entry.exports.clone(),
+                    entry.has_float_imports,
+                )
             } else {
                 let code_b64 =
                     code_b64_opt.ok_or_else(|| format!("missing wasm module cache: {module_key}"))?;
@@ -526,19 +555,31 @@ impl Runtime {
                 validate_imports(&module)?;
                 let exports = collect_exports(&module);
                 validate_exports(&exports)?;
+                let has_float_imports = module
+                    .imports()
+                    .any(|entry| FLOAT_IMPORTS.contains(&entry.name()));
                 guard.insert(
                     module_key,
                     ModuleCacheEntry {
                         module: module.clone(),
                         exports: exports.clone(),
+                        has_float_imports,
                         updated_at: now_secs(),
                     },
                 );
-                (module, exports)
+                (module, exports, has_float_imports)
             }
         };
 
         let mut store = Store::new(shared_engine(), HostState::from_payload(payload)?);
+        store.limiter(|state| &mut state.limits);
+        let fuel_limit = payload
+            .fuel_limit
+            .unwrap_or(DEFAULT_FUEL_LIMIT)
+            .min(MAX_FUEL_LIMIT);
+        store
+            .set_fuel(fuel_limit)
+            .map_err(|e| format!("wasm fuel setup failed: {e}"))?;
         if description_only {
             let data = store.data_mut();
             Arc::make_mut(&mut data.storage).clear();
@@ -569,10 +610,16 @@ impl Runtime {
             store,
             instance,
             exports,
+            fuel_limit,
+            has_float_imports,
         })
     }
 
-    fn call_export(&mut self, export_name: &str, request_bytes: &[u8]) -> Result<(i32, Vec<u8>), String> {
+    fn call_export(
+        &mut self,
+        export_name: &str,
+        request_bytes: &[u8],
+    ) -> Result<(i32, Vec<u8>, u64), String> {
         let alloc = self
             .instance
             .get_typed_func::<i32, i32>(&self.store, "octra_alloc")
@@ -601,44 +648,61 @@ impl Runtime {
             .call(&mut self.store, (ptr, request_bytes.len() as i32))
             .map_err(|e| format!("wasm export trapped: {e}"))?;
         let response_bytes = self.store.data().response_bytes.clone();
-        Ok((code, response_bytes))
+        let remaining = self
+            .store
+            .get_fuel()
+            .map_err(|e| format!("wasm fuel read failed: {e}"))?;
+        Ok((code, response_bytes, self.fuel_limit - remaining))
     }
 
-    fn reset_for_payload(&mut self, payload: &Payload) -> Result<(), String> {
-        let storage = build_storage_from_payload(payload)?;
-        let hfhe_caps = payload
-            .hfhe_caps
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let hfhe_pubkeys = payload
-            .hfhe_pubkeys
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| (entry.addr, entry.pubkey_b64))
-            .collect();
-        let data = self.store.data_mut();
-        data.storage = storage;
-        data.hfhe_caps = hfhe_caps;
-        data.hfhe_pubkeys = hfhe_pubkeys;
-        data.hfhe_active_key = payload.hfhe_active_key.clone();
-        data.caller_bytes = payload.caller.clone().unwrap_or_default().into_bytes();
-        data.self_bytes = payload.address.clone().unwrap_or_default().into_bytes();
-        data.tx_hash_bytes = payload.tx_hash.clone().unwrap_or_default().into_bytes();
-        data.current_epoch = payload.current_epoch.unwrap_or(0);
-        data.is_view = payload.is_view.unwrap_or(false);
-        data.response_bytes.clear();
-        data.response_status = 0;
-        data.events.clear();
-        data.spawns.clear();
-        data.assets.clear();
-        data.encrypted_assets.clear();
-        data.circle_invoke_cache = None;
-        data.hfhe_invoke_cache = None;
-        Ok(())
+}
+
+fn is_lower_hex64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_hfhe_verify_method(method: &str) -> bool {
+    matches!(
+        method,
+        "fhe_verify_zero" | "fhe_verify_range" | "fhe_verify_bound"
+    )
+}
+
+fn validate_hfhe_receipt_input(
+    mode: &str,
+    entries: &[HfheReceiptEntryJson],
+) -> Result<(), String> {
+    if !matches!(mode, "direct" | "capture" | "consume") {
+        return Err("invalid hfhe receipt mode".to_owned());
     }
+    if entries.len() > MAX_HFHE_RECEIPT_ENTRIES {
+        return Err("hfhe receipt entry limit exceeded".to_owned());
+    }
+    if mode != "consume" && !entries.is_empty() {
+        return Err("hfhe receipt entries require consume mode".to_owned());
+    }
+    if entries
+        .iter()
+        .filter(|entry| is_hfhe_verify_method(&entry.method))
+        .count()
+        > MAX_HFHE_VERIFIER_ENTRIES
+    {
+        return Err("hfhe verifier entry limit exceeded".to_owned());
+    }
+    for entry in entries {
+        if entry.method.is_empty()
+            || entry.method.len() > 64
+            || !is_lower_hex64(&entry.request_hash)
+            || !is_lower_hex64(&entry.response_hash)
+            || is_hfhe_verify_method(&entry.method) != entry.result.is_some()
+        {
+            return Err("invalid hfhe receipt entry".to_owned());
+        }
+    }
+    Ok(())
 }
 
 impl HostState {
@@ -657,11 +721,33 @@ impl HostState {
             .into_iter()
             .map(|entry| (entry.addr, entry.pubkey_b64))
             .collect();
+        let hfhe_receipt_mode = payload
+            .hfhe_receipt_mode
+            .clone()
+            .unwrap_or_else(|| "direct".to_owned());
+        let hfhe_receipt_expected = payload
+            .hfhe_receipt_entries
+            .clone()
+            .unwrap_or_default();
+        validate_hfhe_receipt_input(&hfhe_receipt_mode, &hfhe_receipt_expected)?;
         Ok(Self {
+            limits: StoreLimitsBuilder::new()
+                .memory_size(MAX_INITIAL_PAGES * PAGE_BYTES)
+                .memories(1)
+                .tables(1)
+                .instances(1)
+                .trap_on_grow_failure(true)
+                .build(),
             storage,
             hfhe_caps,
             hfhe_pubkeys,
             hfhe_active_key: payload.hfhe_active_key.clone(),
+            hfhe_receipt_mode,
+            hfhe_receipt_expected,
+            hfhe_receipt_entries: Vec::new(),
+            hfhe_receipt_index: 0,
+            public_reads: build_public_reads(payload)?,
+            public_read_bytes: 0,
             caller_bytes: payload.caller.clone().unwrap_or_default().into_bytes(),
             self_bytes: payload.address.clone().unwrap_or_default().into_bytes(),
             tx_hash_bytes: payload.tx_hash.clone().unwrap_or_default().into_bytes(),
@@ -670,6 +756,7 @@ impl HostState {
             response_bytes: Vec::new(),
             response_status: 0,
             events: Vec::new(),
+            event_bytes: 0,
             spawns: Vec::new(),
             assets: Vec::new(),
             encrypted_assets: Vec::new(),
@@ -679,17 +766,83 @@ impl HostState {
     }
 }
 
+fn public_read_key(circle_id: &str, canonical_path: &str, offset: usize, max_bytes: usize) -> String {
+    format!("{circle_id}\0{canonical_path}\0{offset}\0{max_bytes}")
+}
+
+fn build_public_reads(payload: &Payload) -> Result<BTreeMap<String, PublicRead>, String> {
+    let reads = payload.public_reads.clone().unwrap_or_default();
+    if reads.len() > MAX_PUBLIC_READS {
+        return Err("wasm public read count exceeds limit".to_owned());
+    }
+    let mut total_bytes = 0usize;
+    let mut result = BTreeMap::new();
+    for read in reads {
+        if read.circle_id.is_empty()
+            || read.canonical_path.is_empty()
+            || read.canonical_path.as_bytes().contains(&0)
+            || read.circle_id.as_bytes().contains(&0)
+            || read.max_bytes == 0
+            || read.max_bytes > 65_536
+        {
+            return Err("invalid wasm public read".to_owned());
+        }
+        normalize_hex64(&read.snapshot_root, "snapshot_root")?;
+        let metadata = serde_json::from_str::<JsonValue>(&read.metadata_json)
+            .map_err(|_| "invalid wasm public read metadata".to_owned())?;
+        if metadata.get("snapshot_root").and_then(JsonValue::as_str)
+            != Some(read.snapshot_root.as_str())
+        {
+            return Err("wasm public read snapshot root mismatch".to_owned());
+        }
+        let body = BASE64
+            .decode(read.body_b64.as_bytes())
+            .map_err(|_| "invalid wasm public read body".to_owned())?;
+        if body.len() > read.max_bytes {
+            return Err("wasm public read body exceeds declaration".to_owned());
+        }
+        total_bytes = total_bytes
+            .checked_add(body.len())
+            .ok_or_else(|| "wasm public read bytes overflow".to_owned())?;
+        if total_bytes > MAX_PUBLIC_READ_BYTES {
+            return Err("wasm public read bytes exceed limit".to_owned());
+        }
+        let key = public_read_key(
+            &read.circle_id,
+            &read.canonical_path,
+            read.offset,
+            read.max_bytes,
+        );
+        if result
+            .insert(
+                key,
+                PublicRead {
+                    metadata_json: read.metadata_json,
+                    body_b64: read.body_b64,
+                    body_bytes: body.len(),
+                },
+            )
+            .is_some()
+        {
+            return Err("duplicate wasm public read".to_owned());
+        }
+    }
+    Ok(result)
+}
+
 fn build_storage_from_payload(payload: &Payload) -> Result<Arc<BTreeMap<String, Vec<u8>>>, String> {
     let cache_key = payload.storage_cache_key.clone();
     let pairs_opt = payload.storage_pairs.clone();
 
     if pairs_opt.is_none() {
         if let Some(key) = cache_key {
-            let guard = storage_cache()
+            let mut guard = storage_cache()
                 .lock()
                 .map_err(|_| "storage cache poisoned".to_owned())?;
-            if let Some(storage) = guard.get(&key) {
-                return Ok(storage.clone());
+            prune_storage_cache_locked(&mut guard);
+            if let Some(entry) = guard.get_mut(&key) {
+                entry.updated_at = now_secs();
+                return Ok(entry.storage.clone());
             }
             return Err(format!("missing storage cache: {key}"));
         }
@@ -709,7 +862,18 @@ fn build_storage_from_payload(payload: &Payload) -> Result<Arc<BTreeMap<String, 
             .lock()
             .map_err(|_| "storage cache poisoned".to_owned())?;
         let shared = Arc::new(storage);
-        guard.insert(key, shared.clone());
+        let weight = storage_weight(&shared);
+        prepare_storage_cache_insert(&mut guard, &key, weight);
+        if weight <= STORAGE_CACHE_BYTE_LIMIT {
+            guard.insert(
+                key,
+                StorageCacheEntry {
+                    storage: shared.clone(),
+                    weight,
+                    updated_at: now_secs(),
+                },
+            );
+        }
         return Ok(shared);
     }
 
@@ -858,6 +1022,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                 &mut *store,
                 |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32| -> Result<i32, WasmiError> {
                     let request_bytes = read_guest_bytes(&mut caller, req_ptr, req_len)?;
+                    charge_host_fuel(&mut caller, CIRCLE_INVOKE_FUEL)?;
                     let response_bytes = execute_circle_invoke(&mut caller, &request_bytes)
                         .map_err(WasmiError::new)?;
                     let len = response_bytes.len() as i32;
@@ -883,8 +1048,11 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                     let cached = caller.data().circle_invoke_cache.clone();
                     let response_bytes = match cached {
                         Some((cached_req, cached_res)) if cached_req == request_bytes => cached_res,
-                        _ => execute_circle_invoke(&mut caller, &request_bytes)
-                            .map_err(WasmiError::new)?,
+                        _ => {
+                            charge_host_fuel(&mut caller, CIRCLE_INVOKE_FUEL)?;
+                            execute_circle_invoke(&mut caller, &request_bytes)
+                                .map_err(WasmiError::new)?
+                        }
                     };
                     if out_cap < 0 || (out_cap as usize) < response_bytes.len() {
                         return Ok(-2);
@@ -904,6 +1072,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                 &mut *store,
                 |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32| -> Result<i32, WasmiError> {
                     let request_bytes = read_guest_bytes(&mut caller, req_ptr, req_len)?;
+                    charge_host_fuel(&mut caller, HFHE_INVOKE_FUEL)?;
                     let response_bytes = execute_hfhe_invoke(&mut caller, &request_bytes)
                         .map_err(WasmiError::new)?;
                     let len = response_bytes.len() as i32;
@@ -929,8 +1098,11 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                     let cached = caller.data().hfhe_invoke_cache.clone();
                     let response_bytes = match cached {
                         Some((cached_req, cached_res)) if cached_req == request_bytes => cached_res,
-                        _ => execute_hfhe_invoke(&mut caller, &request_bytes)
-                            .map_err(WasmiError::new)?,
+                        _ => {
+                            charge_host_fuel(&mut caller, HFHE_INVOKE_FUEL)?;
+                            execute_hfhe_invoke(&mut caller, &request_bytes)
+                                .map_err(WasmiError::new)?
+                        }
                     };
                     if out_cap < 0 || (out_cap as usize) < response_bytes.len() {
                         return Ok(-2);
@@ -1171,6 +1343,11 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                         .checked_mul(max_t)
                         .and_then(|value| value.checked_mul(kv_dim))
                         .ok_or_else(|| WasmiError::new("tensor session size overflow"))?;
+                    let total_bytes = total
+                        .checked_mul(16)
+                        .filter(|value| *value <= MAX_TENSOR_SESSION_BYTES)
+                        .ok_or_else(|| WasmiError::new("tensor session exceeds cap"))?;
+                    charge_host_work(&mut caller, total_bytes)?;
                     let mut guard = tensor_session_cache()
                         .lock()
                         .map_err(|_| WasmiError::new("tensor session cache poisoned"))?;
@@ -1364,9 +1541,27 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                     if caller.data().is_view {
                         return Ok(-1);
                     }
+                    if topic_len < 0
+                        || data_len < 0
+                        || topic_len as usize > MAX_EVENT_TOPIC_BYTES
+                        || data_len as usize > MAX_EVENT_DATA_BYTES
+                    {
+                        return Err(WasmiError::new("wasm event exceeds field cap"));
+                    }
+                    let event_bytes = (topic_len as usize)
+                        .checked_add(data_len as usize)
+                        .ok_or_else(|| WasmiError::new("wasm event size overflow"))?;
+                    if caller.data().events.len() >= MAX_EVENT_COUNT
+                        || caller.data().event_bytes.saturating_add(event_bytes)
+                            > MAX_EVENT_BYTES
+                    {
+                        return Err(WasmiError::new("wasm event cap exceeded"));
+                    }
                     let topic = read_guest_bytes(&mut caller, topic_ptr, topic_len)?;
                     let data = read_guest_bytes(&mut caller, data_ptr, data_len)?;
-                    caller.data_mut().events.push(EventJson {
+                    let state = caller.data_mut();
+                    state.event_bytes += event_bytes;
+                    state.events.push(EventJson {
                         topic_b64: encode_b64(&topic),
                         data_b64: encode_b64(&data),
                     });
@@ -1646,6 +1841,38 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
     Ok(())
 }
 
+fn charge_host_fuel(
+    caller: &mut Caller<'_, HostState>,
+    cost: u64,
+) -> Result<(), WasmiError> {
+    let remaining = caller
+        .get_fuel()
+        .map_err(|e| WasmiError::new(format!("wasm fuel read failed: {e}")))?;
+    if cost > remaining {
+        caller
+            .set_fuel(0)
+            .map_err(|e| WasmiError::new(format!("wasm fuel update failed: {e}")))?;
+        return Err(WasmiError::new("wasm fuel exhausted"));
+    }
+    caller
+        .set_fuel(remaining - cost)
+        .map_err(|e| WasmiError::new(format!("wasm fuel update failed: {e}")))
+}
+
+fn charge_host_work(
+    caller: &mut Caller<'_, HostState>,
+    units: usize,
+) -> Result<(), WasmiError> {
+    charge_host_fuel(caller, u64::try_from(units).unwrap_or(u64::MAX))
+}
+
+fn host_work_product(factors: &[usize]) -> Result<usize, WasmiError> {
+    factors
+        .iter()
+        .try_fold(1_usize, |value, factor| value.checked_mul(*factor))
+        .ok_or_else(|| WasmiError::new("wasm host work overflow"))
+}
+
 fn read_guest_bytes(
     caller: &mut Caller<'_, HostState>,
     ptr: i32,
@@ -1654,11 +1881,16 @@ fn read_guest_bytes(
     if ptr < 0 || len < 0 {
         return Err(WasmiError::new("negative pointer"));
     }
+    let len = len as usize;
+    if len > MAX_GUEST_READ_BYTES {
+        return Err(WasmiError::new("guest read exceeds cap"));
+    }
+    charge_host_work(caller, len.saturating_add(64))?;
     let memory = caller
         .get_export("memory")
         .and_then(Extern::into_memory)
         .ok_or_else(|| WasmiError::new("wasm_v1 memory export missing"))?;
-    let mut out = vec![0_u8; len as usize];
+    let mut out = vec![0_u8; len];
     memory
         .read(caller.as_context(), ptr as usize, &mut out)
         .map_err(|_| WasmiError::new("guest memory read out of bounds"))?;
@@ -1681,6 +1913,9 @@ fn write_guest_bytes(
 ) -> Result<i32, WasmiError> {
     if ptr < 0 {
         return Ok(-2);
+    }
+    if bytes.len() > MAX_GUEST_WRITE_BYTES {
+        return Err(WasmiError::new("guest write exceeds cap"));
     }
     let memory = caller
         .get_export("memory")
@@ -1732,11 +1967,55 @@ fn prune_module_cache_locked(cache: &mut HashMap<String, ModuleCacheEntry>) {
     }
 }
 
-fn prune_runtime_cache_locked(cache: &mut HashMap<String, RuntimeCacheEntry>) {
+fn storage_weight(storage: &BTreeMap<String, Vec<u8>>) -> usize {
+    storage
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + 64)
+        .sum()
+}
+
+fn storage_cache_weight(cache: &HashMap<String, StorageCacheEntry>) -> usize {
+    cache.values().map(|entry| entry.weight).sum()
+}
+
+fn remove_oldest_storage_cache_entry(cache: &mut HashMap<String, StorageCacheEntry>) {
+    if let Some(key) = cache
+        .iter()
+        .min_by(|(_, left), (_, right)| left.updated_at.total_cmp(&right.updated_at))
+        .map(|(key, _)| key.clone())
+    {
+        cache.remove(&key);
+    }
+}
+
+fn prune_storage_cache_locked(cache: &mut HashMap<String, StorageCacheEntry>) {
     let now = now_secs();
-    cache.retain(|_, entry| now - entry.updated_at <= RUNTIME_CACHE_TTL_SECS);
-    if cache.len() > RUNTIME_CACHE_LIMIT {
-        cache.clear();
+    cache.retain(|_, entry| now - entry.updated_at <= STORAGE_CACHE_TTL_SECS);
+    while
+        cache.len() > STORAGE_CACHE_LIMIT
+            || storage_cache_weight(cache) > STORAGE_CACHE_BYTE_LIMIT
+    {
+        remove_oldest_storage_cache_entry(cache);
+    }
+}
+
+fn prepare_storage_cache_insert(
+    cache: &mut HashMap<String, StorageCacheEntry>,
+    key: &str,
+    incoming_weight: usize,
+) {
+    prune_storage_cache_locked(cache);
+    if let Some((circle_id, _)) = key.split_once(':') {
+        let prefix = format!("{circle_id}:");
+        cache.retain(|cached_key, _| cached_key == key || !cached_key.starts_with(&prefix));
+    }
+    cache.remove(key);
+    while
+        !cache.is_empty()
+            && (cache.len() >= STORAGE_CACHE_LIMIT
+                || storage_cache_weight(cache) + incoming_weight > STORAGE_CACHE_BYTE_LIMIT)
+    {
+        remove_oldest_storage_cache_entry(cache);
     }
 }
 
@@ -1745,7 +2024,11 @@ fn read_guest_f64_vec(
     ptr: i32,
     len: usize,
 ) -> Result<Vec<f64>, WasmiError> {
-    let raw = read_guest_bytes(caller, ptr, (len * 8) as i32)?;
+    let byte_len = len
+        .checked_mul(8)
+        .filter(|value| *value <= MAX_GUEST_READ_BYTES)
+        .ok_or_else(|| WasmiError::new("tensor input exceeds cap"))?;
+    let raw = read_guest_bytes(caller, ptr, byte_len as i32)?;
     let mut out = Vec::with_capacity(len);
     for chunk in raw.chunks_exact(8) {
         out.push(f64::from_le_bytes([
@@ -1760,7 +2043,12 @@ fn write_guest_f64_vec(
     ptr: i32,
     values: &[f64],
 ) -> Result<i32, WasmiError> {
-    let mut raw = Vec::with_capacity(values.len() * 8);
+    let byte_len = values
+        .len()
+        .checked_mul(8)
+        .filter(|value| *value <= MAX_GUEST_READ_BYTES)
+        .ok_or_else(|| WasmiError::new("tensor output exceeds cap"))?;
+    let mut raw = Vec::with_capacity(byte_len);
     for value in values {
         raw.extend_from_slice(&value.to_le_bytes());
     }
@@ -1784,6 +2072,7 @@ fn host_tensor_load_i8_kv(
         return Ok(-1);
     }
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
+    charge_host_work(caller, n as usize)?;
     let scale = bits_to_fp64(scale_bits);
     let out = {
         let data = caller.data();
@@ -1819,6 +2108,7 @@ fn host_tensor_matmul_fp(
         return Ok(-1);
     }
     let (m, k, n) = (m as usize, k as usize, n as usize);
+    charge_host_work(caller, host_work_product(&[m, k, n])?)?;
     let lhs = read_guest_f64_vec(caller, lhs_ptr, m * k)?;
     let rhs = read_guest_f64_vec(caller, rhs_ptr, k * n)?;
     let mut dst = vec![0.0_f64; m * n];
@@ -1846,6 +2136,7 @@ fn host_tensor_rmsnorm_fp(
         return Ok(-1);
     }
     let n = n as usize;
+    charge_host_work(caller, n.saturating_mul(3))?;
     let mut values = read_guest_f64_vec(caller, addr_ptr, n)?;
     let gamma = read_guest_f64_vec(caller, gamma_ptr, n)?;
     let sum_sq = values.iter().fold(0.0_f64, |acc, value| acc + (value * value));
@@ -1865,6 +2156,7 @@ fn host_tensor_silu_fp(
         return Ok(-1);
     }
     let n = n as usize;
+    charge_host_work(caller, n.saturating_mul(4))?;
     let mut values = read_guest_f64_vec(caller, addr_ptr, n)?;
     for value in &mut values {
         let sig = 1.0_f64 / (1.0_f64 + (-*value).exp());
@@ -1883,6 +2175,7 @@ fn host_tensor_elemwise_mul_fp(
         return Ok(-1);
     }
     let n = n as usize;
+    charge_host_work(caller, n)?;
     let mut dst = read_guest_f64_vec(caller, dst_ptr, n)?;
     let src = read_guest_f64_vec(caller, src_ptr, n)?;
     for idx in 0..n {
@@ -1901,6 +2194,7 @@ fn host_tensor_residual_add_fp(
         return Ok(-1);
     }
     let n = n as usize;
+    charge_host_work(caller, n)?;
     let mut dst = read_guest_f64_vec(caller, dst_ptr, n)?;
     let src = read_guest_f64_vec(caller, src_ptr, n)?;
     for idx in 0..n {
@@ -1920,6 +2214,7 @@ fn host_tensor_rope_apply_fp(
         return Ok(-1);
     }
     let n_dim = n_dim as usize;
+    charge_host_work(caller, n_dim.saturating_mul(8))?;
     let mut values = read_guest_f64_vec(caller, addr_ptr, n_dim)?;
     let half = n_dim / 2;
     let base = bits_to_fp64(base_bits);
@@ -2006,6 +2301,10 @@ fn host_tensor_attention_kv_fp(
     }
     let (t_total, n_q_heads, n_kv_heads, head_dim) =
         (t_total as usize, n_q_heads as usize, n_kv_heads as usize, head_dim as usize);
+    charge_host_work(
+        caller,
+        host_work_product(&[t_total, n_q_heads, head_dim, 2])?,
+    )?;
     let kv_dim = n_kv_heads * head_dim;
     let q = read_guest_f64_vec(caller, q_ptr, n_q_heads * head_dim)?;
     let k = read_guest_f64_vec(caller, k_ptr, t_total * kv_dim)?;
@@ -2025,8 +2324,16 @@ fn host_tensor_append_vec_fp(
         return Ok(-1);
     }
     let n = n as usize;
+    charge_host_work(caller, n)?;
     let src = read_guest_f64_vec(caller, src_ptr, n)?;
-    let dst_elem_ptr = dst_ptr + ((pos as usize * n * 8) as i32);
+    let byte_offset = (pos as usize)
+        .checked_mul(n)
+        .and_then(|value| value.checked_mul(8))
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| WasmiError::new("tensor append offset overflow"))?;
+    let dst_elem_ptr = dst_ptr
+        .checked_add(byte_offset)
+        .ok_or_else(|| WasmiError::new("tensor append pointer overflow"))?;
     write_guest_f64_vec(caller, dst_elem_ptr, &src)
 }
 
@@ -2045,6 +2352,7 @@ fn host_tensor_session_append_kv_fp(
     }
     let raw_key = read_guest_utf8(caller, key_ptr, key_len)?;
     let cache_key = tensor_session_namespaced_key(caller.data(), &raw_key);
+    charge_host_work(caller, (n as usize).saturating_mul(2))?;
     let k_src = read_guest_f64_vec(caller, k_ptr, n as usize)?;
     let v_src = read_guest_f64_vec(caller, v_ptr, n as usize)?;
     let mut guard = tensor_session_cache()
@@ -2097,6 +2405,10 @@ fn host_tensor_session_attention_kv_fp(
         n_kv_heads as usize,
         head_dim as usize,
     );
+    charge_host_work(
+        caller,
+        host_work_product(&[t_total, n_q_heads, head_dim, 2])?,
+    )?;
     let q = read_guest_f64_vec(caller, q_ptr, n_q_heads * head_dim)?;
     let kv_dim = n_kv_heads * head_dim;
     let ctx = {
@@ -2136,6 +2448,7 @@ fn host_tensor_argmax_fp(
     if n <= 0 {
         return Ok(-1);
     }
+    charge_host_work(caller, n as usize)?;
     let values = read_guest_f64_vec(caller, addr_ptr, n as usize)?;
     let mut best_idx = 0usize;
     let mut best_val = f64::NEG_INFINITY;
@@ -2162,6 +2475,7 @@ fn host_tensor_linear_i8_kv(
         return Ok(-1);
     }
     let (in_dim, out_dim) = (in_dim as usize, out_dim as usize);
+    charge_host_work(caller, host_work_product(&[in_dim, out_dim])?)?;
     let input = read_guest_f64_vec(caller, in_ptr, in_dim)?;
     let input_f32: Vec<f32> = input.into_iter().map(|value| value as f32).collect();
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
@@ -2202,6 +2516,7 @@ fn host_tensor_argmax_i8_kv(
         return Ok(-1);
     }
     let (rows, cols) = (rows as usize, cols as usize);
+    charge_host_work(caller, host_work_product(&[rows, cols])?)?;
     let input = read_guest_f64_vec(caller, in_ptr, cols)?;
     let input_f32: Vec<f32> = input.into_iter().map(|value| value as f32).collect();
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
@@ -2248,6 +2563,7 @@ fn host_tensor_top1_i8_kv(
         return Ok(-1);
     }
     let (rows, cols) = (rows as usize, cols as usize);
+    charge_host_work(caller, host_work_product(&[rows, cols])?)?;
     let input = read_guest_f64_vec(caller, in_ptr, cols)?;
     let input_f32: Vec<f32> = input.into_iter().map(|value| value as f32).collect();
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
@@ -2395,6 +2711,9 @@ fn parse_request_frame(raw: &[u8]) -> Result<RequestFrame, String> {
             _ => return Err(format!("unsupported request param tag: {tag}")),
         };
         params.push(value);
+    }
+    if offset != raw.len() {
+        return Err("request has trailing bytes".to_owned());
     }
     Ok(RequestFrame { method, params })
 }
@@ -2771,6 +3090,38 @@ fn encrypted_asset_locator(kind: &str, value: &str) -> Result<(Option<String>, O
 fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let request = parse_request_frame(req_bytes)?;
     let params = request.params;
+    if request.method == "circle_public_asset_meta"
+        || request.method == "circle_public_asset_read"
+    {
+        let circle_id = parse_string_param(&params, 0, "circle_id")?;
+        let canonical_path = parse_string_param(&params, 1, "canonical_path")?;
+        let offset = parse_int_param(&params, 2, "offset")?
+            .parse::<usize>()
+            .map_err(|_| "offset must be non-negative".to_owned())?;
+        let max_bytes = parse_int_param(&params, 3, "max_bytes")?
+            .parse::<usize>()
+            .map_err(|_| "max_bytes must be positive".to_owned())?;
+        let key = public_read_key(&circle_id, &canonical_path, offset, max_bytes);
+        let read = caller
+            .data()
+            .public_reads
+            .get(&key)
+            .ok_or_else(|| "wasm public read not declared".to_owned())?;
+        if request.method == "circle_public_asset_meta" {
+            return Ok(frame_string(read.metadata_json.clone()));
+        }
+        let next_total = caller
+            .data()
+            .public_read_bytes
+            .checked_add(read.body_bytes)
+            .ok_or_else(|| "wasm public read bytes overflow".to_owned())?;
+        if next_total > MAX_PUBLIC_READ_BYTES {
+            return Err("wasm public read bytes exceed limit".to_owned());
+        }
+        let body_b64 = read.body_b64.clone();
+        caller.data_mut().public_read_bytes = next_total;
+        return Ok(frame_string(body_b64));
+    }
     if request.method == "circle_spawn" {
         if caller.data().is_view {
             return Err("circle spawn disabled in view".to_owned());
@@ -3282,7 +3633,154 @@ fn hfhe_capability_name(method: &str) -> Option<&'static str> {
     }
 }
 
-fn execute_hfhe_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn hfhe_receipt_hash(domain: &[u8], value: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(value);
+    hex::encode(hasher.finalize())
+}
+
+fn hfhe_response_bool(response: &[u8]) -> Option<bool> {
+    if response == frame_bool(false) {
+        Some(false)
+    } else if response == frame_bool(true) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn hfhe_receipt_entry(
+    method: &str,
+    request: &[u8],
+    response: &[u8],
+) -> Result<HfheReceiptEntryJson, String> {
+    let result =
+        if is_hfhe_verify_method(method) {
+            Some(
+                hfhe_response_bool(response)
+                    .ok_or_else(|| "invalid hfhe verifier response".to_owned())?,
+            )
+        } else {
+            None
+        };
+    Ok(HfheReceiptEntryJson {
+        method: method.to_owned(),
+        request_hash: hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", request),
+        response_hash: hfhe_receipt_hash(b"octra:circle_hfhe_response:v1", response),
+        result,
+    })
+}
+
+fn expected_hfhe_receipt_entry(
+    caller: &Caller<'_, HostState>,
+) -> Result<HfheReceiptEntryJson, String> {
+    caller
+        .data()
+        .hfhe_receipt_expected
+        .get(caller.data().hfhe_receipt_index)
+        .cloned()
+        .ok_or_else(|| "hfhe receipt exhausted".to_owned())
+}
+
+fn consume_hfhe_receipt_entry(
+    caller: &mut Caller<'_, HostState>,
+    entry: HfheReceiptEntryJson,
+) -> Result<(), String> {
+    let expected = expected_hfhe_receipt_entry(caller)?;
+    match_hfhe_receipt_entry(&expected, &entry)?;
+    let state = caller.data_mut();
+    state.hfhe_receipt_index += 1;
+    state.hfhe_receipt_entries.push(entry);
+    Ok(())
+}
+
+fn match_hfhe_receipt_entry(
+    expected: &HfheReceiptEntryJson,
+    actual: &HfheReceiptEntryJson,
+) -> Result<(), String> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err("hfhe receipt entry mismatch".to_owned())
+    }
+}
+
+fn match_hfhe_receipt_request(
+    expected: &HfheReceiptEntryJson,
+    method: &str,
+    request_hash: &str,
+) -> Result<(), String> {
+    if expected.method == method && expected.request_hash == request_hash {
+        Ok(())
+    } else {
+        Err("hfhe receipt request mismatch".to_owned())
+    }
+}
+
+fn execute_hfhe_invoke(
+    caller: &mut Caller<'_, HostState>,
+    req_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let request = parse_request_frame(req_bytes)?;
+    let capability = hfhe_capability_name(&request.method)
+        .ok_or_else(|| format!("unsupported hfhe host method: {}", request.method))?;
+    if !caller.data().hfhe_caps.contains(capability) {
+        return Err(format!("hfhe capability denied: {}", request.method));
+    }
+    let method = request.method.clone();
+    let mode = caller.data().hfhe_receipt_mode.clone();
+    let is_verify = is_hfhe_verify_method(&method);
+    if mode == "capture" && caller.data().hfhe_receipt_entries.len() >= MAX_HFHE_RECEIPT_ENTRIES {
+        return Err("hfhe receipt entry limit exceeded".to_owned());
+    }
+    if mode == "capture"
+        && is_verify
+        && caller
+            .data()
+            .hfhe_receipt_entries
+            .iter()
+            .filter(|entry| is_hfhe_verify_method(&entry.method))
+            .count()
+            >= MAX_HFHE_VERIFIER_ENTRIES
+    {
+        return Err("hfhe verifier entry limit exceeded".to_owned());
+    }
+    if mode == "consume" {
+        let expected = expected_hfhe_receipt_entry(caller)?;
+        let request_hash = hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", req_bytes);
+        match_hfhe_receipt_request(&expected, &method, &request_hash)?;
+        if is_verify {
+            let result = expected
+                .result
+                .ok_or_else(|| "hfhe verifier result missing".to_owned())?;
+            let response = frame_bool(result);
+            let entry = hfhe_receipt_entry(&method, req_bytes, &response)?;
+            consume_hfhe_receipt_entry(caller, entry)?;
+            return Ok(response);
+        }
+    } else if !caller.data().is_view && is_verify && mode != "capture" {
+        return Err(format!(
+            "hfhe proof verification requires a preverified receipt: {}",
+            method
+        ));
+    }
+    let response = execute_hfhe_direct(caller, req_bytes)?;
+    let entry = hfhe_receipt_entry(&method, req_bytes, &response)?;
+    match mode.as_str() {
+        "capture" => caller.data_mut().hfhe_receipt_entries.push(entry),
+        "consume" => consume_hfhe_receipt_entry(caller, entry)?,
+        "direct" => (),
+        _ => return Err("invalid hfhe receipt mode".to_owned()),
+    }
+    Ok(response)
+}
+
+fn execute_hfhe_direct(
+    caller: &mut Caller<'_, HostState>,
+    req_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
     let request = parse_request_frame(req_bytes)?;
     let capability = hfhe_capability_name(&request.method)
         .ok_or_else(|| format!("unsupported hfhe host method: {}", request.method))?;
@@ -3456,11 +3954,13 @@ fn execute_hfhe_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -> 
             let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
             let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
             let proof = parse_string_param(&params, 2, "proof")?;
+            let amount_commitment = parse_string_param(&params, 3, "amount_commitment")?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_range",
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "proof": proof,
+                "amount_commitment": amount_commitment,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -3685,5 +4185,121 @@ unsafe fn write_owned_bytes(bytes: Vec<u8>, ptr_out: *mut *mut u8, len_out: *mut
     }
     if !len_out.is_null() {
         *len_out = len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        method: &str,
+        request: u8,
+        response: u8,
+        result: Option<bool>,
+    ) -> HfheReceiptEntryJson {
+        HfheReceiptEntryJson {
+            method: method.to_owned(),
+            request_hash: format!("{request:064x}"),
+            response_hash: format!("{response:064x}"),
+            result,
+        }
+    }
+
+    #[test]
+    fn receipt_input_rejects_invalid_shapes() {
+        let valid = entry("fhe_verify_zero", 1, 2, Some(true));
+        assert!(validate_hfhe_receipt_input("consume", &[valid.clone()]).is_ok());
+        assert!(validate_hfhe_receipt_input("capture", &[valid.clone()]).is_err());
+        assert!(
+            validate_hfhe_receipt_input("consume", &[entry("fhe_verify_zero", 1, 2, None)])
+                .is_err()
+        );
+        assert!(
+            validate_hfhe_receipt_input("consume", &[entry("fhe_commit", 1, 2, Some(true))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_request_binds_order_and_payload() {
+        let expected = entry("fhe_verify_zero", 1, 2, Some(true));
+        assert!(
+            match_hfhe_receipt_request(&expected, "fhe_verify_zero", &expected.request_hash)
+                .is_ok()
+        );
+        assert!(
+            match_hfhe_receipt_request(&expected, "fhe_verify_bound", &expected.request_hash)
+                .is_err()
+        );
+        assert!(
+            match_hfhe_receipt_request(&expected, "fhe_verify_zero", &format!("{:064x}", 3))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_entry_binds_response_and_result() {
+        let expected = entry("fhe_verify_zero", 1, 2, Some(true));
+        assert!(match_hfhe_receipt_entry(&expected, &expected).is_ok());
+        assert!(
+            match_hfhe_receipt_entry(&expected, &entry("fhe_verify_zero", 1, 3, Some(true)))
+                .is_err()
+        );
+        assert!(
+            match_hfhe_receipt_entry(&expected, &entry("fhe_verify_zero", 1, 2, Some(false)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_cache_replaces_roots_and_stays_bounded() {
+        let mut cache = HashMap::new();
+        for index in 0..32 {
+            let key = format!("oct{index:044}:root{index}");
+            prepare_storage_cache_insert(&mut cache, &key, 1024);
+            cache.insert(
+                key,
+                StorageCacheEntry {
+                    storage: Arc::new(BTreeMap::new()),
+                    weight: 1024,
+                    updated_at: index as f64,
+                },
+            );
+        }
+        assert!(cache.len() <= STORAGE_CACHE_LIMIT);
+        assert!(storage_cache_weight(&cache) <= STORAGE_CACHE_BYTE_LIMIT);
+        for index in 0..4 {
+            let key = format!("oct{:044}:large{index}", 100 + index);
+            let weight = 20 * 1024 * 1024;
+            prepare_storage_cache_insert(&mut cache, &key, weight);
+            cache.insert(
+                key,
+                StorageCacheEntry {
+                    storage: Arc::new(BTreeMap::new()),
+                    weight,
+                    updated_at: (50 + index) as f64,
+                },
+            );
+        }
+        assert!(storage_cache_weight(&cache) <= STORAGE_CACHE_BYTE_LIMIT);
+        for index in 0..8 {
+            let key = format!("oct{:044}:root{index}", 1);
+            prepare_storage_cache_insert(&mut cache, &key, 1024);
+            cache.insert(
+                key,
+                StorageCacheEntry {
+                    storage: Arc::new(BTreeMap::new()),
+                    weight: 1024,
+                    updated_at: (100 + index) as f64,
+                },
+            );
+        }
+        let circle_prefix = format!("oct{:044}:", 1);
+        let circle_roots = cache
+            .keys()
+            .filter(|key| key.starts_with(&circle_prefix))
+            .count();
+        assert_eq!(circle_roots, 1);
     }
 }

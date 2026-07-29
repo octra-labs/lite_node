@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type deps = {
   sleep : float -> unit Lwt.t;
@@ -27,7 +15,8 @@ type launch_deps = {
   start_driver : unit -> unit Lwt.t;
   startup_probe : unit -> unit Lwt.t;
   poll_loop : unit -> unit Lwt.t;
-  pending_recovery : unit -> unit Lwt.t;
+  pending_recovery : unit -> bool Lwt.t;
+  hold_startup : unit -> unit;
   log_started : unit -> unit;
 }
 
@@ -59,11 +48,12 @@ type runtime_state_ops = {
 type 'driver driver_deps = {
   sleep : float -> unit Lwt.t;
   state : state_refs;
+  hold_startup : unit -> unit;
   replay_stashed : source:string -> unit Lwt.t;
   start_driver : 'driver -> unit Lwt.t;
   probe_health : 'driver -> unit Lwt.t;
   reset_liveness : 'driver -> source:string -> unit Lwt.t;
-  pending_recovery : 'driver -> unit Lwt.t;
+  pending_recovery : 'driver -> bool Lwt.t;
   poll_interval : float;
   pending_delay : float;
   log_started : unit -> unit;
@@ -110,7 +100,9 @@ type fork_repair_runtime = {
   committed_head_epoch : unit -> int;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
+  finality_target_ready : int -> (unit, string) result;
   run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  rewind_finality : int -> (unit, string) result;
   drop_finality_after : int -> int;
   prune_after_epoch : int -> unit;
   set_current_epoch : int -> unit;
@@ -121,6 +113,7 @@ type fork_repair_runtime = {
 }
 
 type node_fork_repair_runtime = {
+  chain_id : string;
   committed_head_epoch : unit -> int;
   data_dir : string;
   store : Octra_core.Store_irmin.t;
@@ -172,8 +165,13 @@ type 'driver liveness_deps = {
   quarantine_active : unit -> bool;
   state_attested : unit -> bool;
   pending_finalized : unit -> bool;
+  proposal_active : 'driver -> bool;
   log_reset : Consensus_liveness.reset -> unit;
-  realign_height : 'driver -> int64 -> unit Lwt.t;
+  realign_progress :
+    'driver ->
+    height:int64 ->
+    round:int ->
+    unit Lwt.t;
 }
 
 type node_liveness_deps = {
@@ -229,10 +227,11 @@ type node_driver_health_deps = {
 type consensus_driver_runtime = {
   sleep : float -> unit Lwt.t;
   state : state_refs;
+  hold_startup : unit -> unit;
   replay_stashed : source:string -> unit Lwt.t;
   probe : driver_probe_deps;
   liveness : Octra_consensus.C_driver.t liveness_deps;
-  pending_recovery : Octra_consensus.C_driver.t -> unit Lwt.t;
+  pending_recovery : Octra_consensus.C_driver.t -> bool Lwt.t;
   poll_interval : float;
   pending_delay : float;
   log_started : unit -> unit;
@@ -245,7 +244,7 @@ type node_consensus_driver_runtime = {
   replay_stashed : source:string -> unit Lwt.t;
   probe : driver_probe_deps;
   liveness : Octra_consensus.C_driver.t liveness_deps;
-  pending_recovery : Octra_consensus.C_driver.t -> unit Lwt.t;
+  pending_recovery : Octra_consensus.C_driver.t -> bool Lwt.t;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
@@ -339,6 +338,12 @@ val after :
   (unit -> unit Lwt.t) ->
   unit Lwt.t
 
+val await_pending_recovery :
+  deps ->
+  delay:float ->
+  (unit -> bool Lwt.t) ->
+  bool Lwt.t
+
 val poll_once :
   deps ->
   unit Lwt.t
@@ -354,10 +359,11 @@ val launch :
 
 val launch_health :
   deps ->
+  hold_startup:(unit -> unit) ->
   start_driver:(unit -> unit Lwt.t) ->
   poll_interval:float ->
   pending_delay:float ->
-  pending_recovery:(unit -> unit Lwt.t) ->
+  pending_recovery:(unit -> bool Lwt.t) ->
   log_started:(unit -> unit) ->
   unit
 

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type effects = {
   prepare : Consensus_epoch_commit.prepare_effects;
@@ -31,6 +19,7 @@ type effects = {
 
 type input = {
   epoch_id : int;
+  epoch_ts : float;
   current_epoch : int;
   consensus_mode : bool;
   layera_diag : bool;
@@ -53,6 +42,7 @@ type input = {
   prev_supply : Z.t;
   emission_remaining : Z.t;
   reward_recipients : Octra_core.Epochlog.reward_recipient list;
+  reward_source : Octra_consensus.C_types.reward_source;
   epoch_receipts_json : string list;
   account_addrs : string list;
   short : string -> string;

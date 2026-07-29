@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type result = Preverify_submit.result = {
   delta_ok : bool;
@@ -35,6 +23,18 @@ type gate =
   }
 
 val pending_count :
+  unit ->
+  int
+
+val cache_ttl :
+  unit ->
+  float
+
+val pending_ceiling :
+  unit ->
+  float
+
+val configured_max_entries :
   unit ->
   int
 

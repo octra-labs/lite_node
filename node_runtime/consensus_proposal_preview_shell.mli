@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type backend = {
   run :
@@ -19,6 +7,7 @@ type backend = {
     proposal_id:string ->
     expected_prev_root:string option ->
     preverify:Octra_core.Preverify_commit.t ->
+    reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
     txs:Octra_core.Transaction.t list ->
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
@@ -35,6 +24,15 @@ type deps = {
 
 val node_backend :
   program_trust:Octra_vm.Program_trust.t ->
+  legacy_replay:
+    (epoch:int ->
+     address:string ->
+     cipher:string ->
+     Octra_core.Pvac_legacy_public_replay.decision) ->
+  private_result_policy:
+    (int -> Octra_core.Private_result_policy.t) ->
+  max_fhe:int ->
+  max_stealth:int ->
   Octra_core.Store_irmin.t ->
   backend
 

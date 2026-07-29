@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Commit_journal = Octra_core.Commit_journal
 module Epoch_boundary = Octra_core.Epoch_boundary
@@ -143,12 +131,12 @@ type prepare_effects = {
   head : unit -> Head_manifest.t option;
   irmin_last_epoch : unit -> int;
   next_txid : unit -> int64;
-  now : unit -> float;
   commit_id : int -> string;
 }
 
 type prepare_input = {
   epoch_id : int;
+  finalized_at : float;
   pre_state_hash : string;
   confirmed_count : int;
   confirmed_txs : Transaction.t list;
@@ -220,6 +208,7 @@ type commit_effects = {
 type live_effects = {
   data_dir : string;
   store : Store_irmin.t;
+  ledger : Octra_core.Ledger.t;
   chaindata : Store_chaindata.t;
   trace : string -> unit;
   fatal : string -> unit;
@@ -242,6 +231,7 @@ type commit_request = {
   confirmed_fees : Z.t;
   plan : Epoch_exec.reward_plan;
   reward_recipients : Epochlog.reward_recipient list;
+  reward_source : Octra_consensus.C_types.reward_source;
   epoch_receipts_json : string list;
   commit_id : string;
   prev_generation : int;
@@ -372,7 +362,7 @@ let prepare_commit (effects : prepare_effects) (input : prepare_input) =
     boundary = boundary.boundary;
     irmin_last_before = boundary.irmin_last_before;
     log = boundary.log;
-    finalized_at = effects.now ();
+    finalized_at = input.finalized_at;
     commit_id = effects.commit_id input.epoch_id;
     index;
     rollback =
@@ -533,7 +523,15 @@ let live_commit_effects deps =
         ~epoch_id
         ~start_txid
         ~tx_count);
-    commit_irmin_batch = Store_irmin.commit_epoch_batch deps.store;
+    commit_irmin_batch = (fun message ->
+      let open Lwt.Syntax in
+      if not (Octra_core.Ledger.journal_active deps.ledger) then
+        Lwt.fail_with "ledger journal is not active before irmin commit"
+      else
+        let* () = Store_irmin.commit_epoch_batch deps.store message in
+        match Octra_core.Ledger.commit_journal deps.ledger with
+        | Ok () -> Lwt.return_unit
+        | Error error -> Lwt.fail_with error);
     tag_epoch = Store_irmin.tag_epoch deps.store;
     irmin_commit_hash = (fun () -> Store_irmin.get_commit_hash deps.store);
     txlog_position = (fun () -> Store_chaindata.txlog_position deps.chaindata);
@@ -553,7 +551,9 @@ let live_failure_effects deps ~rollback =
   {
     rollback;
     abort_chaindata = (fun () -> Store_chaindata.abort_batch deps.chaindata);
-    abort_irmin = (fun () -> Store_irmin.abort_epoch_batch deps.store);
+    abort_irmin = (fun () ->
+      ignore (Octra_core.Ledger.abort_journal deps.ledger);
+      Store_irmin.abort_epoch_batch deps.store);
     log = deps.log;
     exit_later = (fun () ->
       let open Lwt.Syntax in
@@ -564,7 +564,8 @@ let live_failure_effects deps ~rollback =
 
 let epoch_header ~epoch_id ~state_root ~prev_state_root ~parent_commit
     ~start_txid ~tx_count ~finalized_by ~finalized_at ~proposer
-    ~confirmed_fees ~(plan : Epoch_exec.reward_plan) ~reward_recipients =
+    ~confirmed_fees ~(plan : Epoch_exec.reward_plan) ~reward_recipients
+    ~reward_source =
   Epochlog.{
     id = epoch_id;
     state_root;
@@ -576,11 +577,13 @@ let epoch_header ~epoch_id ~state_root ~prev_state_root ~parent_commit
     finalized_at;
     proposer;
     fees_total = Z.to_string confirmed_fees;
+    fees_burned = Z.to_string plan.fees_burned;
     base_reward = Z.to_string plan.base_reward;
     total_reward = Z.to_string plan.total_reward;
     proposer_reward = Z.to_string plan.proposer_total;
     validator_reward_each = Z.to_string plan.each_validator;
     reward_recipients;
+    reward_source = Some reward_source;
   }
 
 let head_manifest ~generation ~state_root ~ledger_root ~irmin_commit
@@ -650,7 +653,8 @@ let run_commit_effects (effects : commit_effects) (request : commit_request) =
        ~proposer:request.proposer
        ~confirmed_fees:request.confirmed_fees
        ~plan:request.plan
-       ~reward_recipients:request.reward_recipients);
+       ~reward_recipients:request.reward_recipients
+       ~reward_source:request.reward_source);
   effects.set_epoch_index_commitment
     ~epoch_id:request.epoch_id
     ~epoch_hash:request.epoch_index_hash

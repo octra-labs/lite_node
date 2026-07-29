@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type state = {
   key : string;
@@ -35,6 +23,7 @@ type sample = {
   quarantine_active : bool;
   state_attested : bool;
   pending_finalized : bool;
+  proposal_active : bool;
 }
 
 type reset = {
@@ -97,12 +86,23 @@ let blocked (sample : sample) ~stalled =
   || sample.catchup_active
   || sample.quarantine_active
   || not sample.state_attested
+  || sample.proposal_active
   || not stalled
   || sample.height <> sample.expected
   || sample.pending_finalized
 
 let record state (sample : sample) =
   let state = refresh_state state sample in
+  let state =
+    if sample.proposal_active then
+      {
+        state with
+        key_started_at = sample.now;
+        height_started_at = sample.now;
+      }
+    else
+      state
+  in
   let state_age = sample.now -. state.key_started_at in
   let height_age = sample.now -. state.height_started_at in
   let state_stalled = state_age >= sample.stall_sec in
@@ -150,7 +150,7 @@ let driver_snapshot driver =
 
 let record_snapshot state snapshot ~expected ~now ~source ~stall_sec ~observer
     ~voting ~catchup_active ~quarantine_active ~state_attested
-    ~pending_finalized =
+    ~pending_finalized ~proposal_active =
   record state {
     height = snapshot.height;
     round = snapshot.round;
@@ -165,4 +165,5 @@ let record_snapshot state snapshot ~expected ~now ~source ~stall_sec ~observer
     quarantine_active;
     state_attested;
     pending_finalized;
+    proposal_active;
   }

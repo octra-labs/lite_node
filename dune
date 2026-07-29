@@ -1,0 +1,2 @@
+(dirs
+ (:standard \ tmp archive libv_litecore))

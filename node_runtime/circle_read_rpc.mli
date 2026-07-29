@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 
@@ -244,7 +232,7 @@ val with_owner_subject_auth :
   (string -> string -> rpc_result Lwt.t) ->
   rpc_result Lwt.t
 
-val with_any_auth :
+val with_owner_asset_auth :
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   circle_id:string ->
@@ -293,6 +281,11 @@ val program :
   rpc_result Lwt.t
 
 val program_params :
+  Octra_core.Store_irmin.t ->
+  Yojson.Safe.t ->
+  rpc_result Lwt.t
+
+val program_auth_params :
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t

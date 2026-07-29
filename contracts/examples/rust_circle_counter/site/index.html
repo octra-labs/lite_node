@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rust Circle Runtime</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="masthead">
+        <div class="masthead-copy">
+          <p class="eyebrow">Octra Circles</p>
+          <h1>Rust guest room</h1>
+          <p class="lede">
+            Sealed browser shell talking to the live Wasm guest through the
+            native Circle bridge and typed runtime verbs.
+          </p>
+        </div>
+        <div class="meta">
+          <div class="meta-row"><span>runtime</span><strong>wasm_v1</strong></div>
+          <div class="meta-row"><span>bridge</span><strong>native_circle_bridge</strong></div>
+          <div class="meta-row"><span>object</span><strong>typed_private_graph</strong></div>
+          <div class="meta-row"><span>hfhe</span><strong>policy_gated</strong></div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">Control surface</p>
+            <h2>Runtime actions</h2>
+          </div>
+          <p class="panel-note">guard | state | workflow | transition</p>
+        </div>
+        <div class="actions">
+          <button id="wallet-info" type="button">Wallet info</button>
+          <button id="program-info" type="button">Program info</button>
+          <button id="runtime-guard" type="button">Runtime guard</button>
+          <button id="get-counter" type="button">Get counter</button>
+          <button id="inc" type="button">Increment</button>
+          <button id="prepare-room" type="button">Prepare room</button>
+          <button id="prepare-register" type="button">Prepare register lane</button>
+          <button id="promote-room" type="button">Promote room</button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">Session output</p>
+            <h2>Terminal</h2>
+          </div>
+          <p class="panel-note">bridge_trace | object_status | diagnostics</p>
+        </div>
+        <pre id="result">ready</pre>
+      </section>
+      <section class="panel">
+        <div class="grid">
+          <article class="card">
+            <p class="card-kicker">Step 01</p>
+            <h3>Prepare room</h3>
+            <p>Builds the balance lane, workflow, and object shell for the private room state.</p>
+          </article>
+          <article class="card">
+            <p class="card-kicker">Step 02</p>
+            <h3>Prepare register</h3>
+            <p>Opens the register lane so the room can carry a second typed private plane.</p>
+          </article>
+          <article class="card">
+            <p class="card-kicker">Step 03</p>
+            <h3>Promote room</h3>
+            <p>Applies the object transition and moves the room into operational state.</p>
+          </article>
+        </div>
+      </section>
+      <footer class="footer">
+        <p>Prepared by Denis CMIX for the Octra network. Use, adapt, and redistribute freely.</p>
+      </footer>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

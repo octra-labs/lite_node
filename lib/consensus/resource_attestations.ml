@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type attestation_kind = PoW | PoStorage | PoUW | Finality
 
@@ -328,11 +316,11 @@ let encode_attestation attestation =
 let decode_attestation data =
   Octra_net.Oce1.decode
     (fun cursor ->
-      let chain_id = Octra_net.Oce1.get_string cursor in
+      let chain_id = Octra_net.Oce1.get_string_bounded ~max:128 cursor in
       let epoch_id = Octra_net.Oce1.get_u64 cursor in
-      let node_id = Octra_net.Oce1.get_string cursor in
+      let node_id = Octra_net.Oce1.get_string_bounded ~max:128 cursor in
       let kind = attestation_kind_of_u8 (Octra_net.Oce1.get_u8 cursor) in
-      let commitment = Octra_net.Oce1.get_string cursor in
+      let commitment = Octra_net.Oce1.get_string_bounded ~max:(64 * 1024) cursor in
       let proof_hash = Octra_net.Oce1.get_hash32 cursor in
       let weight = Octra_net.Oce1.get_u64 cursor in
       let score = Octra_net.Oce1.get_hash32 cursor in

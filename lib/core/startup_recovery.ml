@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Syntax
 
@@ -30,8 +18,7 @@ type result = {
   eic_errors : string list;
 }
 
-let log_prefix = "[STARTUP_RECOVERY]"
-let pf fmt = Octra_log.stdout ("%s " ^^ fmt ^^ "\n%!") log_prefix
+let pf fmt = Octra_log.info "recovery" fmt
 
 let schema_version = "v2_ascii64_int32be"
 let schema_meta_key = "index_schema_version"
@@ -68,7 +55,6 @@ let handle_marker_phase ~data_dir ~store m =
     pf "phase=%s UNKNOWN, clearing marker (operator review recommended)" other;
     Epoch_commit_marker.clear_marker data_dir;
     Lwt.return_unit
-
 
 let schema_check chaindata ~irmin_last_epoch =
   let idx = Store_chaindata.index chaindata in
@@ -296,7 +282,6 @@ let recover ~data_dir ~chaindata ~store =
     | Some m -> handle_marker_phase ~data_dir ~store m
   in
 
-
   let head =
     match Head_manifest.load_result data_dir with
     | Head_manifest.Missing ->
@@ -322,7 +307,6 @@ let recover ~data_dir ~chaindata ~store =
       end;
       Some h
   in
-
 
   let journal = Commit_journal.read_all data_dir in
   let head_commit_id = match head with
@@ -371,7 +355,6 @@ let recover ~data_dir ~chaindata ~store =
       Some "HEAD-consistent uncommitted residue"
     else None
   in
-
 
   let pending_wal = Wal.read_pending data_dir in
   if pending_wal <> [] then begin

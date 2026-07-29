@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Plan = Consensus_tick_plan
 
@@ -65,16 +53,24 @@ let step (deps : deps) ~consensus_mode ~epoch_duration =
   let current_epoch = deps.current_epoch () in
   let elapsed = now -. deps.last_epoch_time () in
   let prepared = tick_state deps ~consensus_mode ~current_epoch in
+  let effective_duration =
+    Epoch_cadence.duration_seconds
+      ~minimum_seconds:epoch_duration
+      ~commit_round:(Option.value prepared.commit_round ~default:0)
+  in
   let tick_plan =
     Plan.plan
       ~consensus_mode
-      ~epoch_duration
+      ~epoch_duration:effective_duration
       ~elapsed
       ~finalized_state:prepared.state
   in
   Plan.apply_action
     ~current_epoch
-    ~clear_trigger:(consensus_mode && prepared.state <> Plan.No_trigger)
+    ~clear_trigger:
+      (consensus_mode
+       && prepared.state <> Plan.No_trigger
+       && tick_plan.action <> Plan.Wait)
     ~store_empty_bundle:(fun () -> store_empty_bundle deps prepared)
     ~queue_missing_bundle:deps.queue_missing_bundle
     ~warn:deps.warn
@@ -86,7 +82,7 @@ let step (deps : deps) ~consensus_mode ~epoch_duration =
          "tick epoch = %d elapsed = %.2fs next_in = %.2fs"
          current_epoch
          elapsed
-         (max 0. (epoch_duration -. elapsed)));
+         (max 0. (effective_duration -. elapsed)));
   Lwt.bind
     (if Plan.should_apply tick_plan.action then
        deps.apply ~now ~elapsed

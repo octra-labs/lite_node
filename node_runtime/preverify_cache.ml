@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type result = Preverify_submit.result = {
   delta_ok : bool;
@@ -40,17 +28,53 @@ let cache_ts : (string, float) Hashtbl.t = Hashtbl.create 100
 
 let pending = ref 0
 
+let float_env name ~fallback ~min_value ~max_value =
+  match Sys.getenv_opt name with
+  | None -> fallback
+  | Some raw ->
+    try
+      let value = float_of_string raw in
+      match classify_float value with
+      | FP_nan | FP_infinite -> fallback
+      | FP_normal | FP_subnormal | FP_zero ->
+        if value < min_value || value > max_value then fallback else value
+    with _ -> fallback
+
+let int_env name ~fallback ~min_value ~max_value =
+  match Sys.getenv_opt name with
+  | None -> fallback
+  | Some raw ->
+    try
+      let value = int_of_string raw in
+      if value < min_value || value > max_value then fallback else value
+    with _ -> fallback
+
 let cache_ttl () =
-  try float_of_string (Sys.getenv "OCTRA_PREVERIFY_CACHE_TTL") with _ -> 45.0
+  float_env "OCTRA_PREVERIFY_CACHE_TTL"
+    ~fallback:45.
+    ~min_value:1.
+    ~max_value:3_600.
 
 let pending_ceiling () =
-  try float_of_string (Sys.getenv "OCTRA_PREVERIFY_PENDING_CEILING") with _ -> 90.0
+  float_env "OCTRA_PREVERIFY_PENDING_CEILING"
+    ~fallback:90.
+    ~min_value:1.
+    ~max_value:7_200.
 
 let configured_max_entries () =
-  try int_of_string (Sys.getenv "OCTRA_PREVERIFY_CACHE_MAX") with _ -> 64
+  int_env "OCTRA_PREVERIFY_CACHE_MAX"
+    ~fallback:64
+    ~min_value:1
+    ~max_value:4_096
 
 let pending_max () =
-  try int_of_string (Sys.getenv "OCTRA_PREVERIFY_PENDING_MAX") with _ -> 2
+  int_env "OCTRA_PREVERIFY_PENDING_MAX"
+    ~fallback:2
+    ~min_value:1
+    ~max_value:16
+
+let now () =
+  Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1e9
 
 let pending_count () =
   !pending
@@ -106,7 +130,7 @@ let prune ?(ttl = -1.0) ?(max_entries = -1) () =
     if max_entries < 0 then configured_max_entries () else max_entries
   in
   let pending_ceiling = pending_ceiling () in
-  let now = Unix.gettimeofday () in
+  let now = now () in
   let plan =
     Preverify_submit.cache_prune_plan
       ~now
@@ -127,7 +151,7 @@ let prune ?(ttl = -1.0) ?(max_entries = -1) () =
       (Hashtbl.length cache)
 
 let insert_with_cap hash result_promise =
-  let now = Unix.gettimeofday () in
+  let now = now () in
   let max_entries = configured_max_entries () in
   let plan =
     Preverify_submit.hard_cap_plan

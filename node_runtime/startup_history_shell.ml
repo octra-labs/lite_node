@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type repair_kind =
   | Tx_loc
@@ -88,8 +76,8 @@ type window =
     }
 
 let repair_label = function
-  | Tx_loc -> "TX_LOC STARTUP HEAL"
-  | Txid_loc -> "TXID_LOC STARTUP HEAL"
+  | Tx_loc -> "tx_loc"
+  | Txid_loc -> "txid_loc"
 
 let repair_windows ~int_value =
   let tx_loc = int_value "OCTRA_TX_HEAL_STARTUP_EPOCHS" 512 in
@@ -115,13 +103,14 @@ let repair_window ~window ~last_epoch =
       }
 
 let log_repair_disabled label env_name window =
-  Octra_log.warn "init" "%s disabled env = %s epochs = %d"
+  Octra_log.warn "init"
+    "event = startup_heal lane = %s status = disabled env = %s epochs = %d"
     label env_name window
 
 let log_repair_stats label ~from_epoch ~to_epoch stats =
   if stats.Octra_core.Store_chaindata.repaired > 0 || stats.errors <> [] then
     Octra_log.warn "init"
-      "%s epochs = %d..%d checked = %d repaired = %d errors = %d"
+      "event = startup_heal lane = %s status = repaired epochs = %d..%d checked = %d repaired = %d errors = %d"
       label
       from_epoch
       to_epoch
@@ -130,7 +119,7 @@ let log_repair_stats label ~from_epoch ~to_epoch stats =
       (List.length stats.errors)
   else
     Octra_log.info "init"
-      "%s clean epochs = %d..%d checked = %d"
+      "event = startup_heal lane = %s status = clean epochs = %d..%d checked = %d"
       label from_epoch to_epoch stats.checked
 
 let run_repair deps =
@@ -139,7 +128,9 @@ let run_repair deps =
   | Disabled window ->
     log_repair_disabled label deps.env_name window
   | No_epochs ->
-    Octra_log.info "init" "%s skipped reason = no_chaindata_epochs" label
+    Octra_log.info "init"
+      "event = startup_heal lane = %s status = skipped reason = no_chaindata_epochs"
+      label
   | Window { from_epoch; to_epoch } ->
     deps.repair ~from_epoch ~to_epoch
     |> log_repair_stats label ~from_epoch ~to_epoch
@@ -177,7 +168,7 @@ let log_strict_failure
     (failures : (int * Octra_core.Store_chaindata.epoch_index_status) list) =
   let first_epoch, first_status = List.hd failures in
   Octra_log.fatal "init"
-    "HISTORY STRICT VERIFY failed epochs = %d..%d failures = %d first_epoch = %d missing_epoch_meta = %b missing_txid_loc = %d missing_tx_loc = %d missing_addr_refs = %d malformed = %d"
+    "event = history_strict_verify status = failed epochs = %d..%d failures = %d first_epoch = %d missing_epoch_meta = %b missing_txid_loc = %d missing_tx_loc = %d missing_addr_refs = %d malformed = %d"
     from_epoch
     to_epoch
     (List.length failures)
@@ -192,7 +183,7 @@ let log_strict_failure
       match status.Octra_core.Store_chaindata.errors with
       | first :: _ ->
         Octra_log.fatal "init"
-          "HISTORY STRICT VERIFY epoch = %d first_error = %s"
+          "event = history_strict_verify_error epoch = %d first_error = %s"
           epoch first
       | [] -> ())
     failures
@@ -201,16 +192,16 @@ let run_strict_verify deps =
   match repair_window ~window:deps.window ~last_epoch:(deps.last_epoch ()) with
   | Disabled window ->
     Octra_log.warn "init"
-      "HISTORY STRICT VERIFY disabled env = OCTRA_HISTORY_STRICT_STARTUP_EPOCHS epochs = %d"
+      "event = history_strict_verify status = disabled env = OCTRA_HISTORY_STRICT_STARTUP_EPOCHS epochs = %d"
       window
   | No_epochs ->
     Octra_log.info "init"
-      "HISTORY STRICT VERIFY skipped reason = no_chaindata_epochs"
+      "event = history_strict_verify status = skipped reason = no_chaindata_epochs"
   | Window { from_epoch; to_epoch } ->
     let failures = strict_failures ~from_epoch ~to_epoch ~status_at:deps.status_at in
     if failures = [] then
       Octra_log.info "init"
-        "HISTORY STRICT VERIFY clean epochs = %d..%d"
+        "event = history_strict_verify status = clean epochs = %d..%d"
         from_epoch to_epoch
     else begin
       log_strict_failure ~from_epoch ~to_epoch failures;
@@ -219,7 +210,8 @@ let run_strict_verify deps =
 
 let run_reindex_marker_guard deps =
   if deps.exists deps.marker_path then begin
-    Octra_log.stderr "\n[INIT FATAL] external reindex marker found at %s\n"
+    Octra_log.fatal "init"
+      "event = external_reindex_marker_found path = %s action = refuse_start"
       deps.marker_path;
     deps.exit_fatal ()
   end
@@ -227,11 +219,11 @@ let run_reindex_marker_guard deps =
 let log_stealth_counter ~irmin_stealth_counter ~chaindata_next_txid =
   if Int64.compare irmin_stealth_counter chaindata_next_txid > 0 then
     Octra_log.warn "init"
-      "stealth_counter = %Ld chaindata_next_txid = %Ld relation = ahead action = check_gap_outputs"
+      "event = stealth_counter irmin = %Ld chaindata_next_txid = %Ld relation = ahead action = check_gap_outputs"
       irmin_stealth_counter chaindata_next_txid
   else
     Octra_log.info "init"
-      "stealth_counter = %Ld chaindata_next_txid = %Ld relation = ok"
+      "event = stealth_counter irmin = %Ld chaindata_next_txid = %Ld relation = ok"
       irmin_stealth_counter chaindata_next_txid
 
 let run_startup_checks deps =

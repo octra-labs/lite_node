@@ -1,0 +1,33 @@
+contract SubtleAllowanceDrain {
+  state {
+    balances: map[address]int
+    grants: map[address]map[address]int
+  }
+
+  constructor(owner_supply: int) {
+    self.balances[origin] = owner_supply
+  }
+
+  fn grant(spender: address, amount: int): bool {
+    require(amount >= 0, "invalid allowance")
+    self.grants[caller][spender] = amount
+    return true
+  }
+
+  private fn move_balance(from: address, to: address, delta: int): bool {
+    let from_bal = self.balances[from]
+    require(from_bal >= delta, "insufficient balance")
+    self.balances[from] = from_bal - delta
+    self.balances[to] = self.balances[to] + delta
+    return true
+  }
+
+  fn pull(from: address, to: address, amount: int): bool {
+    let allowed = self.grants[from][caller]
+    require(allowed >= amount, "not allowed")
+    let ok = move_balance(from, to, amount)
+    require(ok, "move failed")
+    self.grants[from][caller] = allowed - amount
+    return true
+  }
+}

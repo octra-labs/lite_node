@@ -1,0 +1,56 @@
+opam-version: "2.0"
+synopsis: "Octra lite node pre-release"
+maintainer: "Octra Labs"
+authors: ["Octra Labs"]
+homepage: "https://octra.org"
+bug-reports: "https://gitlab.octra.org.uk/octra/libv_litecore/issues"
+depends: [
+  "ocaml" {>= "4.14.2" & < "5.0"}
+  "dune" {>= "3.0"}
+  "base64"
+  "cohttp-lwt-unix"
+  "conf-gmp"
+  "conf-libev"
+  "conf-pkg-config"
+  "conf-sqlite3"
+  "cstruct"
+  "digestif"
+  "eqaf"
+  "fmt"
+  "irmin-pack"
+  "lmdb"
+  "lwt"
+  "mirage-crypto"
+  "mirage-crypto-ec"
+  "mirage-crypto-rng"
+  "mtime"
+  "sqlite3"
+  "tls-lwt"
+  "uri"
+  "yojson"
+  "zarith"
+  "alcotest" {with-test}
+  "alcotest-lwt" {with-test}
+  "coq" {with-test}
+]
+build: [
+  [
+    make
+    "-C"
+    "mcl"
+    "MCL_FP_BIT=256"
+    "MCL_FR_BIT=256"
+    "lib/libmcl.a"
+  ]
+  [
+    "dune"
+    "build"
+    "--root"
+    "."
+    "-j"
+    jobs
+    "--profile"
+    "release"
+    "bin/octra_node.exe"
+  ]
+]

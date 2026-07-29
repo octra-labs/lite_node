@@ -1,22 +1,6 @@
-(*
-Octra Labs 2026
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
-
-module FB = Crypto.FheBalance
-module PT = Crypto.PrivateTransferV4
-module SC = Crypto.StealthClaimV5
-module SA = Crypto.StealthAddress
 module R = Preverify_receipt
 module Q = Preverify_queue
 module T = Transaction
@@ -40,6 +24,10 @@ type verdict =
   | Ready of R.t
   | Skip of string
 
+type checked =
+  | Checked_ready of ready
+  | Checked_skip of skip
+
 let hex_hash tag payload =
   Digestif.SHA256.digest_string (tag ^ "\000" ^ payload)
   |> Digestif.SHA256.to_hex
@@ -53,14 +41,91 @@ let input_hash tx =
 let output_hash tx status =
   hex_hash "octra:preverify_output:v1" (T.hash tx ^ "\000" ^ status)
 
-let receipt tx =
-  match R.for_tx
-    ~input_hash:(input_hash tx)
-    ~output_hash:(output_hash tx "ok")
+let state_hash root =
+  hex_hash "octra:preverify_state:v2" root
+
+let bound_payload tx state =
+  let fields = [
+    tx_json tx;
+    state.R.pre_state_hash;
+    state.source_cipher_hash;
+    state.pvac_key_hash;
+  ] in
+  let fields =
+    match state.transition_hash with
+    | None -> fields
+    | Some transition_hash -> fields @ [transition_hash]
+  in
+  String.concat "\000" fields
+
+let bound_input_hash tx state =
+  hex_hash "octra:preverify_input:v2" (bound_payload tx state)
+
+let bound_output_hash tx state status =
+  hex_hash "octra:preverify_output:v2"
+    (T.hash tx ^ "\000" ^ bound_payload tx state ^ "\000" ^ status)
+
+let circle_payload tx (circle : R.circle_state) =
+  String.concat "\000" [
+    tx_json tx;
+    circle.snapshot_hash;
+    circle.circle_id;
+    circle.code_hash;
+    circle.stable_root;
+    circle.public_reads_hash;
+    circle.context_hash;
+    Circle_hfhe_transcript.canonical circle.transcript;
+  ]
+
+let circle_input_hash tx circle =
+  hex_hash "octra:circle_preverify_input:v1" (circle_payload tx circle)
+
+let circle_output_hash tx circle status =
+  hex_hash
+    "octra:circle_preverify_output:v1"
+    (T.hash tx ^ "\000" ^ circle_payload tx circle ^ "\000" ^ status)
+
+let receipt tx state prepared =
+  let state = {
+    state with
+    R.transition_hash =
+      Some (Private_ledger.hash_prepared prepared);
+  } in
+  match R.for_tx_bound
+    ~input_hash:(bound_input_hash tx state)
+    ~output_hash:(bound_output_hash tx state "ok")
+    ~state
     ~ok:true
     ~reason:""
     tx with
   | Ok r -> Ready r
+  | Error e -> Skip e
+
+let transition_receipt tx state transition_hash =
+  let state = {
+    state with
+    R.transition_hash = Some transition_hash;
+  } in
+  match R.for_tx_bound
+    ~input_hash:(bound_input_hash tx state)
+    ~output_hash:(bound_output_hash tx state "ok")
+    ~state
+    ~ok:true
+    ~reason:""
+    tx with
+  | Ok receipt -> Ready receipt
+  | Error error -> Skip error
+
+let circle_receipt tx circle =
+  match R.make_circle
+    ~tx_hash:(T.hash tx)
+    ~input_hash:(circle_input_hash tx circle)
+    ~output_hash:(circle_output_hash tx circle "ok")
+    ~circle
+    ~ok:true
+    ~reason:""
+    ~cost:(Resource_lanes.cost tx) with
+  | Ok receipt -> Ready receipt
   | Error e -> Skip e
 
 let json_of_receipts receipts =
@@ -83,194 +148,140 @@ let receipt_json_for_hashes ready hashes =
 let txs (batch : batch) =
   List.map (fun (item : ready) -> item.tx) batch.ready
 
-let missing name =
-  Error (name ^ "_missing")
-
-let field name json =
-  match Yojson.Safe.Util.(member name json |> to_string_option) with
-  | Some s -> Ok s
-  | None -> missing name
-
-let int_field name json =
-  match Yojson.Safe.Util.(member name json |> to_int_option) with
-  | Some n -> Ok n
-  | None -> missing name
-
-let enc_json tx =
-  match tx.T.encrypted_data with
-  | Some raw when raw <> "" ->
-    begin
-      try Ok (Yojson.Safe.from_string raw)
-      with _ -> Error "encrypted_data_json"
-    end
-  | Some _ | None -> Error "encrypted_data_missing"
-
-let pkt tx =
-  match enc_json tx with
-  | Error e -> Error e
-  | Ok json ->
-    match field "cipher" json,
-          field "amount_commitment" json,
-          field "zero_proof" json,
-          field "blinding" json with
-    | Ok cipher, Ok com, Ok proof, Ok blind ->
-      let rp = Yojson.Safe.Util.(member "range_proof_balance" json |> to_string_option) in
-      Ok (cipher, com, proof, blind, rp)
-    | Error e, _, _, _
-    | _, Error e, _, _
-    | _, _, Error e, _
-    | _, _, _, Error e -> Error e
-
 let sender_enc ledger addr =
   match Ledger.find_opt ledger addr with
   | Some acc -> Ok (Option.value ~default:"0" acc.Ledger.encrypted_balance)
   | None -> Error "sender_missing"
 
-let with_pk ledger addr f =
-  let open Lwt.Syntax in
-  let* pk_opt = Ledger.get_pvac_pubkey ledger addr in
-  match pk_opt with
-  | None -> Lwt.return (Error "no_pvac_pubkey")
-  | Some blob ->
-    Lwt_preemptive.detach (fun () ->
-      match FB.load_pubkey_result blob with
-      | Error e -> Error e
-      | Ok pk -> f pk)
-      ()
-
-let verify_encrypt ledger tx =
-  match pkt tx with
-  | Error e -> Lwt.return (Error e)
-  | Ok (cipher, com, proof, blind, _) ->
-    with_pk ledger tx.T.from (fun pk ->
-      FB.verify_encrypt_proof pk cipher tx.T.amount proof com blind)
-
-let verify_decrypt ledger tx =
-  match pkt tx with
-  | Error e -> Lwt.return (Error e)
-  | Ok (cipher, com, proof, blind, rp_opt) ->
-    match sender_enc ledger tx.T.from with
-    | Error e -> Lwt.return (Error e)
-    | Ok current ->
-      with_pk ledger tx.T.from (fun pk ->
-        match FB.verify_encrypt_proof pk cipher tx.T.amount proof com blind with
-        | Error e -> Error e
-        | Ok () ->
-          match rp_opt with
-          | None -> Error "range_proof_balance_missing"
-          | Some rp ->
-            match FB.decode_cipher cipher with
-            | Error e -> Error ("bad_delta_cipher:" ^ e)
-            | Ok delta ->
-              match FB.withdraw_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-              | Error e -> Error ("encrypted_balance_update:" ^ e)
-              | Ok next ->
-                if FB.verify_range pk next rp then Ok ()
-                else Error "range_proof_balance_failed")
-
-let stealth_data tx =
-  match enc_json tx with
-  | Error e -> Error e
-  | Ok json ->
-    match int_field "version" json with
-    | Ok 5 -> PT.of_json json
-    | Ok _ -> Error "stealth_version"
-    | Error e -> Error e
-
-let verify_stealth ledger tx =
-  match stealth_data tx with
-  | Error e -> Lwt.return (Error e)
-  | Ok ptd ->
-    if String.length ptd.PT.claim_pub <> 64 then Lwt.return (Error "claim_pub_invalid")
-    else if String.length ptd.PT.send_zero_proof = 0 then Lwt.return (Error "send_zero_proof_missing")
-    else
+let source_cipher_hash ledger tx =
+  match tx.T.op_type with
+  | T.CircleBalanceCellPut
+  | T.CircleRegisterCellPut ->
+    Circle_cell_transition.source_cipher_hash tx
+  | _ ->
+    begin
       match sender_enc ledger tx.T.from with
-      | Error e -> Lwt.return (Error e)
-      | Ok current ->
-        with_pk ledger tx.T.from (fun pk ->
-          if not (FB.verify_commitment pk ptd.PT.delta_cipher ptd.PT.commitment) then
-            Error "commitment_failed"
-          else
-            match FB.decode_cipher ptd.PT.delta_cipher with
-            | Error e -> Error ("bad_delta_cipher:" ^ e)
-            | Ok delta ->
-              match FB.withdraw_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-              | Error e -> Error ("encrypted_balance_update:" ^ e)
-              | Ok next ->
-                if not (FB.verify_range pk ptd.PT.delta_cipher ptd.PT.range_proof_delta) then
-                  Error "range_proof_delta_failed"
-                else if not (FB.verify_range pk next ptd.PT.range_proof_balance) then
-                  Error "range_proof_balance_failed"
-                else FB.verify_claim_amount_v5 pk ptd.PT.delta_cipher ptd.PT.send_zero_proof ptd.PT.amount_commitment)
+      | Error error -> Error error
+      | Ok cipher ->
+        Ok
+          (Digestif.SHA256.digest_string cipher
+           |> Digestif.SHA256.to_hex)
+    end
 
-let claim_data tx =
-  match enc_json tx with
-  | Error e -> Error e
-  | Ok json ->
-    match int_field "version" json with
-    | Ok 5 -> SC.of_json json
-    | Ok _ -> Error "claim_version"
-    | Error e -> Error e
-
-let verify_claim ledger tx =
+let source_binding ledger pre_state_hash tx =
   let open Lwt.Syntax in
-  match claim_data tx with
-  | Error e -> Lwt.return (Error e)
-  | Ok claim ->
-    let* out_opt = Ledger.get_stealth_output_by_id ledger claim.SC.output_id in
-    match out_opt with
-    | None -> Lwt.return (Error "output_missing")
-    | Some out ->
-      match Private_ledger.claim_gate tx.T.from out claim with
-      | Error e -> Lwt.return (Error e.Private_ledger.tag)
-      | Ok () ->
-        match sender_enc ledger tx.T.from with
-        | Error e -> Lwt.return (Error e)
-        | Ok current ->
-          with_pk ledger tx.T.from (fun pk ->
-            if not (FB.verify_commitment pk claim.SC.claim_cipher claim.SC.commitment) then
-              Error "commitment_failed"
-            else
-              match FB.verify_claim_amount_v5 pk claim.SC.claim_cipher claim.SC.zero_proof out.amount_commitment with
-              | Error e -> Error e
+  match source_cipher_hash ledger tx with
+  | Error e -> Lwt.return_error e
+  | Ok source_cipher_hash ->
+    let* key_hash = Ledger.get_pvac_key_hash ledger tx.T.from in
+    let key_hash =
+      match tx.T.op_type, key_hash with
+      | T.KeySwitch, None -> Some R.zero_hash
+      | _, value -> value
+    in
+    match key_hash with
+    | None -> Lwt.return_error "pvac_key_not_consensus_bound"
+    | Some pvac_key_hash ->
+      Lwt.return_ok R.{
+        pre_state_hash;
+        source_cipher_hash;
+        pvac_key_hash;
+        transition_hash = None;
+      }
+
+let plan_result make task =
+  let open Lwt.Syntax in
+  let* result = task in
+  match result with
+  | Ok plan -> Lwt.return_ok (make plan)
+  | Error failure -> Lwt.return_error failure.Private_ledger.reason
+
+let verify_encrypt result_policy ledger tx =
+  plan_result
+    (fun plan -> Private_ledger.Prepared_encrypt plan)
+    (Private_ledger.encrypt_plan ~result_policy ledger tx)
+
+let verify_decrypt result_policy ledger tx =
+  plan_result
+    (fun plan -> Private_ledger.Prepared_decrypt plan)
+    (Private_ledger.decrypt_plan ~result_policy ledger tx)
+
+let verify_stealth result_policy ledger tx =
+  let open Lwt.Syntax in
+  let* plan = Private_ledger.stealth_plan ~result_policy ledger tx in
+  match plan with
+  | Error failure -> Lwt.return_error failure.Private_ledger.reason
+  | Ok plan ->
+    let* range = Private_ledger.stealth_inline_range ledger tx plan in
+    begin
+      match range with
+      | Error failure -> Lwt.return_error failure.Private_ledger.reason
+      | Ok range ->
+        begin
+          match Private_ledger.stealth_accept_range range with
+          | Error failure -> Lwt.return_error failure.Private_ledger.reason
+          | Ok () ->
+            let* binding = Private_ledger.stealth_binding ledger tx plan in
+            begin
+              match binding with
+              | Error failure ->
+                Lwt.return_error failure.Private_ledger.reason
               | Ok () ->
-                match FB.decode_cipher claim.SC.claim_cipher with
-                | Error e -> Error ("bad_claim_cipher:" ^ e)
-                | Ok delta ->
-                  match FB.deposit_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-                  | Error e -> Error ("encrypted_balance_update:" ^ e)
-                  | Ok _ -> Ok ())
+                Lwt.return_ok (Private_ledger.Prepared_stealth plan)
+            end
+        end
+    end
 
-let verify_key_switch tx =
-  match enc_json tx with
-  | Error e -> Lwt.return (Error e)
-  | Ok json ->
-    match field "new_pubkey" json, field "aes_kat" json with
-    | Ok new_pk_b64, Ok kat_hex ->
-      Lwt_preemptive.detach (fun () ->
-        try
-          if kat_hex <> FB.aes_kat_hex () then Error "aes_kat_mismatch"
-          else
-            let blob = Base64.decode_exn new_pk_b64 in
-            if String.length blob > 5_000_000 then Error "pubkey_too_large"
-            else
-              match FB.load_pubkey_result blob with
-              | Error e -> Error e
-              | Ok pk ->
-                ignore (Pvac_ffi.serialize_pubkey pk);
-                Ok ()
-        with e -> Error (Printexc.to_string e))
-        ()
-    | Error e, _
-    | _, Error e -> Lwt.return (Error e)
+let verify_claim result_policy ledger tx =
+  let open Lwt.Syntax in
+  let* plan = Private_ledger.claim_plan ledger tx in
+  match plan with
+  | Error failure -> Lwt.return_error failure.Private_ledger.tag
+  | Ok plan ->
+    let* balance =
+      Private_ledger.claim_balance_plan ~result_policy ledger tx plan
+    in
+    begin
+      match balance with
+      | Error failure -> Lwt.return_error failure.Private_ledger.reason
+      | Ok balance ->
+        Lwt.return_ok (Private_ledger.Prepared_claim (plan, balance))
+    end
 
-let run_heavy ?ledger tx =
+let verify_key_switch ?legacy_replay ledger tx =
+  let open Lwt.Syntax in
+  let replay =
+    if Private_ledger.key_switch_requests_legacy_audit tx then
+      match legacy_replay, sender_enc ledger tx.T.from with
+      | Some lookup, Ok cipher ->
+        Some (lookup ~address:tx.T.from ~cipher)
+      | Some _, Error _
+      | None, _ -> None
+    else
+      None
+  in
+  let* plan =
+    Private_ledger.key_switch_plan
+      ?legacy_public_replay:replay
+      ledger
+      tx
+  in
+  match plan with
+  | Ok plan ->
+    Lwt.return_ok (Private_ledger.Prepared_key_switch plan)
+  | Error failure -> Lwt.return_error failure.Private_ledger.reason
+
+let run_heavy
+    ?ledger
+    ?legacy_replay
+    ?(result_policy = Private_result_policy.Recoverable)
+    tx =
   match tx.T.op_type, ledger with
-  | T.EncryptOp, Some ledger -> verify_encrypt ledger tx
-  | T.DecryptOp, Some ledger -> verify_decrypt ledger tx
-  | T.StealthOp, Some ledger -> verify_stealth ledger tx
-  | T.ClaimOp, Some ledger -> verify_claim ledger tx
-  | T.KeySwitch, _ -> verify_key_switch tx
+  | T.EncryptOp, Some ledger -> verify_encrypt result_policy ledger tx
+  | T.DecryptOp, Some ledger -> verify_decrypt result_policy ledger tx
+  | T.StealthOp, Some ledger -> verify_stealth result_policy ledger tx
+  | T.ClaimOp, Some ledger -> verify_claim result_policy ledger tx
+  | T.KeySwitch, Some ledger -> verify_key_switch ?legacy_replay ledger tx
   | T.PrivateOp, _ -> Lwt.return (Error "private_disabled")
   | T.RecryptOp, _ -> Lwt.return (Error "recrypt_disabled")
   | T.CircleBalanceCellPut, _ -> Lwt.return (Error "circle_balance_preverify_not_ready")
@@ -278,25 +289,281 @@ let run_heavy ?ledger tx =
   | _, None -> Lwt.return (Error "ledger_required")
   | _ -> Lwt.return (Error "lane_not_heavy")
 
-let run ?ledger tx =
+let run
+    ?ledger
+    ?circle_preverify
+    ?circle_cell_preverify
+    ?legacy_replay
+    ?pre_state_hash
+    ?pre_state_root
+    ?(result_policy = Private_result_policy.Recoverable)
+    tx =
   if not (Q.needs_preverify tx) then Lwt.return (Skip "lane_not_heavy")
   else
     let open Lwt.Syntax in
-    let* v = run_heavy ?ledger tx in
-    match v with
-    | Error e -> Lwt.return (Skip e)
-    | Ok () -> Lwt.return (receipt tx)
+    let* pre_state_hash =
+      match ledger, pre_state_hash with
+      | Some ledger, None ->
+        let* hash = Ledger.hash ledger in
+        Lwt.return_some (state_hash hash)
+      | _, value -> Lwt.return value
+    in
+    if tx.T.op_type = T.CircleCall then
+      begin
+        match circle_preverify, pre_state_hash, pre_state_root with
+        | Some verify, Some pre_state_hash, Some pre_state_root ->
+          let* circle =
+            verify ~pre_state_hash ~pre_state_root tx
+          in
+          begin
+            match circle with
+            | Ok circle -> Lwt.return (circle_receipt tx circle)
+            | Error e -> Lwt.return (Skip e)
+          end
+        | None, _, _ -> Lwt.return (Skip "circle_preverify_required")
+        | _, None, _
+        | _, _, None -> Lwt.return (Skip "state_binding_required")
+      end
+    else if
+      tx.T.op_type = T.CircleBalanceCellPut
+      || tx.T.op_type = T.CircleRegisterCellPut
+    then
+      begin
+        match
+          ledger,
+          circle_cell_preverify,
+          pre_state_hash,
+          pre_state_root
+        with
+        | Some ledger, Some verify, Some pre_state_hash, Some pre_state_root ->
+          let* state = source_binding ledger pre_state_hash tx in
+          begin
+            match state with
+            | Error error -> Lwt.return (Skip error)
+            | Ok state ->
+              let* transition_hash =
+                verify ~pre_state_hash ~pre_state_root tx
+              in
+              begin
+                match transition_hash with
+                | Ok transition_hash ->
+                  Lwt.return (transition_receipt tx state transition_hash)
+                | Error error -> Lwt.return (Skip error)
+              end
+          end
+        | None, _, _, _ -> Lwt.return (Skip "ledger_required")
+        | _, None, _, _ ->
+          Lwt.return (Skip "circle_cell_preverify_required")
+        | _, _, None, _
+        | _, _, _, None -> Lwt.return (Skip "state_binding_required")
+      end
+    else
+      let* v = run_heavy ?ledger ?legacy_replay ~result_policy tx in
+      match v with
+      | Error e -> Lwt.return (Skip e)
+      | Ok prepared ->
+        begin
+          match ledger, pre_state_hash with
+          | Some ledger, Some pre_state_hash ->
+            let* state = source_binding ledger pre_state_hash tx in
+            begin
+              match state with
+              | Ok state -> Lwt.return (receipt tx state prepared)
+              | Error e -> Lwt.return (Skip e)
+            end
+          | _ -> Lwt.return (Skip "state_binding_required")
+        end
 
-let run_many ?ledger txs =
-  let open Lwt.Syntax in
-  let rec go ready skipped = function
-    | [] -> Lwt.return { ready = List.rev ready; skipped = List.rev skipped }
-    | tx :: rest ->
-      if not (Q.needs_preverify tx) then
-        go ({ tx; receipt = None } :: ready) skipped rest
+let snapshot_transition tx =
+  match tx.T.op_type with
+  | T.CircleCall
+  | T.CircleBalanceCellPut
+  | T.CircleRegisterCellPut -> true
+  | _ -> false
+
+let first_snapshot_transition txs =
+  List.find_opt
+    snapshot_transition
+    txs
+
+let snapshot_isolation_reason tx =
+  if tx.T.op_type = T.CircleCall then "circle_receipt_snapshot_isolation"
+  else "circle_cell_receipt_snapshot_isolation"
+
+let isolate_snapshot selected txs =
+  let selected_hash = T.hash selected in
+  List.fold_right
+    (fun tx (ready, skipped) ->
+      if String.equal (T.hash tx) selected_hash then
+        tx :: ready, skipped
       else
-        let* v = run ?ledger tx in
-        match v with
-        | Ready receipt -> go ({ tx; receipt = Some receipt } :: ready) skipped rest
-        | Skip reason -> go ready ({ tx; reason } :: skipped) rest in
-  go [] [] txs
+        ready,
+        {
+          tx;
+          reason = snapshot_isolation_reason selected;
+        } :: skipped)
+    txs
+    ([], [])
+
+let without_snapshot_transitions txs =
+  List.filter
+    (fun tx -> not (snapshot_transition tx))
+    txs
+
+let deferred_snapshot_transitions selected_skip txs =
+  List.filter_map
+    (fun tx ->
+      if not (snapshot_transition tx) then None
+      else if String.equal (T.hash tx) (T.hash selected_skip.tx) then
+        Some selected_skip
+      else
+        Some {
+          tx;
+          reason = "circle_preverify_deferred";
+        })
+    txs
+
+let private_state_transition tx =
+  match tx.T.op_type with
+  | T.EncryptOp
+  | T.DecryptOp
+  | T.StealthOp
+  | T.ClaimOp
+  | T.KeySwitch -> true
+  | _ -> false
+
+let tx_position tx =
+  tx.T.nonce, T.hash tx
+
+let compare_position (left_nonce, left_hash) (right_nonce, right_hash) =
+  let nonce_order = compare left_nonce right_nonce in
+  if nonce_order <> 0 then nonce_order
+  else String.compare left_hash right_hash
+
+let private_transition_cutoffs txs =
+  let by_sender = Hashtbl.create 32 in
+  List.iter
+    (fun tx ->
+      if private_state_transition tx then
+        let current =
+          match Hashtbl.find_opt by_sender tx.T.from with
+          | Some values -> values
+          | None -> []
+        in
+        Hashtbl.replace by_sender tx.T.from (tx_position tx :: current))
+    txs;
+  let cutoffs = Hashtbl.create (Hashtbl.length by_sender) in
+  Hashtbl.iter
+    (fun sender positions ->
+      match List.sort compare_position positions with
+      | _ :: second :: _ -> Hashtbl.add cutoffs sender second
+      | _ -> ())
+    by_sender;
+  cutoffs
+
+let isolate_private_transitions txs =
+  let cutoffs = private_transition_cutoffs txs in
+  List.fold_right
+    (fun tx (ready, skipped) ->
+      match Hashtbl.find_opt cutoffs tx.T.from with
+      | Some cutoff
+        when compare_position (tx_position tx) cutoff >= 0 ->
+        ready,
+        {
+          tx;
+          reason = "private_transition_dependency_deferred";
+        } :: skipped
+      | _ -> tx :: ready, skipped)
+    txs
+    ([], [])
+
+let batch_of_checked checked isolated =
+  let ready, skipped =
+    List.fold_right
+      (fun verdict (ready, skipped) ->
+        match verdict with
+        | Checked_ready item -> item :: ready, skipped
+        | Checked_skip item -> ready, item :: skipped)
+      checked
+      ([], isolated)
+  in
+  { ready; skipped }
+
+let verify_checked_batch verify txs isolated =
+  let open Lwt.Syntax in
+  let* checked = Lwt_list.map_p verify txs in
+  Lwt.return (batch_of_checked checked isolated)
+
+let run_checked verify txs =
+  let open Lwt.Syntax in
+  let txs, private_isolated = isolate_private_transitions txs in
+  match first_snapshot_transition txs with
+  | None ->
+    verify_checked_batch verify txs private_isolated
+  | Some selected ->
+    let* selected_verdict = verify selected in
+    begin
+      match selected_verdict with
+      | Checked_ready item ->
+        let _, isolated = isolate_snapshot selected txs in
+        Lwt.return {
+          ready = [item];
+          skipped = private_isolated @ isolated;
+        }
+      | Checked_skip selected_skip ->
+        verify_checked_batch
+          verify
+          (without_snapshot_transitions txs)
+          (private_isolated
+           @ deferred_snapshot_transitions selected_skip txs)
+    end
+
+let checked_of_single_batch tx batch =
+  let same_hash candidate =
+    String.equal (T.hash tx) (T.hash candidate)
+  in
+  match batch.ready, batch.skipped with
+  | [item], [] when same_hash item.tx ->
+    Ok (Checked_ready item)
+  | [], [item] when same_hash item.tx ->
+    Ok (Checked_skip item)
+  | _ ->
+    Error "invalid_single_preverify_batch"
+
+let run_many
+    ?ledger
+    ?circle_preverify
+    ?circle_cell_preverify
+    ?legacy_replay
+    ?(result_policy = Private_result_policy.Recoverable)
+    txs =
+  let open Lwt.Syntax in
+  let* pre_state_root =
+    match ledger with
+    | Some ledger ->
+      Ledger.hash ledger
+    | None -> Lwt.return R.zero_hash
+  in
+  let pre_state_hash = state_hash pre_state_root in
+  let verify tx =
+    if not (Q.needs_preverify tx) then
+      Lwt.return (Checked_ready { tx; receipt = None })
+    else
+      let* verdict =
+        run
+          ?ledger
+          ?circle_preverify
+          ?circle_cell_preverify
+          ?legacy_replay
+          ~pre_state_hash
+          ~pre_state_root
+          ~result_policy
+          tx
+      in
+      match verdict with
+      | Ready receipt ->
+        Lwt.return (Checked_ready { tx; receipt = Some receipt })
+      | Skip reason ->
+        Lwt.return (Checked_skip { tx; reason })
+  in
+  run_checked verify txs

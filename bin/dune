@@ -1,0 +1,84 @@
+(executable
+ (name octra_node)
+ (public_name octra_node)
+ (libraries
+  octra_core
+  octra_node_runtime
+  octra_bootstrap
+  octra_circle_runtime
+  octra_vm
+  octra_net
+  octra_consensus
+  pvac_ffi
+  lwt.unix
+  cohttp-lwt-unix
+  base64
+  yojson
+  zarith
+  uri
+  str
+  digestif
+  digestif.c
+  mirage-crypto
+  mirage-crypto-ec
+  mirage-crypto-rng.unix
+  eqaf
+  cstruct)
+ (ocamlopt_flags
+  (:standard
+   -O3
+   -inline 50
+   -inline-toplevel 50
+   -inline-alloc-cost 50
+   -inline-branch-cost 50
+   -inline-call-cost 50
+   -unbox-closures
+   -remove-unused-arguments
+   -rounds 4
+   -nodynlink))
+ (flags
+  (:standard
+   -w @a-4-27-40-41-42-44-45-48-58-66
+   -warn-error -a+31
+   -safe-string
+   -strict-sequence
+   -strict-formats)))
+
+(executable
+ (name octra_pvac_worker)
+ (public_name octra_pvac_worker)
+ (libraries octra_core pvac_ffi lwt.unix yojson zarith digestif digestif.c)
+ (flags
+  (:standard
+   -w @a-4-27-40-41-42-44-45-48-58-66
+   -warn-error -a+31
+   -safe-string
+   -strict-sequence
+   -strict-formats)))
+
+(executable
+ (name octra_state_sync_client)
+ (libraries octra_core octra_bootstrap octra_net lwt.unix cohttp-lwt-unix tls-lwt yojson uri digestif digestif.c)
+ (flags
+  (:standard
+   -w @a-4-27-40-41-42-44-45-48-58-66
+   -warn-error -a
+   -safe-string)))
+
+(executable
+ (name octra_state_sync_manifest)
+ (libraries octra_core octra_bootstrap octra_consensus unix yojson)
+ (flags
+  (:standard
+   -w @a-4-27-40-41-42-44-45-48-58-66
+   -warn-error -a
+   -safe-string)))
+
+(executable
+ (name bft_control_tx)
+ (libraries octra_core lwt.unix cohttp-lwt-unix base64 yojson zarith uri mirage-crypto-ec mirage-crypto-rng.unix)
+ (flags
+  (:standard
+   -w @a-4-27-40-41-42-44-45-48-58-66
+   -warn-error -a
+   -safe-string)))

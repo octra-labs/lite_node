@@ -1,23 +1,34 @@
-(*
-Octra Labs 2026
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-Lite node, for internal use only (pre-release build 0x1067dzc2)
+val client_progress_body_cap : int
 
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
+val read_body :
+  Cohttp_lwt.Body.t ->
+  (string, string) result Lwt.t
 
+val handle_manifest :
+  chain_id:string ->
+  config_hash:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+
+val handle_chunk :
+  data_dir:string ->
+  chain_id:string ->
+  config_hash:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  (string * string list) list ->
+  (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
 
 val handle :
   data_dir:string ->
   ledger:Octra_core.Ledger.t ->
   tree_ref:Octra_core.Tree.t ref ->
   validator:string ->
+  chain_id:string ->
+  config_hash:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
   current_epoch:int ref ->
   chaindata:Octra_core.Store_chaindata.t ->
   encrypted_supply:(unit -> Z.t) ->

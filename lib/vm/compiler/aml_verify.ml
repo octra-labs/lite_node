@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Oct_lang
 
@@ -61,6 +49,10 @@ type report = {
   summaries : function_summary list;
   invariants : invariant list;
 }
+
+type writes_state =
+  | Writes_visiting
+  | Writes_complete of string list
 
 let severity_to_string = function
   | Error -> "error"
@@ -630,32 +622,47 @@ let write_count field body =
 let fn_by_name functions name =
   List.find_opt (fun fn -> fn.fn_name = name) functions
 
-let rec transitive_writes functions seen fn =
-  let direct = block_direct_writes fn.fn_body in
-  let nested =
-    block_direct_calls fn.fn_body
-    |> List.filter_map (fun name ->
-      if List.mem name seen then None
-      else fn_by_name functions name)
-    |> List.concat_map (fun callee -> transitive_writes functions (callee.fn_name :: seen) callee)
-  in
-  uniq (direct @ nested)
-
-let function_summary fields functions fn =
+let function_summary fields transitive fn =
   let direct_writes = block_direct_writes fn.fn_body in
-  let transitive = transitive_writes functions [fn.fn_name] fn in
+  let transitive_writes = transitive fn.fn_name in
   {
     summary_name = fn.fn_name;
     summary_visibility = visibility_to_string fn.fn_vis;
     direct_calls = uniq (block_direct_calls fn.fn_body);
     direct_writes = uniq direct_writes;
-    transitive_writes = transitive;
-    value_writes = uniq (List.filter (is_value_storage_write fields) transitive);
+    transitive_writes;
+    value_writes =
+      uniq
+        (List.filter
+           (is_value_storage_write fields)
+           transitive_writes);
     signed_params = fn.fn_params |> List.filter (fun param -> typ_is_signed param.p_typ) |> List.map (fun param -> param.p_name);
   }
 
 let summarize_functions fields functions =
-  List.map (function_summary fields functions) functions
+  let by_name = Hashtbl.create (List.length functions) in
+  List.iter (fun fn -> Hashtbl.replace by_name fn.fn_name fn) functions;
+  let states = Hashtbl.create (List.length functions) in
+  let rec transitive name =
+    match Hashtbl.find_opt states name with
+    | Some Writes_visiting -> []
+    | Some (Writes_complete writes) -> writes
+    | None ->
+      match Hashtbl.find_opt by_name name with
+      | None -> []
+      | Some fn ->
+        Hashtbl.replace states name Writes_visiting;
+        let direct = block_direct_writes fn.fn_body in
+        let nested =
+          block_direct_calls fn.fn_body
+          |> List.filter (Hashtbl.mem by_name)
+          |> List.concat_map transitive
+        in
+        let writes = uniq (direct @ nested) in
+        Hashtbl.replace states name (Writes_complete writes);
+        writes
+  in
+  List.map (function_summary fields transitive) functions
 
 let summary_by_name summaries name =
   List.find_opt (fun summary -> summary.summary_name = name) summaries

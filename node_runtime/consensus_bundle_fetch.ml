@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Bundle = Consensus_bundle_validation
 module C_driver = Octra_consensus.C_driver
@@ -186,15 +174,15 @@ let ensure_proposal (deps : proposal_deps) ~epoch_id:_ ~proposal_id_short ~expec
     Lwt.return bundle
   | None when hashes_empty ->
     Lwt.return { txs = []; receipts_json = [] }
+  | None when missing_count = 0 ->
+    local_proposal_fallback deps
+      ~reason:"local_complete"
+      ~local_tx_count
+      ~expected_hash_count
   | None ->
-    if missing_count > 0 then
-      Log.info "consensus"
-        "verify_proposal canonical_bundle = fetch_missing missing = %d total = %d"
-        missing_count expected_hash_count
-    else
-      Log.info "consensus"
-        "verify_proposal canonical_bundle = fetch_forced have = %d need = %d"
-        local_tx_count expected_hash_count;
+    Log.info "consensus"
+      "verify_proposal canonical_bundle = fetch_missing missing = %d total = %d"
+      missing_count expected_hash_count;
     if deps.driver_available () then
       fetch_proposal deps ~local_tx_count ~expected_hash_count
     else

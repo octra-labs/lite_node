@@ -1,0 +1,10 @@
+{
+  "name": "rust-circle-counter",
+  "mode": "sealed_read",
+  "entry": "/index.html",
+  "assets": [
+    "/index.html",
+    "/style.css",
+    "/app.js"
+  ]
+}

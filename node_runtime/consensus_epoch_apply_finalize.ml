@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Footer = Consensus_epoch_apply_footer
 module Tree = Consensus_epoch_apply_tree
@@ -31,6 +19,7 @@ type input = {
   validator_addr : string;
   validator_pubkeys : (string * string) list;
   active_validators : string list;
+  reward : Consensus_reward_attribution.t;
   ready_state_root_at : int -> string option Lwt.t;
   ready_max_lag : int;
   confirmed_fees : Z.t;
@@ -60,8 +49,15 @@ let node_effects deps =
   {
     footer = {
       get_meta = deps.get_meta;
-      apply_footer = (fun env plan ->
-        Octra_core.Epoch_exec.apply_epoch_footer
+      set_meta = (fun key value ->
+        Octra_core.Store_irmin.set_meta deps.store key value);
+      policy = Octra_core.Emission_policy.of_env Sys.getenv_opt;
+      schedule = Octra_core.Emission_schedule.of_env_exn Sys.getenv_opt;
+      legacy_total = Octra_core.Emission_policy.legacy_total Sys.getenv_opt;
+      public_supply = (fun () -> Octra_core.Ledger.get_total_supply deps.ledger);
+      apply_footer = (fun env reward plan ->
+        Octra_core.Epoch_exec.apply_epoch_footer_with_reward
+          ~reward
           ~backend:live_backend
           ~env
           ~plan);
@@ -81,7 +77,6 @@ let node_effects deps =
 
 let run effects input =
   let open Lwt.Syntax in
-  let validator_count = List.length input.active_validators in
   let* footer =
     Footer.run_node
       effects.footer
@@ -90,10 +85,9 @@ let run effects input =
         epoch_ts = input.epoch_ts;
         proposer_addr = input.proposer_addr;
         validator_pubkeys = input.validator_pubkeys;
-        active_validators = input.active_validators;
+        reward = input.reward;
         ready_state_root_at = input.ready_state_root_at;
         ready_max_lag = input.ready_max_lag;
-        validator_count;
         confirmed_fees = input.confirmed_fees;
         short = input.short;
       }

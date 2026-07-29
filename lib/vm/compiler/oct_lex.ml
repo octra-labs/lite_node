@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Oct_lang
 
@@ -21,11 +9,19 @@ type lexer = {
   mutable pos : int;
   mutable line : int;
   mutable col : int;
+  mutable depth : int;
 }
 
 exception LexError of string * int * int
 
-let create src = { src; len = String.length src; pos = 0; line = 1; col = 1 }
+let create src = {
+  src;
+  len = String.length src;
+  pos = 0;
+  line = 1;
+  col = 1;
+  depth = 0;
+}
 
 let peek lx = if lx.pos < lx.len then Some lx.src.[lx.pos] else None
 
@@ -40,6 +36,18 @@ let peek2 lx =
   if lx.pos + 1 < lx.len then Some lx.src.[lx.pos + 1] else None
 
 let err lx msg = raise (LexError (msg, lx.line, lx.col))
+
+let open_delimiter lx token =
+  lx.depth <- lx.depth + 1;
+  if lx.depth > Program_limits.max_parser_depth then
+    err lx "syntax nesting exceeds limit";
+  advance lx;
+  token
+
+let close_delimiter lx token =
+  if lx.depth > 0 then lx.depth <- lx.depth - 1;
+  advance lx;
+  token
 
 let is_alpha c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_'
 let is_digit c = c >= '0' && c <= '9'
@@ -162,12 +170,12 @@ let next_token lx =
   | Some c when is_alpha c ->
     let id = read_ident lx in
     classify_ident id
-  | Some '{' -> advance lx; TkLBrace
-  | Some '}' -> advance lx; TkRBrace
-  | Some '(' -> advance lx; TkLParen
-  | Some ')' -> advance lx; TkRParen
-  | Some '[' -> advance lx; TkLBrack
-  | Some ']' -> advance lx; TkRBrack
+  | Some '{' -> open_delimiter lx TkLBrace
+  | Some '}' -> close_delimiter lx TkRBrace
+  | Some '(' -> open_delimiter lx TkLParen
+  | Some ')' -> close_delimiter lx TkRParen
+  | Some '[' -> open_delimiter lx TkLBrack
+  | Some ']' -> close_delimiter lx TkRBrack
   | Some ':' -> advance lx; TkColon
   | Some ',' -> advance lx; TkComma
   | Some '.' ->

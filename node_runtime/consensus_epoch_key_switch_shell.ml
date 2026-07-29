@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Private_gate = Consensus_epoch_apply_private_gate
 module Private_ledger = Octra_core.Private_ledger
@@ -66,7 +54,7 @@ type live_tx_args = {
 
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
-  chaindata : Octra_core.Store_chaindata.t;
+  legacy_replay : string -> Octra_core.Pvac_legacy_public_replay.decision;
   gate : unit -> Private_gate.reject option;
   reject_gate : Private_gate.reject -> unit Lwt.t;
   record_rejected : Transaction.t -> string -> string -> unit;
@@ -151,11 +139,7 @@ let run_live_ledger_tx args tx =
     {
       gate = args.gate;
       needs_legacy_audit = Private_ledger.key_switch_requests_legacy_audit;
-      legacy_replay = (fun addr ->
-        (Octra_core.Store_chaindata.pvac_legacy_public_replay_by_addr
-           args.chaindata
-           addr
-           ~max_txs:50_000).decision);
+      legacy_replay = args.legacy_replay;
       apply_tx = (fun ?legacy_public_replay tx ->
         Private_ledger.apply_key_switch ?legacy_public_replay args.ledger tx);
       reject_gate = args.reject_gate;

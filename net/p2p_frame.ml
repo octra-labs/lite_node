@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let max_frame_size = 10_000_000
 let default_read_timeout_s = 10.0
@@ -20,6 +8,7 @@ let msg_hello = 0x01
 let msg_hello_ack = 0x02
 let msg_ping = 0x03
 let msg_pong = 0x04
+let msg_hello_finish = 0x05
 let msg_get_peers = 0x10
 let msg_peers = 0x11
 let msg_tx_gossip = 0x20
@@ -37,17 +26,28 @@ let msg_catchup_range_response = 0x39
 let msg_query_catchup_range_v2 = 0x3a
 let msg_catchup_range_response_v2 = 0x3b
 let msg_resource_attestation = 0x3c
+let msg_vote_evidence = 0x3d
+let msg_cons_round_sync = 0x3e
+let msg_epoch_broadcast = 0x40
 
 let control_payload_max = 4 * 1024
 let handshake_payload_max = 64 * 1024
 let peers_payload_max = 512 * 1024
 let tx_payload_max = P2p_tx_gossip.max_tx_json + 4_096
+let consensus_control_payload_max = 16 * 1024
+let proposal_payload_max = 256 * 1024
+let finalize_payload_max = 1024 * 1024
+let bundle_payload_max = 8 * 1024 * 1024
+let catchup_payload_max = 5 * 1024 * 1024
+let attestation_payload_max = 256 * 1024
+let epoch_payload_max = 8 * 1024 * 1024
 
 let known_msg_types = [
   msg_hello;
   msg_hello_ack;
   msg_ping;
   msg_pong;
+  msg_hello_finish;
   msg_get_peers;
   msg_peers;
   msg_tx_gossip;
@@ -56,6 +56,7 @@ let known_msg_types = [
   msg_cons_vote;
   msg_cons_finalize;
   msg_cons_timeout;
+  msg_cons_round_sync;
   msg_query_epoch_root;
   msg_epoch_root_response;
   msg_query_bundle;
@@ -65,13 +66,16 @@ let known_msg_types = [
   msg_query_catchup_range_v2;
   msg_catchup_range_response_v2;
   msg_resource_attestation;
+  msg_vote_evidence;
+  msg_epoch_broadcast;
 ]
 
 let known_msg_type n =
   List.mem n known_msg_types
 
 let max_payload_size msg_type =
-  if msg_type = msg_hello || msg_type = msg_hello_ack then
+  if msg_type = msg_hello || msg_type = msg_hello_ack
+     || msg_type = msg_hello_finish then
     handshake_payload_max
   else if msg_type = msg_ping
        || msg_type = msg_pong
@@ -81,8 +85,23 @@ let max_payload_size msg_type =
     peers_payload_max
   else if msg_type = msg_tx_gossip then
     tx_payload_max
+  else if msg_type = msg_cons_propose then
+    proposal_payload_max
+  else if msg_type = msg_cons_finalize then
+    finalize_payload_max
+  else if msg_type = msg_bundle_response then
+    bundle_payload_max
+  else if msg_type = msg_catchup_range_response
+       || msg_type = msg_catchup_range_response_v2 then
+    catchup_payload_max
+  else if msg_type = msg_resource_attestation then
+    attestation_payload_max
+  else if msg_type = msg_vote_evidence then
+    consensus_control_payload_max
+  else if msg_type = msg_epoch_broadcast then
+    epoch_payload_max
   else if known_msg_type msg_type then
-    max_frame_size - 1
+    consensus_control_payload_max
   else
     control_payload_max
 
@@ -99,6 +118,7 @@ let msg_type_name = function
   | 0x02 -> "HELLO_ACK"
   | 0x03 -> "PING"
   | 0x04 -> "PONG"
+  | 0x05 -> "HELLO_FINISH"
   | 0x10 -> "GET_PEERS"
   | 0x11 -> "PEERS"
   | 0x20 -> "TX_GOSSIP"
@@ -116,6 +136,9 @@ let msg_type_name = function
   | 0x3a -> "QUERY_CATCHUP_RANGE_V2"
   | 0x3b -> "CATCHUP_RANGE_RESPONSE_V2"
   | 0x3c -> "RESOURCE_ATTESTATION"
+  | 0x3d -> "VOTE_EVIDENCE"
+  | 0x3e -> "CONS_ROUND_SYNC"
+  | 0x40 -> "EPOCH_BROADCAST"
   | n -> Printf.sprintf "UNKNOWN(0x%02x)" n
 
 type frame = {

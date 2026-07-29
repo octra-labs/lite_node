@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Rpc = Octra_core.Rpc
 
@@ -82,6 +70,7 @@ type 'handler circle_handlers = {
   circle_asset_ciphertext_by_slot_ref_auth : 'handler;
   circle_asset_ciphertext_by_state_ref_auth : 'handler;
   circle_program : 'handler;
+  circle_program_auth : 'handler;
 }
 
 type 'handler program_handlers = {
@@ -189,6 +178,7 @@ let circle_routes h =
     route_aliases "circle_asset_ciphertext_by_slot_ref_auth" "octra_circleAssetCiphertextBySlotRefAuth" h.circle_asset_ciphertext_by_slot_ref_auth;
     route_aliases "circle_asset_ciphertext_by_state_ref_auth" "octra_circleAssetCiphertextByStateRefAuth" h.circle_asset_ciphertext_by_state_ref_auth;
     route "octra_circleProgram" h.circle_program;
+    route_aliases "circle_program_auth" "octra_circleProgramAuth" h.circle_program_auth;
   ]
 
 let program_routes h =
@@ -205,6 +195,9 @@ let program_routes h =
     route_aliases "contract_saveAbi" "octra_programSaveAbi" h.program_save_abi;
     route_aliases "contract_source" "octra_programSource" h.program_source;
     route_aliases "octra_contractBytecode" "octra_programBytecode" h.program_bytecode;
+    route "octra_compileAssembly" h.program_compile_assembly;
+    route "octra_compileAml" h.program_compile_aml;
+    route "octra_compileAmlMulti" h.program_compile_aml_multi;
     route "octra_tokensByAddress" h.program_tokens_by_address;
   ]
 
@@ -247,7 +240,7 @@ let handle_request meta req ctx routes =
     if elapsed > slow_warn_s then
       Log.warn
         "rpc"
-        "SLOW method = %s took=%.2fs from=%s id=%s params=%s body_bytes =%d ua=%s"
+        "SLOW method=%s took=%.2fs from=%s id=%s params=%s body_bytes=%d ua=%s"
         req.method_
         elapsed
         meta.Rpc_http.rpc_peer

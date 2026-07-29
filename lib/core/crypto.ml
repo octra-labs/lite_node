@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let z_to_yojson z = `String (Z.to_string z)
 let z_of_yojson = function
@@ -49,24 +37,20 @@ end
 module Address = struct
   let is_valid_address addr =
     if not (String.starts_with ~prefix:"oct" addr) then false
-    else if String.length addr < 4 then false
+    else if String.length addr <> 47 then false
     else
       let base58_part = String.sub addr 3 (String.length addr - 3) in
-      let len = String.length base58_part in
-      if len < 43 || len > 45 then false
-      else
-        let is_valid_base58_char c =
-          let valid_chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" in
-          String.contains valid_chars c
-        in
-        String.for_all is_valid_base58_char base58_part
+      let is_valid_base58_char c =
+        let valid_chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" in
+        String.contains valid_chars c
+      in
+      String.for_all is_valid_base58_char base58_part
 
   let address_from_pubkey pub_b64 =
     try
       let pub_raw = Base64.decode_exn pub_b64 in
       let hash = Digestif.SHA256.digest_string pub_raw in
       let base58_hash = Base58.encode (Digestif.SHA256.to_raw_string hash) in
-
       let padded = if String.length base58_hash < 44 then
         String.make (44 - String.length base58_hash) '1' ^ base58_hash
       else base58_hash in
@@ -78,173 +62,17 @@ module Address = struct
     addr = expected
 end
 
-module EncryptedBalance = struct
-  let max_cipher_len = 512
-
-  let cipher_format_valid cipher =
-  if not (String.starts_with ~prefix:"v2|" cipher) then false
-  else
-    try
-      let b64_part = String.sub cipher 3 (String.length cipher - 3) in
-      let raw = Base64.decode_exn b64_part in
-      String.length raw >= 29
-    with _ -> false
-
-  let extract_nonce b64_cipher =
-    try
-      let raw = Base64.decode_exn b64_cipher in
-      if String.length raw >= 12 then String.sub raw 0 12 else ""
-    with _ -> ""
-
-  let derive_encryption_key_v1 priv_b64 =
-    let priv = Base64.decode_exn priv_b64 in
-    let salt = "octra_encrypted_balance_v1" in
-    Digestif.SHA256.(
-      to_raw_string (digest_string (salt ^ priv)) ^
-      to_raw_string (digest_string (priv ^ salt))
-    )
-    |> (fun s -> String.sub s 0 32)
-
-  let derive_encryption_key priv_b64 =
-    let priv = Base64.decode_exn priv_b64 in
-    let salt = "octra_encrypted_balance_v2" in
-    Digestif.SHA256.(digest_string (salt ^ priv) |> to_raw_string)
-    |> (fun s -> String.sub s 0 32)
-
-  let cipher_valid b64 =
-    String.length b64 <= max_cipher_len &&
-    cipher_format_valid b64
-
-  let legacy_decrypt encrypted priv_b64 =
-    if encrypted = "0" || encrypted = "" then Ok Z.zero else
-    try
-      let key  = derive_encryption_key_v1 priv_b64 in
-      let data = Base64.decode_exn encrypted in
-      if String.length data < 32 then Error "Invalid v1 payload"
-      else
-        let nonce = String.sub data 0 16 in
-        let tag = String.sub data 16 16 in
-        let cipher = String.sub data 32 (String.length data - 32) in
-        let calc_tag =
-          Digestif.SHA256.(digest_string (nonce ^ cipher ^ key)
-                          |> to_raw_string |> fun s -> String.sub s 0 16) in
-        if not (Eqaf.equal tag calc_tag) then Error "Auth failed (v1)"
-        else
-          let key_hash =
-            Digestif.SHA256.(digest_string (key ^ nonce) |> to_raw_string) in
-          let res = Bytes.create (String.length cipher) in
-          String.iteri (fun i c ->
-            Bytes.set res i
-              (Char.chr (Char.code c lxor Char.code key_hash.[i mod 32])))
-            cipher;
-          Ok (Z.of_string (Bytes.to_string res))
-    with e -> Error (Printexc.to_string e)
-
-  let encrypt_balance balance priv_b64 =
-    let key_string = derive_encryption_key priv_b64 in
-    let key = Mirage_crypto.AES.GCM.of_secret key_string in
-    let nonce = Mirage_crypto_rng.generate 12 in
-    let plain = Z.to_string balance in
-    let ciphertext_with_tag =
-      Mirage_crypto.AES.GCM.authenticate_encrypt ~key ~nonce plain
-    in
-    "v2|" ^ Base64.encode_exn (nonce ^ ciphertext_with_tag)
-
-  let decrypt_balance payload priv_b64 =
-    match String.split_on_char '|' payload with
-    | "v2" :: b64 :: _ ->
-        (try
-          let raw = Base64.decode_exn b64 in
-          if String.length raw < 12 then Error "Malformed v2 payload" else
-          let nonce = String.sub raw 0 12 in
-          let ciphertext_with_tag = String.sub raw 12 (String.length raw - 12) in
-          let key_string = derive_encryption_key priv_b64 in
-          let key = Mirage_crypto.AES.GCM.of_secret key_string in
-          match Mirage_crypto.AES.GCM.authenticate_decrypt ~key ~nonce ciphertext_with_tag with
-          | None -> Error "Auth failed (v2)"
-          | Some plain -> Ok (Z.of_string plain)
-        with e -> Error (Printf.sprintf "Malformed v2 payload: %s" (Printexc.to_string e)))
-    | _ ->
-        legacy_decrypt payload priv_b64
-
+module WalletKey = struct
   let verify_privkey_for_address addr priv_b64 =
     try
       let priv = Base64.decode_exn priv_b64 in
       match Mirage_crypto_ec.Ed25519.priv_of_octets priv with
       | Error _ -> false
-      | Ok sk   ->
-          let pk   = Mirage_crypto_ec.Ed25519.pub_of_priv sk in
-          let pubB = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
-          Address.address_from_pubkey pubB = addr
-    with _ -> false
-
-  type private_transfer_data = {
-    from_cipher : string;
-    to_cipher : string;
-    ephemeral_key : string;
-  }
-
-  let private_transfer_data_to_json _d = `Null
-  let private_transfer_data_of_json _ = Error "PrivateOp V1 is disabled"
-
-    let generate_ephemeral_keypair () =
-      let sk, pk = Mirage_crypto_ec.Ed25519.generate () in
-      let eph_sk_b64 = Base64.encode_exn (Mirage_crypto_ec.Ed25519.priv_to_octets sk) in
-      let eph_pk_b64 = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
-      (eph_sk_b64, eph_pk_b64)
-
-    let derive_shared_secret ephemeral_sk_b64 recipient_pk_b64 =
-    try
-      let eph_sk_bytes = Base64.decode_exn ephemeral_sk_b64 in
-      let rec_pk_bytes = Base64.decode_exn recipient_pk_b64 in
-
-      match Mirage_crypto_ec.Ed25519.priv_of_octets eph_sk_bytes with
       | Ok sk ->
-          let eph_pk = Mirage_crypto_ec.Ed25519.pub_of_priv sk in
-          let eph_pk_bytes = Mirage_crypto_ec.Ed25519.pub_to_octets eph_pk in
-
-          let smaller, larger =
-            if String.compare eph_pk_bytes rec_pk_bytes < 0 then
-              (eph_pk_bytes, rec_pk_bytes)
-            else
-              (rec_pk_bytes, eph_pk_bytes)
-          in
-
-          let combined = smaller ^ larger in
-          let round1 = Digestif.SHA256.(digest_string combined |> to_raw_string) in
-          let round2 = Digestif.SHA256.(digest_string (round1 ^ "OCTRA_SYMMETRIC_V1") |> to_raw_string) in
-          String.sub round2 0 32
-      | Error _ -> failwith "Invalid ephemeral private key"
-    with _e ->
-      failwith "ECDH failed"
-
-      let encrypt_private_amount amount shared_secret =
-        let _hex_of_string s =
-          let hex_byte c = Printf.sprintf "%02x" (Char.code c) in
-          String.concat "" (List.init (String.length s) (fun i -> hex_byte s.[i]))
-        in
-        let key = Mirage_crypto.AES.GCM.of_secret shared_secret in
-        let nonce = Mirage_crypto_rng.generate 12 in
-        let plaintext = Z.to_string amount in
-        let ciphertext_with_tag =
-          Mirage_crypto.AES.GCM.authenticate_encrypt ~key ~nonce plaintext
-        in
-        "v2|" ^ Base64.encode_exn (nonce ^ ciphertext_with_tag)
-
-  let decrypt_private_amount encrypted_data shared_secret =
-    match String.split_on_char '|' encrypted_data with
-    | "v2" :: b64 :: _ ->
-        (try
-          let raw = Base64.decode_exn b64 in
-          if String.length raw < 12 then Error "Malformed encrypted amount" else
-          let nonce = String.sub raw 0 12 in
-          let ciphertext_with_tag = String.sub raw 12 (String.length raw - 12) in
-          let key = Mirage_crypto.AES.GCM.of_secret shared_secret in
-          match Mirage_crypto.AES.GCM.authenticate_decrypt ~key ~nonce ciphertext_with_tag with
-          | None -> Error "Failed to decrypt amount"
-          | Some plain -> Ok (Z.of_string plain)
-        with e -> Error (Printf.sprintf "Decryption error: %s" (Printexc.to_string e)))
-    | _ -> Error "Invalid encrypted amount format"
+        let pk = Mirage_crypto_ec.Ed25519.pub_of_priv sk in
+        let pub_b64 = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
+        Address.address_from_pubkey pub_b64 = addr
+    with _ -> false
 end
 
 module FheBalance = struct
@@ -279,6 +107,10 @@ module FheBalance = struct
     let blob = Pvac_ffi.serialize_cipher ct in
     prefix ^ Base64.encode_exn (Bytes.to_string blob)
 
+  let encode_cipher_public ct =
+    let blob = Pvac_ffi.serialize_cipher_public ct in
+    prefix ^ Base64.encode_exn (Bytes.to_string blob)
+
   let decode_cipher s =
     if not (is_fhe_cipher s) then Error "not FHE cipher"
     else try
@@ -287,17 +119,17 @@ module FheBalance = struct
       Ok (Pvac_ffi.deserialize_cipher (Bytes.of_string raw))
     with e -> Error (Printexc.to_string e)
 
+  let public_cipher s =
+    if s = "0" || s = "" || not (is_fhe_cipher s) then s
+    else
+      match decode_cipher s with
+      | Ok ct -> encode_cipher_public ct
+      | Error _ -> "0"
+
   let cipher_has_key_bound_material s =
     match decode_cipher s with
     | Error e -> Error e
     | Ok ct -> Ok (Pvac_ffi.cipher_has_key_bound_material ct)
-
-  let bind_legacy_cipher_material pk sk s =
-    match decode_cipher s with
-    | Error e -> Error e
-    | Ok ct ->
-      try Ok (encode_cipher (Pvac_ffi.bind_legacy_cipher_material pk sk ct))
-      with e -> Error (Printexc.to_string e)
 
   let cipher_is_key_bound_extension legacy_s bound_s =
     match decode_cipher legacy_s, decode_cipher bound_s with
@@ -361,23 +193,88 @@ module FheBalance = struct
     try Ok (Pvac_ffi.deserialize_pubkey (Bytes.of_string blob))
     with e -> Error (Printf.sprintf "load_pubkey failed: %s" (Printexc.to_string e))
 
+  let cipher_base_layers cipher_str =
+    if cipher_str = "0" || cipher_str = "" then Ok 0
+    else
+      match decode_cipher cipher_str with
+      | Error e -> Error e
+      | Ok cipher ->
+        (try Ok (Pvac_ffi.cipher_base_layers cipher)
+         with e -> Error (Printexc.to_string e))
+
+  let cipher_is_wrapped_scalar cipher_str =
+    match decode_cipher cipher_str with
+    | Error _ -> false
+    | Ok cipher -> Pvac_ffi.cipher_is_wrapped_scalar cipher
+
+  let private_input_base_limit = 6
+  let refresh_source_base_limit = 8
+
+  let encode_private_result result_policy cipher =
+    match result_policy with
+    | Private_result_policy.Legacy -> Ok (encode_cipher cipher)
+    | Private_result_policy.Recoverable ->
+      try
+        let layers = Pvac_ffi.cipher_base_layers cipher in
+        if layers > private_input_base_limit then
+          Error
+            (Printf.sprintf
+              "encrypted balance result exceeds recoverable limit (%d base layers)"
+              layers)
+        else
+          Ok (encode_cipher cipher)
+      with e ->
+        Error ("encrypted balance result shape failed: " ^ Printexc.to_string e)
+
+  let check_private_input cipher_str =
+    match cipher_base_layers cipher_str with
+    | Error e -> Error e
+    | Ok layers when layers > private_input_base_limit ->
+      Error
+        (Printf.sprintf
+          "encrypted balance compact refresh required (%d base layers)"
+          layers)
+    | Ok _ -> Ok ()
+
+  let check_refresh_source cipher_str =
+    match cipher_base_layers cipher_str with
+    | Error e -> Error e
+    | Ok layers when layers > refresh_source_base_limit ->
+      Error
+        (Printf.sprintf
+          "encrypted balance refresh source exceeds %d base layers"
+          refresh_source_base_limit)
+    | Ok _ -> Ok ()
+
   let pubkey_is_key_bound_extension legacy_blob bound_blob =
     match load_pubkey_result legacy_blob, load_pubkey_result bound_blob with
     | Ok legacy, Ok bound -> Ok (Pvac_ffi.pubkey_is_key_bound_extension legacy bound)
     | Error e, _ | _, Error e -> Error e
 
-  let deposit_with_pubkey pk ~current_cipher ~delta_cipher =
+  let deposit_with_pubkey
+      ?(result_policy = Private_result_policy.Recoverable)
+      pk
+      ~current_cipher
+      ~delta_cipher =
     match current_cipher with
-    | None | Some "0" | Some "" -> Ok (encode_cipher delta_cipher)
+    | None | Some "0" | Some "" ->
+      encode_private_result result_policy delta_cipher
     | Some s when not (is_fhe_cipher s) ->
       Error (Printf.sprintf "legacy cipher format (not hfhe_v1): %s"
                (if String.length s > 20 then String.sub s 0 20 ^ "..." else s))
     | Some s ->
       (match decode_cipher s with
        | Error e -> Error ("decode current: " ^ e)
-       | Ok curr -> Ok (encode_cipher (Pvac_ffi.ct_add pk curr delta_cipher)))
+       | Ok curr ->
+         encode_private_result
+           result_policy
+           (Pvac_ffi.ct_add pk curr delta_cipher))
 
-  let withdraw_with_pubkey pk ~current_cipher ~delta_cipher =
+  let withdraw_with_pubkey
+      ?(result_policy = Private_result_policy.Recoverable)
+      pk
+      ~current_cipher
+      ~delta_cipher =
     match current_cipher with
     | None | Some "0" | Some "" -> Error "no encrypted balance"
     | Some s when not (is_fhe_cipher s) ->
@@ -386,7 +283,10 @@ module FheBalance = struct
     | Some s ->
       (match decode_cipher s with
        | Error e -> Error ("decode current: " ^ e)
-       | Ok curr -> Ok (encode_cipher (Pvac_ffi.ct_sub pk curr delta_cipher)))
+       | Ok curr ->
+         encode_private_result
+           result_policy
+           (Pvac_ffi.ct_sub pk curr delta_cipher))
 
   let verify_commitment pk cipher_str expected_b64 =
     match decode_cipher cipher_str with
@@ -414,8 +314,7 @@ module FheBalance = struct
     | Some actual -> String.equal actual expected_b64
 
   let cipher_valid s =
-    s = "0" || s = "" || is_fhe_cipher s ||
-    EncryptedBalance.cipher_format_valid s
+    s = "0" || s = "" || is_fhe_cipher s
 
   let commit pk cipher_str =
     match decode_cipher cipher_str with
@@ -493,18 +392,24 @@ module FheBalance = struct
     | Ok a, Ok b -> Ok (encode_cipher (Pvac_ffi.ct_sub pk a b))
     | Error e, _ | _, Error e -> Error e
 
-  let verify_claim_amount_v5 pk claim_cipher_str zero_proof_str amount_commitment_b64 =
+  let verify_claim_amount_with verifier pk claim_cipher_str zero_proof_str amount_commitment_b64 =
     match decode_cipher claim_cipher_str, decode_zero_proof zero_proof_str with
     | Ok ct, Ok zp ->
       (try
          let commitment_bytes = Bytes.of_string (Base64.decode_exn amount_commitment_b64) in
          if Bytes.length commitment_bytes <> 32 then
            Error "amount_commitment must be 32 bytes"
-         else if Pvac_ffi.verify_zero_bound pk ct zp commitment_bytes then Ok ()
-         else Error "bound zero proof failed: amount commitment mismatch"
+         else if verifier pk ct zp commitment_bytes then Ok ()
+         else Error "bound zero proof verification failed"
        with e -> Error ("bad amount_commitment: " ^ Printexc.to_string e))
     | Error e, _ -> Error ("bad claim cipher: " ^ e)
     | _, Error e -> Error ("bad zero proof: " ^ e)
+
+  let verify_claim_amount_v5 =
+    verify_claim_amount_with Pvac_ffi.verify_zero_bound
+
+  let verify_key_switch_claim_amount =
+    verify_claim_amount_with Pvac_ffi.verify_zero_bound_key_switch
 
   let verify_encrypt_proof pk cipher_str amount zero_proof_str amount_commitment_b64 blinding_b64 =
     try
@@ -524,7 +429,9 @@ module FheBalance = struct
         else
           match decode_cipher cipher_str, decode_zero_proof zero_proof_str with
           | Ok ct, Ok zp ->
-            if Pvac_ffi.verify_zero_bound pk ct zp actual_commitment then Ok ()
+            if not (Pvac_ffi.cipher_is_wrapped_scalar ct) then
+              Error "amount cipher must be a wrapped scalar"
+            else if Pvac_ffi.verify_zero_bound pk ct zp actual_commitment then Ok ()
             else Error "bound zero proof verification failed"
           | Error e, _ -> Error ("bad cipher: " ^ e)
           | _, Error e -> Error ("bad zero proof: " ^ e)
@@ -650,9 +557,26 @@ module StealthAddress = struct
     Buffer.contents buf
 
   let stealth_tag_of_hex hex =
-    let len = String.length hex / 2 in
-    String.init len (fun i ->
-      Char.chr (int_of_string ("0x" ^ String.sub hex (i * 2) 2)))
+    let value = function
+      | '0' .. '9' as ch -> Some (Char.code ch - Char.code '0')
+      | 'a' .. 'f' as ch -> Some (Char.code ch - Char.code 'a' + 10)
+      | 'A' .. 'F' as ch -> Some (Char.code ch - Char.code 'A' + 10)
+      | _ -> None
+    in
+    let len = String.length hex in
+    if len mod 2 <> 0 then None
+    else
+      let raw = Bytes.create (len / 2) in
+      let rec decode index =
+        if index = len then Some (Bytes.unsafe_to_string raw)
+        else
+          match value hex.[index], value hex.[index + 1] with
+          | Some high, Some low ->
+            Bytes.set raw (index / 2) (Char.chr ((high lsl 4) lor low));
+            decode (index + 2)
+          | _ -> None
+      in
+      decode 0
 
   let encrypt_stealth_amount shared_secret amount =
     let key = Mirage_crypto.AES.GCM.of_secret (String.sub shared_secret 0 32) in
@@ -709,10 +633,15 @@ module StealthAddress = struct
   let verify_claim_secret ~claim_secret_hex ~claimer_addr ~stored_claim_pub_hex =
     if String.length claim_secret_hex <> 64 || String.length stored_claim_pub_hex <> 64 then false
     else
-    let cs_raw = stealth_tag_of_hex claim_secret_hex in
-    let computed = compute_claim_pub cs_raw claimer_addr in
-    let computed_hex = stealth_tag_to_hex computed in
-    String.equal (String.lowercase_ascii computed_hex) (String.lowercase_ascii stored_claim_pub_hex)
+      match stealth_tag_of_hex claim_secret_hex,
+            stealth_tag_of_hex stored_claim_pub_hex with
+      | Some claim_secret, Some _ ->
+        let computed = compute_claim_pub claim_secret claimer_addr in
+        let computed_hex = stealth_tag_to_hex computed in
+        String.equal
+          (String.lowercase_ascii computed_hex)
+          (String.lowercase_ascii stored_claim_pub_hex)
+      | _ -> false
 end
 
 module PrivateTransferV3 = struct
@@ -842,6 +771,7 @@ module PrivateTransferV4 = struct
     claim_pub : string;
     amount_commitment : string;
     send_zero_proof : string;
+
   }
 
   let to_json t =
@@ -952,11 +882,8 @@ module Wallet = struct
         else
           let sk, pk = Mirage_crypto_ec.Ed25519.generate () in
           let priv_s = Base64.encode_exn (Mirage_crypto_ec.Ed25519.priv_to_octets sk) in
-          let pub_s = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
-          let pub_raw = Mirage_crypto_ec.Ed25519.pub_to_octets pk in
-          let hash = Digestif.SHA256.digest_string pub_raw in
-          let base58_hash = Base58.encode (Digestif.SHA256.to_raw_string hash) in
-          let address = "oct" ^ base58_hash in
+          let pub_s  = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
+          let address = Address.address_from_pubkey pub_s in
           if is_octra_address address then begin
             let json = `Assoc [
                 "priv", `String priv_s;

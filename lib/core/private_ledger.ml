@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module FB = Crypto.FheBalance
 module PR = Pvac_registry
@@ -20,6 +8,7 @@ module PT = Crypto.PrivateTransferV4
 module SC = Crypto.StealthClaimV5
 module SA = Crypto.StealthAddress
 module T = Transaction
+module VW = Pvac_verify_worker
 
 type kat =
   | Kat_missing
@@ -42,7 +31,26 @@ type key_switch_plan = {
   new_key_hash : string;
   new_pubkey : string;
   new_cipher : string option;
+  source_cipher : string;
 }
+
+let key_switch_cache_cap = 32
+
+let key_switch_cache : (string, key_switch_plan) Hashtbl.t =
+  Hashtbl.create key_switch_cache_cap
+
+let key_switch_cache_key ledger tx =
+  let open Lwt.Syntax in
+  let* root = Ledger.hash ledger in
+  Lwt.return (T.hash tx ^ ":" ^ root)
+
+let remember_key_switch_plan key plan =
+  if
+    not (Hashtbl.mem key_switch_cache key)
+    && Hashtbl.length key_switch_cache >= key_switch_cache_cap
+  then
+    Hashtbl.reset key_switch_cache;
+  Hashtbl.replace key_switch_cache key plan
 
 type key_switch_apply = {
   old_key_hash : string;
@@ -82,6 +90,13 @@ type claim_plan = {
   claim_cipher : string;
 }
 
+type prepared =
+  | Prepared_encrypt of balance_plan
+  | Prepared_decrypt of balance_plan
+  | Prepared_key_switch of key_switch_plan
+  | Prepared_stealth of stealth_plan
+  | Prepared_claim of claim_plan * balance_plan
+
 let key_bound_stealth_output_marker = "pvac_key_bound_output_v1"
 
 let stealth_output_is_key_bound (so : Ledger_types.stealth_output) =
@@ -107,6 +122,7 @@ type key_switch_payload = {
   aes_kat : string;
   old_bound_pubkey_b64 : string option;
   old_bound_cipher : string option;
+  source_cipher_hash : string option;
   new_cipher : string option;
   old_zero_proof : string option;
   new_zero_proof : string option;
@@ -115,7 +131,17 @@ type key_switch_payload = {
   legacy_ct_migration : bool;
   legacy_public_migration : bool;
   legacy_commitment_migration : bool;
+  legacy_zero_reset : bool;
 }
+
+let key_switch_migration_count payload =
+  [
+    payload.legacy_ct_migration;
+    payload.legacy_public_migration;
+    payload.legacy_commitment_migration;
+    payload.legacy_zero_reset;
+  ]
+  |> List.fold_left (fun count enabled -> if enabled then count + 1 else count) 0
 
 let error ?user_reason tag reason =
   let user_reason = match user_reason with
@@ -123,6 +149,56 @@ let error ?user_reason tag reason =
     | None -> reason
   in
   Error { tag; reason; user_reason }
+
+let digest value =
+  Digestif.SHA256.digest_string value
+  |> Digestif.SHA256.to_hex
+
+let prepared_hash tag fields =
+  String.concat "\000" (tag :: List.map digest fields)
+  |> digest
+
+let hash_prepared = function
+  | Prepared_encrypt plan ->
+    prepared_hash
+      "octra:private_transition:encrypt"
+      [plan.current_cipher; plan.next_cipher]
+  | Prepared_decrypt plan ->
+    prepared_hash
+      "octra:private_transition:decrypt"
+      [plan.current_cipher; plan.next_cipher]
+  | Prepared_key_switch plan ->
+    prepared_hash
+      "octra:private_transition:key_switch"
+      [
+        plan.old_key_hash;
+        plan.new_key_hash;
+        plan.new_pubkey;
+        Option.value ~default:"" plan.new_cipher;
+        plan.source_cipher;
+      ]
+  | Prepared_stealth plan ->
+    prepared_hash
+      "octra:private_transition:stealth"
+      [
+        plan.stealth_current_cipher;
+        plan.stealth_next_cipher;
+        plan.stealth_delta_cipher;
+        plan.stealth_tag;
+        plan.stealth_eph_pub;
+        plan.stealth_enc_amount;
+        plan.stealth_claim_pub;
+        plan.stealth_amount_commitment;
+      ]
+  | Prepared_claim (claim, balance) ->
+    prepared_hash
+      "octra:private_transition:claim"
+      [
+        string_of_int claim.claim_output_id;
+        claim.claim_cipher;
+        balance.current_cipher;
+        balance.next_cipher;
+      ]
 
 let claim_gate claimer (so : Ledger_types.stealth_output) (claim : SC.t) =
   if so.Ledger_types.claimed <> 0 then
@@ -212,11 +288,12 @@ let parse_key_switch raw =
   | Ok json ->
     match field json "new_pubkey", field json "aes_kat" with
     | Ok new_pubkey_b64, Ok aes_kat ->
-      Ok {
+      let payload = {
         new_pubkey_b64;
         aes_kat;
         old_bound_pubkey_b64 = Yojson.Safe.Util.(member "old_bound_pubkey" json |> to_string_option);
         old_bound_cipher = Yojson.Safe.Util.(member "old_bound_cipher" json |> to_string_option);
+        source_cipher_hash = Yojson.Safe.Util.(member "source_cipher_hash" json |> to_string_option);
         new_cipher = Yojson.Safe.Util.(member "new_cipher" json |> to_string_option);
         old_zero_proof = Yojson.Safe.Util.(member "old_zero_proof" json |> to_string_option);
         new_zero_proof = Yojson.Safe.Util.(member "new_zero_proof" json |> to_string_option);
@@ -228,7 +305,13 @@ let parse_key_switch raw =
           Yojson.Safe.Util.(member "legacy_public_migration" json |> to_bool_option) = Some true;
         legacy_commitment_migration =
           Yojson.Safe.Util.(member "legacy_commitment_migration" json |> to_bool_option) = Some true;
-      }
+        legacy_zero_reset =
+          Yojson.Safe.Util.(member "legacy_zero_reset" json |> to_bool_option) = Some true;
+      } in
+      if key_switch_migration_count payload > 1 then
+        error "key_switch_rejected" "key_switch migration modes are mutually exclusive"
+      else
+        Ok payload
     | Error e, _
     | _, Error e ->
       error "key_switch_rejected"
@@ -296,7 +379,7 @@ let current_cipher ledger addr tag =
   | None -> error tag "account not found"
   | Some acc -> Ok (Option.value ~default:"0" acc.Ledger.encrypted_balance)
 
-let load_pk ledger addr tag op =
+let load_pk_blob ledger addr tag op =
   let open Lwt.Syntax in
   let* pk_opt = Ledger.get_pvac_pubkey ledger addr in
   match pk_opt with
@@ -305,54 +388,196 @@ let load_pk ledger addr tag op =
       (error tag
         (op ^ ": no pvac pubkey registered")
         ~user_reason:(op ^ ": bound zero proof failed: no pvac pubkey registered"))
-  | Some blob ->
-    match FB.load_pubkey_result blob with
-    | Error e ->
-      Lwt.return
-        (error tag
-          (op ^ ": " ^ e)
-          ~user_reason:(op ^ ": bound zero proof failed: " ^ e))
-    | Ok pk -> Lwt.return (Ok pk)
+  | Some blob -> Lwt.return (Ok blob)
 
-let load_pk_plain ledger addr missing_tag missing_reason bad_tag =
+let load_pk_blob_plain ledger addr missing_tag missing_reason =
   let open Lwt.Syntax in
   let* pk_opt = Ledger.get_pvac_pubkey ledger addr in
   match pk_opt with
   | None -> Lwt.return (error missing_tag missing_reason)
-  | Some blob ->
-    match FB.load_pubkey_result blob with
-    | Error e -> Lwt.return (error bad_tag e)
-    | Ok pk -> Lwt.return (Ok pk)
+  | Some blob -> Lwt.return (Ok blob)
 
-let encrypt_plan ledger tx =
-  let open Lwt.Syntax in
-  match parse_encrypt tx.T.encrypted_data with
-  | Error e -> Lwt.return (Error e)
-  | Ok payload ->
-    let* pk_result = load_pk ledger tx.T.from "bad_zero_proof" "encrypt" in
-    match pk_result with
-    | Error e -> Lwt.return (Error e)
+let with_loaded_pk blob bad_tag verify =
+  match FB.load_pubkey_result blob with
+  | Error e -> error bad_tag e
+  | Ok pk -> verify pk
+
+let guard_private_input cipher tag op =
+  match FB.check_private_input cipher with
+  | Error e -> error tag e ~user_reason:(op ^ ": " ^ e)
+  | Ok () -> Ok ()
+
+let guard_refresh_source cipher =
+  match FB.check_refresh_source cipher with
+  | Error e -> error "key_switch_rejected" e
+  | Ok () -> Ok ()
+
+let encrypt_balance_plan result_policy blob current (payload : encrypt_payload) =
+  Proof_pool.run (fun () ->
+    match FB.load_pubkey_result blob with
+    | Error e ->
+      error "bad_zero_proof"
+        ("encrypt: " ^ e)
+        ~user_reason:("encrypt: bound zero proof failed: " ^ e)
     | Ok pk ->
-      match FB.verify_encrypt_proof pk payload.cipher tx.T.amount payload.zero_proof payload.amount_commitment payload.blinding with
+      match FB.decode_cipher payload.cipher with
+      | Error e -> error "encrypt_balance_failed" e
+      | Ok delta ->
+        match
+          FB.deposit_with_pubkey
+            ~result_policy
+            pk
+            ~current_cipher:(Some current)
+            ~delta_cipher:delta
+        with
+        | Error e -> error "encrypt_balance_failed" e
+        | Ok next_cipher -> Ok { current_cipher = current; next_cipher })
+
+let verify_encrypt result_policy blob current amount (payload : encrypt_payload) =
+  let open Lwt.Syntax in
+  match guard_private_input current "encrypt_balance_failed" "encrypt" with
+  | Error e -> Lwt.return (Error e)
+  | Ok () ->
+    let* verified =
+      VW.verify_encrypt
+        ~pubkey:blob
+        ~cipher:payload.cipher
+        ~amount
+        ~proof:payload.zero_proof
+        ~commitment:payload.amount_commitment
+        ~blinding:payload.blinding
+    in
+    begin
+      match verified with
       | Error e ->
         Lwt.return
           (error "bad_zero_proof"
             ("encrypt: " ^ e)
             ~user_reason:("encrypt: bound zero proof failed: " ^ e))
       | Ok () ->
-        match current_cipher ledger tx.T.from "encrypt_balance_failed" with
+        encrypt_balance_plan result_policy blob current payload
+    end
+
+let prepare_encrypt_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  match parse_encrypt tx.T.encrypted_data with
+  | Error e -> Lwt.return (Error e)
+  | Ok payload ->
+    let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "encrypt" in
+    match blob_result with
+    | Error e -> Lwt.return (Error e)
+    | Ok blob ->
+      match current_cipher ledger tx.T.from "encrypt_balance_failed" with
+      | Error e -> Lwt.return (Error e)
+      | Ok current ->
+        match guard_private_input current "encrypt_balance_failed" "encrypt" with
         | Error e -> Lwt.return (Error e)
-        | Ok current ->
-          match FB.decode_cipher payload.cipher with
-          | Error e -> Lwt.return (error "encrypt_balance_failed" e)
-          | Ok delta ->
-            match FB.deposit_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-            | Error e -> Lwt.return (error "encrypt_balance_failed" e)
-            | Ok next_cipher -> Lwt.return (Ok { current_cipher = current; next_cipher })
+        | Ok () -> encrypt_balance_plan result_policy blob current payload
+
+let encrypt_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  match parse_encrypt tx.T.encrypted_data with
+  | Error e -> Lwt.return (Error e)
+  | Ok payload ->
+    let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "encrypt" in
+    match blob_result with
+    | Error e -> Lwt.return (Error e)
+    | Ok blob ->
+      match current_cipher ledger tx.T.from "encrypt_balance_failed" with
+      | Error e -> Lwt.return (Error e)
+      | Ok current ->
+        verify_encrypt result_policy blob current tx.T.amount payload
 
 let max_decrypt_amount = Z.of_string "1000000000000"
 
-let decrypt_plan ledger tx =
+let decrypt_balance_plan result_policy blob current (payload : decrypt_payload) =
+  Proof_pool.run (fun () ->
+    match FB.load_pubkey_result blob with
+    | Error e ->
+      error "bad_zero_proof"
+        ("decrypt: " ^ e)
+        ~user_reason:("decrypt: bound zero proof failed: " ^ e)
+    | Ok pk ->
+      match FB.decode_cipher payload.cipher with
+      | Error e ->
+        error "decrypt_cipher_failed" ("cannot decode delta cipher: " ^ e)
+      | Ok delta ->
+        match
+          FB.withdraw_with_pubkey
+            ~result_policy
+            pk
+            ~current_cipher:(Some current)
+            ~delta_cipher:delta
+        with
+        | Error e ->
+          error "decrypt_cipher_failed" ("encrypted balance subtract failed: " ^ e)
+        | Ok next_cipher ->
+          Ok { current_cipher = current; next_cipher })
+
+let verify_decrypt result_policy blob current amount (payload : decrypt_payload) =
+  let open Lwt.Syntax in
+  match guard_private_input current "decrypt_cipher_failed" "decrypt" with
+  | Error e -> Lwt.return (Error e)
+  | Ok () ->
+    begin
+      match payload.range_proof_balance with
+      | None ->
+        Lwt.return
+          (error "bad_range_proof_balance"
+            "decrypt: range_proof_balance required: proves remaining encrypted balance >= 0"
+            ~user_reason:"decrypt: range_proof_balance required: proves remaining encrypted balance >= 0")
+      | Some range_proof ->
+        let* verified =
+          VW.verify_encrypt
+            ~pubkey:blob
+            ~cipher:payload.cipher
+            ~amount
+            ~proof:payload.zero_proof
+            ~commitment:payload.amount_commitment
+            ~blinding:payload.blinding
+        in
+        begin
+          match verified with
+          | Error e ->
+            Lwt.return
+              (error "bad_zero_proof"
+                ("decrypt: " ^ e)
+                ~user_reason:("decrypt: bound zero proof failed: " ^ e))
+          | Ok () ->
+            let* plan = decrypt_balance_plan result_policy blob current payload in
+            begin
+              match plan with
+              | Error _ as e -> Lwt.return e
+              | Ok plan ->
+                let* range =
+                  VW.verify_range
+                    ~pubkey:blob
+                    ~cipher:plan.next_cipher
+                    ~proof:range_proof
+                in
+                begin
+                  match range with
+                  | Ok () -> Lwt.return (Ok plan)
+                  | Error _ ->
+                    Lwt.return
+                      (error "bad_range_proof_balance"
+                        "decrypt: range_proof_balance verification failed: remaining balance may be negative"
+                        ~user_reason:"decrypt: range_proof_balance verification failed: remaining balance may be negative")
+                end
+            end
+        end
+    end
+
+let prepare_decrypt_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
   let open Lwt.Syntax in
   if Z.gt tx.T.amount max_decrypt_amount then
     Lwt.return
@@ -364,74 +589,92 @@ let decrypt_plan ledger tx =
     match parse_decrypt tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok payload ->
-      let* pk_result = load_pk ledger tx.T.from "bad_zero_proof" "decrypt" in
-      match pk_result with
+      let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "decrypt" in
+      match blob_result with
       | Error e -> Lwt.return (Error e)
-      | Ok pk ->
-        match FB.verify_encrypt_proof pk payload.cipher tx.T.amount payload.zero_proof payload.amount_commitment payload.blinding with
-        | Error e ->
-          Lwt.return
-            (error "bad_zero_proof"
-              ("decrypt: " ^ e)
-              ~user_reason:("decrypt: bound zero proof failed: " ^ e))
-        | Ok () ->
-          match current_cipher ledger tx.T.from "decrypt_cipher_failed" with
+      | Ok blob ->
+        match current_cipher ledger tx.T.from "decrypt_cipher_failed" with
+        | Error e -> Lwt.return (Error e)
+        | Ok current ->
+          match guard_private_input current "decrypt_cipher_failed" "decrypt" with
           | Error e -> Lwt.return (Error e)
-          | Ok current ->
-            match FB.decode_cipher payload.cipher with
-            | Error e ->
-              Lwt.return
-                (error "decrypt_cipher_failed" ("cannot decode delta cipher: " ^ e))
-            | Ok delta ->
-              match FB.withdraw_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-              | Error e ->
-                Lwt.return
-                  (error "decrypt_cipher_failed" ("encrypted balance subtract failed: " ^ e))
-              | Ok next_cipher ->
-                match payload.range_proof_balance with
-                | None ->
-                  Lwt.return
-                    (error "bad_range_proof_balance"
-                      "decrypt: range_proof_balance required: proves remaining encrypted balance >= 0"
-                      ~user_reason:"decrypt: range_proof_balance required: proves remaining encrypted balance >= 0")
-                | Some proof ->
-                  if FB.verify_range pk next_cipher proof then
-                    Lwt.return (Ok { current_cipher = current; next_cipher })
-                  else
-                    Lwt.return
-                      (error "bad_range_proof_balance"
-                        "decrypt: range_proof_balance verification failed: remaining balance may be negative"
-                        ~user_reason:"decrypt: range_proof_balance verification failed: remaining balance may be negative")
+          | Ok () -> decrypt_balance_plan result_policy blob current payload
 
-let apply_encrypt ledger tx =
+let decrypt_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
   let open Lwt.Syntax in
-  let* plan = encrypt_plan ledger tx in
-  match plan with
-  | Error e -> Lwt.return (Error e)
-  | Ok plan ->
-    let total_cost = Z.add tx.T.amount tx.T.ou in
-    match Ledger.debit ledger tx.T.from total_cost tx.T.nonce with
-    | Error err -> Lwt.return (error "insufficient_balance" err)
-    | Ok () ->
-      (match Ledger.update_enc_balance ledger tx.T.from plan.next_cipher with
-      | Ok () -> Lwt.return (Ok plan)
-      | Error e -> failwith (Printf.sprintf "encrypt update_enc_balance: %s" e))
+  if Z.gt tx.T.amount max_decrypt_amount then
+    Lwt.return
+      (error "amount_too_large" "decrypt amount exceeds 1000000 OCT limit")
+  else if Z.leq tx.T.amount Z.zero then
+    Lwt.return
+      (error "invalid_amount" "decrypt amount must be positive")
+  else
+    match parse_decrypt tx.T.encrypted_data with
+    | Error e -> Lwt.return (Error e)
+    | Ok payload ->
+      let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "decrypt" in
+      match blob_result with
+      | Error e -> Lwt.return (Error e)
+      | Ok blob ->
+        match current_cipher ledger tx.T.from "decrypt_cipher_failed" with
+        | Error e -> Lwt.return (Error e)
+        | Ok current ->
+          verify_decrypt result_policy blob current tx.T.amount payload
 
-let apply_decrypt ledger tx =
-  let open Lwt.Syntax in
-  let* plan = decrypt_plan ledger tx in
-  match plan with
-  | Error e -> Lwt.return (Error e)
-  | Ok plan ->
-    match Ledger.debit ledger tx.T.from tx.T.ou tx.T.nonce with
-    | Error err -> Lwt.return (error "insufficient_balance" err)
+let current_plan ledger addr tag plan =
+  match current_cipher ledger addr tag with
+  | Error e -> Error e
+  | Ok current when String.equal current plan.current_cipher -> Ok ()
+  | Ok _ -> error tag "encrypted balance changed during proof verification"
+
+let apply_encrypt_plan ledger tx plan =
+  match current_plan ledger tx.T.from "encrypt_balance_failed" plan with
+    | Error e -> Lwt.return (Error e)
     | Ok () ->
-      match Ledger.credit ledger tx.T.from tx.T.amount with
-      | Error err -> Lwt.return (error "supply_violation" err)
+      let total_cost = Z.add tx.T.amount tx.T.ou in
+      match Ledger.debit ledger tx.T.from total_cost tx.T.nonce with
+      | Error err -> Lwt.return (error "insufficient_balance" err)
       | Ok () ->
         (match Ledger.update_enc_balance ledger tx.T.from plan.next_cipher with
         | Ok () -> Lwt.return (Ok plan)
-        | Error e -> failwith (Printf.sprintf "decrypt update_enc_balance: %s" e))
+        | Error e -> failwith (Printf.sprintf "encrypt update_enc_balance: %s" e))
+
+let apply_encrypt
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  let* plan = encrypt_plan ~result_policy ledger tx in
+  match plan with
+  | Error e -> Lwt.return (Error e)
+  | Ok plan -> apply_encrypt_plan ledger tx plan
+
+let apply_decrypt_plan ledger tx plan =
+  match current_plan ledger tx.T.from "decrypt_cipher_failed" plan with
+    | Error e -> Lwt.return (Error e)
+    | Ok () ->
+      match Ledger.debit ledger tx.T.from tx.T.ou tx.T.nonce with
+      | Error err -> Lwt.return (error "insufficient_balance" err)
+      | Ok () ->
+        match Ledger.credit ledger tx.T.from tx.T.amount with
+        | Error err -> Lwt.return (error "supply_violation" err)
+        | Ok () ->
+          (match Ledger.update_enc_balance ledger tx.T.from plan.next_cipher with
+          | Ok () -> Lwt.return (Ok plan)
+          | Error e -> failwith (Printf.sprintf "decrypt update_enc_balance: %s" e))
+
+let apply_decrypt
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  let* plan = decrypt_plan ~result_policy ledger tx in
+  match plan with
+  | Error e -> Lwt.return (Error e)
+  | Ok plan -> apply_decrypt_plan ledger tx plan
 
 let legacy_public_replay_amount = function
   | Some replay when replay.Pvac_legacy_public_replay.can_public_migrate ->
@@ -450,27 +693,200 @@ let legacy_audit_commitment = function
     | _, None -> Error "legacy commitment migration requires reconstructable commitment history")
   | None -> Error "legacy commitment migration requires node history audit"
 
-let verify_legacy_public_migration new_loaded amount payload =
+let verify_legacy_public_migration new_pubkey amount payload =
   match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
   | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
-    (match PM.classify_cipher new_cipher with
+    begin
+      match PM.classify_cipher new_cipher with
     | PM.V3 ->
-      FB.verify_encrypt_proof new_loaded new_cipher amount new_zero_proof amount_commitment amount_blinding
-    | _ -> Error "new encrypted balance must be v3 key-bound")
+      VW.verify_encrypt
+        ~pubkey:new_pubkey
+        ~cipher:new_cipher
+        ~amount
+        ~proof:new_zero_proof
+        ~commitment:amount_commitment
+        ~blinding:amount_blinding
+    | _ ->
+      Lwt.return_error "new encrypted balance must be v3 key-bound"
+    end
   | _ ->
-    Error "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
+    Lwt.return_error
+      "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
 
-let verify_legacy_commitment_migration new_loaded commitment payload =
+let verify_legacy_commitment_migration new_pubkey commitment payload =
   match payload.new_cipher, payload.new_zero_proof with
   | Some new_cipher, Some new_zero_proof ->
-    (match PM.classify_cipher new_cipher with
-    | PM.V3 ->
-      FB.verify_claim_amount_v5 new_loaded new_cipher new_zero_proof commitment
-    | _ -> Error "legacy commitment migration requires a v3 key-bound new cipher")
+    if not (FB.cipher_is_wrapped_scalar new_cipher) then
+      Lwt.return_error
+        "legacy commitment migration requires a wrapped scalar new cipher"
+    else
+      begin
+        match PM.classify_cipher new_cipher with
+      | PM.V3 ->
+        VW.verify_claim
+          ~pubkey:new_pubkey
+          ~cipher:new_cipher
+          ~proof:new_zero_proof
+          ~commitment
+      | _ ->
+        Lwt.return_error
+          "legacy commitment migration requires a v3 key-bound new cipher"
+      end
   | _ ->
-    Error "legacy commitment migration requires new_cipher and new_zero_proof"
+    Lwt.return_error
+      "legacy commitment migration requires new_cipher and new_zero_proof"
 
-let key_switch_plan ?legacy_public_replay ledger tx =
+let verify_legacy_zero_reset new_pubkey payload =
+  match payload.old_bound_pubkey_b64, payload.old_bound_cipher, payload.old_zero_proof with
+  | Some _, _, _
+  | _, Some _, _
+  | _, _, Some _ ->
+    Lwt.return_error
+      "legacy zero reset must not include old ciphertext binding fields"
+  | None, None, None ->
+    match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
+    | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
+      begin
+        match PM.classify_cipher new_cipher with
+      | PM.V3 ->
+        VW.verify_encrypt
+          ~pubkey:new_pubkey
+          ~cipher:new_cipher
+          ~amount:Z.zero
+          ~proof:new_zero_proof
+          ~commitment:amount_commitment
+          ~blinding:amount_blinding
+      | _ ->
+        Lwt.return_error
+          "legacy zero reset requires a v3 key-bound new cipher"
+      end
+    | _ ->
+      Lwt.return_error
+        "legacy zero reset requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
+
+let key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey ~new_cipher
+    ~source_cipher =
+  Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher; source_cipher }
+
+let verify_new_key new_pubkey label verify =
+  let open Lwt.Syntax in
+  let* result = verify new_pubkey in
+  match result with
+  | Error e ->
+    Lwt.return (error "key_switch_rejected" (label ^ e))
+  | Ok () ->
+    Lwt.return_ok ()
+
+let prepared_legacy_zero_reset payload =
+  match
+    payload.old_bound_pubkey_b64,
+    payload.old_bound_cipher,
+    payload.old_zero_proof
+  with
+  | Some _, _, _
+  | _, Some _, _
+  | _, _, Some _ ->
+    error
+      "key_switch_rejected"
+      "legacy zero reset must not include old ciphertext binding fields"
+  | None, None, None ->
+    match
+      payload.new_cipher,
+      payload.new_zero_proof,
+      payload.amount_commitment,
+      payload.amount_blinding
+    with
+    | Some new_cipher, Some _, Some _, Some _ ->
+      begin
+        match PM.classify_cipher new_cipher with
+        | PM.V3 -> Ok new_cipher
+        | _ ->
+          error
+            "key_switch_rejected"
+            "legacy zero reset requires a v3 key-bound new cipher"
+      end
+    | _ ->
+      error
+        "key_switch_rejected"
+        "legacy zero reset requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
+
+let prepared_legacy_commitment payload =
+  match payload.new_cipher, payload.new_zero_proof with
+  | Some new_cipher, Some _ when FB.cipher_is_wrapped_scalar new_cipher ->
+    begin
+      match PM.classify_cipher new_cipher with
+      | PM.V3 -> Ok new_cipher
+      | _ ->
+        error
+          "key_switch_rejected"
+          "legacy commitment migration requires a v3 key-bound new cipher"
+    end
+  | Some _, Some _ ->
+    error
+      "key_switch_rejected"
+      "legacy commitment migration requires a wrapped scalar new cipher"
+  | _ ->
+    error
+      "key_switch_rejected"
+      "legacy commitment migration requires new_cipher and new_zero_proof"
+
+let prepared_legacy_public payload =
+  match
+    payload.new_cipher,
+    payload.new_zero_proof,
+    payload.amount_commitment,
+    payload.amount_blinding
+  with
+  | Some new_cipher, Some _, Some _, Some _ ->
+    begin
+      match PM.classify_cipher new_cipher with
+      | PM.V3 -> Ok new_cipher
+      | _ ->
+        error
+          "key_switch_rejected"
+          "new encrypted balance must be v3 key-bound"
+    end
+  | _ ->
+    error
+      "key_switch_rejected"
+      "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
+
+let prepared_bound_migration old_pk current_cipher payload =
+  match payload.source_cipher_hash with
+  | None ->
+    error
+      "key_switch_rejected"
+      "encrypted balance migration requires source_cipher_hash"
+  | Some source when not (String.equal source (digest current_cipher)) ->
+    error
+      "key_switch_rejected"
+      "encrypted balance changed before key switch verification"
+  | Some _ ->
+    begin
+      match guard_refresh_source current_cipher with
+      | Error _ as result -> result
+      | Ok () ->
+        match
+          old_pk,
+          payload.new_cipher,
+          payload.old_zero_proof,
+          payload.new_zero_proof,
+          payload.amount_commitment
+        with
+        | Some _, Some new_cipher, Some _, Some _, Some _
+            when FB.cipher_is_wrapped_scalar new_cipher ->
+          Ok new_cipher
+        | Some _, Some _, Some _, Some _, Some _ ->
+          error
+            "key_switch_rejected"
+            "new encrypted balance must be a wrapped scalar"
+        | _ ->
+          error
+            "key_switch_rejected"
+            "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"
+    end
+
+let verify_key_switch_plan ?legacy_public_replay ledger tx =
   let open Lwt.Syntax in
   match parse_key_switch tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
@@ -478,15 +894,16 @@ let key_switch_plan ?legacy_public_replay ledger tx =
     if payload.aes_kat <> PR.expected_kat () then
       Lwt.return
         (error "key_switch_rejected" "AES KAT mismatch - incompatible key")
-    else
-      match PR.decode_b64 payload.new_pubkey_b64 with
-      | Error e ->
-        Lwt.return (error "key_switch_rejected" e)
-      | Ok new_raw ->
-        match PR.canonicalize_blob new_raw with
-        | Error e ->
-          Lwt.return (error "key_switch_rejected" e)
-        | Ok new_pubkey ->
+    else begin
+      let* new_pubkey_result =
+        Proof_pool.run (fun () ->
+          match PR.decode_b64 payload.new_pubkey_b64 with
+          | Error e -> Error e
+          | Ok raw -> PR.canonicalize_blob raw)
+      in
+      match new_pubkey_result with
+      | Error e -> Lwt.return (error "key_switch_rejected" e)
+      | Ok new_pubkey ->
           let* old_pk = Ledger.get_pvac_pubkey ledger tx.T.from in
           let old_key_hash = match old_pk with
             | Some blob -> PR.key_hash blob
@@ -497,23 +914,49 @@ let key_switch_plan ?legacy_public_replay ledger tx =
           match current with
           | Error e -> Lwt.return (Error e)
           | Ok current_cipher ->
-            let migration_status = PM.status_of_cipher current_cipher in
-            if migration_status.can_key_switch then
-              Lwt.return (Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher = None })
+            let* migration_status =
+              Proof_pool.run (fun () -> PM.status_of_cipher current_cipher)
+            in
+            if payload.legacy_zero_reset && not migration_status.needs_legacy_public_replay then
+              Lwt.return (error "key_switch_rejected" "legacy zero reset requires a legacy hfhe balance")
+            else if migration_status.can_key_switch then
+              Lwt.return
+                (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                  ~new_cipher:None ~source_cipher:current_cipher)
             else if migration_status.needs_legacy_public_replay then
-              if payload.legacy_commitment_migration then
+              if payload.legacy_zero_reset then
+                  let* checked =
+                    verify_new_key new_pubkey "legacy zero reset failed: "
+                    (fun pubkey -> verify_legacy_zero_reset pubkey payload)
+                in
+                (match checked, payload.new_cipher with
+                | Error e, _ -> Lwt.return (Error e)
+                | Ok (), Some new_cipher ->
+                  Lwt.return
+                    (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                      ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
+                | Ok (), None ->
+                  Lwt.return (error "key_switch_rejected" "legacy zero reset lost new cipher"))
+              else if payload.legacy_commitment_migration then
                 (match legacy_audit_commitment legacy_public_replay with
                 | Error e -> Lwt.return (error "key_switch_rejected" e)
                 | Ok commitment ->
-                  (match FB.load_pubkey_result new_pubkey with
-                  | Error e -> Lwt.return (error "key_switch_rejected" ("new pubkey decode failed: " ^ e))
-                  | Ok new_loaded ->
-                    match verify_legacy_commitment_migration new_loaded commitment payload with
-                    | Error e -> Lwt.return (error "key_switch_rejected" ("legacy commitment migration failed: " ^ e))
-                    | Ok () ->
-                      (match payload.new_cipher with
-                      | Some new_cipher -> Lwt.return (Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher = Some new_cipher })
-                      | None -> Lwt.return (error "key_switch_rejected" "legacy commitment migration lost new cipher"))))
+                  let* checked =
+                    verify_new_key new_pubkey "legacy commitment migration failed: "
+                      (fun pubkey ->
+                        verify_legacy_commitment_migration
+                          pubkey
+                          commitment
+                          payload)
+                  in
+                  (match checked, payload.new_cipher with
+                  | Error e, _ -> Lwt.return (Error e)
+                  | Ok (), Some new_cipher ->
+                    Lwt.return
+                      (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                        ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
+                  | Ok (), None ->
+                    Lwt.return (error "key_switch_rejected" "legacy commitment migration lost new cipher")))
               else if payload.legacy_ct_migration then
                 Lwt.return
                   (error "key_switch_rejected"
@@ -522,128 +965,351 @@ let key_switch_plan ?legacy_public_replay ledger tx =
                 match legacy_public_replay_amount legacy_public_replay with
                 | Error e -> Lwt.return (error "key_switch_rejected" e)
                 | Ok amount ->
-                  (match FB.load_pubkey_result new_pubkey with
-                  | Error e -> Lwt.return (error "key_switch_rejected" ("new pubkey decode failed: " ^ e))
-                  | Ok new_loaded ->
-                    match verify_legacy_public_migration new_loaded amount payload with
-                    | Error e -> Lwt.return (error "key_switch_rejected" ("legacy public migration failed: " ^ e))
-                    | Ok () ->
-                      (match payload.new_cipher with
-                      | Some new_cipher -> Lwt.return (Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher = Some new_cipher })
-                      | None -> Lwt.return (error "key_switch_rejected" "legacy public migration lost new cipher")))
+                  let* checked =
+                    verify_new_key new_pubkey "legacy public migration failed: "
+                      (fun pubkey ->
+                        verify_legacy_public_migration pubkey amount payload)
+                  in
+                  (match checked, payload.new_cipher with
+                  | Error e, _ -> Lwt.return (Error e)
+                  | Ok (), Some new_cipher ->
+                    Lwt.return
+                      (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                        ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
+                  | Ok (), None ->
+                    Lwt.return (error "key_switch_rejected" "legacy public migration lost new cipher"))
               else
                 Lwt.return (error "key_switch_rejected" migration_status.reason)
             else if not migration_status.can_v3_migrate then
               Lwt.return (error "key_switch_rejected" migration_status.reason)
             else
-              match old_pk, payload.new_cipher, payload.old_zero_proof, payload.new_zero_proof, payload.amount_commitment with
-              | Some old_blob, Some new_cipher, Some old_zero_proof, Some new_zero_proof, Some amount_commitment ->
-                (match FB.load_pubkey_result old_blob, FB.load_pubkey_result new_pubkey with
-                | Ok old_loaded, Ok new_loaded ->
-                  (match FB.verify_claim_amount_v5 old_loaded current_cipher old_zero_proof amount_commitment with
-                  | Error e -> Lwt.return (error "key_switch_rejected" ("old encrypted balance proof failed: " ^ e))
-                  | Ok () ->
-                    (match FB.verify_claim_amount_v5 new_loaded new_cipher new_zero_proof amount_commitment with
-                    | Error e -> Lwt.return (error "key_switch_rejected" ("new encrypted balance proof failed: " ^ e))
-                    | Ok () -> Lwt.return (Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher = Some new_cipher })))
-                | Error e, _ -> Lwt.return (error "key_switch_rejected" ("old pubkey decode failed: " ^ e))
-                | _, Error e -> Lwt.return (error "key_switch_rejected" ("new pubkey decode failed: " ^ e)))
-              | _ ->
+              (match payload.source_cipher_hash with
+              | None ->
                 Lwt.return
                   (error "key_switch_rejected"
-                    "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment")
+                    "encrypted balance migration requires source_cipher_hash")
+              | Some source when
+                  not (String.equal source
+                    Digestif.SHA256.(digest_string current_cipher |> to_hex)) ->
+                Lwt.return
+                  (error "key_switch_rejected"
+                    "encrypted balance changed before key switch verification")
+              | Some _ ->
+                match guard_refresh_source current_cipher with
+                | Error e -> Lwt.return (Error e)
+                | Ok () ->
+                match old_pk, payload.new_cipher, payload.old_zero_proof, payload.new_zero_proof, payload.amount_commitment with
+                | Some old_blob, Some new_cipher, Some old_zero_proof, Some new_zero_proof, Some amount_commitment ->
+                  if not (FB.cipher_is_wrapped_scalar new_cipher) then
+                    Lwt.return
+                      (error "key_switch_rejected"
+                        "new encrypted balance must be a wrapped scalar")
+                  else
+                    let* old_checked =
+                      VW.verify_key_switch_claim
+                        ~pubkey:old_blob
+                        ~cipher:current_cipher
+                        ~proof:old_zero_proof
+                        ~commitment:amount_commitment
+                    in
+                    let* checked =
+                      match old_checked with
+                      | Error e ->
+                        Lwt.return
+                          (error "key_switch_rejected"
+                            ("old encrypted balance proof failed: " ^ e))
+                      | Ok () ->
+                        let* new_checked =
+                          VW.verify_claim
+                            ~pubkey:new_pubkey
+                            ~cipher:new_cipher
+                            ~proof:new_zero_proof
+                            ~commitment:amount_commitment
+                        in
+                        begin
+                          match new_checked with
+                          | Error e ->
+                            Lwt.return
+                              (error "key_switch_rejected"
+                                ("new encrypted balance proof failed: " ^ e))
+                          | Ok () ->
+                            Lwt.return_ok ()
+                        end
+                    in
+                    (match checked with
+                    | Error e -> Lwt.return (Error e)
+                    | Ok () ->
+                      Lwt.return
+                        (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                          ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher))
+                | _ ->
+                  Lwt.return
+                    (error "key_switch_rejected"
+                      "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"))
+    end
+
+let prepare_key_switch_plan ledger tx =
+  let open Lwt.Syntax in
+  match parse_key_switch tx.T.encrypted_data with
+  | Error e -> Lwt.return (Error e)
+  | Ok payload when payload.aes_kat <> PR.expected_kat () ->
+    Lwt.return
+      (error "key_switch_rejected" "AES KAT mismatch - incompatible key")
+  | Ok payload ->
+    let* new_pubkey_result =
+      Proof_pool.run (fun () ->
+        match PR.decode_b64 payload.new_pubkey_b64 with
+        | Error e -> Error e
+        | Ok raw -> PR.canonicalize_blob raw)
+    in
+    begin
+      match new_pubkey_result with
+      | Error e -> Lwt.return (error "key_switch_rejected" e)
+      | Ok new_pubkey ->
+        let* old_pk = Ledger.get_pvac_pubkey ledger tx.T.from in
+        let old_key_hash =
+          match old_pk with
+          | Some blob -> PR.key_hash blob
+          | None -> "none"
+        in
+        let new_key_hash = PR.key_hash new_pubkey in
+        match current_cipher ledger tx.T.from "key_switch_rejected" with
+        | Error e -> Lwt.return (Error e)
+        | Ok current_cipher ->
+          let* status =
+            Proof_pool.run (fun () -> PM.status_of_cipher current_cipher)
+          in
+          let prepared =
+            if payload.legacy_zero_reset
+              && not status.needs_legacy_public_replay
+            then
+              error
+                "key_switch_rejected"
+                "legacy zero reset requires a legacy hfhe balance"
+            else if status.can_key_switch then
+              Ok None
+            else if status.needs_legacy_public_replay then
+              if payload.legacy_zero_reset then
+                Result.map Option.some (prepared_legacy_zero_reset payload)
+              else if payload.legacy_commitment_migration then
+                Result.map Option.some (prepared_legacy_commitment payload)
+              else if payload.legacy_ct_migration then
+                error
+                  "key_switch_rejected"
+                  "legacy ciphertext rebinding is not statement preserving; use public or commitment history migration"
+              else if payload.legacy_public_migration then
+                Result.map Option.some (prepared_legacy_public payload)
+              else
+                error "key_switch_rejected" status.reason
+            else if not status.can_v3_migrate then
+              error "key_switch_rejected" status.reason
+            else
+              Result.map Option.some
+                (prepared_bound_migration old_pk current_cipher payload)
+          in
+          Lwt.return
+            (Result.map
+               (fun new_cipher ->
+                 {
+                   old_key_hash;
+                   new_key_hash;
+                   new_pubkey;
+                   new_cipher;
+                   source_cipher = current_cipher;
+                 })
+               prepared)
+    end
+
+let key_switch_plan ?legacy_public_replay ledger tx =
+  let open Lwt.Syntax in
+  let* result = verify_key_switch_plan ?legacy_public_replay ledger tx in
+  match result with
+  | Error _ -> Lwt.return result
+  | Ok _ when key_switch_requests_legacy_audit tx -> Lwt.return result
+  | Ok plan ->
+    let* key = key_switch_cache_key ledger tx in
+    remember_key_switch_plan key plan;
+    Lwt.return result
+
+let key_switch_plan_for_apply ?legacy_public_replay ledger tx =
+  let open Lwt.Syntax in
+  if key_switch_requests_legacy_audit tx then
+    key_switch_plan ?legacy_public_replay ledger tx
+  else
+    let* key = key_switch_cache_key ledger tx in
+    match Hashtbl.find_opt key_switch_cache key with
+    | Some plan -> Lwt.return_ok plan
+    | None -> key_switch_plan ?legacy_public_replay ledger tx
+
+let apply_key_switch_plan ledger tx plan =
+  let open Lwt.Syntax in
+  match current_cipher ledger tx.T.from "key_switch_rejected" with
+    | Error failure ->
+      Lwt.return (Key_switch_rejected { failure; consume_nonce = false })
+    | Ok current when not (String.equal current plan.source_cipher) ->
+      let failure = {
+        tag = "key_switch_rejected";
+        reason = "encrypted balance changed during key switch verification";
+        user_reason = "encrypted balance changed during key switch verification";
+      } in
+      Lwt.return (Key_switch_rejected { failure; consume_nonce = false })
+    | Ok _ ->
+      match Ledger.debit ledger tx.T.from tx.T.ou tx.T.nonce with
+      | Error reason ->
+        let failure = { tag = "key_switch_failed"; reason; user_reason = reason } in
+        Lwt.return (Key_switch_rejected { failure; consume_nonce = false })
+      | Ok () ->
+        let* () = Ledger.delete_pvac_pubkey ledger tx.T.from in
+        let* () = Ledger.set_pvac_pubkey ledger tx.T.from plan.new_pubkey in
+        let migrated_cipher = match plan.new_cipher with
+          | None -> false
+          | Some cipher ->
+            (match Ledger.update_enc_balance ledger tx.T.from cipher with
+            | Ok () -> true
+            | Error e -> failwith (Printf.sprintf "key_switch update_enc_balance: %s" e))
+        in
+        Ledger.set_pvac_kat ledger tx.T.from (PR.expected_kat ());
+        Lwt.return
+          (Key_switch_applied {
+            old_key_hash = plan.old_key_hash;
+            new_key_hash = plan.new_key_hash;
+            migrated_cipher;
+          })
 
 let apply_key_switch ?legacy_public_replay ledger tx =
   let open Lwt.Syntax in
-  let* plan = key_switch_plan ?legacy_public_replay ledger tx in
+  let* plan = key_switch_plan_for_apply ?legacy_public_replay ledger tx in
   match plan with
   | Error failure ->
     Lwt.return (Key_switch_rejected { failure; consume_nonce = false })
-  | Ok plan ->
-    match Ledger.debit ledger tx.T.from tx.T.ou tx.T.nonce with
-    | Error reason ->
-      let failure = { tag = "key_switch_failed"; reason; user_reason = reason } in
-      Lwt.return (Key_switch_rejected { failure; consume_nonce = false })
-    | Ok () ->
-      let* () = Ledger.delete_pvac_pubkey ledger tx.T.from in
-      let* () = Ledger.set_pvac_pubkey ledger tx.T.from plan.new_pubkey in
-      let migrated_cipher = match plan.new_cipher with
-        | None -> false
-        | Some cipher ->
-          (match Ledger.update_enc_balance ledger tx.T.from cipher with
-          | Ok () -> true
-          | Error e -> failwith (Printf.sprintf "key_switch update_enc_balance: %s" e))
-      in
-      Ledger.set_pvac_kat ledger tx.T.from (PR.expected_kat ());
-      Lwt.return
-        (Key_switch_applied {
-          old_key_hash = plan.old_key_hash;
-          new_key_hash = plan.new_key_hash;
-          migrated_cipher;
-        })
+  | Ok plan -> apply_key_switch_plan ledger tx plan
 
-let stealth_plan ledger tx =
+let prepare_stealth_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
   let open Lwt.Syntax in
   match parse_stealth tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok ptd ->
-    let* pk_result =
-      load_pk_plain ledger tx.T.from
+    let* blob_result =
+      load_pk_blob_plain ledger tx.T.from
         "no_pvac_pubkey"
         "sender has no registered PVAC pubkey"
-        "bad_pvac_pubkey"
     in
-    match pk_result with
+    match blob_result with
     | Error e -> Lwt.return (Error e)
-    | Ok pk ->
-      if not (FB.verify_commitment pk ptd.PT.delta_cipher ptd.PT.commitment) then
-        Lwt.return (error "bad_commitment" "delta cipher commitment verification failed")
-      else
-        match current_cipher ledger tx.T.from "encrypted_balance_update_failed" with
+    | Ok blob ->
+      match current_cipher ledger tx.T.from "encrypted_balance_update_failed" with
+      | Error e -> Lwt.return (Error e)
+      | Ok _ when not (FB.cipher_is_wrapped_scalar ptd.PT.delta_cipher) ->
+        Lwt.return
+          (error "bad_delta_cipher"
+            "stealth delta cipher must be a wrapped scalar")
+      | Ok current ->
+        match guard_private_input current "encrypted_balance_update_failed" "stealth" with
         | Error e -> Lwt.return (Error e)
-        | Ok current ->
-          match FB.decode_cipher ptd.PT.delta_cipher with
-          | Error e ->
-            Lwt.return
-              (error "bad_delta_cipher" ("cannot decode delta cipher: " ^ e))
-          | Ok delta ->
-            match FB.withdraw_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-            | Error e ->
-              Lwt.return
-                (error "encrypted_balance_update_failed" ("sender encrypted balance update: " ^ e))
-            | Ok next_cipher ->
-              Lwt.return
-                (Ok {
-                  stealth_current_cipher = current;
-                  stealth_next_cipher = next_cipher;
-                  stealth_delta_cipher = ptd.PT.delta_cipher;
-                  stealth_range_proof_delta = ptd.PT.range_proof_delta;
-                  stealth_range_proof_balance = ptd.PT.range_proof_balance;
-                  stealth_tag = ptd.PT.stealth_tag;
-                  stealth_eph_pub = ptd.PT.eph_pub;
-                  stealth_enc_amount = ptd.PT.enc_amount;
-                  stealth_claim_pub = ptd.PT.claim_pub;
-                  stealth_amount_commitment = ptd.PT.amount_commitment;
-                })
+        | Ok () ->
+          Proof_pool.run (fun () ->
+            with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
+              match FB.decode_cipher ptd.PT.delta_cipher with
+              | Error e ->
+                error "bad_delta_cipher" ("cannot decode delta cipher: " ^ e)
+              | Ok delta ->
+                match
+                  FB.withdraw_with_pubkey
+                    ~result_policy
+                    pk
+                    ~current_cipher:(Some current)
+                    ~delta_cipher:delta
+                with
+                | Error e ->
+                  error
+                    "encrypted_balance_update_failed"
+                    ("sender encrypted balance update: " ^ e)
+                | Ok next_cipher ->
+                  Ok {
+                    stealth_current_cipher = current;
+                    stealth_next_cipher = next_cipher;
+                    stealth_delta_cipher = ptd.PT.delta_cipher;
+                    stealth_range_proof_delta = ptd.PT.range_proof_delta;
+                    stealth_range_proof_balance = ptd.PT.range_proof_balance;
+                    stealth_tag = ptd.PT.stealth_tag;
+                    stealth_eph_pub = ptd.PT.eph_pub;
+                    stealth_enc_amount = ptd.PT.enc_amount;
+                    stealth_claim_pub = ptd.PT.claim_pub;
+                    stealth_amount_commitment = ptd.PT.amount_commitment;
+                  }))
+
+let stealth_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  let* plan = prepare_stealth_plan ~result_policy ledger tx in
+  match plan with
+  | Error _ as result -> Lwt.return result
+  | Ok plan ->
+    match parse_stealth tx.T.encrypted_data with
+    | Error e -> Lwt.return (Error e)
+    | Ok ptd ->
+      let* blob_result =
+        load_pk_blob_plain ledger tx.T.from
+          "no_pvac_pubkey"
+          "sender has no registered PVAC pubkey"
+      in
+      begin
+        match blob_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok blob ->
+          let* commitment =
+            Proof_pool.run (fun () ->
+              with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
+                if
+                  FB.verify_commitment
+                    pk
+                    ptd.PT.delta_cipher
+                    ptd.PT.commitment
+                then
+                  Ok ()
+                else
+                  error
+                    "bad_commitment"
+                    "delta cipher commitment verification failed"))
+          in
+          begin
+            match commitment with
+            | Error _ as result -> Lwt.return result
+            | Ok () -> Lwt.return_ok plan
+          end
+      end
 
 let stealth_inline_range ledger tx plan =
   let open Lwt.Syntax in
-  let* pk_result =
-    load_pk_plain ledger tx.T.from
+  let* blob_result =
+    load_pk_blob_plain ledger tx.T.from
       "no_pvac_pubkey"
       "sender has no registered PVAC pubkey"
-      "bad_pvac_pubkey"
   in
-  match pk_result with
+  match blob_result with
   | Error e -> Lwt.return (Error e)
-  | Ok pk ->
-    let delta_ok =
-      FB.verify_range pk plan.stealth_delta_cipher plan.stealth_range_proof_delta
+  | Ok blob ->
+    let* delta =
+      VW.verify_range
+        ~pubkey:blob
+        ~cipher:plan.stealth_delta_cipher
+        ~proof:plan.stealth_range_proof_delta
     in
-    let balance_ok =
-      FB.verify_range pk plan.stealth_next_cipher plan.stealth_range_proof_balance
+    let* balance =
+      VW.verify_range
+        ~pubkey:blob
+        ~cipher:plan.stealth_next_cipher
+        ~proof:plan.stealth_range_proof_balance
     in
-    Lwt.return (Ok { delta_ok; balance_ok })
+    Lwt.return_ok {
+      delta_ok = Result.is_ok delta;
+      balance_ok = Result.is_ok balance;
+    }
 
 let stealth_accept_range range =
   if not range.delta_ok then
@@ -658,28 +1324,36 @@ let stealth_binding ledger tx plan =
   match parse_stealth tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok ptd ->
-      let* pk_result =
-        load_pk_plain ledger tx.T.from
-          "no_pvac_pubkey"
-          "sender has no registered PVAC pubkey"
-          "bad_pvac_pubkey"
-      in
-      match pk_result with
-      | Error e -> Lwt.return (Error e)
-      | Ok pk ->
-        if String.length ptd.PT.send_zero_proof = 0 then
-          Lwt.return
-            (error "bad_send_binding"
-              "send_zero_proof does not bind delta_cipher to amount_commitment: send_zero_proof required but missing")
-        else
-          match FB.verify_claim_amount_v5 pk plan.stealth_delta_cipher ptd.PT.send_zero_proof plan.stealth_amount_commitment with
-          | Ok () -> Lwt.return (Ok ())
-          | Error e ->
-            Lwt.return
-              (error "bad_send_binding"
-                ("send_zero_proof does not bind delta_cipher to amount_commitment: " ^ e))
+      if String.length ptd.PT.send_zero_proof = 0 then
+        Lwt.return
+          (error "bad_send_binding"
+            "send_zero_proof does not bind delta_cipher to amount_commitment: send_zero_proof required but missing")
+      else
+        let* blob_result =
+          load_pk_blob_plain ledger tx.T.from
+            "no_pvac_pubkey"
+            "sender has no registered PVAC pubkey"
+        in
+        match blob_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok blob ->
+          let* verified =
+            VW.verify_claim
+              ~pubkey:blob
+              ~cipher:plan.stealth_delta_cipher
+              ~proof:ptd.PT.send_zero_proof
+              ~commitment:plan.stealth_amount_commitment
+          in
+          begin
+            match verified with
+            | Ok () -> Lwt.return_ok ()
+            | Error e ->
+              Lwt.return
+                (error "bad_send_binding"
+                  ("send_zero_proof does not bind delta_cipher to amount_commitment: " ^ e))
+          end
 
-let claim_plan ledger tx =
+let prepare_claim_plan ledger tx =
   let open Lwt.Syntax in
   if not (String.equal tx.T.from tx.T.to_) then
     Lwt.return (error "claim_not_self" "claim operation must target sender (from == to)")
@@ -696,48 +1370,115 @@ let claim_plan ledger tx =
       | Some so ->
         match claim_gate tx.T.from so claim with
         | Error e -> Lwt.return (Error e)
+        | Ok () when not (FB.cipher_is_wrapped_scalar claim.SC.claim_cipher) ->
+          Lwt.return
+            (error "bad_claim_cipher"
+              "claim cipher must be a wrapped scalar")
         | Ok () ->
-          let* pk_result =
-            load_pk_plain ledger tx.T.from
+          Lwt.return_ok {
+            claim_output_id = claim.SC.output_id;
+            claim_cipher = claim.SC.claim_cipher;
+          }
+
+let claim_plan ledger tx =
+  let open Lwt.Syntax in
+  let* plan = prepare_claim_plan ledger tx in
+  match plan with
+  | Error _ as result -> Lwt.return result
+  | Ok plan ->
+    match parse_claim tx.T.encrypted_data with
+    | Error e -> Lwt.return (Error e)
+    | Ok claim ->
+      let* so_opt = Ledger.get_stealth_output_by_id ledger claim.SC.output_id in
+      begin
+        match so_opt with
+        | None ->
+          Lwt.return
+            (error "output_not_found"
+              (Printf.sprintf "stealth output %d not found" claim.SC.output_id))
+        | Some so ->
+          let* blob_result =
+            load_pk_blob_plain ledger tx.T.from
               "no_pvac_pubkey"
               "claimant has no registered PVAC pubkey"
-              "bad_pvac_pubkey"
           in
-          match pk_result with
-          | Error e -> Lwt.return (Error e)
-          | Ok pk ->
-            if not (FB.verify_commitment pk claim.SC.claim_cipher claim.SC.commitment) then
-              Lwt.return (error "bad_commitment" "claim cipher commitment verification failed")
-            else
-              match FB.verify_claim_amount_v5 pk claim.SC.claim_cipher claim.SC.zero_proof so.Ledger_types.amount_commitment with
-              | Error e ->
-                Lwt.return
-                  (error "bad_zero_proof" ("bound zero proof verification failed: " ^ e))
-              | Ok () ->
-                Lwt.return (Ok { claim_output_id = claim.SC.output_id; claim_cipher = claim.SC.claim_cipher })
+          begin
+            match blob_result with
+            | Error e -> Lwt.return (Error e)
+            | Ok blob ->
+              let* commitment =
+                Proof_pool.run (fun () ->
+                  with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
+                    if
+                      FB.verify_commitment
+                        pk
+                        claim.SC.claim_cipher
+                        claim.SC.commitment
+                    then
+                      Ok ()
+                    else
+                      error
+                        "bad_commitment"
+                        "claim cipher commitment verification failed"))
+              in
+              begin
+                match commitment with
+                | Error _ as result -> Lwt.return result
+                | Ok () ->
+                  let* verified =
+                    VW.verify_claim
+                      ~pubkey:blob
+                      ~cipher:claim.SC.claim_cipher
+                      ~proof:claim.SC.zero_proof
+                      ~commitment:so.Ledger_types.amount_commitment
+                  in
+                  begin
+                    match verified with
+                    | Error e ->
+                      Lwt.return
+                        (error
+                           "bad_zero_proof"
+                           ("bound zero proof verification failed: " ^ e))
+                    | Ok () -> Lwt.return_ok plan
+                  end
+              end
+          end
+      end
 
-let claim_balance_plan ledger tx plan =
+let claim_balance_plan
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx
+    plan =
   let open Lwt.Syntax in
-  let* pk_result =
-    load_pk_plain ledger tx.T.from
+  let* blob_result =
+    load_pk_blob_plain ledger tx.T.from
       "no_pvac_pubkey"
       "claimant has no registered PVAC pubkey"
-      "bad_pvac_pubkey"
   in
-  match pk_result with
+  match blob_result with
   | Error e -> Lwt.return (Error e)
-  | Ok pk ->
+  | Ok blob ->
     match current_cipher ledger tx.T.from "encrypted_balance_update_failed" with
     | Error e -> Lwt.return (Error e)
     | Ok current ->
-      match FB.decode_cipher plan.claim_cipher with
-      | Error e ->
-        Lwt.return
-          (error "bad_claim_cipher" ("cannot decode claim cipher: " ^ e))
-      | Ok delta ->
-        match FB.deposit_with_pubkey pk ~current_cipher:(Some current) ~delta_cipher:delta with
-        | Error e ->
-          Lwt.return
-            (error "encrypted_balance_update_failed" ("claimant encrypted balance update: " ^ e))
-        | Ok next_cipher ->
-          Lwt.return (Ok { current_cipher = current; next_cipher })
+      match guard_private_input current "encrypted_balance_update_failed" "claim" with
+      | Error e -> Lwt.return (Error e)
+      | Ok () ->
+        Proof_pool.run (fun () ->
+          with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
+            match FB.decode_cipher plan.claim_cipher with
+            | Error e ->
+              error "bad_claim_cipher" ("cannot decode claim cipher: " ^ e)
+            | Ok delta ->
+              match
+                FB.deposit_with_pubkey
+                  ~result_policy
+                  pk
+                  ~current_cipher:(Some current)
+                  ~delta_cipher:delta
+              with
+              | Error e ->
+                error "encrypted_balance_update_failed" ("claimant encrypted balance update: " ^ e)
+              | Ok next_cipher ->
+                Ok { current_cipher = current; next_cipher }))

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type entry = {
   epoch_id : int;
@@ -63,7 +51,6 @@ let ensure_dir data_dir =
   if not (Sys.file_exists dir) then
     (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
 
-
 let write data_dir entry =
   ensure_dir data_dir;
   let path = entry_path data_dir entry.epoch_id in
@@ -87,7 +74,6 @@ let delete data_dir epoch_id =
   if Sys.file_exists path then
     (try Sys.remove path with _ -> ())
 
-
 let read_pending data_dir =
   let dir = wal_dir data_dir in
   if not (Sys.file_exists dir) then []
@@ -106,7 +92,6 @@ let read_pending data_dir =
           Some (of_json (Bytes.to_string buf))
         with _ -> None)
     |> List.sort (fun a b -> compare a.epoch_id b.epoch_id)
-
 
 type recovery_action =
   | Skip
@@ -148,7 +133,17 @@ type pending_commit = {
   txid_hi : int64;
   ts : float;
   validator_addr : string;
+  proposal_b64 : string option;
+  vote_b64 : string option;
+  tx_hashes : string list;
+  txs_json : string list;
+  receipts_json : string list;
 }
+
+let max_pending_commit_bytes = 128 * 1024 * 1024
+
+let string_list_to_json values =
+  `List (List.map (fun value -> `String value) values)
 
 let pending_commit_to_json p =
   `Assoc [
@@ -159,11 +154,30 @@ let pending_commit_to_json p =
     "txid_hi", `String (Int64.to_string p.txid_hi);
     "ts", `Float p.ts;
     "validator_addr", `String p.validator_addr;
+    "proposal_b64",
+      (match p.proposal_b64 with Some value -> `String value | None -> `Null);
+    "vote_b64",
+      (match p.vote_b64 with Some value -> `String value | None -> `Null);
+    "tx_hashes", string_list_to_json p.tx_hashes;
+    "txs_json", string_list_to_json p.txs_json;
+    "receipts_json", string_list_to_json p.receipts_json;
   ] |> Yojson.Safe.to_string
 
 let pending_commit_of_json s =
   let j = Yojson.Safe.from_string s in
   let open Yojson.Safe.Util in
+  let optional_string name =
+    match j |> member name with
+    | `String value -> Some value
+    | `Null -> None
+    | _ -> failwith ("pending commit field is invalid: " ^ name)
+  in
+  let string_list name =
+    match j |> member name with
+    | `List values -> List.map to_string values
+    | `Null -> []
+    | _ -> failwith ("pending commit field is invalid: " ^ name)
+  in
   {
     epoch_id = j |> member "epoch_id" |> to_int;
     round = j |> member "round" |> to_int;
@@ -172,28 +186,70 @@ let pending_commit_of_json s =
     txid_hi = Int64.of_string (j |> member "txid_hi" |> to_string);
     ts = j |> member "ts" |> to_number;
     validator_addr = j |> member "validator_addr" |> to_string;
+    proposal_b64 = optional_string "proposal_b64";
+    vote_b64 = optional_string "vote_b64";
+    tx_hashes = string_list "tx_hashes";
+    txs_json = string_list "txs_json";
+    receipts_json = string_list "receipts_json";
   }
 
 let pending_commit_path data_dir epoch_id round =
   Filename.concat (wal_dir data_dir)
     (Printf.sprintf "%010d_%04d.pending" epoch_id round)
 
+let read_pending_commit_file path =
+  let stat = Unix.lstat path in
+  if stat.Unix.st_kind <> Unix.S_REG then
+    failwith "pending commit is not a regular file";
+  if stat.Unix.st_size <= 0 || stat.Unix.st_size > max_pending_commit_bytes then
+    failwith "pending commit size is invalid";
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () ->
+      pending_commit_of_json
+        (really_input_string ic stat.Unix.st_size))
+
+let same_pending_commit left right =
+  left.epoch_id = right.epoch_id
+  && left.round = right.round
+  && left.proposal_id = right.proposal_id
+  && left.proposed_state_root = right.proposed_state_root
+  && left.txid_hi = right.txid_hi
+  && left.validator_addr = right.validator_addr
+  && left.proposal_b64 = right.proposal_b64
+  && left.vote_b64 = right.vote_b64
+  && left.tx_hashes = right.tx_hashes
+  && left.txs_json = right.txs_json
+  && left.receipts_json = right.receipts_json
+
 let write_pending_commit data_dir p =
   ensure_dir data_dir;
   let path = pending_commit_path data_dir p.epoch_id p.round in
-  let tmp = path ^ ".tmp" in
-  let json = pending_commit_to_json p in
-  let oc = open_out_bin tmp in
-  output_string oc json;
-  flush oc;
-  (try Unix.fsync (Unix.descr_of_out_channel oc) with _ -> ());
-  close_out oc;
-  Unix.rename tmp path;
-  (try
+  let write () =
+    let tmp = path ^ ".tmp" in
+    let json = pending_commit_to_json p in
+    if String.length json > max_pending_commit_bytes then
+      failwith "pending commit exceeds size limit";
+    let oc = open_out_bin tmp in
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr oc)
+      (fun () ->
+        output_string oc json;
+        flush oc;
+        Unix.fsync (Unix.descr_of_out_channel oc));
+    Unix.rename tmp path;
     let dfd = Unix.openfile (wal_dir data_dir) [Unix.O_RDONLY] 0 in
-    (try Unix.fsync dfd with _ -> ());
-    Unix.close dfd
-   with _ -> ())
+    Fun.protect
+      ~finally:(fun () -> Unix.close dfd)
+      (fun () -> Unix.fsync dfd)
+  in
+  if Sys.file_exists path then begin
+    let existing = read_pending_commit_file path in
+    if not (same_pending_commit existing p) then
+      failwith "conflicting pending commit record"
+  end else
+    write ()
 
 let delete_pending_commit data_dir epoch_id round =
   let path = pending_commit_path data_dir epoch_id round in
@@ -221,16 +277,9 @@ let read_pending_commits data_dir =
     Sys.readdir dir
     |> Array.to_list
     |> List.filter (fun f -> Filename.check_suffix f ".pending")
-    |> List.filter_map (fun f ->
+    |> List.map (fun f ->
         let path = Filename.concat dir f in
-        try
-          let ic = open_in path in
-          let n = in_channel_length ic in
-          let buf = Bytes.create n in
-          really_input ic buf 0 n;
-          close_in ic;
-          Some (pending_commit_of_json (Bytes.to_string buf))
-        with _ -> None)
+        read_pending_commit_file path)
     |> List.sort (fun a b ->
         let by_epoch = compare a.epoch_id b.epoch_id in
         if by_epoch <> 0 then by_epoch else compare a.round b.round)

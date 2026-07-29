@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Rpc = Octra_core.Rpc
 
@@ -247,7 +235,7 @@ let with_owner_subject_auth store params ~field ~op f =
         ~subject
         (fun _ -> f circle_id subject)
 
-let with_any_auth store params ~circle_id ~op ~subject f =
+let with_owner_asset_auth store params ~circle_id ~op ~subject f =
   let open Lwt.Syntax in
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
@@ -260,7 +248,7 @@ let with_any_auth store params ~circle_id ~op ~subject f =
       2
       3
       4
-      ~gate:Circle_auth.Any
+      ~gate:Circle_auth.Owner
       ~op
       ~circle_id
       ~subject
@@ -360,25 +348,41 @@ let program_info_public_params store params =
   circle_id_param params (fun circle_id ->
     program_info_public store ~circle_id)
 
+let program_value store (info : Octra_core.Circles.circle_info) =
+  let open Lwt.Syntax in
+  let* code_opt =
+    Octra_core.Store_irmin.get_circle_program_code_b64 store info.Octra_core.Circles.circle_id in
+  ok
+    (Circle_view.program
+       ~circle_id:info.circle_id
+       ~code_b64:code_opt
+       ~code_hash:info.code_hash
+       ~runtime:info.runtime)
+
 let program store ~circle_id =
   let open Lwt.Syntax in
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
-  let* code_opt =
-    Octra_core.Store_irmin.get_circle_program_code_b64 store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error (Rpc.not_found "circle not found"))
   | Some info ->
-    ok
-      (Circle_view.program
-         ~circle_id
-         ~code_b64:code_opt
-         ~code_hash:info.code_hash
-         ~runtime:info.runtime)
+    if Circle_auth.private_view_required info then
+      Lwt.return (Error (Rpc.err (-32000) "authenticated circle program read required" None))
+    else
+      program_value store info
 
 let program_params store params =
   circle_id_param params (fun circle_id ->
     program store ~circle_id)
+
+let program_auth_params store params =
+  with_scope_auth
+    store
+    params
+    ~gate:Circle_auth.Private_owner
+    ~op:"octra_circle_program"
+    (fun _circle_id info ->
+      program_value store info)
 
 let view_call
     ?(trusted=[])
@@ -477,7 +481,7 @@ let view_call_auth ?(trusted=[]) store params ~view_ctx =
         3
         4
         5
-        ~gate:(Circle_auth.Storage_owner_if include_storage)
+        ~gate:(Circle_auth.view_gate ~include_storage)
         ~op:"octra_circle_view"
         ~circle_id:call.Circle_view.circle_id
         ~subject:(Circle_view.view_subject
@@ -972,7 +976,7 @@ let asset_ciphertext_auth_params store params ~current_epoch =
   match Circle_view.asset_path_params params with
   | Error e -> Lwt.return (Error e)
   | Ok path ->
-    with_any_auth
+    with_owner_asset_auth
       store
       params
       ~circle_id:path.Circle_view.circle_id
@@ -991,7 +995,7 @@ let asset_ciphertext_by_resource_key_auth_params store params ~current_epoch =
   match Circle_view.asset_resource_params params with
   | Error e -> Lwt.return (Error e)
   | Ok req ->
-    with_any_auth
+    with_owner_asset_auth
       store
       params
       ~circle_id:req.Circle_view.circle_id
@@ -1015,25 +1019,20 @@ let asset_ciphertext_by_locator_auth_params
   match Circle_view.asset_locator_params params field parse_locator with
   | Error e -> Lwt.return (Error e)
   | Ok parsed ->
-    match
-      Circle_auth.authenticate_rpc_params
-        params
-        2
-        3
-        4
-        ~op
-        ~circle_id:parsed.Circle_view.circle_id
-        ~subject:(Circle_view.asset_locator_subject field parsed.locator)
-    with
-    | Error e -> Lwt.return (Error e)
-    | Ok _ ->
-      asset_ciphertext
-        store
-        ~circle_id:parsed.Circle_view.circle_id
-        ~path_key:parsed.locator.Circle_view.path_key
-        ~canonical_path:parsed.locator.Circle_view.canonical_path
-        ~current_epoch
-        ~reveal_sensitive_fields:true
+    with_owner_asset_auth
+      store
+      params
+      ~circle_id:parsed.Circle_view.circle_id
+      ~op
+      ~subject:(Circle_view.asset_locator_subject field parsed.locator)
+      (fun () ->
+        asset_ciphertext
+          store
+          ~circle_id:parsed.Circle_view.circle_id
+          ~path_key:parsed.locator.Circle_view.path_key
+          ~canonical_path:parsed.locator.Circle_view.canonical_path
+          ~current_epoch
+          ~reveal_sensitive_fields:true)
 
 let asset_ciphertext_by_slot_ref_auth_params store params ~current_epoch =
   asset_ciphertext_by_locator_auth_params
@@ -1321,11 +1320,21 @@ let storage store ~circle_id ~key =
     Octra_circle_runtime.Circle_exec.read_storage_key store circle_id key in
   ok (Circle_view.storage ~circle_id ~key ~value:value_opt)
 
+let storage_dump_limit = 128
+
 let storage_dump store ~circle_id =
   let open Lwt.Syntax in
   let* result =
-    Octra_circle_runtime.Circle_exec.list_storage_pairs store circle_id in
-  match query_result result (Circle_view.storage_dump ~circle_id) with
+    Octra_circle_runtime.Circle_exec.list_storage_page
+      store
+      circle_id
+      ~limit:storage_dump_limit in
+  match
+    query_result
+      result
+      (fun (storage_pairs, total) ->
+        Circle_view.storage_dump ~circle_id ~total storage_pairs)
+  with
   | Ok value -> ok value
   | Error e -> Lwt.return (Error e)
 
@@ -1575,4 +1584,5 @@ let dispatch
     circle_asset_ciphertext_by_state_ref_auth =
       adapters.epoch_read asset_ciphertext_by_state_ref_auth_params;
     circle_program = adapters.store_read program_params;
+    circle_program_auth = adapters.store_read program_auth_params;
   }

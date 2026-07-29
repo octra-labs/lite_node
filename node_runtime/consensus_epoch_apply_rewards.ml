@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Epoch_exec = Octra_core.Epoch_exec
 module Epochlog = Octra_core.Epochlog
@@ -26,35 +14,22 @@ let role_label = function
   | Validator -> "validator"
   | Proposer_validator -> "proposer_validator"
 
-let is_validator ~active_validators addr =
-  List.exists (String.equal addr) active_validators
-
-let role_of ~proposer_addr ~active_validators addr =
-  match String.equal addr proposer_addr, is_validator ~active_validators addr with
+let role_of (credit : Epoch_exec.reward_credit) =
+  match credit.proposer, credit.validator with
   | true, true -> Proposer_validator
   | true, false -> Proposer
-  | false, _ -> Validator
+  | false, true -> Validator
+  | false, false -> invalid_arg "reward recipient has no role"
 
-let amount_of ~role ~plan =
-  match role with
-  | Proposer -> plan.Epoch_exec.proposer_total
-  | Validator -> plan.Epoch_exec.each_validator
-  | Proposer_validator ->
-    Z.add plan.Epoch_exec.proposer_total plan.Epoch_exec.each_validator
-
-let recipient ~proposer_addr ~active_validators ~plan addr =
-  let role = role_of ~proposer_addr ~active_validators addr in
-  let amount = amount_of ~role ~plan in
-  if Z.leq amount Z.zero then
+let recipient (credit : Epoch_exec.reward_credit) =
+  if Z.leq credit.amount Z.zero then
     None
   else
     Some Epochlog.{
-      reward_addr = addr;
-      reward_role = role_label role;
-      reward_amount = Z.to_string amount;
+      reward_addr = credit.address;
+      reward_role = role_label (role_of credit);
+      reward_amount = Z.to_string credit.amount;
     }
 
-let recipients ~proposer_addr ~active_validators ~plan =
-  proposer_addr :: active_validators
-  |> List.sort_uniq String.compare
-  |> List.filter_map (recipient ~proposer_addr ~active_validators ~plan)
+let recipients credits =
+  List.filter_map recipient credits

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type progress_report = {
   peer : string;
@@ -25,17 +13,7 @@ type progress_report = {
   eta_seconds : float option;
 }
 
-let state_sync_version = "octra-state-sync-v1"
-
-let env_int name default =
-  match Sys.getenv_opt name with
-  | Some s -> (try int_of_string s with _ -> default)
-  | None -> default
-
-let chunk_max () =
-  let mib = 1024 * 1024 in
-  let configured = env_int "OCTRA_STATE_SYNC_CHUNK_MAX" (16 * mib) in
-  min (64 * mib) (max mib configured)
+let state_sync_version = "octra-state-sync"
 
 let normalize_path raw =
   let raw =
@@ -49,10 +27,16 @@ let normalize_path raw =
     if List.exists (( = ) "..") parts then None else Some raw
 
 let path_allowed rel =
-  let base = Filename.basename rel in
-  base <> "lock"
-  && base <> "lock.mdb"
-  && base <> ".-lock"
+  let components = String.split_on_char '/' rel in
+  let compact_control = rel = "irmin_store/store.control" in
+  let component_allowed name =
+    name <> "lock"
+    && name <> "lock.mdb"
+    && name <> ".-lock"
+    && name <> "store.control"
+    && not (String.starts_with ~prefix:"index.bak" name)
+  in
+  (compact_control || List.for_all component_allowed components)
   && rel <> "commit_journal.log"
   && (rel = "HEAD.json"
       || rel = "state_root"
@@ -64,27 +48,6 @@ let path_allowed rel =
 let regular_file path =
   try (Unix.stat path).Unix.st_kind = Unix.S_REG with _ -> false
 
-let mkdir_p path =
-  let rec loop p =
-    if p = "" || p = "." || Sys.file_exists p then ()
-    else begin
-      loop (Filename.dirname p);
-      Unix.mkdir p 0o755
-    end
-  in
-  loop path
-
-let rec remove_tree path =
-  if Sys.file_exists path then
-    match (Unix.lstat path).Unix.st_kind with
-    | Unix.S_DIR ->
-        Array.iter (fun name ->
-          if name <> "." && name <> ".." then
-            remove_tree (Filename.concat path name)
-        ) (Sys.readdir path);
-        Unix.rmdir path
-    | _ -> Unix.unlink path
-
 let fsync_parent path =
   try
     let fd = Unix.openfile (Filename.dirname path) [Unix.O_RDONLY] 0 in
@@ -92,26 +55,6 @@ let fsync_parent path =
       ~finally:(fun () -> Unix.close fd)
       (fun () -> Unix.fsync fd)
   with _ -> ()
-
-let copy_file ~src ~dst =
-  mkdir_p (Filename.dirname dst);
-  let ic = open_in_bin src in
-  let oc = open_out_gen [Open_wronly; Open_creat; Open_trunc; Open_binary] 0o644 dst in
-  Fun.protect
-    ~finally:(fun () -> close_in_noerr ic; close_out_noerr oc)
-    (fun () ->
-      let buf = Bytes.create (1024 * 1024) in
-      let rec loop () =
-        match input ic buf 0 (Bytes.length buf) with
-        | 0 -> ()
-        | n ->
-            output oc buf 0 n;
-            loop ()
-      in
-      loop ();
-      flush oc;
-      (try Unix.fsync (Unix.descr_of_out_channel oc) with _ -> ()));
-  fsync_parent dst
 
 let rec walk_dir ~base ~rel acc =
   let dir = if rel = "" then base else Filename.concat base rel in
@@ -138,9 +81,19 @@ let rec walk_dir ~base ~rel acc =
       in
       loop acc)
 
-let roots = [ "HEAD.json"; "state_root"; "irmin_store"; "chaindata"; "pvac" ]
+let roots = [
+  "HEAD.json";
+  "state_root";
+  "irmin_store";
+  "chaindata";
+  "pvac";
+  "preverify_receipts";
+]
 
 let list_files base =
+  let compact_ready =
+    Sys.file_exists (Filename.concat base ".compact-ready.json")
+  in
   List.fold_left (fun acc root ->
     let abs = Filename.concat base root in
     if Sys.file_exists abs then
@@ -153,6 +106,8 @@ let list_files base =
     else acc
   ) [] roots
   |> List.sort_uniq String.compare
+  |> List.filter (fun rel ->
+    rel <> "irmin_store/store.control" || compact_ready)
   |> List.filter (fun rel -> regular_file (Filename.concat base rel))
 
 let head_equal a b =
@@ -167,28 +122,6 @@ let snapshot_root data_dir =
   match Sys.getenv_opt "OCTRA_STATE_SYNC_SNAPSHOT_DIR" with
   | Some dir when String.trim dir <> "" -> dir
   | _ -> Filename.concat data_dir "state_sync_snapshots"
-
-let snapshot_keep () =
-  max 1 (env_int "OCTRA_STATE_SYNC_SNAPSHOT_KEEP" 3)
-
-let safe_prefix s n =
-  let n = min n (String.length s) in
-  String.sub s 0 n
-
-let sanitize_id s =
-  String.map (function
-    | 'a'..'z' | 'A'..'Z' | '0'..'9' | '-' | '_' | '.' as c -> c
-    | _ -> '_'
-  ) s
-
-let snapshot_id_of_head (h : Octra_core.Head_manifest.t) =
-  let commit =
-    match h.irmin_commit with
-    | Some c when c <> "" -> safe_prefix c 16
-    | _ -> h.commit_id
-  in
-  sanitize_id
-    (Printf.sprintf "ep%09d-%s-%s" h.epoch_id (safe_prefix h.state_root 16) commit)
 
 let valid_snapshot_id id =
   id <> ""
@@ -207,7 +140,7 @@ let snapshot_ready_path dir =
 let write_ready dir head =
   let body =
     `Assoc [
-      "version", `String "octra-state-sync-snapshot-ready-v1";
+      "version", `String "octra-state-sync-snapshot-ready";
       "head_epoch", `Int head.Octra_core.Head_manifest.epoch_id;
       "state_root", `String head.state_root;
       "commit_id", `String head.commit_id;
@@ -237,169 +170,6 @@ let stable_head data_dir expected =
   | Some h -> head_equal h expected
   | None -> false
 
-let cleanup_old_snapshots data_dir =
-  let root = snapshot_root data_dir in
-  if Sys.file_exists root then
-    let entries =
-      Sys.readdir root
-      |> Array.to_list
-      |> List.filter_map (fun name ->
-        let path = Filename.concat root name in
-        try
-          if (Unix.lstat path).Unix.st_kind = Unix.S_DIR
-             && Sys.file_exists (snapshot_ready_path path) then
-            Some (path, (Unix.stat path).Unix.st_mtime)
-          else None
-        with _ -> None)
-      |> List.sort (fun (_, a) (_, b) -> compare b a)
-    in
-    entries
-    |> List.mapi (fun i (path, _) -> i, path)
-    |> List.iter (fun (i, path) ->
-      if i >= snapshot_keep () then
-        try remove_tree path with _ -> ())
-
-let create_snapshot data_dir head =
-  let root = snapshot_root data_dir in
-  mkdir_p root;
-  let id = snapshot_id_of_head head in
-  let final_dir = snapshot_dir data_dir id in
-  if Sys.file_exists (snapshot_ready_path final_dir) then Ok (id, final_dir)
-  else begin
-    if Sys.file_exists final_dir then remove_tree final_dir;
-    let tmp_dir =
-      Filename.concat root
-        (Printf.sprintf ".%s.tmp.%d.%06x"
-           id (Unix.getpid ()) (Random.bits ()))
-    in
-    if Sys.file_exists tmp_dir then remove_tree tmp_dir;
-    mkdir_p tmp_dir;
-    let cleanup () =
-      try if Sys.file_exists tmp_dir then remove_tree tmp_dir with _ -> ()
-    in
-    try
-      if not (stable_head data_dir head) then
-        Error "source is committing; retry snapshot manifest"
-      else begin
-        let files = list_files data_dir in
-        List.iter (fun rel ->
-          copy_file
-            ~src:(Filename.concat data_dir rel)
-            ~dst:(Filename.concat tmp_dir rel)
-        ) files;
-        if not (stable_head data_dir head) then begin
-          cleanup ();
-          Error "source head changed during snapshot copy; retry"
-        end else begin
-          write_ready tmp_dir head;
-          Unix.rename tmp_dir final_dir;
-          fsync_parent final_dir;
-          cleanup_old_snapshots data_dir;
-          Ok (id, final_dir)
-        end
-      end
-    with exn ->
-      cleanup ();
-      Error (Printexc.to_string exn)
-  end
-
-let ensure_snapshot data_dir =
-  match Octra_core.Head_manifest.load data_dir with
-  | None -> Error "HEAD.json is not available yet"
-  | Some head ->
-      let attempts = max 1 (env_int "OCTRA_STATE_SYNC_SNAPSHOT_ATTEMPTS" 3) in
-      let rec loop n last_error =
-        match create_snapshot data_dir head with
-        | Ok (id, dir) -> Ok (head, id, dir)
-        | Error msg when n + 1 < attempts ->
-            Unix.sleepf 0.25;
-            loop (n + 1) msg
-        | Error msg -> Error (if msg = "" then last_error else msg)
-      in
-      loop 0 ""
-
-let manifest_from_dir ~source_dir ~current_epoch ~head ~snapshot_id =
-  let files =
-    list_files source_dir
-    |> List.map (fun rel ->
-      let abs = Filename.concat source_dir rel in
-      let st = Unix.stat abs in
-      `Assoc [
-        "path", `String rel;
-        "size", `Int st.Unix.st_size;
-        "mtime", `Float st.Unix.st_mtime;
-      ])
-  in
-  `Assoc [
-    "version", `String state_sync_version;
-    "mode", `String "rpc_chunks";
-    "snapshot_mode", `String "immutable_copy";
-    "snapshot_id", `String snapshot_id;
-    "snapshot_epoch", `Int head.Octra_core.Head_manifest.epoch_id;
-    "snapshot_state_root", `String head.state_root;
-    "current_epoch", `Int !current_epoch;
-    "chunk_max", `Int (chunk_max ());
-    "head_epoch", `Int head.epoch_id;
-    "state_root", `String head.state_root;
-    "txid_hi", `String (Int64.to_string head.txid_hi);
-    "irmin_commit",
-      (match head.irmin_commit with Some c -> `String c | None -> `Null);
-    "commit_id", `String head.commit_id;
-    "files", `List files;
-  ]
-
-let manifest_result ~data_dir ~current_epoch =
-  match ensure_snapshot data_dir with
-  | Error msg -> Error msg
-  | Ok (head, snapshot_id, source_dir) ->
-      Ok (manifest_from_dir ~source_dir ~current_epoch ~head ~snapshot_id)
-
-let manifest ~data_dir ~current_epoch =
-  match manifest_result ~data_dir ~current_epoch with
-  | Ok json -> json
-  | Error msg ->
-      `Assoc [
-        "version", `String state_sync_version;
-        "mode", `String "rpc_chunks";
-        "status", `String "error";
-        "error", `String msg;
-        "current_epoch", `Int !current_epoch;
-        "files", `List [];
-      ]
-
-let legacy_live_manifest ~data_dir ~current_epoch =
-  let files =
-    list_files data_dir
-    |> List.map (fun rel ->
-      let abs = Filename.concat data_dir rel in
-      let st = Unix.stat abs in
-      `Assoc [
-        "path", `String rel;
-        "size", `Int st.Unix.st_size;
-        "mtime", `Float st.Unix.st_mtime;
-      ])
-  in
-  let head_fields =
-    match Octra_core.Head_manifest.get_cached () with
-    | None -> [
-        "head_epoch", `Null;
-        "state_root", `Null;
-        "txid_hi", `Null;
-      ]
-    | Some h -> [
-        "head_epoch", `Int h.Octra_core.Head_manifest.epoch_id;
-        "state_root", `String h.Octra_core.Head_manifest.state_root;
-        "txid_hi", `String (Int64.to_string h.Octra_core.Head_manifest.txid_hi);
-      ]
-  in
-  `Assoc ([
-    "version", `String state_sync_version;
-    "mode", `String "rpc_chunks";
-    "current_epoch", `Int !current_epoch;
-    "chunk_max", `Int (chunk_max ());
-    "files", `List files;
-  ] @ head_fields)
-
 let head_json ~current_epoch =
   let head_fields =
     match Octra_core.Head_manifest.get_cached () with
@@ -425,7 +195,7 @@ let progress_accepted_json =
 
 let readiness_not_ready_json =
   `Assoc [
-    "version", `String "octra-observer-ready-v1";
+    "version", `String "octra-observer-ready";
     "status", `String "not_ready";
   ]
 
@@ -433,7 +203,7 @@ let observer_ready_marker_json ~consensus_role ~leader_rpc ~chain_id ~validator
     ~validator_pubkey ~ready_epoch ~state_root ~records_verified ~sign_payload
     ~signature ~generated_at =
   `Assoc [
-    "version", `String "octra-observer-ready-v1";
+    "version", `String "octra-observer-ready";
     "status", `String "observer_ready";
     "consensus_role", `String consensus_role;
     "leader_rpc", `String leader_rpc;
@@ -461,7 +231,8 @@ let hex_to_raw32 hh =
   else if String.length raw > 32 then String.sub raw 0 32
   else raw ^ String.make (32 - String.length raw) '\x00'
 
-let build_range ~data_dir ~chaindata ~from_epoch ~max_epochs =
+let build_range ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
+    ~from_epoch ~max_epochs =
   try
     let max_chunk = min (max 1 max_epochs) 16 in
     let max_bytes = 4_000_000 in
@@ -530,6 +301,12 @@ let build_range ~data_dir ~chaindata ~from_epoch ~max_epochs =
                     ~epoch_id:target_int ~receipts:receipts_json parsed_txs with
                   | Stdlib.Error _ -> stop := true
                   | Stdlib.Ok () ->
+                    match read_finality target_int with
+                    | None -> stop := true
+                    | Some finality ->
+                    match reward_source target_int elog with
+                    | Stdlib.Error _ -> stop := true
+                    | Stdlib.Ok reward_source ->
                     let tx_list_hash_raw = Octra_net.Hash_domain.hash
                       "octra:tx_list:v1" (String.concat "" hashes_in_order) in
                     let catchup_creator_addr =
@@ -543,14 +320,58 @@ let build_range ~data_dir ~chaindata ~from_epoch ~max_epochs =
                       txs_json = txs_in_order;
                       receipt_root = Octra_consensus.C_hash.receipt_root receipts_json;
                       receipts_json;
+                      epoch_ts = elog.finalized_at;
                       creator_addr = catchup_creator_addr;
                       commit_round = elog.proposer.commit_round;
+                      reward_source = Some reward_source;
+                      finality = Some finality;
                     } in
+                    let expected_txid =
+                      Int64.add
+                        start_txid
+                        (Int64.of_int (List.length hashes_in_order))
+                    in
+                    match
+                      Octra_consensus.C_catchup.verify_record_finality
+                        ~chain_id
+                        ~expected_validator_set_hash:
+                          (Octra_consensus.C_config.validator_set_hash
+                             finality.validator_set)
+                        ~expected_txid
+                        ~record
+                    with
+                    | Stdlib.Error _ -> stop := true
+                    | Stdlib.Ok _ ->
                     let tx_bytes =
                       List.fold_left (fun acc s -> acc + 32 + String.length s) 0 txs_in_order in
                     let receipt_bytes =
                       List.fold_left (fun acc s -> acc + 32 + String.length s) 0 receipts_json in
-                    let approx_size = 128 + tx_bytes + receipt_bytes in
+                    let reward_bytes =
+                      Octra_net.Oce1.encode
+                        (fun buf ->
+                          Octra_consensus.C_reward_source.encode_into
+                            buf
+                            reward_source)
+                      |> String.length
+                    in
+                    let finality_bytes =
+                      Octra_consensus.C_codec.encode_finalize
+                        finality.finalize
+                      |> String.length
+                    in
+                    let validator_bytes =
+                      Octra_consensus.C_codec.encode_validator_set
+                        finality.validator_set
+                      |> String.length
+                    in
+                    let approx_size =
+                      136
+                      + tx_bytes
+                      + receipt_bytes
+                      + reward_bytes
+                      + finality_bytes
+                      + validator_bytes
+                    in
                     if !total_bytes + approx_size > max_bytes && !records <> [] then begin
                       next_epoch := Some target_epoch;
                       stop := true
@@ -578,11 +399,33 @@ let record_json (r : Octra_consensus.C_codec.catchup_epoch_record) =
     "txs_json", `List (List.map (fun j -> `String j) r.txs_json);
     "receipt_root", `String (raw_to_hex r.receipt_root);
     "receipts_json", `List (List.map (fun j -> `String j) r.receipts_json);
+    "epoch_ts", `Float r.epoch_ts;
     "creator_addr", `String r.creator_addr;
     "commit_round", `Int r.commit_round;
+    "reward_source",
+      (match r.reward_source with
+       | Some source -> Octra_consensus.C_reward_source.to_yojson source
+       | None -> `Null);
+    "finality",
+      (match r.finality with
+       | None -> `Null
+       | Some finality ->
+         `Assoc [
+           "finalize",
+             `String
+               (finality.finalize
+                |> Octra_consensus.C_codec.encode_finalize
+                |> Base64.encode_exn);
+           "validator_set",
+             `String
+               (finality.validator_set
+                |> Octra_consensus.C_codec.encode_validator_set
+                |> Base64.encode_exn);
+         ]);
   ]
 
-let range_json ~data_dir ~chaindata ~from_epoch ~max_epochs =
+let range_json ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
+    ~from_epoch ~max_epochs =
   let head_fields =
     match Octra_core.Head_manifest.get_cached () with
     | None -> [ "head_epoch", `Null; "head_state_root", `Null ]
@@ -591,7 +434,16 @@ let range_json ~data_dir ~chaindata ~from_epoch ~max_epochs =
         "head_state_root", `String h.Octra_core.Head_manifest.state_root;
       ]
   in
-  match build_range ~data_dir ~chaindata ~from_epoch ~max_epochs with
+  match
+    build_range
+      ~chain_id
+      ~data_dir
+      ~chaindata
+      ~reward_source
+      ~read_finality
+      ~from_epoch
+      ~max_epochs
+  with
   | `Ok (records, next_epoch) ->
       `Assoc ([
         "version", `String state_sync_version;
@@ -651,7 +503,7 @@ let read_chunk ~data_dir ~snapshot_id ~rel ~offset ~len =
           if offset < 0 || len <= 0 then Error "invalid offset/len"
           else if offset >= st.Unix.st_size then Ok ("", st.Unix.st_size)
           else
-            let max_len = chunk_max () in
+            let max_len = State_sync_limits.chunk_max in
             let len = min len max_len in
             let len = min len (st.Unix.st_size - offset) in
             let ic = open_in_bin abs in

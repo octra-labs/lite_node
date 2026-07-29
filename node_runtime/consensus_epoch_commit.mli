@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val planned_txid_hi :
   next_txid:int64 ->
@@ -105,12 +93,12 @@ type prepare_effects = {
   head : unit -> Octra_core.Head_manifest.t option;
   irmin_last_epoch : unit -> int;
   next_txid : unit -> int64;
-  now : unit -> float;
   commit_id : int -> string;
 }
 
 type prepare_input = {
   epoch_id : int;
+  finalized_at : float;
   pre_state_hash : string;
   confirmed_count : int;
   confirmed_txs : Octra_core.Transaction.t list;
@@ -176,6 +164,7 @@ type commit_effects = {
 type live_effects = {
   data_dir : string;
   store : Octra_core.Store_irmin.t;
+  ledger : Octra_core.Ledger.t;
   chaindata : Octra_core.Store_chaindata.t;
   trace : string -> unit;
   fatal : string -> unit;
@@ -198,6 +187,7 @@ type commit_request = {
   confirmed_fees : Z.t;
   plan : Octra_core.Epoch_exec.reward_plan;
   reward_recipients : Octra_core.Epochlog.reward_recipient list;
+  reward_source : Octra_consensus.C_types.reward_source;
   epoch_receipts_json : string list;
   commit_id : string;
   prev_generation : int;
@@ -299,6 +289,7 @@ val epoch_header :
   confirmed_fees:Z.t ->
   plan:Octra_core.Epoch_exec.reward_plan ->
   reward_recipients:Octra_core.Epochlog.reward_recipient list ->
+  reward_source:Octra_consensus.C_types.reward_source ->
   Octra_core.Epochlog.epoch_header
 
 val head_manifest :

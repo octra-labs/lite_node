@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type effect =
   | Neutral
@@ -55,6 +43,9 @@ let z_field fields name =
     | Some (`Int n) when n >= 0 -> Some (Z.of_int n)
     | _ -> None
 
+let amount_in_supply_envelope amount =
+  Z.sign amount >= 0 && Z.leq amount Denomination.max_supply
+
 let op_field fields =
   match string_field fields "op_type" with
   | Some s -> s
@@ -79,6 +70,28 @@ let has_string fields name =
   | Some s -> String.length s > 0
   | None -> false
 
+let bytes_of_b64 value =
+  try
+    let bytes = Bytes.of_string (Base64.decode_exn value) in
+    if Bytes.length bytes = 32 then Some bytes else None
+  with _ -> None
+
+let canonical_commitment value =
+  match bytes_of_b64 value with
+  | None ->
+    None
+  | Some point ->
+    begin
+      try
+        ignore
+          (Pvac_ffi.pedersen_add
+             (Pvac_ffi.pedersen_identity ())
+             point);
+        Some point
+      with _ ->
+        None
+    end
+
 let stealth_effect ~addr fields =
   let ed = encrypted_fields fields in
   if not (has_string ed "send_zero_proof") then
@@ -88,7 +101,15 @@ let stealth_effect ~addr fields =
   else if not (has_string ed "delta_cipher") then
     Poisoned_flow "stealth missing delta_cipher"
   else if string_field fields "from" = Some addr then
-    Hidden_commitment ("stealth", -1, Option.get (string_field ed "amount_commitment"))
+    begin
+      match string_field ed "amount_commitment" with
+      | Some commitment when Option.is_some (canonical_commitment commitment) ->
+        Hidden_commitment ("stealth", -1, commitment)
+      | Some _ ->
+        Poisoned_flow "stealth invalid amount_commitment"
+      | None ->
+        Poisoned_flow "stealth missing amount_commitment"
+    end
   else
     Neutral
 
@@ -101,9 +122,7 @@ let claim_effect ~addr fields =
   else if not (List.mem_assoc "output_id" ed) then
     Poisoned_flow "claim missing output_id"
   else if string_field fields "from" = Some addr then
-    match string_field ed "amount_commitment" with
-    | Some commitment -> Hidden_commitment ("claim", 1, commitment)
-    | None -> Hidden_flow "claim"
+    Hidden_flow "claim"
   else
     Neutral
 
@@ -116,12 +135,15 @@ let hidden_effect ~addr op fields =
   | "recrypt" -> Hidden_flow "recrypt"
   | _ -> Neutral
 
-let classify_tx : addr:string -> Yojson.Safe.t -> effect =
+let classify_tx : addr:string -> [> Yojson.Safe.t ] -> effect =
   fun ~addr json -> match json with
   | `Assoc fields when not (mentions_addr addr fields) -> Neutral
   | `Assoc fields ->
     let op = op_field fields in
     (match op, string_field fields "from", z_field fields "amount" with
+    | ("encrypt" | "decrypt"), _, Some amount
+        when not (amount_in_supply_envelope amount) ->
+      Poisoned_flow (op ^ " amount is outside the supply envelope")
     | "encrypt", Some from_addr, Some amount when from_addr = addr ->
       Public_encrypt amount
     | "decrypt", Some from_addr, Some amount when from_addr = addr ->
@@ -142,7 +164,8 @@ let classify_tx : addr:string -> Yojson.Safe.t -> effect =
   | `Intlit _
   | `List _
   | `Null
-  | `String _ -> Poisoned_flow "malformed json"
+  | `String _
+  | _ -> Poisoned_flow "malformed json"
 
 let effect_blocker = function
   | Hidden_commitment (op, _, _) -> Some ("hidden witness required: " ^ op)
@@ -169,32 +192,37 @@ let zero_blinding = Bytes.make 32 '\000'
 let b64_of_bytes b =
   Base64.encode_exn (Bytes.to_string b)
 
-let bytes_of_b64 s =
-  try
-    let b = Bytes.of_string (Base64.decode_exn s) in
-    if Bytes.length b = 32 then Some b else None
-  with _ -> None
-
 let public_amount_commitment amount =
   if Z.sign amount < 0 || Z.compare amount (Z.of_int64 Int64.max_int) > 0 then
     None
   else
     Some (Pvac_ffi.pedersen_commit_amount (Z.to_int64 amount) zero_blinding)
 
+let point_op op left right =
+  try Some (op left right) with _ -> None
+
 let apply_commitment acc = function
   | Neutral
   | Hidden_flow _
   | Poisoned_flow _ -> Some acc
   | Public_encrypt amount ->
-    Option.map (Pvac_ffi.pedersen_add acc) (public_amount_commitment amount)
+    begin
+      match public_amount_commitment amount with
+      | None -> None
+      | Some point -> point_op Pvac_ffi.pedersen_add acc point
+    end
   | Public_decrypt amount ->
-    Option.map (Pvac_ffi.pedersen_sub acc) (public_amount_commitment amount)
+    begin
+      match public_amount_commitment amount with
+      | None -> None
+      | Some point -> point_op Pvac_ffi.pedersen_sub acc point
+    end
   | Hidden_commitment (_, sign, commitment) ->
-    match bytes_of_b64 commitment with
+    match canonical_commitment commitment with
     | None -> None
     | Some point ->
-      if sign >= 0 then Some (Pvac_ffi.pedersen_add acc point)
-      else Some (Pvac_ffi.pedersen_sub acc point)
+      if sign >= 0 then point_op Pvac_ffi.pedersen_add acc point
+      else point_op Pvac_ffi.pedersen_sub acc point
 
 let replay_commitment effects =
   let start = Pvac_ffi.pedersen_identity () in
@@ -212,14 +240,41 @@ let replay_history ~addr txs =
   let blockers = List.filter_map effect_blocker effects in
   let public_net = List.fold_left add_effect Z.zero effects in
   let commitment_net = replay_commitment effects in
-  if blockers <> [] then
+  let net_violation =
+    if Z.sign public_net < 0 then
+      Some
+        ( "public net is negative",
+          "legacy public flow is not a valid non-negative balance" )
+    else if Z.gt public_net Denomination.max_supply then
+      Some
+        ( "public net exceeds the supply envelope",
+          "legacy public flow exceeds the supply envelope" )
+    else
+      None
+  in
+  match net_violation with
+  | Some (blocker, reason) ->
+    {
+      audit_class = Poisoned;
+      can_public_migrate = false;
+      public_net = None;
+      commitment_net = None;
+      blockers = blockers @ [blocker];
+      effects;
+      reason;
+    }
+  | None when blockers <> [] ->
     let audit_class =
       if List.exists effect_poison effects then Poisoned else Hidden_witness
+    in
+    let public_net, commitment_net =
+      if audit_class = Poisoned then None, None
+      else Some public_net, commitment_net
     in
     {
       audit_class;
       can_public_migrate = false;
-      public_net = Some public_net;
+      public_net;
       commitment_net;
       blockers;
       effects;
@@ -229,25 +284,14 @@ let replay_history ~addr txs =
         else
           "legacy history needs hidden witness migration";
     }
-  else
-    if Z.sign public_net < 0 then
-      {
-        audit_class = Poisoned;
-        can_public_migrate = false;
-        public_net = Some public_net;
-        commitment_net;
-        blockers = ["public net is negative"];
-        effects;
-        reason = "legacy public flow is not a valid non-negative balance";
-      }
-    else
-      {
-        audit_class =
-          if List.exists effect_hidden effects then Hidden_witness else Public_clean;
-        can_public_migrate = true;
-        public_net = Some public_net;
-        commitment_net;
-        blockers = [];
-        effects;
-        reason = "legacy public flow is reconstructable";
-      }
+  | None ->
+    {
+      audit_class =
+        if List.exists effect_hidden effects then Hidden_witness else Public_clean;
+      can_public_migrate = true;
+      public_net = Some public_net;
+      commitment_net;
+      blockers = [];
+      effects;
+      reason = "legacy public flow is reconstructable";
+    }

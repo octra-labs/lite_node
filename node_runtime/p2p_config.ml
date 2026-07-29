@@ -1,23 +1,13 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
+  config_hash : string;
   binary_hash : string;
   require_binary_hash : bool;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
   handshake_allowed_pubkeys : string list;
+  validator_pubkeys : string list;
   readiness_runtime : Octra_core.Validator_ready_policy.runtime;
 }
 
@@ -110,6 +100,8 @@ type node_stack_deps = {
   chain_id : string;
   consensus_mode : bool;
   current_height : int64;
+  chain_active_raw : string option;
+  chain_pending_raw : string option;
   chain_pending_entries : string list;
   install : node_startup_install_deps;
   swarm : node_swarm_start_deps;
@@ -160,7 +152,9 @@ let env_of_getenv getenv =
 
 let identity ~priv_b64 ~pub_b64 =
   let priv_raw_32 = Base64.decode_exn priv_b64 |> first32 in
-  let pub_raw_32 = Base64.decode_exn pub_b64 |> first32 in
+  let pub_raw_32 = Base64.decode_exn pub_b64 in
+  if String.length priv_raw_32 <> 32 then invalid_arg "invalid validator private key";
+  if String.length pub_raw_32 <> 32 then invalid_arg "invalid validator public key";
   {
     priv_raw_32;
     pub_raw_32;
@@ -190,10 +184,12 @@ let build ~chain_id ~consensus_config_hash ~allowed_pubkeys
       config_hash = Text.raw_to_hex consensus_config_hash;
     } in
     Ok {
+      config_hash = consensus_config_hash;
       binary_hash;
       require_binary_hash;
       upgrade_plan;
       handshake_allowed_pubkeys;
+      validator_pubkeys = allowed_pubkeys;
       readiness_runtime;
     }
 
@@ -255,9 +251,10 @@ let upgrade_log_message = function
 
 let startup_config ~env ~chain_id ~consensus_mode ~current_height
     ~current_entries ~next_entries ~chain_pending_entries
-    ~next_activation_epoch =
-  let validator =
-    Validator_config.build
+    ~next_activation_epoch ?program_trust_hash
+    ?runtime_profile_hash ?active_raw ?pending_raw () =
+  let base_validator =
+    Validator_config.build_bound
       ~chain_id
       ~consensus_mode
       ~current_height
@@ -265,21 +262,49 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height
       ~next_entries
       ~chain_pending_entries
       ~next_activation_epoch
+      ~program_trust_hash
+      ~runtime_profile_hash
   in
-  let consensus_config_hash = validator.consensus_config_hash in
-  match Octra_net.P2p_upgrade_plan.of_env ~current_config_hash:consensus_config_hash with
+  let validator =
+    Validator_config.bind_persistent_updates
+      ~chain_id
+      ~consensus_mode
+      ~current_height
+      ~active_raw
+      ~pending_raw
+      base_validator
+  in
+  match validator with
+  | Error error -> Error error
+  | Ok validator ->
+  let network_config_hash =
+    Octra_consensus.C_config.network_hash
+      ~chain_id
+      ?program_trust_hash
+      ?runtime_profile_hash
+      ()
+  in
+  match Octra_net.P2p_upgrade_plan.of_env ~current_config_hash:network_config_hash with
   | Error e -> Error e
   | Ok upgrade_plan ->
     match
       build_from_env
         env
         ~chain_id
-        ~consensus_config_hash
+        ~consensus_config_hash:network_config_hash
         ~allowed_pubkeys:validator.allowed_pubkeys
         ~upgrade_plan
     with
     | Error e -> Error e
     | Ok handshake ->
+      let handshake = {
+        handshake with
+        validator_pubkeys =
+          List.map
+            (fun validator ->
+              validator.Octra_consensus.C_types.pubkey)
+            validator.active_vs.validators;
+      } in
       let readiness_requirements = readiness_requirements env in
       Ok {
         validator;
@@ -292,16 +317,38 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height
       }
 
 let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
-    ~chain_pending_entries =
-  startup_config
-    ~env:(env_of_getenv getenv)
-    ~chain_id
-    ~consensus_mode
-    ~current_height
-    ~current_entries:(Validators.entries_of_env_name "OCTRA_VALIDATORS")
-    ~next_entries:(Validators.entries_of_env_name "OCTRA_VALIDATORS_NEXT")
-    ~chain_pending_entries
-    ~next_activation_epoch:(Validators.activation_epoch_int64 ())
+    ~chain_active_raw ~chain_pending_raw ~chain_pending_entries =
+  match Consensus_profile.validate getenv with
+  | Error error -> Error error
+  | Ok () ->
+    match Octra_vm.Program_trust.of_env getenv with
+    | Error error -> Error (Octra_vm.Program_trust.error_message error)
+    | Ok trust ->
+      let validator_policy =
+        Octra_core.Validator_policy.of_env_exn getenv
+      in
+      let env = env_of_getenv getenv in
+      let env =
+        if Octra_core.Validator_policy.lifecycle_enabled validator_policy then
+          { env with allow_dynamic_peers = true }
+        else
+          env
+      in
+      let runtime_profile_hash = Consensus_profile.hash getenv in
+      startup_config
+        ~env
+        ~chain_id
+        ~consensus_mode
+        ~current_height
+        ~current_entries:(Validators.entries_of_env_name "OCTRA_VALIDATORS")
+        ~next_entries:(Validators.entries_of_env_name "OCTRA_VALIDATORS_NEXT")
+        ~chain_pending_entries
+        ~next_activation_epoch:(Validators.activation_epoch_int64 ())
+        ?program_trust_hash:(Octra_vm.Program_trust.config_hash trust)
+        ~runtime_profile_hash
+        ?active_raw:chain_active_raw
+        ?pending_raw:chain_pending_raw
+        ()
 
 let install_node_startup_config deps ~current_height startup =
   let validator = startup.validator in
@@ -386,20 +433,22 @@ let swarm_params ~listen_port ~chain_id ~node_addr ~identity
   }
 
 let startup_swarm_params ~listen_port ~chain_id ~node_addr ~identity
-    ~bootstrap_peers ~best_epoch_fn ~best_root_fn startup =
+    ~bootstrap_peers ~best_epoch_fn ~best_root_fn
+    (startup : startup_config) =
   swarm_params
     ~listen_port
     ~chain_id
     ~node_addr
     ~identity
-    ~consensus_config_hash:startup.validator.consensus_config_hash
+    ~consensus_config_hash:startup.handshake.config_hash
     ~bootstrap_peers
     ~best_epoch_fn
     ~best_root_fn
     ~handshake:startup.handshake
 
 let node_startup_swarm_params ~listen_port ~chain_id ~node_addr ~priv_b64
-    ~pub_b64 ~bootstrap_peers ~best_epoch_fn ~best_root_fn startup =
+    ~pub_b64 ~bootstrap_peers ~best_epoch_fn ~best_root_fn
+    (startup : startup_config) =
   let identity = identity ~priv_b64 ~pub_b64 in
   startup_swarm_params
     ~listen_port
@@ -431,10 +480,21 @@ let swarm_config (params : swarm_params) =
   }
 
 let create_swarm params =
-  Octra_net.P2p_swarm.create (swarm_config params)
+  let swarm = Octra_net.P2p_swarm.create (swarm_config params) in
+  if params.handshake.validator_pubkeys = [] then
+    swarm
+  else
+    match
+      Octra_net.P2p_swarm.set_validator_pubkeys
+        swarm
+        params.handshake.validator_pubkeys
+    with
+    | Ok () -> swarm
+    | Error error -> invalid_arg error
 
 let start_node_swarm deps ~listen_port ~chain_id ~node_addr ~priv_b64
-    ~pub_b64 ~bootstrap_peers ~best_epoch_fn ~best_root_fn startup =
+    ~pub_b64 ~bootstrap_peers ~best_epoch_fn ~best_root_fn
+    (startup : startup_config) =
   let params =
     node_startup_swarm_params
       ~listen_port
@@ -464,6 +524,8 @@ let node_stack deps =
       ~chain_id:deps.chain_id
       ~consensus_mode:deps.consensus_mode
       ~current_height:deps.current_height
+      ~chain_active_raw:deps.chain_active_raw
+      ~chain_pending_raw:deps.chain_pending_raw
       ~chain_pending_entries:deps.chain_pending_entries
   with
   | Error e -> Error e

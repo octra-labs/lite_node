@@ -1,0 +1,17 @@
+contract BadNegativeAmount {
+  state {
+    balances: map[address]int
+  }
+
+  constructor(supply: int) {
+    self.balances[origin] = supply
+  }
+
+  fn transfer(to: address, amount: int): bool {
+    let bal = self.balances[caller]
+    require(bal >= amount, "insufficient balance")
+    self.balances[caller] = bal - amount
+    self.balances[to] = self.balances[to] + amount
+    return true
+  }
+}

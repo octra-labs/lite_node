@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type deploy = {
   address : string;
@@ -19,16 +7,30 @@ type deploy = {
   bytecode_b64 : string;
   owner : string;
   ctype : string;
+  admission : string;
   storage : (string, string) Hashtbl.t;
+}
+
+type upgrade = {
+  address : string;
+  expected_code_hash : string;
+  code_hash : string;
+  bytecode_b64 : string;
+  owner : string;
+  ctype : string;
+  admission : string;
+  version : string;
 }
 
 type snapshot = {
   deploys : deploy list;
+  upgrades : upgrade list;
   storage : (string, (string, string) Hashtbl.t) Hashtbl.t;
 }
 
 type t = {
   deploys : deploy list ref;
+  upgrades : upgrade list ref;
   storage : (string, (string, string) Hashtbl.t) Hashtbl.t;
 }
 
@@ -43,11 +45,16 @@ let copy_storage storage =
   copy
 
 let create () : t =
-  { deploys = ref []; storage = Hashtbl.create 16 }
+  {
+    deploys = ref [];
+    upgrades = ref [];
+    storage = Hashtbl.create 16;
+  }
 
 let snapshot (journal : t) : snapshot =
   {
     deploys = List.map copy_deploy !(journal.deploys);
+    upgrades = !(journal.upgrades);
     storage = copy_storage journal.storage;
   }
 
@@ -57,6 +64,7 @@ let restore_table target source =
 
 let restore (journal : t) (snapshot : snapshot) =
   journal.deploys := List.map copy_deploy snapshot.deploys;
+  journal.upgrades := snapshot.upgrades;
   let addresses =
     Hashtbl.fold (fun address _ items -> address :: items) journal.storage []
   in
@@ -80,6 +88,7 @@ let restore (journal : t) (snapshot : snapshot) =
 
 let discard (journal : t) =
   journal.deploys := [];
+  journal.upgrades := [];
   Hashtbl.reset journal.storage
 
 let add_deploy (journal : t) (deploy : deploy) =
@@ -89,13 +98,23 @@ let add_deploy (journal : t) (deploy : deploy) =
 
 let find_deploy (journal : t) address =
   !(journal.deploys)
-  |> List.find_opt (fun deploy -> String.equal deploy.address address)
+  |> List.find_opt (fun (deploy : deploy) -> String.equal deploy.address address)
   |> Option.map copy_deploy
 
 let has_deploy (journal : t) address =
   List.exists
-    (fun deploy -> String.equal deploy.address address)
+    (fun (deploy : deploy) -> String.equal deploy.address address)
     !(journal.deploys)
+
+let add_upgrade (journal : t) (upgrade : upgrade) =
+  journal.upgrades := upgrade :: !(journal.upgrades)
+
+let find_upgrade (journal : t) address =
+  !(journal.upgrades)
+  |> List.find_opt (fun (upgrade : upgrade) -> String.equal upgrade.address address)
+
+let has_upgrade (journal : t) address =
+  Option.is_some (find_upgrade journal address)
 
 let load_storage (journal : t) address =
   Option.map Hashtbl.copy (Hashtbl.find_opt journal.storage address)
@@ -110,6 +129,9 @@ let checkout_storage (journal : t) address ~fallback =
 
 let deploys (journal : t) =
   List.rev_map copy_deploy !(journal.deploys)
+
+let upgrades (journal : t) =
+  List.rev !(journal.upgrades)
 
 let storage_entries (journal : t) =
   Hashtbl.fold

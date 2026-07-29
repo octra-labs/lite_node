@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val with_address :
   Yojson.Safe.t ->
@@ -110,14 +98,6 @@ val ledger_chaindata_params_read :
 val account_lwt_read :
   with_account:('params -> 'ctx -> (string -> 'account -> 'result) -> 'result) ->
   (addr:string -> account:'account -> 'result) ->
-  'params ->
-  'ctx ->
-  'result
-
-val account_chaindata_lwt_read :
-  chaindata:('ctx -> 'chaindata) ->
-  with_account:('params -> 'ctx -> (string -> 'account -> 'result) -> 'result) ->
-  ('chaindata -> addr:string -> account:'account -> 'result) ->
   'params ->
   'ctx ->
   'result

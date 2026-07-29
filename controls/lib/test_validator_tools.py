@@ -1,0 +1,674 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
+
+import base64
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from nacl.signing import SigningKey
+
+from validator_common import ValidatorError
+from validator_common import address_from_pubkey
+from validator_common import ensure_wallet
+from validator_common import load_network
+from validator_common import parse_env
+from validator_common import rpc_url
+from validator_common import validate_checkpoint
+from validator_common import validate_network
+from validator_common import write_env
+from validator_config import canonical_pm2_name
+from validator_config import ROOT as CONFIG_ROOT
+from validator_config import tool_version
+from validator_config import install_verified_snapshot
+from validator_config import load_verified_snapshot
+from validator_config import maybe_sync
+from validator_config import parser
+from validator_config import resolve_sync_stage
+from validator_config import validate_advertise
+from validator_config import validate_sync_layout
+from validator_bundle import validate_bundle
+from validator_enroll import exact_member
+from validator_enroll import next_nonce
+from validator_enroll import require_admission_active
+from validator_enroll import resume_join_transaction
+from validator_guard import require_hashed_file
+from validator_process import process_plan
+from validator_process import process_pids
+from validator_process import remaining_owners
+from validator_process import wait_stopped
+from validator_status import promotion_readiness
+
+TMP_ROOT = CONFIG_ROOT / "tmp"
+WORK = TMP_ROOT / "validator_tools_test"
+
+def identity():
+    key = SigningKey.generate()
+    public_key = bytes(key.verify_key)
+    encoded = base64.b64encode(public_key).decode("ascii")
+    return address_from_pubkey(public_key), encoded
+
+def network_values(entitlement):
+    validators = ",".join(":".join(identity()) for _ in range(5))
+    exporter = ":".join(identity())
+    program_key = base64.b64encode(bytes(SigningKey.generate().verify_key)).decode("ascii")
+    return {
+        "OCTRA_BFT_PROPOSAL_BUILD_GRACE_MS": "180000",
+        "OCTRA_BFT_PROPOSAL_VERIFY_GRACE_MS": "180000",
+        "OCTRA_BFT_PROPOSE_TIMEOUT_MS": "180000",
+        "OCTRA_BFT_RELEASE_PROFILE": "devnet_full_v1",
+        "OCTRA_BINARY_HASH": "1" * 64,
+        "OCTRA_BOOTSTRAP_PEERS": "10.0.0.1:19000,10.0.0.2:19000",
+        "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
+        "OCTRA_CHECKPOINT_EPOCH": "99",
+        "OCTRA_CHECKPOINT_STATE_ROOT": "3" * 64,
+        "OCTRA_CHECKPOINT_TXID_HI": "500",
+        "OCTRA_CONSENSUS_CONFIG_HASH": "4" * 64,
+        "OCTRA_EMISSION_ACTIVATION_EPOCH": "100",
+        "OCTRA_EPOCH_DURATION": "10",
+        "OCTRA_FHE_MAX_PER_EPOCH": "1",
+        "OCTRA_P2P_REQUIRE_BINARY_HASH": "1",
+        "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH": "100",
+        "OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH": "200",
+        "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH": "150",
+        "OCTRA_PROGRAM_RELEASE_KEYS": f"release={program_key}",
+        "OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH": "100",
+        "OCTRA_PVAC_MIGRATION_ENTITLEMENTS": str(entitlement),
+        "OCTRA_PVAC_MIGRATION_ROOT": "2" * 64,
+        "OCTRA_STEALTH_MAX_PER_EPOCH": "1",
+        "OCTRA_STATE_SYNC_EXPORTERS": exporter,
+        "OCTRA_STATE_SYNC_SOURCES": "https://seed-a.example,https://seed-b.example",
+        "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "200",
+        "OCTRA_VALIDATORS": validators,
+    }
+
+class ValidatorToolsTest(unittest.TestCase):
+    def setUp(self):
+        if WORK.exists():
+            shutil.rmtree(WORK)
+        WORK.mkdir(parents=True)
+        self.entitlement = WORK / "entitlements.json"
+        self.entitlement.write_text(json.dumps({
+            "schema": "octra_pvac_migration_entitlements_v2",
+            "chain_id": "octra-devnet-bft-v1",
+            "snapshot_epoch": 99,
+            "state_root": "3" * 64,
+            "activation_epoch": 100,
+            "root": "2" * 64,
+            "entries": [],
+        }), encoding="utf-8")
+
+    def tearDown(self):
+        if WORK.exists():
+            shutil.rmtree(WORK)
+        if TMP_ROOT.exists():
+            try:
+                TMP_ROOT.rmdir()
+            except OSError:
+                pass
+
+    def test_wallet_is_canonical_and_private(self):
+        wallet_path = WORK / "data/wallet.json"
+        wallet = ensure_wallet(wallet_path)
+        self.assertEqual(len(wallet["address"]), 47)
+        self.assertEqual(os.stat(wallet_path).st_mode & 0o777, 0o600)
+        self.assertEqual(ensure_wallet(wallet_path), wallet)
+
+    def test_network_bundle_round_trip(self):
+        bundle = WORK / "network.env"
+        values = network_values(self.entitlement)
+        write_env(bundle, values)
+        digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        _, loaded_digest, loaded = load_network(bundle, digest)
+        self.assertEqual(loaded_digest, digest)
+        self.assertEqual(loaded["OCTRA_FHE_MAX_PER_EPOCH"], "1")
+        self.assertEqual(loaded["OCTRA_BFT_PROPOSE_TIMEOUT_MS"], "180000")
+        self.assertEqual(loaded["OCTRA_PEERS"], values["OCTRA_BOOTSTRAP_PEERS"])
+
+    def test_network_rejects_unsafe_override(self):
+        values = network_values(self.entitlement)
+        values["OCTRA_ALLOW_UNSAFE_QUORUM"] = "1"
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_network_rejects_address_key_mismatch(self):
+        values = network_values(self.entitlement)
+        entries = values["OCTRA_VALIDATORS"].split(",")
+        address, _ = entries[0].split(":", 1)
+        _, other_key = identity()
+        entries[0] = f"{address}:{other_key}"
+        values["OCTRA_VALIDATORS"] = ",".join(entries)
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_network_rejects_activation_drift(self):
+        values = network_values(self.entitlement)
+        values["OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH"] = "101"
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_network_rejects_entitlement_metadata_drift(self):
+        values = network_values(self.entitlement)
+        payload = json.loads(self.entitlement.read_text(encoding="utf-8"))
+        payload["chain_id"] = "octra-devnet-other"
+        self.entitlement.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_bundle_validator_binds_binary_hash(self):
+        bundle = WORK / "network.env"
+        binary = WORK / "octra_node.exe"
+        binary.write_bytes(b"candidate")
+        values = network_values(self.entitlement)
+        values["OCTRA_BINARY_HASH"] = hashlib.sha256(b"candidate").hexdigest()
+        write_env(bundle, values)
+        loaded, digest = validate_bundle(bundle, binary)
+        self.assertEqual(loaded["OCTRA_BINARY_HASH"], values["OCTRA_BINARY_HASH"])
+        self.assertEqual(digest, hashlib.sha256(bundle.read_bytes()).hexdigest())
+        binary.write_bytes(b"other")
+        with self.assertRaises(ValidatorError):
+            validate_bundle(bundle, binary)
+
+    def test_network_requires_permissionless_validator_activation(self):
+        values = network_values(self.entitlement)
+        del values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"]
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_network_requires_proposal_protocol_activation(self):
+        values = network_values(self.entitlement)
+        del values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"]
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_proposal_protocol_activation_follows_checkpoint(self):
+        values = network_values(self.entitlement)
+        values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"] = "99"
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_validator_activation_cannot_precede_emission(self):
+        values = network_values(self.entitlement)
+        values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"] = "99"
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_network_rejects_public_plain_http_state_sync(self):
+        values = network_values(self.entitlement)
+        values["OCTRA_STATE_SYNC_SOURCES"] = (
+            "http://203.0.113.1:8080,https://seed-b.example"
+        )
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_advertise_uses_consensus_port(self):
+        self.assertEqual(
+            validate_advertise("203.0.113.1:19000", 19000),
+            "203.0.113.1:19000",
+        )
+        with self.assertRaises(ValidatorError):
+            validate_advertise("203.0.113.1:9000", 19000)
+
+    def test_rpc_url_requires_secure_public_transport(self):
+        self.assertEqual(
+            rpc_url("https://devnet.example/rpc"),
+            "https://devnet.example/rpc",
+        )
+        self.assertEqual(
+            rpc_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/rpc",
+        )
+        with self.assertRaises(ValidatorError):
+            rpc_url("http://203.0.113.1:8080/rpc")
+
+    def test_membership_requires_exact_identity(self):
+        address, pubkey = identity()
+        wallet = {"address": address, "pub": pubkey}
+        self.assertTrue(
+            exact_member([{"address": address, "pubkey": pubkey}], wallet)
+        )
+        self.assertFalse(exact_member([], wallet))
+        with self.assertRaises(ValidatorError):
+            exact_member([{"address": address, "pubkey": identity()[1]}], wallet)
+
+    def test_enrollment_nonce_comes_from_local_observer(self):
+        wallet = {"address": identity()[0]}
+        values = {"OCTRA_API_PORT": "8080"}
+        with mock.patch(
+            "validator_enroll.call",
+            return_value={"nonce": 41},
+        ) as invoke:
+            self.assertEqual(next_nonce(values, wallet), 42)
+        self.assertEqual(
+            invoke.call_args.args,
+            ("http://127.0.0.1:8080/rpc", "octra_account", [wallet["address"], 1]),
+        )
+
+    def test_admission_waits_for_activation_epoch(self):
+        values = {
+            "OCTRA_API_PORT": "8080",
+            "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "100",
+        }
+        with mock.patch(
+            "validator_enroll.call",
+            return_value={"head_epoch": 99, "state_root": "a" * 64},
+        ):
+            with self.assertRaises(ValidatorError):
+                require_admission_active(values)
+        with mock.patch(
+            "validator_enroll.call",
+            return_value={"head_epoch": 100, "state_root": "a" * 64},
+        ):
+            require_admission_active(values)
+
+    def test_join_resumes_confirmed_transaction(self):
+        config = WORK / "node.env"
+        config.write_text("", encoding="utf-8")
+        state = {
+            "version": "octra-validator-enrollment",
+            "transactions": {
+                "bond": {
+                    "tx_hash": "a" * 64,
+                    "submitted_at": 1,
+                },
+            },
+        }
+        (WORK / "enrollment.json").write_text(
+            json.dumps(state),
+            encoding="utf-8",
+        )
+        values = {"OCTRA_API_PORT": "8080"}
+        args = mock.Mock(no_wait=False, wait_seconds=1, poll_seconds=0.1)
+        with mock.patch(
+            "validator_enroll.transaction",
+            return_value={"status": "confirmed", "epoch": 101},
+        ):
+            self.assertTrue(
+                resume_join_transaction(config, values, "bond", args)
+            )
+        self.assertFalse(
+            resume_join_transaction(config, values, "ready", args)
+        )
+
+    def test_pm2_name_is_canonical(self):
+        self.assertEqual(canonical_pm2_name("val01"), "octra-val01")
+        self.assertEqual(canonical_pm2_name("octra-val01"), "octra-val01")
+
+    def test_promotion_readiness_tracks_observer_marker(self):
+        values = {"OCTRA_OPERATOR_ROLE": "observer"}
+        self.assertEqual(promotion_readiness(values, WORK), "pending")
+        (WORK / "ready_to_vote.json").write_text("{}\n", encoding="utf-8")
+        self.assertEqual(promotion_readiness(values, WORK), "ready")
+
+    def test_active_validator_does_not_require_promotion_marker(self):
+        values = {"OCTRA_OPERATOR_ROLE": "validator"}
+        self.assertEqual(promotion_readiness(values, WORK), "not_required")
+
+    def test_strict_validator_requires_promotion_marker(self):
+        values = {
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_VALIDATOR_READY_STRICT": "1",
+        }
+        self.assertEqual(promotion_readiness(values, WORK), "pending")
+        (WORK / "ready_to_vote.json").write_text("{}\n", encoding="utf-8")
+        self.assertEqual(promotion_readiness(values, WORK), "ready")
+
+    def test_permissionless_validator_uses_canonical_readiness(self):
+        values = {
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "100",
+            "OCTRA_VALIDATOR_READY_STRICT": "1",
+        }
+        self.assertEqual(promotion_readiness(values, WORK), "not_required")
+
+    def test_verified_snapshot_installs_atomically(self):
+        values = network_values(self.entitlement)
+        snapshot = WORK / "stage/snapshots/abc"
+        data = snapshot / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":101,"state_root":"' + "5" * 64 + '","txid_hi":"510"}\n',
+            encoding="utf-8",
+        )
+        marker = {
+            "version": "octra-state-sync-verified",
+            "status": "snapshot_verified",
+            "voting": False,
+            "chain_id": values["OCTRA_CHAIN_ID"],
+            "config_hash": values["OCTRA_CONSENSUS_CONFIG_HASH"],
+            "manifest_hash": "a" * 64,
+            "snapshot_epoch": "101",
+        }
+        (snapshot / "snapshot_verified.json").write_text(
+            json.dumps(marker),
+            encoding="utf-8",
+        )
+        (snapshot / "certificate.json").write_text("{}\n", encoding="utf-8")
+        selected = load_verified_snapshot(WORK / "stage", values)
+        target = WORK / "installed"
+        install_verified_snapshot(selected, target)
+        self.assertTrue((target / "HEAD.json").is_file())
+        self.assertTrue((target / ".state_sync/snapshot_verified.json").is_file())
+        self.assertFalse(data.exists())
+
+    def test_checkpoint_rejects_wrong_root(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "4" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValidatorError):
+            validate_checkpoint(data, network_values(self.entitlement))
+
+    def test_checkpoint_allows_progress_for_restart(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":101,"state_root":"' + "5" * 64 + '","txid_hi":"510"}\n',
+            encoding="utf-8",
+        )
+        values = network_values(self.entitlement)
+        validate_checkpoint(data, values, allow_progress=True)
+        with self.assertRaises(ValidatorError):
+            validate_checkpoint(data, values)
+
+    def test_env_parser_never_executes_values(self):
+        marker = WORK / "executed"
+        bundle = WORK / "hostile.env"
+        bundle.write_text(f"OCTRA_CHAIN_ID='$(touch {marker})'\n", encoding="utf-8")
+        values = parse_env(bundle)
+        self.assertFalse(marker.exists())
+        self.assertEqual(values["OCTRA_CHAIN_ID"], f"$(touch {marker})")
+
+    def test_run_rebinds_candidate_path(self):
+        source_path = Path(__file__).resolve().parent / "run.sh"
+        exported_path = Path(__file__).resolve().parent.parent / "run.sh"
+        script_path = source_path if source_path.is_file() else exported_path
+        script = script_path.read_text(encoding="utf-8")
+        guard = script.index("validator_guard.py")
+        source = script.index('. "$CONFIG"')
+        cleanup = script.index("validator_process.py")
+        runtime = script.index('mkdir -p "$ROOT/data"')
+        start = script.index('pm2 start "$OCTRA_OPERATOR_BINARY"')
+        self.assertLess(guard, source)
+        self.assertLess(source, cleanup)
+        self.assertLess(cleanup, start)
+        self.assertLess(runtime, start)
+        self.assertNotIn("pm2 restart", script)
+
+    def test_install_prepares_operator_data_root(self):
+        source_path = Path(__file__).resolve().parent / "install.sh"
+        exported_path = Path(__file__).resolve().parent.parent / "install.sh"
+        script_path = source_path if source_path.is_file() else exported_path
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("OCTRA_DATA_ROOT", script)
+        self.assertIn('run_root install -d -m 700 -o "$OPERATOR_USER"', script)
+
+    def test_gate_reports_missing_python_runtime(self):
+        source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
+        exported_path = Path(__file__).resolve().parent.parent / "check.sh"
+        script_path = source_path if source_path.is_file() else exported_path
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("python3_missing", script)
+        self.assertIn("python3_nacl_missing", script)
+
+    def test_gate_requires_source_commit(self):
+        source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
+        exported_path = Path(__file__).resolve().parent.parent / "check.sh"
+        script_path = source_path if source_path.is_file() else exported_path
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn("source_commit_missing", script)
+        self.assertIn("source_commit_invalid", script)
+
+    def test_sync_budget_matches_seed_capacity(self):
+        args = parser().parse_args([])
+        self.assertEqual(args.sync_concurrency, 4)
+        self.assertEqual(args.sync_source_concurrency, 1)
+        self.assertIsNone(args.sync_stage)
+
+    def test_default_sync_stage_is_sibling(self):
+        data = WORK / "node"
+        self.assertEqual(
+            resolve_sync_stage(None, data),
+            (WORK / "node.state_sync").resolve(),
+        )
+
+    def test_nested_sync_stage_is_rejected(self):
+        data = WORK / "node"
+        with self.assertRaises(ValidatorError):
+            validate_sync_layout(data / "state_sync", data)
+
+    def test_sync_budget_reaches_client(self):
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        args = parser().parse_args([
+            "--sync",
+            "--sync-binary",
+            str(sync_binary),
+            "--sync-stage",
+            str(WORK / "stage"),
+            "--yes",
+        ])
+        with mock.patch("validator_config.run", side_effect=RuntimeError("captured")) as invoke:
+            with self.assertRaisesRegex(RuntimeError, "captured"):
+                maybe_sync(args, str(WORK / "data"), network_values(self.entitlement))
+        command = invoke.call_args.args[0]
+        self.assertEqual(command[command.index("--concurrency") + 1], "4")
+        self.assertEqual(command[command.index("--source-concurrency") + 1], "1")
+
+    def test_config_root_matches_layout(self):
+        source = Path(__file__).resolve()
+        expected = source.parents[2] if source.parents[1].name == "controls" else source.parents[3]
+        self.assertEqual(CONFIG_ROOT, expected)
+
+    def test_tool_version(self):
+        self.assertEqual(tool_version("rustc 1.85.1 (test)"), (1, 85, 1))
+        self.assertEqual(tool_version("rustc 1.80"), (1, 80, 0))
+        with self.assertRaises(ValidatorError):
+            tool_version("rustc invalid")
+
+    def test_hashed_file_rejects_tampering(self):
+        worker = WORK / "octra_pvac_worker.exe"
+        worker.write_bytes(b"worker")
+        values = {
+            "OCTRA_PVAC_VERIFY_WORKER": str(worker),
+            "OCTRA_PVAC_VERIFY_WORKER_HASH": hashlib.sha256(b"worker").hexdigest(),
+        }
+        self.assertEqual(
+            require_hashed_file(
+                values,
+                "OCTRA_PVAC_VERIFY_WORKER",
+                "OCTRA_PVAC_VERIFY_WORKER_HASH",
+            ),
+            worker,
+        )
+        worker.write_bytes(b"tampered")
+        with self.assertRaises(ValidatorError):
+            require_hashed_file(
+                values,
+                "OCTRA_PVAC_VERIFY_WORKER",
+                "OCTRA_PVAC_VERIFY_WORKER_HASH",
+            )
+
+    def test_control_builder_creates_canonical_bond_proof(self):
+        built = CONFIG_ROOT / "_build/default/bin/bft_control_tx.exe"
+        packaged = CONFIG_ROOT / "artifacts/bft_control_tx.exe"
+        binary = built if built.is_file() else packaged
+        if not binary.is_file():
+            self.skipTest("bft_control_tx is not built")
+        if binary.read_bytes()[:4] == b"\x7fELF" and sys.platform != "linux":
+            self.skipTest("packaged bft_control_tx requires Linux")
+        wallet_path = WORK / "wallet.json"
+        wallet = ensure_wallet(wallet_path)
+        result = subprocess.run(
+            [
+                str(binary),
+                "--wallet",
+                str(wallet_path),
+                "--rpc",
+                "http://127.0.0.1:1/rpc",
+                "--chain-id",
+                "octra-devnet-test",
+                "--op",
+                "validator_bond",
+                "--amount",
+                "1000000",
+                "--nonce",
+                "7",
+                "--print-only",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tx = json.loads(result.stdout)
+        payload = json.loads(tx["message"])
+        public_key = base64.b64decode(wallet["pub"])
+        fields = [
+            b"octra:validator_bond:v1",
+            b"octra-devnet-test",
+            wallet["address"].encode("ascii"),
+            b"1000000",
+            b"7",
+            public_key,
+        ]
+        message = b"".join(
+            str(len(field)).encode("ascii") + b":" + field
+            for field in fields
+        )
+        SigningKey(base64.b64decode(wallet["priv"])).verify_key.verify(
+            message,
+            base64.b64decode(payload["proof"]),
+        )
+        escrow = address_from_pubkey(
+            hashlib.sha256(b"octra:validator_bond:escrow").digest()
+        )
+        self.assertEqual(tx["to_"], escrow)
+        self.assertEqual(tx["nonce"], 7)
+        self.assertEqual(payload["consensus_pubkey"], wallet["pub"])
+
+    def test_process_plan_removes_stale_owner(self):
+        entries = [
+            {
+                "name": "octra-old",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/octra",
+                    "status": "stopped",
+                },
+            },
+        ]
+        self.assertEqual(
+            process_plan(entries, "octra-new", "/data/octra"),
+            ["octra-old"],
+        )
+
+    def test_process_plan_accepts_fresh_install(self):
+        self.assertEqual(
+            process_plan([], "octra-new", "/data/octra"),
+            [],
+        )
+
+    def test_process_plan_rejects_active_owner(self):
+        entries = [
+            {
+                "name": "octra-old",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/octra",
+                    "status": "online",
+                },
+            },
+        ]
+        with self.assertRaises(ValidatorError):
+            process_plan(entries, "octra-new", "/data/octra")
+
+    def test_process_pids_tracks_deleted_entries(self):
+        entries = [
+            {
+                "name": "octra-new",
+                "pid": 201,
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/octra",
+                    "status": "online",
+                },
+            },
+            {
+                "name": "octra-old",
+                "pid": 199,
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/octra",
+                    "status": "stopped",
+                },
+            },
+            {
+                "name": "other",
+                "pid": 301,
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/other",
+                    "status": "online",
+                },
+            },
+        ]
+        self.assertEqual(
+            process_pids(entries, ["octra-new", "octra-old"]),
+            [199, 201],
+        )
+
+    def test_remaining_owners_detects_name_and_data_dir(self):
+        entries = [
+            {
+                "name": "octra-new",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/new",
+                },
+            },
+            {
+                "name": "octra-renamed",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/octra",
+                },
+            },
+            {
+                "name": "other",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/other",
+                },
+            },
+        ]
+        self.assertEqual(
+            remaining_owners(entries, ["octra-new"], "/data/octra"),
+            ["octra-new", "octra-renamed"],
+        )
+
+    def test_wait_stopped_observes_process_exit(self):
+        with mock.patch(
+            "validator_process.process_alive",
+            side_effect=[True, False],
+        ) as alive:
+            with mock.patch("validator_process.time.sleep"):
+                wait_stopped([41], timeout=5.0, poll=0.0)
+        self.assertEqual(alive.call_count, 2)
+
+    def test_wait_stopped_refuses_lingering_process(self):
+        with mock.patch(
+            "validator_process.process_alive",
+            return_value=True,
+        ):
+            with mock.patch(
+                "validator_process.time.monotonic",
+                side_effect=[0.0, 2.0],
+            ):
+                with self.assertRaises(ValidatorError):
+                    wait_stopped([41], timeout=1.0, poll=0.0)
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,27 +1,23 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module Epoch_exec = Octra_core.Epoch_exec
 
-type process = Transaction.t -> (unit, string * string) result Lwt.t
+type process =
+  Transaction.t ->
+  (Epoch_exec.tx_effect, string * string) result Lwt.t
 
 type deps = {
   process : process;
   confirm : Transaction.t -> unit;
   reject : Transaction.t -> error_type:string -> reason:string -> unit;
+  reject_after_fee :
+    Transaction.t ->
+    fee:Z.t ->
+    error_type:string ->
+    reason:string ->
+    unit;
 }
 
 type standard_or_sender_deps = {
@@ -39,11 +35,23 @@ type runtime = {
   exit : unit -> unit;
   backend : unit -> Epoch_exec.backend;
   env : unit -> Epoch_exec.env;
+  max_fhe_per_epoch : int;
+  max_stealth_per_epoch : int;
   process_sender : Transaction.t list -> unit Lwt.t;
   confirm_tx : Transaction.t -> unit;
   reject_tx : Transaction.t -> string -> string -> unit;
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
+  program_trust : Octra_vm.Program_trust.t;
+  legacy_replay :
+    epoch:int ->
+    address:string ->
+    cipher:string ->
+    Octra_core.Pvac_legacy_public_replay.decision;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
+  add_rejected_fee : Z.t -> unit;
 }
 
 type node_runtime = {
@@ -74,6 +82,14 @@ type node_runtime = {
   notify_new_account : string -> unit;
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
+  legacy_replay :
+    epoch:int ->
+    address:string ->
+    cipher:string ->
+    Octra_core.Pvac_legacy_public_replay.decision;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
 }
 
 type node_result = {
@@ -101,15 +117,18 @@ val run_standard_or_sender :
   unit Lwt.t
 
 val runtime_deps :
+  ?preverify:Octra_core.Preverify_commit.t ->
   runtime ->
   standard_or_sender_deps
 
 val run_runtime :
+  ?preverify:Octra_core.Preverify_commit.t ->
   runtime ->
   Transaction.t list ->
   unit Lwt.t
 
 val run_node :
+  ?preverify:Octra_core.Preverify_commit.t ->
   node_runtime ->
   Transaction.t list ->
   node_result Lwt.t

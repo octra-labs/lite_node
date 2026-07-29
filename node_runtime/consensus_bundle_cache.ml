@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module C_types = Octra_consensus.C_types
@@ -52,6 +40,8 @@ type t = {
   fifo : string Queue.t;
   cap : int;
   frozen : (string, frozen) Hashtbl.t;
+  preverify : (string, Octra_core.Preverify_worker.checked Lwt.t) Hashtbl.t;
+  preverify_fifo : string Queue.t;
   mutable stores : int;
   mutable hits : int;
   mutable misses : int;
@@ -79,6 +69,8 @@ let create ~cap =
     fifo = Queue.create ();
     cap;
     frozen = Hashtbl.create 16;
+    preverify = Hashtbl.create 8;
+    preverify_fifo = Queue.create ();
     stores = 0;
     hits = 0;
     misses = 0;
@@ -255,3 +247,66 @@ let prune_frozen t ~finalized_epoch =
       []
   in
   List.iter (Hashtbl.remove t.frozen) doomed
+
+let add_key_part buffer value =
+  Buffer.add_string buffer (string_of_int (String.length value));
+  Buffer.add_char buffer ':';
+  Buffer.add_string buffer value
+
+let preverify_item_key ~state_root ~tx_hash =
+  let buffer = Buffer.create 256 in
+  add_key_part buffer state_root;
+  add_key_part buffer tx_hash;
+  Octra_net.Hash_domain.hash
+    "octra:consensus_preverify_item_cache:v1"
+    (Buffer.contents buffer)
+
+let evict_preverify t =
+  let rec loop () =
+    if Hashtbl.length t.preverify > t.cap then
+      match Queue.take_opt t.preverify_fifo with
+      | Some key ->
+        Hashtbl.remove t.preverify key;
+        loop ()
+      | None -> ()
+  in
+  loop ()
+
+let run_preverify_item_once t ~state_root ~tx_hash verify =
+  let key = preverify_item_key ~state_root ~tx_hash in
+  match Hashtbl.find_opt t.preverify key with
+  | Some job ->
+    Lwt.protected job
+  | None ->
+    let job =
+      try verify () with exn -> Lwt.fail exn
+    in
+    Hashtbl.add t.preverify key job;
+    Queue.push key t.preverify_fifo;
+    Lwt.on_failure job (fun _ ->
+      match Hashtbl.find_opt t.preverify key with
+      | Some current when current == job ->
+        Hashtbl.remove t.preverify key
+      | Some _ | None -> ());
+    evict_preverify t;
+    Lwt.protected job
+
+let run_preverify_once t ~state_root ~tx_hashes ~txs verify =
+  let recomputed = List.map Transaction.hash txs in
+  if recomputed <> tx_hashes then
+    Lwt.fail_with "consensus preverify hash mismatch"
+  else
+    let verify_item tx =
+      let tx_hash = Transaction.hash tx in
+      run_preverify_item_once
+        t
+        ~state_root
+        ~tx_hash
+        (fun () ->
+          let open Lwt.Syntax in
+          let* batch = verify [tx] in
+          match Octra_core.Preverify_worker.checked_of_single_batch tx batch with
+          | Ok checked -> Lwt.return checked
+          | Error reason -> Lwt.fail_with reason)
+    in
+    Octra_core.Preverify_worker.run_checked verify_item txs

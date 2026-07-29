@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type env = {
   int_value : string -> int -> int;
@@ -45,39 +33,67 @@ let z_value raw ~default =
   | Some s -> (try Z.of_string s with _ -> default)
   | None -> default
 
+let bounded_int env name ~fallback ~low ~high =
+  let value = env.int_value name fallback in
+  if value < low || value > high then fallback else value
+
+let bounded_z raw ~fallback ~high =
+  let value = z_value raw ~default:fallback in
+  if Z.sign value <= 0 || Z.gt value high then fallback else value
+
 let private_limits env =
   {
-    max_stealth_defer = env.int_value "OCTRA_STEALTH_MAX_DEFER" 30;
-    max_stealth_per_epoch = env.int_value "OCTRA_STEALTH_MAX_PER_EPOCH" 4;
-    max_fhe_per_epoch = env.int_value "OCTRA_FHE_MAX_PER_EPOCH" 8;
+    max_stealth_defer =
+      bounded_int env "OCTRA_STEALTH_MAX_DEFER" ~fallback:30 ~low:0 ~high:10_000;
+    max_stealth_per_epoch =
+      bounded_int env "OCTRA_STEALTH_MAX_PER_EPOCH" ~fallback:4 ~low:0 ~high:128;
+    max_fhe_per_epoch =
+      bounded_int env "OCTRA_FHE_MAX_PER_EPOCH" ~fallback:8 ~low:0 ~high:128;
     stealth_inline_verify_allowed =
       bool_flag (env.opt "OCTRA_STEALTH_INLINE_VERIFY");
   }
 
 let consensus_limits env =
+  let liveness_floor =
+    (Octra_consensus.C_engine.max_timeout_ms / 1000) + 30
+  in
   {
     quarantine_mismatch_threshold =
-      env.int_value "OCTRA_QUARANTINE_MISMATCH_THRESHOLD" 3;
+      bounded_int env "OCTRA_QUARANTINE_MISMATCH_THRESHOLD"
+        ~fallback:3 ~low:1 ~high:100;
     quarantine_poll_sec =
-      float_of_int (env.int_value "OCTRA_QUARANTINE_POLL_SEC" 15);
+      float_of_int (bounded_int env "OCTRA_QUARANTINE_POLL_SEC"
+        ~fallback:15 ~low:1 ~high:300);
     quarantine_ahead_streak_threshold =
-      env.int_value "OCTRA_QUARANTINE_AHEAD_STREAK_THRESHOLD" 5;
+      bounded_int env "OCTRA_QUARANTINE_AHEAD_STREAK_THRESHOLD"
+        ~fallback:5 ~low:1 ~high:100;
     quarantine_ahead_grace_epochs =
-      env.int_value "OCTRA_QUARANTINE_AHEAD_GRACE_EPOCHS" 32;
+      bounded_int env "OCTRA_QUARANTINE_AHEAD_GRACE_EPOCHS"
+        ~fallback:32 ~low:0 ~high:100_000;
     quarantine_ahead_drift_tolerance =
-      env.int_value "OCTRA_QUARANTINE_AHEAD_DRIFT_TOLERANCE" 2;
+      bounded_int env "OCTRA_QUARANTINE_AHEAD_DRIFT_TOLERANCE"
+        ~fallback:2 ~low:0 ~high:10_000;
     soft_catchup_max_lag =
-      env.int_value "OCTRA_CATCHUP_SOFT_MAX_LAG" 4;
+      bounded_int env "OCTRA_CATCHUP_SOFT_MAX_LAG"
+        ~fallback:4 ~low:0 ~high:10_000;
     consensus_liveness_stall_sec =
-      float_of_int (env.int_value "OCTRA_BFT_LIVENESS_STALL_SEC" 90);
+      float_of_int (bounded_int env "OCTRA_BFT_LIVENESS_STALL_SEC"
+        ~fallback:liveness_floor ~low:liveness_floor ~high:3_600);
     bundle_cache_cap =
-      env.int_value "OCTRA_BUNDLE_CACHE_CAP" 4096;
+      bounded_int env "OCTRA_BUNDLE_CACHE_CAP"
+        ~fallback:4096 ~low:64 ~high:65_536;
   }
 
 let proposal_limits env ~default_max_ou =
-  let max_txs = env.int_value "OCTRA_BFT_PROPOSAL_MAX_TXS" 1000 in
-  let max_bytes = env.int_value "OCTRA_BFT_PROPOSAL_MAX_BYTES" 5_000_000 in
+  let max_txs = bounded_int env "OCTRA_BFT_PROPOSAL_MAX_TXS"
+    ~fallback:1000 ~low:1 ~high:10_000 in
+  let max_bytes = bounded_int env "OCTRA_BFT_PROPOSAL_MAX_BYTES"
+    ~fallback:5_000_000 ~low:1024 ~high:(32 * 1024 * 1024) in
   let max_ou =
-    z_value (env.opt "OCTRA_BFT_PROPOSAL_MAX_OU") ~default:default_max_ou
+    bounded_z (env.opt "OCTRA_BFT_PROPOSAL_MAX_OU")
+      ~fallback:default_max_ou ~high:default_max_ou
   in
   Consensus_proposal.limits ~max_txs ~max_bytes ~max_ou
+
+let multi_exec_max env =
+  bounded_int env "OCTRA_MULTI_EXEC_MAX_CALLS" ~fallback:8 ~low:1 ~high:64

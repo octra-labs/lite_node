@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   rows : (string, P2p_peer_record.t) Hashtbl.t;
@@ -26,6 +14,9 @@ type add_result =
 
 let create ?(ttl_s = 300.0) ?(max_per_bucket = 4) () =
   { rows = Hashtbl.create 32; ttl_s; max_per_bucket }
+
+let clear t =
+  Hashtbl.clear t.rows
 
 let live ~now t r =
   let age = now -. Int64.to_float r.P2p_peer_record.ts in

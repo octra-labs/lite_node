@@ -1,0 +1,40 @@
+contract UintOverflowProbe {
+  state {
+    u64_value: u64
+    u128_value: u128
+    u256_value: u256
+  }
+
+  constructor(seed64: u64, seed128: u128, seed256: u256) {
+    self.u64_value = seed64
+    self.u128_value = seed128
+    self.u256_value = seed256
+  }
+
+  view fn get64(): u64 {
+    return self.u64_value
+  }
+
+  view fn get128(): u128 {
+    return self.u128_value
+  }
+
+  view fn get256(): u256 {
+    return self.u256_value
+  }
+
+  fn add64(amount: u64): bool {
+    self.u64_value = self.u64_value + amount
+    return true
+  }
+
+  fn add128(amount: u128): bool {
+    self.u128_value = self.u128_value + amount
+    return true
+  }
+
+  fn add256(amount: u256): bool {
+    self.u256_value = self.u256_value + amount
+    return true
+  }
+}

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Rpc = Octra_core.Rpc
 module Store_chaindata = Octra_core.Store_chaindata
@@ -31,7 +19,7 @@ type 'handler dispatch_adapters = {
 }
 
 type tx_epoch_cache_entry = {
-  tx_epoch_cache_t : float;
+  tx_epoch_cache_deadline : float;
   tx_epoch_cache_v : Yojson.Safe.t;
 }
 
@@ -56,12 +44,13 @@ let tx_epoch_recent_ttl =
 let tx_epoch_old_ttl =
   float_of_int (max 1 (Env.int_value "OCTRA_TX_BY_EPOCH_OLD_TTL" 3600))
 
-let tx_epoch_cache_key epoch_id limit offset =
-  Printf.sprintf "%d:%d:%d" epoch_id limit offset
-
-let tx_epoch_cache_get key ttl =
+let tx_epoch_cache_get key =
+  let now = Unix.gettimeofday () in
   match Hashtbl.find_opt tx_epoch_cache key with
-  | Some entry when Unix.gettimeofday () -. entry.tx_epoch_cache_t <= ttl ->
+  | Some entry
+    when History.epoch_page_cache_live
+      ~now
+      ~deadline:entry.tx_epoch_cache_deadline ->
     Some entry.tx_epoch_cache_v
   | Some _ ->
     Hashtbl.remove tx_epoch_cache key;
@@ -69,19 +58,28 @@ let tx_epoch_cache_get key ttl =
   | None ->
     None
 
-let tx_epoch_cache_put key value =
+let tx_epoch_cache_put key ~ttl value =
   if Hashtbl.length tx_epoch_cache >= tx_epoch_cache_max then
     Hashtbl.clear tx_epoch_cache;
+  let now = Unix.gettimeofday () in
   Hashtbl.replace
     tx_epoch_cache
     key
     {
-      tx_epoch_cache_t = Unix.gettimeofday ();
+      tx_epoch_cache_deadline =
+        History.epoch_page_cache_deadline ~now ~ttl;
       tx_epoch_cache_v = value;
     }
 
 let tx_lookup_recent_heal_window () =
   Env.int_value "OCTRA_TX_HEAL_RECENT_EPOCHS" 256
+
+let bounded_heal_limit value =
+  min 4096 (max 0 value)
+
+let tx_lookup_recent_heal_limit () =
+  Env.int_value "OCTRA_TX_HEAL_MAX_RECORDS" 256
+  |> bounded_heal_limit
 
 let txid_epoch_heal_recent_window () =
   Env.int_value "OCTRA_TXID_HEAL_RECENT_EPOCHS" 256
@@ -102,21 +100,24 @@ let lookup_confirmed_tx_with_heal chaindata txh =
     hit
   | None ->
     let recent_epochs = tx_lookup_recent_heal_window () in
-    if recent_epochs <= 0 then None
+    let max_records = tx_lookup_recent_heal_limit () in
+    if recent_epochs <= 0 || max_records <= 0 then None
     else
       match
         Store_chaindata.heal_tx_by_hash_recent
           chaindata
           ~hash:txh
           ~recent_epochs
+          ~max_records
       with
       | Some (epoch_id, tx_json) ->
         Log.warn
           "chaindata"
-          "auto-healed tx_loc hash = %s epoch = %d recent_epochs = %d"
+          "auto-healed tx_loc hash = %s epoch = %d recent_epochs = %d max_records = %d"
           (Text.addr_short txh)
           epoch_id
-          recent_epochs;
+          recent_epochs
+          max_records;
         Some (epoch_id, tx_json)
       | None ->
         None
@@ -306,15 +307,23 @@ let transactions_by_epoch chaindata ~params ~current_epoch_id =
     let eid = page.History.epoch_page_id in
     let limit = page.History.epoch_page_limit in
     let offset = page.History.epoch_page_offset in
-    let cache_key = tx_epoch_cache_key eid limit offset in
-    let cache_ttl =
-      History.epoch_page_cache_ttl
+    let header =
+      Store_chaindata.get_epoch_header chaindata eid
+      |> Option.map (fun header ->
+        header.Octra_core.Epochlog.start_txid,
+        header.Octra_core.Epochlog.tx_count)
+    in
+    let cache_plan =
+      History.epoch_page_cache_plan
         ~current_epoch_id
         ~recent_ttl:tx_epoch_recent_ttl
         ~old_ttl:tx_epoch_old_ttl
         ~epoch_id:eid
+        ~header
+        ~limit
+        ~offset
     in
-    match tx_epoch_cache_get cache_key cache_ttl with
+    match Option.bind cache_plan (fun (key, _) -> tx_epoch_cache_get key) with
     | Some result ->
       ok result
     | None ->
@@ -410,7 +419,9 @@ let transactions_by_epoch chaindata ~params ~current_epoch_id =
             ~total_ms
         in
         warn_epoch_profile profile;
-        tx_epoch_cache_put cache_key result;
+        Option.iter
+          (fun (key, ttl) -> tx_epoch_cache_put key ~ttl result)
+          cache_plan;
         ok result
 
 let dispatch adapters =

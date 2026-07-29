@@ -1,31 +1,12 @@
-(*
-Octra Labs 2026
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
-
-type level =
+type level = Octra_log_format.level =
   | FATAL
   | ERROR
   | WARN
   | INFO
   | TRACE
-
-let level_str = function
-  | FATAL -> "FATAL"
-  | ERROR -> "ERROR"
-  | WARN -> "WARN "
-  | INFO -> "INFO "
-  | TRACE -> "TRACE"
 
 let min_level = ref INFO
 
@@ -57,16 +38,12 @@ let level_ord = function
   | INFO -> 3
   | TRACE -> 4
 
-let timestamp () =
-  let t = Unix.gettimeofday () in
-  let tm = Unix.localtime t in
-  Printf.sprintf "%04d-%02d-%02d %02d:%02d:%02d"
-    (tm.tm_year + 1900)
-    (tm.tm_mon + 1)
-    tm.tm_mday
-    tm.tm_hour
-    tm.tm_min
-    tm.tm_sec
+let color_enabled channel =
+  Sys.getenv_opt "NO_COLOR" = None
+  && match Sys.getenv_opt "OCTRA_LOG_COLOR" with
+     | Some "always" -> true
+     | Some "never" -> false
+     | _ -> Unix.isatty (Unix.descr_of_out_channel channel)
 
 let write channel msg =
   output_string channel msg;
@@ -80,8 +57,17 @@ let stderr fmt =
 
 let log level modul fmt =
   let k msg =
-    if level_ord level <= level_ord !min_level then
-      stdout "%s %s [%s] %s\n%!" (timestamp ()) (level_str level) modul msg
+    if level_ord level <= level_ord !min_level then begin
+      let line =
+        Octra_log_format.render
+          ~color:(color_enabled Stdlib.stdout)
+          ~timestamp:(Octra_log_format.timestamp (Unix.gettimeofday ()))
+          ~level
+          ~component:modul
+          ~message:msg
+      in
+      write Stdlib.stdout (line ^ "\n")
+    end
   in
   Printf.ksprintf k fmt
 

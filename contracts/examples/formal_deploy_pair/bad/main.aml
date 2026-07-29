@@ -1,0 +1,23 @@
+contract BadFormalDeployProgram {
+  state {
+    total_supply: int
+    balances: map[address]int
+  }
+
+  event Transfer(from: address, to: address, amount: int)
+
+  constructor(supply: int) {
+    self.total_supply = supply
+    self.balances[origin] = supply
+    emit Transfer(origin, origin, supply)
+  }
+
+  fn transfer(to: address, amount: int): bool {
+    let bal = self.balances[caller]
+    require(bal >= amount, "insufficient balance")
+    self.balances[caller] = bal - amount
+    self.balances[to] = self.balances[to] + amount
+    emit Transfer(caller, to, amount)
+    return true
+  }
+}

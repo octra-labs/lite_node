@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Epoch_exec = Octra_core.Epoch_exec
 module Epochlog = Octra_core.Epochlog
@@ -22,10 +10,7 @@ type role =
   | Proposer_validator
 
 val role_label : role -> string
-val role_of : proposer_addr:string -> active_validators:string list -> string -> role
-val amount_of : role:role -> plan:Epoch_exec.reward_plan -> Z.t
+val role_of : Epoch_exec.reward_credit -> role
 val recipients :
-  proposer_addr:string ->
-  active_validators:string list ->
-  plan:Epoch_exec.reward_plan ->
+  Epoch_exec.reward_credit list ->
   Epochlog.reward_recipient list

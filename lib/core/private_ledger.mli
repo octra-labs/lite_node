@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type kat =
   | Kat_missing
@@ -34,6 +22,7 @@ type key_switch_plan = {
   new_key_hash : string;
   new_pubkey : string;
   new_cipher : string option;
+  source_cipher : string;
 }
 
 type key_switch_apply = {
@@ -74,6 +63,15 @@ type claim_plan = {
   claim_cipher : string;
 }
 
+type prepared =
+  | Prepared_encrypt of balance_plan
+  | Prepared_decrypt of balance_plan
+  | Prepared_key_switch of key_switch_plan
+  | Prepared_stealth of stealth_plan
+  | Prepared_claim of claim_plan * balance_plan
+
+val hash_prepared : prepared -> string
+
 val key_bound_stealth_output_marker : string
 
 val stealth_output_is_key_bound :
@@ -91,27 +89,60 @@ val kat_state : Ledger.t -> string -> kat
 val backfill_kat : Ledger.t -> string -> unit
 
 val encrypt_plan :
+  ?result_policy:Private_result_policy.t ->
+  Ledger.t ->
+  Transaction.t ->
+  (balance_plan, failure) result Lwt.t
+
+val prepare_encrypt_plan :
+  ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
 val decrypt_plan :
+  ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
+val prepare_decrypt_plan :
+  ?result_policy:Private_result_policy.t ->
+  Ledger.t ->
+  Transaction.t ->
+  (balance_plan, failure) result Lwt.t
+
+val apply_encrypt_plan :
+  Ledger.t ->
+  Transaction.t ->
+  balance_plan ->
+  (balance_plan, failure) result Lwt.t
+
+val apply_decrypt_plan :
+  Ledger.t ->
+  Transaction.t ->
+  balance_plan ->
+  (balance_plan, failure) result Lwt.t
+
 val apply_encrypt :
+  ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
 val apply_decrypt :
+  ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
 val key_switch_plan :
   ?legacy_public_replay:Pvac_legacy_public_replay.decision ->
+  Ledger.t ->
+  Transaction.t ->
+  (key_switch_plan, failure) result Lwt.t
+
+val prepare_key_switch_plan :
   Ledger.t ->
   Transaction.t ->
   (key_switch_plan, failure) result Lwt.t
@@ -130,7 +161,20 @@ val apply_key_switch :
   Transaction.t ->
   key_switch_outcome Lwt.t
 
+val apply_key_switch_plan :
+  Ledger.t ->
+  Transaction.t ->
+  key_switch_plan ->
+  key_switch_outcome Lwt.t
+
 val stealth_plan :
+  ?result_policy:Private_result_policy.t ->
+  Ledger.t ->
+  Transaction.t ->
+  (stealth_plan, failure) result Lwt.t
+
+val prepare_stealth_plan :
+  ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (stealth_plan, failure) result Lwt.t
@@ -156,7 +200,13 @@ val claim_plan :
   Transaction.t ->
   (claim_plan, failure) result Lwt.t
 
+val prepare_claim_plan :
+  Ledger.t ->
+  Transaction.t ->
+  (claim_plan, failure) result Lwt.t
+
 val claim_balance_plan :
+  ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   claim_plan ->

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val opt_hex :
   string option ->
@@ -65,6 +53,7 @@ val account_proof :
   Yojson.Safe.t
 
 val validator :
+  weighted:bool ->
   Octra_consensus.C_light_validator_set.validator ->
   Yojson.Safe.t
 
@@ -166,6 +155,8 @@ val supply :
   display_supply:Z.t ->
   encrypted_supply:Z.t ->
   max_supply:Z.t ->
+  emission_remaining:Z.t ->
+  retired_supply:Z.t ->
   Yojson.Safe.t
 
 val storage_assoc :
@@ -225,8 +216,10 @@ val pvac_status :
 
 val pvac_migration_status :
   addr:string ->
+  cipher:string ->
+  epoch:int ->
   Octra_core.Pvac_migration.status ->
-  Octra_core.Store_chaindata.pvac_legacy_public_replay_status option ->
+  Octra_core.Pvac_migration_entitlement.t ->
   Yojson.Safe.t
 
 val encrypted_cipher :
@@ -256,6 +249,20 @@ val account_view_pubkey :
 
 val stealth_outputs :
   from_epoch:int ->
+  outputs:Yojson.Safe.t list ->
+  Yojson.Safe.t
+
+val stealth_outputs_page :
+  from_epoch:int ->
+  before_id:int64 option ->
+  outputs:Yojson.Safe.t list ->
+  next_before_id:int64 option ->
+  has_more:bool ->
+  scanned:int ->
+  Yojson.Safe.t
+
+val stealth_outputs_by_id :
+  requested:int ->
   outputs:Yojson.Safe.t list ->
   Yojson.Safe.t
 

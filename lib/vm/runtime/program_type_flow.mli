@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type kind =
   | Int
@@ -58,6 +46,7 @@ type xcall = {
 
 type facts = {
   root : (int * kind) list;
+  storage : (string * kind) list;
   entries : entry list;
   calls : call list;
   xcalls : xcall list;
@@ -71,5 +60,9 @@ val kind_of_name : string -> kind option
 val capability_name : capability -> string
 val capability_of_name : string -> capability option
 val facts_hash : facts -> string
-val check : ?facts:facts -> Contract_vm.instr array -> (unit, error) result
+val check :
+  ?max_steps:int ->
+  ?facts:facts ->
+  Contract_vm.instr array ->
+  (unit, error) result
 val error_message : error -> string

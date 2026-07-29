@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -98,6 +86,7 @@ type prev_root_decision =
 
 type prev_root_wait_deps = {
   read_root : unit -> string Lwt.t;
+  replay_stashed : unit -> unit Lwt.t;
   sleep : float -> unit Lwt.t;
 }
 
@@ -141,6 +130,7 @@ type tx_hash_admission =
 
 type proposal_envelope = {
   header : Octra_consensus.C_types.epoch_header;
+  parent_commit : Octra_consensus.C_types.parent_commit option;
   proposal_id : string;
   txid_hi : int64;
   tx_hashes : string list;
@@ -164,6 +154,7 @@ type build_preview_request = {
   proposal_id : string;
   expected_prev_root : string;
   prev_state_root : string;
+  parent_commit : Octra_consensus.C_types.parent_commit option;
   proposer : string;
   validator_pubkeys : (string * string) list;
   preverify : Octra_core.Preverify_commit.t;
@@ -179,6 +170,9 @@ type make_proposal_deps = {
   read_prev_ledger_root : unit -> string option Lwt.t;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   current_round : unit -> int;
+  parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
   frozen_bundle : string -> Consensus_bundle_cache.frozen option;
   store_bundle :
     proposal_id:string ->
@@ -189,6 +183,11 @@ type make_proposal_deps = {
   staging_txs : unit -> Transaction.t list;
   admits_tx : Transaction.t -> bool;
   run_preverify :
+    Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
+  run_preverify_once :
+    state_root:string ->
+    tx_hashes:string list ->
     Transaction.t list ->
     Octra_core.Preverify_worker.batch Lwt.t;
   staging_total : unit -> int;
@@ -232,6 +231,11 @@ type verify_proposal_deps = {
   run_preverify :
     Transaction.t list ->
     Octra_core.Preverify_worker.batch Lwt.t;
+  run_preverify_once :
+    state_root:string ->
+    tx_hashes:string list ->
+    Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
   driver_available : unit -> bool;
   validate_bundle :
     header:Octra_consensus.C_types.epoch_header ->
@@ -261,9 +265,15 @@ type verify_proposal_deps = {
   next_txid : unit -> int64;
   root_to_raw32 : string -> string;
   set_proposal : Transaction.t list -> string list -> unit;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
 }
 
 type before_precommit_deps = {
+  chain_id : string;
+  validator_set : Octra_consensus.C_types.validator_set;
   current_tx_hashes : unit -> string list;
   cached_bundle : string -> Consensus_bundle_cache.encoded option;
   sync_bundle :
@@ -296,6 +306,16 @@ type reject_reason =
   | Missing_txs of {
       have : int;
       need : int;
+    }
+  | Disabled_operation of {
+      hash : string;
+      op_type : string;
+    }
+  | Underpriced_transaction of {
+      hash : string;
+      op_type : string;
+      provided : Z.t;
+      required : Z.t;
     }
   | Receipt_root_mismatch
   | Receipt_decode_failed of string
@@ -343,6 +363,12 @@ val local_preverify_bundle :
   tx_hashes:string list ->
   Transaction.t list ->
   local_preverify_bundle Lwt.t
+
+val check_local_bundle :
+  expected_hashes:string list ->
+  Consensus_bundle_fetch.proposal_bundle ->
+  local_preverify_bundle ->
+  (Consensus_bundle_fetch.proposal_bundle, string) result
 
 val build_preverify :
   run_many:(Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t) ->
@@ -540,6 +566,7 @@ val build_header :
   creator_addr:string ->
   next_txid:int64 ->
   head_txid_hi:int64 option ->
+  parent_commit_hash:string ->
   ts:float ->
   Octra_consensus.C_types.epoch_header
 
@@ -554,6 +581,7 @@ val build_proposal_envelope :
   creator_addr:string ->
   next_txid:int64 ->
   head_txid_hi:int64 option ->
+  parent_commit:Octra_consensus.C_types.parent_commit option ->
   ts:float ->
   proposal_envelope
 
@@ -579,7 +607,7 @@ val make_proposal :
   root_to_raw32:(string -> string) ->
   limits:limits ->
   epoch_id:int64 ->
-  (Octra_consensus.C_types.epoch_header * string list) option Lwt.t
+  Octra_consensus.C_driver.proposal_plan option Lwt.t
 
 val precommit_sync_plan :
   proposal_id:string ->
@@ -595,6 +623,11 @@ val pending_commit :
   txid_hi:int64 ->
   ts:float ->
   validator_addr:string ->
+  proposal_wire:string ->
+  vote_wire:string ->
+  tx_hashes:string list ->
+  txs_json:string list ->
+  receipts_json:string list ->
   Octra_core.Wal.pending_commit
 
 val handle_before_precommit :
@@ -605,7 +638,9 @@ val handle_before_precommit :
   proposed_state_root:string ->
   txid_hi:int64 ->
   validator_addr:string ->
-  unit
+  proposal_wire:string ->
+  vote_wire:string ->
+  bool
 
 val admission_plan :
   epoch_id:int64 ->

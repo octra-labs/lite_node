@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module C_types = Octra_consensus.C_types
@@ -20,7 +8,6 @@ module C_hash = Octra_consensus.C_hash
 type cached_bundle = string list * Transaction.t list * string list
 
 type effect =
-  | Remove_processed of string list
   | Store_empty_bundle of C_types.epoch_header
 
 type selected = {
@@ -59,7 +46,6 @@ type node_deps = {
   receipt_root_matches : C_types.epoch_header -> string list -> bool;
   header_has_empty_bundle : C_types.epoch_header -> bool;
   staging_txs : unit -> Transaction.t list;
-  remove_processed : string list -> unit;
   store_empty_bundle : C_types.epoch_header -> unit;
   fatal : string -> unit;
   exit : unit -> Transaction.t list * string list;
@@ -129,8 +115,7 @@ let choose_consensus (deps : deps) request =
     match deps.cached_bundle proposal_id with
     | Some (_tx_hashes, txs, receipts_json) ->
       if deps.receipt_root_matches header receipts_json then
-        let processed = List.map Transaction.hash txs in
-        Ok (selected txs receipts_json ~effects:[Remove_processed processed])
+        Ok (selected txs receipts_json)
       else
         Error (Receipt_root_mismatch { proposal_id })
     | None ->
@@ -166,8 +151,6 @@ let deps_of_node (deps : node_deps) =
   }
 
 let apply_node_effect (deps : node_deps) = function
-  | Remove_processed tx_hashes ->
-    deps.remove_processed tx_hashes
   | Store_empty_bundle header ->
     deps.store_empty_bundle header
 

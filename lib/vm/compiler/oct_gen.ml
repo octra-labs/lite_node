@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Oct_lang
 
@@ -150,6 +138,26 @@ let is_int_storage env t =
     | TStruct name -> find_enum env name <> None
     | TEnum _ -> true
     | _ -> false)
+
+let typed_static_storage env = function
+  | TInt
+  | TBool
+  | TString
+  | TAddress
+  | TBytes
+  | TBytes32
+  | TU64
+  | TU128
+  | TU256 -> env.declaration = ProgramDecl
+  | TCipher
+  | TPubKey
+  | TMap _
+  | TList _
+  | TStruct _
+  | TEnum _
+  | TOption _
+  | TTuple _
+  | TVoid -> false
 
 let resolve_enum_variant env enum_name variant_name =
   match find_enum env enum_name with
@@ -971,7 +979,7 @@ and gen_unwrap env args =
     (match find_state env name with
      | Some sf ->
        let inner_t = (match map_value_type sf.sf_typ with TOption t -> t | t -> t) in
-       if inner_t = TInt then gen_int_from_storage env rd
+       if is_int_storage env inner_t then gen_int_from_storage env rd
        else rd
      | None -> rd)
   | _ -> gerr env.line "unwrap: argument must be self.field or self.map[key]"
@@ -1773,7 +1781,8 @@ and gen_expr env expr =
      | Some sf ->
        let r = alloc_reg env in
        emit env (Contract_vm.SLOAD (r, storage_key_for_field name));
-       if is_int_storage env sf.sf_typ then gen_int_from_storage env r
+       if typed_static_storage env sf.sf_typ then r
+       else if is_int_storage env sf.sf_typ then gen_int_from_storage env r
        else if sf.sf_typ = TBool then begin
          let tr = alloc_reg env in
          emit env (Contract_vm.LDI (tr, VString "true"));
@@ -1789,7 +1798,7 @@ and gen_expr env expr =
        let r = alloc_reg env in
        emit env (Contract_vm.SLOADK (r, kr));
        let vt = map_value_type sf.sf_typ in
-       if vt = TInt then gen_int_from_storage env r
+       if is_int_storage env vt then gen_int_from_storage env r
        else if vt = TBool then begin
          let tr = alloc_reg env in
          emit env (Contract_vm.LDI (tr, VString "true"));
@@ -2107,7 +2116,7 @@ and gen_stmt env stmt =
              emit env (Contract_vm.SSTORE (gen_some_key_field name, tr)))
         | _ ->
           let r = gen_expr env expr in
-          if sf.sf_typ = TBool then begin
+          if sf.sf_typ = TBool && not (typed_static_storage env sf.sf_typ) then begin
             let sr = alloc_reg env in
             let lbl_true = alloc_label env in
             let lbl_end = alloc_label env in

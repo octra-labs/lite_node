@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Store_chaindata = Octra_core.Store_chaindata
 
@@ -29,6 +17,8 @@ type refs = {
 
 type deps = {
   env : string -> string option;
+  read_active_validator_meta : unit -> string option;
+  read_pending_validator_meta : unit -> string option;
   data_dir : string;
   store_path : string;
   epoch_duration : float;
@@ -72,6 +62,14 @@ let run deps =
     chain_id;
   } = network_config in
   let refs = create_refs () in
+  let validator_anchor = Consensus_validator_anchor.{
+    getenv = deps.env;
+    chain_id;
+    current_height = (fun () ->
+      Int64.of_int (max (-1) (!(deps.current_epoch) - 1)));
+    active_raw = deps.read_active_validator_meta;
+    pending_raw = deps.read_pending_validator_meta;
+  } in
   Startup_process_shell.log_node_start
     ~info:(Log.info "init" "%s")
     ~version:"3.0.0"
@@ -84,6 +82,12 @@ let run deps =
     Consensus_startup_sync.run_node
       Consensus_startup_sync.{
         env = deps.env;
+        expected_validator_set_hash = (fun epoch ->
+          Result.map
+            Octra_consensus.C_config.validator_set_hash
+            (Consensus_validator_anchor.expected_set
+               validator_anchor
+               ~epoch));
         fetch_json = Consensus_join_rpc.http_get_json;
         current_epoch = (fun () -> !(deps.current_epoch));
         head = Octra_core.Head_manifest.get_cached;

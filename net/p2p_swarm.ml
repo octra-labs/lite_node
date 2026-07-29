@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type config = {
   listen_port : int;
@@ -31,15 +19,22 @@ type config = {
   best_root_fn : unit -> string;
 }
 
+type peer_role =
+  | Validator
+  | Observer
+
 type t = {
   config : config;
   peers : (string, P2p_conn.t) Hashtbl.t;
   dialing : (string, unit) Hashtbl.t;
   registry : P2p_peer_registry.t;
   peer_guard : P2p_peer_guard.t;
+  mutable validator_pubkeys : string list option;
   mutable on_message : (P2p_conn.t -> P2p_frame.frame -> unit Lwt.t);
   mutable running : bool;
 }
+
+let max_observer_peers = 8
 
 let create config =
   {
@@ -48,6 +43,9 @@ let create config =
     dialing = Hashtbl.create 16;
     registry = P2p_peer_registry.create ();
     peer_guard = P2p_peer_guard.create ();
+    validator_pubkeys =
+      if config.allowed_pubkeys = [] then None
+      else Some config.allowed_pubkeys;
     on_message = (fun _ _ -> Lwt.return_unit);
     running = false;
   }
@@ -74,8 +72,71 @@ let peer_ids t =
 let peer_scores t =
   P2p_peer_guard.snapshot t.peer_guard
 
+let validator_node_ids t =
+  match t.validator_pubkeys with
+  | None -> []
+  | Some pubkeys ->
+    List.map P2p_handshake.node_id_of_pubkey pubkeys
+
+let peer_role t peer_id =
+  match t.validator_pubkeys with
+  | None -> Validator
+  | Some _ ->
+    if List.mem peer_id (validator_node_ids t) then Validator
+    else Observer
+
+let local_is_validator t =
+  match t.validator_pubkeys with
+  | None -> true
+  | Some pubkeys -> List.mem t.config.pubkey_raw pubkeys
+
+let local_accepts_observers t =
+  Option.is_some t.validator_pubkeys
+  && local_is_validator t
+
+let set_validator_pubkeys t pubkeys =
+  if pubkeys = [] then
+    Error "active validator public keys are empty"
+  else if List.exists (fun pubkey -> String.length pubkey <> 32) pubkeys then
+    Error "active validator public key must contain 32 bytes"
+  else if List.length (List.sort_uniq String.compare pubkeys) <> List.length pubkeys then
+    Error "active validator public keys contain duplicates"
+  else if t.validator_pubkeys = Some pubkeys then
+    Ok ()
+  else begin
+    t.validator_pubkeys <- Some pubkeys;
+    P2p_peer_registry.clear t.registry;
+    Ok ()
+  end
+
+let role_count t role =
+  Hashtbl.fold
+    (fun peer_id conn count ->
+      if P2p_conn.is_connected conn && peer_role t peer_id = role then
+        count + 1
+      else
+        count)
+    t.peers
+    0
+
+let validator_count t = role_count t Validator
+
+let observer_count t = role_count t Observer
+
+let peer_capacity ~max_peers ~validator_count ~observer_count = function
+  | Validator -> validator_count < max_peers
+  | Observer -> observer_count < max_observer_peers
+
+let has_role_capacity t role =
+  peer_capacity
+    ~max_peers:t.config.max_peers
+    ~validator_count:(validator_count t)
+    ~observer_count:(observer_count t)
+    role
+
 let has_inbound_capacity t =
-  connected_count t < t.config.max_peers
+  has_role_capacity t Validator
+  || (local_accepts_observers t && has_role_capacity t Observer)
 
 let peer_records t =
   P2p_peer_registry.values ~now:(Unix.gettimeofday ()) t.registry
@@ -88,12 +149,12 @@ let peer_key conn =
 
 let log_node addr fmt =
   Printf.ksprintf
-    (fun msg -> Octra_log.stdout "component = p2p node = %s %s\n%!" addr msg)
+    (fun msg -> Octra_log.info "p2p" "node = %s %s" addr msg)
     fmt
 
 let err_node addr fmt =
   Printf.ksprintf
-    (fun msg -> Octra_log.stderr "component = p2p node = %s %s\n%!" addr msg)
+    (fun msg -> Octra_log.warn "p2p" "node = %s %s" addr msg)
     fmt
 
 let report_bad_peer t conn ~reason =
@@ -106,7 +167,6 @@ let report_bad_peer t conn ~reason =
   | P2p_peer_guard.Banned until_ts ->
     err_node t.config.node_addr "event = peer_banned key = %s until = %.0f reason = %s"
       key until_ts reason
-
 
 let is_peer_connected t peer_id =
   match Hashtbl.find_opt t.peers peer_id with
@@ -122,15 +182,12 @@ let preferred_direction t peer_id =
 let is_preferred t (conn : P2p_conn.t) =
   conn.direction = preferred_direction t conn.peer_id
 
-
 let add_peer t (conn : P2p_conn.t) =
   let peer_id = conn.peer_id in
-
   if peer_id = t.config.node_id then begin
     Lwt.async (fun () -> P2p_conn.close conn);
     false
   end
-
   else match Hashtbl.find_opt t.peers peer_id with
     | Some existing when P2p_conn.is_connected existing ->
       if is_preferred t existing || not (is_preferred t conn) then begin
@@ -142,18 +199,20 @@ let add_peer t (conn : P2p_conn.t) =
         true
       end
     | Some _dead ->
-
       Hashtbl.replace t.peers peer_id conn;
       true
     | None ->
-      if Hashtbl.length t.peers >= t.config.max_peers then begin
+      let role = peer_role t peer_id in
+      if role = Observer && not (local_accepts_observers t) then begin
+        Lwt.async (fun () -> P2p_conn.close conn);
+        false
+      end else if not (has_role_capacity t role) then begin
         Lwt.async (fun () -> P2p_conn.close conn);
         false
       end else begin
         Hashtbl.replace t.peers peer_id conn;
         true
       end
-
 
 let remove_peer t peer_id =
   (match Hashtbl.find_opt t.peers peer_id with
@@ -199,18 +258,17 @@ let broadcast_except t ~except (frame : P2p_frame.frame) =
   |> List.filter (fun conn -> conn.P2p_conn.peer_id <> except)
   |> Lwt_list.iter_p (fun conn -> send_with_timeout conn frame 2.0)
 
-
 let send_to t ~peer_id (frame : P2p_frame.frame) =
   match Hashtbl.find_opt t.peers peer_id with
   | Some conn when P2p_conn.is_connected conn ->
     P2p_conn.send conn frame
   | _ -> Lwt.return_unit
 
-
 let make_my_hello t =
+  let best_epoch = t.config.best_epoch_fn () in
   let consensus_config_hash =
     P2p_upgrade_plan.handshake_hash
-      ~epoch:(t.config.best_epoch_fn ())
+      ~epoch:best_epoch
       ~config_hash:t.config.consensus_config_hash
       ~binary_hash:t.config.binary_hash
       ~require_binary_hash:t.config.require_binary_hash
@@ -222,7 +280,7 @@ let make_my_hello t =
     ~pubkey_raw:t.config.pubkey_raw
     ~consensus_config_hash
     ~listen_port:t.config.listen_port
-    ~best_epoch:(t.config.best_epoch_fn ())
+    ~best_epoch
     ~best_root:(t.config.best_root_fn ())
     ~sign_fn:t.config.sign_fn
 
@@ -241,7 +299,8 @@ let make_my_record t =
     ~sign_fn:t.config.sign_fn
 
 let record_values t =
-  make_my_record t :: peer_records t
+  let records = peer_records t in
+  if local_is_validator t then make_my_record t :: records else records
 
 let send_get_peers conn =
   P2p_conn.send conn { msg_type = P2p_frame.msg_get_peers; payload = "" }
@@ -288,12 +347,9 @@ let accept_record t r =
       | P2p_peer_registry.Refreshed -> Ok false
       | P2p_peer_registry.Rejected reason -> Error reason
 
-
 let dial t host port =
   let open Lwt.Syntax in
-
-  let n_connected = Hashtbl.fold (fun _ c n -> if P2p_conn.is_connected c then n+1 else n) t.peers 0 in
-  if n_connected >= t.config.max_peers then
+  if validator_count t >= t.config.max_peers then
     Lwt.return_none
   else begin
   log_node t.config.node_addr "event = dial host = %s port = %d" host port;
@@ -309,9 +365,9 @@ let dial t host port =
         let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
         fd_ref := Some fd;
         let* () = Lwt_unix.connect fd ai.Unix.ai_addr in
-
         let my_hello = make_my_hello t in
-        let* hs_result = P2p_handshake.dial_handshake fd ~my_hello ~allowed_pubkeys:t.config.allowed_pubkeys in
+        let* hs_result = P2p_handshake.dial_handshake fd ~my_hello
+          ~allowed_pubkeys:t.config.allowed_pubkeys ~sign_fn:t.config.sign_fn in
         match hs_result with
         | P2p_handshake.Error reason ->
           err_node t.config.node_addr
@@ -351,7 +407,7 @@ let maybe_dial_record t r =
      || r.P2p_peer_record.node_id = t.config.node_id
      || is_peer_connected t r.node_id
      || Hashtbl.mem t.dialing endpoint
-     || connected_count t >= t.config.max_peers then
+     || validator_count t >= t.config.max_peers then
     ()
   else
     match P2p_endpoint.of_string endpoint with
@@ -397,7 +453,6 @@ let handle_frame t user_handler conn frame =
 let bootstrap_endpoints t =
   P2p_endpoint.bootstrap t.config.bootstrap_peers
 
-
 let accept t fd addr =
   let open Lwt.Syntax in
   Lwt.async (fun () ->
@@ -419,7 +474,11 @@ let accept t fd addr =
           (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
         end else
         let my_hello = make_my_hello t in
-        let* hs_result = P2p_handshake.accept_handshake fd ~my_hello ~allowed_pubkeys:t.config.allowed_pubkeys in
+        let allowed_pubkeys =
+          if local_accepts_observers t then [] else t.config.allowed_pubkeys
+        in
+        let* hs_result = P2p_handshake.accept_handshake fd ~my_hello
+          ~allowed_pubkeys ~sign_fn:t.config.sign_fn in
         match hs_result with
         | P2p_handshake.Error reason ->
           (match P2p_peer_guard.handshake_penalty reason with
@@ -449,7 +508,6 @@ let accept t fd addr =
         (try Lwt_unix.close fd |> ignore with _ -> ());
         Lwt.return_unit))
 
-
 let listen t =
   let open Lwt.Syntax in
   let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
@@ -465,7 +523,6 @@ let listen t =
   in
   accept_loop ()
 
-
 let dial_bootstrap t =
   let open Lwt.Syntax in
   let endpoints = bootstrap_endpoints t in
@@ -480,7 +537,7 @@ let dial_bootstrap t =
         if not t.running then begin
           Hashtbl.remove t.dialing addr;
           Lwt.return_unit
-        end else if connected_count t >= target then begin
+        end else if validator_count t >= target then begin
           Hashtbl.remove t.dialing addr;
           Lwt.return_unit
         end else
@@ -499,19 +556,16 @@ let dial_bootstrap t =
   in
   Lwt_list.iter_p dial_one endpoints
 
-
 let reconnect_loop t =
   let open Lwt.Syntax in
   let rec loop () =
     if not t.running then Lwt.return_unit
     else begin
-
       let dead = Hashtbl.fold (fun id conn acc ->
         if not (P2p_conn.is_connected conn) then id :: acc else acc
       ) t.peers [] in
       List.iter (fun id -> Hashtbl.remove t.peers id) dead;
-
-      if connected_count t < List.length (bootstrap_endpoints t) then
+      if validator_count t < List.length (bootstrap_endpoints t) then
         Lwt.async (fun () -> dial_bootstrap t);
       let* () = Lwt_unix.sleep 10.0 in
       loop ()
@@ -529,7 +583,6 @@ let peer_exchange_loop t =
       loop ()
   in
   loop ()
-
 
 let start t ~on_message =
   t.running <- true;

@@ -1,23 +1,12 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Epoch_exec = Octra_core.Epoch_exec
 
 type meta = {
   emission_remaining : Z.t;
   prev_supply : Z.t;
+  supply_retired : Z.t;
 }
 
 type trace = {
@@ -33,7 +22,16 @@ type validator_context = {
 
 type node_deps = {
   get_meta : string -> string option;
-  apply_footer : Epoch_exec.env -> Epoch_exec.reward_plan -> unit Lwt.t;
+  set_meta : string -> string -> unit Lwt.t;
+  policy : Octra_core.Emission_policy.t;
+  schedule : Octra_core.Emission_schedule.t;
+  legacy_total : string option;
+  public_supply : unit -> Z.t;
+  apply_footer :
+    Epoch_exec.env ->
+    Consensus_reward_attribution.t ->
+    Epoch_exec.reward_plan ->
+    unit Lwt.t;
   log : string -> unit;
 }
 
@@ -42,10 +40,9 @@ type node_request = {
   epoch_ts : float;
   proposer_addr : string;
   validator_pubkeys : (string * string) list;
-  active_validators : string list;
+  reward : Consensus_reward_attribution.t;
   ready_state_root_at : int -> string option Lwt.t;
   ready_max_lag : int;
-  validator_count : int;
   confirmed_fees : Z.t;
   short : string -> string;
 }
@@ -56,13 +53,17 @@ type node_result = {
   reward_recipients : Octra_core.Epochlog.reward_recipient list;
 }
 
-val z_of_meta : string option -> Z.t
-val meta : emission_remaining:string option -> total_supply:string option -> meta
+val z_of_meta : string -> string option -> (Z.t, string) result
+val meta :
+  supply_retired:string option ->
+  emission_remaining:string option ->
+  total_supply:string option ->
+  (meta, string) result
 val reward_plan :
   validator_count:int ->
   confirmed_fees:Z.t ->
   meta ->
-  Epoch_exec.reward_plan
+  (Epoch_exec.reward_plan, string) result
 val trace : env:(string -> string option) -> trace
 val validators_sha :
   hash:(string -> string -> string) ->

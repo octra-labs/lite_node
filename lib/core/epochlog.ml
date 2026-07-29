@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let magic = "OEPL"
 let version = 2
@@ -41,11 +29,13 @@ type epoch_header = {
   finalized_at : float;
   proposer : proposer_info;
   fees_total : string;
+  fees_burned : string;
   base_reward : string;
   total_reward : string;
   proposer_reward : string;
   validator_reward_each : string;
   reward_recipients : reward_recipient list;
+  reward_source : Octra_consensus.C_types.reward_source option;
 }
 
 let empty_epoch_header = {
@@ -59,15 +49,18 @@ let empty_epoch_header = {
   finalized_at = 0.0;
   proposer = empty_proposer_info;
   fees_total = "0";
+  fees_burned = "0";
   base_reward = "0";
   total_reward = "0";
   proposer_reward = "0";
   validator_reward_each = "0";
   reward_recipients = [];
+  reward_source = None;
 }
 
 type t = {
   fd : Unix.file_descr;
+  readonly : bool;
   mutable offsets : (int, int) Hashtbl.t;
   mutable tip : epoch_header option;
 }
@@ -97,6 +90,11 @@ let epoch_to_json h =
         "amount", `String r.reward_amount;
       ]) h.reward_recipients)
   in
+  let reward_source_json =
+    match h.reward_source with
+    | None -> `Null
+    | Some source -> Octra_consensus.C_reward_source.to_yojson source
+  in
   Yojson.Safe.to_string (`Assoc [
     "id", `Int h.id;
     "state_root", `String h.state_root;
@@ -109,11 +107,13 @@ let epoch_to_json h =
     "creator_addr", `String h.proposer.creator_addr;
     "commit_round", `Int h.proposer.commit_round;
     "fees_total", `String h.fees_total;
+    "fees_burned", `String h.fees_burned;
     "base_reward", `String h.base_reward;
     "total_reward", `String h.total_reward;
     "proposer_reward", `String h.proposer_reward;
     "validator_reward_each", `String h.validator_reward_each;
     "reward_recipients", rewards_json;
+    "reward_source", reward_source_json;
   ])
 
 let epoch_of_json s =
@@ -139,6 +139,16 @@ let epoch_of_json s =
           with _ -> None)
       with _ -> []
     in
+    let reward_source =
+      match j |> member "reward_source" with
+      | `Null -> None
+      | value ->
+        begin
+          match Octra_consensus.C_reward_source.of_yojson value with
+          | Ok source -> Some source
+          | Error error -> failwith error
+        end
+    in
     Some {
       id = j |> member "id" |> to_int;
       state_root = j |> member "state_root" |> to_string;
@@ -153,11 +163,13 @@ let epoch_of_json s =
         commit_round = opt_int "commit_round";
       };
       fees_total = opt_amount "fees_total";
+      fees_burned = opt_amount "fees_burned";
       base_reward = opt_amount "base_reward";
       total_reward = opt_amount "total_reward";
       proposer_reward = opt_amount "proposer_reward";
       validator_reward_each = opt_amount "validator_reward_each";
       reward_recipients;
+      reward_source;
     }
   with _ -> None
 
@@ -211,25 +223,33 @@ let scan_records fd =
   done with Exit -> ());
   (offsets, !tip)
 
-let open_log path =
+let open_log ?(readonly=false) path =
   let dir = Filename.dirname path in
-  if not (Sys.file_exists dir) then
+  if not (Sys.file_exists dir) && readonly then
+    failwith "epochlog: read-only directory is missing"
+  else if not (Sys.file_exists dir) then
     Unix.mkdir dir 0o755;
   if Sys.file_exists path then begin
-    let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_APPEND] 0o644 in
+    let flags =
+      if readonly then [Unix.O_RDONLY] else [Unix.O_RDWR; Unix.O_APPEND]
+    in
+    let fd = Unix.openfile path flags 0o644 in
     validate_file_header fd;
     let (offsets, tip) = scan_records fd in
-    { fd; offsets; tip }
+    { fd; readonly; offsets; tip }
+  end else if readonly then begin
+    failwith "epochlog: read-only file is missing"
   end else begin
     let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
     write_file_header fd;
-    { fd; offsets = Hashtbl.create 64; tip = None }
+    { fd; readonly; offsets = Hashtbl.create 64; tip = None }
   end
 
 let close t =
   Unix.close t.fd
 
 let append t h =
+  if t.readonly then failwith "epochlog: append on read-only log";
   let payload = epoch_to_json h in
   let payload_len = String.length payload in
   let record_len = payload_len + 4 in
@@ -277,7 +297,6 @@ let read_all t =
 
 let last t = t.tip
 
-
 let current_offset t =
   try Unix.lseek t.fd 0 Unix.SEEK_END
   with _ -> 0
@@ -297,10 +316,10 @@ let offset_after t epoch_id =
     None
 
 let fsync t =
-  Unix.fsync t.fd
-
+  if not t.readonly then Unix.fsync t.fd
 
 let truncate_to t ~offset =
+  if t.readonly then failwith "epochlog: truncate on read-only log";
   Unix.ftruncate t.fd offset;
   Unix.fsync t.fd;
   let (offsets, tip) = scan_records t.fd in

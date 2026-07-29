@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type network = {
   chain_id : string;
@@ -38,6 +26,7 @@ type deps = {
   info : string -> unit;
   warn : string -> unit;
   current_epoch : unit -> int;
+  read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   root_of_head_hash : string -> string;
@@ -49,6 +38,7 @@ type node_request = {
   info : string -> unit;
   warn : string -> unit;
   current_epoch : unit -> int;
+  read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   root_of_head_hash : string -> string;
@@ -95,6 +85,7 @@ type node_start_runtime = {
   warn : string -> unit;
   fatal : string -> unit;
   current_epoch : unit -> int;
+  read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   root_of_head_hash : string -> string;
@@ -119,6 +110,10 @@ type node_start = {
   load_scheduled_validator_set_config :
     unit ->
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
+  activate_validator_set :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
 }
 
 val raw32_zero : string
@@ -133,10 +128,6 @@ val install_refs :
 val current_height :
   deps ->
   int64
-
-val pending_entries :
-  deps ->
-  string list
 
 val best_root :
   deps ->

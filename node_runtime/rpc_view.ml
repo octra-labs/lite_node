@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let raw_to_hex = Text.raw_to_hex
 
@@ -112,32 +100,87 @@ let account_proof ~root ~exists ~account ~irmin_proof =
     "irmin_proof", irmin_proof;
   ]
 
-let validator (v : Octra_consensus.C_light_validator_set.validator) =
-  `Assoc [
+let validator ~weighted
+    (v : Octra_consensus.C_light_validator_set.validator) =
+  `Assoc ([
     "address", `String v.address;
     "pubkey", `String (Base64.encode_exn v.pubkey);
-  ]
+  ] @
+    if weighted then ["weight", `String (Z.to_string v.weight)]
+    else [])
 
 let scheduled_validator = function
   | None -> `Null
   | Some s ->
     `Assoc [
       "activate_epoch", `String (Int64.to_string s.Octra_consensus.C_light_validator_set.activate_epoch);
-      "validators", `List (List.map validator s.validators);
+      "weighted", `Bool s.weighted;
+      "validators", `List (List.map (validator ~weighted:s.weighted) s.validators);
     ]
 
 let validator_set_proof proof =
-  `Assoc [
-    "version", `String "octra-validator-set-proof-v1";
+  let weighted_proof =
+    proof.Octra_consensus.C_light_validator_set.weighted
+    || Option.fold
+         ~none:false
+         ~some:(fun
+           (scheduled : Octra_consensus.C_light_validator_set.scheduled) ->
+           scheduled.weighted)
+         proof.scheduled
+  in
+  let version, profile =
+    if weighted_proof then
+      let trust =
+        match proof.program_trust_hash with
+        | None -> `Null
+        | Some hash -> `String (raw_to_hex hash)
+      in
+      let runtime =
+        match proof.runtime_profile_hash with
+        | None -> `Null
+        | Some hash -> `String (raw_to_hex hash)
+      in
+      "octra-validator-set-proof-v4", [
+        "program_trust_hash", trust;
+        "runtime_profile_hash", runtime;
+        "weighted", `Bool proof.weighted;
+        "total_weight", `String (Z.to_string proof.total_weight);
+        "quorum_weight", `String (Z.to_string proof.quorum_weight);
+      ]
+    else
+    match proof.runtime_profile_hash with
+    | Some value ->
+      let trust =
+        match proof.program_trust_hash with
+        | None -> `Null
+        | Some hash -> `String (raw_to_hex hash)
+      in
+      "octra-validator-set-proof-v3", [
+        "program_trust_hash", trust;
+        "runtime_profile_hash", `String (raw_to_hex value);
+      ]
+    | None ->
+      match proof.program_trust_hash with
+      | None -> "octra-validator-set-proof-v1", []
+      | Some value ->
+        "octra-validator-set-proof-v2",
+        ["program_trust_hash", `String (raw_to_hex value)]
+  in
+  `Assoc ([
+    "version", `String version;
     "chain_id", `String proof.Octra_consensus.C_light_validator_set.chain_id;
     "config_hash", `String (raw_to_hex proof.config_hash);
     "validator_set_hash", `String (raw_to_hex proof.validator_set_hash);
     "n", `Int proof.n;
     "f", `Int proof.f;
     "quorum", `Int proof.quorum;
-    "validators", `List (List.map validator proof.validators);
+    "validators",
+      `List
+        (List.map
+           (validator ~weighted:proof.weighted)
+           proof.validators);
     "scheduled", scheduled_validator proof.scheduled;
-  ]
+  ] @ profile)
 
 let light_epoch (p : Octra_consensus.C_light_epoch.t) =
   `Assoc [
@@ -297,7 +340,9 @@ let validate_address ~raw ~is_valid =
     "error", error_msg;
   ]
 
-let supply ~display_supply ~encrypted_supply ~max_supply =
+let supply ~display_supply ~encrypted_supply ~max_supply ~emission_remaining
+    ~retired_supply =
+  let remaining = Z.sub max_supply display_supply in
   `Assoc [
     "total_supply", `String (format_balance display_supply);
     "total_supply_raw", `String (Z.to_string display_supply);
@@ -307,7 +352,12 @@ let supply ~display_supply ~encrypted_supply ~max_supply =
     "encrypted_supply_raw", `String (Z.to_string encrypted_supply);
     "max_supply", `String (format_balance max_supply);
     "max_supply_raw", `String (Z.to_string max_supply);
-    "burned", `String (format_balance (Z.sub max_supply display_supply));
+    "supply_remaining", `String (format_balance remaining);
+    "supply_remaining_raw", `String (Z.to_string remaining);
+    "emission_remaining", `String (format_balance emission_remaining);
+    "emission_remaining_raw", `String (Z.to_string emission_remaining);
+    "retired_supply", `String (format_balance retired_supply);
+    "retired_supply_raw", `String (Z.to_string retired_supply);
   ]
 
 let storage_visible ?limit value =
@@ -394,27 +444,59 @@ let pvac_status ~addr (status : Pvac_registry.status) =
     "address", `String addr;
     "has_pvac_pubkey", `Bool status.has_pvac_pubkey;
     "pubkey_size", opt_int status.pubkey_size;
-    "deserializable", `Bool status.deserializable;
+    "deserializable", `Null;
+    "canonical_binding", `Bool status.canonical_binding;
     "pubkey_format", opt_string status.pubkey_format;
   ]
 
-let pvac_migration_status ~addr (status : Pvac_migration.status) legacy_public_replay =
+let pvac_migration_status ~addr ~cipher ~epoch
+    (status : Pvac_migration.status) entitlements =
   let replay_json =
-    match legacy_public_replay with
-    | None -> `Null
-    | Some replay ->
-      let decision = replay.Octra_core.Store_chaindata.decision in
-      `Assoc [
-        "total", `Int replay.total;
-        "scanned", `Int replay.scanned;
-        "complete", `Bool replay.complete;
-        "audit_class", `String (Pvac_legacy_public_replay.string_of_audit_class decision.audit_class);
-        "can_public_migrate", `Bool decision.can_public_migrate;
-        "public_net", (match decision.public_net with None -> `Null | Some amount -> `String (Z.to_string amount));
-        "commitment_net", (match decision.commitment_net with None -> `Null | Some commitment -> `String commitment);
-        "blockers", `List (List.map (fun s -> `String s) decision.blockers);
-        "reason", `String decision.reason;
-      ]
+    if not status.needs_legacy_public_replay then
+      `Null
+    else
+      match
+        Octra_core.Pvac_migration_entitlement.find
+          entitlements
+          ~epoch
+          ~address:addr
+          ~cipher
+      with
+      | Error reason ->
+        `Assoc [
+          "total", `Int 0;
+          "scanned", `Int 0;
+          "complete", `Bool false;
+          "audit_class", `String "poisoned";
+          "can_public_migrate", `Bool false;
+          "public_net", `Null;
+          "commitment_net", `Null;
+          "blockers", `List [`String reason];
+          "reason", `String reason;
+        ]
+      | Ok entry ->
+        let decision = entry.Octra_core.Pvac_migration_entitlement.decision in
+        `Assoc [
+          "total", `Int entry.total;
+          "scanned", `Int entry.total;
+          "complete", `Bool true;
+          "audit_class",
+            `String
+              (Pvac_legacy_public_replay.string_of_audit_class
+                 decision.audit_class);
+          "can_public_migrate", `Bool decision.can_public_migrate;
+          "public_net",
+            (match decision.public_net with
+             | None -> `Null
+             | Some amount -> `String (Z.to_string amount));
+          "commitment_net",
+            (match decision.commitment_net with
+             | None -> `Null
+             | Some commitment -> `String commitment);
+          "blockers",
+            `List (List.map (fun value -> `String value) decision.blockers);
+          "reason", `String decision.reason;
+        ]
   in
   `Assoc [
     "address", `String addr;
@@ -423,6 +505,22 @@ let pvac_migration_status ~addr (status : Pvac_migration.status) legacy_public_r
     "can_v3_migrate", `Bool status.can_v3_migrate;
     "needs_legacy_public_replay", `Bool status.needs_legacy_public_replay;
     "reason", `String status.reason;
+    "entitlement_root",
+      (match Octra_core.Pvac_migration_entitlement.root entitlements with
+       | None -> `Null
+       | Some value -> `String value);
+    "entitlement_activation_epoch",
+      (match Octra_core.Pvac_migration_entitlement.activation_epoch entitlements with
+       | None -> `Null
+       | Some value -> `Int value);
+    "entitlement_snapshot_epoch",
+      (match Octra_core.Pvac_migration_entitlement.snapshot_epoch entitlements with
+       | None -> `Null
+       | Some value -> `Int value);
+    "entitlement_state_root",
+      (match Octra_core.Pvac_migration_entitlement.state_root entitlements with
+       | None -> `Null
+       | Some value -> `String value);
     "legacy_public_replay", replay_json;
   ]
 
@@ -474,6 +572,32 @@ let stealth_outputs ~from_epoch ~outputs =
   `Assoc [
     "from_epoch", `Int from_epoch;
     "count", `Int (List.length outputs);
+    "outputs", `List outputs;
+  ]
+
+let stealth_outputs_page
+    ~from_epoch
+    ~before_id
+    ~outputs
+    ~next_before_id
+    ~has_more
+    ~scanned =
+  `Assoc [
+    "from_epoch", `Int from_epoch;
+    "before_id", (match before_id with Some id -> `Intlit (Int64.to_string id) | None -> `Null);
+    "count", `Int (List.length outputs);
+    "scanned", `Int scanned;
+    "has_more", `Bool has_more;
+    "next_before_id",
+      (match next_before_id with Some id -> `Intlit (Int64.to_string id) | None -> `Null);
+    "outputs", `List outputs;
+  ]
+
+let stealth_outputs_by_id ~requested ~outputs =
+  `Assoc [
+    "requested", `Int requested;
+    "count", `Int (List.length outputs);
+    "complete", `Bool (List.length outputs = requested);
     "outputs", `List outputs;
   ]
 

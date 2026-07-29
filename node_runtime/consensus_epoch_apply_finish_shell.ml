@@ -1,23 +1,12 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Env = Consensus_epoch_apply_env
 module Finalize = Consensus_epoch_apply_finalize
 module Footer = Consensus_epoch_apply_footer
 module Post = Consensus_epoch_apply_post
 module Proposer = Consensus_epoch_apply_proposer
+module Reward = Consensus_reward_attribution
 module Transaction = Octra_core.Transaction
 
 type deps = {
@@ -25,6 +14,12 @@ type deps = {
   validator_pubkeys : Env.node_env -> (string * string) list;
   validator_context : (string * string) list -> Footer.validator_context;
   proposer : Proposer.runtime_request -> Proposer.runtime_result;
+  reward :
+    consensus_mode:bool ->
+    epoch_id:int ->
+    proposer_addr:string ->
+    validator_pubkeys:(string * string) list ->
+    (Reward.t, string) result;
   trace : unit -> Footer.trace;
   emit_replay_proposer :
     Footer.trace ->
@@ -41,6 +36,7 @@ type request = {
   now : float;
   consensus_mode : bool;
   override_proposer_info : Octra_core.Epochlog.proposer_info option;
+  override_reward : Reward.t option;
   epoch_env : Env.node_env;
   tree_ref : Octra_core.Tree.t ref;
   epoch_start : float;
@@ -107,6 +103,27 @@ let run (deps : deps) (request : request) =
   let proposer_source = proposer_runtime.Proposer.source_label in
   let proposer_info = proposer_runtime.Proposer.proposer in
   let proposer_addr = proposer_info.Octra_core.Epochlog.creator_addr in
+  let reward =
+    match request.override_reward with
+    | Some reward -> reward
+    | None ->
+      begin
+        match
+          deps.reward
+            ~consensus_mode:request.consensus_mode
+            ~epoch_id
+            ~proposer_addr
+            ~validator_pubkeys
+        with
+        | Ok reward -> reward
+        | Error error -> failwith ("reward attribution rejected: " ^ error)
+      end
+  in
+  let reward_source =
+    match Reward.to_source reward with
+    | Ok source -> source
+    | Error error -> failwith ("reward source rejected: " ^ error)
+  in
   let applied_commit_round = proposer_info.Octra_core.Epochlog.commit_round in
   let trace = deps.trace () in
   let validators_sha = validator_ctx.Footer.sha in
@@ -135,6 +152,7 @@ let run (deps : deps) (request : request) =
         validator_addr = request.validator_addr;
         validator_pubkeys;
         active_validators;
+        reward;
         ready_state_root_at = request.ready_state_root_at;
         ready_max_lag = request.ready_max_lag;
         confirmed_fees = !(request.confirmed_fees);
@@ -146,6 +164,7 @@ let run (deps : deps) (request : request) =
   let post_input =
     Post.input_of_finalized
       ~now:request.now
+      ~epoch_ts
       ~consensus_mode:request.consensus_mode
       ~trace
       ~pre_state_hash:request.pre_state_hash
@@ -162,6 +181,7 @@ let run (deps : deps) (request : request) =
       ~epoch_receipts_json:request.epoch_receipts_json
       ~active_validators
       ~processed_hashes:!(request.processed_hashes)
+      ~reward_source
       ~producer:request.producer
       ~short:request.short
       finalized
@@ -199,6 +219,24 @@ let run_node (deps : node_deps) request =
                 commit_round = 0;
               };
             }));
+      reward = (fun ~consensus_mode ~epoch_id ~proposer_addr ~validator_pubkeys ->
+        match
+          Consensus_finality_state.find_finalized
+            deps.finality_state
+            epoch_id
+        with
+        | Some finalize ->
+          Reward.resolve
+            ~proposer_addr
+            ~validator_pubkeys
+            finalize.Octra_consensus.C_types.parent_commit
+        | None when consensus_mode ->
+          Error "finalized reward source is missing"
+        | None ->
+          Reward.resolve
+            ~proposer_addr
+            ~validator_pubkeys
+            None);
       trace = (fun () -> Footer.trace ~env:deps.env);
       emit_replay_proposer = (fun trace ~epoch_id ~proposer_source ~proposer ~validators_sha ->
         Footer.emit_replay_proposer

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type tx_write = {
   hash : string;
@@ -36,6 +24,7 @@ type batch = {
 
 type t = {
   env : Lmdb.Env.t;
+  readonly : bool;
   tx_loc : (string, string, [ `Uni ]) Lmdb.Map.t;
   addr_tx : (string, int64, [ `Dup | `Uni ]) Lmdb.Map.t;
   addr_recent : (string, string, [ `Uni ]) Lmdb.Map.t;
@@ -53,41 +42,78 @@ let map_size_default = 64 * 1024 * 1024 * 1024
 let addr_recent_limit = 128
 let copy s = Bytes.unsafe_to_string (Bytes.of_string s)
 
-let open_index path =
-  if not (Sys.file_exists path) then begin
+let open_index_map readonly card ~key ~value ~name env =
+  if readonly then
+    Lmdb.Map.open_existing card ~key ~value ~name env
+  else
+    Lmdb.Map.create card ~key ~value ~name env
+
+let open_index ?(readonly=false) path =
+  if not (Sys.file_exists path) && readonly then
+    failwith "chaindata index: read-only directory is missing"
+  else if not (Sys.file_exists path) then begin
     try Unix.mkdir path 0o755 with Unix.Unix_error _ -> ()
   end;
-  let env = Lmdb.Env.create Lmdb.Rw
-    ~max_maps:13
-    ~max_readers:2048
-    ~map_size:map_size_default
-    ~flags:Lmdb.Env.Flags.(no_tls + no_read_ahead)
-    path in
-  let tx_loc = Lmdb.Map.create Lmdb.Map.Nodup
+  let flags =
+    if readonly then
+      Lmdb.Env.Flags.(no_tls + no_read_ahead + no_lock)
+    else
+      Lmdb.Env.Flags.(no_tls + no_read_ahead)
+  in
+  let env =
+    if readonly then
+      Lmdb.Env.create Lmdb.Ro
+        ~max_maps:13
+        ~max_readers:2048
+        ~map_size:map_size_default
+        ~flags
+        path
+    else
+      Lmdb.Env.create Lmdb.Rw
+        ~max_maps:13
+        ~max_readers:2048
+        ~map_size:map_size_default
+        ~flags
+        path
+  in
+  let tx_loc = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"tx_loc" env in
-  let addr_tx = Lmdb.Map.create Lmdb.Map.Dup
+  let addr_tx = open_index_map readonly Lmdb.Map.Dup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.int64_be ~name:"addr_tx" env in
-  let addr_recent = Lmdb.Map.create Lmdb.Map.Nodup
+  let addr_recent = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"addr_recent" env in
-  let txid_loc = Lmdb.Map.create Lmdb.Map.Nodup
+  let txid_loc = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.int64_be ~value:Lmdb.Conv.string ~name:"txid_loc" env in
-  let epoch_meta = Lmdb.Map.create Lmdb.Map.Nodup
+  let epoch_meta = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.int32_be ~value:Lmdb.Conv.string ~name:"epoch_meta" env in
-  let rejected = Lmdb.Map.create Lmdb.Map.Nodup
+  let rejected = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"rejected" env in
-  let rej_addr = Lmdb.Map.create Lmdb.Map.Dup
+  let rej_addr = open_index_map readonly Lmdb.Map.Dup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"rej_addr" env in
-  let rej_epoch = Lmdb.Map.create Lmdb.Map.Dup
+  let rej_epoch = open_index_map readonly Lmdb.Map.Dup
     ~key:Lmdb.Conv.int32_be ~value:Lmdb.Conv.string ~name:"rej_epoch" env in
-  let receipts = Lmdb.Map.create Lmdb.Map.Nodup
+  let receipts = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"receipts" env in
-  let meta = Lmdb.Map.create Lmdb.Map.Nodup
+  let meta = open_index_map readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"meta" env in
-  { env; tx_loc; addr_tx; addr_recent; txid_loc; epoch_meta; rejected; rej_addr; rej_epoch;
-    receipts; meta; batch = None }
+  {
+    env;
+    readonly;
+    tx_loc;
+    addr_tx;
+    addr_recent;
+    txid_loc;
+    epoch_meta;
+    rejected;
+    rej_addr;
+    rej_epoch;
+    receipts;
+    meta;
+    batch = None;
+  }
 
 let close t =
-  Lmdb.Env.sync t.env;
+  if not t.readonly then Lmdb.Env.sync t.env;
   Lmdb.Env.close t.env
 
 let encode_tx_loc ~seg_id ~offset ~len ~epoch_id =
@@ -221,7 +247,6 @@ let buffer_meta t key value =
 
 exception Index_commit_failed of string
 
-
 let set_tx_loc_only t hash ~seg_id ~offset ~len ~epoch_id =
   let loc = encode_tx_loc ~seg_id ~offset ~len ~epoch_id in
   match
@@ -231,14 +256,12 @@ let set_tx_loc_only t hash ~seg_id ~offset ~len ~epoch_id =
   | Some () -> ()
   | None -> raise (Index_commit_failed "set_tx_loc_only: Txn.go returned None")
 
-
 let buffer_tx_loc_only t ~hash ~seg_id ~offset ~len ~epoch_id =
   match t.batch with
   | None -> failwith "history_index: no batch active"
   | Some b ->
     b.txs <- { hash; seg_id; offset; len; epoch_id; txid = 0L;
                from_addr = ""; to_addr = ""; extra_addrs = [] } :: b.txs
-
 
 let commit_tx_loc_only t =
   match t.batch with
@@ -351,14 +374,17 @@ let commit_write t =
         )
       with e ->
         let msg = Printf.sprintf "LMDB commit failed: %s" (Printexc.to_string e) in
-        Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
+        Octra_log.fatal "chaindata"
+          "event = commit_failed error = %s"
+          (Printexc.to_string e);
         raise (Index_commit_failed msg)
     in
     (match result with
      | Some () -> t.batch <- None
      | None ->
        let msg = "LMDB Txn.go returned None (commit failed)" in
-       Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
+       Octra_log.fatal "chaindata"
+         "event = commit_failed reason = transaction_returned_none";
        raise (Index_commit_failed msg))
 
 let abort_write t =
@@ -570,7 +596,6 @@ let get_meta t key =
   try Some (copy (Lmdb.Map.get t.meta key))
   with Not_found -> None
 
-
 let get_meta_string t key = get_meta t key
 
 let get_meta_int t key =
@@ -582,7 +607,6 @@ let get_meta_int64 t key =
   match get_meta t key with
   | None -> None
   | Some s -> (try Some (Int64.of_string s) with _ -> None)
-
 
 let cleanup_after_epoch t ~max_epoch ~start_txid_inflight ~tx_count_inflight:_ =
   let to_del_hashes = ref [] in
@@ -658,14 +682,17 @@ let cleanup_after_epoch t ~max_epoch ~start_txid_inflight ~tx_count_inflight:_ =
       )
     with e ->
       let msg = Printf.sprintf "cleanup_after_epoch txn failed: %s" (Printexc.to_string e) in
-      Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
+      Octra_log.fatal "chaindata"
+        "event = cleanup_failed error = %s"
+        (Printexc.to_string e);
       raise (Index_commit_failed msg)
   in
   (match result with
    | Some () -> ()
    | None ->
      let msg = "cleanup_after_epoch: Txn.go returned None" in
-     Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
+     Octra_log.fatal "chaindata"
+       "event = cleanup_failed reason = transaction_returned_none";
      raise (Index_commit_failed msg));
   (List.length !to_del_hashes,
    List.length !to_del_epochs_int32,
@@ -680,16 +707,19 @@ let set_meta_direct t key value =
       )
     with e ->
       let msg = Printf.sprintf "LMDB set_meta_direct failed key=%S: %s" key (Printexc.to_string e) in
-      Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
+      Octra_log.fatal "chaindata"
+        "event = metadata_write_failed key = %S error = %s"
+        key (Printexc.to_string e);
       raise (Index_commit_failed msg)
   in
   match result with
   | Some () -> ()
   | None ->
     let msg = Printf.sprintf "LMDB set_meta_direct Txn.go returned None key=%S" key in
-    Octra_log.stderr "[CHAINDATA_INDEX FATAL] %s\n%!" msg;
+    Octra_log.fatal "chaindata"
+      "event = metadata_write_failed key = %S reason = transaction_returned_none"
+      key;
     raise (Index_commit_failed msg)
-
 
 let set_meta_many_direct t kvs =
   let result =
@@ -704,8 +734,6 @@ let set_meta_many_direct t kvs =
   | Some () -> ()
   | None ->
     raise (Index_commit_failed "set_meta_many_direct: Txn.go returned None")
-
-
 
 let repair_tx_full t ~hash ~seg_id ~offset ~len ~epoch_id ~txid
     ~from_addr ~to_addr =
@@ -762,7 +790,6 @@ let remove_addr_tx_direct t ~addr ~txid =
   | Some () -> ()
   | None -> raise (Index_commit_failed "remove_addr_tx_direct: Txn.go returned None")
 
-
 let find_txid_for_epoch_pointer t ~epoch_id ~seg_id ~offset =
   let em_v = try Some (copy (Lmdb.Map.get t.epoch_meta (Int32.of_int epoch_id)))
              with Not_found -> None in
@@ -801,7 +828,6 @@ let find_txid_for_epoch_pointer t ~epoch_id ~seg_id ~offset =
       !found
     with _ -> None)
 
-
 let repair_class_b t ~hash ~seg_id ~offset ~len ~epoch_id ~txid
     ~from_addr ~to_addr =
   let result =
@@ -834,7 +860,6 @@ let set_epoch_meta_json t epoch_id json =
   match result with
   | Some () -> ()
   | None -> raise (Index_commit_failed "set_epoch_meta_json: Txn.go returned None")
-
 
 type delta_row = {
   d_txid : int64;
@@ -872,7 +897,6 @@ let apply_delta_atomic t ~rows ~epoch_meta_updates ~meta_kvs =
   match result with
   | Some () -> ()
   | None -> raise (Index_commit_failed "apply_delta_atomic: Txn.go returned None")
-
 
 let clear_rebuild_tables t =
   let result =

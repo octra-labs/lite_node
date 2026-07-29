@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Ledger = Octra_core.Ledger
 module Rpc = Octra_core.Rpc
@@ -122,13 +110,7 @@ let staging_estimate_ou () =
        ~capacity:Staging.max_ou_per_epoch)
 
 let stealth_floor () =
-  match Sys.getenv_opt "OCTRA_STEALTH_MIN_OU" with
-  | Some s ->
-    begin
-      try Z.of_string s with _ -> Z.of_int 1_000_000
-    end
-  | None ->
-    Z.of_int 1_000_000
+  Transaction.stealth_min_ou_of Sys.getenv_opt
 
 let recommended_fee ~params ~stealth_floor =
   let jitter () =

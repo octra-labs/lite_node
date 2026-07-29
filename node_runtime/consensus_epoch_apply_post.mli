@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type commit_result = {
   post_consensus_root : string;
@@ -66,6 +54,7 @@ type node_effects = {
 
 type node_input = {
   now : float;
+  epoch_ts : float;
   consensus_mode : bool;
   layera_diag : bool;
   replay_trace : bool;
@@ -86,6 +75,7 @@ type node_input = {
   prev_supply : Z.t;
   emission_remaining : Z.t;
   reward_recipients : Octra_core.Epochlog.reward_recipient list;
+  reward_source : Octra_consensus.C_types.reward_source;
   epoch_receipts_json : string list;
   active_validators : string list;
   processed_hashes : string list;
@@ -96,6 +86,7 @@ type node_input = {
 
 val input_of_finalized :
   now:float ->
+  epoch_ts:float ->
   consensus_mode:bool ->
   trace:Consensus_epoch_apply_footer.trace ->
   pre_state_hash:string ->
@@ -112,6 +103,7 @@ val input_of_finalized :
   epoch_receipts_json:string list ->
   active_validators:string list ->
   processed_hashes:string list ->
+  reward_source:Octra_consensus.C_types.reward_source ->
   producer:string ->
   short:(string -> string) ->
   Consensus_epoch_apply_finalize.result ->

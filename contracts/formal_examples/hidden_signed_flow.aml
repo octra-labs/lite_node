@@ -1,0 +1,17 @@
+contract HiddenSignedFlow {
+  state {
+    balances: map[address]u128
+  }
+
+  private fn credit(to: address, delta: int): bool {
+    self.balances[to] = self.balances[to] + delta
+    return true
+  }
+
+  fn execute(to: address, ticket: int): bool {
+    let shadow = ticket
+    let ok = credit(to, shadow)
+    require(ok, "credit failed")
+    return true
+  }
+}

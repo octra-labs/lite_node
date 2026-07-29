@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module Address = Octra_core.Crypto.Address
@@ -122,6 +110,7 @@ type proposal_preview_runtime = {
   warn : string -> unit;
   run_preview :
     Consensus_proposal.build_preview_request ->
+    reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
 }
@@ -169,6 +158,13 @@ type deps = {
   current_epoch : unit -> int;
   current_round : unit -> int;
   committed_head_epoch : unit -> int;
+  load_parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
   finality : Consensus_finality_state.callbacks;
   read_prev_ledger_root : unit -> string option Lwt.t;
   cached_head : unit -> Octra_core.Head_manifest.t option;
@@ -227,6 +223,13 @@ type config_with_standard_input = {
   current_epoch : unit -> int;
   current_round : unit -> int;
   committed_head_epoch : unit -> int;
+  load_parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
   finality : Consensus_finality_state.callbacks;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   now : unit -> float;
@@ -279,6 +282,13 @@ type node_driver_config_runtime = {
   current_epoch : unit -> int;
   current_round : unit -> int;
   committed_head_epoch : unit -> int;
+  load_parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
   finality : Consensus_finality_state.callbacks;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   now : unit -> float;
@@ -428,6 +438,16 @@ let node_proposal_preview
     ?(catch_exn = false)
     (request : Consensus_proposal.build_preview_request) =
   let run () =
+    let reward =
+      match
+        Consensus_reward_attribution.resolve
+          ~proposer_addr:request.proposer
+          ~validator_pubkeys:request.validator_pubkeys
+          request.parent_commit
+      with
+      | Ok reward -> reward
+      | Error error -> failwith ("reward attribution rejected: " ^ error)
+    in
     let env =
       Consensus_proposal.epoch_exec_env
         ~chain_id:runtime.chain_id
@@ -439,7 +459,7 @@ let node_proposal_preview
         ~ready_state_root_at:runtime.ready_state_root_at
         ~ready_max_lag:runtime.ready_max_lag
     in
-    runtime.run_preview request ~env
+    runtime.run_preview request ~reward ~env
   in
   preview_with_optional_catch ~catch_exn ~warn:runtime.warn run
 
@@ -502,8 +522,11 @@ let verify_proposal_deps (deps : deps) =
   Consensus_proposal.{
     now = deps.now;
     previous_epoch_ts = (fun epoch ->
-      deps.finality.find_finalized (Int64.to_int epoch)
-      |> Option.map (fun finalize -> finalize.Octra_consensus.C_types.header.ts));
+      match deps.finality.find_finalized (Int64.to_int epoch) with
+      | Some finalize ->
+        Some finalize.Octra_consensus.C_types.header.ts
+      | None ->
+        Consensus_driver_read.epoch_time deps.driver_read_deps epoch);
     quarantine_active = deps.gates.quarantine_active;
     quarantine_reason = deps.gates.quarantine_reason;
     mark_quarantine = deps.gates.mark_quarantine;
@@ -517,6 +540,8 @@ let verify_proposal_deps (deps : deps) =
     layera_diag_context = make_layera_diag_context deps;
     wait_prev_root = {
       read_root = deps.read_local_root_raw;
+      replay_stashed = (fun () ->
+        deps.replay_stashed_while_safe ~source:"proposal_prev_root");
       sleep = deps.sleep;
     };
     max_prev_root_wait_tries = 60;
@@ -525,6 +550,13 @@ let verify_proposal_deps (deps : deps) =
     staging_txs = deps.staging_txs;
     cached_bundle = cached_proposal_bundle deps;
     run_preverify = deps.run_preverify;
+    run_preverify_once = (fun ~state_root ~tx_hashes txs ->
+      Consensus_bundle_cache.run_preverify_once
+        deps.proposal_bundles
+        ~state_root
+        ~tx_hashes
+        ~txs
+        deps.run_preverify);
     driver_available = driver_available deps;
     validate_bundle;
     query_bundle = query_bundle deps;
@@ -539,6 +571,7 @@ let verify_proposal_deps (deps : deps) =
     next_txid = deps.next_txid;
     root_to_raw32 = deps.root_to_raw32;
     set_proposal = deps.set_proposal;
+    verify_parent_commit = deps.verify_parent_commit;
   }
 
 let make_proposal_deps (deps : deps) =
@@ -556,13 +589,22 @@ let make_proposal_deps (deps : deps) =
     read_prev_ledger_root = deps.read_prev_ledger_root;
     cached_head = deps.cached_head;
     current_round = deps.current_round;
+    parent_commit = deps.load_parent_commit;
     frozen_bundle = Consensus_bundle_cache.find_frozen deps.proposal_bundles;
     store_bundle = deps.store_bundle;
     staging_txs = deps.staging_epoch_txs;
     admits_tx = (fun tx ->
       (not (deps.gates.consensus_mode ()))
-      || Transaction.bft_admits_op tx.Transaction.op_type);
+      || Transaction.bft_consensus_admits_op
+           tx.Transaction.op_type);
     run_preverify = deps.run_preverify;
+    run_preverify_once = (fun ~state_root ~tx_hashes txs ->
+      Consensus_bundle_cache.run_preverify_once
+        deps.proposal_bundles
+        ~state_root
+        ~tx_hashes
+        ~txs
+        deps.run_preverify);
     staging_total = deps.staging_total;
     proposer = deps.proposer;
     validator_pubkeys = proposal_validator_pubkeys deps;
@@ -606,24 +648,28 @@ let finalized_deps (deps : deps) =
   }
 
 let before_precommit (deps : deps) ~epoch_id ~round ~proposal_id ~proposed_state_root
-    ~txid_hi =
-  Consensus_proposal.handle_before_precommit
-    {
-      current_tx_hashes = deps.current_tx_hashes;
-      cached_bundle = Consensus_bundle_cache.peek_raw deps.proposal_bundles;
-      sync_bundle = (fun ~tx_hashes ~txs ~receipts_json:_ ->
-        deps.set_proposal txs tx_hashes);
-      mark_unsynced = deps.mark_unsynced;
-      write_pending = deps.write_pending;
-      now = deps.now;
-    }
-    ~epoch_id
-    ~round
-    ~proposal_id
-    ~proposed_state_root
-    ~txid_hi
-    ~validator_addr:deps.my_addr;
-  Lwt.return_unit
+    ~txid_hi ~proposal_wire ~vote_wire =
+  Lwt.return
+    (Consensus_proposal.handle_before_precommit
+      {
+        chain_id = deps.chain_id;
+        validator_set = deps.validator_set;
+        current_tx_hashes = deps.current_tx_hashes;
+        cached_bundle = Consensus_bundle_cache.peek_raw deps.proposal_bundles;
+        sync_bundle = (fun ~tx_hashes ~txs ~receipts_json:_ ->
+          deps.set_proposal txs tx_hashes);
+        mark_unsynced = deps.mark_unsynced;
+        write_pending = deps.write_pending;
+        now = deps.now;
+      }
+      ~epoch_id
+      ~round
+      ~proposal_id
+      ~proposed_state_root
+      ~txid_hi
+      ~validator_addr:deps.my_addr
+      ~proposal_wire
+      ~vote_wire)
 
 let config (deps : deps) =
   Octra_consensus.C_driver.{
@@ -647,6 +693,7 @@ let config (deps : deps) =
         (verify_proposal_deps deps)
         ~chain_id:deps.chain_id
         propose);
+    verify_parent_commit = deps.verify_parent_commit;
     on_finalized = (fun finalize ->
       Consensus_finalized_shell.handle (finalized_deps deps) finalize);
     make_proposal = (fun epoch_id ->
@@ -708,6 +755,8 @@ let config_with_standard (input : config_with_standard_input) =
       current_epoch = input.current_epoch;
       current_round = input.current_round;
       committed_head_epoch = input.committed_head_epoch;
+      load_parent_commit = input.load_parent_commit;
+      verify_parent_commit = input.verify_parent_commit;
       finality = input.finality;
       read_prev_ledger_root = standard.read_prev_ledger_root;
       cached_head = input.cached_head;
@@ -755,6 +804,8 @@ let node_driver_config (runtime : node_driver_config_runtime) =
       current_epoch = runtime.current_epoch;
       current_round = runtime.current_round;
       committed_head_epoch = runtime.committed_head_epoch;
+      load_parent_commit = runtime.load_parent_commit;
+      verify_parent_commit = runtime.verify_parent_commit;
       finality = runtime.finality;
       cached_head = runtime.cached_head;
       now = runtime.now;

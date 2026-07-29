@@ -1,22 +1,10 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type status = {
   has_pvac_pubkey : bool;
   pubkey_size : int option;
-  deserializable : bool;
+  canonical_binding : bool;
   pubkey_format : string option;
 }
 
@@ -38,6 +26,8 @@ val expected_kat : unit -> string
 
 val key_hash : string -> string
 
+val full_key_hash : string -> string
+
 val decode_b64 : string -> (string, string) result
 
 val validate_size : string -> (string, string) result
@@ -52,6 +42,6 @@ val load_pubkey : string -> (Pvac_ffi.pubkey, string) result
 
 val canonicalize_blob : string -> (string, string) result
 
-val status_of_blob : string option -> status
+val status_of_blob : canonical_binding:bool -> string option -> status
 
 val register_decision : existing:string option -> incoming:string -> register_decision

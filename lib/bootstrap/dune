@@ -1,3 +1,14 @@
 (library
  (name octra_bootstrap)
- (libraries octra_core octra_net octra_consensus unix yojson digestif digestif.c))
+ (libraries
+  octra_core
+  octra_net
+  octra_consensus
+  unix
+  yojson
+  digestif
+  digestif.c
+  lwt.unix
+  cohttp-lwt-unix
+  tls-lwt
+  uri))

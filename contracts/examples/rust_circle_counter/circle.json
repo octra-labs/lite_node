@@ -1,0 +1,29 @@
+{
+  "name": "rust-circle-counter",
+  "runtime": "wasm_v1",
+  "build": {
+    "kind": "cargo-wasm",
+    "target": "wasm32-unknown-unknown",
+    "profile": "release",
+    "artifact": "target/wasm32-unknown-unknown/release/rust_circle_counter.wasm"
+  },
+  "deploy": {
+    "privacy_class": "sealed",
+    "browser_mode": "native_sealed",
+    "resource_mode": "sealed_read",
+    "ou": "250000",
+    "limits": {
+      "max_stable_bytes": "33554432",
+      "max_assets_bytes": "33554432",
+      "max_inline_value": "65536",
+      "max_wasm_bytes": "33554432"
+    }
+  },
+  "assets": {
+    "mode": "sealed",
+    "root": "site",
+    "key_id": "rust-browser-demo",
+    "padding_class": "4k",
+    "metadata_mode": "reveal"
+  }
+}

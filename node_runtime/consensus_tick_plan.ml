@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type finalized_state =
   | No_trigger
@@ -41,12 +29,13 @@ type t = {
 type 'header prepared = {
   state : finalized_state;
   empty_bundle_header : 'header option;
+  commit_round : int option;
 }
 
 let missing_bundle_reason = "finalized_bundle_missing_tick"
 
-let prepared state empty_bundle_header =
-  { state; empty_bundle_header }
+let prepared state empty_bundle_header commit_round =
+  { state; empty_bundle_header; commit_round }
 
 let finalized_state ~consensus_mode ~consensus_finalized ~current_epoch
     ~find_finalized ~cached_bundle_for_pid ~header_has_empty_bundle =
@@ -56,19 +45,20 @@ let finalized_state ~consensus_mode ~consensus_finalized ~current_epoch
       let header = finalize.Octra_consensus.C_types.header in
       let pid = Octra_consensus.C_hash.proposal_id header in
       if cached_bundle_for_pid pid then
-        prepared Cached_bundle None
+        prepared Cached_bundle None (Some finalize.commit_round)
       else if header_has_empty_bundle header then
-        prepared Empty_bundle (Some header)
+        prepared Empty_bundle (Some header) (Some finalize.commit_round)
       else
         prepared
           (Missing_bundle {
             target_epoch = header.Octra_consensus.C_types.epoch_id;
           })
           None
+          (Some finalize.commit_round)
     | None ->
-      prepared Missing_header None
+      prepared Missing_header None None
   else
-    prepared No_trigger None
+    prepared No_trigger None None
 
 let consensus_action = function
   | No_trigger -> Wait
@@ -110,7 +100,11 @@ let apply_action ~current_epoch ~clear_trigger ~store_empty_bundle
 
 let plan ~consensus_mode ~epoch_duration ~elapsed ~finalized_state =
   if consensus_mode then
-    let action = consensus_action finalized_state in
+    let planned = consensus_action finalized_state in
+    let action =
+      if should_apply planned && elapsed < epoch_duration then Wait
+      else planned
+    in
     {
       action;
       log_tick = should_apply action;

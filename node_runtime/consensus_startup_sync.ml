@@ -1,20 +1,9 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type deps = {
   env : string -> string option;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   head : unit -> Octra_core.Head_manifest.t option;
@@ -27,6 +16,8 @@ type deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
@@ -44,6 +35,8 @@ type apply_finalized =
   ?override_ordered_txs:Octra_core.Transaction.t list ->
   ?override_receipts_json:string list ->
   ?override_proposer_info:Octra_core.Epochlog.proposer_info ->
+  ?override_reward:Consensus_reward_attribution.t ->
+  ?override_epoch_ts:float ->
   now:float ->
   elapsed:float ->
   unit ->
@@ -55,11 +48,14 @@ type apply_callbacks = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     proposer_info:Octra_core.Epochlog.proposer_info option ->
+    reward:Consensus_reward_attribution.t ->
+    epoch_ts:float ->
     unit Lwt.t;
 }
 
 type node_deps = {
   env : string -> string option;
+  expected_validator_set_hash : int64 -> (string, string) result;
   fetch_json : string -> Yojson.Safe.t Lwt.t;
   current_epoch : unit -> int;
   head : unit -> Octra_core.Head_manifest.t option;
@@ -89,11 +85,13 @@ let apply_callbacks ~now (apply : apply_finalized) =
         ~now:(now ())
         ~elapsed:0.0
         ());
-    join = (fun ~txs ~receipts_json ~proposer_info ->
+    join = (fun ~txs ~receipts_json ~proposer_info ~reward ~epoch_ts ->
       apply
         ~override_ordered_txs:txs
         ~override_receipts_json:receipts_json
         ?override_proposer_info:proposer_info
+        ~override_reward:reward
+        ~override_epoch_ts:epoch_ts
         ~now:(now ())
         ~elapsed:0.0
         ());
@@ -103,6 +101,7 @@ let node_deps runtime =
   let apply = apply_callbacks ~now:runtime.now runtime.apply_finalized in
   {
     env = runtime.env;
+    expected_validator_set_hash = runtime.expected_validator_set_hash;
     fetch_json = runtime.fetch_json;
     current_epoch = runtime.current_epoch;
     head = runtime.head;
@@ -138,6 +137,7 @@ let replay_deps (deps : deps) =
 let join_wiring (deps : deps) =
   Consensus_join_rpc.{
     env = deps.env;
+    expected_validator_set_hash = deps.expected_validator_set_hash;
     fetch_json = deps.fetch_json;
     current_epoch = deps.current_epoch;
     head = deps.head;

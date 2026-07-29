@@ -1,28 +1,24 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module C_codec = Octra_consensus.C_codec
+module C_catchup = Octra_consensus.C_catchup
 module C_hash = Octra_consensus.C_hash
 module Epochlog = Octra_core.Epochlog
 module Transaction = Octra_core.Transaction
 
 type deps = {
+  chain_id : string;
   get_epoch_json : int -> string option;
+  epoch_time : int -> float option;
   get_tx_by_txid : int64 -> (string * string) option;
   read_receipts : int -> string list;
   root_to_raw32 : string -> string;
+  reward_source :
+    int ->
+    Epochlog.epoch_header ->
+    (Octra_consensus.C_types.reward_source, string) result;
+  read_finality : int -> C_codec.catchup_finality option;
 }
 
 type state = {
@@ -63,8 +59,27 @@ let read_txs deps ~start_txid ~tx_count =
 let wire_bytes strings =
   List.fold_left (fun acc s -> acc + 32 + String.length s) 0 strings
 
-let record_size txs_json receipts_json =
-  128 + wire_bytes txs_json + wire_bytes receipts_json
+let record_size reward_source finality txs_json receipts_json =
+  let reward_bytes =
+    Octra_net.Oce1.encode
+      (fun buf ->
+        Octra_consensus.C_reward_source.encode_into buf reward_source)
+    |> String.length
+  in
+  let finality_bytes =
+    C_codec.encode_finalize finality.C_codec.finalize
+    |> String.length
+  in
+  let validator_bytes =
+    C_codec.encode_validator_set finality.C_codec.validator_set
+    |> String.length
+  in
+  136
+  + wire_bytes txs_json
+  + wire_bytes receipts_json
+  + reward_bytes
+  + finality_bytes
+  + validator_bytes
 
 let tx_list_hash tx_hashes =
   Octra_net.Hash_domain.hash "octra:tx_list:v1" (String.concat "" tx_hashes)
@@ -81,31 +96,90 @@ let log_proposer_divergence ~epoch_id elog =
 
 let build_record deps ~epoch_id ~target_int elog tx_hashes txs_json parsed_txs =
   let receipts_json = deps.read_receipts target_int in
-  match Octra_core.Preverify_receipt_policy.check
-    ~epoch_id:target_int
-    ~receipts:receipts_json
-    parsed_txs with
-  | Error e ->
+  match deps.read_finality target_int with
+  | None ->
     Octra_log.warn "catchup"
-      "lookup_catchup_range epoch = %Ld receipt_check_failed = %s"
-      epoch_id e;
+      "lookup_catchup_range epoch = %Ld finality = missing"
+      epoch_id;
     None
-  | Ok () ->
-    log_proposer_divergence ~epoch_id elog;
-    Some (
-      C_codec.{
-        epoch_id;
-        prev_state_root = deps.root_to_raw32 elog.Epochlog.prev_state_root;
-        state_root = deps.root_to_raw32 elog.state_root;
-        tx_list_hash = tx_list_hash tx_hashes;
-        tx_hashes;
-        txs_json;
-        receipt_root = C_hash.receipt_root receipts_json;
-        receipts_json;
-        creator_addr = elog.proposer.creator_addr;
-        commit_round = elog.proposer.commit_round;
-      },
-      record_size txs_json receipts_json)
+  | Some finality ->
+  match deps.reward_source target_int elog with
+  | Error error ->
+    Octra_log.warn "catchup"
+      "lookup_catchup_range epoch = %Ld reward_source = invalid reason = %s"
+      epoch_id error;
+    None
+  | Ok reward_source ->
+  match deps.epoch_time target_int with
+  | None ->
+    Octra_log.warn "catchup"
+      "lookup_catchup_range epoch = %Ld canonical_time = missing"
+      epoch_id;
+    None
+  | Some epoch_ts ->
+    begin
+      match Octra_consensus.Epoch_time.of_seconds epoch_ts with
+      | Error error ->
+        Octra_log.warn "catchup"
+          "lookup_catchup_range epoch = %Ld canonical_time = invalid reason = %s"
+          epoch_id error;
+        None
+      | Ok _ ->
+        match Octra_core.Preverify_receipt_policy.check
+          ~epoch_id:target_int
+          ~receipts:receipts_json
+          parsed_txs with
+        | Error e ->
+          Octra_log.warn "catchup"
+            "lookup_catchup_range epoch = %Ld receipt_check_failed = %s"
+            epoch_id e;
+          None
+        | Ok () ->
+          log_proposer_divergence ~epoch_id elog;
+          let record =
+            C_codec.{
+              epoch_id;
+              prev_state_root = deps.root_to_raw32 elog.Epochlog.prev_state_root;
+              state_root = deps.root_to_raw32 elog.state_root;
+              tx_list_hash = tx_list_hash tx_hashes;
+              tx_hashes;
+              txs_json;
+              receipt_root = C_hash.receipt_root receipts_json;
+              receipts_json;
+              epoch_ts;
+              creator_addr = elog.proposer.creator_addr;
+              commit_round = elog.proposer.commit_round;
+              reward_source = Some reward_source;
+              finality = Some finality;
+            }
+          in
+          let expected_txid =
+            Int64.add
+              elog.Epochlog.start_txid
+              (Int64.of_int (List.length tx_hashes))
+          in
+          begin
+            match
+              C_catchup.verify_record_finality
+                ~chain_id:deps.chain_id
+                ~expected_validator_set_hash:
+                  (Octra_consensus.C_config.validator_set_hash
+                     finality.validator_set)
+                ~expected_txid
+                ~record
+            with
+            | Ok _ ->
+              Some (
+                record,
+                record_size reward_source finality txs_json receipts_json)
+            | Error error ->
+              Octra_log.warn "catchup"
+                "lookup_catchup_range epoch = %Ld finality = invalid reason = %s"
+                epoch_id
+                error;
+              None
+          end
+    end
 
 let read_record deps ~epoch_id ~target_int json =
   match Epochlog.epoch_of_json json with

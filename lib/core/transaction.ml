@@ -1,23 +1,11 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type priority = Low | Normal | High | Express
 
 type op_type =
   | Standard | EncryptOp | DecryptOp | PrivateOp
-  | ContractDeploy | ContractCall | ProgramExec | MultiExec | ContractUpgrade
+  | ContractDeploy | ProgramDeploy | ContractCall | ProgramExec | MultiExec | ContractUpgrade
   | CircleDeploy | CircleProgramUpdate | CircleAssetPut | CircleAssetPutEncrypted
   | CircleSealedSlotPut | CircleSlotPolicyPut
   | CircleStateDescriptorPut
@@ -27,6 +15,7 @@ type op_type =
   | CircleOutboxOpen | CircleRelayClaim | CircleRelayCancel | CircleIngressCommit
   | CircleCall
   | ValidatorSetUpdate | ValidatorReady
+  | ValidatorBond | ValidatorExit | ValidatorWithdraw | ValidatorEvidence
   | StealthOp | ClaimOp | RecryptOp | KeySwitch
   | Op01Burn
 
@@ -34,6 +23,7 @@ let op_type_to_string = function
   | Standard -> "standard" | EncryptOp -> "encrypt"
   | DecryptOp -> "decrypt" | PrivateOp -> "private"
   | ContractDeploy -> "deploy" | ContractCall -> "call"
+  | ProgramDeploy -> "program_deploy"
   | ProgramExec -> "program_exec"
   | MultiExec -> "multi_exec"
   | ContractUpgrade -> "upgrade"
@@ -60,6 +50,10 @@ let op_type_to_string = function
   | CircleCall -> "circle_call"
   | ValidatorSetUpdate -> "validator_set_update"
   | ValidatorReady -> "validator_ready"
+  | ValidatorBond -> "validator_bond"
+  | ValidatorExit -> "validator_exit"
+  | ValidatorWithdraw -> "validator_withdraw"
+  | ValidatorEvidence -> "validator_evidence"
   | StealthOp -> "stealth" | ClaimOp -> "claim"
   | RecryptOp -> "recrypt"
   | KeySwitch -> "key_switch"
@@ -88,38 +82,125 @@ let is_circle_noncall = function
   | CircleIngressCommit -> true
   | _ -> false
 
+let bft_circle_noncall op =
+  is_circle_noncall op
+
+type bft_crypto_profile =
+  | Crypto_off
+  | Private_v1
+
+type bft_release_profile =
+  | Release_off
+  | Devnet_private_v1
+  | Devnet_full_v1
+
+let bft_release_profile_of getenv =
+  match getenv "OCTRA_BFT_RELEASE_PROFILE" with
+  | Some "devnet_private_v1" -> Devnet_private_v1
+  | Some "devnet_full_v1" -> Devnet_full_v1
+  | Some _
+  | None -> Release_off
+
+let bft_release_profile () =
+  bft_release_profile_of Sys.getenv_opt
+
+let bft_release_profile_name = function
+  | Release_off -> "off"
+  | Devnet_private_v1 -> "devnet_private_v1"
+  | Devnet_full_v1 -> "devnet_full_v1"
+
+let bft_crypto_profile_of getenv =
+  match bft_release_profile_of getenv with
+  | Devnet_private_v1
+  | Devnet_full_v1 -> Private_v1
+  | Release_off ->
+    match getenv "OCTRA_BFT_CRYPTO_PROFILE" with
+    | Some "private_v1" -> Private_v1
+    | Some _
+    | None -> Crypto_off
+
+let bft_crypto_profile () =
+  bft_crypto_profile_of Sys.getenv_opt
+
+let bft_crypto_profile_name = function
+  | Crypto_off -> "off"
+  | Private_v1 -> "private_v1"
+
+let bft_crypto_op = function
+  | EncryptOp
+  | DecryptOp
+  | StealthOp
+  | ClaimOp
+  | KeySwitch -> true
+  | _ -> false
+
+let bft_crypto_active () =
+  bft_crypto_profile () = Private_v1
+
 let bft_experimental_can_admit = function
-  | op when is_circle_noncall op -> true
-  | KeySwitch
-  | Op01Burn -> true
+  | op when bft_circle_noncall op -> true
+  | op when bft_crypto_active () && bft_crypto_op op -> true
+  | CircleCall -> true
   | _ -> false
 
 let bft_allow_token_matches token op =
   let token = String.trim token in
   token <> "" && (
     String.equal token (op_type_to_string op)
-    || (String.equal token "circle_noncall" && is_circle_noncall op)
+    || (String.equal token "circle_noncall" && bft_circle_noncall op)
   )
 
 let bft_lab_op_allowed op =
-  match Sys.getenv_opt "OCTRA_BFT_ADMIT_OPS" with
-  | None | Some "" -> false
-  | Some raw ->
-    bft_experimental_can_admit op
-    && (raw
-        |> String.split_on_char ','
-        |> List.exists (fun token -> bft_allow_token_matches token op))
+  match bft_release_profile () with
+  | Devnet_private_v1 -> bft_crypto_op op
+  | Devnet_full_v1 ->
+    bft_crypto_op op
+    || bft_circle_noncall op
+    || begin
+      match op with
+      | ContractDeploy
+      | ProgramDeploy
+      | ContractCall
+      | ProgramExec
+      | MultiExec
+      | ContractUpgrade
+      | CircleCall -> true
+      | _ -> false
+    end
+  | Release_off ->
+    if bft_crypto_active () && bft_crypto_op op then
+      true
+    else match Sys.getenv_opt "OCTRA_BFT_ADMIT_OPS" with
+    | None | Some "" -> false
+    | Some raw ->
+      bft_experimental_can_admit op
+      && (raw
+          |> String.split_on_char ','
+          |> List.exists (fun token -> bft_allow_token_matches token op))
 
 let bft_admits_op = function
   | Standard -> true
-  | ValidatorSetUpdate | ValidatorReady -> true
   | op -> bft_lab_op_allowed op
 
-  (*  included *)
+let bft_consensus_admits_op = function
+  | ValidatorSetUpdate
+  | ValidatorReady
+  | ValidatorBond
+  | ValidatorExit
+  | ValidatorWithdraw -> true
+  | ValidatorEvidence -> true
+  | op -> bft_admits_op op
+
+let bft_reject_reason op =
+  Printf.sprintf
+    "BFT operation disabled by the active release profile; op_type = %s"
+    (op_type_to_string op)
 
 let op_type_of_string = function
+  | "standard" -> Ok Standard
   | "encrypt" -> Ok EncryptOp | "decrypt" -> Ok DecryptOp
   | "private" -> Ok PrivateOp | "deploy" -> Ok ContractDeploy
+  | "program_deploy" -> Ok ProgramDeploy
   | "call" -> Ok ContractCall
   | "program_exec" -> Ok ProgramExec
   | "multi_exec" -> Ok MultiExec
@@ -147,11 +228,15 @@ let op_type_of_string = function
   | "circle_call" -> Ok CircleCall
   | "validator_set_update" -> Ok ValidatorSetUpdate
   | "validator_ready" -> Ok ValidatorReady
+  | "validator_bond" -> Ok ValidatorBond
+  | "validator_exit" -> Ok ValidatorExit
+  | "validator_withdraw" -> Ok ValidatorWithdraw
+  | "validator_evidence" -> Ok ValidatorEvidence
   | "stealth" -> Ok StealthOp | "claim" -> Ok ClaimOp
   | "recrypt" -> Ok RecryptOp
   | "key_switch" -> Ok KeySwitch
   | "op01_burn" -> Ok Op01Burn
-  | _ -> Ok Standard
+  | value -> Error ("unsupported op_type: " ^ value)
 
 type t = {
   from : string;
@@ -248,11 +333,12 @@ let sign_with_privkey tx priv_b64 =
     { tx with signature = Base64.encode_exn raw }
 
 let verify tx pub_b64 =
-  match Mirage_crypto_ec.Ed25519.pub_of_octets (Base64.decode_exn pub_b64) with
-  | Error _ -> false
-  | Ok pk ->
-    Mirage_crypto_ec.Ed25519.verify ~key:pk
-      ~msg:(serialize_for_signing tx) (Base64.decode_exn tx.signature)
+  try
+    Octra_ed25519.verify
+      ~pub:(Base64.decode_exn pub_b64)
+      ~msg:(serialize_for_signing tx)
+      (Base64.decode_exn tx.signature)
+  with _ -> false
 
 let circle_asset_max_raw_bytes = 33_554_432
 
@@ -281,14 +367,38 @@ let circle_asset_min_ou = function
   | None -> Z.of_int 5_000
   | Some body_b64 -> circle_asset_min_ou_from_wire_len (String.length body_b64)
 
+let stealth_min_ou_default = Z.of_int 5_000
+let stealth_min_ou_max = Z.of_int64 10_000_000_000L
+
+let stealth_min_ou_of getenv =
+  match getenv "OCTRA_STEALTH_MIN_OU" with
+  | Some raw ->
+    (try
+       let value = Z.of_string raw in
+       if Z.sign value <= 0 || Z.gt value stealth_min_ou_max then
+         stealth_min_ou_default
+       else value
+     with _ -> stealth_min_ou_default)
+  | None -> stealth_min_ou_default
+
+let program_deploy_min_ou_from_wire_len encoded_size =
+  Z.of_int
+    (200_000 + ((((max 0 encoded_size) + 1_023) / 1_024) * 1_000))
+
 let ou_cost tx = match tx.op_type with
   | EncryptOp | DecryptOp -> Z.of_int 3_000
   | PrivateOp | StealthOp ->
-    let min_ou = match Sys.getenv_opt "OCTRA_STEALTH_MIN_OU" with Some s -> (try int_of_string s with _ -> 5_000) | None -> 5_000 in
-    Z.of_int min_ou
+    stealth_min_ou_of Sys.getenv_opt
   | ClaimOp -> Z.of_int 3_000
   | RecryptOp -> Z.of_int 5_000
   | ContractDeploy -> Z.of_int 200_000
+  | ProgramDeploy ->
+    let encoded_size =
+      match tx.encrypted_data with
+      | Some value -> String.length value
+      | None -> 0
+    in
+    program_deploy_min_ou_from_wire_len encoded_size
   | ContractCall | ProgramExec -> Z.of_int 1_000
   | MultiExec ->
     let base = 1_000 in
@@ -330,7 +440,9 @@ let ou_cost tx = match tx.op_type with
   | CircleRelayCancel -> Z.of_int 3_000
   | CircleIngressCommit -> Z.of_int 3_000
   | CircleCall -> Z.of_int 1_000
-  | ValidatorSetUpdate | ValidatorReady -> Z.of_int 1_000
+  | ValidatorSetUpdate | ValidatorReady
+  | ValidatorBond | ValidatorExit | ValidatorWithdraw -> Z.of_int 1_000
+  | ValidatorEvidence -> Z.of_int 5_000
   | KeySwitch -> Z.of_int 3_000
   | Standard -> Z.of_int 1_000
   | Op01Burn -> Z.of_int 1_000

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -39,6 +27,14 @@ type deps = {
   notify_new_account : string -> unit;
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
+  legacy_replay :
+    epoch:int ->
+    address:string ->
+    cipher:string ->
+    Octra_core.Pvac_legacy_public_replay.decision;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
 }
 
 val trace_enc_balance :

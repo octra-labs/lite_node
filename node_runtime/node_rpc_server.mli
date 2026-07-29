@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Wallet = Octra_core.Crypto.Wallet
 module Ledger = Octra_core.Ledger
@@ -44,8 +32,10 @@ type config = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
+  migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
+  epoch_visibility : Epoch_visibility.t;
   deps : deps;
 }
 

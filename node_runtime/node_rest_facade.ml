@@ -1,19 +1,7 @@
-(*
-Octra Labs 2026
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
-
-module Denomination = Octra_core.Denomination
+module Emission_policy = Octra_core.Emission_policy
 module Ledger = Octra_core.Ledger
 module Store_irmin = Octra_core.Store_irmin
 module Store_chaindata = Octra_core.Store_chaindata
@@ -30,14 +18,26 @@ type runtime = {
 let cli_has_flag name =
   Array.exists (fun a -> a = name) Sys.argv
 
-let encrypted_supply_aggregate () =
-  let default_oct = 12_413_100 in
-  let oct =
-    match Sys.getenv_opt "OCTRA_ENCRYPTED_SUPPLY_OCT" with
-    | Some s -> (try int_of_string s with _ -> default_oct)
-    | None -> default_oct
+let encrypted_supply_aggregate store ledger () =
+  let public_supply = Ledger.get_total_supply ledger in
+  let total_supply =
+    match
+      Emission_policy.resolve_total
+        ~policy:(Emission_policy.of_env Sys.getenv_opt)
+        ~stored:(Ledger.run_s (Store_irmin.get_meta store "total_supply"))
+        ~legacy:(Emission_policy.legacy_total Sys.getenv_opt)
+        ~public_supply
+    with
+    | Ok value -> value
+    | Error error -> failwith error
   in
-  Z.mul (Z.of_int oct) Denomination.units_per_oct
+  match
+    Emission_policy.hidden_supply
+      ~total_supply
+      ~public_supply
+  with
+  | Ok hidden -> hidden
+  | Error error -> failwith error
 
 let notify_staging_update ?(total_txs = List.length (Staging.all ()))
     ?(total_ou = !Staging.total_ou) ?(max_ou = Staging.max_ou) () =
@@ -57,55 +57,58 @@ let sweep_low_fee_stealth () =
       (Z.to_string min_ou);
   n
 
-let add_tx_to_staging ?(relay = true) runtime ledger tx =
-  match Tx_view.staging_submit_admission
-          ~min_ou:(Rest_read_rpc.stealth_floor ())
-          ~min_relay_fee:(Staging.min_relay_fee tx)
-          tx with
-  | Error e -> Error e
+let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
+  match Tx_view.bft_op_admission ~bft_mode tx with
+  | Error (_, reason) -> Error reason
   | Ok () ->
-    let tx_hash = Transaction.hash tx in
-    let lookup addr =
-      Ledger.find_opt ledger addr
-      |> Option.map (fun a -> (a.Ledger.balance, a.Ledger.nonce))
-    in
-    match Staging.add_smart ~lookup tx with
+    match Tx_view.staging_submit_admission
+            ~min_ou:(Rest_read_rpc.stealth_floor ())
+            ~min_relay_fee:(Staging.min_relay_fee tx)
+            tx with
     | Error e -> Error e
     | Ok _ ->
-      let swarm_opt = !(runtime.swarm_ref) in
-      let peer_count =
-        match swarm_opt with
-        | Some swarm -> Octra_net.P2p_swarm.peer_count swarm
-        | None -> 0
+      let tx_hash = Transaction.hash tx in
+      let lookup addr =
+        Ledger.find_opt ledger addr
+        |> Option.map (fun a -> (a.Ledger.balance, a.Ledger.nonce))
       in
-      let effects =
-        Tx_view.staging_submit_effects
-          ~relay
-          ~peer_count
-          ~total_txs:(List.length (Staging.all ()))
-          ~total_ou:!Staging.total_ou
-          ~max_ou:Staging.max_ou
-          ~tx_hash
-      in
-      WSServer.notify_new_tx tx;
-      notify_staging_update
-        ~total_txs:effects.Tx_view.total_txs
-        ~total_ou:effects.total_ou
-        ~max_ou:effects.max_ou
-        ();
-      begin
-        match swarm_opt, effects.relay_payload with
-        | Some swarm, Some payload ->
-          Lwt.async (fun () ->
-            Octra_net.P2p_swarm.broadcast swarm
-              {
-                Octra_net.P2p_frame.msg_type =
-                  Octra_net.P2p_frame.msg_tx_gossip;
-                payload;
-              })
-        | _ -> ()
-      end;
-      Ok tx_hash
+      match Staging.add_smart ~lookup tx with
+      | Error e -> Error e
+      | Ok _ ->
+        let swarm_opt = !(runtime.swarm_ref) in
+        let peer_count =
+          match swarm_opt with
+          | Some swarm -> Octra_net.P2p_swarm.peer_count swarm
+          | None -> 0
+        in
+        let effects =
+          Tx_view.staging_submit_effects
+            ~relay
+            ~peer_count
+            ~total_txs:(List.length (Staging.all ()))
+            ~total_ou:!Staging.total_ou
+            ~max_ou:Staging.max_ou
+            ~tx_hash
+        in
+        WSServer.notify_new_tx tx;
+        notify_staging_update
+          ~total_txs:effects.Tx_view.total_txs
+          ~total_ou:effects.total_ou
+          ~max_ou:effects.max_ou
+          ();
+        begin
+          match swarm_opt, effects.relay_payload with
+          | Some swarm, Some payload ->
+            Lwt.async (fun () ->
+              Octra_net.P2p_swarm.broadcast swarm
+                {
+                  Octra_net.P2p_frame.msg_type =
+                    Octra_net.P2p_frame.msg_tx_gossip;
+                  payload;
+                })
+          | _ -> ()
+        end;
+        Ok tx_hash
 
 let max_encrypted_data_len = 50_000_000
 let max_message_len = 256
@@ -131,8 +134,9 @@ let consensus_mode_flags () =
 let bft_mode () =
   (consensus_mode_flags ()).consensus_enabled
 
-let observer_rpc_mode () =
+let observer_rejects_submissions () =
   (consensus_mode_flags ()).observer_enabled
+  && not (Env.flag "OCTRA_OBSERVER_RELAY_SUBMITS")
 
 let bft_pending_nonce_window () =
   max 1 (Env.int_value "OCTRA_BFT_PENDING_NONCE_WINDOW" 32)
@@ -142,7 +146,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
   match Tx_view.submit_pre_signature_admission
           ~now
           ~max_timestamp_drift
-          ~observer_rpc_mode:(observer_rpc_mode ())
+          ~observer_rpc_mode:(observer_rejects_submissions ())
           ~bft_mode:(bft_mode ())
           ~limits:tx_payload_limits
           ~sender_exists:(Ledger.mem ledger tx.from)
@@ -161,7 +165,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
             tx with
     | Error e -> Error e
     | Ok () ->
-      match add_tx_to_staging runtime ledger tx with
+      match add_tx_to_staging ~bft_mode:(bft_mode ()) runtime ledger tx with
       | Error msg ->
         let (t, r) = Tx_view.staging_error msg in
         Error (t, r)
@@ -182,11 +186,10 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
                 insert_task = Preverify_cache.insert_with_cap;
                 verify_ranges =
                   (fun ~pubkey_blob ~sender_enc ptd ->
-                    Lwt_preemptive.detach (fun () ->
-                      Tx_view.preverify_stealth_ranges
-                        ~pubkey_blob
-                        ~sender_enc
-                        ptd) ());
+                    Tx_view.preverify_stealth_ranges
+                      ~pubkey_blob
+                      ~sender_enc
+                      ptd);
                 now = Unix.gettimeofday;
               }
               ~tx_hash
@@ -205,10 +208,11 @@ let list_saved_epochs chaindata =
 let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     ~consensus_config_hash ~consensus_validator_set ~scheduled_validator_set
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
-    ~program_trust ~chaindata ~consensus_driver_ref =
+    ~program_trust ~migration_entitlements ~chaindata ~consensus_driver_ref
+    ~epoch_visibility =
   let deps = Node_rpc_server.{
     validate = validate_and_submit_tx runtime ledger;
-    encrypted_supply = encrypted_supply_aggregate;
+    encrypted_supply = encrypted_supply_aggregate store ledger;
     notify_staging_update = (fun () -> notify_staging_update ());
     bft_mode;
     account_path_profile_enabled = Env.flag "OCTRA_PROFILE_ACCOUNT_PATHS";
@@ -230,16 +234,19 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     validator_view_sk;
     validator_view_pub;
     program_trust;
+    migration_entitlements;
     chaindata;
     consensus_driver_ref;
+    epoch_visibility;
     deps;
   }
 
 let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
-    ~validator_view_sk ~validator_view_pub ~program_trust ~chaindata
-    ~consensus_driver_ref () =
+    ~validator_view_sk ~validator_view_pub ~program_trust
+    ~migration_entitlements ~chaindata
+    ~consensus_driver_ref ~epoch_visibility () =
   start
     runtime
     ~port
@@ -257,5 +264,7 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~validator_view_sk
     ~validator_view_pub
     ~program_trust
+    ~migration_entitlements
     ~chaindata
     ~consensus_driver_ref
+    ~epoch_visibility

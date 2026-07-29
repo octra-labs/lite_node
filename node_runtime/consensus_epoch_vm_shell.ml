@@ -1,20 +1,9 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Contract = Octra_vm.Contract
 module ContractVM = Octra_vm.Contract_vm
+module Admission = Octra_vm.Admission
 module Call_plan = Octra_vm.Call_plan
 module Direct_exec = Octra_vm.Direct_exec
 module Multi_exec = Octra_vm.Multi_exec
@@ -25,6 +14,8 @@ module Ledger = Octra_core.Ledger
 module Store_chaindata = Octra_core.Store_chaindata
 module Value_journal = Octra_vm.Value_journal
 module Program_journal = Octra_vm.Program_journal
+module Program_package = Octra_vm.Program_package
+module Program_upgrade = Octra_vm.Program_upgrade
 module Program_trust = Octra_vm.Program_trust
 module Tx_effects = Octra_vm.Tx_effects
 
@@ -82,6 +73,7 @@ type receipt_deps = {
 type tx_reject =
   ?consume_nonce:bool ->
   ?notify_reason:string ->
+  ?persist_state:bool ->
   string ->
   string ->
   unit Lwt.t
@@ -176,10 +168,14 @@ type vm_tx_deps = {
   deploy_balance : Transaction.t -> Z.t option;
   deploy_and_save :
     Transaction.t ->
+    admitted:Admission.t option ->
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
     deploy_result;
+  program_prepare :
+    Transaction.t ->
+    (Program_package.admitted, string) result Lwt.t;
   ensure_account : string -> unit;
   circle_exec :
     Transaction.t ->
@@ -604,6 +600,37 @@ let run_program_call_tx (deps : program_call_deps) tx =
     ~reject_domain:Call_plan.Program_exec
     tx
 
+let run_program_upgrade_tx (runtime : call_runtime) ~trusted_program_keys
+    ~program_journal ~store (tx : Transaction.t) =
+  runtime.with_debited_fee tx.ou (fun () ->
+    match Program_upgrade.parse tx with
+    | Error error ->
+      runtime.reject_after_fee tx.ou "program_upgrade_rejected" error
+    | Ok payload ->
+      begin
+        match
+          Contract.upgrade
+            ~journal:program_journal
+            ~trusted:(Program_trust.keys trusted_program_keys)
+            store
+            ~address:tx.to_
+            ~caller:tx.from
+            ~expected_code_hash:payload.expected_code_hash
+            ~bytecode_raw:payload.bytecode_raw
+        with
+        | Error error ->
+          runtime.reject_after_fee tx.ou "program_upgrade_rejected" error
+        | Ok result ->
+          runtime.commit_effects ();
+          Octra_log.info
+            "program"
+            "event = program_upgraded addr = %s old = %s new = %s"
+            tx.to_
+            result.old_code_hash
+            result.new_code_hash;
+          runtime.confirm ()
+      end)
+
 let run_contract_deploy ~trusted_program_keys ~fee ~balance ~bytecode_b64_opt ~deployer ~nonce
     ~target ~message ~handle_reject ~with_debited_fee ~reject_after_fee
     ~deploy_and_save ~ensure_account ~commit_effects ~log_deployed
@@ -684,6 +711,66 @@ let run_deploy_tx_runtime ~trusted_program_keys (runtime : call_runtime) ~balanc
     ~log_deployed:runtime.log_deployed
     ~log_constructor_failed:runtime.log_constructor_failed
     ~confirm:runtime.confirm
+
+let run_program_deploy_tx (deps : vm_tx_deps) tx =
+  let runtime = deps.runtime in
+  match Call_plan.plan_deploy_fee
+    ~balance:(deps.deploy_balance tx)
+    ~fee:tx.Transaction.ou with
+  | Call_plan.Deploy_fee_rejected reject ->
+    runtime.handle_deploy_reject reject
+  | Call_plan.Deploy_fee_ready ->
+    runtime.with_debited_fee tx.ou (fun () ->
+      let open Lwt.Syntax in
+      let* prepared = deps.program_prepare tx in
+      match prepared with
+      | Error reason ->
+        runtime.reject_after_fee tx.ou "program_deploy_rejected" reason
+      | Ok package ->
+        let expected =
+          Contract.addr_from_code package.envelope tx.from tx.nonce
+        in
+        if not (String.equal expected tx.to_) then
+          runtime.reject_after_fee
+            tx.ou
+            "program_address_mismatch"
+            "Program address does not match source package"
+        else
+          let params = Call_plan.parse_deploy_params tx.message in
+          let result =
+            deps.deploy_and_save
+              tx
+              ~admitted:(Some package.program)
+              ~params
+              ~bytecode:(Admission.code package.program)
+              ~bytecode_raw:package.envelope
+          in
+          if result.receipt.success then begin
+            deps.ensure_account result.contract_addr;
+            runtime.commit_effects ();
+            runtime.log_deployed
+              result.contract_addr
+              result.receipt.effort_used;
+            runtime.confirm ()
+          end else
+            let reason =
+              Receipt_view.constructor_revert_message
+                result.receipt.events
+                result.receipt.error
+            in
+            runtime.log_constructor_failed result.contract_addr reason;
+            runtime.reject_after_fee tx.ou "constructor_failed" reason)
+
+let prepare_program_package (tx : Transaction.t) =
+  match tx.encrypted_data with
+  | None -> Lwt.return_error "Program package missing"
+  | Some encoded ->
+    Lwt_preemptive.detach
+      (fun () ->
+        match Program_package.admit_base64 encoded with
+        | Ok package -> Ok package
+        | Error error -> Error (Program_package.error_message error))
+      ()
 
 let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
     ~from_addr ~message ~fee =
@@ -778,7 +865,7 @@ let with_debited_fee ~debit ~reject tx fee on_ok =
 
 let reject_after_fee ~discard_fee ~(reject : tx_reject) fee error_type reason =
   discard_fee fee;
-  reject ~consume_nonce:true error_type reason
+  reject ~consume_nonce:true ~persist_state:true error_type reason
 
 let save_receipt (deps : receipt_deps) ?(program = false) ~tx_hash ~contract_addr
     ~method_name receipt =
@@ -794,10 +881,10 @@ let save_receipt (deps : receipt_deps) ?(program = false) ~tx_hash ~contract_add
     ~epoch_id:(deps.epoch ())
 
 let log_deployed addr effort =
-  Log.info "contract" "event = deployed addr = %s effort = %d" addr effort
+  Log.info "program" "event = deployed addr = %s effort = %d" addr effort
 
 let log_constructor_failed addr reason =
-  Log.warn "contract"
+  Log.warn "program"
     "event = deploy_constructor_failed addr = %s reason = %s"
     addr reason
 
@@ -808,13 +895,17 @@ let log_multi_exec_success ~calls ~effort =
 let log_multi_exec_failed err =
   Log.warn "program" "event = multi_exec_failed err = %s" err
 
+let program_log_scope meta =
+  if String.equal meta.Receipt_view.scope "contract" then "program"
+  else meta.Receipt_view.scope
+
 let log_direct_call_ok meta target method_name effort =
-  Log.info meta.Receipt_view.scope
+  Log.info (program_log_scope meta)
     "event = call_ok %s = %s method = %s effort = %d"
     meta.target_key target method_name effort
 
 let log_direct_call_failed meta target method_name error =
-  Log.warn meta.Receipt_view.scope
+  Log.warn (program_log_scope meta)
     "event = call_failed %s = %s method = %s err = %s"
     meta.target_key target method_name error
 
@@ -865,17 +956,19 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
     deploy_balance = (fun tx ->
       Option.map (fun acc -> acc.Ledger.balance)
         (Ledger.find_opt args.ledger tx.Transaction.from));
-    deploy_and_save = (fun tx ~params ~bytecode ~bytecode_raw ->
+    deploy_and_save = (fun tx ~admitted ~params ~bytecode ~bytecode_raw ->
       let tx_hash = Transaction.hash tx in
       let ctx_for_tx = args.ctx_for_hash tx_hash in
       let contract_addr, receipt =
         Contract.deploy
           ~trusted:(Program_trust.keys args.trusted_program_keys)
+          ?admitted
           ~journal:args.program_journal ~ctx:ctx_for_tx ~params
           args.store tx.from "CUSTOM" bytecode bytecode_raw tx.nonce
       in
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       { contract_addr; receipt });
+    program_prepare = prepare_program_package;
     ensure_account = args.ensure_account;
     circle_exec = (fun tx ~ctx call ->
       let ctx = { ctx with ContractVM.node_id = tx.to_ } in
@@ -915,13 +1008,21 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
 
 let run_vm_tx (deps : vm_tx_deps) tx =
   match tx.Transaction.op_type with
+  | Transaction.ProgramDeploy ->
+    run_program_deploy_tx deps tx
   | Transaction.ContractDeploy ->
     run_deploy_tx_runtime
       ~trusted_program_keys:deps.trusted_program_keys
       deps.runtime
       ~balance:(deps.deploy_balance tx)
       tx
-      ~deploy_and_save:(deps.deploy_and_save tx)
+      ~deploy_and_save:(fun ~params ~bytecode ~bytecode_raw ->
+        deps.deploy_and_save
+          tx
+          ~admitted:None
+          ~params
+          ~bytecode
+          ~bytecode_raw)
       ~ensure_account:deps.ensure_account
   | Transaction.CircleCall ->
     run_circle_call_tx
@@ -957,11 +1058,13 @@ let run_vm_tx (deps : vm_tx_deps) tx =
     deps.reject_malformed "invalid vm operation"
 
 let max_multi_exec_calls ~env =
-  match env "OCTRA_MULTI_EXEC_MAX_CALLS" with
-  | Some s ->
-    (try max 1 (int_of_string s) with _ -> 8)
-  | None ->
-    8
+  Startup_runtime_limits.multi_exec_max {
+    int_value = (fun name fallback ->
+      match env name with
+      | Some raw -> (try int_of_string raw with _ -> fallback)
+      | None -> fallback);
+    opt = env;
+  }
 
 let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
   let ctx_for_hash tx_hash =

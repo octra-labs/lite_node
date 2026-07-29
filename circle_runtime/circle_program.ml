@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Syntax
 
@@ -42,6 +30,7 @@ type code =
       code_raw : string;
       exports : Octra_core.Circle_wasm_host.export_info list;
       methods : method_info list;
+      public_reads : Octra_core.Circle_wasm_public_read.declaration list;
     }
 
 type loaded = {
@@ -286,22 +275,32 @@ let load ?(trusted = []) store circle_id =
                   | Error e ->
                     Lwt.return (Error ("invalid circle wasm: " ^ e))
                   | Ok wasm_descriptor ->
-                    let loaded = {
-                      circle_id;
-                      info;
-                      code =
-                        Wasm_v1 {
-                          code_b64;
-                          code_raw = raw_code;
-                          exports = wasm_descriptor.exports;
-                          methods = methods_of_wasm_descriptor wasm_descriptor;
-                        };
-                    } in
-                    Hashtbl.replace
-                      loaded_cache
-                      cache_key
-                      { loaded; updated_at = Unix.gettimeofday () };
-                    Lwt.return (Ok loaded)
+                    begin
+                      match
+                        Octra_core.Circle_wasm_public_read.declarations_of_manifest
+                          wasm_descriptor.manifest
+                      with
+                      | Error e ->
+                        Lwt.return (Error ("invalid circle wasm manifest: " ^ e))
+                      | Ok public_reads ->
+                        let loaded = {
+                          circle_id;
+                          info;
+                          code =
+                            Wasm_v1 {
+                              code_b64;
+                              code_raw = raw_code;
+                              exports = wasm_descriptor.exports;
+                              methods = methods_of_wasm_descriptor wasm_descriptor;
+                              public_reads;
+                            };
+                        } in
+                        Hashtbl.replace
+                          loaded_cache
+                          cache_key
+                          { loaded; updated_at = Unix.gettimeofday () };
+                        Lwt.return (Ok loaded)
+                    end
                 end
           with e ->
             Lwt.return (Error ("invalid circle code: " ^ Printexc.to_string e))

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let hash tag payload =
   let h = Digestif.SHA256.init () in
@@ -26,7 +14,6 @@ let hash_hex tag payload =
   String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02x" (Char.code c))) raw;
   Buffer.contents buf
 
-
 let hash_encoded tag encode_fn =
   let payload = Oce1.encode encode_fn in
   hash tag payload
@@ -34,7 +21,6 @@ let hash_encoded tag encode_fn =
 let hash_encoded_hex tag encode_fn =
   let payload = Oce1.encode encode_fn in
   hash_hex tag payload
-
 
 let nil_hash = String.make 32 '\x00'
 

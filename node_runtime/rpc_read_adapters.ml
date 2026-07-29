@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Rpc = Octra_core.Rpc
 
@@ -71,10 +59,6 @@ let ledger_chaindata_params_read ~ledger ~chaindata f params ctx =
 let account_lwt_read ~with_account f params ctx =
   with_account params ctx (fun addr account ->
     f ~addr ~account)
-
-let account_chaindata_lwt_read ~chaindata ~with_account f params ctx =
-  with_account params ctx (fun addr account ->
-    f (chaindata ctx) ~addr ~account)
 
 let store_label_read ~store f params ctx =
   f ~store:(store ctx) params

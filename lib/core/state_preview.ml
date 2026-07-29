@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Syntax
 
@@ -27,12 +15,10 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     ?(expected_prev_root : string option) f =
   let branch_name = preview_branch_name ~epoch_id ~proposal_id in
 
-
   let* head_opt = Store_irmin.Store.Head.find base_store.store in
   match head_opt with
   | None -> Lwt.return (Error "no head commit for preview")
   | Some head_commit ->
-
 
   let head_tree = Store_irmin.Store.Commit.tree head_commit in
   let head_hash = Irmin.Type.to_string Store_irmin.Store.Hash.t
@@ -56,12 +42,9 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     Lwt.return (Error (Printf.sprintf "preview race: HEAD moved (head=%s)" (String.sub head_hash 0 16)))
   else
 
-
   let* () = Store_irmin.Store.Branch.set base_store.repo branch_name head_commit in
 
-
   let* preview_store = Store_irmin.Store.of_branch base_store.repo branch_name in
-
 
   let preview_t = {
     Store_irmin.repo = base_store.repo;
@@ -71,14 +54,18 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     pvac_dir = base_store.pvac_dir;
   } in
 
-
   let preview_ledger = Ledger.create preview_t in
-
 
   let backend = Epoch_exec.{
     store = preview_t;
     ledger = preview_ledger;
     ops = Epoch_exec.ledger_ops preview_ledger;
+    emission_policy = Emission_policy.of_env Sys.getenv_opt;
+    emission_schedule = Emission_schedule.of_env_exn Sys.getenv_opt;
+    legacy_total_supply = Emission_policy.legacy_total Sys.getenv_opt;
+    sender_key_activation_epoch =
+      Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
+    validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
     begin_batch = (fun () -> Store_irmin.begin_epoch_batch preview_t);
     commit_batch = (fun () -> Store_irmin.commit_epoch_batch preview_t "preview");
     flush_dirty = (fun () -> Ledger.flush_dirty_lwt preview_ledger);
@@ -86,14 +73,12 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     set_meta = (fun k v -> Store_irmin.set_meta preview_t k v);
   } in
 
-
   Lwt.finalize
     (fun () -> f backend)
     (fun () ->
 
       let* () = Store_irmin.Store.Branch.remove base_store.repo branch_name in
       Lwt.return_unit)
-
 
 let cleanup_stale_previews ~(base_store : Store_irmin.t) =
   let* branches = Store_irmin.Store.Branch.list base_store.repo in

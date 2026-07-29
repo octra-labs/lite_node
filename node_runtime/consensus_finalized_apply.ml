@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module C_types = Octra_consensus.C_types
 module C_hash = Octra_consensus.C_hash
@@ -21,9 +9,18 @@ module Bundle_validation = Consensus_bundle_validation
 module Log = Octra_log
 
 type deps = {
+  check_finality : C_types.finalize -> unit;
   write_finality : C_types.finalize -> unit;
+  persist_finality_certificate : C_types.finalize -> unit;
+  persist_finality_bundle :
+    C_types.finalize ->
+    Consensus_finality_journal.bundle ->
+    unit;
   chaos_after_finality_log : unit -> unit;
   cached_bundle : proposal_id:string -> bool;
+  cached_bundle_data :
+    proposal_id:string ->
+    (string list * Octra_core.Transaction.t list * string list) option;
   cached_bundle_len : proposal_id:string -> int;
   header_has_empty_bundle : C_types.epoch_header -> bool;
   store_empty_bundle : C_types.epoch_header -> unit;
@@ -41,9 +38,18 @@ type deps = {
 }
 
 type node_deps = {
+  check_finality : C_types.finalize -> unit;
   write_finality : C_types.finalize -> unit;
+  persist_finality_certificate : C_types.finalize -> unit;
+  persist_finality_bundle :
+    C_types.finalize ->
+    Consensus_finality_journal.bundle ->
+    unit;
   chaos_after_finality_log : unit -> unit;
   cached_bundle : proposal_id:string -> bool;
+  cached_bundle_data :
+    proposal_id:string ->
+    (string list * Octra_core.Transaction.t list * string list) option;
   cached_bundle_len : proposal_id:string -> int;
   header_has_empty_bundle : C_types.epoch_header -> bool;
   store_empty_bundle : C_types.epoch_header -> unit;
@@ -61,9 +67,13 @@ type node_deps = {
 
 let node_deps input =
   {
+    check_finality = input.check_finality;
     write_finality = input.write_finality;
+    persist_finality_certificate = input.persist_finality_certificate;
+    persist_finality_bundle = input.persist_finality_bundle;
     chaos_after_finality_log = input.chaos_after_finality_log;
     cached_bundle = input.cached_bundle;
+    cached_bundle_data = input.cached_bundle_data;
     cached_bundle_len = input.cached_bundle_len;
     header_has_empty_bundle = input.header_has_empty_bundle;
     store_empty_bundle = input.store_empty_bundle;
@@ -114,18 +124,40 @@ let bundle_deps (deps : deps) header proposal_id =
         ~reason:"finalized_bundle_missing");
   }
 
+let journal_bundle tx_hashes txs receipts_json =
+  Consensus_finality_journal.{
+    tx_hashes;
+    txs;
+    receipts_json;
+  }
+
+let persist_available_bundle (deps : deps) finalize proposal_id =
+  match deps.cached_bundle_data ~proposal_id with
+  | Some (tx_hashes, txs, receipts_json) ->
+    deps.persist_finality_bundle
+      finalize
+      (journal_bundle tx_hashes txs receipts_json);
+    true
+  | None ->
+    false
+
 let run (deps : deps) finalize =
   let open Lwt.Syntax in
   let header = finalize.C_types.header in
   let round = finalize.C_types.commit_round in
   let proposal_id = C_hash.proposal_id header in
+  deps.check_finality finalize;
+  deps.persist_finality_certificate finalize;
+  let bundle_persisted =
+    persist_available_bundle deps finalize proposal_id
+  in
+  deps.write_finality finalize;
+  deps.chaos_after_finality_log ();
   Log.info "consensus"
     "BFT finalized epoch = %Ld round = %d txs = %d"
     header.C_types.epoch_id
     round
     (deps.cached_bundle_len ~proposal_id);
-  deps.write_finality finalize;
-  deps.chaos_after_finality_log ();
   let* bundle_state =
     Bundle_fetch.ensure_finalized
       (bundle_deps deps header proposal_id)
@@ -135,6 +167,11 @@ let run (deps : deps) finalize =
   | Bundle_fetch.Finalized_deferred ->
     Lwt.return_unit
   | Bundle_fetch.Finalized_ready ->
+    if
+      not bundle_persisted
+      && not (persist_available_bundle deps finalize proposal_id)
+    then
+      failwith "finalized bundle ready without cached data";
     deps.post_finalize
       ~epoch_id:header.C_types.epoch_id
       ~proposed_root:header.C_types.proposed_state_root

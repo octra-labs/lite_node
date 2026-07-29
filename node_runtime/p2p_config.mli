@@ -1,23 +1,13 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
+  config_hash : string;
   binary_hash : string;
   require_binary_hash : bool;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
   handshake_allowed_pubkeys : string list;
+  validator_pubkeys : string list;
   readiness_runtime : Octra_core.Validator_ready_policy.runtime;
 }
 
@@ -106,6 +96,8 @@ type node_stack_deps = {
   chain_id : string;
   consensus_mode : bool;
   current_height : int64;
+  chain_active_raw : string option;
+  chain_pending_raw : string option;
   chain_pending_entries : string list;
   install : node_startup_install_deps;
   swarm : node_swarm_start_deps;
@@ -187,6 +179,11 @@ val startup_config :
   next_entries:string list ->
   chain_pending_entries:string list ->
   next_activation_epoch:int64 option ->
+  ?program_trust_hash:string ->
+  ?runtime_profile_hash:string ->
+  ?active_raw:string ->
+  ?pending_raw:string ->
+  unit ->
   (startup_config, string) result
 
 val node_startup_config :
@@ -194,6 +191,8 @@ val node_startup_config :
   chain_id:string ->
   consensus_mode:bool ->
   current_height:int64 ->
+  chain_active_raw:string option ->
+  chain_pending_raw:string option ->
   chain_pending_entries:string list ->
   (startup_config, string) result
 

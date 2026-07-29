@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Rpc = Octra_core.Rpc
 
@@ -74,11 +62,14 @@ let node_stats ~current_epoch ~total_accounts ~active_accounts ~true_total
     ~latest_epochs
     ~head
 
-let validator_set_proof ~chain_id ~config_hash ?scheduled validator_set =
+let validator_set_proof ~chain_id ~config_hash ?program_trust_hash
+    ?runtime_profile_hash ?scheduled validator_set =
   let proof =
     Octra_consensus.C_light_validator_set.of_validator_set
       ~chain_id
       ~config_hash
+      ?program_trust_hash
+      ?runtime_profile_hash
       ?scheduled
       validator_set
   in

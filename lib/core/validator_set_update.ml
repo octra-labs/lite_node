@@ -1,26 +1,17 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type validator_entry = {
   address : string;
   pubkey_b64 : string;
+  weight : Z.t;
 }
 
 type t = {
   activate_epoch : int64;
+  source_epoch : int64 option;
   validators : validator_entry list;
+  weighted : bool;
   fingerprint : string;
 }
 
@@ -44,6 +35,7 @@ type ready_ext = {
 }
 
 let pending_meta_key = "bft.validator_set.pending"
+let active_meta_key = "bft.validator_set.active"
 
 let ready_meta_key ~fingerprint ~address =
   "bft.validator_set.ready." ^ fingerprint ^ "." ^ address
@@ -51,32 +43,47 @@ let ready_meta_key ~fingerprint ~address =
 let normalize_pubkey pubkey_b64 =
   try
     let raw = Base64.decode_exn pubkey_b64 in
-    if String.length raw < 32 then None
-    else
-      let raw32 = String.sub raw 0 32 in
-      Some (Base64.encode_exn raw32)
+    if String.length raw = 32 then Some (Base64.encode_exn raw)
+    else None
   with _ -> None
 
-let normalize_validator_entry address pubkey_b64 =
+let normalize_validator_entry ~weighted address pubkey_b64 weight =
   match normalize_pubkey pubkey_b64 with
   | None -> Error "invalid validator public key"
   | Some normalized_pubkey ->
     if not (Crypto.Address.is_valid_address address) then
       Error "invalid validator address"
-    else if not (Crypto.Address.verify_address_pubkey address normalized_pubkey) then
+    else if Z.sign weight <= 0 then
+      Error "validator weight must be positive"
+    else if not weighted
+            && not
+                 (Crypto.Address.verify_address_pubkey
+                    address
+                    normalized_pubkey) then
       Error "validator address does not match public key"
     else
-      Ok { address; pubkey_b64 = normalized_pubkey }
+      Ok {
+        address;
+        pubkey_b64 = normalized_pubkey;
+        weight;
+      }
 
 let canonical_validators validators =
   let sorted = List.sort (fun a b -> String.compare a.address b.address) validators in
-  let rec loop seen = function
+  let rec loop addresses pubkeys = function
     | [] -> Ok sorted
     | v :: rest ->
-      if List.mem v.address seen then Error "duplicate validator address"
-      else loop (v.address :: seen) rest
+      if List.mem v.address addresses then
+        Error "duplicate validator address"
+      else if List.mem v.pubkey_b64 pubkeys then
+        Error "duplicate validator public key"
+      else
+        loop
+          (v.address :: addresses)
+          (v.pubkey_b64 :: pubkeys)
+          rest
   in
-  loop [] sorted
+  loop [] [] sorted
 
 let fingerprint validators =
   validators
@@ -85,73 +92,248 @@ let fingerprint validators =
   |> Digestif.SHA256.digest_string
   |> Digestif.SHA256.to_hex
 
-let validator_entry_to_yojson v =
-  `Assoc [
+let put_string buffer value =
+  Buffer.add_string buffer (string_of_int (String.length value));
+  Buffer.add_char buffer ':';
+  Buffer.add_string buffer value
+
+let weighted_fingerprint ~source_epoch ~activate_epoch validators =
+  let buffer = Buffer.create 512 in
+  put_string buffer "octra:validator_set_update:bonded";
+  put_string buffer (Int64.to_string source_epoch);
+  put_string buffer (Int64.to_string activate_epoch);
+  List.iter
+    (fun validator ->
+      put_string buffer validator.address;
+      put_string buffer validator.pubkey_b64;
+      put_string buffer (Z.to_string validator.weight))
+    validators;
+  buffer
+  |> Buffer.contents
+  |> Digestif.SHA256.digest_string
+  |> Digestif.SHA256.to_hex
+
+let validator_entry_to_yojson ~weighted v =
+  let fields = [
     "address", `String v.address;
     "pubkey", `String v.pubkey_b64;
-  ]
+  ] in
+  `Assoc (
+    if weighted then
+      fields @ ["weight", `String (Z.to_string v.weight)]
+    else
+      fields)
 
-let validator_entry_of_yojson = function
+let parse_weight = function
+  | `String raw ->
+    begin
+      try
+        let weight = Z.of_string raw in
+        if Z.sign weight <= 0 then
+          Error "validator weight must be positive"
+        else
+          Ok weight
+      with _ ->
+        Error "invalid validator weight"
+    end
+  | `Int value when value > 0 -> Ok (Z.of_int value)
+  | _ -> Error "validator weight must be a positive integer"
+
+let validator_entry_of_yojson ~weighted = function
   | `Assoc fields ->
     begin
       match List.assoc_opt "address" fields, List.assoc_opt "pubkey" fields with
       | Some (`String address), Some (`String pubkey_b64) ->
-        normalize_validator_entry address pubkey_b64
+        let weight =
+          if weighted then
+            match List.assoc_opt "weight" fields with
+            | None -> Error "weighted validator entry requires weight"
+            | Some value -> parse_weight value
+          else
+            Ok Z.one
+        in
+        begin
+          match weight with
+          | Error _ as error -> error
+          | Ok weight ->
+            normalize_validator_entry
+              ~weighted
+              address
+              pubkey_b64
+              weight
+        end
       | _ -> Error "validator entry requires address and pubkey"
     end
   | _ -> Error "validator entry must be object"
 
 let to_yojson t =
-  `Assoc [
+  let fields = [
     "activate_epoch", `String (Int64.to_string t.activate_epoch);
     "fingerprint", `String t.fingerprint;
-    "validators", `List (List.map validator_entry_to_yojson t.validators);
-  ]
+    "validators",
+      `List
+        (List.map
+           (validator_entry_to_yojson ~weighted:t.weighted)
+           t.validators);
+  ] in
+  if t.weighted then
+    `Assoc (
+      fields @ [
+        "standard", `String Validator_policy.standard_name;
+        "weighted", `Bool true;
+        "source_epoch",
+          `String
+            (Int64.to_string
+               (Option.get t.source_epoch));
+      ])
+  else
+    `Assoc fields
+
+let parse_epoch label = function
+  | `String raw ->
+    begin
+      try Ok (Int64.of_string raw)
+      with _ -> Error ("invalid " ^ label)
+    end
+  | `Int value -> Ok (Int64.of_int value)
+  | _ -> Error (label ^ " must be string or int")
+
+let parse_weighted fields =
+  match List.assoc_opt "weighted" fields with
+  | None -> Ok false
+  | Some (`Bool value) -> Ok value
+  | Some _ -> Error "weighted must be bool"
+
+let parse_source_epoch ~weighted fields =
+  match weighted, List.assoc_opt "source_epoch" fields with
+  | false, None -> Ok None
+  | false, Some _ -> Error "legacy validator update rejects source_epoch"
+  | true, Some value -> Result.map Option.some (parse_epoch "source_epoch" value)
+  | true, None -> Error "weighted validator update requires source_epoch"
+
+let validate_standard ~weighted fields =
+  match weighted, List.assoc_opt "standard" fields with
+  | false, None -> Ok ()
+  | false, Some _ -> Error "legacy validator update rejects standard"
+  | true, Some (`String value)
+      when String.equal value Validator_policy.standard_name -> Ok ()
+  | true, _ -> Error "weighted validator update standard mismatch"
 
 let of_yojson = function
   | `Assoc fields ->
     begin
       match List.assoc_opt "activate_epoch" fields, List.assoc_opt "validators" fields with
       | Some epoch_json, Some (`List validator_jsons) ->
-        let activate_epoch =
-          match epoch_json with
-          | `String s -> (try Ok (Int64.of_string s) with _ -> Error "invalid activate_epoch")
-          | `Int n -> Ok (Int64.of_int n)
-          | _ -> Error "activate_epoch must be string or int"
-        in
         begin
-          match activate_epoch with
-          | Error e -> Error e
-          | Ok activate_epoch ->
-            let validators =
-              List.fold_left (fun acc json ->
-                match acc with
-                | Error _ -> acc
-                | Ok items ->
-                  match validator_entry_of_yojson json with
+          match
+            parse_epoch "activate_epoch" epoch_json,
+            parse_weighted fields
+          with
+          | Error error, _
+          | _, Error error -> Error error
+          | Ok activate_epoch, Ok weighted ->
+            begin
+              match
+                parse_source_epoch ~weighted fields,
+                validate_standard ~weighted fields
+              with
+              | Error error, _
+              | _, Error error -> Error error
+              | Ok source_epoch, Ok () ->
+                let validators =
+                  List.fold_left
+                    (fun acc json ->
+                      match acc with
+                      | Error _ -> acc
+                      | Ok items ->
+                        match validator_entry_of_yojson ~weighted json with
+                        | Error e -> Error e
+                        | Ok item -> Ok (item :: items))
+                    (Ok [])
+                    validator_jsons
+                in
+                begin
+                  match validators with
                   | Error e -> Error e
-                  | Ok item -> Ok (item :: items)
-              ) (Ok []) validator_jsons
-            in
-            match validators with
-            | Error e -> Error e
-            | Ok validators_rev ->
-              let validators = List.rev validators_rev in
-              if validators = [] then Error "validator set cannot be empty"
-              else
-                match canonical_validators validators with
-                | Error e -> Error e
-                | Ok validators ->
-                  let actual = fingerprint validators in
-                  begin
-                    match List.assoc_opt "fingerprint" fields with
-                    | Some (`String expected) when expected <> actual -> Error "validator set fingerprint mismatch"
-                    | _ -> Ok { activate_epoch; validators; fingerprint = actual }
-                  end
+                  | Ok validators_rev ->
+                    let validators = List.rev validators_rev in
+                    if validators = [] then
+                      Error "validator set cannot be empty"
+                    else
+                      match canonical_validators validators with
+                      | Error e -> Error e
+                      | Ok validators ->
+                        let actual =
+                          match source_epoch with
+                          | None -> fingerprint validators
+                          | Some source_epoch ->
+                            weighted_fingerprint
+                              ~source_epoch
+                              ~activate_epoch
+                              validators
+                        in
+                        if
+                          Option.fold
+                            ~none:false
+                            ~some:(fun source ->
+                              Int64.compare source activate_epoch >= 0)
+                            source_epoch
+                        then
+                          Error
+                            "weighted validator source epoch must precede activation"
+                        else
+                          begin
+                            match List.assoc_opt "fingerprint" fields with
+                            | Some (`String expected)
+                                when expected <> actual ->
+                              Error "validator set fingerprint mismatch"
+                            | _ ->
+                              Ok {
+                                activate_epoch;
+                                source_epoch;
+                                validators;
+                                weighted;
+                                fingerprint = actual;
+                              }
+                          end
+                end
+            end
         end
       | _ -> Error "validator_set_update requires activate_epoch and validators"
     end
   | _ -> Error "validator_set_update payload must be object"
+
+let make_weighted ~source_epoch ~activate_epoch members =
+  if Int64.compare source_epoch activate_epoch >= 0 then
+    Error "weighted validator source epoch must precede activation"
+  else
+    let entries =
+      List.map
+        (fun (member : Validator_admission.member) ->
+          {
+            address = member.address;
+            pubkey_b64 = Base64.encode_exn member.pubkey;
+            weight = member.weight;
+          })
+        members
+    in
+    match canonical_validators entries with
+    | Error _ as error -> error
+    | Ok validators ->
+      if validators = [] then
+        Error "validator set cannot be empty"
+      else
+        Ok {
+          activate_epoch;
+          source_epoch = Some source_epoch;
+          validators;
+          weighted = true;
+          fingerprint =
+            weighted_fingerprint
+              ~source_epoch
+              ~activate_epoch
+              validators;
+        }
 
 let of_message = function
   | None -> Error "validator_set_update requires message payload"

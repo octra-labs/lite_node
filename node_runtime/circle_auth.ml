@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   addr : string;
@@ -25,7 +13,6 @@ type gate =
   | Private_owner
   | Owner_private
   | Storage_owner
-  | Storage_owner_if of bool
 
 module Rpc = Octra_core.Rpc
 
@@ -35,7 +22,17 @@ let owner_required =
 let storage_owner_required =
   "circle owner authorization required for storage snapshot"
 
+let frame domain fields =
+  List.fold_left
+    (fun out field ->
+      out ^ "|" ^ string_of_int (String.length field) ^ ":" ^ field)
+    domain
+    fields
+
 let message ~op ~circle_id ~addr ~subject =
+  frame "octra_circle_auth_v2" [op; circle_id; addr; subject]
+
+let legacy_message ~op ~circle_id ~addr ~subject =
   if String.length subject = 0 then
     op ^ "|" ^ circle_id ^ "|" ^ addr
   else
@@ -97,6 +94,9 @@ let storage_owner info addr =
   else
     Error storage_owner_required
 
+let view_gate ~include_storage =
+  if include_storage then Storage_owner else Private_owner
+
 let check_gate info addr = function
   | Any ->
     Ok ()
@@ -108,8 +108,6 @@ let check_gate info addr = function
     owner_private info addr
   | Storage_owner ->
     storage_owner info addr
-  | Storage_owner_if enabled ->
-    if enabled then storage_owner info addr else Ok ()
 
 let verify auth msg =
   if not (Octra_core.Crypto.Address.verify_address_pubkey auth.addr auth.pub_b64) then
@@ -119,26 +117,29 @@ let verify auth msg =
     | Error _ ->
       Error "invalid public key"
     | Ok pub_raw ->
-      begin
-        match Mirage_crypto_ec.Ed25519.pub_of_octets pub_raw with
+      if not (Octra_ed25519.safe pub_raw) then Error "invalid public key"
+      else
+        match Base64.decode auth.sig_b64 with
         | Error _ ->
-          Error "invalid public key"
-        | Ok pk_ed ->
-          begin
-            match Base64.decode auth.sig_b64 with
-            | Error _ ->
-              Error "invalid signature"
-            | Ok sig_raw ->
-              if Mirage_crypto_ec.Ed25519.verify ~key:pk_ed ~msg sig_raw then
-                Ok auth.addr
-              else
-                Error "signature verification failed"
-          end
-      end
+          Error "invalid signature"
+        | Ok sig_raw ->
+          if Octra_ed25519.verify ~pub:pub_raw ~msg sig_raw then
+            Ok auth.addr
+          else
+            Error "signature verification failed"
 
 let authenticate ~op ~circle_id ~subject auth =
   let msg = message ~op ~circle_id ~addr:auth.addr ~subject in
-  verify auth msg
+  match verify auth msg with
+  | Ok _ as ok -> ok
+  | Error _ as err ->
+    if String.contains op '|'
+       || String.contains circle_id '|'
+       || String.contains auth.addr '|' then
+      err
+    else
+      legacy_message ~op ~circle_id ~addr:auth.addr ~subject
+      |> verify auth
 
 let authorize ?(gate=Any) ~op ~circle_id ~subject info auth =
   match authenticate ~op ~circle_id ~subject auth with

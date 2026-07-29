@@ -1,0 +1,16 @@
+interface IOCS01 {
+  fn transfer(to: address, amount: u128): bool
+  fn grant(spender: address, amount: u128): bool
+  fn increase_grant(spender: address, amount: u128): bool
+  fn decrease_grant(spender: address, amount: u128): bool
+  fn revoke_grant(spender: address): bool
+  fn pull(from: address, to: address, amount: u128): bool
+  fn balance_of(addr: address): u128
+  fn allowance(owner: address, spender: address): u128
+  fn can_pull(from: address, spender: address, amount: u128): bool
+  fn decimals(): u64
+  fn get_name(): string
+  fn get_symbol(): string
+  fn get_total_supply(): u128
+  fn get_owner(): address
+}

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module C_catchup = Octra_consensus.C_catchup
 module C_driver = Octra_consensus.C_driver
@@ -68,7 +56,9 @@ type fork_repair_deps = {
   committed_head_epoch : unit -> int;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
+  finality_target_ready : int -> (unit, string) result;
   run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  rewind_finality : int -> (unit, string) result;
   drop_finality_after : int -> int;
   prune_after_epoch : int -> unit;
   set_current_epoch : int -> unit;
@@ -115,23 +105,35 @@ let repair_empty_fork (deps : fork_repair_deps) ~target_epoch ~target_root ~requ
     | C_catchup.Fork_snapshot_required reason ->
       repair_snapshot deps reason
     | C_catchup.Rollback_fork_head _ ->
-      let* result = deps.run_empty ~target ~root:target_root in
-      match result with
-      | Octra_core.Fork_head_repair.Snapshot_required reason ->
-        repair_snapshot deps reason
-      | Octra_core.Fork_head_repair.Repaired r ->
-        let dropped = deps.drop_finality_after target in
-        deps.prune_after_epoch target;
-        deps.set_current_epoch (target + 1);
-        deps.set_state_attested ~head:target ~root:target_root;
-        deps.set_catchup_in_progress false;
-        deps.clear_quarantine "fork_empty_rollback";
-        Log.warn "catchup"
-          "event = fork_empty_rollback target = %d old_head = %d required = %d finality_dropped = %d root = %s"
-          r.target r.old_head required dropped (short_hex8 r.root);
-        let* () = deps.start_height (Int64.succ target_epoch) in
-        let* () = deps.wake_ready () in
-        Lwt.return true
+      begin
+        match deps.finality_target_ready target with
+        | Error reason ->
+          repair_snapshot deps ("finality_target:" ^ reason)
+        | Ok () ->
+          let* result = deps.run_empty ~target ~root:target_root in
+          match result with
+          | Octra_core.Fork_head_repair.Snapshot_required reason ->
+            repair_snapshot deps reason
+          | Octra_core.Fork_head_repair.Repaired r ->
+            begin
+              match deps.rewind_finality target with
+              | Error reason ->
+                repair_snapshot deps ("finality_rewind:" ^ reason)
+              | Ok () ->
+                let dropped = deps.drop_finality_after target in
+                deps.prune_after_epoch target;
+                deps.set_current_epoch (target + 1);
+                deps.set_state_attested ~head:target ~root:target_root;
+                deps.set_catchup_in_progress false;
+                deps.clear_quarantine "fork_empty_rollback";
+                Log.warn "catchup"
+                  "event = fork_empty_rollback target = %d old_head = %d required = %d finality_dropped = %d root = %s"
+                  r.target r.old_head required dropped (short_hex8 r.root);
+                let* () = deps.start_height (Int64.succ target_epoch) in
+                let* () = deps.wake_ready () in
+                Lwt.return true
+            end
+      end
 
 let peer_target_epoch (deps : deps) ~active_f ~our_head responses =
   let peer_heads =

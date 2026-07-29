@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Call_plan = Octra_vm.Call_plan
 module Circle_exec = Octra_circle_runtime.Circle_exec
@@ -29,20 +17,47 @@ let fail effects tag reason =
       (Error
          ("circle_call_rollback_failed", Printexc.to_string error))
 
+let fail_after_fee effects backend tx error_type reason =
+  try
+    Tx_effects.discard effects;
+    begin
+      match backend.Octra_core.Epoch_exec.ops.debit tx.Transaction.from
+          tx.ou tx.nonce with
+      | Error fee_reason ->
+        Lwt.return
+          (Error ("circle_call_fee_failed", fee_reason))
+      | Ok () ->
+        Lwt.return
+          (Ok
+             (Octra_core.Epoch_exec.Rejected_after_fee {
+                fee = tx.ou;
+                error_type;
+                reason;
+              }))
+    end
+  with error ->
+    Lwt.return
+      (Error
+         ("circle_call_rollback_failed", Printexc.to_string error))
+
 let reject_plan effects rejected =
   let rejected = Call_plan.direct_exec_reject Call_plan.Circle_exec rejected in
   fail effects rejected.error_type rejected.log_reason
 
-let commit effects store circle_id result =
+let commit effects backend tx result =
   let open Lwt.Syntax in
-  let* committed = Circle_exec.commit_call_result store circle_id result in
+  let* committed =
+    Circle_exec.commit_call_result backend.Octra_core.Epoch_exec.store
+      tx.Transaction.to_ result in
   match committed with
   | Error reason ->
-    fail effects "circle_call_commit_failed" reason
+    fail_after_fee effects backend tx "circle_call_commit_failed" reason
   | Ok () ->
     begin
       match Tx_effects.commit effects with
-      | Ok () -> Lwt.return (Ok ())
+      | Ok () ->
+        Lwt.return
+          (Ok (Octra_core.Epoch_exec.Confirmed tx.Transaction.ou))
       | Error reason ->
         Lwt.return (Error ("circle_call_effect_commit_failed", reason))
     end
@@ -80,11 +95,11 @@ let execute ~program_trust backend env tx effects call =
       tx.amount
   in
   if not result.receipt.Contract.success then
-    fail effects
+    fail_after_fee effects backend tx
       "circle_call_failed"
       (Option.value ~default:"execution reverted" result.receipt.error)
   else
-    commit effects backend.store tx.to_ result
+    commit effects backend tx result
 
 let run ~program_trust backend env tx =
   let effects =
@@ -110,11 +125,7 @@ let run ~program_trust backend env tx =
           if Tx_effects.apply effects call.value_effect then
             let open Lwt.Syntax in
             let* executed = execute ~program_trust backend env tx effects call in
-            begin
-              match executed with
-              | Ok () -> Lwt.return (Ok tx.ou)
-              | Error _ as error -> Lwt.return error
-            end
+            Lwt.return executed
           else
             fail effects "insufficient_balance" "value transfer rejected"
         | (Call_plan.Direct_exec_invalid_format
@@ -128,4 +139,11 @@ let run ~program_trust backend env tx =
 let process_tx ~backend ~env ~program_trust tx =
   match tx.Transaction.op_type with
   | Transaction.CircleCall -> run ~program_trust backend env tx
-  | _ -> Octra_core.Epoch_exec.process_standard_tx ~backend ~env tx
+  | _ ->
+    let open Lwt.Syntax in
+    let* result =
+      Octra_core.Epoch_exec.process_standard_tx ~backend ~env tx in
+    Lwt.return
+      (Result.map
+         (fun fee -> Octra_core.Epoch_exec.Confirmed fee)
+         result)

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type replay_deps = {
   current_epoch : unit -> int;
@@ -27,7 +15,15 @@ type deps = {
 }
 
 type node_deps = {
+  check_finality : Octra_consensus.C_types.finalize -> unit;
   write_finality : Octra_consensus.C_types.finalize -> unit;
+  persist_finality_certificate :
+    Octra_consensus.C_types.finalize ->
+    unit;
+  persist_finality_bundle :
+    Octra_consensus.C_types.finalize ->
+    Consensus_finality_journal.bundle ->
+    unit;
   chaos_after_finality_log : unit -> unit;
   cached_bundle_for_pid :
     string ->
@@ -46,11 +42,14 @@ type node_deps = {
   deactivate_gap : unit -> unit;
   set_consensus_finalized : bool -> unit;
   current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   sleep : float -> unit Lwt.t;
   read_pre_finalize_root : unit -> string option;
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
+  commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
+  apply_timeout_seconds : float;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
@@ -59,6 +58,7 @@ type node_deps = {
 
 type node_runtime = {
   data_dir : string;
+  validator_set : unit -> Octra_consensus.C_types.validator_set;
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
   proposal_state : Consensus_proposal_state.t;
@@ -66,10 +66,12 @@ type node_runtime = {
   catchup_queue : Consensus_catchup_queue.t;
   consensus_finalized : bool ref;
   current_epoch : int ref;
+  committed_head_epoch : unit -> int;
   sleep : float -> unit Lwt.t;
   read_pre_finalize_root : unit -> string option;
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
+  apply_timeout_seconds : float;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
   runtime_state : Consensus_runtime_state.t;

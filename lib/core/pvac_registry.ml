@@ -1,24 +1,12 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module FB = Crypto.FheBalance
 
 type status = {
   has_pvac_pubkey : bool;
   pubkey_size : int option;
-  deserializable : bool;
+  canonical_binding : bool;
   pubkey_format : string option;
 }
 
@@ -41,6 +29,10 @@ let expected_kat () = FB.aes_kat_hex ()
 let key_hash blob =
   let hex = Digestif.SHA256.(digest_string blob |> to_hex) in
   String.sub hex 0 16
+
+let full_key_hash blob =
+  Digestif.SHA256.digest_string blob
+  |> Digestif.SHA256.to_hex
 
 let decode_b64 s =
   try Ok (Base64.decode_exn s)
@@ -69,7 +61,8 @@ let byte raw i =
 let raw_header_ok raw =
   String.length raw >= 6
   && String.sub raw 0 4 = "PVAC"
-  && (byte raw 4 = 0x01 || byte raw 4 = 0x02 || byte raw 4 = 0x03)
+  && byte raw 4 >= 0x01
+  && byte raw 4 <= 0x05
   && byte raw 5 = 0x01
 
 let packed_header_ok raw =
@@ -94,12 +87,12 @@ let canonicalize_blob raw =
   | Error e -> Error e
   | Ok pk -> Ok (Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
 
-let status_of_blob = function
+let status_of_blob ~canonical_binding = function
   | None ->
     {
       has_pvac_pubkey = false;
       pubkey_size = None;
-      deserializable = false;
+      canonical_binding = false;
       pubkey_format = None;
     }
   | Some blob ->
@@ -109,15 +102,10 @@ let status_of_blob = function
       else
         Some "raw"
     in
-    let deserializable =
-      match canonicalize_blob blob with
-      | Ok _ -> true
-      | Error _ -> false
-    in
     {
       has_pvac_pubkey = true;
       pubkey_size = Some (String.length blob);
-      deserializable;
+      canonical_binding;
       pubkey_format;
     }
 

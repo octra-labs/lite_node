@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type peer_head = {
   responder_addr : string;
@@ -175,6 +163,78 @@ let verify_record_receipts
   let expected = C_hash.receipt_root record.receipts_json in
   if expected = record.receipt_root then Ok ()
   else Error (Printf.sprintf "receipt_root mismatch at epoch = %Ld" record.epoch_id)
+
+let verify_record_finality
+    ~chain_id
+    ~expected_validator_set_hash
+    ~expected_txid
+    ~(record : C_codec.catchup_epoch_record) =
+  match record.finality with
+  | None ->
+    Error
+      (Printf.sprintf
+         "finality is missing at epoch = %Ld"
+         record.epoch_id)
+  | Some finality ->
+    let finalize = finality.finalize in
+    let header = finalize.C_types.header in
+    let validator_set_hash =
+      C_config.validator_set_hash finality.validator_set
+    in
+    let verify_vote (vote : C_types.vote) =
+      match
+        C_types.pubkey_of_addr
+          finality.validator_set
+          vote.C_types.validator
+      with
+      | Some pubkey -> C_hash.verify_vote ~pubkey_raw:pubkey vote
+      | None -> false
+    in
+    if validator_set_hash <> expected_validator_set_hash then
+      Error
+        (Printf.sprintf
+           "finality validator set mismatch at epoch = %Ld"
+           record.epoch_id)
+    else
+    match
+      C_qc.validate_persisted_finalize
+        ~chain_id
+        ~validator_set:finality.validator_set
+        ~verify_vote
+        finalize
+    with
+    | C_qc.Invalid reason ->
+      Error
+        (Printf.sprintf
+           "finality qc is invalid at epoch = %Ld reason = %s"
+           record.epoch_id
+           reason)
+    | C_qc.Valid ->
+      let expected_txid_hi = Int64.pred expected_txid in
+      let same_timestamp =
+        Int64.bits_of_float header.ts
+        = Int64.bits_of_float record.epoch_ts
+      in
+      if finalize.epoch_id <> record.epoch_id then
+        Error "finality epoch mismatch"
+      else if header.prev_state_root <> record.prev_state_root then
+        Error "finality previous root mismatch"
+      else if header.proposed_state_root <> record.state_root then
+        Error "finality state root mismatch"
+      else if header.tx_list_hash <> record.tx_list_hash then
+        Error "finality transaction root mismatch"
+      else if header.receipt_root <> record.receipt_root then
+        Error "finality receipt root mismatch"
+      else if header.txid_hi <> expected_txid_hi then
+        Error "finality transaction high-water mismatch"
+      else if not same_timestamp then
+        Error "finality timestamp mismatch"
+      else if header.creator_addr <> record.creator_addr then
+        Error "finality proposer mismatch"
+      else if finalize.commit_round <> record.commit_round then
+        Error "finality round mismatch"
+      else
+        Ok finality
 
 let verify_chain_continuity
     ~(records : C_codec.catchup_epoch_record list)

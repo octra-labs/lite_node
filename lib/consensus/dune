@@ -1,3 +1,3 @@
 (library
  (name octra_consensus)
- (libraries octra_net digestif digestif.c mirage-crypto-ec cstruct mtime mtime.clock.os zarith unix yojson base64 octra_log))
+ (libraries octra_net digestif digestif.c mirage-crypto-ec cstruct mtime mtime.clock.os zarith unix yojson base64 octra_log octra_crypto_guard))

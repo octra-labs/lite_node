@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Ledger = Octra_core.Ledger
 module Metrics = Octra_core.Metrics
@@ -31,7 +19,8 @@ type read_ctx = {
   validator_pubkey : string;
   validator_priv_b64 : string;
   chain_id : string;
-  config_hash : string;
+  program_trust_hash : string option;
+  runtime_profile_hash : string option;
   validator_view_pub : string;
   validator_set : Octra_consensus.C_types.validator_set;
   scheduled_validator_set : Octra_consensus.C_config.scheduled option;
@@ -102,18 +91,42 @@ let active_scheduled_validator_set ~driver_ref ~fallback =
         validator_set = cfg.validator_set;
       }
 
-let validator_set_proof ~chain_id ~config_hash ~driver_ref ~validator_set
-    ~scheduled_validator_set =
+let current_validator_config ~chain_id ~program_trust_hash
+    ~runtime_profile_hash ~driver_ref ~validator_set ~scheduled_validator_set =
   let validator_set = active_validator_set ~driver_ref ~fallback:validator_set in
   let scheduled =
     active_scheduled_validator_set
       ~driver_ref
       ~fallback:scheduled_validator_set
   in
+  let config_hash =
+    Octra_consensus.C_config.hash
+      ~chain_id
+      ~validator_set
+      ?scheduled
+      ?program_trust_hash
+      ?runtime_profile_hash
+      ()
+  in
+  validator_set, scheduled, config_hash
+
+let validator_set_proof ~chain_id ~program_trust_hash
+    ~runtime_profile_hash ~driver_ref ~validator_set ~scheduled_validator_set =
+  let validator_set, scheduled, config_hash =
+    current_validator_config
+      ~chain_id
+      ~program_trust_hash
+      ~runtime_profile_hash
+      ~driver_ref
+      ~validator_set
+      ~scheduled_validator_set
+  in
   Lwt.return
     (Status_rpc.validator_set_proof
        ~chain_id
        ~config_hash
+       ?program_trust_hash
+       ?runtime_profile_hash
        ?scheduled
        validator_set)
 
@@ -173,12 +186,21 @@ let node_stats ~ledger ~chaindata ~current_epoch ~total_confirmed ~encrypted =
        ~head:(Octra_core.Head_manifest.get_cached ()))
 
 let signer_of_ctx ctx =
+  let _, _, config_hash =
+    current_validator_config
+      ~chain_id:ctx.chain_id
+      ~program_trust_hash:ctx.program_trust_hash
+      ~runtime_profile_hash:ctx.runtime_profile_hash
+      ~driver_ref:ctx.driver_ref
+      ~validator_set:ctx.validator_set
+      ~scheduled_validator_set:ctx.scheduled_validator_set
+  in
   signer
     ~chain_id:ctx.chain_id
     ~validator_addr:ctx.validator_address
     ~validator_pubkey:ctx.validator_pubkey
     ~validator_priv_b64:ctx.validator_priv_b64
-    ~config_hash:ctx.config_hash
+    ~config_hash
 
 let node_version_params _params _ctx =
   node_version ()
@@ -206,7 +228,8 @@ let account_proof_params params ctx =
 let validator_set_proof_params _params ctx =
   validator_set_proof
     ~chain_id:ctx.chain_id
-    ~config_hash:ctx.config_hash
+    ~program_trust_hash:ctx.program_trust_hash
+    ~runtime_profile_hash:ctx.runtime_profile_hash
     ~driver_ref:ctx.driver_ref
     ~validator_set:ctx.validator_set
     ~scheduled_validator_set:ctx.scheduled_validator_set

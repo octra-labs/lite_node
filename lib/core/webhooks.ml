@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Infix
 
@@ -34,11 +22,11 @@ let webhooks : (string, config) Hashtbl.t = Hashtbl.create 10
 
 let register_webhook id config =
   Hashtbl.replace webhooks id config;
-  Octra_log.stdout "info [webhook] registered id = %s url = %s\n%!" id config.url
+  Octra_log.info "webhook" "event = registered id = %s url = %s" id config.url
 
 let unregister_webhook id =
   Hashtbl.remove webhooks id;
-  Octra_log.stdout "info [webhook] unregistered id = %s\n%!" id
+  Octra_log.info "webhook" "event = unregistered id = %s" id
 
 let create_signature body secret =
   Digestif.SHA256.digest_string (secret ^ body) |> Digestif.SHA256.to_hex
@@ -70,10 +58,12 @@ let deliver id config event_type body =
   let code = Cohttp.Code.code_of_status (Cohttp.Response.status resp) in
   if code >= 200 && code < 300 then (
     config.failures <- 0;
-    Octra_log.stdout "info [webhook] delivered id = %s event = %s\n%!" id event_type
+    Octra_log.info "webhook" "event = delivered id = %s type = %s" id event_type
   ) else (
     config.failures <- config.failures + 1;
-    Octra_log.stdout "warn [webhook] delivery failed id = %s event = %s http = %d\n%!" id event_type code
+    Octra_log.warn "webhook"
+      "event = delivery_failed id = %s type = %s http = %d"
+      id event_type code
   );
   Lwt.return_unit
 
@@ -92,7 +82,8 @@ let notify event =
             deliver id config event_type body)
           (fun exn ->
             config.failures <- config.failures + 1;
-            Octra_log.stdout "error [webhook] exception id = %s event = %s err = %s\n%!"
+            Octra_log.error "webhook"
+              "event = delivery_exception id = %s type = %s error = %s"
               id event_type (Printexc.to_string exn);
             Lwt.return_unit))
   ) webhooks

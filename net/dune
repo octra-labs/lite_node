@@ -1,3 +1,3 @@
 (library
  (name octra_net)
- (libraries digestif digestif.c lwt lwt.unix mirage-crypto-ec mirage-crypto-rng mirage-crypto-rng.unix cstruct octra_log))
+ (libraries digestif digestif.c lwt lwt.unix mirage-crypto-ec mirage-crypto-rng mirage-crypto-rng.unix cstruct mtime mtime.clock.os octra_log octra_crypto_guard))

@@ -1,27 +1,20 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type runtime = {
   driver_config : Consensus_driver_wiring.node_driver_config_runtime;
   validator_set : Octra_consensus.C_types.validator_set;
   swarm : Octra_net.P2p_swarm.t;
+  activate_validator_set :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   start_height : int64;
   sleep : float -> unit Lwt.t;
   health : Consensus_health_wiring.node_driver_health_runtime;
   pending : Consensus_pending_commit_recovery.node_driver_runtime;
+  recovery_pending : unit -> bool;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
@@ -33,6 +26,7 @@ type health_runtime_input = {
   replay_stashed : source:string -> unit Lwt.t;
   health : Consensus_health_wiring.node_driver_health_runtime;
   pending : Consensus_pending_commit_recovery.node_driver_runtime;
+  recovery_pending : unit -> bool;
   poll_interval : float;
   pending_delay : float;
   role_label : string;

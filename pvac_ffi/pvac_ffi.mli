@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type pubkey
 type seckey
@@ -20,7 +8,15 @@ type cipher
 type params
 type zero_proof
 type range_proof
+type cipher_shape = {
+  slots : int;
+  layers : int;
+  edges : int;
+  c0 : int;
+  base_layers : int;
+}
 
+val isolate_worker : unit -> unit
 val default_params : unit -> params
 val keygen : params -> pubkey * seckey
 val keygen_from_seed : params -> bytes -> pubkey * seckey
@@ -45,50 +41,49 @@ val ct_recrypt_seeded : pubkey -> evalkey -> cipher -> bytes -> cipher
 
 val commit_ct : pubkey -> cipher -> bytes
 val cipher_has_key_bound_material : cipher -> bool
+val cipher_base_layers : cipher -> int
+val cipher_shape : cipher -> cipher_shape
+val cipher_is_wrapped_scalar : cipher -> bool
 val pubkey_is_key_bound_extension : pubkey -> pubkey -> bool
 val cipher_is_key_bound_extension : cipher -> cipher -> bool
 
-
 val make_zero_proof : pubkey -> seckey -> cipher -> zero_proof
-
 
 val verify_zero : pubkey -> cipher -> zero_proof -> bool
 
-
 val make_zero_proof_bound : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
-
 
 val verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
 
+val verify_zero_bound_key_switch :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
-
 
 val pedersen_commit_amount : int64 -> bytes -> bytes
 val pedersen_identity : unit -> bytes
 val pedersen_add : bytes -> bytes -> bytes
 val pedersen_sub : bytes -> bytes -> bytes
 
-
 val make_range_proof : pubkey -> seckey -> cipher -> int64 -> range_proof
 
-
 val verify_range : pubkey -> cipher -> range_proof -> bool
-
 
 type agg_range_proof
 val make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> agg_range_proof
 val serialize_agg_range_proof : agg_range_proof -> bytes
 
-
 val verify_range_any : pubkey -> cipher -> bytes -> bool
+val verify_range_bound : pubkey -> cipher -> bytes -> bytes -> bool
 
 val serialize_cipher : cipher -> bytes
 val serialize_cipher_public : cipher -> bytes
 val deserialize_cipher : bytes -> cipher
+val deserialize_cipher_result : bytes -> (cipher, string) result
 val serialize_pubkey : pubkey -> bytes
 val serialize_pubkey_legacy_v2 : pubkey -> bytes
 val deserialize_pubkey : bytes -> pubkey
+val deserialize_pubkey_result : bytes -> (pubkey, string) result
 val serialize_seckey : seckey -> bytes
 val deserialize_seckey : bytes -> seckey
 val serialize_zero_proof : zero_proof -> bytes
@@ -96,6 +91,5 @@ val serialize_bound_range_proof : zero_proof -> bytes
 val deserialize_zero_proof : bytes -> zero_proof
 val serialize_range_proof : range_proof -> bytes
 val deserialize_range_proof : bytes -> range_proof
-
 
 val aes_kat : unit -> bytes

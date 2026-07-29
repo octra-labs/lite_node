@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   address : string;
@@ -29,6 +17,11 @@ type exec_result = {
   events : Contract_vm.event_record list;
   error : string option;
   storage_writes : int;
+}
+
+type upgrade_result = {
+  old_code_hash : string;
+  new_code_hash : string;
 }
 
 let run_s p =
@@ -78,11 +71,35 @@ let decode_loaded ?(trusted = []) raw =
     | Error _ -> None
   with _ -> None
 
+let decode_loaded_for_admission ?(trusted = []) admission raw =
+  if String.equal admission "source" then
+    try
+      match Admission.decode_program_source raw with
+      | Ok admitted ->
+        Some {
+          code = Admission.code admitted;
+          profile = Admission.profile admitted;
+        }
+      | Error _ -> None
+    with _ -> None
+  else
+    decode_loaded ~trusted raw
+
 let load_loaded ?(trusted = []) store contract_addr =
   match run_s (Octra_core.Store_irmin.load_bytecode store contract_addr) with
-  | None -> None
   | Some b64 ->
-    (try decode_loaded ~trusted (Base64.decode_exn b64) with _ -> None)
+    let admission =
+      match run_s (Octra_core.Store_irmin.get_contract_meta store contract_addr) with
+      | Some meta -> meta.admission
+      | None -> "binary"
+    in
+    (try
+       decode_loaded_for_admission
+         ~trusted
+         admission
+         (Base64.decode_exn b64)
+     with _ -> None)
+  | None -> None
 
 let load_bytecode ?(trusted = []) store contract_addr =
   Option.map (fun loaded -> loaded.code) (load_loaded ~trusted store contract_addr)
@@ -245,6 +262,28 @@ let strict_values = function
   | Admission.Legacy -> false
   | Admission.Program _ -> true
 
+let storage_kind = function
+  | Program_type_flow.Int -> Some Contract_vm.StorageInt
+  | Program_type_flow.Bool -> Some Contract_vm.StorageBool
+  | Program_type_flow.String -> Some Contract_vm.StorageString
+  | Program_type_flow.Bytes -> Some Contract_vm.StorageBytes
+  | Program_type_flow.Bytes32 -> Some Contract_vm.StorageBytes32
+  | Program_type_flow.U64 -> Some Contract_vm.StorageU64
+  | Program_type_flow.U128 -> Some Contract_vm.StorageU128
+  | Program_type_flow.U256 -> Some Contract_vm.StorageU256
+  | Program_type_flow.Addr -> Some Contract_vm.StorageAddr
+  | Program_type_flow.Cipher
+  | Program_type_flow.PubKey
+  | Program_type_flow.Unknown -> None
+
+let storage_kinds = function
+  | Admission.Legacy -> []
+  | Admission.Program facts ->
+    List.filter_map
+      (fun (key, kind) ->
+        Option.map (fun value -> key, value) (storage_kind kind))
+      facts.Program_type_flow.storage
+
 let count_storage_writes state =
   List.fold_left (fun acc e -> match e with
     | Contract_vm.UndoWrite _ -> acc + 1
@@ -252,9 +291,10 @@ let count_storage_writes state =
   ) 0 state.Contract_vm.undo_stack
 
 let setup_call_state_values ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
-    ?(strict_values=false)
+    ?(strict_values=false) ?(storage_kinds=[])
     ~caller ~address ~value ~storage_tbl ~method_name ~params () =
   let state = Contract_vm.create_state ~ctx ~depth ~limit ~strict_values
+    ~storage_kinds
     ~caller ~origin:caller ~address ~value ~storage:storage_tbl () in
   state.memory.data <- Hashtbl.create 1024;
   Hashtbl.add state.memory.data 999 (Contract_vm.VString "call");
@@ -302,24 +342,33 @@ let exec_result_to_result r =
   else
     Error (trim_error (Option.value r.error ~default:"execution failed"))
 
-let deploy ~journal ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(params=[]) store deployer
-    ctype _code bytecode_raw nonce =
+let deploy ~journal ?(trusted = []) ?admitted ?(ctx=Contract_vm.default_ctx)
+    ?(params=[]) store deployer ctype _code bytecode_raw nonce =
   let addr = addr_from_code bytecode_raw deployer nonce in
   let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
-  Octra_log.stdout "info [contract] deploying addr = %s deployer = %s size = %d hash = %s\n%!"
+  Octra_log.info "program" "event = deploy_start addr = %s deployer = %s size = %d hash = %s"
     addr (String.sub deployer 0 (min 12 (String.length deployer)))
     (String.length bytecode_raw) (String.sub hash 0 16);
-  match Admission.decode_deploy ~trusted bytecode_raw with
+  let source_bound = Option.is_some admitted in
+  let admission_result =
+    match admitted with
+    | Some value -> Ok value
+    | None -> Admission.decode_deploy ~trusted bytecode_raw
+  in
+  match admission_result with
   | Error error ->
     (addr, { success = false; return_value = None; effort_used = 0;
              events = []; error = Some (Admission.error_message error); storage_writes = 0 })
 | Ok admitted ->
+  let admission = if source_bound then "source" else "binary" in
   let code = Admission.code admitted in
-  let strict_values = strict_values (Admission.profile admitted) in
+  let profile = Admission.profile admitted in
+  let strict_values = strict_values profile in
+  let storage_kinds = storage_kinds profile in
   let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
   let staged = Program_journal.has_deploy journal addr in
   if exists || staged then (
-    Octra_log.stdout "warn [contract] already exists addr = %s\n%!" addr;
+    Octra_log.warn "program" "event = deploy_exists addr = %s" addr;
     (addr, { success = true; return_value = None; effort_used = 0;
              events = []; error = None; storage_writes = 0 })
   ) else
@@ -329,13 +378,15 @@ let deploy ~journal ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(params=[]) 
                events = []; error = Some (Program_input.error_message error); storage_writes = 0 })
     | Ok values ->
       let storage_tbl = Hashtbl.create 100 in
-      let state = Contract_vm.create_state ~ctx ~strict_values ~caller:deployer ~origin:deployer
-        ~address:addr ~value:Z.zero ~storage:storage_tbl () in
+      let state = Contract_vm.create_state ~ctx ~strict_values ~storage_kinds
+        ~caller:deployer ~origin:deployer ~address:addr ~value:Z.zero
+        ~storage:storage_tbl () in
       state.memory.data <- Hashtbl.create 1024;
       Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
       Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
       List.iteri (fun i value -> Hashtbl.add state.memory.data (1001 + i) value) values;
-      Octra_log.stdout "info [contract] running constructor addr = %s params = %d\n%!" addr (List.length params);
+      Octra_log.info "program" "event = constructor_start addr = %s params = %d"
+        addr (List.length params);
       let fixed = fix_jumps code in
       let success = Contract_vm.run state fixed in
       let result = {
@@ -354,14 +405,17 @@ let deploy ~journal ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(params=[]) 
           bytecode_b64 = Base64.encode_exn bytecode_raw;
           owner = deployer;
           ctype;
+          admission;
           storage = storage_tbl;
         };
-        Octra_log.stdout
-          "info [contract] constructor ok addr = %s effort = %d persistence = deferred\n%!"
+        Octra_log.info "program"
+          "event = constructor_done addr = %s effort = %d persistence = deferred"
           addr result.effort_used;
         (addr, result)
       ) else (
-        Octra_log.stdout "error [contract] constructor failed addr = %s effort = %d\n%!" addr result.effort_used;
+        Octra_log.error "program"
+          "event = constructor_failed addr = %s effort = %d"
+          addr result.effort_used;
         (addr, result)
       )
 
@@ -373,7 +427,9 @@ let deploy_internal ~journal ?(trusted = []) ~ctx ~depth ?(params=[]) store ~dep
   | Error (Admission.Unsafe_error error) -> Error error
   | Ok admitted ->
       let code = Admission.code admitted in
-      let strict_values = strict_values (Admission.profile admitted) in
+      let profile = Admission.profile admitted in
+      let strict_values = strict_values profile in
+      let storage_kinds = storage_kinds profile in
       let addr = addr_from_code bytecode_raw deployer nonce in
       let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
       let already_pending = Program_journal.has_deploy journal addr in
@@ -383,11 +439,13 @@ let deploy_internal ~journal ?(trusted = []) ~ctx ~depth ?(params=[]) store ~dep
         | Error error -> Error (Program_input.error_message error)
         | Ok values ->
           let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
-          Octra_log.stdout "info [contract] spawn addr = %s deployer = %s nonce = %d depth = %d\n%!"
+          Octra_log.info "program"
+            "event = spawn_start addr = %s deployer = %s nonce = %d depth = %d"
             addr (String.sub deployer 0 (min 12 (String.length deployer))) nonce depth;
           let storage_tbl = Hashtbl.create 100 in
-          let state = Contract_vm.create_state ~ctx ~strict_values ~caller:deployer ~origin:deployer
-            ~address:addr ~value:Z.zero ~storage:storage_tbl () in
+          let state = Contract_vm.create_state ~ctx ~strict_values ~storage_kinds
+            ~caller:deployer ~origin:deployer ~address:addr ~value:Z.zero
+            ~storage:storage_tbl () in
           state.memory.data <- Hashtbl.create 1024;
           Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
           Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
@@ -401,18 +459,63 @@ let deploy_internal ~journal ?(trusted = []) ~ctx ~depth ?(params=[]) store ~dep
               bytecode_b64 = Base64.encode_exn bytecode_raw;
               owner = deployer;
               ctype = "CUSTOM";
+              admission = "binary";
               storage = storage_tbl;
             };
-            Octra_log.stdout "info [contract] spawn ok addr = %s effort = %d (deferred)\n%!" addr state.effort_used;
+            Octra_log.info "program"
+              "event = spawn_done addr = %s effort = %d persistence = deferred"
+              addr state.effort_used;
             Ok {
               Contract_vm.spawned_addr = addr;
               effort_used = state.effort_used;
               events = List.rev !(state.logs);
             }
           ) else (
-            Octra_log.stdout "error [contract] spawn constructor failed addr = %s\n%!" addr;
+            Octra_log.error "program" "event = spawn_failed addr = %s" addr;
             Error "constructor failed"
           )
+
+let upgrade ~journal ?(trusted = []) store ~address ~caller
+    ~expected_code_hash ~bytecode_raw =
+  if Program_journal.has_upgrade journal address then
+    Error "program upgrade already staged"
+  else if Program_journal.has_deploy journal address then
+    Error "staged program cannot be upgraded"
+  else
+    match run_s (Octra_core.Store_irmin.get_contract_meta store address) with
+    | None ->
+      Error "program not found"
+    | Some meta when not (String.equal meta.owner caller) ->
+      Error "only the program owner can upgrade"
+    | Some meta when not (String.equal meta.code_hash expected_code_hash) ->
+      Error "program upgrade code hash mismatch"
+    | Some meta ->
+      begin
+        match Admission.decode_program ~trusted bytecode_raw with
+        | Error error ->
+          Error (Admission.error_message error)
+        | Ok _ ->
+          let new_code_hash =
+            Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
+          if String.equal new_code_hash meta.code_hash then
+            Error "program upgrade bytecode unchanged"
+          else begin
+            Program_journal.add_upgrade journal {
+              address;
+              expected_code_hash;
+              code_hash = new_code_hash;
+              bytecode_b64 = Base64.encode_exn bytecode_raw;
+              owner = meta.owner;
+              ctype = meta.ctype;
+              admission = "binary";
+              version = Oct_compile.lang_version;
+            };
+            Ok {
+              old_code_hash = meta.code_hash;
+              new_code_hash;
+            }
+          end
+      end
 
 let load_storage_with_overlay journal store program_addr =
   match Program_journal.load_storage journal program_addr with
@@ -420,12 +523,24 @@ let load_storage_with_overlay journal store program_addr =
   | None -> load_storage store program_addr
 
 let load_loaded_with_overlay ?(trusted = []) journal store program_addr =
-  match Program_journal.find_deploy journal program_addr with
-  | Some deploy ->
+  match Program_journal.find_upgrade journal program_addr with
+  | Some upgrade ->
     (try
-       decode_loaded ~trusted (Base64.decode_exn deploy.bytecode_b64)
+       decode_loaded_for_admission
+         ~trusted
+         upgrade.admission
+         (Base64.decode_exn upgrade.bytecode_b64)
      with _ -> None)
-  | None -> load_loaded ~trusted store program_addr
+  | None ->
+    match Program_journal.find_deploy journal program_addr with
+    | Some deploy ->
+      (try
+         decode_loaded_for_admission
+           ~trusted
+           deploy.admission
+           (Base64.decode_exn deploy.bytecode_b64)
+       with _ -> None)
+    | None -> load_loaded ~trusted store program_addr
 
 let load_bytecode_with_overlay ?(trusted = []) journal store program_addr =
   Option.map (fun loaded -> loaded.code)
@@ -437,7 +552,9 @@ let contract_exists_with_overlay journal store program_addr =
 
 let execute_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
     ~journal store program_addr method_name params caller value =
-  Octra_log.stdout "info [contract] call addr = %s method = %s depth = %d limit = %d\n%!" program_addr method_name depth limit;
+  Octra_log.info "program"
+    "event = call_start addr = %s method = %s depth = %d limit = %d"
+    program_addr method_name depth limit;
   match load_loaded_with_overlay ~trusted journal store program_addr with
   | None ->
     { success = false; return_value = None; effort_used = 0;
@@ -468,6 +585,7 @@ let execute_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(lim
            in
            let state = setup_call_state_values ~ctx ~depth ~limit ~caller
              ~strict_values:(strict_values loaded.profile)
+             ~storage_kinds:(storage_kinds loaded.profile)
              ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
            run_fixed_from_dispatcher state fixed)
 
@@ -500,6 +618,7 @@ let execute_view_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) 
            let storage_copy = Hashtbl.copy storage_tbl in
            let state = setup_call_state_values ~ctx ~depth ~limit ~caller
              ~strict_values:(strict_values loaded.profile)
+             ~storage_kinds:(storage_kinds loaded.profile)
              ~address:contract_addr ~value:Z.zero ~storage_tbl:storage_copy
              ~method_name ~params:values () in
            state.is_view <- true;

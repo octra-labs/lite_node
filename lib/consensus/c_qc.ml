@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open C_types
 
@@ -37,40 +25,97 @@ let vote_ok ~chain_id ~epoch_id ~round ~proposal_id (vote : vote) =
   && vote.vote_type = Precommit
   && vote.proposal_id = proposal_id
 
-let validate_finalize ~chain_id ~validator_set ~verify_vote f =
-  if f.chain_id <> chain_id then invalid "chain_id"
-  else if f.header.chain_id <> f.chain_id then invalid "header_chain_id"
-  else if f.header.epoch_id <> f.epoch_id then invalid "header_epoch"
-  else if Octra_net.Hash_domain.is_nil f.proposal_id then invalid "nil_proposal"
-  else if f.proposal_id <> C_hash.proposal_id f.header then invalid "proposal_id"
-  else if List.length f.precommits < validator_set.quorum then invalid "quorum"
+let validate_certificate ~chain_id ~validator_set ~verify_vote
+    (certificate : commit_certificate) =
+  if certificate.chain_id <> chain_id then invalid "chain_id"
+  else if certificate.header.chain_id <> certificate.chain_id then
+    invalid "header_chain_id"
+  else if certificate.header.epoch_id <> certificate.epoch_id then
+    invalid "header_epoch"
+  else if
+    certificate.header.proto_version <> proto_version_parent_legacy
+    && certificate.header.proto_version <> proto_version_current
+  then
+    invalid "header_proto_version"
+  else if not (is_validator validator_set certificate.header.creator_addr) then
+    invalid "header_creator"
+  else if Octra_net.Hash_domain.is_nil certificate.proposal_id then
+    invalid "nil_proposal"
+  else if
+    certificate.proposal_id <> C_hash.proposal_id certificate.header
+  then
+    invalid "proposal_id"
   else
-    let addrs = List.map (fun (v : vote) -> v.validator) f.precommits in
+    let addrs =
+      List.map
+        (fun (vote : vote) -> vote.validator)
+        certificate.precommits
+    in
     if not (unique addrs) then invalid "duplicate_validator"
+    else if not (C_types.has_quorum validator_set addrs) then invalid "quorum"
     else
       let bad_vote =
         List.find_opt
           (fun vote ->
             not (vote_ok
-              ~chain_id:f.chain_id
-              ~epoch_id:f.epoch_id
-              ~round:f.commit_round
-              ~proposal_id:f.proposal_id
+              ~chain_id:certificate.chain_id
+              ~epoch_id:certificate.epoch_id
+              ~round:certificate.commit_round
+              ~proposal_id:certificate.proposal_id
               vote))
-          f.precommits
+          certificate.precommits
       in
       match bad_vote with
       | Some _ -> invalid "vote_fields"
       | None ->
-        let bad_validator =
-          List.find_opt
-            (fun (vote : vote) -> not (C_types.is_validator validator_set vote.validator))
-            f.precommits
-        in
-        match bad_validator with
-        | Some _ -> invalid "validator"
-        | None ->
-          let bad_sig = List.find_opt (fun (vote : vote) -> not (verify_vote vote)) f.precommits in
+          let bad_validator =
+            List.find_opt
+              (fun (vote : vote) -> not (C_types.is_validator validator_set vote.validator))
+              certificate.precommits
+          in
+          match bad_validator with
+          | Some _ -> invalid "validator"
+          | None ->
+          let bad_sig =
+            List.find_opt
+              (fun (vote : vote) -> not (verify_vote vote))
+              certificate.precommits
+          in
           match bad_sig with
           | Some _ -> invalid "signature"
           | None -> Valid
+
+let validate_finalize_with ~version_valid ~chain_id ~validator_set
+    ~verify_vote (finalize : finalize) =
+  if not (version_valid finalize) then
+    invalid "header_proto_version"
+  else if
+    C_hash.parent_commit_hash_opt finalize.parent_commit
+    <> finalize.header.parent_commit_hash
+  then
+    invalid "parent_commit_hash"
+  else
+    validate_certificate
+      ~chain_id
+      ~validator_set
+      ~verify_vote
+      (C_types.certificate_of_finalize finalize)
+
+let validate_finalize ~chain_id ~validator_set ~verify_vote finalize =
+  validate_finalize_with
+    ~version_valid:(fun finalize ->
+      finalize.header.proto_version
+      = C_protocol.version_for_epoch finalize.epoch_id)
+    ~chain_id
+    ~validator_set
+    ~verify_vote
+    finalize
+
+let validate_persisted_finalize ~chain_id ~validator_set ~verify_vote finalize =
+  validate_finalize_with
+    ~version_valid:(fun finalize ->
+      C_protocol.supported_version finalize.header.proto_version)
+    ~chain_id
+    ~validator_set
+    ~verify_vote
+    finalize

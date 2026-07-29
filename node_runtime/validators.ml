@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let entries_of_env_name name =
   match Sys.getenv_opt name with
@@ -36,13 +24,33 @@ let pubkeys_of_env_name_in_order name =
 let raw32_of_base64 encoded =
   try
     let raw = Base64.decode_exn encoded in
-    Some (if String.length raw >= 32 then String.sub raw 0 32 else raw)
+    if String.length raw = 32 then Some raw else None
   with _ -> None
 
-let raw_pubkey_of_entry entry =
-  match String.split_on_char ':' entry with
-  | [_addr; pub_b64] -> raw32_of_base64 pub_b64
+let parsed_entry entry =
+  match String.split_on_char ':' (String.trim entry) with
+  | [addr; pub_b64] when String.length addr > 3 ->
+    Option.map (fun pubkey -> addr, pubkey) (raw32_of_base64 pub_b64)
   | _ -> None
+
+let entry_errors ~label entries =
+  let rec loop seen_addr seen_key errors = function
+    | [] -> List.rev errors
+    | entry :: rest ->
+      match parsed_entry entry with
+      | None ->
+        loop seen_addr seen_key ((label ^ ":invalid_entry") :: errors) rest
+      | Some (addr, _pubkey) when List.mem addr seen_addr ->
+        loop seen_addr seen_key ((label ^ ":duplicate_address:" ^ addr) :: errors) rest
+      | Some (addr, pubkey) when List.mem pubkey seen_key ->
+        loop seen_addr seen_key ((label ^ ":duplicate_pubkey:" ^ addr) :: errors) rest
+      | Some (addr, pubkey) ->
+        loop (addr :: seen_addr) (pubkey :: seen_key) errors rest
+  in
+  loop [] [] [] entries
+
+let raw_pubkey_of_entry entry =
+  Option.map snd (parsed_entry entry)
 
 let raw_pubkeys_of_entries entries =
   List.filter_map raw_pubkey_of_entry entries

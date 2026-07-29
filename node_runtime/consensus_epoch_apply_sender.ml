@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -31,6 +19,7 @@ type tx_context = {
   reject :
     ?consume_nonce:bool ->
     ?notify_reason:string ->
+    ?persist_state:bool ->
     string ->
     string ->
     unit Lwt.t;
@@ -247,6 +236,9 @@ let nonce_mismatch_reason ~expected ~got =
 let next_nonce ~expected ~consume =
   if consume then expected + 1 else expected
 
+let savepoint_result ~accepted ~persist_state =
+  if accepted || persist_state then Ok () else Error ()
+
 let initial_nonce ~account_nonce = function
   | [] -> None
   | tx :: _ ->
@@ -267,25 +259,43 @@ let run_nonce_loop ~account_nonce ~nonce_mismatch ~confirm ~reject ~handle txs =
         in
         loop expected_nonce rest
       else
+        let outcome = ref None in
+        let set_outcome value =
+          match !outcome with
+          | None -> outcome := Some value
+          | Some _ -> failwith "sender transaction completed more than once"
+        in
         let confirm () =
           let open Lwt.Syntax in
           let* () = confirm tx in
-          loop (expected_nonce + 1) rest
+          set_outcome true;
+          Lwt.return_unit
         in
         let continue_after_reject ~consume_nonce =
-          loop (next_nonce ~expected:expected_nonce ~consume:consume_nonce) rest
+          set_outcome consume_nonce;
+          Lwt.return_unit
         in
-        let reject ?(consume_nonce = false) ?notify_reason error_type reason =
+        let reject ?(consume_nonce = false) ?notify_reason ?persist_state
+            error_type reason =
+          ignore persist_state;
           let open Lwt.Syntax in
           let* () = reject tx ~notify_reason ~error_type ~reason in
           continue_after_reject ~consume_nonce
         in
-        handle {
-          tx;
-          confirm;
-          reject;
-          continue_after_reject;
-        }
+        let open Lwt.Syntax in
+        let* () =
+          handle {
+            tx;
+            confirm;
+            reject;
+            continue_after_reject;
+          }
+        in
+        match !outcome with
+        | Some consume_nonce ->
+          loop (next_nonce ~expected:expected_nonce ~consume:consume_nonce) rest
+        | None ->
+          Lwt.fail_with "sender transaction did not complete"
   in
   match initial_nonce ~account_nonce txs with
   | None -> Lwt.return_unit

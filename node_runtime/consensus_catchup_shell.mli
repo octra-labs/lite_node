@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type queued = {
   target_epoch : int64;
@@ -117,6 +105,7 @@ type validated_record = {
   expected_eic : string;
   expected_txid : int64;
   proposer : Octra_core.Epochlog.proposer_info option;
+  reward : Consensus_reward_attribution.t;
   expected_root : string option;
   apply_action : record_apply_action;
 }
@@ -134,13 +123,19 @@ type apply_point_source = {
 }
 
 type record_apply_deps = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   head_before_record : unit -> int;
+  find_finalized : int -> Octra_consensus.C_types.finalize option;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_expected_root : int -> string -> unit;
   activate_gap : unit -> unit;
   point_source : apply_point_source;
   write_finality :
-    Octra_consensus.C_codec.catchup_epoch_record ->
+    validated_record ->
+    unit;
+  promote_finality :
+    validated_record ->
     unit;
   apply_record :
     validated_record ->
@@ -164,6 +159,8 @@ type target_deps = {
 }
 
 type target_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   normalize : source:string -> unit;
   head_epoch : unit -> int;
   env_timeout : unit -> string option;
@@ -172,11 +169,15 @@ type target_wiring = {
   read_apply_root : unit -> string Lwt.t;
   cached_head : unit -> cached_apply_head;
   next_txid : unit -> int64;
+  find_finalized : int -> Octra_consensus.C_types.finalize option;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_expected_root : int -> string -> unit;
   activate_gap : unit -> unit;
   write_finality :
-    Octra_consensus.C_codec.catchup_epoch_record ->
+    validated_record ->
+    unit;
+  promote_finality :
+    validated_record ->
     unit;
   apply_record :
     validated_record ->
@@ -202,6 +203,8 @@ type node_deps_wiring = {
 }
 
 type node_target_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   normalize : source:string -> unit;
   head_epoch : unit -> int;
   env_timeout : unit -> string option;
@@ -212,7 +215,10 @@ type node_target_wiring = {
   finality : Consensus_finality_state.callbacks;
   queue : Consensus_catchup_queue.t;
   write_finality :
-    Octra_consensus.C_codec.catchup_epoch_record ->
+    validated_record ->
+    unit;
+  promote_finality :
+    validated_record ->
     unit;
   apply_record :
     validated_record ->
@@ -228,6 +234,8 @@ type driver_io = {
 }
 
 type driver_runner_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   catchup_active : bool ref;
   queue : Consensus_catchup_queue.t;
   committed_head_epoch : unit -> int;
@@ -238,7 +246,10 @@ type driver_runner_wiring = {
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
   write_finality :
-    Octra_consensus.C_codec.catchup_epoch_record ->
+    validated_record ->
+    unit;
+  promote_finality :
+    validated_record ->
     unit;
   apply_record :
     validated_record ->
@@ -253,6 +264,8 @@ type driver_runner_wiring = {
 }
 
 type driver_runner_node_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   catchup_active : bool ref;
   queue : Consensus_catchup_queue.t;
   committed_head_epoch : unit -> int;
@@ -263,7 +276,10 @@ type driver_runner_node_wiring = {
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
   write_finality :
-    Octra_consensus.C_codec.catchup_epoch_record ->
+    validated_record ->
+    unit;
+  promote_finality :
+    validated_record ->
     unit;
   apply_record :
     validated_record ->
@@ -326,10 +342,17 @@ val final_apply_gate :
   (Octra_consensus.C_driver.catchup_range_response_record, string) result
 
 val validate_record :
+  chain_id:string ->
+  expected_validator_set_hash:string ->
   prev_eic:string ->
   start_txid:int64 ->
   head_before_record:int ->
   Octra_consensus.C_codec.catchup_epoch_record ->
+  (validated_record, string) result
+
+val bind_finality :
+  validated_record ->
+  Octra_consensus.C_types.finalize ->
   (validated_record, string) result
 
 val read_apply_point :

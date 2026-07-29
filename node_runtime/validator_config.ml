@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type transition =
   | No_transition
@@ -27,6 +15,9 @@ type transition =
 
 type t = {
   allowed_pubkeys : string list;
+  identity_errors : string list;
+  program_trust_hash : string option;
+  runtime_profile_hash : string option;
   current_validator_list : Octra_consensus.C_types.validator_info list;
   next_validator_list : Octra_consensus.C_types.validator_info list;
   active_validator_list : Octra_consensus.C_types.validator_info list;
@@ -78,14 +69,9 @@ type startup_event_deps = {
 }
 
 let validator_info_of_entry entry =
-  match String.split_on_char ':' entry with
-  | [addr; pub_b64] ->
-    (match Validators.raw32_of_base64 pub_b64 with
-     | Some raw32 ->
-       Some (Octra_consensus.C_types.{ address = addr; pubkey = raw32 })
-     | None ->
-       Some (Octra_consensus.C_types.{ address = addr; pubkey = "" }))
-  | _ -> Some (Octra_consensus.C_types.{ address = entry; pubkey = "" })
+  Option.map
+    (fun (address, pubkey) -> Octra_consensus.C_types.{ address; pubkey })
+    (Validators.parsed_entry entry)
 
 let validator_list_of_entries entries =
   List.filter_map validator_info_of_entry entries
@@ -96,20 +82,33 @@ let driver_config_of_update update =
     |> List.filter_map (fun v ->
       match Validators.raw32_of_base64 v.Octra_core.Validator_set_update.pubkey_b64 with
       | Some raw32 ->
-        Some Octra_consensus.C_types.{
-          address = v.address;
-          pubkey = raw32;
-        }
+        Some (
+          Octra_consensus.C_types.{
+            address = v.address;
+            pubkey = raw32;
+          },
+          v.weight)
       | None -> None)
   in
   if validators = [] then None
   else
-    let validator_set = Octra_consensus.C_engine.make_validator_set validators in
-    Some Octra_consensus.C_driver.{
-      activate_epoch = update.activate_epoch;
-      validator_set;
-      fingerprint = update.fingerprint;
-    }
+    let validator_set =
+      if update.weighted then
+        Octra_consensus.C_types.make_weighted_validator_set validators
+      else
+        Ok (
+          validators
+          |> List.map fst
+          |> Octra_consensus.C_engine.make_validator_set)
+    in
+    match validator_set with
+    | Error _ -> None
+    | Ok validator_set ->
+      Some Octra_consensus.C_driver.{
+        activate_epoch = update.activate_epoch;
+        validator_set;
+        fingerprint = update.fingerprint;
+      }
 
 let pending_entries_of_raw = function
   | None -> []
@@ -157,34 +156,37 @@ let load_persistent_update (deps : persistent_update_deps) ~runtime
       deps.log_invalid e;
       Lwt.return_none
     | Ok update ->
-      let* readiness =
-        Lwt_list.map_s
-          (fun v ->
-            let key =
-              Octra_core.Validator_set_update.ready_meta_key
-                ~fingerprint:update.fingerprint
-                ~address:v.Octra_core.Validator_set_update.address
-            in
-            let* marker = deps.read_marker key in
-            Lwt.return (v, marker))
-          update.validators
-      in
-      let missing =
-        readiness_missing
-          ~runtime
-          ~requirements
-          ~update
-          readiness
-      in
-      if missing <> [] then begin
-        if Int64.compare current_height update.activate_epoch >= 0 then
-          deps.log_waiting
-            ~activate_epoch:update.activate_epoch
-            ~missing
-            ~fingerprint:(short_fingerprint update.fingerprint);
-        Lwt.return_none
-      end else
+      if update.weighted then
         Lwt.return (driver_config_of_update update)
+      else
+        let* readiness =
+          Lwt_list.map_s
+            (fun v ->
+              let key =
+                Octra_core.Validator_set_update.ready_meta_key
+                  ~fingerprint:update.fingerprint
+                  ~address:v.Octra_core.Validator_set_update.address
+              in
+              let* marker = deps.read_marker key in
+              Lwt.return (v, marker))
+            update.validators
+        in
+        let missing =
+          readiness_missing
+            ~runtime
+            ~requirements
+            ~update
+            readiness
+        in
+        if missing <> [] then begin
+          if Int64.compare current_height update.activate_epoch >= 0 then
+            deps.log_waiting
+              ~activate_epoch:update.activate_epoch
+              ~missing
+              ~fingerprint:(short_fingerprint update.fingerprint);
+          Lwt.return_none
+        end else
+          Lwt.return (driver_config_of_update update)
 
 let load_node_persistent_update (deps : persistent_update_node_deps) ~runtime
     ~requirements =
@@ -215,6 +217,10 @@ let fingerprint_of_validator_set vs =
       Octra_core.Validator_set_update.{
         address = v.Octra_consensus.C_types.address;
         pubkey_b64 = Base64.encode_exn v.Octra_consensus.C_types.pubkey;
+        weight =
+          Option.value
+            ~default:Z.one
+            (Octra_consensus.C_types.weight_of_addr vs v.address);
       })
   in
   let fingerprint = Octra_core.Validator_set_update.fingerprint entries in
@@ -227,6 +233,160 @@ let light_scheduled_of_driver = function
       activate_epoch = cfg.Octra_consensus.C_driver.activate_epoch;
       validator_set = cfg.validator_set;
     }
+
+let persistent_update label = function
+  | None -> Ok None
+  | Some raw ->
+    begin
+      match Octra_core.Validator_set_update.of_string raw with
+      | Ok update -> Ok (Some update)
+      | Error error -> Error (label ^ " validator set is invalid: " ^ error)
+    end
+
+let required_driver_config label update =
+  match driver_config_of_update update with
+  | Some config -> Ok config
+  | None -> Error (label ^ " validator set cannot build consensus config")
+
+let validate_active_update ~current_height update =
+  if not update.Octra_core.Validator_set_update.weighted then
+    Error "active validator set must use bonded weights"
+  else if Int64.compare update.activate_epoch current_height > 0 then
+    Error "active validator set activation is in the future"
+  else
+    required_driver_config "active" update
+
+let validate_pending_update ~current_height ~active
+    (update : Octra_core.Validator_set_update.t) =
+  if not update.Octra_core.Validator_set_update.weighted then
+    Error "pending validator set must use bonded weights"
+  else
+    match active with
+    | None ->
+      if Int64.compare update.activate_epoch current_height < 0 then
+        Error "activated pending validator set has no durable active marker"
+      else
+        Result.map Option.some (required_driver_config "pending" update)
+    | Some (active_update : Octra_core.Validator_set_update.t) ->
+      if String.equal update.fingerprint active_update.fingerprint then
+        Ok None
+      else if Int64.compare update.activate_epoch active_update.activate_epoch <= 0 then
+        Error "pending validator set does not follow durable active set"
+      else if Int64.compare update.activate_epoch current_height <= 0 then
+        Error "pending validator set activation is not durable"
+      else
+        Result.map Option.some (required_driver_config "pending" update)
+
+let validator_pubkeys validator_set =
+  validator_set.Octra_consensus.C_types.validators
+  |> List.map (fun validator ->
+    validator.Octra_consensus.C_types.pubkey)
+
+let transition_of_persistent ~active_config ~scheduled_config =
+  match scheduled_config, active_config with
+  | Some scheduled, _ ->
+    Scheduled {
+      activate_epoch = scheduled.Octra_consensus.C_driver.activate_epoch;
+      n = scheduled.validator_set.n;
+      quorum = scheduled.validator_set.quorum;
+      fingerprint = scheduled.fingerprint;
+    }
+  | None, Some active ->
+    Already_active { activate_epoch = active.Octra_consensus.C_driver.activate_epoch }
+  | None, None -> No_transition
+
+let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
+    ~active_raw ~pending_raw cfg =
+  match
+    persistent_update "active" active_raw,
+    persistent_update "pending" pending_raw
+  with
+  | Error error, _
+  | _, Error error -> Error error
+  | Ok None, Ok None -> Ok cfg
+  | Ok None, Ok (Some pending) when not pending.weighted -> Ok cfg
+  | Ok active_update, Ok pending_update ->
+    let active_config =
+      match active_update with
+      | None -> Ok None
+      | Some update ->
+        Result.map Option.some (validate_active_update ~current_height update)
+    in
+    begin
+      match active_config with
+      | Error error -> Error error
+      | Ok active_config ->
+        let pending_config =
+          match pending_update with
+          | None -> Ok None
+          | Some update ->
+            validate_pending_update
+              ~current_height
+              ~active:active_update
+              update
+        in
+        begin
+          match pending_config with
+          | Error error -> Error error
+          | Ok pending_config ->
+            let active_vs =
+              match active_config with
+              | None -> cfg.active_vs
+              | Some active -> active.validator_set
+            in
+            let scheduled_driver_config =
+              match pending_config with
+              | Some scheduled -> Some scheduled
+              | None when Option.is_some active_config -> None
+              | None -> cfg.scheduled_driver_config
+            in
+            let light_scheduled_validator_set =
+              light_scheduled_of_driver scheduled_driver_config
+            in
+            let active_validator_list = active_vs.validators in
+            let next_validator_list =
+              match scheduled_driver_config with
+              | None -> []
+              | Some scheduled -> scheduled.validator_set.validators
+            in
+            let allowed_pubkeys =
+              validator_pubkeys active_vs
+              @
+              match scheduled_driver_config with
+              | None -> []
+              | Some scheduled ->
+                validator_pubkeys scheduled.validator_set
+              |> List.sort_uniq String.compare
+            in
+            let consensus_config_hash =
+              if consensus_mode && active_validator_list <> [] then
+                Octra_consensus.C_config.hash
+                  ~chain_id
+                  ~validator_set:active_vs
+                  ?scheduled:light_scheduled_validator_set
+                  ?program_trust_hash:cfg.program_trust_hash
+                  ?runtime_profile_hash:cfg.runtime_profile_hash
+                  ()
+              else
+                String.make 32 '\x00'
+            in
+            Ok {
+              cfg with
+              allowed_pubkeys;
+              current_validator_list = active_validator_list;
+              next_validator_list;
+              active_validator_list;
+              active_vs;
+              scheduled_driver_config;
+              light_scheduled_validator_set;
+              consensus_config_hash;
+              transition =
+                transition_of_persistent
+                  ~active_config
+                  ~scheduled_config:scheduled_driver_config;
+            }
+        end
+    end
 
 let transition_message ~current_height cfg =
   match cfg.transition with
@@ -251,12 +411,15 @@ let contains_validator address validators =
     (fun p -> p.Octra_consensus.C_types.address = address)
     validators
 
-let self_membership ~address ~voting ~role_label cfg =
+let self_membership ?(permissionless = false) ~address ~voting ~role_label cfg =
   let active = contains_validator address cfg.active_validator_list in
   let scheduled = contains_validator address cfg.next_validator_list in
   match active, scheduled, voting with
   | true, _, _ -> Self_active
   | false, true, _ -> Self_scheduled
+  | false, false, true when permissionless ->
+    Self_observer
+      "validator candidate follows finality until selected by the bonded validator lifecycle"
   | false, false, true ->
     Self_refused
       "REFUSING TO START: wallet is not in active or scheduled validator set"
@@ -271,7 +434,7 @@ let scheduled_self_warning ~address ~voting cfg =
      && not (contains_validator address cfg.active_validator_list)
      && contains_validator address cfg.next_validator_list then
     Some
-      "wallet is not in active validator set yet; running catchup /non-voting until scheduled activation"
+      "wallet is not in active validator set yet; running catchup/non-voting until scheduled activation"
   else None
 
 let quorum_admission ~allow_unsafe cfg =
@@ -280,32 +443,25 @@ let quorum_admission ~allow_unsafe cfg =
   else if allow_unsafe then
     Quorum_unsafe_allowed
       (Printf.sprintf
-         "OCTRA_ALLOW_UNSAFE_QUORUM = 1 - running with n = %d (unsafe: not real lite-BFT, only for testing or [hidden], do not use in prod)"
+         "OCTRA_ALLOW_UNSAFE_QUORUM = 1 - running with n = %d (unsafe: not real BFT, do not use in production)"
          vs.n)
   else
     Quorum_refused [
       Printf.sprintf
-        "REFUSING TO START: lite consensus requires n >= 4 validators (current: n = %d, f = %d, quorum = %d)."
+        "REFUSING TO START: BFT consensus requires n >= 4 validators (current: n = %d, f = %d, quorum = %d)."
         vs.n vs.f vs.quorum;
+      "With n < 4, BFT safety is broken (any single validator can finalize).";
+      "For local single-validator: unset OCTRA_CONSENSUS_MODE.";
+      "For testing/devnet only: set OCTRA_ALLOW_UNSAFE_QUORUM = 1 to bypass.";
     ]
 
-
-
-(*
-  For all [o_dev_labs] - if you write a reason, write a link to the problem right away and immediately note whether it is closed or not 
-  (if not closed, analyze it and add a commit to OC7 with an exact indication of the commit and also attach all the tests that led to the cause, 
-  also try to add an opinion on the correction or improvement, do not make entries or corrections without a clear description. 
-
-  It is not the first time an issue has been left open after the weekend without a clear definition.
-
-  12.02.2025
-*)
-
-let startup_admission ~address ~voting ~role_label ~allow_unsafe_quorum
-    ~next_activation_epoch cfg =
-  if cfg.allowed_pubkeys = [] then
+let startup_admission ?(permissionless = false) ~address ~voting ~role_label
+    ~allow_unsafe_quorum ~next_activation_epoch cfg =
+  if cfg.identity_errors <> [] then
+    [Startup_refuse cfg.identity_errors]
+  else if cfg.allowed_pubkeys = [] then
     [Startup_refuse [
-       "REFUSING TO START: consensus mode requires OCTRA_VALIDATORS with valid pubkeys. Set OCTRA_VALIDATORS = addr1:pub1, addr2:pub2, ... (request a build with a version higher than the current one for D. & J.";
+       "REFUSING TO START: consensus mode requires OCTRA_VALIDATORS with valid pubkeys. Set OCTRA_VALIDATORS=addr1:pub1,addr2:pub2,...";
      ]]
   else if cfg.current_validator_list = [] then
     [Startup_refuse [
@@ -317,7 +473,14 @@ let startup_admission ~address ~voting ~role_label ~allow_unsafe_quorum
      ]]
   else
     let self_events =
-      match self_membership ~address ~voting ~role_label cfg with
+      match
+        self_membership
+          ~permissionless
+          ~address
+          ~voting
+          ~role_label
+          cfg
+      with
       | Self_active
       | Self_scheduled -> []
       | Self_observer message -> [Startup_info message]
@@ -341,13 +504,17 @@ let startup_admission ~address ~voting ~role_label ~allow_unsafe_quorum
 
 let node_startup_admission ~getenv ~activation_epoch ~address ~voting
     ~role_label cfg =
-  startup_admission
-    ~address
-    ~voting
-    ~role_label
-    ~allow_unsafe_quorum:(getenv "OCTRA_ALLOW_UNSAFE_QUORUM" = Some "1")
-    ~next_activation_epoch:(activation_epoch ())
-    cfg
+  match Octra_core.Validator_policy.of_env getenv with
+  | Error error -> [Startup_refuse [error]]
+  | Ok policy ->
+    startup_admission
+      ~permissionless:(Octra_core.Validator_policy.lifecycle_enabled policy)
+      ~address
+      ~voting
+      ~role_label
+      ~allow_unsafe_quorum:(getenv "OCTRA_ALLOW_UNSAFE_QUORUM" = Some "1")
+      ~next_activation_epoch:(activation_epoch ())
+      cfg
 
 let emit_startup_events deps =
   List.iter
@@ -356,8 +523,14 @@ let emit_startup_events deps =
       | Startup_warn message -> deps.warn message
       | Startup_refuse messages -> deps.refuse messages)
 
-let build ~chain_id ~consensus_mode ~current_height ~current_entries
-    ~next_entries ~chain_pending_entries ~next_activation_epoch =
+let build_bound ~chain_id ~consensus_mode ~current_height ~current_entries
+    ~next_entries ~chain_pending_entries ~next_activation_epoch
+    ~program_trust_hash ~runtime_profile_hash =
+  let identity_errors =
+    Validators.entry_errors ~label:"current" current_entries
+    @ Validators.entry_errors ~label:"next" next_entries
+    @ Validators.entry_errors ~label:"pending" chain_pending_entries
+  in
   let allowed_pubkeys =
     Validators.raw_pubkeys_of_entries
       (current_entries @ next_entries @ chain_pending_entries)
@@ -397,11 +570,16 @@ let build ~chain_id ~consensus_mode ~current_height ~current_entries
         ~chain_id
         ~validator_set:active_vs
         ?scheduled:light_scheduled_validator_set
+        ?program_trust_hash
+        ?runtime_profile_hash
         ()
     else String.make 32 '\x00'
   in
   {
     allowed_pubkeys;
+    identity_errors;
+    program_trust_hash;
+    runtime_profile_hash;
     current_validator_list;
     next_validator_list;
     active_validator_list;
@@ -411,3 +589,17 @@ let build ~chain_id ~consensus_mode ~current_height ~current_entries
     consensus_config_hash;
     transition;
   }
+
+let build ~chain_id ~consensus_mode ~current_height ~current_entries
+    ~next_entries ~chain_pending_entries ~next_activation_epoch
+    ~program_trust_hash =
+  build_bound
+    ~chain_id
+    ~consensus_mode
+    ~current_height
+    ~current_entries
+    ~next_entries
+    ~chain_pending_entries
+    ~next_activation_epoch
+    ~program_trust_hash
+    ~runtime_profile_hash:None

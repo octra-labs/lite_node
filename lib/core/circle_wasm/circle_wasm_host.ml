@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Syntax
 
@@ -63,6 +51,7 @@ type encrypted_asset_put = {
 
 type exec_result = {
   success : bool;
+  effort_used : int;
   response_value : Circle_wasm_codec.response option;
   response_status : int;
   storage_tbl : (string, string) Hashtbl.t;
@@ -70,19 +59,29 @@ type exec_result = {
   spawns : spawn list;
   assets : asset_put list;
   encrypted_assets : encrypted_asset_put list;
+  hfhe_transcript : Circle_hfhe_transcript.entry list;
   error : string option;
 }
 
 type storage_cache_entry = {
   storage_json : Yojson.Safe.t list;
   mutable seeded_in_native : bool;
+  weight : int;
+  mutable touched_at : float;
 }
 
 let storage_payload_cache : (string, storage_cache_entry) Hashtbl.t =
   Hashtbl.create 8
 
-let code_seed_cache : (string, bool) Hashtbl.t =
+let code_seed_cache : (string, float) Hashtbl.t =
   Hashtbl.create 8
+
+let storage_payload_cache_ttl_secs = 300.0
+let storage_payload_cache_limit = 16
+let storage_payload_cache_byte_limit = 48 * 1024 * 1024
+let storage_payload_cache_bytes = ref 0
+let code_seed_cache_limit = 128
+let code_seed_cache_ttl_secs = 300.0
 
 let code_cache_key code_b64 =
   Digestif.SHA256.(to_hex (digest_string code_b64))
@@ -110,7 +109,12 @@ let decode_b64_field name = function
 let read_process_json payload =
   Circle_wasm_hfhe_backend.ensure_registered ();
   let body = Yojson.Safe.to_string payload in
-  match Circle_wasm_native.run_json body with
+  let* native =
+    Lwt_preemptive.detach
+      (fun () -> Circle_wasm_native.run_json body)
+      ()
+  in
+  match native with
   | Error e ->
     Lwt.return (Error e)
   | Ok raw ->
@@ -181,17 +185,124 @@ let make_storage_pairs_json storage_tbl =
     []
   |> List.rev
 
-let cached_storage_entry storage_cache_key storage_tbl =
-  match Hashtbl.find_opt storage_payload_cache storage_cache_key with
-  | Some entry -> entry
+let base64_size len =
+  ((len + 2) / 3) * 4
+
+let storage_payload_weight storage_tbl =
+  Hashtbl.fold
+    (fun key value total ->
+      total + base64_size (String.length key)
+      + base64_size (String.length value)
+      + 128)
+    storage_tbl
+    0
+
+let remove_storage_cache key =
+  match Hashtbl.find_opt storage_payload_cache key with
   | None ->
+    ()
+  | Some entry ->
+    Hashtbl.remove storage_payload_cache key;
+    storage_payload_cache_bytes :=
+      max 0 (!storage_payload_cache_bytes - entry.weight)
+
+let oldest_storage_cache_key () =
+  Hashtbl.fold
+    (fun key entry oldest ->
+      match oldest with
+      | None -> Some (key, entry.touched_at)
+      | Some (_, touched_at) when entry.touched_at < touched_at ->
+        Some (key, entry.touched_at)
+      | Some _ ->
+        oldest)
+    storage_payload_cache
+    None
+  |> Option.map fst
+
+let prune_storage_payload_cache incoming_count incoming_weight =
+  let now = Unix.gettimeofday () in
+  let stale =
+    Hashtbl.fold
+      (fun key entry keys ->
+        if now -. entry.touched_at > storage_payload_cache_ttl_secs then
+          key :: keys
+        else
+          keys)
+      storage_payload_cache
+      [] in
+  List.iter remove_storage_cache stale;
+  while
+    Hashtbl.length storage_payload_cache + incoming_count
+    > storage_payload_cache_limit
+    || !storage_payload_cache_bytes + incoming_weight
+       > storage_payload_cache_byte_limit
+  do
+    match oldest_storage_cache_key () with
+    | None ->
+      storage_payload_cache_bytes := 0
+    | Some key ->
+      remove_storage_cache key
+  done
+
+let storage_payload_cache_stats () =
+  Hashtbl.length storage_payload_cache, !storage_payload_cache_bytes
+
+let storage_payload_cache_mem key =
+  Hashtbl.mem storage_payload_cache key
+
+let clear_storage_payload_cache () =
+  Hashtbl.reset storage_payload_cache;
+  storage_payload_cache_bytes := 0
+
+let cached_storage_entry storage_cache_key storage_tbl =
+  prune_storage_payload_cache 0 0;
+  match Hashtbl.find_opt storage_payload_cache storage_cache_key with
+  | Some entry ->
+    entry.touched_at <- Unix.gettimeofday ();
+    entry
+  | None ->
+    let weight = storage_payload_weight storage_tbl in
     let entry =
       {
         storage_json = make_storage_pairs_json storage_tbl;
         seeded_in_native = false;
+        weight;
+        touched_at = Unix.gettimeofday ();
       } in
-    Hashtbl.replace storage_payload_cache storage_cache_key entry;
+    if weight <= storage_payload_cache_byte_limit then begin
+      prune_storage_payload_cache 1 weight;
+      Hashtbl.replace storage_payload_cache storage_cache_key entry;
+      storage_payload_cache_bytes := !storage_payload_cache_bytes + weight
+    end;
     entry
+
+let prune_code_seed_cache () =
+  let now = Unix.gettimeofday () in
+  Hashtbl.filter_map_inplace
+    (fun _ touched_at ->
+      if now -. touched_at > code_seed_cache_ttl_secs then None
+      else Some touched_at)
+    code_seed_cache;
+  if Hashtbl.length code_seed_cache > code_seed_cache_limit then
+    Hashtbl.reset code_seed_cache
+
+let code_seeded code_key =
+  prune_code_seed_cache ();
+  match Hashtbl.find_opt code_seed_cache code_key with
+  | Some _ ->
+    Hashtbl.replace code_seed_cache code_key (Unix.gettimeofday ());
+    true
+  | None ->
+    false
+
+let mark_code_seeded code_key =
+  prune_code_seed_cache ();
+  if
+    not (Hashtbl.mem code_seed_cache code_key)
+    && Hashtbl.length code_seed_cache >= code_seed_cache_limit
+  then
+    Hashtbl.reset code_seed_cache;
+  Hashtbl.replace code_seed_cache code_key (Unix.gettimeofday ())
 
 let decode_storage_tbl = function
   | `List items ->
@@ -501,12 +612,12 @@ let execute
     ~hfhe_caps
     ~hfhe_pubkeys
     ~hfhe_active_key
-    ~is_view =
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+  ~is_view =
   let code_key = code_cache_key code_b64 in
-  let initial_allow_code_cache_only =
-    match Hashtbl.find_opt code_seed_cache code_key with
-    | Some true -> true
-    | _ -> false in
+  let initial_allow_code_cache_only = code_seeded code_key in
   let initial_allow_cache_only =
     match storage_cache_key with
     | Some key ->
@@ -526,7 +637,7 @@ let execute
            (Option.map (fun entry -> entry.seeded_in_native) storage_entry) in
     let use_code_cache_only =
       allow_code_cache_only
-      && Option.value ~default:false (Hashtbl.find_opt code_seed_cache code_key) in
+      && code_seeded code_key in
     let storage_json =
       if use_cache_only then
         `Null
@@ -582,6 +693,17 @@ let execute
           | None ->
             `Null
         end;
+        "hfhe_receipt_mode",
+        `String (Circle_hfhe_transcript.mode_name hfhe_mode);
+        "hfhe_receipt_entries",
+        Circle_hfhe_transcript.entries_json
+          (Circle_hfhe_transcript.mode_entries hfhe_mode);
+        "public_reads",
+        `List
+          (List.map
+             Circle_wasm_public_read.yojson_of_snapshot
+             public_reads);
+        "fuel_limit", `Int fuel_limit;
         "is_view", `Bool is_view;
       ] in
     let* json_result = read_process_json payload in
@@ -599,7 +721,7 @@ let execute
     | Ok _ as ok ->
       begin
         if not use_code_cache_only then
-          Hashtbl.replace code_seed_cache code_key true;
+          mark_code_seeded code_key;
         match storage_entry with
         | Some entry when not use_cache_only ->
           entry.seeded_in_native <- true
@@ -620,15 +742,19 @@ let execute
       match
         List.assoc_opt "success" fields,
         List.assoc_opt "status_code" fields,
+        List.assoc_opt "effort_used" fields,
         List.assoc_opt "response_b64" fields,
         List.assoc_opt "storage_pairs" fields,
-        List.assoc_opt "events" fields
+        List.assoc_opt "events" fields,
+        List.assoc_opt "hfhe_receipt_entries" fields
       with
       | Some (`Bool success),
         Some (`Int status_code),
+        Some (`Int effort_used),
         Some response_json,
         Some storage_json,
-        Some events_json ->
+        Some events_json,
+        Some hfhe_transcript_json ->
         begin
           let storage_decode_result =
             match storage_json with
@@ -657,6 +783,7 @@ let execute
             decode_spawns spawns_json,
             decode_assets assets_json,
             decode_encrypted_assets encrypted_assets_json,
+            Circle_hfhe_transcript.entries_of_json hfhe_transcript_json,
             (match response_json with
              | `Null -> Ok None
              | _ ->
@@ -671,7 +798,8 @@ let execute
                  | Error e -> Error e
                end)
           with
-          | Ok storage_tbl, Ok events, Ok spawns, Ok assets, Ok encrypted_assets, Ok response_value ->
+          | Ok storage_tbl, Ok events, Ok spawns, Ok assets,
+            Ok encrypted_assets, Ok hfhe_transcript, Ok response_value ->
             let error =
               match List.assoc_opt "error" fields with
               | Some (`String msg) -> Some msg
@@ -679,6 +807,7 @@ let execute
             Lwt.return
               (Ok {
                  success;
+                 effort_used;
                  response_value;
                  response_status = status_code;
                  storage_tbl;
@@ -686,14 +815,16 @@ let execute
                  spawns;
                  assets;
                  encrypted_assets;
+                 hfhe_transcript;
                  error;
                })
-          | Error e, _, _, _, _, _
-          | _, Error e, _, _, _, _
-          | _, _, Error e, _, _, _
-          | _, _, _, Error e, _, _
-          | _, _, _, _, Error e, _
-          | _, _, _, _, _, Error e ->
+          | Error e, _, _, _, _, _, _
+          | _, Error e, _, _, _, _, _
+          | _, _, Error e, _, _, _, _
+          | _, _, _, Error e, _, _, _
+          | _, _, _, _, Error e, _, _
+          | _, _, _, _, _, Error e, _
+          | _, _, _, _, _, _, Error e ->
             Lwt.return (Error e)
         end
       | _ ->

@@ -1,0 +1,100 @@
+contract ProgramExecProbe {
+  state {
+    owner: address
+    total_deposited: int
+    call_count: int
+    counters: map[string]int
+    texts: map[string]string
+    ciphers: map[string]bytes
+  }
+
+  event Deposited(sender: address, amount: int, label: string)
+  event CounterChanged(key: string, value: int)
+  event TextStored(key: string, size: int)
+  event CipherStored(key: string)
+
+  constructor() {
+    self.owner = caller
+    self.total_deposited = 0
+    self.call_count = 0
+  }
+
+  fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  fn deposit(label: string) {
+    require(value > 0, "zero value")
+    self.total_deposited += value
+    self.call_count += 1
+    emit Deposited(caller, value, label)
+  }
+
+  fn inc(key: string, by: int): int {
+    only_owner()
+    self.counters[key] += by
+    self.call_count += 1
+    emit CounterChanged(key, self.counters[key])
+    return self.counters[key]
+  }
+
+  fn set_text(key: string, text: string): int {
+    only_owner()
+    self.texts[key] = text
+    self.call_count += 1
+    emit TextStored(key, len(text))
+    return len(text)
+  }
+
+  fn store_cipher(key: string, ct_data: bytes) {
+    only_owner()
+    let pk = fhe_load_pk(caller)
+    let ct = fhe_deser(ct_data)
+    self.ciphers[key] = fhe_ser(ct)
+    emit CipherStored(key)
+  }
+
+  fn add_cipher(out_key: string, a_key: string, b_key: string) {
+    only_owner()
+    let pk = fhe_load_pk(caller)
+    let a = fhe_deser(self.ciphers[a_key])
+    let b = fhe_deser(self.ciphers[b_key])
+    let result = fhe_add(pk, a, b)
+    self.ciphers[out_key] = fhe_ser(result)
+    emit CipherStored(out_key)
+  }
+
+  fn mul_cipher(out_key: string, a_key: string, b_key: string) {
+    only_owner()
+    let pk = fhe_load_pk(caller)
+    let a = fhe_deser(self.ciphers[a_key])
+    let b = fhe_deser(self.ciphers[b_key])
+    let result = fhe_mul(pk, a, b)
+    self.ciphers[out_key] = fhe_ser(result)
+    emit CipherStored(out_key)
+  }
+
+  view fn get_owner(): address {
+    return self.owner
+  }
+
+  view fn get_total_deposited(): int {
+    return self.total_deposited
+  }
+
+  view fn get_call_count(): int {
+    return self.call_count
+  }
+
+  view fn get_counter(key: string): int {
+    return self.counters[key]
+  }
+
+  view fn get_text(key: string): string {
+    return self.texts[key]
+  }
+
+  view fn get_cipher(key: string): bytes {
+    return self.ciphers[key]
+  }
+}

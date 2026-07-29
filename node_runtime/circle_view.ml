@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type policy = {
   delivery_key_id : string option;
@@ -309,12 +297,15 @@ let storage ~circle_id ~key ~value =
     "value", opt_string value;
   ]
 
-let storage_dump ~circle_id storage_pairs =
+let storage_dump ~circle_id ~total storage_pairs =
+  let count = List.length storage_pairs in
   `Assoc [
     "circle_id", `String circle_id;
     "storage", Rpc_view.storage_assoc storage_pairs;
     "storage_sizes", Rpc_view.storage_sizes storage_pairs;
-    "count", `Int (List.length storage_pairs);
+    "count", `Int count;
+    "total", `Int total;
+    "has_more", `Bool (count < total);
   ]
 
 let outbox_claim ~circle_id ~primary_claim ~claims ~active_claims =

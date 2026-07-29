@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Private_gate = Consensus_epoch_apply_private_gate
 module Private_ledger = Octra_core.Private_ledger
@@ -166,6 +154,9 @@ type live_tx_args = {
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
   current_epoch : unit -> int;
+  private_result_policy :
+    int ->
+    Octra_core.Private_result_policy.t;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -312,7 +303,11 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
     clear_defer_count = args.clear_defer_count;
     defer_tx = args.defer_tx;
     reject = args.reject;
-    plan = Octra_core.Private_ledger.stealth_plan args.ledger;
+    plan = (fun tx ->
+      Octra_core.Private_ledger.stealth_plan
+        ~result_policy:(args.private_result_policy (args.current_epoch ()))
+        args.ledger
+        tx);
     trace_cipher = args.trace_cipher;
     inline_range = Octra_core.Private_ledger.stealth_inline_range args.ledger;
     accept_range = Octra_core.Private_ledger.stealth_accept_range;

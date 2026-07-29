@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let lang_version = "1.0 Rehovot"
 
@@ -79,55 +67,99 @@ let param_facts params =
   |> List.mapi (fun i param -> (1001 + i, flow_kind param.Oct_lang.p_typ))
 
 let facts_of_ast ast code =
-  let label_pc label =
-    Array.to_list code
-    |> List.mapi (fun pc op ->
+  let labels = Hashtbl.create (List.length ast.Oct_lang.funcs + 1) in
+  Array.iteri
+    (fun pc op ->
       match op with
-      | Contract_vm.JDEST value when value = label -> Some pc
-      | _ -> None)
-    |> List.find_map (fun value -> value)
-  in
+      | Contract_vm.JDEST label -> Hashtbl.replace labels label pc
+      | _ -> ())
+    code;
   let root =
     match ast.Oct_lang.ctor with
     | Some ctor -> param_facts ctor.Oct_lang.fn_params
     | None -> []
   in
+  let storage =
+    ast.Oct_lang.state
+    |> List.filter_map (fun field ->
+      let kind = flow_kind field.Oct_lang.sf_typ in
+      match kind with
+      | Program_type_flow.Int
+      | Program_type_flow.Bool
+      | Program_type_flow.String
+      | Program_type_flow.Bytes
+      | Program_type_flow.Bytes32
+      | Program_type_flow.U64
+      | Program_type_flow.U128
+      | Program_type_flow.U256
+      | Program_type_flow.Addr -> Some (field.sf_name, kind)
+      | Program_type_flow.Cipher
+      | Program_type_flow.PubKey
+      | Program_type_flow.Unknown -> None)
+  in
   let entries =
     ast.Oct_lang.funcs
     |> List.mapi (fun i fn ->
-      match label_pc (200 + i * 100) with
+      match Hashtbl.find_opt labels (200 + i * 100) with
       | Some target ->
         Some { Program_type_flow.target; mem = param_facts fn.Oct_lang.fn_params; effects = [] }
       | None -> None)
     |> List.filter_map (fun value -> value)
   in
+  let functions = Hashtbl.create (List.length ast.Oct_lang.funcs) in
+  List.iteri
+    (fun i fn -> Hashtbl.replace functions (200 + i * 100) fn)
+    ast.Oct_lang.funcs;
+  let entry_targets = Hashtbl.create (List.length entries) in
+  List.iter
+    (fun (entry : Program_type_flow.entry) ->
+      Hashtbl.replace entry_targets entry.target ())
+    entries;
+  let owners = Array.make (Array.length code) None in
+  let owner = ref None in
+  Array.iteri
+    (fun pc _ ->
+      if Hashtbl.mem entry_targets pc then owner := Some pc;
+      owners.(pc) <- !owner)
+    code;
   let calls =
-    let owner_pc entries pc =
-      entries
-      |> List.fold_left (fun owner (entry : Program_type_flow.entry) ->
-        if entry.Program_type_flow.target <= pc then Some entry.target else owner)
-        None
-    in
-    Array.to_list code
-    |> List.mapi (fun pc op ->
+    let found = ref [] in
+    Array.iteri
+      (fun pc op ->
       match op with
       | Contract_vm.CALL_INT (_, label) ->
-        (match label_pc label, owner_pc entries pc,
-               List.mapi (fun i fn -> (200 + i * 100, fn)) ast.Oct_lang.funcs
-               |> List.find_opt (fun (value, _) -> value = label) with
-         | Some target, Some owner, Some (_, fn) ->
-           Some { Program_type_flow.owner; pc; target; kind = flow_kind fn.Oct_lang.fn_ret }
-         | _ -> None)
-      | _ -> None)
-    |> List.filter_map (fun value -> value)
+        (match
+           Hashtbl.find_opt labels label,
+           owners.(pc),
+           Hashtbl.find_opt functions label
+         with
+         | Some target, Some owner, Some fn ->
+           found := {
+             Program_type_flow.owner;
+             pc;
+             target;
+             kind = flow_kind fn.Oct_lang.fn_ret;
+           } :: !found
+         | _ -> ())
+      | _ -> ())
+      code;
+    List.rev !found
   in
-  { Program_type_flow.root; entries; calls; xcalls = [] }
+  { Program_type_flow.root; storage; entries; calls; xcalls = [] }
 
 let fact_json key (slot, kind) =
   `Assoc [key, `Int slot; "kind", `String (Program_type_flow.kind_name kind)]
 
 let facts_json facts =
   let root = List.map (fact_json "slot") facts.Program_type_flow.root in
+  let storage =
+    facts.Program_type_flow.storage
+    |> List.map (fun (key, kind) ->
+      `Assoc [
+        "key", `String key;
+        "kind", `String (Program_type_flow.kind_name kind);
+      ])
+  in
   let entries =
     List.map (fun (entry : Program_type_flow.entry) ->
       `Assoc [
@@ -158,12 +190,17 @@ let facts_json facts =
         "capabilities", `List (List.map (fun value -> `String (Program_type_flow.capability_name value)) call.capabilities)
       ])
   in
-  `Assoc [
+  let fields = [
     "root", `List root;
     "entries", `List entries;
     "calls", `List calls;
-    "xcalls", `List xcalls
-  ]
+    "xcalls", `List xcalls;
+  ] in
+  let fields =
+    if storage = [] then fields
+    else ("storage", `List storage) :: fields
+  in
+  `Assoc fields
 
 let program_certificate raw effects facts =
   try
@@ -256,14 +293,37 @@ let abi_json declaration abi =
 
 let compile_ast ~source_mode ~source_material ast =
   let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
-  let code = Oct_gen.generate ast in
-  let abi_json = Oct_gen.to_abi ast |> abi_json declaration in
-  let bytecode = Bytecode.encode code in
-  let verification_json = verification_json ast in
-  let certificate_json = certificate_json ~declaration ~source_mode ~source_material ~bytecode ~verification_json in
-  let program_facts = facts_of_ast ast code in
-  { (ok_result ~bytecode ~abi_json ~instructions:(Array.length code) ~verification_json ~certificate_json) with
-    program_facts = Some program_facts }
+  let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
+  if program
+     && List.length ast.Oct_lang.funcs > Program_limits.max_functions then
+    error_result "Program function limit exceeded"
+  else
+    let code = Oct_gen.generate ast in
+    if program && Array.length code > Program_limits.max_instructions then
+      error_result "Program instruction limit exceeded"
+    else
+      let abi_json = Oct_gen.to_abi ast |> abi_json declaration in
+      let bytecode = Bytecode.encode code in
+      let verification_json = verification_json ast in
+      let certificate_json =
+        certificate_json
+          ~declaration
+          ~source_mode
+          ~source_material
+          ~bytecode
+          ~verification_json
+      in
+      let program_facts = facts_of_ast ast code in
+      {
+        (ok_result
+           ~bytecode
+           ~abi_json
+           ~instructions:(Array.length code)
+           ~verification_json
+           ~certificate_json)
+        with
+        program_facts = Some program_facts;
+      }
 
 let load_required load path =
   match load path with
@@ -285,6 +345,12 @@ let imported_interfaces load ast =
 let merge_interfaces ast interfaces =
   { ast with Oct_lang.interfaces = interfaces @ ast.Oct_lang.interfaces }
 
+let compile_exception = function
+  | Stack_overflow -> raise Stack_overflow
+  | Out_of_memory -> raise Out_of_memory
+  | error ->
+    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string error))
+
 let compile source =
   try
     let ast = Oct_parse.parse source in
@@ -296,8 +362,7 @@ let compile source =
     error_result (Printf.sprintf "line %d: %s" line msg)
   | Oct_gen.GenError (msg, line) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | e ->
-    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+  | error -> compile_exception error
 
 let compile_multi_mode ~program_only (resolver : string -> string option) main_path =
   try
@@ -325,8 +390,7 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
     error_result (Printf.sprintf "line %d: %s" line msg)
   | Oct_gen.GenError (msg, line) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | e ->
-    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+  | error -> compile_exception error
 
 let compile_multi resolver main_path =
   compile_multi_mode ~program_only:false resolver main_path
@@ -341,7 +405,9 @@ let external_pcs code =
 
 let attach_xcalls code facts specs =
   let pcs = external_pcs code in
-  if List.length pcs <> List.length specs then
+  if List.length specs > Program_limits.max_external_calls then
+    Error "external ABI limit exceeded"
+  else if List.length pcs <> List.length specs then
     Error "external ABI count does not match XCALL count"
   else
     let xcalls =
@@ -403,14 +469,16 @@ let compile_program source =
     if ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
       error_result "Program declaration required"
     else
-      emit_program (compile source)
+      emit_program
+        (compile_ast ~source_mode:"single" ~source_material:source ast)
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
   | Oct_parse.ParseError (msg, line) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | e ->
-    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+  | Oct_gen.GenError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | error -> compile_exception error
 
 let compile_program_with_xcalls source specs =
   try
@@ -418,7 +486,9 @@ let compile_program_with_xcalls source specs =
     if ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
       error_result "Program declaration required"
     else
-      let result = compile source in
+      let result =
+        compile_ast ~source_mode:"single" ~source_material:source ast
+      in
       match result.error, result.program_facts with
       | Some _, _ -> result
       | None, None -> error_result "Program facts missing"
@@ -434,8 +504,9 @@ let compile_program_with_xcalls source specs =
     error_result (Printf.sprintf "line %d: %s" line msg)
   | Oct_parse.ParseError (msg, line) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | e ->
-    error_result (Printf.sprintf "compile error: %s" (Printexc.to_string e))
+  | Oct_gen.GenError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | error -> compile_exception error
 
 let admit_program_source source raw =
   let result = compile_program source in

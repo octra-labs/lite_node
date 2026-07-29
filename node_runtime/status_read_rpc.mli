@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
@@ -24,7 +12,8 @@ type read_ctx = {
   validator_pubkey : string;
   validator_priv_b64 : string;
   chain_id : string;
-  config_hash : string;
+  program_trust_hash : string option;
+  runtime_profile_hash : string option;
   validator_view_pub : string;
   validator_set : Octra_consensus.C_types.validator_set;
   scheduled_validator_set : Octra_consensus.C_config.scheduled option;
@@ -67,7 +56,8 @@ val signed_root :
 
 val validator_set_proof :
   chain_id:string ->
-  config_hash:string ->
+  program_trust_hash:string option ->
+  runtime_profile_hash:string option ->
   driver_ref:Octra_consensus.C_driver.t option ref ->
   validator_set:Octra_consensus.C_types.validator_set ->
   scheduled_validator_set:Octra_consensus.C_config.scheduled option ->

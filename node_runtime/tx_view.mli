@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val display_from : Octra_core.Transaction.t -> string
 
@@ -303,6 +291,11 @@ val payload_admission :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
+val bft_op_admission :
+  bft_mode:bool ->
+  Octra_core.Transaction.t ->
+  (unit, string * string) result
+
 val pre_route_admission :
   now:float ->
   max_timestamp_drift:float ->
@@ -339,7 +332,7 @@ val preverify_stealth_ranges :
   pubkey_blob:string ->
   sender_enc:string ->
   Octra_core.Crypto.PrivateTransferV4.t ->
-  ((bool * bool), string) result
+  ((bool * bool), string) result Lwt.t
 
 val post_signature_admission :
   preverify_has_capacity:bool ->

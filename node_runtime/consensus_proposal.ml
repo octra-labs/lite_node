@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -98,6 +86,7 @@ type prev_root_decision =
 
 type prev_root_wait_deps = {
   read_root : unit -> string Lwt.t;
+  replay_stashed : unit -> unit Lwt.t;
   sleep : float -> unit Lwt.t;
 }
 
@@ -141,6 +130,7 @@ type tx_hash_admission =
 
 type proposal_envelope = {
   header : Octra_consensus.C_types.epoch_header;
+  parent_commit : Octra_consensus.C_types.parent_commit option;
   proposal_id : string;
   txid_hi : int64;
   tx_hashes : string list;
@@ -164,6 +154,7 @@ type build_preview_request = {
   proposal_id : string;
   expected_prev_root : string;
   prev_state_root : string;
+  parent_commit : Octra_consensus.C_types.parent_commit option;
   proposer : string;
   validator_pubkeys : (string * string) list;
   preverify : Octra_core.Preverify_commit.t;
@@ -179,6 +170,9 @@ type make_proposal_deps = {
   read_prev_ledger_root : unit -> string option Lwt.t;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   current_round : unit -> int;
+  parent_commit :
+    epoch_id:int64 ->
+    (Octra_consensus.C_types.parent_commit option, string) result;
   frozen_bundle : string -> Consensus_bundle_cache.frozen option;
   store_bundle :
     proposal_id:string ->
@@ -189,6 +183,11 @@ type make_proposal_deps = {
   staging_txs : unit -> Transaction.t list;
   admits_tx : Transaction.t -> bool;
   run_preverify :
+    Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
+  run_preverify_once :
+    state_root:string ->
+    tx_hashes:string list ->
     Transaction.t list ->
     Octra_core.Preverify_worker.batch Lwt.t;
   staging_total : unit -> int;
@@ -230,6 +229,11 @@ type verify_proposal_deps = {
   run_preverify :
     Transaction.t list ->
     Octra_core.Preverify_worker.batch Lwt.t;
+  run_preverify_once :
+    state_root:string ->
+    tx_hashes:string list ->
+    Transaction.t list ->
+    Octra_core.Preverify_worker.batch Lwt.t;
   driver_available : unit -> bool;
   validate_bundle :
     header:Octra_consensus.C_types.epoch_header ->
@@ -259,9 +263,15 @@ type verify_proposal_deps = {
   next_txid : unit -> int64;
   root_to_raw32 : string -> string;
   set_proposal : Transaction.t list -> string list -> unit;
+  verify_parent_commit :
+    epoch_id:int64 ->
+    Octra_consensus.C_types.parent_commit option ->
+    (unit, string) result;
 }
 
 type before_precommit_deps = {
+  chain_id : string;
+  validator_set : Octra_consensus.C_types.validator_set;
   current_tx_hashes : unit -> string list;
   cached_bundle : string -> Consensus_bundle_cache.encoded option;
   sync_bundle :
@@ -294,6 +304,16 @@ type reject_reason =
   | Missing_txs of {
       have : int;
       need : int;
+    }
+  | Disabled_operation of {
+      hash : string;
+      op_type : string;
+    }
+  | Underpriced_transaction of {
+      hash : string;
+      op_type : string;
+      provided : Z.t;
+      required : Z.t;
     }
   | Receipt_root_mismatch
   | Receipt_decode_failed of string
@@ -392,24 +412,61 @@ let first_three render items =
   |> List.rev
   |> String.concat ","
 
+let first_disabled_bft_tx txs =
+  List.find_opt
+    (fun tx ->
+       not
+         (Transaction.bft_consensus_admits_op
+            tx.Transaction.op_type))
+    txs
+
+let first_underpriced_tx txs =
+  List.find_opt
+    (fun tx ->
+       Z.lt tx.Transaction.ou (Transaction.ou_cost tx))
+    txs
+
 let local_preverify_bundle ~run_many ~tx_hashes txs =
-  let open Lwt.Syntax in
-  let* batch = run_many txs in
-  let ready_txs = Octra_core.Preverify_worker.txs batch in
-  let receipts_json =
-    Octra_core.Preverify_worker.receipt_json_for_hashes batch.ready tx_hashes
-  in
-  let skipped_sample =
-    first_three
-      (fun (item : Octra_core.Preverify_worker.skip) -> item.reason)
-      batch.skipped
-  in
-  Lwt.return {
-    ready_txs;
-    receipts_json;
-    skipped_count = List.length batch.skipped;
-    skipped_sample;
-  }
+  match first_disabled_bft_tx txs with
+  | Some tx ->
+    Lwt.return {
+      ready_txs = [];
+      receipts_json = [];
+      skipped_count = 1;
+      skipped_sample = Transaction.bft_reject_reason tx.Transaction.op_type;
+    }
+  | None ->
+    let open Lwt.Syntax in
+    let* batch = run_many txs in
+    let ready_txs = Octra_core.Preverify_worker.txs batch in
+    let receipts_json =
+      Octra_core.Preverify_worker.receipt_json_for_hashes batch.ready tx_hashes
+    in
+    let skipped_sample =
+      first_three
+        (fun (item : Octra_core.Preverify_worker.skip) -> item.reason)
+        batch.skipped
+    in
+    Lwt.return {
+      ready_txs;
+      receipts_json;
+      skipped_count = List.length batch.skipped;
+      skipped_sample;
+    }
+
+let check_local_bundle ~expected_hashes
+    (received : Consensus_bundle_fetch.proposal_bundle)
+    (local : local_preverify_bundle) =
+  let received_hashes = List.map Transaction.hash received.txs in
+  let local_hashes = List.map Transaction.hash local.ready_txs in
+  if received_hashes <> expected_hashes then
+    Error "received_tx_hash_mismatch"
+  else if local_hashes <> expected_hashes then
+    Error "local_preverify_tx_mismatch"
+  else if local.receipts_json <> received.receipts_json then
+    Error "local_preverify_receipt_mismatch"
+  else
+    Ok received
 
 let build_preverify ~run_many ~limits txs =
   let open Lwt.Syntax in
@@ -478,23 +535,43 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
   let have = List.length txs in
   if expected_tx_count <> 0 && have <> expected_tx_count then
     Error (Missing_txs { have; need = expected_tx_count })
-  else if not (receipt_root_matches ~header receipts_json) then
-    Error Receipt_root_mismatch
   else
-    match Octra_core.Preverify_commit.receipts_of_strings receipts_json with
-    | Error e -> Error (Receipt_decode_failed e)
-    | Ok receipts ->
-      let preverify = Octra_core.Preverify_commit.create receipts in
-      match Octra_core.Preverify_commit.check preverify txs with
-      | Error e -> Error (Preverify_gate_failed e)
-      | Ok () ->
-        if not (within_limits ~limits txs) then
-          Error (Bundle_limit { totals = totals txs; limits })
-        else
-          match verify_signatures deps txs with
-          | Some bad -> Error bad
-          | None ->
-            Ok { txs; receipts_json; preverify }
+    match first_disabled_bft_tx txs with
+    | Some tx ->
+      Error
+        (Disabled_operation {
+           hash = short 12 (Transaction.hash tx);
+           op_type = Transaction.op_type_to_string tx.Transaction.op_type;
+         })
+    | None ->
+      match first_underpriced_tx txs with
+      | Some tx ->
+        Error
+          (Underpriced_transaction {
+             hash = short 12 (Transaction.hash tx);
+             op_type =
+               Transaction.op_type_to_string tx.Transaction.op_type;
+             provided = tx.Transaction.ou;
+             required = Transaction.ou_cost tx;
+           })
+      | None ->
+      if not (receipt_root_matches ~header receipts_json) then
+        Error Receipt_root_mismatch
+      else
+        match Octra_core.Preverify_commit.receipts_of_strings receipts_json with
+        | Error e -> Error (Receipt_decode_failed e)
+        | Ok receipts ->
+          let preverify = Octra_core.Preverify_commit.create receipts in
+          match Octra_core.Preverify_commit.check preverify txs with
+          | Error e -> Error (Preverify_gate_failed e)
+          | Ok () ->
+            if not (within_limits ~limits txs) then
+              Error (Bundle_limit { totals = totals txs; limits })
+            else
+              match verify_signatures deps txs with
+              | Some bad -> Error bad
+              | None ->
+                Ok { txs; receipts_json; preverify }
 
 let validator_pubkeys_from_driver driver =
   driver.Octra_consensus.C_driver.engine.Octra_consensus.C_engine.vs.validators
@@ -524,6 +601,13 @@ let epoch_exec_env ~chain_id ~epoch_id ~epoch_ts ~proposer ~validator_pubkeys
 let wait_for_prev_root deps ~target_root ~max_tries ~delay_seconds =
   let open Lwt.Syntax in
   let* initial_root = deps.read_root () in
+  let* current_root =
+    if initial_root = target_root then
+      Lwt.return initial_root
+    else
+      let* () = deps.replay_stashed () in
+      deps.read_root ()
+  in
   let rec loop tries_left current_root =
     if current_root = target_root || tries_left <= 0 then
       Lwt.return { initial_root; current_root; tries_left }
@@ -532,13 +616,24 @@ let wait_for_prev_root deps ~target_root ~max_tries ~delay_seconds =
       let* next_root = deps.read_root () in
       loop (tries_left - 1) next_root
   in
-  loop max_tries initial_root
+  loop max_tries current_root
 
 let log_reject ~epoch_id = function
   | Missing_txs { have; need } ->
     Octra_log.warn "consensus"
       "reject proposal reason = missing_txs have = %d need = %d"
       have need
+  | Disabled_operation { hash; op_type } ->
+    Octra_log.warn "consensus"
+      "reject proposal reason = disabled_operation hash = %s op_type = %s"
+      hash op_type
+  | Underpriced_transaction { hash; op_type; provided; required } ->
+    Octra_log.warn "consensus"
+      "reject proposal reason = underpriced_transaction hash = %s op_type = %s provided = %s required = %s"
+      hash
+      op_type
+      (Z.to_string provided)
+      (Z.to_string required)
   | Receipt_root_mismatch ->
     Octra_log.warn "consensus"
       "reject proposal reason = receipt_root_mismatch"
@@ -762,12 +857,7 @@ let build_preview_output ~root_to_raw32 ~epoch_id ~start_txid ~prev_eic_root
   }
 
 let raw32_to_hex r =
-  if String.length r = 64 then
-    r
-  else
-    String.concat ""
-      (List.init (String.length r)
-         (fun i -> Printf.sprintf "%02x" (Char.code r.[i])))
+  Text.hash32_hex r
 
 let raw_hex_prefix n s =
   String.concat ""
@@ -945,15 +1035,31 @@ let proposal_txid_hi ~final_count ~next_txid ~head_txid_hi =
 
 let build_header ~chain_id ~epoch_id ~prev_state_root ~final_hashes
     ~receipts_json ~proposed_state_root ~creator_addr ~next_txid
-    ~head_txid_hi ~ts =
+    ~head_txid_hi ~parent_commit_hash ~ts =
+  let proto_version =
+    Octra_consensus.C_protocol.version_for_epoch epoch_id
+  in
+  let parent_commit_hash =
+    if
+      proto_version
+      = Octra_consensus.C_types.proto_version_parent_legacy
+    then
+      if Octra_net.Hash_domain.is_nil parent_commit_hash then
+        parent_commit_hash
+      else
+        invalid_arg "legacy proposal has parent commit"
+    else
+      parent_commit_hash
+  in
   Octra_consensus.C_types.{
-    proto_version = proto_version_current;
+    proto_version;
     chain_id;
     epoch_id;
     prev_state_root;
     tx_list_hash = tx_list_hash final_hashes;
     receipt_root = Octra_consensus.C_hash.receipt_root receipts_json;
     proposed_state_root;
+    parent_commit_hash;
     creator_addr;
     txid_hi =
       proposal_txid_hi
@@ -965,7 +1071,24 @@ let build_header ~chain_id ~epoch_id ~prev_state_root ~final_hashes
 
 let build_proposal_envelope ~chain_id ~epoch_id ~prev_state_root
     ~final_hashes ~final_txs ~receipts_json ~proposed_state_root
-    ~creator_addr ~next_txid ~head_txid_hi ~ts =
+    ~creator_addr ~next_txid ~head_txid_hi ~parent_commit ~ts =
+  let proto_version =
+    Octra_consensus.C_protocol.version_for_epoch epoch_id
+  in
+  let parent_commit =
+    if
+      proto_version
+      = Octra_consensus.C_types.proto_version_parent_legacy
+    then
+      match parent_commit with
+      | None -> None
+      | Some _ -> invalid_arg "legacy proposal has parent commit"
+    else
+      parent_commit
+  in
+  let parent_commit_hash =
+    Octra_consensus.C_hash.parent_commit_hash_opt parent_commit
+  in
   let header =
     build_header
       ~chain_id
@@ -977,10 +1100,12 @@ let build_proposal_envelope ~chain_id ~epoch_id ~prev_state_root
       ~creator_addr
       ~next_txid
       ~head_txid_hi
+      ~parent_commit_hash
       ~ts
   in
   {
     header;
+    parent_commit;
     proposal_id = Octra_consensus.C_hash.proposal_id header;
     txid_hi = header.Octra_consensus.C_types.txid_hi;
     tx_hashes = final_hashes;
@@ -1000,26 +1125,27 @@ let precommit_sync_plan ~proposal_id ~current_tx_hashes ~cached_bundle =
   match cached_bundle with
   | None ->
     Precommit_sync_missing { pid_short }
-  | Some (tx_hashes, _txs_json, receipts_json as raw) ->
-    if current_tx_hashes = tx_hashes then
-      Precommit_sync_current
-    else
-      match Consensus_bundle_cache.parse_txs raw with
-      | Ok txs ->
+  | Some raw ->
+    match Consensus_bundle_cache.decode raw with
+    | Ok bundle ->
+      if current_tx_hashes = bundle.tx_hashes then
+        Precommit_sync_current
+      else
         Precommit_sync_decoded {
           pid_short;
-          tx_hashes;
-          txs;
-          receipts_json;
+          tx_hashes = bundle.tx_hashes;
+          txs = bundle.txs;
+          receipts_json = bundle.receipts_json;
         }
-      | Error error ->
-        Precommit_sync_decode_failed {
-          pid_short;
-          error;
-        }
+    | Error error ->
+      Precommit_sync_decode_failed {
+        pid_short;
+        error;
+      }
 
 let pending_commit ~epoch_id ~round ~proposal_id ~proposed_state_root ~txid_hi
-    ~ts ~validator_addr =
+    ~ts ~validator_addr ~proposal_wire ~vote_wire ~tx_hashes ~txs_json
+    ~receipts_json =
   Octra_core.Wal.{
     epoch_id = Int64.to_int epoch_id;
     round;
@@ -1028,53 +1154,154 @@ let pending_commit ~epoch_id ~round ~proposal_id ~proposed_state_root ~txid_hi
     txid_hi;
     ts;
     validator_addr;
+    proposal_b64 = Some (Base64.encode_exn proposal_wire);
+    vote_b64 = Some (Base64.encode_exn vote_wire);
+    tx_hashes;
+    txs_json;
+    receipts_json;
   }
 
+let precommit_record_matches ~chain_id ~validator_set ~epoch_id ~round ~proposal_id
+    ~proposed_state_root ~txid_hi ~validator_addr ~proposal_wire ~vote_wire
+    (tx_hashes, _txs_json, receipts_json) =
+  try
+    let proposal = Octra_consensus.C_codec.decode_propose proposal_wire in
+    let vote = Octra_consensus.C_codec.decode_vote vote_wire in
+    let proposal_hash =
+      Octra_consensus.C_hash.proposal_id proposal.header
+    in
+    let proposal_hashes = List.map Text.hash32_hex proposal.tx_hashes in
+    if proposal.epoch_id <> epoch_id then Error "proposal epoch mismatch"
+    else if proposal.round <> round then Error "proposal round mismatch"
+    else if not
+      (Octra_consensus.C_types.proposal_is_well_formed
+         ~chain_id
+         ~validator_set
+         proposal)
+    then
+      Error "proposal envelope mismatch"
+    else if proposal_hash <> proposal_id then Error "proposal id mismatch"
+    else if proposal.header.proposed_state_root <> proposed_state_root then
+      Error "proposal state root mismatch"
+    else if proposal.header.txid_hi <> txid_hi then Error "proposal txid mismatch"
+    else if proposal_hashes <> tx_hashes then Error "proposal bundle mismatch"
+    else if
+      Octra_consensus.C_engine.tx_list_hash_for_header tx_hashes
+      <> proposal.header.tx_list_hash
+    then
+      Error "proposal tx list root mismatch"
+    else if
+      Octra_consensus.C_hash.receipt_root receipts_json
+      <> proposal.header.receipt_root
+    then
+      Error "proposal receipt root mismatch"
+    else if
+      Octra_consensus.C_hash.parent_commit_hash_opt proposal.parent_commit
+      <> proposal.header.parent_commit_hash
+    then
+      Error "proposal parent commit mismatch"
+    else if vote.chain_id <> proposal.chain_id then Error "vote chain mismatch"
+    else if vote.epoch_id <> epoch_id then Error "vote epoch mismatch"
+    else if vote.round <> round then Error "vote round mismatch"
+    else if vote.vote_type <> Octra_consensus.C_types.Precommit then
+      Error "vote type mismatch"
+    else if vote.proposal_id <> proposal_id then Error "vote proposal mismatch"
+    else if vote.validator <> validator_addr then Error "vote validator mismatch"
+    else
+      Ok ()
+  with exn ->
+    Error (Printexc.to_string exn)
+
 let handle_before_precommit deps ~epoch_id ~round ~proposal_id
-    ~proposed_state_root ~txid_hi ~validator_addr =
+    ~proposed_state_root ~txid_hi ~validator_addr ~proposal_wire ~vote_wire =
+  let cached_bundle = deps.cached_bundle proposal_id in
   let plan =
     precommit_sync_plan
       ~proposal_id
       ~current_tx_hashes:(deps.current_tx_hashes ())
-      ~cached_bundle:(deps.cached_bundle proposal_id)
+      ~cached_bundle
   in
-  (match plan with
-   | Precommit_sync_current ->
-     ()
-   | Precommit_sync_decoded { pid_short; tx_hashes; txs; receipts_json } ->
-     deps.sync_bundle ~tx_hashes ~txs ~receipts_json;
-     Octra_log.info "consensus"
-       "before_precommit canonical_bundle = synced pid = %s n = %d"
-       pid_short
-       (List.length tx_hashes)
-   | Precommit_sync_decode_failed { pid_short; error } ->
-     deps.mark_unsynced ();
-     Octra_log.error "consensus"
-       "before_precommit canonical_bundle = decode_failed pid = %s error = %s"
-       pid_short
-       error
-   | Precommit_sync_missing { pid_short } ->
-     deps.mark_unsynced ();
-     Octra_log.warn "consensus"
-       "before_precommit canonical_bundle = missing pid = %s action = fetch_on_finalized"
-       pid_short);
-  let entry =
-    pending_commit
-      ~epoch_id
-      ~round
-      ~proposal_id
-      ~proposed_state_root
-      ~txid_hi
-      ~ts:(deps.now ())
-      ~validator_addr
-  in
-  deps.write_pending entry;
-  Octra_log.info "consensus"
-    "pending_commit durable epoch = %Ld round = %d pid = %s txid_hi = %Ld"
-    epoch_id
-    round
-    (short 16 entry.proposal_id)
-    txid_hi
+  match plan, cached_bundle with
+  | (Precommit_sync_current
+    | Precommit_sync_decoded _),
+    Some ((tx_hashes, txs_json, receipts_json) as bundle) ->
+    (match
+       precommit_record_matches
+         ~chain_id:deps.chain_id
+         ~validator_set:deps.validator_set
+         ~epoch_id
+         ~round
+         ~proposal_id
+         ~proposed_state_root
+         ~txid_hi
+         ~validator_addr
+         ~proposal_wire
+         ~vote_wire
+         bundle
+     with
+     | Error error ->
+       deps.mark_unsynced ();
+       Octra_log.error "consensus"
+         "event = refuse_precommit reason = record_mismatch error = %s"
+         error;
+       false
+     | Ok () ->
+       (match plan with
+        | Precommit_sync_decoded { pid_short; tx_hashes; txs; receipts_json } ->
+          deps.sync_bundle ~tx_hashes ~txs ~receipts_json;
+          Octra_log.info "consensus"
+            "event = before_precommit bundle = synced pid = %s n = %d"
+            pid_short
+            (List.length tx_hashes)
+        | _ -> ());
+       let entry =
+         pending_commit
+           ~epoch_id
+           ~round
+           ~proposal_id
+           ~proposed_state_root
+           ~txid_hi
+           ~ts:(deps.now ())
+           ~validator_addr
+           ~proposal_wire
+           ~vote_wire
+           ~tx_hashes
+           ~txs_json
+           ~receipts_json
+       in
+       (try
+          deps.write_pending entry;
+          Octra_log.info "consensus"
+            "event = pending_commit durable = true epoch = %Ld round = %d pid = %s txid_hi = %Ld"
+            epoch_id
+            round
+            (short 16 entry.proposal_id)
+            txid_hi;
+          true
+        with exn ->
+          deps.mark_unsynced ();
+          Octra_log.error "consensus"
+            "event = refuse_precommit reason = pending_commit_write error = %s"
+            (Printexc.to_string exn);
+          false))
+  | Precommit_sync_decode_failed { pid_short; error }, _ ->
+    deps.mark_unsynced ();
+    Octra_log.error "consensus"
+      "event = refuse_precommit reason = bundle_decode pid = %s error = %s"
+      pid_short
+      error;
+    false
+  | Precommit_sync_missing { pid_short }, _ ->
+    deps.mark_unsynced ();
+    Octra_log.warn "consensus"
+      "event = refuse_precommit reason = bundle_missing pid = %s"
+      pid_short;
+    false
+  | _ ->
+    deps.mark_unsynced ();
+    Octra_log.error "consensus"
+      "event = refuse_precommit reason = bundle_state";
+    false
 
 let admission_plan ~epoch_id ~current_epoch ~state_attested ~quarantine_active
     ~quarantine_reason =
@@ -1129,6 +1356,17 @@ let handle_proposal_admission ~start_height ~epoch_id ~current_epoch
 let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
+  match
+    deps.verify_parent_commit
+      ~epoch_id:propose.epoch_id
+      propose.parent_commit
+  with
+  | Error reason ->
+    Octra_log.warn "consensus"
+      "reject proposal reason = parent_commit detail = %s"
+      reason;
+    Lwt.return_false
+  | Ok () ->
   let previous =
     if propose.epoch_id <= 0L then Ok None
     else
@@ -1148,12 +1386,26 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
       reason;
     Lwt.return_false
   | Ok previous ->
-    match
-      Octra_consensus.Epoch_time.check
-        ~now:(deps.now ())
-        ~previous
-        ~candidate:propose.header.ts
-    with
+    let epoch_time_check =
+      if not
+        (valid_round_is_well_formed
+           ~round:propose.round
+           propose.valid_round)
+      then
+        Error "proposal valid round is invalid"
+      else
+        match propose.valid_round with
+        | None ->
+          Octra_consensus.Epoch_time.check
+            ~now:(deps.now ())
+            ~previous
+            ~candidate:propose.header.ts
+        | Some _ ->
+          Octra_consensus.Epoch_time.check_reproposal
+            ~previous
+            ~candidate:propose.header.ts
+    in
+    match epoch_time_check with
   | Error reason ->
     Octra_log.warn "consensus"
       "reject proposal reason = invalid_epoch_time detail = %s"
@@ -1236,9 +1488,15 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
           List.length tx_hashes_hex - List.length tx_list_local
         in
         let local_preverify txs =
+          let run_many txs =
+            deps.run_preverify_once
+              ~state_root:propose.header.prev_state_root
+              ~tx_hashes:tx_hashes_hex
+              txs
+          in
           let* shaped =
             local_preverify_bundle
-              ~run_many:deps.run_preverify
+              ~run_many
               ~tx_hashes:tx_hashes_hex
               txs
           in
@@ -1286,51 +1544,70 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
             ~missing_count
             ~hashes_empty:(tx_hashes_hex = [])
         in
-        let tx_list = proposal_bundle.Consensus_bundle_fetch.txs in
-        let receipts_json = proposal_bundle.receipts_json in
-        match
-          verify_bundle
-            {
-              public_key_for_tx = deps.public_key_for_tx;
-              verify_address_pubkey = deps.verify_address_pubkey;
-              verify_tx_signature = deps.verify_tx_signature;
-            }
-            ~limits:deps.limits
-            ~header:propose.header
-            ~expected_tx_count:(List.length propose.tx_hashes)
-            tx_list
-            receipts_json
-        with
-        | Error reason ->
-          log_reject ~epoch_id:propose.epoch_id reason;
-          Lwt.return_false
-        | Ok verified ->
-          let tx_list = verified.txs in
-          let receipts_json = verified.receipts_json in
-          let preverify = verified.preverify in
-          deps.store_bundle
-            ~proposal_id:pid
+        let* local =
+          local_preverify_bundle
+            ~run_many:(fun txs ->
+              deps.run_preverify_once
+                ~state_root:propose.header.prev_state_root
+                ~tx_hashes:tx_hashes_hex
+                txs)
             ~tx_hashes:tx_hashes_hex
-            ~txs:tx_list
-            ~receipts_json;
-          let proposer = propose.header.creator_addr in
-          let validator_pubkeys = deps.validator_pubkeys propose.epoch_id in
-          let validator_addrs = List.map fst validator_pubkeys in
-          let* local_ledger_root_for_preview = deps.read_local_ledger_root () in
-          let* preview_result =
-            deps.preview {
-              epoch_id = propose.epoch_id;
-              epoch_ts = propose.header.ts;
-              proposal_id = Printf.sprintf "verify-%Ld" propose.epoch_id;
-              expected_prev_root = local_ledger_root_for_preview;
-              prev_state_root = our_root;
-              proposer;
-              validator_pubkeys;
-              preverify;
-              txs = tx_list;
-            }
-          in
-          let decision =
+            proposal_bundle.txs
+        in
+        match check_local_bundle ~expected_hashes:tx_hashes_hex proposal_bundle local with
+        | Error reason ->
+          Octra_log.warn "consensus"
+            "reject proposal reason = local_preverify_mismatch epoch = %Ld detail = %s"
+            propose.epoch_id
+            reason;
+          Lwt.return_false
+        | Ok proposal_bundle ->
+          let tx_list = proposal_bundle.Consensus_bundle_fetch.txs in
+          let receipts_json = proposal_bundle.receipts_json in
+          match
+            verify_bundle
+              {
+                public_key_for_tx = deps.public_key_for_tx;
+                verify_address_pubkey = deps.verify_address_pubkey;
+                verify_tx_signature = deps.verify_tx_signature;
+              }
+              ~limits:deps.limits
+              ~header:propose.header
+              ~expected_tx_count:(List.length propose.tx_hashes)
+              tx_list
+              receipts_json
+          with
+          | Error reason ->
+            log_reject ~epoch_id:propose.epoch_id reason;
+            Lwt.return_false
+          | Ok verified ->
+            let tx_list = verified.txs in
+            let receipts_json = verified.receipts_json in
+            let preverify = verified.preverify in
+            deps.store_bundle
+              ~proposal_id:pid
+              ~tx_hashes:tx_hashes_hex
+              ~txs:tx_list
+              ~receipts_json;
+            let proposer = propose.header.creator_addr in
+            let validator_pubkeys = deps.validator_pubkeys propose.epoch_id in
+            let validator_addrs = List.map fst validator_pubkeys in
+            let* local_ledger_root_for_preview = deps.read_local_ledger_root () in
+            let* preview_result =
+              deps.preview {
+                epoch_id = propose.epoch_id;
+                epoch_ts = propose.header.ts;
+                proposal_id = Printf.sprintf "verify-%Ld" propose.epoch_id;
+                expected_prev_root = local_ledger_root_for_preview;
+                prev_state_root = our_root;
+                parent_commit = propose.parent_commit;
+                proposer;
+                validator_pubkeys;
+                preverify;
+                txs = tx_list;
+              }
+            in
+            let decision =
             preview_decision
               ~root_to_raw32:deps.root_to_raw32
               ~epoch_id:propose.epoch_id
@@ -1342,7 +1619,7 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
               ~proposed_state_root:propose.header.proposed_state_root
               ~preview:(preview_status_of_result preview_result)
           in
-          let root_matches =
+            let root_matches =
             match decision with
             | Preview_accept _ ->
               Octra_log.info "consensus"
@@ -1379,27 +1656,27 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
                 error;
               false
           in
-          if root_matches then begin
-            deps.set_prev_root_streak 0;
-            deps.set_state_root_streak 0;
-            deps.set_proposal tx_list tx_hashes_hex;
-            deps.store_bundle
-              ~proposal_id:pid
-              ~tx_hashes:tx_hashes_hex
-              ~txs:tx_list
-              ~receipts_json;
-            Lwt.return_true
-          end else begin
-            let next_streak = deps.state_root_streak () + 1 in
-            deps.set_state_root_streak next_streak;
-            if next_streak >= deps.quarantine_mismatch_threshold then
-              deps.mark_quarantine
-                (Printf.sprintf
-                   "state_root_mismatch_streak = %d epoch = %Ld"
-                   next_streak
-                   propose.epoch_id);
-            Lwt.return_false
-          end
+            if root_matches then begin
+              deps.set_prev_root_streak 0;
+              deps.set_state_root_streak 0;
+              deps.set_proposal tx_list tx_hashes_hex;
+              deps.store_bundle
+                ~proposal_id:pid
+                ~tx_hashes:tx_hashes_hex
+                ~txs:tx_list
+                ~receipts_json;
+              Lwt.return_true
+            end else begin
+              let next_streak = deps.state_root_streak () + 1 in
+              deps.set_state_root_streak next_streak;
+              if next_streak >= deps.quarantine_mismatch_threshold then
+                deps.mark_quarantine
+                  (Printf.sprintf
+                     "state_root_mismatch_streak = %d epoch = %Ld"
+                     next_streak
+                     propose.epoch_id);
+              Lwt.return_false
+            end
 
 let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
   let open Lwt.Syntax in
@@ -1416,6 +1693,15 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
   | Proposal_defer ->
     Lwt.return_none
   | Proposal_admit ->
+    begin
+      match deps.parent_commit ~epoch_id with
+      | Error reason ->
+        Octra_log.warn "consensus"
+          "defer proposal reason = parent_commit epoch = %Ld detail = %s"
+          epoch_id
+          reason;
+        Lwt.return_none
+      | Ok parent_commit ->
     let* prev_ledger_root_opt = deps.read_prev_ledger_root () in
     let roots =
       proposal_roots
@@ -1430,19 +1716,38 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
     match deps.frozen_bundle freeze_key with
     | Some frozen ->
       let frozen = frozen_proposal frozen in
-      deps.store_bundle
-        ~proposal_id:frozen.proposal_id
-        ~tx_hashes:frozen.tx_hashes
-        ~txs:frozen.txs
-        ~receipts_json:frozen.receipts_json;
-      log_frozen_proposal ~epoch_id ~round:proposal_round frozen;
-      Lwt.return_some (frozen.header, frozen.tx_hashes)
+      if
+        frozen.header.parent_commit_hash
+        <> Octra_consensus.C_hash.parent_commit_hash_opt parent_commit
+      then begin
+        Octra_log.warn "consensus"
+          "defer proposal reason = frozen_parent_commit_mismatch epoch = %Ld"
+          epoch_id;
+        Lwt.return_none
+      end else begin
+        deps.store_bundle
+          ~proposal_id:frozen.proposal_id
+          ~tx_hashes:frozen.tx_hashes
+          ~txs:frozen.txs
+          ~receipts_json:frozen.receipts_json;
+        log_frozen_proposal ~epoch_id ~round:proposal_round frozen;
+        Lwt.return_some Octra_consensus.C_driver.{
+          header = frozen.header;
+          tx_hashes = frozen.tx_hashes;
+          parent_commit;
+        }
+      end
     | None ->
       let tx_list_raw = deps.staging_txs () in
       let tx_list_admitted = List.filter deps.admits_tx tx_list_raw in
+      let admitted_hashes = List.map Transaction.hash tx_list_admitted in
       let* pre_shape =
         build_preverify
-          ~run_many:deps.run_preverify
+          ~run_many:(fun txs ->
+            deps.run_preverify_once
+              ~state_root:prev_root
+              ~tx_hashes:admitted_hashes
+              txs)
           ~limits
           tx_list_admitted
       in
@@ -1468,6 +1773,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
           proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
           expected_prev_root = prev_ledger_root;
           prev_state_root = prev_root;
+          parent_commit;
           proposer;
           validator_pubkeys;
           preverify;
@@ -1512,6 +1818,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
           ~creator_addr:proposer
           ~next_txid:(deps.next_txid ())
           ~head_txid_hi:(deps.head_txid_hi ())
+          ~parent_commit
           ~ts:epoch_ts
       in
       Octra_log.info "consensus"
@@ -1525,4 +1832,9 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
         ~txs:proposal_envelope.txs
         ~receipts_json:proposal_envelope.receipts_json;
       deps.freeze freeze_key proposal_envelope.frozen_bundle;
-      Lwt.return_some (proposal_envelope.header, final_tx_hashes)
+      Lwt.return_some Octra_consensus.C_driver.{
+        header = proposal_envelope.header;
+        tx_hashes = final_tx_hashes;
+        parent_commit = proposal_envelope.parent_commit;
+      }
+    end

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type deps = {
   sleep : float -> unit Lwt.t;
@@ -27,7 +15,8 @@ type launch_deps = {
   start_driver : unit -> unit Lwt.t;
   startup_probe : unit -> unit Lwt.t;
   poll_loop : unit -> unit Lwt.t;
-  pending_recovery : unit -> unit Lwt.t;
+  pending_recovery : unit -> bool Lwt.t;
+  hold_startup : unit -> unit;
   log_started : unit -> unit;
 }
 
@@ -59,11 +48,12 @@ type runtime_state_ops = {
 type 'driver driver_deps = {
   sleep : float -> unit Lwt.t;
   state : state_refs;
+  hold_startup : unit -> unit;
   replay_stashed : source:string -> unit Lwt.t;
   start_driver : 'driver -> unit Lwt.t;
   probe_health : 'driver -> unit Lwt.t;
   reset_liveness : 'driver -> source:string -> unit Lwt.t;
-  pending_recovery : 'driver -> unit Lwt.t;
+  pending_recovery : 'driver -> bool Lwt.t;
   poll_interval : float;
   pending_delay : float;
   log_started : unit -> unit;
@@ -110,7 +100,9 @@ type fork_repair_runtime = {
   committed_head_epoch : unit -> int;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
+  finality_target_ready : int -> (unit, string) result;
   run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  rewind_finality : int -> (unit, string) result;
   drop_finality_after : int -> int;
   prune_after_epoch : int -> unit;
   set_current_epoch : int -> unit;
@@ -121,6 +113,7 @@ type fork_repair_runtime = {
 }
 
 type node_fork_repair_runtime = {
+  chain_id : string;
   committed_head_epoch : unit -> int;
   data_dir : string;
   store : Octra_core.Store_irmin.t;
@@ -172,8 +165,13 @@ type 'driver liveness_deps = {
   quarantine_active : unit -> bool;
   state_attested : unit -> bool;
   pending_finalized : unit -> bool;
+  proposal_active : 'driver -> bool;
   log_reset : Consensus_liveness.reset -> unit;
-  realign_height : 'driver -> int64 -> unit Lwt.t;
+  realign_progress :
+    'driver ->
+    height:int64 ->
+    round:int ->
+    unit Lwt.t;
 }
 
 type node_liveness_deps = {
@@ -229,10 +227,11 @@ type node_driver_health_deps = {
 type consensus_driver_runtime = {
   sleep : float -> unit Lwt.t;
   state : state_refs;
+  hold_startup : unit -> unit;
   replay_stashed : source:string -> unit Lwt.t;
   probe : driver_probe_deps;
   liveness : Octra_consensus.C_driver.t liveness_deps;
-  pending_recovery : Octra_consensus.C_driver.t -> unit Lwt.t;
+  pending_recovery : Octra_consensus.C_driver.t -> bool Lwt.t;
   poll_interval : float;
   pending_delay : float;
   log_started : unit -> unit;
@@ -245,7 +244,7 @@ type node_consensus_driver_runtime = {
   replay_stashed : source:string -> unit Lwt.t;
   probe : driver_probe_deps;
   liveness : Octra_consensus.C_driver.t liveness_deps;
-  pending_recovery : Octra_consensus.C_driver.t -> unit Lwt.t;
+  pending_recovery : Octra_consensus.C_driver.t -> bool Lwt.t;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
@@ -308,6 +307,7 @@ let maybe_reset_liveness (deps : 'driver liveness_deps) driver ~source =
       ~quarantine_active:(deps.quarantine_active ())
       ~state_attested:(deps.state_attested ())
       ~pending_finalized:(deps.pending_finalized ())
+      ~proposal_active:(deps.proposal_active driver)
   in
   deps.state := result.state;
   match result.reset with
@@ -315,7 +315,10 @@ let maybe_reset_liveness (deps : 'driver liveness_deps) driver ~source =
     Lwt.return_unit
   | Some reset ->
     deps.log_reset reset;
-    deps.realign_height driver reset.expected
+    deps.realign_progress
+      driver
+      ~height:reset.expected
+      ~round:reset.round
 
 let log_liveness_reset (reset : Consensus_liveness.reset) =
   Octra_log.warn "consensus"
@@ -346,9 +349,10 @@ let node_liveness_deps (deps : node_liveness_deps) =
       Consensus_runtime_state.state_attested deps.runtime_state);
     pending_finalized = (fun () ->
       deps.finality.has_finalized (deps.current_epoch ()));
+    proposal_active = Octra_consensus.C_driver.proposal_work_active;
     log_reset = log_liveness_reset;
-    realign_height = (fun driver expected ->
-      Octra_consensus.C_driver.realign_height driver expected);
+    realign_progress = (fun driver ~height ~round ->
+      Octra_consensus.C_driver.realign_progress driver ~height ~round);
   }
 
 let snapshot_policy_threshold ~getenv =
@@ -378,6 +382,18 @@ let peer_snapshot_text records =
   |> String.concat ","
 
 let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
+  let entry target =
+    Octra_consensus.Finality_log.find
+      (Octra_consensus.Finality_log.index runtime.data_dir)
+      target
+  in
+  let with_entry target action =
+    if not (Consensus_finality_journal.committed runtime.data_dir) then Ok ()
+    else
+      match entry target with
+      | None -> Error "finality entry is missing"
+      | Some value -> action value
+  in
   {
     committed_head_epoch = runtime.committed_head_epoch;
     target_matches = (fun ~target ~root ->
@@ -390,6 +406,12 @@ let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
         runtime.chaindata
         ~target
         ~head);
+    finality_target_ready = (fun target ->
+      with_entry target (fun entry ->
+        Consensus_finality_journal.committed_for
+          ~chain_id:runtime.chain_id
+          ~entry
+          runtime.data_dir));
     run_empty = (fun ~target ~root ->
       Octra_core.Fork_head_repair.run_empty
         ~data_dir:runtime.data_dir
@@ -397,6 +419,12 @@ let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
         ~chaindata:runtime.chaindata
         ~target
         ~root);
+    rewind_finality = (fun target ->
+      with_entry target (fun entry ->
+        Consensus_finality_journal.rewind_committed
+          ~chain_id:runtime.chain_id
+          ~entry
+          runtime.data_dir));
     drop_finality_after =
       Octra_consensus.Finality_log.drop_after runtime.data_dir;
     prune_after_epoch = runtime.finality.prune_after_epoch;
@@ -415,6 +443,8 @@ let fork_repair_deps (runtime : fork_repair_runtime) driver =
     target_matches = runtime.target_matches;
     empty_after = runtime.empty_after;
     run_empty = runtime.run_empty;
+    finality_target_ready = runtime.finality_target_ready;
+    rewind_finality = runtime.rewind_finality;
     drop_finality_after = runtime.drop_finality_after;
     prune_after_epoch = runtime.prune_after_epoch;
     set_current_epoch = runtime.set_current_epoch;
@@ -606,6 +636,14 @@ let after (deps : deps) ~delay f =
   let* () = deps.sleep delay in
   f ()
 
+let rec await_pending_recovery (deps : deps) ~delay recover =
+  let open Lwt.Syntax in
+  let* ready = recover () in
+  if ready then Lwt.return_true
+  else
+    let* () = deps.sleep delay in
+    await_pending_recovery deps ~delay recover
+
 let poll_once (deps : deps) =
   let open Lwt.Syntax in
   if deps.catchup_active () then
@@ -627,19 +665,27 @@ let rec poll_loop (deps : deps) ~interval =
   poll_loop deps ~interval
 
 let launch (deps : launch_deps) =
-  Lwt.async deps.start_driver;
-  Lwt.async deps.startup_probe;
-  Lwt.async deps.poll_loop;
-  Lwt.async deps.pending_recovery;
-  deps.log_started ()
+  deps.hold_startup ();
+  Lwt.async (fun () ->
+    let open Lwt.Syntax in
+    let* ready = deps.pending_recovery () in
+    if not ready then Lwt.return_unit
+    else
+      let* () = deps.start_driver () in
+      let* () = deps.startup_probe () in
+      Lwt.async deps.poll_loop;
+      deps.log_started ();
+      Lwt.return_unit)
 
-let launch_health (deps : deps) ~start_driver ~poll_interval ~pending_delay ~pending_recovery
-    ~log_started =
+let launch_health (deps : deps) ~hold_startup ~start_driver ~poll_interval
+    ~pending_delay ~pending_recovery ~log_started =
   launch {
     start_driver;
     startup_probe = (fun () -> startup_probe deps);
     poll_loop = (fun () -> poll_loop deps ~interval:poll_interval);
-    pending_recovery = (fun () -> after deps ~delay:pending_delay pending_recovery);
+    pending_recovery = (fun () ->
+      await_pending_recovery deps ~delay:pending_delay pending_recovery);
+    hold_startup;
     log_started;
   }
 
@@ -658,6 +704,7 @@ let health_deps_of_driver (deps : 'driver driver_deps) driver =
 let launch_driver (deps : 'driver driver_deps) driver =
   launch_health
     (health_deps_of_driver deps driver)
+    ~hold_startup:deps.hold_startup
     ~start_driver:(fun () -> deps.start_driver driver)
     ~poll_interval:deps.poll_interval
     ~pending_delay:deps.pending_delay
@@ -668,6 +715,7 @@ let consensus_driver_deps (deps : consensus_driver_runtime) =
   {
     sleep = deps.sleep;
     state = deps.state;
+    hold_startup = deps.hold_startup;
     replay_stashed = deps.replay_stashed;
     start_driver = Octra_consensus.C_driver.start;
     probe_health = (fun driver ->
@@ -688,6 +736,7 @@ let node_consensus_driver_runtime runtime =
       quarantine =
         Consensus_runtime_state.quarantine_active_ref runtime.runtime_state;
     };
+    hold_startup = runtime.probe.clear_state_attested;
     replay_stashed = runtime.replay_stashed;
     probe = runtime.probe;
     liveness = runtime.liveness;

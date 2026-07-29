@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type rows_status = {
   total : int;
@@ -81,8 +69,8 @@ let history_profile_enabled =
 
 let emit_history_profile ~tag ~cache ~addr ~limit ~offset ~total ~missing profile =
   if history_profile_enabled then
-    Octra_log.stdout
-      "history_profile tag=%s cache=%s addr=%s limit=%d offset=%d total=%d fetched=%d selected=%d rows=%d missing=%d fetch_ms=%.2f resolve_ms=%.2f sort_ms=%.2f page_ms=%.2f total_ms=%.2f\n%!"
+    Octra_log.trace "history"
+      "event = read_profile tag = %s cache = %s addr = %s limit = %d offset = %d total = %d fetched = %d selected = %d rows = %d missing = %d fetch_ms = %.2f resolve_ms = %.2f sort_ms = %.2f page_ms = %.2f total_ms = %.2f"
       tag
       cache
       addr
@@ -118,14 +106,14 @@ let rec mkdir_p path =
     (try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
   end
 
-let open_chaindata base_dir =
-  mkdir_p base_dir;
+let open_chaindata ?(readonly=false) base_dir =
+  if not readonly then mkdir_p base_dir;
   let txlog_dir = Filename.concat base_dir "txlog" in
   let epochlog_path = Filename.concat (Filename.concat base_dir "epochlog") "epochs.dat" in
   let index_dir = Filename.concat base_dir "index" in
-  let txlog = Txlog.open_log txlog_dir in
-  let epochlog = Epochlog.open_log epochlog_path in
-  let index = Chaindata_index.open_index index_dir in
+  let txlog = Txlog.open_log ~readonly txlog_dir in
+  let epochlog = Epochlog.open_log ~readonly epochlog_path in
+  let index = Chaindata_index.open_index ~readonly index_dir in
   let next_txid = match Chaindata_index.get_meta index "next_txid" with
     | Some s -> (try Int64.of_string s with _ -> 0L)
     | None -> 0L in
@@ -651,7 +639,6 @@ let get_visible_epoch_index_status t epoch_id =
              ~start_txid:h.Epochlog.start_txid
              ~tx_count:h.Epochlog.tx_count))
 
-
 let verify_and_repair_tx_loc_only t ~max_epoch =
   let checked = ref 0 in
   let repaired = ref 0 in
@@ -663,7 +650,8 @@ let verify_and_repair_tx_loc_only t ~max_epoch =
   Txlog.scan_all t.txlog (fun seg_id pos record_len epoch_id payload ->
     incr progress;
     if !progress mod 1_000_000 = 0 then
-      Octra_log.stdout "  tx_loc repair: %dM scanned, %d repaired\n%!"
+      Octra_log.info "chaindata"
+        "event = tx_location_repair scanned_million = %d repaired = %d"
         (!progress / 1_000_000) !repaired;
     if epoch_id > max_epoch then ()
     else begin
@@ -742,30 +730,54 @@ let verify_and_repair_tx_loc_recent_epochs t ~from_epoch ~to_epoch =
     { checked = !checked; repaired = !repaired; errors = List.rev !errors }
   end
 
-let heal_tx_by_hash_recent t ~hash ~recent_epochs =
+let read_tx_hash_at_txid t txid =
+  match Chaindata_index.get_txid_loc t.index txid with
+  | None -> None
+  | Some (seg_id, offset, len) ->
+    if seg_id < 0 || offset < 0 || len <= 8 || len > max_txlog_record_len then None
+    else
+      try
+        let epoch_id, prefix =
+          Txlog.read_record_prefix t.txlog ~seg_id ~offset ~len ~prefix_len:64
+        in
+        if String.length prefix <> 64 then None
+        else Some (prefix, epoch_id)
+      with _ -> None
+
+let heal_tx_by_hash_recent t ~hash ~recent_epochs ~max_records =
   match Epochlog.last t.epochlog with
   | None -> None
   | Some tip ->
     let window = max 1 recent_epochs in
+    let limit = max 0 max_records in
     let from_epoch = max 0 (tip.Epochlog.id - window + 1) in
     let found = ref None in
     let epoch_id = ref tip.Epochlog.id in
-    while !epoch_id >= from_epoch && !found = None do
+    let checked = ref 0 in
+    while !epoch_id >= from_epoch && !found = None && !checked < limit do
       match Epochlog.get t.epochlog !epoch_id with
       | None -> decr epoch_id
       | Some h ->
         let i = ref (h.Epochlog.tx_count - 1) in
-        while !i >= 0 && !found = None do
+        while !i >= 0 && !found = None && !checked < limit do
           let txid = Int64.add h.Epochlog.start_txid (Int64.of_int !i) in
-          match read_tx_record_at_txid t txid with
-          | Some (tx_hash, record_epoch_id, tx_json, seg_id, offset, len)
-            when tx_hash = hash ->
-            (try
-               Chaindata_index.set_tx_loc_only t.index hash ~seg_id ~offset ~len
-                 ~epoch_id:record_epoch_id
-             with _ -> ());
-            found := Some (record_epoch_id, tx_json)
-          | _ -> decr i
+          incr checked;
+          begin
+            match read_tx_hash_at_txid t txid with
+            | Some (tx_hash, record_epoch_id) when tx_hash = hash ->
+              begin
+                match read_tx_record_at_txid t txid with
+                | Some (_, _, tx_json, seg_id, offset, len) ->
+                  (try
+                     Chaindata_index.set_tx_loc_only t.index hash ~seg_id ~offset ~len
+                       ~epoch_id:record_epoch_id
+                   with _ -> ());
+                  found := Some (record_epoch_id, tx_json)
+                | None -> ()
+              end
+            | _ -> ()
+          end;
+          decr i
         done;
         decr epoch_id
     done;
@@ -854,7 +866,9 @@ let verify_and_repair t ~last_irmin_epoch =
   Txlog.scan_all t.txlog (fun seg_id pos record_len epoch_id payload ->
     incr progress;
     if !progress mod 1_000_000 = 0 then
-      Octra_log.stdout "  chaindata verify: %dM records scanned, %d repaired\n%!" (!progress / 1_000_000) !repaired;
+      Octra_log.info "chaindata"
+        "event = verify_progress scanned_million = %d repaired = %d"
+        (!progress / 1_000_000) !repaired;
     let (hash, tx_json) = split_payload payload in
     if String.length hash = 64 then begin
       match Chaindata_index.get_tx_loc t.index hash with
@@ -1173,11 +1187,65 @@ let compute_txs_by_addr_rows_status_profile t addr ~limit ~offset =
 let compute_txs_by_addr_rows_status t addr ~limit ~offset =
   fst (compute_txs_by_addr_rows_status_profile t addr ~limit ~offset)
 
+let bounded_txs_by_addr_rows_status_profile t addr ~limit ~offset =
+  let t0 = Unix.gettimeofday () in
+  let indexed_total = Chaindata_index.addr_tx_count t.index addr in
+  let remaining = max 0 (indexed_total - offset) in
+  let scan_limit = min remaining (max 64 (limit * 4)) in
+  let (_raw_total, txids) =
+    Chaindata_index.addr_txids_rev t.index addr ~limit:scan_limit ~offset
+  in
+  let t1 = Unix.gettimeofday () in
+  let missing = ref 0 in
+  let rows =
+    List.filter_map
+      (fun txid ->
+        match read_tx_at_txid t txid with
+        | Some (hash, epoch_id, tx_json) ->
+          begin
+            match tx_json_to_summary_row hash epoch_id tx_json with
+            | Some row when summary_row_mentions_addr addr row -> Some row
+            | Some _ -> None
+            | None ->
+              incr missing;
+              None
+          end
+        | None ->
+          incr missing;
+          None)
+      txids
+  in
+  let scanned_all = offset = 0 && scan_limit = indexed_total in
+  let total = if scanned_all then List.length rows else indexed_total in
+  let rows_needed = min limit (max 0 (total - offset)) in
+  let rec take n = function
+    | _ when n <= 0 -> []
+    | [] -> []
+    | row :: rest -> row :: take (n - 1) rest
+  in
+  let page = take rows_needed rows in
+  let t2 = Unix.gettimeofday () in
+  ({
+    total;
+    rows = page;
+    missing = !missing;
+    incomplete = !missing > 0 || List.length page <> rows_needed;
+  }, {
+    fetched = List.length txids;
+    selected = List.length rows;
+    rows = List.length page;
+    fetch_ms = (t1 -. t0) *. 1000.0;
+    resolve_ms = (t2 -. t1) *. 1000.0;
+    sort_ms = 0.0;
+    page_ms = 0.0;
+    total_ms = (t2 -. t0) *. 1000.0;
+  })
+
 let txs_by_addr_rows_status ?(profile_tag = "") t addr ~limit ~offset =
   let use_cache = limit <= 100 in
   if not use_cache then
     let (status, profile) =
-      compute_txs_by_addr_rows_status_profile t addr ~limit ~offset
+      bounded_txs_by_addr_rows_status_profile t addr ~limit ~offset
     in
     emit_history_profile
       ~tag:profile_tag
@@ -1214,7 +1282,7 @@ let txs_by_addr_rows_status ?(profile_tag = "") t addr ~limit ~offset =
         status
     | None ->
         let (status, profile) =
-          compute_txs_by_addr_rows_status_profile t addr ~limit ~offset
+          bounded_txs_by_addr_rows_status_profile t addr ~limit ~offset
         in
         if not status.incomplete then
           capped_replace t.addr_rows_page_cache key status;
@@ -1233,10 +1301,14 @@ let txs_by_addr_rows t addr ~limit ~offset =
   let status = txs_by_addr_rows_status t addr ~limit ~offset in
   (status.total, status.rows)
 
+let token_history_scan_limit = 4096
+
 let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
   let t0 = Unix.gettimeofday () in
-  let (_total, all_txids) =
-    Chaindata_index.addr_txids_rev t.index addr ~limit:max_int ~offset:0
+  let addr_total = Chaindata_index.addr_tx_count t.index addr in
+  let scan_limit = min addr_total token_history_scan_limit in
+  let (_total, txids) =
+    Chaindata_index.addr_txids_rev t.index addr ~limit:scan_limit ~offset:0
   in
   let t1 = Unix.gettimeofday () in
   let incoming = ref 0 in
@@ -1253,12 +1325,8 @@ let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
          | Token_transfer_absent -> None
          | Token_transfer_malformed -> incr missing; None)
     | None -> incr missing; None
-  ) all_txids in
+  ) txids in
   let t2 = Unix.gettimeofday () in
-  let sorted = List.sort (fun (e1, t1, _) (e2, t2, _) ->
-    if e1 <> e2 then compare e2 e1 else compare t2 t1
-  ) token_rows in
-  let t3 = Unix.gettimeofday () in
   let rec drop n = function
     | l when n <= 0 -> l
     | [] -> []
@@ -1269,9 +1337,9 @@ let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
     | [] -> []
     | h :: tl -> h :: take (n - 1) tl
   in
-  let total = List.length sorted in
-  let page_rows = take limit (drop offset sorted) in
-  let t4 = Unix.gettimeofday () in
+  let total = List.length token_rows in
+  let page_rows = take limit (drop offset token_rows) in
+  let t3 = Unix.gettimeofday () in
   ({
     total;
     rows = List.map (fun (_, _, row) -> row) page_rows;
@@ -1279,16 +1347,16 @@ let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
     outgoing = !outgoing;
     has_more = offset + List.length page_rows < total;
     missing = !missing;
-    incomplete = !missing > 0;
+    incomplete = !missing > 0 || scan_limit < addr_total;
   }, {
-    fetched = List.length all_txids;
+    fetched = List.length txids;
     selected = List.length token_rows;
     rows = List.length page_rows;
     fetch_ms = (t1 -. t0) *. 1000.0;
     resolve_ms = (t2 -. t1) *. 1000.0;
-    sort_ms = (t3 -. t2) *. 1000.0;
-    page_ms = (t4 -. t3) *. 1000.0;
-    total_ms = (t4 -. t0) *. 1000.0;
+    sort_ms = 0.0;
+    page_ms = (t3 -. t2) *. 1000.0;
+    total_ms = (t3 -. t0) *. 1000.0;
   })
 
 let token_txs_by_addr_page ?(profile_tag = "") t addr ~limit ~offset =
@@ -1440,28 +1508,23 @@ let txs_by_epoch_full t epoch_id =
        done;
        List.rev !results)
 
-
 let txs_by_address t addr ~limit ~offset =
-  let (_total, all_txids) = Chaindata_index.addr_txids_rev t.index addr ~limit:max_int ~offset:0 in
+  let limit = max 0 limit in
+  let offset = max 0 offset in
+  let page_txids =
+    if limit = 0 then
+      []
+    else
+      snd (Chaindata_index.addr_txids_rev t.index addr ~limit ~offset)
+  in
   let resolved = List.filter_map (fun txid ->
     match read_tx_at_txid t txid with
     | Some (hash, epoch_id, tx_json) -> Some (epoch_id, txid, hash, tx_json)
     | None -> None
-  ) all_txids in
-  let sorted = List.sort (fun (e1, t1, _, _) (e2, t2, _, _) ->
+  ) page_txids in
+  let page = List.sort (fun (e1, t1, _, _) (e2, t2, _, _) ->
     if e1 <> e2 then compare e2 e1 else compare t2 t1
   ) resolved in
-  let rec drop n = function
-    | l when n <= 0 -> l
-    | [] -> []
-    | _ :: tl -> drop (n - 1) tl
-  in
-  let rec take n = function
-    | _ when n <= 0 -> []
-    | [] -> []
-    | h :: tl -> h :: take (n - 1) tl
-  in
-  let page = take limit (drop offset sorted) in
   List.filter_map (fun (epoch_id, _txid, hash, tx_json) ->
     (try
        let j = Yojson.Safe.from_string tx_json in
@@ -1541,6 +1604,7 @@ let get_epoch_summary t epoch_id =
          "state_root", sr;
          "tree_hash", sr;
          "fees_total", j |> member "fees_total";
+         "fees_burned", j |> member "fees_burned";
          "base_reward", j |> member "base_reward";
          "total_reward", j |> member "total_reward";
          "proposer_reward", j |> member "proposer_reward";
@@ -1553,6 +1617,13 @@ let get_epoch_header t epoch_id =
   match Chaindata_index.get_epoch t.index epoch_id with
   | None -> None
   | Some s -> Epochlog.epoch_of_json s
+
+let get_bound_epoch_header t epoch_id =
+  match get_epoch_header t epoch_id, Epochlog.get t.epochlog epoch_id with
+  | None, _ -> Error "epoch not found"
+  | Some _, None -> Error "epoch log entry missing"
+  | Some indexed, Some durable when indexed = durable -> Ok durable
+  | Some _, Some _ -> Error "epoch metadata does not match epoch log"
 
 let list_epoch_ids t =
   Chaindata_index.list_epoch_ids t.index
@@ -1706,9 +1777,7 @@ let read_all_epochs t = Epochlog.read_all t.epochlog
 
 let index t = t.index
 
-
 let txlog t = t.txlog
-
 
 let txlog_position t = Txlog.current_position t.txlog
 
@@ -1726,7 +1795,6 @@ let epochs_empty_after t ~from_epoch ~to_epoch =
       | _ -> false
   in
   loop (from_epoch + 1)
-
 
 let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
                        ~head_epochlog_off ~inflight_start_txid ~inflight_tx_count =

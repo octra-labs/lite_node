@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = int64
 
@@ -29,15 +17,24 @@ let of_seconds seconds =
 
 let to_z value = Z.of_int64 value
 
+let check_candidate ~previous ~candidate =
+  match of_seconds candidate with
+  | Error error -> Error error
+  | Ok candidate_ms ->
+    match previous with
+    | Some previous_ms when candidate_ms < previous_ms ->
+      Error "epoch time is not monotonic"
+    | _ -> Ok candidate_ms
+
 let check ~now ~previous ~candidate =
-  match of_seconds now, of_seconds candidate with
+  match of_seconds now, check_candidate ~previous ~candidate with
   | Error error, _ | _, Error error -> Error error
   | Ok now_ms, Ok candidate_ms ->
     let drift = Int64.abs (Int64.sub candidate_ms now_ms) in
     if drift > max_drift_ms then
       Error "epoch time drift exceeds limit"
     else
-      match previous with
-      | Some previous_ms when candidate_ms < previous_ms ->
-        Error "epoch time is not monotonic"
-      | _ -> Ok candidate_ms
+      Ok candidate_ms
+
+let check_reproposal ~previous ~candidate =
+  check_candidate ~previous ~candidate

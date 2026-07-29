@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 open Lwt.Infix
 
@@ -56,11 +44,6 @@ let int_env env name fallback =
   | Some raw -> parse_int ~default:fallback raw
   | None -> fallback
 
-let float_env env name fallback =
-  match env name with
-  | Some raw -> parse_float ~default:fallback raw
-  | None -> fallback
-
 let string_env env name fallback =
   match env name with
   | Some raw -> raw
@@ -88,7 +71,7 @@ let network_config ~env =
   }
 
 let epoch_duration ~env =
-  float_env env "OCTRA_EPOCH_DURATION" 10.0
+  Epoch_cadence.minimum_seconds_of env
 
 let node_start_messages ~version ~validator ~storage ~store_path
     ~epoch_duration config =
@@ -150,14 +133,16 @@ let validator_pubkeys_boot ~current ~next ~fallback =
   | [] -> fallback
   | validators -> validators
 
-let local_wallet_admission ~validator_env_present ~validators ~wallet_addr
-    ~wallet_pub ~voting_consensus_mode ~consensus_mode =
+let local_wallet_admission ~permissionless ~validator_env_present
+    ~validators ~wallet_addr ~wallet_pub ~voting_consensus_mode
+    ~consensus_mode =
   if not validator_env_present then
     Wallet_admitted
   else
     match List.assoc_opt wallet_addr validators with
-    | None ->
-      if voting_consensus_mode then Missing_voting_validator
+  | None ->
+      if voting_consensus_mode && not permissionless then
+        Missing_voting_validator
       else if consensus_mode then Missing_non_voting_validator
       else Wallet_admitted
     | Some expected_pub when expected_pub <> wallet_pub ->
@@ -165,10 +150,12 @@ let local_wallet_admission ~validator_env_present ~validators ~wallet_addr
       else Pubkey_mismatch_non_voting
     | Some _ -> Wallet_admitted
 
-let admit_local_wallet ~validator_env_present ~validators ~wallet_addr
-    ~wallet_pub ~voting_consensus_mode ~consensus_mode ~role_label ~exit_fatal =
+let admit_local_wallet ~permissionless ~validator_env_present
+    ~validators ~wallet_addr ~wallet_pub ~voting_consensus_mode
+    ~consensus_mode ~role_label ~exit_fatal =
   match
     local_wallet_admission
+      ~permissionless
       ~validator_env_present
       ~validators
       ~wallet_addr
@@ -198,11 +185,12 @@ let admit_local_wallet ~validator_env_present ~validators ~wallet_addr
       wallet_addr
       role_label
 
-let admit_wallet_validators ~validator_env_present ~current ~next ~fallback
-    ~wallet_addr ~wallet_pub ~voting_consensus_mode ~consensus_mode
-    ~role_label ~exit_fatal =
+let admit_wallet_validators ~permissionless ~validator_env_present
+    ~current ~next ~fallback ~wallet_addr ~wallet_pub
+    ~voting_consensus_mode ~consensus_mode ~role_label ~exit_fatal =
   let validators = validator_pubkeys_boot ~current ~next ~fallback in
   admit_local_wallet
+    ~permissionless
     ~validator_env_present
     ~validators
     ~wallet_addr

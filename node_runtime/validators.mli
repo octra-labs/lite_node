@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val entries_of_env_name : string -> string list
 
@@ -20,6 +8,10 @@ val pubkeys_of_entries : string list -> (string * string) list
 val pubkeys_of_env_name_in_order : string -> (string * string) list
 
 val raw32_of_base64 : string -> string option
+
+val parsed_entry : string -> (string * string) option
+
+val entry_errors : label:string -> string list -> string list
 
 val raw_pubkey_of_entry : string -> string option
 

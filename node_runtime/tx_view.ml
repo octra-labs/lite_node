@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Address = Octra_core.Crypto.Address
 module Denomination = Octra_core.Denomination
@@ -20,6 +8,7 @@ module Transaction = Octra_core.Transaction
 module Crypto = Octra_core.Crypto
 module Pvac_registry = Octra_core.Pvac_registry
 module Rpc = Octra_core.Rpc
+module Program_package = Octra_vm.Program_package
 
 let anon = "-"
 
@@ -294,6 +283,7 @@ let has_encrypted_data_marker tx =
   | Transaction.EncryptOp
   | Transaction.DecryptOp
   | Transaction.ContractDeploy -> Option.is_some tx.Transaction.encrypted_data
+  | Transaction.ProgramDeploy -> Option.is_some tx.Transaction.encrypted_data
   | _ -> false
 
 let staging_row ~decode_message tx =
@@ -379,6 +369,8 @@ let submit_rpc_error etype reason =
   | "self_only_operation" -> Rpc.self_only_op reason
   | "unsupported_operation" ->
     Rpc.err 116 "unsupported operation" (Some (`String reason))
+  | "read_only_observer" ->
+    Rpc.err 117 "read-only observer" (Some (`String reason))
   | _ ->
     Rpc.malformed_tx reason
 
@@ -420,6 +412,7 @@ let semantic_check tx =
     if Z.leq tx.Transaction.amount Z.zero then Error "amount must be positive" else Ok ()
   | Transaction.PrivateOp
   | Transaction.ContractDeploy
+  | Transaction.ProgramDeploy
   | Transaction.CircleDeploy
   | Transaction.CircleProgramUpdate
   | Transaction.CircleAssetPut
@@ -441,8 +434,13 @@ let semantic_check tx =
   | Transaction.CircleRelayCancel
   | Transaction.CircleIngressCommit
   | Transaction.ValidatorSetUpdate
-  | Transaction.ValidatorReady ->
+  | Transaction.ValidatorReady
+  | Transaction.ValidatorExit
+  | Transaction.ValidatorWithdraw
+  | Transaction.ValidatorEvidence ->
     if not (Z.equal tx.Transaction.amount Z.zero) then Error "amount must be zero for this operation" else Ok ()
+  | Transaction.ValidatorBond ->
+    if Z.leq tx.Transaction.amount Z.zero then Error "validator bond must be positive" else Ok ()
   | Transaction.ContractCall
   | Transaction.ProgramExec
   | Transaction.CircleCall ->
@@ -466,14 +464,15 @@ let semantic_check tx =
     if Z.leq tx.Transaction.amount Z.zero then Error "amount must be positive for op01_burn" else Ok ()
 
 let staging_submit_admission ~min_ou ~min_relay_fee tx =
+  let required = Z.max min_relay_fee (Transaction.ou_cost tx) in
   match admission_fee_check ~min_ou tx with
   | Error e -> Error e
   | Ok () ->
     match semantic_check tx with
     | Error e -> Error e
     | Ok () ->
-      if Z.lt tx.Transaction.ou min_relay_fee then
-        Error (Printf.sprintf "fee too low (min: %s)" (Z.to_string min_relay_fee))
+      if Z.lt tx.Transaction.ou required then
+        Error (Printf.sprintf "fee too low (min: %s)" (Z.to_string required))
       else Ok ()
 
 type staging_submit_effects = {
@@ -581,13 +580,12 @@ let verify_address_signature ~addr ~pubkey_b64 ~signature_b64 ~msg ~mismatch_err
     match Base64.decode pubkey_b64 with
     | Error _ -> Error "invalid pubkey b64"
     | Ok pub_raw ->
-      match Mirage_crypto_ec.Ed25519.pub_of_octets pub_raw with
-      | Error _ -> Error "invalid pubkey"
-      | Ok pk_ed ->
+      if not (Octra_ed25519.safe pub_raw) then Error "invalid pubkey"
+      else
         match Base64.decode signature_b64 with
         | Error _ -> Error "invalid signature b64"
         | Ok sig_raw ->
-          if Mirage_crypto_ec.Ed25519.verify ~key:pk_ed ~msg sig_raw then Ok ()
+          if Octra_ed25519.verify ~pub:pub_raw ~msg sig_raw then Ok ()
           else Error "signature verification failed"
 
 let staging_remove_auth ~sender ~tx_hash ~signature_b64 ~pubkey_b64 =
@@ -721,6 +719,7 @@ let call_params_ok tx =
   | Transaction.ProgramExec
   | Transaction.MultiExec
   | Transaction.ContractDeploy
+  | Transaction.ProgramDeploy
   | Transaction.CircleCall ->
     begin
       match tx.Transaction.message with
@@ -816,23 +815,33 @@ let preverify_stealth_payload tx =
   | _ -> None
 
 let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
-  match Crypto.FheBalance.load_pubkey_result pubkey_blob with
-  | Error e -> Error e
-  | Ok pk ->
-    let new_enc =
-      match Crypto.FheBalance.ct_sub_encoded pk sender_enc ptd.Crypto.PrivateTransferV4.delta_cipher with
-      | Ok value -> Some value
-      | Error _ -> None in
-    let delta_ok =
-      Crypto.FheBalance.verify_range pk
-        ptd.Crypto.PrivateTransferV4.delta_cipher
-        ptd.Crypto.PrivateTransferV4.range_proof_delta in
-    let balance_ok =
-      match new_enc with
-      | Some value ->
-        Crypto.FheBalance.verify_range pk value ptd.Crypto.PrivateTransferV4.range_proof_balance
-      | None -> false in
-    Ok (delta_ok, balance_ok)
+  let open Lwt.Syntax in
+  let* new_enc =
+    Octra_core.Proof_pool.run (fun () ->
+      match Crypto.FheBalance.load_pubkey_result pubkey_blob with
+      | Error e -> Error e
+      | Ok pk ->
+        Crypto.FheBalance.ct_sub_encoded
+          pk
+          sender_enc
+          ptd.Crypto.PrivateTransferV4.delta_cipher)
+  in
+  match new_enc with
+  | Error e -> Lwt.return_error e
+  | Ok new_enc ->
+    let* delta =
+      Octra_core.Pvac_verify_worker.verify_range
+        ~pubkey:pubkey_blob
+        ~cipher:ptd.Crypto.PrivateTransferV4.delta_cipher
+        ~proof:ptd.Crypto.PrivateTransferV4.range_proof_delta
+    in
+    let* balance =
+      Octra_core.Pvac_verify_worker.verify_range
+        ~pubkey:pubkey_blob
+        ~cipher:new_enc
+        ~proof:ptd.Crypto.PrivateTransferV4.range_proof_balance
+    in
+    Lwt.return_ok (Result.is_ok delta, Result.is_ok balance)
 
 let claim_payload_ok json =
   try
@@ -888,6 +897,9 @@ let encrypted_payload_ok tx =
   | Transaction.KeySwitch, Some json ->
     key_switch_payload_ok json
   | Transaction.KeySwitch, None -> false
+  | Transaction.ProgramDeploy, Some package ->
+    Result.is_ok (Program_package.validate_base64 package)
+  | Transaction.ProgramDeploy, None -> false
   | (Transaction.EncryptOp
     | Transaction.DecryptOp
     | Transaction.StealthOp
@@ -929,10 +941,13 @@ let payload_message_limit limits tx =
   | Transaction.CircleRelayCancel
   | Transaction.CircleIngressCommit
   | Transaction.ContractDeploy
+  | Transaction.ProgramDeploy
   | Transaction.CircleDeploy
   | Transaction.CircleProgramUpdate -> limits.message_program_len
   | Transaction.ValidatorSetUpdate
-  | Transaction.ValidatorReady -> limits.message_validator_len
+  | Transaction.ValidatorReady
+  | Transaction.ValidatorBond
+  | Transaction.ValidatorEvidence -> limits.message_validator_len
   | _ -> limits.message_len
 
 let payload_encrypted_data_limit limits tx =
@@ -980,6 +995,17 @@ let payload_admission ~limits tx =
         Error ("malformed_transaction", "contract call params contain invalid characters")
       else Ok ()
 
+let bft_op_admission ~bft_mode tx =
+  if
+    bft_mode
+    && not
+         (Transaction.bft_consensus_admits_op
+            tx.Transaction.op_type)
+  then
+    Error ("unsupported_operation", Transaction.bft_reject_reason tx.Transaction.op_type)
+  else
+    Ok ()
+
 let pre_route_admission
     ~now
     ~max_timestamp_drift
@@ -993,9 +1019,8 @@ let pre_route_admission
         timestamp_drift (int_of_float max_timestamp_drift))
   else if observer_rpc_mode then
     Error ("read_only_observer", "observer node is read-only")
-  else if bft_mode && not (Transaction.bft_admits_op tx.Transaction.op_type) then
-    Error ("unsupported_operation", Transaction.bft_reject_reason tx.Transaction.op_type)
-  else Ok ()
+  else
+    bft_op_admission ~bft_mode tx
 
 let submission_pubkey ~account_public_key tx =
   match account_public_key, tx.Transaction.public_key with

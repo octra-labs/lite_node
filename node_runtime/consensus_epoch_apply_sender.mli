@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 
@@ -31,6 +19,7 @@ type tx_context = {
   reject :
     ?consume_nonce:bool ->
     ?notify_reason:string ->
+    ?persist_state:bool ->
     string ->
     string ->
     unit Lwt.t;
@@ -156,6 +145,11 @@ val live_tx_sink :
 val nonce_mismatch_reason : expected:int -> got:int -> string
 
 val next_nonce : expected:int -> consume:bool -> int
+
+val savepoint_result :
+  accepted:bool ->
+  persist_state:bool ->
+  (unit, unit) result
 
 val initial_nonce :
   account_nonce:(string -> int option) ->

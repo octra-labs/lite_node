@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type decision =
   | Already_applied
@@ -95,34 +83,6 @@ let rec write_all fd s pos =
     write_all fd s (pos + n)
   end
 
-let write base e =
-  ensure_dir base;
-  let p = path base in
-  let fd = Unix.openfile p [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND] 0o640 in
-  Fun.protect
-    ~finally:(fun () -> Unix.close fd)
-    (fun () ->
-      write_all fd (line e ^ "\n") 0;
-      Unix.fsync fd)
-
-let replace base entries =
-  ensure_dir base;
-  let p = path base in
-  let tmp = p ^ ".tmp" in
-  let fd = Unix.openfile tmp [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o640 in
-  Fun.protect
-    ~finally:(fun () -> Unix.close fd)
-    (fun () ->
-      List.iter (fun e -> write_all fd (line e ^ "\n") 0) entries;
-      Unix.fsync fd);
-  Unix.rename tmp p;
-  (try
-    let dfd = Unix.openfile (dir base) [Unix.O_RDONLY] 0 in
-    Fun.protect
-      ~finally:(fun () -> Unix.close dfd)
-      (fun () -> Unix.fsync dfd)
-   with _ -> ())
-
 let entry_of_json j =
   let open Yojson.Safe.Util in
   let int64 name =
@@ -144,6 +104,65 @@ let entry_of_json j =
     ts = j |> member "ts" |> to_float;
   }
 
+let last_entry_fast base =
+  let p = path base in
+  if not (Sys.file_exists p) then None
+  else
+    let ic = open_in_bin p in
+    Fun.protect
+      ~finally:(fun () -> close_in ic)
+      (fun () ->
+        let length = in_channel_length ic in
+        if length = 0 then None
+        else
+          let window = min length 16384 in
+          let offset = length - window in
+          seek_in ic offset;
+          let tail = really_input_string ic window in
+          let lines = String.split_on_char '\n' tail in
+          let complete =
+            if offset = 0 then lines
+            else
+              match lines with
+              | _ :: rest -> rest
+              | [] -> []
+          in
+          match
+            complete
+            |> List.filter (fun value -> String.trim value <> "")
+            |> List.rev
+          with
+          | value :: _ ->
+            Some (entry_of_json (Yojson.Safe.from_string value))
+          | [] ->
+            failwith "finality log tail exceeds read window")
+
+let same_commitment a b =
+  a.height = b.height
+  && a.proposal_id = b.proposal_id
+  && a.tx_list_hash = b.tx_list_hash
+  && a.state_root = b.state_root
+  && a.creator_addr = b.creator_addr
+  && a.txid_hi = b.txid_hi
+
+let replace base entries =
+  ensure_dir base;
+  let p = path base in
+  let tmp = p ^ ".tmp" in
+  let fd = Unix.openfile tmp [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o640 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () ->
+      List.iter (fun e -> write_all fd (line e ^ "\n") 0) entries;
+      Unix.fsync fd);
+  Unix.rename tmp p;
+  (try
+    let dfd = Unix.openfile (dir base) [Unix.O_RDONLY] 0 in
+    Fun.protect
+      ~finally:(fun () -> Unix.close dfd)
+      (fun () -> Unix.fsync dfd)
+   with _ -> ())
+
 let read base =
   let p = path base in
   if not (Sys.file_exists p) then []
@@ -162,6 +181,67 @@ let read base =
         in
         loop [])
 
+let can_upgrade_catchup_placeholder prior entry =
+  prior.height = entry.height
+  && prior.round = entry.round
+  && prior.txid_hi = -1L
+  && prior.qc_hash = None
+  && entry.creator_addr <> ""
+  && (entry.txid_hi >= 0L || prior.creator_addr = "")
+  && prior.tx_list_hash = entry.tx_list_hash
+  && prior.state_root = entry.state_root
+
+let replace_last base prior entry =
+  match List.rev (read base) with
+  | last :: rest when last = prior ->
+    replace base (List.rev (entry :: rest))
+  | _ ->
+    failwith "finality log changed during replacement"
+
+let check_write base entry =
+  match last_entry_fast base with
+  | Some prior when entry.height < prior.height ->
+    failwith "finality log height regression"
+  | Some prior when entry.height = prior.height ->
+    if not
+         (same_commitment prior entry
+          || can_upgrade_catchup_placeholder prior entry)
+    then
+      failwith "conflicting finality at committed height"
+  | Some _
+  | None ->
+    ()
+
+let write base entry =
+  ensure_dir base;
+  check_write base entry;
+  match last_entry_fast base with
+  | Some prior when same_commitment prior entry ->
+    ()
+  | Some prior when can_upgrade_catchup_placeholder prior entry ->
+    replace_last base prior entry
+  | Some prior when entry.height = prior.height ->
+    failwith "conflicting finality at committed height"
+  | Some _
+  | None ->
+    let p = path base in
+    let fd =
+      Unix.openfile p [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND] 0o640
+    in
+    Fun.protect
+      ~finally:(fun () -> Unix.close fd)
+      (fun () ->
+        write_all fd (line entry ^ "\n") 0;
+        Unix.fsync fd)
+
+let index base =
+  let entries = Hashtbl.create 256 in
+  List.iter (fun entry -> Hashtbl.replace entries entry.height entry) (read base);
+  entries
+
+let find entries height =
+  Hashtbl.find_opt entries height
+
 let drop_after base head =
   let entries = read base in
   let kept = List.filter (fun e -> e.height <= head) entries in
@@ -170,6 +250,24 @@ let drop_after base head =
     replace base kept;
     List.length entries - List.length kept
   end
+
+let drop_uncommitted_after base head =
+  let entries = read base in
+  let tail = List.filter (fun e -> e.height > head) entries in
+  match List.find_opt (fun e -> Option.is_some e.qc_hash) tail with
+  | Some entry ->
+    Error
+      (Printf.sprintf
+         "certified finality above head height = %d head = %d"
+         entry.height
+         head)
+  | None ->
+    let kept = List.filter (fun e -> e.height <= head) entries in
+    if List.length kept = List.length entries then Ok 0
+    else begin
+      replace base kept;
+      Ok (List.length entries - List.length kept)
+    end
 
 let last base =
   match List.rev (read base) with
@@ -213,28 +311,21 @@ let of_finalize f =
     ~ts:f.C_types.header.ts
     ()
 
-let id_of_parts ~height ~prev_state_root ~tx_list_hash ~state_root =
-  Digestif.SHA256.digest_string
-    (string_of_int height ^ prev_state_root ^ tx_list_hash ^ state_root)
-  |> Digestif.SHA256.to_raw_string
-  |> hex
-
-let catchup_id (r : C_codec.catchup_epoch_record) =
-  id_of_parts
-    ~height:(Int64.to_int r.epoch_id)
-    ~prev_state_root:r.prev_state_root
-    ~tx_list_hash:r.tx_list_hash
-    ~state_root:r.state_root
-
-let of_catchup ?qc_hash (r : C_codec.catchup_epoch_record) =
-  make
-    ~height:(Int64.to_int r.epoch_id)
-    ~round:r.commit_round
-    ~proposal_id:(catchup_id r)
-    ~tx_list_hash:(hex r.tx_list_hash)
-    ~state_root:(hex r.state_root)
-    ~creator_addr:r.creator_addr
-    ~txid_hi:(-1L)
-    ?qc_hash
-    ~ts:(Unix.gettimeofday ())
-    ()
+let of_catchup ?qc_hash ~chain_id ~txid_hi
+    (record : C_codec.catchup_epoch_record) =
+  if record.creator_addr = "" then
+    failwith "catchup finality creator is missing";
+  let header : C_types.epoch_header = {
+    proto_version = C_types.proto_version_current;
+    chain_id;
+    epoch_id = record.epoch_id;
+    prev_state_root = record.prev_state_root;
+    tx_list_hash = record.tx_list_hash;
+    receipt_root = record.receipt_root;
+    proposed_state_root = record.state_root;
+    parent_commit_hash = Octra_net.Hash_domain.nil_hash;
+    creator_addr = record.creator_addr;
+    txid_hi;
+    ts = record.epoch_ts;
+  } in
+  of_header ?qc_hash ~round:record.commit_round header

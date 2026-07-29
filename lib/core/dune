@@ -16,12 +16,15 @@
   lmdb
   sqlite3
   irmin-pack.unix
+  mtime mtime.clock.os
   str
   digestif digestif.c
   mirage-crypto mirage-crypto-ec mirage-crypto-rng.unix
   eqaf
   cstruct
   octra_log
+  octra_consensus
+  octra_crypto_guard
   pvac_ffi))
 
 (rule

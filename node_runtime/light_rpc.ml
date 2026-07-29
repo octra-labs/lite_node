@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Ledger = Octra_core.Ledger
 module Rpc = Octra_core.Rpc
@@ -170,15 +158,17 @@ let account_proof_params signer ~store ~head params =
       | Ok proof ->
         ok_lwt proof
 
-let rec collect_epoch_tx_hashes chaindata start_txid tx_count i acc =
-  if i >= tx_count then Some (List.rev acc)
-  else
-    let txid = Int64.add start_txid (Int64.of_int i) in
-    match Octra_core.Store_chaindata.get_tx_by_txid chaindata txid with
-    | None -> None
-    | Some (tx_hash, _) ->
-      collect_epoch_tx_hashes chaindata start_txid tx_count (i + 1)
-        (String.lowercase_ascii tx_hash :: acc)
+let collect_epoch_tx_hashes read_tx ~epoch_id ~start_txid ~tx_count =
+  let rec collect i acc =
+    if i >= tx_count then Some (List.rev acc)
+    else
+      let txid = Int64.add start_txid (Int64.of_int i) in
+      match read_tx txid with
+      | Some (tx_hash, stored_epoch_id, _) when stored_epoch_id = epoch_id ->
+        collect (i + 1) (String.lowercase_ascii tx_hash :: acc)
+      | Some _ | None -> None
+  in
+  collect 0 []
 
 let epoch_proof_of_header ~chain_id h tx_hashes =
   let proof = Octra_consensus.C_light_epoch.{
@@ -197,10 +187,17 @@ let epoch_proof_of_header ~chain_id h tx_hashes =
   else Error "epoch proof verification failed"
 
 let epoch_proof ~chain_id chaindata eid =
-  match Octra_core.Store_chaindata.get_epoch_header chaindata eid with
-  | None -> Error "epoch not found"
-  | Some h ->
-    match collect_epoch_tx_hashes chaindata h.start_txid h.tx_count 0 [] with
+  match Octra_core.Store_chaindata.get_bound_epoch_header chaindata eid with
+  | Error e -> Error e
+  | Ok h ->
+    let tx_hashes =
+      collect_epoch_tx_hashes
+        (Octra_core.Store_chaindata.read_tx_at_txid chaindata)
+        ~epoch_id:eid
+        ~start_txid:h.start_txid
+        ~tx_count:h.tx_count
+    in
+    match tx_hashes with
     | None -> Error "epoch tx list incomplete"
     | Some tx_hashes -> epoch_proof_of_header ~chain_id h tx_hashes
 

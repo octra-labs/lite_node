@@ -1,0 +1,133 @@
+import IOCS01 from "interfaces/IOCS01.aml"
+
+Program Token implements IOCS01 {
+  invariant supply_conserved = sum(balances) == total_supply
+
+  const MAX_U128 = 340282366920938463463374607431768211455
+
+  state {
+    name: string
+    symbol: string
+    total_supply: u128
+    decimals: u64
+    owner: address
+    balances: map[address]u128
+    grants: map[address]map[address]u128
+  }
+
+  event Transfer(from: address, to: address, amount: u128)
+  event Grant(owner: address, spender: address, amount: u128)
+
+  constructor(n: string, s: string, supply: u128, dec: u64) {
+    require(len(n) > 0, "name empty")
+    require(len(n) <= 32, "name too long")
+    require(len(s) > 0, "symbol empty")
+    require(len(s) <= 12, "symbol too long")
+    require(supply > 0, "supply must be positive")
+    require(dec <= 18, "decimals too high")
+    self.name = n
+    self.symbol = s
+    self.total_supply = supply
+    self.decimals = dec
+    self.owner = origin
+    self.balances[origin] = supply
+    emit Transfer(origin, origin, supply)
+  }
+
+  private fn safe_add(left: u128, right: u128): u128 {
+    require(right <= MAX_U128 - left, "u128 overflow")
+    return left + right
+  }
+
+  view fn decimals(): u64 { return self.decimals }
+  view fn balance_of(addr: address): u128 { return self.balances[addr] }
+
+  view fn allowance(owner: address, spender: address): u128 {
+    return self.grants[owner][spender]
+  }
+
+  view fn get_name(): string { return self.name }
+  view fn get_symbol(): string { return self.symbol }
+  view fn get_total_supply(): u128 { return self.total_supply }
+  view fn get_owner(): address { return self.owner }
+
+  view fn can_pull(from: address, spender: address, amt: u128): bool {
+    require(amt > 0, "amount must be positive")
+    if self.grants[from][spender] < amt {
+      return false
+    }
+    return self.balances[from] >= amt
+  }
+
+  fn transfer(to: address, amt: u128): bool {
+    assert_address(to)
+    require(amt > 0, "amount must be positive")
+    require(to != caller, "self transfer disabled")
+    let bal = self.balances[caller]
+    require(bal >= amt, "insufficient balance")
+    let to_bal = self.balances[to]
+    let next_to = safe_add(to_bal, amt)
+    self.balances[caller] = bal - amt
+    self.balances[to] = next_to
+    emit Transfer(caller, to, amt)
+    return true
+  }
+
+  fn grant(spender: address, amt: u128): bool {
+    assert_address(spender)
+    require(spender != caller, "self grant disabled")
+    let current = self.grants[caller][spender]
+    require(current == 0 || amt == 0, "reset grant first")
+    self.grants[caller][spender] = amt
+    emit Grant(caller, spender, amt)
+    return true
+  }
+
+  fn increase_grant(spender: address, added: u128): bool {
+    assert_address(spender)
+    require(spender != caller, "self grant disabled")
+    require(added > 0, "amount must be positive")
+    let current = self.grants[caller][spender]
+    let next = safe_add(current, added)
+    self.grants[caller][spender] = next
+    emit Grant(caller, spender, next)
+    return true
+  }
+
+  fn decrease_grant(spender: address, subtracted: u128): bool {
+    assert_address(spender)
+    require(spender != caller, "self grant disabled")
+    require(subtracted > 0, "amount must be positive")
+    let current = self.grants[caller][spender]
+    require(current >= subtracted, "allowance underflow")
+    let next = current - subtracted
+    self.grants[caller][spender] = next
+    emit Grant(caller, spender, next)
+    return true
+  }
+
+  fn revoke_grant(spender: address): bool {
+    assert_address(spender)
+    self.grants[caller][spender] = 0
+    emit Grant(caller, spender, 0)
+    return true
+  }
+
+  fn pull(from: address, to: address, amt: u128): bool {
+    assert_address(from)
+    assert_address(to)
+    require(amt > 0, "amount must be positive")
+    require(from != to, "self pull disabled")
+    let allowed = self.grants[from][caller]
+    require(allowed >= amt, "not allowed")
+    let bal = self.balances[from]
+    require(bal >= amt, "insufficient balance")
+    let to_bal = self.balances[to]
+    let next_to = safe_add(to_bal, amt)
+    self.balances[from] = bal - amt
+    self.balances[to] = next_to
+    self.grants[from][caller] = allowed - amt
+    emit Transfer(from, to, amt)
+    return true
+  }
+}

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type wallet = {
   address : string;
@@ -54,6 +42,12 @@ val last_epoch_or :
   default:int ->
   Octra_core.Epochlog.epoch_header option ->
   int
+
+val recovery_override_error :
+  consensus_mode:bool ->
+  skip_recovery:bool ->
+  skip_reconcile:bool ->
+  string option
 
 val run_store :
   store_deps ->

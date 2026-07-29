@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Log = Octra_log
 module C_catchup = Octra_consensus.C_catchup
@@ -121,6 +109,7 @@ type validated_record = {
   expected_eic : string;
   expected_txid : int64;
   proposer : Octra_core.Epochlog.proposer_info option;
+  reward : Consensus_reward_attribution.t;
   expected_root : string option;
   apply_action : record_apply_action;
 }
@@ -138,12 +127,16 @@ type apply_point_source = {
 }
 
 type record_apply_deps = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   head_before_record : unit -> int;
+  find_finalized : int -> Octra_consensus.C_types.finalize option;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_expected_root : int -> string -> unit;
   activate_gap : unit -> unit;
   point_source : apply_point_source;
-  write_finality : Octra_consensus.C_codec.catchup_epoch_record -> unit;
+  write_finality : validated_record -> unit;
+  promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
 }
 
@@ -164,6 +157,8 @@ type target_deps = {
 }
 
 type target_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   normalize : source:string -> unit;
   head_epoch : unit -> int;
   env_timeout : unit -> string option;
@@ -172,10 +167,12 @@ type target_wiring = {
   read_apply_root : unit -> string Lwt.t;
   cached_head : unit -> cached_apply_head;
   next_txid : unit -> int64;
+  find_finalized : int -> Octra_consensus.C_types.finalize option;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_expected_root : int -> string -> unit;
   activate_gap : unit -> unit;
-  write_finality : Octra_consensus.C_codec.catchup_epoch_record -> unit;
+  write_finality : validated_record -> unit;
+  promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   read_local_root : unit -> string Lwt.t;
   base_eic : unit -> string;
@@ -198,6 +195,8 @@ type node_deps_wiring = {
 }
 
 type node_target_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   normalize : source:string -> unit;
   head_epoch : unit -> int;
   env_timeout : unit -> string option;
@@ -207,7 +206,8 @@ type node_target_wiring = {
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
   queue : Consensus_catchup_queue.t;
-  write_finality : Octra_consensus.C_codec.catchup_epoch_record -> unit;
+  write_finality : validated_record -> unit;
+  promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   base_eic : unit -> string;
   current_head : unit -> int64;
@@ -220,6 +220,8 @@ type driver_io = {
 }
 
 type driver_runner_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   catchup_active : bool ref;
   queue : Consensus_catchup_queue.t;
   committed_head_epoch : unit -> int;
@@ -229,7 +231,8 @@ type driver_runner_wiring = {
   cached_head : unit -> cached_apply_head;
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
-  write_finality : Octra_consensus.C_codec.catchup_epoch_record -> unit;
+  write_finality : validated_record -> unit;
+  promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   base_eic : unit -> string;
   current_head : unit -> int64;
@@ -241,6 +244,8 @@ type driver_runner_wiring = {
 }
 
 type driver_runner_node_wiring = {
+  chain_id : string;
+  expected_validator_set_hash : int64 -> (string, string) result;
   catchup_active : bool ref;
   queue : Consensus_catchup_queue.t;
   committed_head_epoch : unit -> int;
@@ -250,7 +255,8 @@ type driver_runner_node_wiring = {
   cached_root : unit -> Consensus_driver_read.cached_root;
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
-  write_finality : Octra_consensus.C_codec.catchup_epoch_record -> unit;
+  write_finality : validated_record -> unit;
+  promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   base_eic : unit -> string;
   set_state_attested : head:int -> root:string -> unit;
@@ -462,7 +468,8 @@ let cached_apply_point (source : apply_point_source) =
     ~root:cached.cached_root
     ~eic:cached.cached_eic
 
-let validate_record ~prev_eic ~start_txid ~head_before_record record =
+let validate_record ~chain_id ~expected_validator_set_hash ~prev_eic
+    ~start_txid ~head_before_record record =
   match parse_record_txs record with
   | Error e -> Error e
   | Ok parsed_txs ->
@@ -485,6 +492,19 @@ let validate_record ~prev_eic ~start_txid ~head_before_record record =
               e
           )
         | Ok () ->
+          let reward =
+            match record.Octra_consensus.C_codec.reward_source with
+            | None -> Error "catchup reward source is missing"
+            | Some source ->
+              begin
+                match Consensus_reward_attribution.of_source source with
+                | Error error -> Error error
+                | Ok reward -> Ok reward
+              end
+          in
+          match reward with
+          | Error _ as error -> error
+          | Ok reward ->
           let _, expected_eic =
             Octra_core.Epoch_index_commitment.next_root_from_hashes
               ~prev:prev_eic
@@ -496,16 +516,95 @@ let validate_record ~prev_eic ~start_txid ~head_before_record record =
             Int64.add start_txid
               (Int64.of_int (List.length record.tx_hashes))
           in
-          Ok {
-            record;
-            parsed_txs;
-            parsed_tx_hashes;
-            expected_eic;
-            expected_txid;
-            proposer = proposer_of_record record;
-            expected_root = expected_root_of_record record;
-            apply_action = apply_action_of_record ~head_before_record record;
-          }
+          begin
+            match
+              C_catchup.verify_record_finality
+                ~chain_id
+                ~expected_validator_set_hash
+                ~expected_txid
+                ~record
+            with
+            | Error _ as error -> error
+            | Ok _ ->
+              Ok {
+                record;
+                parsed_txs;
+                parsed_tx_hashes;
+                expected_eic;
+                expected_txid;
+                proposer = proposer_of_record record;
+                reward;
+                expected_root = expected_root_of_record record;
+                apply_action =
+                  apply_action_of_record ~head_before_record record;
+              }
+          end
+
+let bind_finality validated finalized =
+  let record = validated.record in
+  let header = finalized.Octra_consensus.C_types.header in
+  let txid_hi = Int64.pred validated.expected_txid in
+  let same_commitment =
+    finalized.epoch_id = record.epoch_id
+    && header.epoch_id = record.epoch_id
+    && header.prev_state_root = record.prev_state_root
+    && header.proposed_state_root = record.state_root
+    && header.tx_list_hash = record.tx_list_hash
+    && header.receipt_root = record.receipt_root
+    && header.txid_hi = txid_hi
+  in
+  if not same_commitment then
+    Error "catchup finality commitment mismatch"
+  else
+    match
+      Consensus_epoch_apply_proposer.proposer_from_finalized finalized
+    with
+    | None ->
+      Error "catchup finality proposer is missing"
+    | Some proposer ->
+      let reward =
+        match finalized.Octra_consensus.C_types.parent_commit with
+        | None -> Ok validated.reward
+        | Some parent ->
+          begin
+            match Consensus_reward_attribution.of_parent_commit parent with
+            | Error error -> Error error
+            | Ok expected when expected = validated.reward -> Ok expected
+            | Ok _ -> Error "catchup reward source does not match parent commit"
+          end
+      in
+      Result.map
+        (fun reward ->
+          {
+            validated with
+            record = {
+              record with
+              epoch_ts = header.ts;
+              creator_addr = proposer.creator_addr;
+              commit_round = proposer.commit_round;
+            };
+            proposer = Some proposer;
+            reward;
+          })
+        reward
+
+let complete_finality (deps : record_apply_deps) validated =
+  let epoch = Int64.to_int validated.record.epoch_id in
+  match validated.record.finality with
+  | None ->
+    Error "catchup finality metadata is missing"
+  | Some finality ->
+    begin
+      match deps.find_finalized epoch with
+      | Some local
+        when local.Octra_consensus.C_types.proposal_id
+             <> finality.finalize.proposal_id
+             || local.header <> finality.finalize.header ->
+        Error "catchup finality conflicts with local finalize"
+      | Some _
+      | None ->
+        bind_finality validated finality.finalize
+    end
 
 let store_record_metadata (deps : record_apply_deps) validated =
   let record = validated.record in
@@ -559,7 +658,13 @@ let assert_post_apply validated point =
 let apply_validated_record (deps : record_apply_deps) ~head_before_record
     validated =
   let open Lwt.Syntax in
-  let record = validated.record in
+  let validated =
+    match complete_finality deps validated with
+    | Ok completed ->
+      completed
+    | Error error ->
+      failwith error
+  in
   store_record_metadata deps validated;
   match validated.apply_action with
   | Record_retry_moved_head err ->
@@ -568,15 +673,14 @@ let apply_validated_record (deps : record_apply_deps) ~head_before_record
   | Record_skip_applied ->
     let* point = read_apply_point deps.point_source in
     assert_already_applied ~head_before_record validated point;
+    deps.write_finality validated;
+    deps.promote_finality validated;
     Lwt.return_unit
   | Record_apply ->
-    if validated.proposer = None then
-      Log.warn "catchup"
-        "event = record_missing_proposer epoch = %Ld fallback = finalized_header"
-        record.epoch_id;
-    deps.write_finality record;
+    deps.write_finality validated;
     let* () = deps.apply_record validated in
     assert_post_apply validated (cached_apply_point deps.point_source);
+    deps.promote_finality validated;
     Lwt.return_unit
 
 let apply_chunk_records (deps : record_apply_deps) ~prev_eic ~start_txid chunk =
@@ -590,7 +694,17 @@ let apply_chunk_records (deps : record_apply_deps) ~prev_eic ~start_txid chunk =
           (fun record ->
             let head_before_record = deps.head_before_record () in
             let validated =
+              let expected_validator_set_hash =
+                match
+                  deps.expected_validator_set_hash
+                    record.Octra_consensus.C_codec.epoch_id
+                with
+                | Ok hash -> hash
+                | Error error -> failwith error
+              in
               match validate_record
+                      ~chain_id:deps.chain_id
+                      ~expected_validator_set_hash
                       ~prev_eic:!expected_eic
                       ~start_txid:!expected_txid
                       ~head_before_record
@@ -840,12 +954,16 @@ let target_of_wiring (wiring : target_wiring) =
     next_txid = wiring.next_txid;
   } in
   let record_apply = {
+    chain_id = wiring.chain_id;
+    expected_validator_set_hash = wiring.expected_validator_set_hash;
     head_before_record = wiring.head_epoch;
+    find_finalized = wiring.find_finalized;
     put_proposer = wiring.put_proposer;
     put_expected_root = wiring.put_expected_root;
     activate_gap = wiring.activate_gap;
     point_source;
     write_finality = wiring.write_finality;
+    promote_finality = wiring.promote_finality;
     apply_record = wiring.apply_record;
   } in
   {
@@ -898,6 +1016,8 @@ let node_deps (wiring : node_deps_wiring) =
 
 let target_wiring_of_node (wiring : node_target_wiring) =
   {
+    chain_id = wiring.chain_id;
+    expected_validator_set_hash = wiring.expected_validator_set_hash;
     normalize = wiring.normalize;
     head_epoch = wiring.head_epoch;
     env_timeout = wiring.env_timeout;
@@ -906,12 +1026,14 @@ let target_wiring_of_node (wiring : node_target_wiring) =
     read_apply_root = wiring.read_local_root;
     cached_head = wiring.cached_head;
     next_txid = wiring.next_txid;
+    find_finalized = wiring.finality.find_finalized;
     put_proposer = wiring.finality.store_proposer;
     put_expected_root = (fun epoch root ->
       wiring.finality.store_expected_root ~epoch ~root);
     activate_gap = (fun () ->
       Consensus_catchup_queue.activate_gap wiring.queue);
     write_finality = wiring.write_finality;
+    promote_finality = wiring.promote_finality;
     apply_record = wiring.apply_record;
     read_local_root = wiring.read_local_root;
     base_eic = wiring.base_eic;
@@ -945,6 +1067,8 @@ let cached_apply_head_of_driver_root root =
 
 let driver_runner_wiring_of_node wiring =
   {
+    chain_id = wiring.chain_id;
+    expected_validator_set_hash = wiring.expected_validator_set_hash;
     catchup_active = wiring.catchup_active;
     queue = wiring.queue;
     committed_head_epoch = wiring.committed_head_epoch;
@@ -956,6 +1080,7 @@ let driver_runner_wiring_of_node wiring =
     next_txid = wiring.next_txid;
     finality = wiring.finality;
     write_finality = wiring.write_finality;
+    promote_finality = wiring.promote_finality;
     apply_record = wiring.apply_record;
     base_eic = wiring.base_eic;
     current_head = (fun () ->
@@ -986,6 +1111,8 @@ let node_deps_of_driver_runner (wiring : driver_runner_wiring) io =
 let target_wiring_of_driver_runner (wiring : driver_runner_wiring) io =
   target_wiring_of_node
     {
+      chain_id = wiring.chain_id;
+      expected_validator_set_hash = wiring.expected_validator_set_hash;
       normalize = wiring.normalize;
       head_epoch = wiring.committed_head_epoch;
       env_timeout = wiring.env_timeout;
@@ -996,6 +1123,7 @@ let target_wiring_of_driver_runner (wiring : driver_runner_wiring) io =
       finality = wiring.finality;
       queue = wiring.queue;
       write_finality = wiring.write_finality;
+      promote_finality = wiring.promote_finality;
       apply_record = wiring.apply_record;
       base_eic = wiring.base_eic;
       current_head = wiring.current_head;

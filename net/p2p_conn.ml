@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type peer_id = string
 
@@ -29,9 +17,13 @@ type t = {
   mutable msg_count_in : int;
   mutable msg_count_out : int;
   mutable last_seen : float;
+  frame_budget : P2p_frame_budget.t;
 }
 
 let read_idle_timeout_s = 60.0
+
+let monotonic_seconds () =
+  Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.0
 
 let create fd ~peer_id ~addr ~direction = {
   fd;
@@ -43,35 +35,50 @@ let create fd ~peer_id ~addr ~direction = {
   msg_count_in = 0;
   msg_count_out = 0;
   last_seen = Unix.gettimeofday ();
+  frame_budget = P2p_frame_budget.create ~now:(monotonic_seconds ());
 }
 
 let is_connected t = t.connected
 
 let log_conn addr fmt =
   Printf.ksprintf
-    (fun msg -> Octra_log.stdout "component = p2p conn = %s %s\n%!" addr msg)
+    (fun msg -> Octra_log.info "p2p" "conn = %s %s" addr msg)
+    fmt
+
+let trace_conn addr fmt =
+  Printf.ksprintf
+    (fun msg -> Octra_log.trace "p2p" "conn = %s %s" addr msg)
     fmt
 
 let err_conn addr fmt =
   Printf.ksprintf
-    (fun msg -> Octra_log.stderr "component = p2p conn = %s %s\n%!" addr msg)
+    (fun msg -> Octra_log.warn "p2p" "conn = %s %s" addr msg)
     fmt
+
+let expected_disconnect = function
+  | End_of_file
+  | Unix.Unix_error (Unix.EBADF, _, _)
+  | Unix.Unix_error (Unix.ECONNRESET, _, _)
+  | Unix.Unix_error (Unix.EPIPE, _, _)
+  | Unix.Unix_error (Unix.ENOTCONN, _, _) -> true
+  | Failure reason when String.equal reason "connection_closed" -> true
+  | _ -> false
 
 let close t =
   if t.connected then begin
     t.connected <- false;
     (try Lwt_unix.shutdown t.fd Lwt_unix.SHUTDOWN_ALL with _ -> ());
-    Lwt_unix.close t.fd
+    Lwt.catch
+      (fun () -> Lwt_unix.close t.fd)
+      (fun _ -> Lwt.return_unit)
   end else
     Lwt.return_unit
-
 
 let send t (frame : P2p_frame.frame) =
   if t.connected then
     Lwt_mvar.put t.write_queue frame
   else
     Lwt.return_unit
-
 
 let write_loop t =
   let open Lwt.Syntax in
@@ -86,12 +93,16 @@ let write_loop t =
             let* () = P2p_frame.write_frame t.fd frame in
             t.msg_count_out <- t.msg_count_out + 1;
             loop ())
-          (fun _exn ->
+          (fun exn ->
+            let error = Printexc.to_string exn in
+            if expected_disconnect exn then
+              trace_conn t.addr "event = disconnected reason = %s" error
+            else
+              err_conn t.addr "event = write_loop_error error = %s" error;
             let* () = close t in
             Lwt.return_unit)
   in
   loop ()
-
 
 let read_loop t ~on_message =
   let open Lwt.Syntax in
@@ -101,17 +112,26 @@ let read_loop t ~on_message =
       Lwt.catch
         (fun () ->
           let* frame = P2p_frame.read_frame ~timeout_s:read_idle_timeout_s t.fd in
-          t.msg_count_in <- t.msg_count_in + 1;
-          t.last_seen <- Unix.gettimeofday ();
-          let* () = on_message t frame in
-          loop ())
+          let budget_now = monotonic_seconds () in
+          match P2p_frame_budget.admit t.frame_budget ~now:budget_now
+            ~msg_type:frame.msg_type ~bytes:(String.length frame.payload) with
+          | P2p_frame_budget.Drop reason ->
+            Lwt.fail (Failure reason)
+          | P2p_frame_budget.Accept ->
+            t.msg_count_in <- t.msg_count_in + 1;
+            t.last_seen <- Unix.gettimeofday ();
+            let* () = on_message t frame in
+            loop ())
         (fun exn ->
-          err_conn t.addr "event = read_loop_error error = %s" (Printexc.to_string exn);
+          let error = Printexc.to_string exn in
+          if expected_disconnect exn then
+            trace_conn t.addr "event = disconnected reason = %s" error
+          else
+            err_conn t.addr "event = read_loop_error error = %s" error;
           let* () = close t in
           Lwt.return_unit)
   in
   loop ()
-
 
 let start t ~on_message =
   log_conn t.addr "event = start_loops";

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type domain =
   | Legacy_epoch
@@ -23,6 +11,7 @@ let consensus_types = [
   Octra_net.P2p_frame.msg_cons_propose;
   Octra_net.P2p_frame.msg_cons_vote;
   Octra_net.P2p_frame.msg_cons_finalize;
+  Octra_net.P2p_frame.msg_cons_round_sync;
   Octra_net.P2p_frame.msg_query_epoch_root;
   Octra_net.P2p_frame.msg_epoch_root_response;
   Octra_net.P2p_frame.msg_query_bundle;
@@ -31,9 +20,11 @@ let consensus_types = [
   Octra_net.P2p_frame.msg_catchup_range_response;
   Octra_net.P2p_frame.msg_query_catchup_range_v2;
   Octra_net.P2p_frame.msg_catchup_range_response_v2;
+  Octra_net.P2p_frame.msg_resource_attestation;
+  Octra_net.P2p_frame.msg_vote_evidence;
 ]
 
-let legacy_epoch_broadcast = 0x40
+let legacy_epoch_broadcast = Octra_net.P2p_frame.msg_epoch_broadcast
 
 let is_consensus t =
   List.exists (( = ) t) consensus_types

@@ -1,21 +1,11 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type lane =
   | Standard
+  | Program_deploy
   | Program
+  | Circle_compute
   | Circle_metadata
   | Circle_assets
   | Pvac
@@ -48,7 +38,9 @@ let zero = {
 
 let to_string = function
   | Standard -> "standard"
+  | Program_deploy -> "program_deploy"
   | Program -> "program"
+  | Circle_compute -> "circle_compute"
   | Circle_metadata -> "circle_metadata"
   | Circle_assets -> "circle_assets"
   | Pvac -> "pvac"
@@ -56,7 +48,9 @@ let to_string = function
 
 let all = [
   Standard;
+  Program_deploy;
   Program;
+  Circle_compute;
   Circle_metadata;
   Circle_assets;
   Pvac;
@@ -67,13 +61,18 @@ let of_op = function
   | Transaction.Standard
   | Transaction.ValidatorSetUpdate
   | Transaction.ValidatorReady
+  | Transaction.ValidatorBond
+  | Transaction.ValidatorExit
+  | Transaction.ValidatorWithdraw
+  | Transaction.ValidatorEvidence
   | Transaction.Op01Burn -> Standard
   | Transaction.ContractDeploy
   | Transaction.ContractCall
   | Transaction.ProgramExec
   | Transaction.MultiExec
-  | Transaction.ContractUpgrade
-  | Transaction.CircleCall -> Program
+  | Transaction.ContractUpgrade -> Program
+  | Transaction.ProgramDeploy -> Program_deploy
+  | Transaction.CircleCall -> Circle_compute
   | Transaction.CircleAssetPut
   | Transaction.CircleAssetPutEncrypted
   | Transaction.CircleSealedSlotPut -> Circle_assets
@@ -109,11 +108,23 @@ let default_budget = function
     max_ou = Z.of_int 2_000_000;
     max_proof = 0;
   }
+  | Program_deploy -> {
+    max_txs = 1;
+    max_bytes = 4 * 1_024 * 1_024;
+    max_ou = Z.of_int 5_000_000;
+    max_proof = 0;
+  }
   | Program -> {
     max_txs = 128;
     max_bytes = 4 * 1_024 * 1_024;
     max_ou = Z.of_int 10_000_000;
-    max_proof = 0;
+    max_proof = 16;
+  }
+  | Circle_compute -> {
+    max_txs = 1;
+    max_bytes = 4 * 1_024 * 1_024;
+    max_ou = Z.of_int 20_000_000;
+    max_proof = 1;
   }
   | Circle_metadata -> {
     max_txs = 256;
@@ -141,9 +152,17 @@ let default_budget = function
   }
 
 let proof_cost op =
-  match of_op op with
+  match op with
+  | Transaction.CircleCall -> 1
+  | _ ->
+    match of_op op with
   | Pvac | Fhe -> 1
-  | Standard | Program | Circle_metadata | Circle_assets -> 0
+  | Standard
+  | Program_deploy
+  | Program
+  | Circle_compute
+  | Circle_metadata
+  | Circle_assets -> 0
 
 let tx_bytes tx =
   tx
@@ -151,10 +170,17 @@ let tx_bytes tx =
   |> Yojson.Safe.to_string
   |> String.length
 
+let compute_ou tx =
+  match of_op tx.Transaction.op_type with
+  | Program_deploy -> Transaction.ou_cost tx
+  | Program | Circle_compute -> tx.Transaction.ou
+  | Standard | Circle_metadata | Circle_assets | Pvac | Fhe ->
+    Transaction.ou_cost tx
+
 let cost tx = {
   txs = 1;
   bytes = tx_bytes tx;
-  ou = Transaction.ou_cost tx;
+  ou = compute_ou tx;
   proof = proof_cost tx.Transaction.op_type;
 }
 

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
 module C_types = Octra_consensus.C_types
@@ -108,6 +96,7 @@ let parse_header ~default_chain_id json =
     tx_list_hash = raw32_field json "tx_list_hash";
     receipt_root = receipt_root_field json;
     proposed_state_root = raw32_field json "proposed_state_root";
+    parent_commit_hash = raw32_field json "parent_commit_hash";
     creator_addr = json |> U.member "creator_addr" |> U.to_string;
     txid_hi = int64_field json "txid_hi";
     ts = float_field json "ts" 0.0;
@@ -151,6 +140,7 @@ let finalize (header : C_types.epoch_header) commit_round =
     header;
     proposal_id = Octra_consensus.C_hash.proposal_id header;
     precommits = [];
+    parent_commit = None;
   }
 
 let build_plan ~(header : C_types.epoch_header) ~commit_round ~txs =

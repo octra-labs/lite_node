@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Commit = Consensus_epoch_apply_commit
 module Cleanup = Consensus_epoch_cleanup
@@ -87,6 +75,7 @@ type node_effects = {
 
 type node_input = {
   now : float;
+  epoch_ts : float;
   consensus_mode : bool;
   layera_diag : bool;
   replay_trace : bool;
@@ -107,6 +96,7 @@ type node_input = {
   prev_supply : Z.t;
   emission_remaining : Z.t;
   reward_recipients : Octra_core.Epochlog.reward_recipient list;
+  reward_source : Octra_consensus.C_types.reward_source;
   epoch_receipts_json : string list;
   active_validators : string list;
   processed_hashes : string list;
@@ -115,15 +105,16 @@ type node_input = {
   short : string -> string;
 }
 
-let input_of_finalized ~now ~consensus_mode ~trace ~pre_state_hash
+let input_of_finalized ~now ~epoch_ts ~consensus_mode ~trace ~pre_state_hash
     ~pre_consensus_root ~proposer_addr ~proposer_info ~proposer_source ~round
     ~validators ~validators_sha ~ordered_txs_count ~confirmed_txs
     ~confirmed_fees ~epoch_receipts_json ~active_validators ~processed_hashes
-    ~producer ~short (finalized : Finalize.result) =
+    ~reward_source ~producer ~short (finalized : Finalize.result) =
   let reward_meta = finalized.reward_meta in
   let tree = finalized.tree in
   {
     now;
+    epoch_ts;
     consensus_mode;
     layera_diag = trace.Footer.layera;
     replay_trace = trace.Footer.replay;
@@ -144,6 +135,7 @@ let input_of_finalized ~now ~consensus_mode ~trace ~pre_state_hash
     prev_supply = reward_meta.Footer.prev_supply;
     emission_remaining = reward_meta.Footer.emission_remaining;
     reward_recipients = finalized.reward_recipients;
+    reward_source;
     epoch_receipts_json;
     active_validators;
     processed_hashes;
@@ -203,6 +195,7 @@ let node_effects refs effects input =
           })
           {
             epoch_id;
+            epoch_ts = input.epoch_ts;
             current_epoch;
             consensus_mode = input.consensus_mode;
             layera_diag = input.layera_diag;
@@ -225,6 +218,7 @@ let node_effects refs effects input =
             prev_supply = input.prev_supply;
             emission_remaining = input.emission_remaining;
             reward_recipients = input.reward_recipients;
+            reward_source = input.reward_source;
             epoch_receipts_json = input.epoch_receipts_json;
             account_addrs = input.proposer_addr :: input.active_validators;
             short = input.short;

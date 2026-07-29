@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type decision =
   | Confirmed_elsewhere of {
@@ -28,6 +16,19 @@ type decision =
       quorum : int;
     }
 
+type recovered = {
+  proposal : Octra_consensus.C_types.propose;
+  vote : Octra_consensus.C_types.vote;
+  tx_hashes : string list;
+  txs : Octra_core.Transaction.t list;
+  receipts_json : string list;
+}
+
+type restore_result =
+  | Restored
+  | Legacy
+  | Invalid of string
+
 val raw32_of_hex : string -> string option
 
 val decide :
@@ -37,6 +38,12 @@ val decide :
   Octra_consensus.C_driver.epoch_root_response_record list ->
   decision
 
+val recover_record :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  Octra_core.Wal.pending_commit ->
+  (recovered, string) result
+
 type deps = {
   read_pending_commits : unit -> Octra_core.Wal.pending_commit list;
   head_epoch : unit -> int;
@@ -45,6 +52,7 @@ type deps = {
     Octra_consensus.C_driver.epoch_root_response_record list Lwt.t;
   run_catchup_to_target : target_epoch:int64 -> reason:string -> unit Lwt.t;
   delete_pending_commit : epoch_id:int -> round:int -> unit;
+  restore_pending : Octra_core.Wal.pending_commit -> restore_result;
 }
 
 type 'driver driver_runtime = {
@@ -60,6 +68,10 @@ type 'driver driver_runtime = {
     reason:string ->
     unit Lwt.t;
   delete_pending_commit : epoch_id:int -> round:int -> unit;
+  restore_pending :
+    'driver ->
+    Octra_core.Wal.pending_commit ->
+    restore_result;
   validator_count : int;
   peer_quorum : int;
 }
@@ -72,6 +84,14 @@ type node_driver_runtime = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
+  chain_id : string;
+  validator_set : Octra_consensus.C_types.validator_set;
+  store_bundle :
+    proposal_id:string ->
+    tx_hashes:string list ->
+    txs:Octra_core.Transaction.t list ->
+    receipts_json:string list ->
+    unit;
   validator_count : int;
   quorum : int;
 }
@@ -82,6 +102,7 @@ val driver_runtime :
   query_epoch_root:('driver -> epoch_id:int64 -> Octra_consensus.C_driver.epoch_root_response_record list Lwt.t) ->
   run_catchup_to_target:('driver -> target_epoch:int64 -> reason:string -> unit Lwt.t) ->
   delete_pending_commit:(epoch_id:int -> round:int -> unit) ->
+  restore_pending:('driver -> Octra_core.Wal.pending_commit -> restore_result) ->
   validator_count:int ->
   quorum:int ->
   'driver driver_runtime
@@ -103,9 +124,9 @@ val run_once :
   deps ->
   validator_count:int ->
   peer_quorum:int ->
-  unit Lwt.t
+  bool Lwt.t
 
 val run_with_driver :
   'driver driver_runtime ->
   'driver ->
-  unit Lwt.t
+  bool Lwt.t

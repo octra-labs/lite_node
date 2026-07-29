@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type atomic_deps = {
   skip_recovery : unit -> bool;
@@ -46,7 +34,7 @@ let marker_label = function
 let log_recovery r =
   if r.Octra_core.Startup_recovery.index_repaired > 0 then
     Octra_log.warn "init"
-      "STARTUP RECOVERY: marker_phase=%s repaired=%d txlog_last=%d irmin_last=%d->%d boundary_ok=%b"
+      "event = startup_recovery status = repaired marker_phase = %s repaired = %d txlog_last = %d irmin_before = %d irmin_after = %d boundary_ok = %b"
       (marker_label r.marker_phase)
       r.index_repaired
       r.txlog_last_epoch
@@ -55,21 +43,23 @@ let log_recovery r =
       r.boundary_ok
   else
     Octra_log.info "init"
-      "STARTUP RECOVERY: clean state (txlog_last = %d irmin_last = %d marker=%s)"
+      "event = startup_recovery status = clean txlog_last = %d irmin_last = %d marker = %s"
       r.txlog_last_epoch
       r.irmin_last_epoch_after
       (marker_label r.marker_phase)
 
 let run_atomic_recovery deps =
   if deps.skip_recovery () then
-    Octra_log.warn "init" "OCTRA_SKIP_RECOVERY = 1 - atomic startup recovery DISABLED"
+    Octra_log.warn "init"
+      "event = startup_recovery status = disabled env = OCTRA_SKIP_RECOVERY"
   else begin
     let recovery = deps.run_recovery () in
     log_recovery recovery;
     let post_recovery_txlog_seg, post_recovery_txlog_off =
       deps.txlog_position ()
     in
-    Octra_log.info "init" "txlog post-recovery current_seg = %d current_off = %d"
+    Octra_log.info "init"
+      "event = txlog_position phase = post_recovery seg = %d off = %d"
       post_recovery_txlog_seg post_recovery_txlog_off;
     deps.set_total_tx_count (deps.tx_count ())
   end
@@ -89,7 +79,10 @@ let reconciliation ~irmin_last_epoch ~chain_last_epoch ~skip_reconcile =
     }
 
 let log_mismatch ~irmin_last_epoch ~chain_last_epoch =
-  Octra_log.stderr "[INIT FATAL] REFUSING TO START\n";
+  Octra_log.fatal "init"
+    "event = storage_boundary_mismatch irmin_last = %d chaindata_last = %d action = refuse_start hint = restore_snapshot_or_replay"
+    irmin_last_epoch
+    chain_last_epoch
 
 let run_reconciliation deps =
   match reconciliation
@@ -97,12 +90,11 @@ let run_reconciliation deps =
           ~chain_last_epoch:(deps.chain_last_epoch ())
           ~skip_reconcile:(deps.skip_reconcile ()) with
   | Reconciled epoch ->
-    Octra_log.info "init" "RECONCILIATION OK: both epoch boundaries at %d" epoch
+    Octra_log.info "init" "event = reconciliation status = ok epoch = %d" epoch
   | Reconciliation_skipped { irmin_last_epoch; chain_last_epoch } ->
     Octra_log.warn "init"
-      "RECONCILIATION SKIPPED via OCTRA_SKIP_RECONCILE = 1 (irmin = %d chain = %d)"
-      irmin_last_epoch chain_last_epoch;
-    Octra_log.warn "init" "OPERATOR has accepted responsibility for the mismatch"
+      "event = reconciliation status = skipped irmin_last = %d chain_last = %d env = OCTRA_SKIP_RECONCILE"
+      irmin_last_epoch chain_last_epoch
   | Reconciliation_mismatch { irmin_last_epoch; chain_last_epoch } ->
     log_mismatch ~irmin_last_epoch ~chain_last_epoch;
     deps.exit_fatal ()

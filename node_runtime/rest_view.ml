@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Denomination = Octra_core.Denomination
 module Head_manifest = Octra_core.Head_manifest
@@ -528,7 +516,7 @@ let op_type_of_params params =
   | Ok t -> t
   | Error _ -> Transaction.Standard
 
-let circle_asset_wire_hint params =
+let payload_wire_hint params =
   match params with
   | `List [_; (`Int _ | `Intlit _ | `String _ as value)] -> read_nonnegative_int value
   | `List [_; `Assoc fields] ->
@@ -567,11 +555,18 @@ let base_fee op_type wire_hint tx =
     | Transaction.CircleBalanceCellPut
     | Transaction.CircleRegisterCellPut), Some wire_len ->
     Transaction.circle_asset_min_ou_from_wire_len wire_len
+  | Transaction.ProgramDeploy, Some wire_len ->
+    Transaction.program_deploy_min_ou_from_wire_len wire_len
   | _ -> Transaction.ou_cost tx
 
 let usage_fee base_fee usage_pct =
   if usage_pct < 50 then base_fee
   else if usage_pct < 80 then Z.mul base_fee (Z.of_int 2)
+  else Z.mul base_fee (Z.of_int 5)
+
+let minimum_fee base_fee usage_pct =
+  if usage_pct < 80 then base_fee
+  else if usage_pct < 95 then Z.mul base_fee (Z.of_int 2)
   else Z.mul base_fee (Z.of_int 5)
 
 let recommended_fee ~stealth_class ~stealth_floor ~jitter ~usage_recommended =
@@ -593,9 +588,9 @@ let recommended_fee_response ~params ~is_heavy ~stealth_floor ~jitter ~staging_o
     ~capacity ~usage_pct ~staging_size =
   let op_type = op_type_of_params params in
   let tx = base_tx op_type in
-  let wire_hint = circle_asset_wire_hint params in
+  let wire_hint = payload_wire_hint params in
   let base_fee = base_fee op_type wire_hint tx in
-  let min_fee = Staging.min_relay_fee tx in
+  let min_fee = minimum_fee base_fee usage_pct in
   let stealth_class = is_heavy tx in
   let usage_recommended = usage_fee base_fee usage_pct in
   let recommended =

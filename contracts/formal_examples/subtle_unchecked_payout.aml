@@ -1,0 +1,18 @@
+contract SubtleUncheckedPayout {
+  state {
+    balances: map[address]u128
+  }
+
+  constructor(supply: u128) {
+    self.balances[origin] = supply
+  }
+
+  fn withdraw(amount: u128): bool {
+    require(amount > 0, "amount must be positive")
+    let bal = self.balances[caller]
+    require(bal >= amount, "insufficient balance")
+    self.balances[caller] = bal - amount
+    transfer(caller, amount)
+    return true
+  }
+}

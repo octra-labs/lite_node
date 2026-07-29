@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type effect =
   | Memory_read
@@ -30,8 +18,22 @@ type t = effect list
 let of_instr = function
   | Contract_vm.MLOAD _ | Contract_vm.MLOADR _ -> Some Memory_read
   | Contract_vm.MSTORE _ | Contract_vm.MSTORER _ -> Some Memory_write
-  | Contract_vm.SLOAD _ | Contract_vm.SLOADK _ -> Some Storage_read
-  | Contract_vm.SSTORE _ | Contract_vm.SSTOREK _ | Contract_vm.SDEL _ | Contract_vm.SDELK _ -> Some Storage_write
+  | Contract_vm.SLOAD _
+  | Contract_vm.SLOADK _
+  | Contract_vm.SKEYS _
+  | Contract_vm.SKEYS_PAGE _
+  | Contract_vm.SLOADN _
+  | Contract_vm.FLOAD _
+  | Contract_vm.OBJECT_MEMBER_COUNT _
+  | Contract_vm.OBJECT_HAS_MEMBER _
+  | Contract_vm.OBJECT_MEMBER_REF_AT _ -> Some Storage_read
+  | Contract_vm.SSTORE _
+  | Contract_vm.SSTOREK _
+  | Contract_vm.SDEL _
+  | Contract_vm.SDELK _
+  | Contract_vm.SSTOREN _
+  | Contract_vm.FSTORE _
+  | Contract_vm.OBJECT_TRANSITION_APPLY _ -> Some Storage_write
   | Contract_vm.XCALL _ | Contract_vm.CALL_INT _ -> Some Call
   | Contract_vm.SPAWN _ | Contract_vm.SPAWN2 _ -> Some Deploy
   | Contract_vm.TRANSFER _ -> Some Transfer

@@ -1,17 +1,5 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
   db : Sqlite3.db;
@@ -52,7 +40,7 @@ let exec db sql =
   match Sqlite3.exec db sql with
   | Sqlite3.Rc.OK -> ()
   | rc ->
-    Octra_log.stdout "error [storage] sql err = %s msg = %s\n%!"
+    Octra_log.error "storage" "event = sql_error rc = %s message = %s"
       (Sqlite3.Rc.to_string rc) (Sqlite3.errmsg db)
 
 let create_schema db =
@@ -125,7 +113,6 @@ let create_schema db =
      timestamp REAL NOT NULL,\
      tx_json TEXT NOT NULL,\
      FOREIGN KEY(epoch_id) REFERENCES epochs(id))";
-
 
     "CREATE TABLE IF NOT EXISTS pending_private_transfers(\
      id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -219,11 +206,15 @@ let create_schema db =
      | Sqlite3.Rc.OK ->
        n_purged := Sqlite3.changes db;
        if !n_purged > 0 then
-         Octra_log.stdout "info [migration] v4.2: purged ALL %d encrypted balance(s) + allowance → 0 (one-time reset)\n%!" !n_purged
+         Octra_log.info "migration"
+           "event = legacy_cipher_purge version = 4.2 count = %d"
+           !n_purged
        else
-         Octra_log.stdout "info [migration] v4.2: no encrypted balances to purge\n%!"
+         Octra_log.info "migration"
+           "event = legacy_cipher_purge version = 4.2 count = 0"
      | rc ->
-       Octra_log.stdout "warn [migration] v4.2 enc_balance purge returned %s\n%!"
+       Octra_log.warn "migration"
+         "event = legacy_cipher_purge_failed version = 4.2 rc = %s"
          (Sqlite3.Rc.to_string rc));
 
     (match Sqlite3.exec db
@@ -235,7 +226,9 @@ let create_schema db =
      | Sqlite3.Rc.OK ->
        let n_da = Sqlite3.changes db in
        if n_da > 0 then
-         Octra_log.stdout "info [migration] v4.2: reset %d stale decrypt_allowance(s) → 0\n%!" n_da
+         Octra_log.info "migration"
+           "event = decrypt_allowance_reset version = 4.2 count = %d"
+           n_da
      | _ -> ());
 
     (match Sqlite3.exec db
@@ -243,7 +236,8 @@ let create_schema db =
      with
      | Sqlite3.Rc.OK -> ()
      | rc ->
-       Octra_log.stdout "warn [migration] failed to mark enc_purge_v43: %s\n%!"
+       Octra_log.warn "migration"
+         "event = marker_write_failed marker = enc_purge_v43 rc = %s"
          (Sqlite3.Rc.to_string rc))
   end
 
@@ -291,7 +285,8 @@ let exec_tx storage sql =
   match Sqlite3.exec storage.db sql with
   | Sqlite3.Rc.OK -> ()
   | rc ->
-    Octra_log.stdout "error [storage] %s failed rc = %s msg = %s\n%!"
+    Octra_log.error "storage"
+      "event = transaction_sql_failed statement = %s rc = %s message = %s"
       sql (Sqlite3.Rc.to_string rc) (Sqlite3.errmsg storage.db)
 
 let begin_transaction s = exec_tx s "BEGIN IMMEDIATE TRANSACTION"
@@ -337,7 +332,6 @@ let close s =
   List.iter (fun stmt -> Sqlite3.finalize stmt |> ignore) (all_stmts s);
   Sqlite3.db_close s.db |> ignore
 
-
 let reset_all_stmts s =
   List.iter (fun stmt -> Sqlite3.reset stmt |> ignore) (all_stmts s)
 
@@ -358,16 +352,22 @@ let wal_checkpoint s =
     if attempt > 3 then begin
       let (_, wp, dp) = try_checkpoint s "PASSIVE" in
       if wp > 0 then
-        Octra_log.stdout "warn [wal] TRUNCATE failed 3x, PASSIVE: %d/%d pages\n%!" dp wp
+        Octra_log.warn "wal"
+          "event = checkpoint_fallback completed_pages = %d wal_pages = %d"
+          dp wp
     end else
       let (busy, wp, dp) = try_checkpoint s "TRUNCATE" in
       if busy then begin
-        Octra_log.stdout "warn [wal] TRUNCATE busy (attempt %d/3, wal=%d done=%d)\n%!" attempt wp dp;
+        Octra_log.warn "wal"
+          "event = checkpoint_busy attempt = %d wal_pages = %d completed_pages = %d"
+          attempt wp dp;
         Unix.sleepf 0.05;
         reset_all_stmts s;
         try_truncate (attempt + 1)
       end else if wp > 0 && dp < wp then begin
-        Octra_log.stdout "warn [wal] TRUNCATE partial: %d/%d pages, retrying...\n%!" dp wp;
+        Octra_log.warn "wal"
+          "event = checkpoint_partial completed_pages = %d wal_pages = %d"
+          dp wp;
         try_truncate (attempt + 1)
       end
   in

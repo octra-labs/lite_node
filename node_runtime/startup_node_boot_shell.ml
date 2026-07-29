@@ -1,22 +1,13 @@
-(*
-Octra Labs 2026
-
-Lite node, for internal use only (pre-release build 0x1067dzc2)
-
-Include at startup:
-- compiler
-- env-constructor
-- binary-proto consensus for updates
-- PVAC (optimized version, build 0f24dd-2025)
-- libp2p
-- gRPC (version 9738fdy44-2025)
-*)
-
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Ledger = Octra_core.Ledger
 module Store_chaindata = Octra_core.Store_chaindata
 module Store_irmin = Octra_core.Store_irmin
 module Epochlog = Octra_core.Epochlog
+module Emission_policy = Octra_core.Emission_policy
+module Emission_schedule = Octra_core.Emission_schedule
+module Denomination = Octra_core.Denomination
 
 type wallet = {
   address : string;
@@ -61,6 +52,14 @@ let last_epoch_or ~default header =
   | Some epoch -> epoch
   | None -> default
 
+let recovery_override_error ~consensus_mode ~skip_recovery ~skip_reconcile =
+  if not consensus_mode then None
+  else if skip_recovery then
+    Some "consensus mode rejects OCTRA_SKIP_RECOVERY"
+  else if skip_reconcile then
+    Some "consensus mode rejects OCTRA_SKIP_RECONCILE"
+  else None
+
 let get_meta (deps : deps) key =
   run_s (Store_irmin.get_meta deps.store key)
 
@@ -69,6 +68,68 @@ let set_meta deps ~key ~value =
 
 let get_store_meta (deps : store_deps) key =
   run_s (Store_irmin.get_meta deps.store key)
+
+let check_emission deps =
+  match
+    Emission_policy.check_remaining
+      (Emission_policy.of_env deps.env)
+      (get_meta deps "emission_remaining")
+  with
+  | Ok () -> ()
+  | Error error ->
+    Octra_log.fatal "init" "event = emission_guard reason = %s" error;
+    deps.exit_fatal ()
+
+let supply_envelope deps state =
+  match Emission_schedule.of_env deps.env with
+  | Error error -> Error error
+  | Ok schedule ->
+    let epoch_id =
+      meta_int
+        ~default:0
+        (get_meta deps "current_epoch")
+    in
+    Emission_schedule.bind
+      ~schedule
+      ~epoch_id
+      ~remaining:state.Emission_policy.emission_remaining
+      ~headroom:(Z.sub Denomination.max_supply state.total_supply)
+      ~stored_standard:(get_meta deps Emission_schedule.standard_key)
+      ~stored_activation:(get_meta deps Emission_schedule.activation_key)
+      ~stored_initial:(get_meta deps Emission_schedule.initial_key)
+      ~stored_retired:(get_meta deps Emission_schedule.retired_key)
+
+let check_supply deps =
+  if Ledger.length deps.ledger = 0 then ()
+  else
+    let total = get_meta deps "total_supply" in
+    let legacy = Emission_policy.legacy_total deps.env in
+    if deps.consensus_mode && Option.is_none total then begin
+      Octra_log.fatal "init"
+        "event = supply_guard reason = consensus mode rejects legacy supply bootstrap";
+      deps.exit_fatal ()
+    end else
+      match
+        Emission_policy.runtime_state
+          ~policy:(Emission_policy.of_env deps.env)
+          ~public_supply:(Ledger.get_total_supply deps.ledger)
+          ~emission:(get_meta deps "emission_remaining")
+          ~total
+          ~legacy
+      with
+      | Error error ->
+        Octra_log.fatal "init" "event = supply_guard reason = %s" error;
+        deps.exit_fatal ()
+      | Ok state ->
+        begin
+          match supply_envelope deps state with
+          | Ok _ -> ()
+          | Error error ->
+            Octra_log.fatal "init"
+              "event = supply_guard reason = %s"
+              error;
+            deps.exit_fatal ()
+        end
 
 let chain_last_epoch deps () =
   Store_chaindata.get_last_epoch deps.chaindata
@@ -175,8 +236,21 @@ let run_store deps =
   run_epoch_tags deps
 
 let run_node deps =
-  run_recovery deps;
-  run_reconciliation deps;
-  run_history deps;
-  run_account deps;
-  run_epoch deps
+  let skip_recovery = deps.env "OCTRA_SKIP_RECOVERY" = Some "1" in
+  let skip_reconcile = deps.env "OCTRA_SKIP_RECONCILE" = Some "1" in
+  match recovery_override_error
+    ~consensus_mode:deps.consensus_mode
+    ~skip_recovery
+    ~skip_reconcile with
+  | Some reason ->
+    Octra_log.fatal "init" "event = recovery_policy reason = %s" reason;
+    deps.exit_fatal ();
+    -1
+  | None ->
+    run_recovery deps;
+    run_reconciliation deps;
+    run_history deps;
+    check_supply deps;
+    check_emission deps;
+    run_account deps;
+    run_epoch deps
