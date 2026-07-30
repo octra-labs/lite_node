@@ -142,7 +142,13 @@ let fallback (request : request) =
     }
 
 let choose (request : request) =
-  match Option.bind request.env_fee_recipient proposer_from_addr with
+  let env_proposer =
+    if request.consensus_mode then
+      None
+    else
+      Option.bind request.env_fee_recipient proposer_from_addr
+  in
+  match env_proposer with
   | Some proposer -> Ok { source = Env; proposer }
   | None ->
     let consensus_candidates =

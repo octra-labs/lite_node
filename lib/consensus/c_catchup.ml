@@ -54,13 +54,20 @@ let pick_target_epoch ~(responses : peer_head list) ~(f : int) ~(fallback : int6
   | Some e -> e
   | None -> fallback
 
+let bounded_distance high low =
+  let distance = Z.sub (Z.of_int64 high) (Z.of_int64 low) in
+  if Z.gt distance (Z.of_int max_int) then max_int
+  else Z.to_int distance
+
 let classify_lag ~(target : int64) ~(our_head : int64) ~(max_lag : int) : lag_decision =
-  let lag64 = Int64.sub target our_head in
-  let lag = Int64.to_int lag64 in
-  if lag = 0 then In_sync
-  else if lag < 0 then Ahead_of_target (- lag)
-  else if lag > max_lag then Snapshot_required lag
-  else Do_catchup lag
+  match Int64.compare target our_head with
+  | 0 -> In_sync
+  | value when value < 0 ->
+    Ahead_of_target (bounded_distance our_head target)
+  | _ ->
+    let lag = bounded_distance target our_head in
+    if lag > max_lag then Snapshot_required lag
+    else Do_catchup lag
 
 let lag_mode ~(lag : int) ~(soft_lag : int) : lag_mode =
   if lag <= max 0 soft_lag then Soft else Quarantine

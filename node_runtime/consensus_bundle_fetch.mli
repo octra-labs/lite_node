@@ -37,7 +37,6 @@ type finalized_deps = {
     validate:(Octra_consensus.C_driver.bundle_response_record -> bool) ->
     Octra_consensus.C_driver.bundle_response_record option Lwt.t;
   store_accepted_bundle : accepted -> unit;
-  queue_missing_bundle : epoch_id:int64 -> unit;
 }
 
 type proposal_deps = {

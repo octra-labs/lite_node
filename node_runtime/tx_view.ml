@@ -914,6 +914,14 @@ type payload_limits = {
   message_program_len : int;
 }
 
+let payload_limits = {
+  encrypted_data_len = 50_000_000;
+  message_len = 256;
+  message_zkp_len = 50_000;
+  message_validator_len = 16_384;
+  message_program_len = 10_000_000;
+}
+
 let payload_message_limit limits tx =
   match tx.Transaction.op_type with
   | Transaction.RecryptOp

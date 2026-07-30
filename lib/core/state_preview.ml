@@ -11,7 +11,7 @@ let preview_branch_name ~epoch_id ~proposal_id =
     if String.length proposal_id > 12 then String.sub proposal_id 0 12 else proposal_id in
   Printf.sprintf "preview_%d_%s_%d_%d" epoch_id pid_short (Unix.getpid ()) !preview_counter
 
-let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
+let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id ~proposal_id
     ?(expected_prev_root : string option) f =
   let branch_name = preview_branch_name ~epoch_id ~proposal_id in
 
@@ -52,29 +52,37 @@ let with_preview ~(base_store : Store_irmin.t) ~epoch_id ~proposal_id
     batch_tree = None;
     stealth_counter = ref !(base_store.stealth_counter);
     pvac_dir = base_store.pvac_dir;
-  } in
-
-  let preview_ledger = Ledger.create preview_t in
-
-  let backend = Epoch_exec.{
-    store = preview_t;
-    ledger = preview_ledger;
-    ops = Epoch_exec.ledger_ops preview_ledger;
-    emission_policy = Emission_policy.of_env Sys.getenv_opt;
-    emission_schedule = Emission_schedule.of_env_exn Sys.getenv_opt;
-    legacy_total_supply = Emission_policy.legacy_total Sys.getenv_opt;
-    sender_key_activation_epoch =
-      Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
-    validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
-    begin_batch = (fun () -> Store_irmin.begin_epoch_batch preview_t);
-    commit_batch = (fun () -> Store_irmin.commit_epoch_batch preview_t "preview");
-    flush_dirty = (fun () -> Ledger.flush_dirty_lwt preview_ledger);
-    get_head_hash = (fun () -> Store_irmin.get_head_hash preview_t);
-    set_meta = (fun k v -> Store_irmin.set_meta preview_t k v);
+    state_root_file = base_store.state_root_file;
   } in
 
   Lwt.finalize
-    (fun () -> f backend)
+    (fun () ->
+      let preview_ledger =
+        match base_ledger with
+        | Some source -> Ledger.clone_clean preview_t source
+        | None -> Ok (Ledger.create preview_t)
+      in
+      match preview_ledger with
+      | Error error -> Lwt.return (Error error)
+      | Ok preview_ledger ->
+        let backend = Epoch_exec.{
+          store = preview_t;
+          ledger = preview_ledger;
+          ops = Epoch_exec.ledger_ops preview_ledger;
+          emission_policy = Emission_policy.of_env Sys.getenv_opt;
+          emission_schedule = Emission_schedule.of_env_exn Sys.getenv_opt;
+          legacy_total_supply = Emission_policy.legacy_total Sys.getenv_opt;
+          sender_key_activation_epoch =
+            Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
+          validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
+          begin_batch = (fun () -> Store_irmin.begin_epoch_batch preview_t);
+          commit_batch = (fun () ->
+            Store_irmin.commit_epoch_batch preview_t "preview");
+          flush_dirty = (fun () -> Ledger.flush_dirty_lwt preview_ledger);
+          get_head_hash = (fun () -> Store_irmin.get_head_hash preview_t);
+          set_meta = (fun k v -> Store_irmin.set_meta preview_t k v);
+        } in
+        f backend)
     (fun () ->
 
       let* () = Store_irmin.Store.Branch.remove base_store.repo branch_name in

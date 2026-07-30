@@ -28,12 +28,14 @@ let node_backend
     ~private_result_policy
     ~max_fhe
     ~max_stealth
-    store =
+    store
+    ledger =
   {
     run = (fun ~epoch_id ~proposal_id ~expected_prev_root ~preverify ~reward
         ~env ~txs ->
       Octra_core.State_preview.with_preview
         ~base_store:store
+        ~base_ledger:ledger
         ~epoch_id
         ~proposal_id
         ?expected_prev_root

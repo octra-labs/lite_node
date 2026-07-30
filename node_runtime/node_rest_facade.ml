@@ -110,20 +110,6 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
         end;
         Ok tx_hash
 
-let max_encrypted_data_len = 50_000_000
-let max_message_len = 256
-let max_message_len_zkp = 50_000
-let max_message_len_validator = 16_384
-let max_message_len_contract = 10_000_000
-
-let tx_payload_limits = Tx_view.{
-  encrypted_data_len = max_encrypted_data_len;
-  message_len = max_message_len;
-  message_zkp_len = max_message_len_zkp;
-  message_validator_len = max_message_len_validator;
-  message_program_len = max_message_len_contract;
-}
-
 let max_timestamp_drift = 300.0
 
 let consensus_mode_flags () =
@@ -148,7 +134,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
           ~max_timestamp_drift
           ~observer_rpc_mode:(observer_rejects_submissions ())
           ~bft_mode:(bft_mode ())
-          ~limits:tx_payload_limits
+          ~limits:Tx_view.payload_limits
           ~sender_exists:(Ledger.mem ledger tx.from)
           tx with
   | Error e -> Error e

@@ -113,6 +113,15 @@ val receipt_save :
   Contract.exec_result ->
   receipt_save
 
+val direct_receipt_json :
+  ?program:bool ->
+  epoch:int ->
+  now:float ->
+  target:string ->
+  method_name:string ->
+  Contract.exec_result ->
+  string
+
 val multi_exec_call_report :
   index:int ->
   program:string ->

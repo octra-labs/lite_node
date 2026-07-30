@@ -4,20 +4,23 @@
 module C_types = Octra_consensus.C_types
 module C_config = Octra_consensus.C_config
 module Parent = Octra_consensus.C_parent_commit
+module Protocol = Octra_consensus.C_protocol
 module Finality_log = Octra_consensus.Finality_log
 module Journal = Consensus_finality_journal
 
 type source = {
   chain_id : string;
   data_dir : string;
-  activation_epoch : int64 option;
+  activation_epoch : int64;
 }
 
+let create ~chain_id ~data_dir getenv =
+  Protocol.activation_epoch_of getenv
+  |> Result.map (fun activation_epoch ->
+    { chain_id; data_dir; activation_epoch })
+
 let required source epoch_id =
-  match source.activation_epoch with
-  | Some activation_epoch ->
-    Int64.compare epoch_id activation_epoch >= 0
-  | None -> false
+  Int64.compare epoch_id source.activation_epoch >= 0
 
 let missing source epoch_id reason =
   if required source epoch_id then Error reason

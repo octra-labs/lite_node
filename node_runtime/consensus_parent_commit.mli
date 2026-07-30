@@ -1,11 +1,13 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type source = {
-  chain_id : string;
-  data_dir : string;
-  activation_epoch : int64 option;
-}
+type source
+
+val create :
+  chain_id:string ->
+  data_dir:string ->
+  (string -> string option) ->
+  (source, string) result
 
 val required :
   source ->

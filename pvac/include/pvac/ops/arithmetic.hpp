@@ -25,6 +25,8 @@ inline Fp fp_from_i64(int64_t x) {
 
 template<typename F>
 inline auto fold_edges(const Cipher& ct, const PubKey& pk, F&& acc_fn) {
+    if (!is_cipher_compatible_with_pubkey(pk, ct))
+        throw std::runtime_error("pvac: fold_edges: cipher is incompatible with public key");
     size_t S = ct.slots;
     std::vector<std::vector<Fp>> out(ct.L.size(), field::Op::zeros(S));
     for (const auto& e : ct.E) {

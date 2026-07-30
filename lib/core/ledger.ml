@@ -144,6 +144,23 @@ let create_from_store store =
 let create store =
   create_from_store store
 
+let clone_clean store source =
+  if source.dirty || Hashtbl.length source.dirty_addrs > 0 then
+    Error "ledger clone requires flushed accounts"
+  else if journal_active source then
+    Error "ledger clone requires no active journal"
+  else
+    Ok {
+      store;
+      cache = Hashtbl.copy source.cache;
+      dirty_addrs = Hashtbl.create 64;
+      dirty = false;
+      total_supply = source.total_supply;
+      active_accounts = source.active_accounts;
+      spent_nonces = Hashtbl.create 1000;
+      epoch_journals = [];
+    }
+
 let get_account_internal l addr =
   match Hashtbl.find_opt l.cache addr with
   | Some a -> Some a

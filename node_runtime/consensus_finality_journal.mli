@@ -48,6 +48,32 @@ val read_committed_epoch :
   string ->
   read_result
 
+val read_committed_epoch_validated :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  epoch:int64 ->
+  string ->
+  read_result
+
+val read_history_epoch_validated :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  epoch:int64 ->
+  string ->
+  read_result
+
+val replayable :
+  record ->
+  (record, string) result
+
+val read_replay_backlog :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  head_epoch:int64 ->
+  head_root:string ->
+  string ->
+  (record list, string) result
+
 val committed_for :
   chain_id:string ->
   entry:Octra_consensus.Finality_log.entry ->
@@ -60,6 +86,13 @@ val rewind_committed :
   string ->
   (unit, string) result
 
+val restore_committed_from_history :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  epoch:int64 ->
+  string ->
+  (record, string) result
+
 val remove :
   string ->
   unit
@@ -70,6 +103,12 @@ val pending :
 
 val promote :
   string ->
+  unit
+
+val promote_applied :
+  string ->
+  epoch:int64 ->
+  state_root:string ->
   unit
 
 val committed :

@@ -3027,6 +3027,23 @@ let promote_active_validator_set ~backend ~env =
           Lwt.return_unit
     end
 
+let register_confirmed_sender_key ~backend ~env (tx : Transaction.t) =
+  let stored =
+    match backend.ops.find_opt tx.from with
+    | Some account -> account.Ledger_types.public_key
+    | None -> None
+  in
+  match
+    Sender_key_policy.decide
+      ~activation_epoch:backend.sender_key_activation_epoch
+      ~epoch:env.epoch_id
+      ~stored
+      ~carried:tx.public_key
+  with
+  | Sender_key_policy.Keep -> ()
+  | Sender_key_policy.Register key ->
+    backend.ops.register_public_key tx.from key
+
 let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
     ~(process_tx : backend:backend -> env:env -> Transaction.t ->
         (tx_effect, string * string) Stdlib.result Lwt.t) =
@@ -3063,23 +3080,7 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
               begin
                 match result with
                 | Ok (Confirmed _) ->
-                  let stored =
-                    match backend.ops.find_opt tx.Transaction.from with
-                    | Some account -> account.Ledger_types.public_key
-                    | None -> None
-                  in
-                  begin
-                    match
-                      Sender_key_policy.decide
-                        ~activation_epoch:backend.sender_key_activation_epoch
-                        ~epoch:env.epoch_id
-                        ~stored
-                        ~carried:tx.public_key
-                    with
-                    | Sender_key_policy.Keep -> ()
-                    | Sender_key_policy.Register key ->
-                      backend.ops.register_public_key tx.from key
-                  end
+                  register_confirmed_sender_key ~backend ~env tx
                 | Ok (Rejected_after_fee _)
                 | Error _ -> ()
               end;

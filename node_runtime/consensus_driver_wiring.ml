@@ -12,6 +12,7 @@ type gates = {
   p2p_upgrade_ready : unit -> bool;
   catchup_active : unit -> bool;
   catchup_gap_active : unit -> bool;
+  pending_finalized : unit -> bool;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   mark_quarantine : string -> unit;
@@ -28,6 +29,7 @@ type node_gates_input = {
   p2p_upgrade_ready : unit -> bool;
   catchup_active : bool ref;
   catchup_queue : Consensus_catchup_queue.t;
+  pending_finalized : unit -> bool;
   runtime_state : Consensus_runtime_state.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
@@ -42,6 +44,7 @@ type node_gates_runtime = {
   log_blocked : string -> int -> unit;
   catchup_active : bool ref;
   catchup_queue : Consensus_catchup_queue.t;
+  pending_finalized : unit -> bool;
   runtime_state : Consensus_runtime_state.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
@@ -315,6 +318,7 @@ let can_vote (deps : deps) =
   && deps.gates.p2p_upgrade_ready ()
   && not (deps.gates.catchup_active ())
   && not (deps.gates.catchup_gap_active ())
+  && not (deps.gates.pending_finalized ())
   && not (deps.gates.quarantine_active ())
 
 let node_gates (input : node_gates_input) =
@@ -327,6 +331,7 @@ let node_gates (input : node_gates_input) =
     catchup_active = (fun () -> !(input.catchup_active));
     catchup_gap_active = (fun () ->
       Consensus_catchup_queue.gap_active input.catchup_queue);
+    pending_finalized = input.pending_finalized;
     quarantine_active = (fun () ->
       Consensus_runtime_state.quarantine_active input.runtime_state);
     quarantine_reason = (fun () ->
@@ -359,6 +364,7 @@ let node_gates_of_runtime runtime =
       p2p_upgrade_ready = p2p_upgrade_ready_of_runtime runtime;
       catchup_active = runtime.catchup_active;
       catchup_queue = runtime.catchup_queue;
+      pending_finalized = runtime.pending_finalized;
       runtime_state = runtime.runtime_state;
       mark_quarantine = runtime.mark_quarantine;
       clear_quarantine = runtime.clear_quarantine;
@@ -370,7 +376,8 @@ let normalize_next_epoch_for_head (runtime : epoch_normalizer_runtime) ~source =
   let current = !(runtime.current_epoch) in
   if current <> expected_next then begin
     runtime.warn ~source ~current ~committed_head ~expected_next;
-    runtime.current_epoch := expected_next
+    if current < expected_next then
+      runtime.current_epoch := expected_next
   end
 
 let node_standard_adapters runtime =
@@ -404,10 +411,7 @@ let node_standard_adapters runtime =
       Staging.get_epoch_txs ~capacity:runtime.staging_epoch_capacity);
     staging_total = (fun () -> List.length (Staging.all ()));
     remove_rejected = Staging.remove_processed;
-    proposer = (fun () ->
-      match runtime.getenv "OCTRA_FEE_RECIPIENT" with
-      | Some address when String.length address > 3 -> address
-      | _ -> runtime.wallet_addr);
+    proposer = (fun () -> runtime.wallet_addr);
     head_txid_hi = (fun () ->
       match runtime.cached_head () with
       | Some h -> Some h.Octra_core.Head_manifest.txid_hi

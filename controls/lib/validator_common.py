@@ -358,14 +358,24 @@ def validate_entitlement(path, values):
     expected = {
         "schema": ENTITLEMENT_SCHEMA,
         "chain_id": values["OCTRA_CHAIN_ID"],
-        "snapshot_epoch": int(values["OCTRA_CHECKPOINT_EPOCH"]),
-        "state_root": values["OCTRA_CHECKPOINT_STATE_ROOT"],
         "activation_epoch": int(values["OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH"]),
         "root": values["OCTRA_PVAC_MIGRATION_ROOT"],
     }
     for key, value in expected.items():
         if payload.get(key) != value:
             raise ValidatorError(f"migration entitlement mismatch: {key}")
+    snapshot_epoch = payload.get("snapshot_epoch")
+    state_root = payload.get("state_root")
+    if (
+        isinstance(snapshot_epoch, bool)
+        or not isinstance(snapshot_epoch, int)
+        or snapshot_epoch < 0
+    ):
+        raise ValidatorError("invalid migration entitlement snapshot epoch")
+    if snapshot_epoch >= expected["activation_epoch"]:
+        raise ValidatorError("migration entitlement snapshot must precede activation")
+    if not isinstance(state_root, str) or not HEX64.fullmatch(state_root):
+        raise ValidatorError("invalid migration entitlement state root")
     if not isinstance(payload.get("entries"), list):
         raise ValidatorError("migration entitlement entries must be a list")
 
@@ -392,7 +402,7 @@ def validate_network(values, bundle_dir):
     if values["OCTRA_EPOCH_DURATION"] != "10":
         raise ValidatorError("first quorum run requires a ten second minimum cadence")
     activation = nonnegative_int(values, "OCTRA_EMISSION_ACTIVATION_EPOCH")
-    checkpoint = nonnegative_int(values, "OCTRA_CHECKPOINT_EPOCH")
+    nonnegative_int(values, "OCTRA_CHECKPOINT_EPOCH")
     nonnegative_int(values, "OCTRA_CHECKPOINT_TXID_HI")
     receipt = nonnegative_int(values, "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH")
     private_result = nonnegative_int(
@@ -407,14 +417,10 @@ def validate_network(values, bundle_dir):
     )
     if activation != receipt or activation != migration:
         raise ValidatorError("activation epochs must match")
-    if activation != checkpoint + 1:
-        raise ValidatorError("activation epoch must equal checkpoint epoch plus one")
-    if private_result <= checkpoint:
-        raise ValidatorError("private result activation must follow checkpoint")
-    if protocol_activation <= checkpoint:
-        raise ValidatorError("proposal protocol activation must follow checkpoint")
-    if validator_activation <= checkpoint:
-        raise ValidatorError("validator admission activation must follow checkpoint")
+    if private_result < activation:
+        raise ValidatorError("private result activation cannot precede emission")
+    if protocol_activation < activation:
+        raise ValidatorError("proposal protocol activation cannot precede emission")
     if validator_activation < activation:
         raise ValidatorError("validator admission cannot precede emission")
     if not HEX64.fullmatch(values["OCTRA_BINARY_HASH"]):
@@ -444,6 +450,23 @@ def validate_network(values, bundle_dir):
     validate_entitlement(entitlement, values)
     values["OCTRA_PVAC_MIGRATION_ENTITLEMENTS"] = str(entitlement)
     return values
+
+def validate_network_binding(values, network):
+    local = {
+        key: values[key]
+        for key in NETWORK_KEYS
+        if key in values
+    }
+    if "OCTRA_PEERS" not in local and "OCTRA_BOOTSTRAP_PEERS" in local:
+        local["OCTRA_PEERS"] = local["OCTRA_BOOTSTRAP_PEERS"]
+    if local == network:
+        return
+    mismatch = sorted(
+        key
+        for key in set(local) | set(network)
+        if local.get(key) != network.get(key)
+    )
+    raise ValidatorError("network bundle drift: " + ",".join(mismatch))
 
 def load_network(path, expected_hash):
     bundle = Path(path).resolve()

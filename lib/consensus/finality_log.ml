@@ -181,6 +181,35 @@ let read base =
         in
         loop [])
 
+let find_height base height =
+  let target = path base in
+  if not (Sys.file_exists target) then None
+  else
+    let input = open_in target in
+    Fun.protect
+      ~finally:(fun () -> close_in input)
+      (fun () ->
+        let rec loop () =
+          match input_line input with
+          | value ->
+            let value = String.trim value in
+            if value = "" then
+              loop ()
+            else
+              let entry =
+                entry_of_json (Yojson.Safe.from_string value)
+              in
+              if entry.height < height then
+                loop ()
+              else if entry.height = height then
+                Some entry
+              else
+                None
+          | exception End_of_file ->
+            None
+        in
+        loop ())
+
 let can_upgrade_catchup_placeholder prior entry =
   prior.height = entry.height
   && prior.round = entry.round
@@ -201,7 +230,13 @@ let replace_last base prior entry =
 let check_write base entry =
   match last_entry_fast base with
   | Some prior when entry.height < prior.height ->
-    failwith "finality log height regression"
+    begin
+      match find_height base entry.height with
+      | Some historical when same_commitment historical entry -> ()
+      | Some _
+      | None ->
+        failwith "finality log height regression"
+    end
   | Some prior when entry.height = prior.height ->
     if not
          (same_commitment prior entry
@@ -216,6 +251,8 @@ let write base entry =
   ensure_dir base;
   check_write base entry;
   match last_entry_fast base with
+  | Some prior when entry.height < prior.height ->
+    ()
   | Some prior when same_commitment prior entry ->
     ()
   | Some prior when can_upgrade_catchup_placeholder prior entry ->

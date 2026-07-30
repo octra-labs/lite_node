@@ -20,6 +20,7 @@ type t = {
   mutable batch_tree : Store.tree option;
   stealth_counter : int64 ref;
   pvac_dir : string;
+  state_root_file : string;
 }
 
 type batch_savepoint = {
@@ -34,6 +35,10 @@ let rec strip_trailing_slash path =
   else
     path
 
+let absolute_path path =
+  if Filename.is_relative path then Filename.concat (Sys.getcwd ()) path
+  else path
+
 let pvac_dir_of_store_path path =
   let path = strip_trailing_slash path in
   if String.equal (Filename.basename path) "irmin_store" then
@@ -41,11 +46,18 @@ let pvac_dir_of_store_path path =
   else
     path ^ "_pvac"
 
+let state_root_file_of_store_path path =
+  path
+  |> strip_trailing_slash
+  |> Filename.dirname
+  |> fun base -> Filename.concat base "state_root"
+
 let make_info msg =
   let date = Int64.of_float (Unix.gettimeofday ()) in
   fun () -> Store.Info.v ~author:"octra" ~message:msg date
 
 let open_store ?(fresh=false) ?(readonly=false) path =
+  let path = absolute_path path in
   let config = Irmin_pack.Conf.init
     ~fresh
     ~readonly
@@ -77,6 +89,7 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     batch_tree = None;
     stealth_counter = counter;
     pvac_dir = pvac_dir_of_store_path path;
+    state_root_file = state_root_file_of_store_path path;
   }
 
 let close t =
@@ -1432,8 +1445,6 @@ let get_commit_hash t =
     Lwt.return (Some (Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit)))
   | None -> Lwt.return_none
 
-let state_root_file = "data/state_root"
-
 type integrity_result = {
   ok : bool;
   head_hash : string;
@@ -1488,8 +1499,8 @@ let verify_integrity t =
     in
     ignore meta_ok;
     let saved_root =
-      if Sys.file_exists state_root_file then
-        let ic = open_in_bin state_root_file in
+      if Sys.file_exists t.state_root_file then
+        let ic = open_in_bin t.state_root_file in
         let s = input_line ic in
         close_in ic; Some s
       else
@@ -1507,7 +1518,7 @@ let verify_integrity t =
 let save_state_root t =
   let* h = state_hash t in
   if h <> "empty" then begin
-    let oc = open_out_bin state_root_file in
+    let oc = open_out_bin t.state_root_file in
     output_string oc h;
     close_out oc;
     Lwt.return_unit

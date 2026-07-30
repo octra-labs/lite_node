@@ -30,6 +30,7 @@ type read_result =
 let schema = "octra_finality_journal"
 let max_bytes = 128 * 1024 * 1024
 let history_limit = 4096L
+let zero_root = String.make 32 '\x00'
 
 let dir base =
   Filename.concat base "finality"
@@ -253,7 +254,9 @@ let archive_record base record =
   if Sys.file_exists target then begin
     match read_record target with
     | Some prior
-      when same_finalize prior.finalize compact.finalize
+      when Finality_log.same_commitment
+             (Finality_log.of_finalize prior.finalize)
+             (Finality_log.of_finalize compact.finalize)
            && C_config.validator_set_hash prior.validator_set
               = C_config.validator_set_hash compact.validator_set ->
       ()
@@ -397,6 +400,115 @@ let read_committed_epoch ~chain_id ~epoch base =
   with exn ->
     Invalid (Printexc.to_string exn)
 
+let read_committed_epoch_validated ~chain_id ~validator_set ~epoch base =
+  match read_committed_epoch ~chain_id ~epoch base with
+  | Missing -> Missing
+  | Invalid _ as invalid -> invalid
+  | Valid record ->
+    begin
+      match validate ~chain_id ~validator_set record with
+      | Ok () -> Valid record
+      | Error reason -> Invalid reason
+    end
+
+let read_history_epoch_validated ~chain_id ~validator_set ~epoch base =
+  read_validated_path
+    ~chain_id
+    ~validator_set
+    (history_path base epoch)
+
+let empty_bundle = {
+  tx_hashes = [];
+  txs = [];
+  receipts_json = [];
+}
+
+let header_has_empty_bundle header =
+  header.C_types.tx_list_hash = Octra_consensus.C_engine.tx_list_hash_for_header []
+  && header.C_types.receipt_root = C_hash.receipt_root []
+
+let replayable record =
+  match record.bundle with
+  | Some _ -> Ok record
+  | None when header_has_empty_bundle record.finalize.C_types.header ->
+    Ok { record with bundle = Some empty_bundle }
+  | None ->
+    Error "committed finality bundle is missing"
+
+let history_epoch name =
+  let suffix = ".json" in
+  let suffix_len = String.length suffix in
+  let name_len = String.length name in
+  if name_len <= suffix_len
+     || String.sub name (name_len - suffix_len) suffix_len <> suffix then
+    None
+  else
+    try
+      Some
+        (String.sub name 0 (name_len - suffix_len)
+         |> Int64.of_string)
+    with Failure _ ->
+      None
+
+let committed_epochs base =
+  let historical =
+    let target = history_dir base in
+    if Sys.file_exists target && Sys.is_directory target then
+      Sys.readdir target
+      |> Array.to_list
+      |> List.filter_map history_epoch
+    else
+      []
+  in
+  let current =
+    match read_record (committed_path base) with
+    | Some record -> [record.finalize.C_types.epoch_id]
+    | None -> []
+  in
+  List.sort_uniq Int64.compare (historical @ current)
+
+let read_replay_backlog ~chain_id ~validator_set ~head_epoch ~head_root base =
+  try
+    let epochs =
+      committed_epochs base
+      |> List.filter (fun epoch -> Int64.compare epoch head_epoch > 0)
+    in
+    let rec loop expected_epoch expected_root records = function
+      | [] -> Ok (List.rev records)
+      | epoch :: _ when not (Int64.equal epoch expected_epoch) ->
+        Error "committed finality history height gap"
+      | epoch :: rest ->
+        begin
+          match
+            read_committed_epoch_validated
+              ~chain_id
+              ~validator_set
+              ~epoch
+              base
+          with
+          | Missing ->
+            Error "committed finality history is missing"
+          | Invalid reason ->
+            Error reason
+          | Valid record ->
+            let header = record.finalize.C_types.header in
+            if header.C_types.prev_state_root <> expected_root then
+              Error "committed finality history root discontinuity"
+            else
+              match replayable record with
+              | Error _ as error -> error
+              | Ok replay ->
+                loop
+                  (Int64.succ epoch)
+                  header.C_types.proposed_state_root
+                  (replay :: records)
+                  rest
+        end
+    in
+    loop (Int64.succ head_epoch) head_root [] epochs
+  with exn ->
+    Error (Printexc.to_string exn)
+
 let read_committed_validated ~chain_id ~entry base =
   match
     read_committed_epoch
@@ -465,7 +577,60 @@ let rewind_committed ~chain_id ~entry base =
             Error (Printexc.to_string exn)
     end
 
-let promote base =
+let restore_committed_from_history ~chain_id ~validator_set ~epoch base =
+  match
+    read_history_epoch_validated
+      ~chain_id
+      ~validator_set
+      ~epoch
+      base
+  with
+  | Missing ->
+    Error "finality history source is missing"
+  | Invalid reason ->
+    Error reason
+  | Valid record ->
+    if pending base then
+      Error "pending finality journal blocks restore"
+    else
+      try
+        write_encoded (committed_path base) (bytes record);
+        Ok record
+      with exn ->
+        Error (Printexc.to_string exn)
+
+let promote_record base ~allow_gap pending_record =
+  let target = committed_path base in
+  begin
+    match read_record target with
+    | None -> ()
+    | Some committed_record ->
+      let pending_epoch =
+        pending_record.finalize.C_types.epoch_id
+      in
+      let committed_epoch =
+        committed_record.finalize.C_types.epoch_id
+      in
+      if Int64.compare pending_epoch committed_epoch < 0 then
+        failwith "finality journal promotion height regression"
+      else if Int64.equal pending_epoch committed_epoch
+              && not (same_record pending_record committed_record) then
+        failwith "conflicting committed finality journal"
+      else if Int64.compare pending_epoch committed_epoch > 0
+              && not allow_gap
+              && not
+                   (Int64.equal
+                      pending_epoch
+                      (Int64.add committed_epoch 1L)) then
+        failwith "finality journal promotion height gap"
+      else
+        archive_record base committed_record
+  end;
+  Unix.rename (path base) target;
+  fsync_dir base;
+  archive_record base pending_record
+
+let pending_with_bundle base =
   let pending_path = path base in
   match read_record pending_path with
   | None ->
@@ -473,34 +638,23 @@ let promote base =
   | Some { bundle = None; _ } ->
     failwith "finality journal promotion requires canonical bundle"
   | Some pending_record ->
-    let target = committed_path base in
-    begin
-      match read_record target with
-      | None -> ()
-      | Some committed_record ->
-        let pending_epoch =
-          pending_record.finalize.C_types.epoch_id
-        in
-        let committed_epoch =
-          committed_record.finalize.C_types.epoch_id
-        in
-        if Int64.compare pending_epoch committed_epoch < 0 then
-          failwith "finality journal promotion height regression"
-        else if Int64.equal pending_epoch committed_epoch
-                && not (same_record pending_record committed_record) then
-          failwith "conflicting committed finality journal"
-        else if Int64.compare pending_epoch committed_epoch > 0
-                && not
-                     (Int64.equal
-                        pending_epoch
-                        (Int64.add committed_epoch 1L)) then
-          failwith "finality journal promotion height gap"
-        else
-          archive_record base committed_record
-    end;
-    Unix.rename pending_path target;
-    fsync_dir base;
-    archive_record base pending_record
+    pending_record
+
+let promote base =
+  promote_record base ~allow_gap:false (pending_with_bundle base)
+
+let promote_applied base ~epoch ~state_root =
+  let pending_record = pending_with_bundle base in
+  let header = pending_record.finalize.C_types.header in
+  if not (Int64.equal pending_record.finalize.C_types.epoch_id epoch) then
+    failwith "finality journal applied epoch mismatch";
+  if header.C_types.proposed_state_root = zero_root then
+    promote_record base ~allow_gap:false pending_record
+  else begin
+    if header.C_types.proposed_state_root <> state_root then
+      failwith "finality journal applied root mismatch";
+    promote_record base ~allow_gap:true pending_record
+  end
 
 let committed base =
   Sys.file_exists (committed_path base)

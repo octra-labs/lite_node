@@ -32,17 +32,25 @@ type health_runtime_input = {
   role_label : string;
 }
 
+let recover_before_start ~recover_pending ~replay_stashed ~recovery_pending =
+  let open Lwt.Syntax in
+  let* () = replay_stashed ~source:"startup_finality" in
+  if recovery_pending () then
+    Lwt.return_false
+  else
+    recover_pending ()
+
 let health_runtime (input : health_runtime_input) =
   let health = Consensus_health_wiring.node_driver_health_deps input.health in
   let pending =
     Consensus_pending_commit_recovery.node_driver_runtime input.pending
   in
   let pending_recovery driver =
-    let open Lwt.Syntax in
-    let* recovered =
-      Consensus_pending_commit_recovery.run_with_driver pending driver
-    in
-    Lwt.return (recovered && not (input.recovery_pending ()))
+    recover_before_start
+      ~recover_pending:(fun () ->
+        Consensus_pending_commit_recovery.run_with_driver pending driver)
+      ~replay_stashed:input.replay_stashed
+      ~recovery_pending:input.recovery_pending
   in
   let validator_set = input.validator_set in
   Consensus_health_wiring.{

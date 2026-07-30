@@ -30,7 +30,7 @@ type deps = {
     proposal_id:string ->
     Bundle_fetch.accepted ->
     unit;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  sleep : float -> unit Lwt.t;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
@@ -58,7 +58,7 @@ type node_deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     unit;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  sleep : float -> unit Lwt.t;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 

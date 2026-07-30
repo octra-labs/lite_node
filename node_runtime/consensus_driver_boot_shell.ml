@@ -157,14 +157,46 @@ let committed_root_at_epoch (deps : deps) epoch =
   else
     deps.committed_epoch_root_raw epoch
 
-let startup_journal (deps : deps) validator_set =
+let startup_pending (deps : deps) validator_set =
+  match
+    Consensus_finality_journal.read_validated
+      ~chain_id:deps.chain_id
+      ~validator_set
+      deps.data_dir
+  with
+  | Consensus_finality_journal.Missing ->
+    Consensus_finality_journal.Missing
+  | Consensus_finality_journal.Invalid _ as invalid ->
+    invalid
+  | Consensus_finality_journal.Valid record ->
+    begin
+      match record.bundle with
+      | Some _ ->
+        Consensus_finality_journal.Valid record
+      | None ->
+        begin
+          match Consensus_finality_journal.replayable record with
+          | Error _ ->
+            Consensus_finality_journal.Valid record
+          | Ok replay ->
+            begin
+              match replay.bundle with
+              | Some bundle ->
+                Consensus_finality_journal.persist_bundle
+                  deps.data_dir
+                  record.finalize
+                  bundle
+              | None ->
+                ()
+            end;
+            Consensus_finality_journal.Valid replay
+        end
+    end
+
+let startup_journal (deps : deps) pending =
   Consensus_finality_journal_recovery.run
     Consensus_finality_journal_recovery.{
-      read_journal = (fun () ->
-        Consensus_finality_journal.read_validated
-          ~chain_id:deps.chain_id
-          ~validator_set
-          deps.data_dir);
+      read_journal = (fun () -> pending);
       head_epoch = deps.committed_head_epoch;
       root_at_epoch = committed_root_at_epoch deps;
       current_root = (fun () -> current_committed_root deps);
@@ -182,10 +214,75 @@ let startup_journal (deps : deps) validator_set =
       set_consensus_finalized = (fun finalized ->
         deps.consensus_finalized := finalized);
       clear_state_attested = deps.clear_state_attested;
-      commit_journal = (fun () ->
-        Consensus_finality_journal.promote deps.data_dir);
+      commit_journal = (fun ~epoch ~state_root ->
+        Consensus_finality_journal.promote_applied
+          deps.data_dir
+          ~epoch
+          ~state_root);
       mark_quarantine = deps.mark_quarantine;
     }
+
+let startup_backlog_anchor (deps : deps) pending =
+  let head = deps.committed_head_epoch () in
+  match pending with
+  | Consensus_finality_journal.Valid record
+    when Int64.equal
+           record.finalize.Octra_consensus.C_types.epoch_id
+           (Int64.of_int (head + 1)) ->
+    Some
+      (record.finalize.Octra_consensus.C_types.epoch_id,
+       record.finalize.header.proposed_state_root)
+  | Consensus_finality_journal.Valid _
+  | Consensus_finality_journal.Missing
+  | Consensus_finality_journal.Invalid _ ->
+    Option.map
+      (fun root -> Int64.of_int head, root)
+      (current_committed_root deps)
+
+let startup_backlog (deps : deps) validator_set pending =
+  match startup_backlog_anchor deps pending with
+  | None ->
+    deps.mark_quarantine "finality_backlog_head_root_missing";
+    Consensus_finality_backlog.Blocked
+  | Some (head_epoch, head_root) ->
+    Consensus_finality_backlog.run
+      Consensus_finality_backlog.{
+        read_backlog = (fun () ->
+          Consensus_finality_journal.read_replay_backlog
+            ~chain_id:deps.chain_id
+            ~validator_set
+            ~head_epoch
+            ~head_root
+            deps.data_dir);
+        write_finality = (fun finalize ->
+          Octra_consensus.Finality_log.write
+            deps.data_dir
+            (Octra_consensus.Finality_log.of_finalize finalize));
+        store_finalized = deps.finality.store_finalized;
+        store_proposer = deps.finality.store_flow_proposer;
+        store_expected_root = deps.finality.store_expected_root;
+        store_bundle = deps.bundle_runtime.store_bundle;
+        set_consensus_finalized = (fun finalized ->
+          deps.consensus_finalized := finalized);
+        clear_state_attested = deps.clear_state_attested;
+        mark_quarantine = deps.mark_quarantine;
+      }
+
+let startup_recovery (deps : deps) validator_set =
+  let pending = startup_pending deps validator_set in
+  match startup_journal deps pending with
+  | Consensus_finality_journal_recovery.Blocked ->
+    Consensus_finality_journal_recovery.Blocked
+  | pending_outcome ->
+    begin
+      match startup_backlog deps validator_set pending with
+      | Consensus_finality_backlog.Blocked ->
+        Consensus_finality_journal_recovery.Blocked
+      | Consensus_finality_backlog.Armed ->
+        Consensus_finality_journal_recovery.Armed
+      | Consensus_finality_backlog.Clean ->
+        pending_outcome
+    end
 
 let finality_runtime (deps : deps) =
   Consensus_finality_runtime.create_node_runtime
@@ -195,7 +292,6 @@ let finality_runtime (deps : deps) =
       bundles = deps.bundle_runtime;
       driver_ref = deps.driver_ref;
       proposal_state = deps.proposal_state;
-      queue_missing_bundle = deps.catchup_queue_node.queue_finalized_gap;
       catchup_queue = deps.catchup_queue;
       consensus_finalized = deps.consensus_finalized;
       current_epoch = deps.current_epoch;
@@ -280,8 +376,11 @@ let run_catchup_to_target (deps : deps) normalize finality_runtime =
               receipts_json = validated.record.receipts_json;
             };
           Octra_consensus.Finality_log.write deps.data_dir entry);
-      promote_finality = (fun _ ->
-        Consensus_finality_journal.promote deps.data_dir);
+      promote_finality = (fun validated ->
+        Consensus_finality_journal.promote_applied
+          deps.data_dir
+          ~epoch:validated.record.Octra_consensus.C_codec.epoch_id
+          ~state_root:validated.record.state_root);
       apply_record = deps.apply_catchup_record;
       base_eic = deps.catchup_base_eic;
       set_state_attested = deps.set_state_attested;
@@ -306,6 +405,8 @@ let driver_gates (deps : deps) p2p =
           epoch);
       catchup_active = deps.catchup_active;
       catchup_queue = deps.catchup_queue;
+      pending_finalized = (fun () ->
+        deps.finality.has_finalized !(deps.current_epoch));
       runtime_state = deps.runtime_state;
       mark_quarantine = deps.mark_quarantine;
       clear_quarantine = deps.clear_quarantine;
@@ -335,14 +436,16 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
   let validator_policy =
     Octra_core.Validator_policy.of_env_exn deps.env
   in
-  let parent_commit_source = Consensus_parent_commit.{
-    chain_id = deps.chain_id;
-    data_dir = deps.data_dir;
-    activation_epoch =
-      Option.map
-        Int64.of_int
-        (Octra_core.Validator_policy.activation_epoch validator_policy);
-  } in
+  let parent_commit_source =
+    match
+      Consensus_parent_commit.create
+        ~chain_id:deps.chain_id
+        ~data_dir:deps.data_dir
+        deps.env
+    with
+    | Ok source -> source
+    | Error reason -> failwith reason
+  in
   Consensus_driver_wiring.{
     standard = {
       getenv = deps.env;
@@ -520,7 +623,7 @@ let run (deps : deps) =
       let normalize =
         Consensus_startup_finality.node_normalizer startup
       in
-      (match startup_journal deps p2p.active_vs with
+      (match startup_recovery deps p2p.active_vs with
        | Consensus_finality_journal_recovery.Continue ->
          Consensus_startup_finality.run_node_startup startup
        | Consensus_finality_journal_recovery.Armed

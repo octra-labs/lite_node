@@ -50,6 +50,15 @@ def process_pids(entries, names):
         and entry.get("pid") > 0
     })
 
+def active_data_owners(entries, data_dir):
+    return sorted({
+        entry.get("name")
+        for entry in entries
+        if entry.get("name")
+        and entry.get("pm2_env", {}).get("OCTRA_DATA_DIR") == data_dir
+        and entry.get("pm2_env", {}).get("status") in ACTIVE
+    })
+
 def process_alive(pid):
     try:
         os.kill(pid, 0)

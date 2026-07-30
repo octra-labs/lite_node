@@ -11,7 +11,6 @@ from pathlib import Path
 from nacl.signing import VerifyKey
 
 from validator_common import FORBIDDEN_KEYS
-from validator_common import NETWORK_KEYS
 from validator_common import ValidatorError
 from validator_common import load_network
 from validator_common import load_wallet
@@ -20,6 +19,7 @@ from validator_common import private_mode
 from validator_common import sha256_file
 from validator_common import state_ready
 from validator_common import validate_checkpoint
+from validator_common import validate_network_binding
 from validator_common import validator_entries
 
 def emit(**fields):
@@ -102,18 +102,7 @@ def validate(values):
     bundle = require_file(values, "OCTRA_OPERATOR_NETWORK_BUNDLE")
     bundle_hash = values.get("OCTRA_OPERATOR_NETWORK_SHA256", "")
     _, _, network = load_network(bundle, bundle_hash)
-    local_network = {
-        key: values[key]
-        for key in NETWORK_KEYS
-        if key in values
-    }
-    if local_network != network:
-        mismatch = sorted(
-            key
-            for key in set(local_network) | set(network)
-            if local_network.get(key) != network.get(key)
-        )
-        raise ValidatorError("network bundle drift: " + ",".join(mismatch))
+    validate_network_binding(values, network)
     entitlement = require_file(values, "OCTRA_PVAC_MIGRATION_ENTITLEMENTS")
     private_mode(entitlement)
     members = dict(validator_entries(values.get("OCTRA_VALIDATORS", "")))

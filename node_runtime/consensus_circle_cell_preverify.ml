@@ -9,6 +9,7 @@ module Transition = Octra_core.Circle_cell_transition
 
 type runtime = {
   store : Store_irmin.t;
+  ledger : Octra_core.Ledger.t;
   env : pre_state_root:string -> Epoch_exec.env;
 }
 
@@ -28,6 +29,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
       (fun () ->
         State_preview.with_preview
           ~base_store:runtime.store
+          ~base_ledger:runtime.ledger
           ~epoch_id:env.epoch_id
           ~proposal_id
           ~expected_prev_root:pre_state_root

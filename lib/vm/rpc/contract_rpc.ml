@@ -8,7 +8,7 @@ module Store_chaindata = Octra_core.Store_chaindata
 
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
-let view_effort_limit = 10_000_000
+let view_effort_limit = 1_000_000
 let max_compile_source_bytes = 1_048_576
 let max_compile_total_bytes = 2_097_152
 let max_compile_files = 64

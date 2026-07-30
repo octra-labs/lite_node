@@ -671,7 +671,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               ~private_result_policy
               ~max_fhe:max_fhe_per_epoch
               ~max_stealth:max_stealth_per_epoch
-              store;
+              store
+              ledger;
           ready_state_root_at;
           ready_max_lag = validator_ready_max_lag;
           warn = (fun reason ->
@@ -697,6 +698,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let circle_preverify =
       Consensus_circle_preverify.{
         store;
+        ledger;
         program_trust;
         env = (fun ~pre_state_root ->
           let epoch_id = !current_epoch in
@@ -722,6 +724,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let circle_cell_preverify =
       Consensus_circle_cell_preverify.{
         store;
+        ledger;
         env = circle_preverify.env;
       }
     in

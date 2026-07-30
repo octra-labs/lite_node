@@ -365,33 +365,17 @@ def install_verified_snapshot(snapshot, data_dir):
     finally:
         os.close(descriptor)
 
-def maybe_sync(args, data_dir, values):
-    if state_ready(data_dir):
-        validate_checkpoint(data_dir, values, allow_progress=True)
-        emit(event="checkpoint", status="ready", path=data_dir)
-        return
-    data_path = Path(data_dir)
-    if data_path.exists() and any(data_path.iterdir()):
-        raise ValidatorError("data directory is nonempty without a valid checkpoint")
-    should_sync = args.sync
-    if not args.yes and not should_sync:
-        should_sync = ask_bool("Download checkpoint now", False)
-    if not should_sync:
-        data_path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        emit(event="checkpoint", status="missing", path=data_dir)
-        return
-    sync_binary = Path(args.sync_binary).resolve()
-    if not sync_binary.is_file():
-        raise ValidatorError(f"state sync client is missing: {sync_binary}")
-    sources = args.sync_url or state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
-    if not args.sync_url and not args.yes:
-        entered = ask("State sync URLs, comma separated", ",".join(sources))
-        sources = state_sync_sources(entered)
-    elif args.sync_url:
-        sources = state_sync_sources(",".join(args.sync_url))
+def sync_snapshot(
+    sync_binary,
+    stage,
+    data_path,
+    values,
+    sources,
+    concurrency,
+    source_concurrency,
+):
     validators = validator_entries(values["OCTRA_VALIDATORS"])
     exporters = exporter_entries(values["OCTRA_STATE_SYNC_EXPORTERS"])
-    stage = resolve_sync_stage(args.sync_stage, data_path)
     validate_sync_layout(stage, data_path)
     command = [
         str(sync_binary),
@@ -402,9 +386,9 @@ def maybe_sync(args, data_dir, values):
         "--config-hash",
         values["OCTRA_CONSENSUS_CONFIG_HASH"],
         "--concurrency",
-        str(args.sync_concurrency),
+        str(concurrency),
         "--source-concurrency",
-        str(args.sync_source_concurrency),
+        str(source_concurrency),
         "--min-epoch",
         values["OCTRA_CHECKPOINT_EPOCH"],
     ]
@@ -422,6 +406,41 @@ def maybe_sync(args, data_dir, values):
     if not state_ready(data_path):
         raise ValidatorError("state sync completed without a valid checkpoint")
     validate_checkpoint(data_path, values, allow_progress=True)
+
+def maybe_sync(args, data_dir, values):
+    if state_ready(data_dir):
+        validate_checkpoint(data_dir, values, allow_progress=True)
+        emit(event="checkpoint", status="ready", path=data_dir)
+        return
+    data_path = Path(data_dir)
+    if data_path.exists() and any(data_path.iterdir()):
+        raise ValidatorError("data directory is nonempty without a valid checkpoint")
+    should_sync = args.sync or args.yes
+    if not args.yes and not should_sync:
+        should_sync = ask_bool("Download checkpoint now", False)
+    if not should_sync:
+        data_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        emit(event="checkpoint", status="missing", path=data_dir)
+        return
+    sync_binary = Path(args.sync_binary).resolve()
+    if not sync_binary.is_file():
+        raise ValidatorError(f"state sync client is missing: {sync_binary}")
+    sources = args.sync_url or state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
+    if not args.sync_url and not args.yes:
+        entered = ask("State sync URLs, comma separated", ",".join(sources))
+        sources = state_sync_sources(entered)
+    elif args.sync_url:
+        sources = state_sync_sources(",".join(args.sync_url))
+    stage = resolve_sync_stage(args.sync_stage, data_path)
+    sync_snapshot(
+        sync_binary,
+        stage,
+        data_path,
+        values,
+        sources,
+        args.sync_concurrency,
+        args.sync_source_concurrency,
+    )
 
 def parser():
     value = argparse.ArgumentParser(prog="config_val.sh")
@@ -485,8 +504,12 @@ def main():
     worker = Path(args.worker).resolve()
     if not worker.is_file():
         raise ValidatorError(f"PVAC worker is missing: {worker}")
+    sync_binary = Path(args.sync_binary).resolve()
+    if not sync_binary.is_file():
+        raise ValidatorError(f"state sync client is missing: {sync_binary}")
     binary_hash = sha256_file(binary)
     worker_hash = sha256_file(worker)
+    sync_hash = sha256_file(sync_binary)
     control_binary = Path(args.control_binary).resolve()
     if not control_binary.is_file():
         raise ValidatorError(f"validator control binary is missing: {control_binary}")
@@ -539,6 +562,11 @@ def main():
         "OCTRA_OPERATOR_PM2_NAME": canonical_pm2_name(name),
         "OCTRA_OPERATOR_ROLE": role,
         "OCTRA_OPERATOR_RPC_URL": rpc_url(args.rpc),
+        "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+        "OCTRA_OPERATOR_SYNC_BINARY_HASH": sync_hash,
+        "OCTRA_OPERATOR_SYNC_CONCURRENCY": str(args.sync_concurrency),
+        "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": str(args.sync_source_concurrency),
+        "OCTRA_OPERATOR_SYNC_STAGE": str(resolve_sync_stage(args.sync_stage, data_dir)),
         "OCTRA_P2P_PORT": str(p2p_port),
         "OCTRA_PVAC_VERIFY_WORKER": str(worker),
         "OCTRA_PVAC_VERIFY_WORKER_HASH": worker_hash,
@@ -549,6 +577,7 @@ def main():
     emit(event="identity", pubkey=wallet["pub"], endpoint=advertise)
     emit(event="candidate", sha256=binary_hash)
     emit(event="pvac_worker", sha256=worker_hash)
+    emit(event="state_sync", sha256=sync_hash)
     emit(event="validator_control", sha256=control_hash)
     emit(event="network", sha256=bundle_hash, chain=values["OCTRA_CHAIN_ID"])
     emit(

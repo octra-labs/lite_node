@@ -32,6 +32,12 @@ type health_runtime_input = {
   role_label : string;
 }
 
+val recover_before_start :
+  recover_pending:(unit -> bool Lwt.t) ->
+  replay_stashed:(source:string -> unit Lwt.t) ->
+  recovery_pending:(unit -> bool) ->
+  bool Lwt.t
+
 val health_runtime :
   health_runtime_input ->
   Consensus_health_wiring.node_consensus_driver_runtime

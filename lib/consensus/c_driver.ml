@@ -98,6 +98,11 @@ type proposal_build = {
   started_at : int64;
 }
 
+type pending_finalize = {
+  finalize : C_types.finalize;
+  validator_set_hash : string;
+}
+
 type proposal_height_status =
   | Proposal_current
   | Proposal_stale
@@ -120,12 +125,15 @@ type t = {
   vote_evidence : (string, C_evidence.vote_conflict) Hashtbl.t;
   activated_validator_set_fingerprints : (string, bool) Hashtbl.t;
   pending_votes : (string, C_types.vote) Hashtbl.t;
+  future_votes : (string, C_types.vote) Hashtbl.t;
   durable_votes : (string, unit) Hashtbl.t;
-  pending_finalizes : (int64, C_types.finalize) Hashtbl.t;
+  pending_finalizes : (int64, pending_finalize) Hashtbl.t;
+  pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
   round_sync_replies : (string, int64) Hashtbl.t;
   catchup_query_from_epoch : (string, int64) Hashtbl.t;
   mutable proposal_build : proposal_build option;
+  mutable proposal_retry : proposal_build option;
   mutable proposal_verify : proposal_build option;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable on_validator_set_activated :
@@ -199,12 +207,15 @@ let create ~config ~validator_set ~swarm ~start_height =
     vote_evidence = Hashtbl.create 16;
     activated_validator_set_fingerprints = Hashtbl.create 8;
     pending_votes = Hashtbl.create 16;
+    future_votes = Hashtbl.create 32;
     durable_votes = Hashtbl.create 16;
     pending_finalizes = Hashtbl.create 16;
+    pending_proposals = Hashtbl.create 8;
     deferred_proposals = Hashtbl.create 16;
     round_sync_replies = Hashtbl.create 16;
     catchup_query_from_epoch = Hashtbl.create 8;
     proposal_build = None;
+    proposal_retry = None;
     proposal_verify = None;
     proposal_work_gate = C_proposal_work_gate.create ();
     on_validator_set_activated =
@@ -228,6 +239,8 @@ let proposal_build_grace_ms () =
   grace_ms "OCTRA_BFT_PROPOSAL_BUILD_GRACE_MS"
     ~fallback:180_000
     ~limit:300_000
+
+let proposal_retry_ms = 500
 
 let proposal_verify_grace_ms () =
   grace_ms "OCTRA_BFT_PROPOSAL_VERIFY_GRACE_MS"
@@ -303,6 +316,13 @@ let proposal_build_grace_left t ~generation ~round ~step =
       && b.round = round
       && b.step = step ->
       within_grace b.started_at (proposal_build_grace_ms ())
+  | _ -> false
+
+let proposal_retry_pending t ~gen ~height ~round ~step =
+  match t.proposal_retry with
+  | Some retry
+    when same_proposal_build retry ~gen ~height ~round ~step ->
+      within_grace retry.started_at proposal_retry_ms
   | _ -> false
 
 let mark_proposal_verify t ~gen ~height ~round ~step =
@@ -387,6 +407,13 @@ let vote_key (v : C_types.vote) =
     v.validator
     (raw_to_hex v.proposal_id)
 
+let future_vote_key (v : C_types.vote) =
+  Printf.sprintf "%s|%Ld|%d|%s"
+    (vote_step_label v.vote_type)
+    v.epoch_id
+    v.round
+    v.validator
+
 let pending_vote_count t = Hashtbl.length t.pending_votes
 
 let pending_finalize_count t = Hashtbl.length t.pending_finalizes
@@ -407,21 +434,43 @@ let farthest_pending_finalize t =
 let queue_vote t (v : C_types.vote) =
   Hashtbl.replace t.pending_votes (vote_key v) v
 
+let defer_future_vote t (v : C_types.vote) =
+  let height = t.engine.state.height in
+  if height = Int64.max_int
+     || v.epoch_id <> Int64.succ height
+     || v.round < 0
+     || v.round > C_engine.max_round_ahead
+  then
+    false
+  else
+    let key = future_vote_key v in
+    if Hashtbl.mem t.future_votes key then
+      false
+    else begin
+      Hashtbl.add t.future_votes key v;
+      true
+    end
+
 let queue_future_finalize t (f : C_types.finalize) =
   if Int64.compare f.epoch_id t.engine.state.height <= 0 then ()
-  else
+  else begin
+    let pending = {
+      finalize = f;
+      validator_set_hash = C_config.validator_set_hash t.engine.vs;
+    } in
     match Hashtbl.find_opt t.pending_finalizes f.epoch_id with
-    | Some old when f.commit_round < old.commit_round ->
-      Hashtbl.replace t.pending_finalizes f.epoch_id f
+    | Some old when f.commit_round < old.finalize.commit_round ->
+      Hashtbl.replace t.pending_finalizes f.epoch_id pending
     | Some _ -> ()
     | None when Hashtbl.length t.pending_finalizes < max_pending_finalizes ->
-      Hashtbl.add t.pending_finalizes f.epoch_id f
+      Hashtbl.add t.pending_finalizes f.epoch_id pending
     | None ->
       match farthest_pending_finalize t with
       | Some epoch when Int64.compare f.epoch_id epoch < 0 ->
         Hashtbl.remove t.pending_finalizes epoch;
-        Hashtbl.add t.pending_finalizes f.epoch_id f
+        Hashtbl.add t.pending_finalizes f.epoch_id pending
       | _ -> ()
+  end
 
 let vote_still_relevant t (v : C_types.vote) =
   Int64.compare v.epoch_id t.engine.state.height = 0
@@ -654,6 +703,23 @@ let defer_verified_proposal t (p : C_types.propose) =
     if not (Hashtbl.mem t.deferred_proposals key) then
       Hashtbl.add t.deferred_proposals key p
 
+let defer_pending_proposal t (p : C_types.propose) =
+  let height = t.engine.state.height in
+  if height = Int64.max_int
+     || p.epoch_id <> Int64.succ height
+     || p.round < 0
+     || p.round > C_engine.max_round_ahead
+  then
+    false
+  else
+    let key = proposal_round_key p.epoch_id p.round in
+    if Hashtbl.mem t.pending_proposals key then
+      false
+    else begin
+      Hashtbl.add t.pending_proposals key p;
+      true
+    end
+
 let replay_deferred_proposal t =
   let height = t.engine.state.height in
   let round = t.engine.state.round in
@@ -851,61 +917,72 @@ let try_current_leader_proposal t =
     let height = t.engine.state.height in
     let round = t.engine.state.round in
     let step = t.engine.state.step in
-    match t.proposal_build with
-    | Some _ ->
+    if proposal_retry_pending t ~gen ~height ~round ~step then
       Lwt.return_false
-    | None ->
-    let work = {
-      gen;
-      height;
-      round;
-      step;
-      started_at = Mtime_clock.elapsed_ns ();
-    } in
-    t.proposal_build <- Some work;
-    let* proposal_opt =
-      Lwt.finalize
-        (fun () ->
-          C_proposal_work_gate.run
-            t.proposal_work_gate
-            ~relevant:(fun () ->
-              t.running
-              && C_engine.am_i_leader t.engine
-              && proposal_work_current t work)
-            (fun () -> t.config.make_proposal height))
-        (fun () ->
-          clear_proposal_build t ~gen ~height ~round ~step;
-          Lwt.return_unit)
-    in
-    if t.engine.generation = gen
-       && t.engine.state.height = height
-       && t.engine.state.round = round
-       && t.engine.state.step = step then
-      match proposal_opt with
-      | Some plan ->
-        C_engine.do_propose
-          ?parent_commit:plan.parent_commit
-          t.engine
-          plan.header
-          plan.tx_hashes
-          ~sign_fn:t.config.sign_fn;
-        Lwt.return (t.engine.state.step <> step)
-      | None ->
-        log_node t.config.my_addr "event = make_proposal_none height = %Ld round = %d"
-          height round;
-        Lwt.return_false
     else begin
-      log_node t.config.my_addr
-        "event = make_proposal_stale old_generation = %d new_generation = %d old_height = %Ld new_height = %Ld old_round = %d new_round = %d old_step = %s new_step = %s"
-        gen
-        t.engine.generation
-        height
-        t.engine.state.height
-        round
-        t.engine.state.round
-        (round_step_label step)
-        (round_step_label t.engine.state.step);
-      Lwt.return_false
+      t.proposal_retry <- None;
+      match t.proposal_build with
+      | Some _ ->
+        Lwt.return_false
+      | None ->
+        let work = {
+          gen;
+          height;
+          round;
+          step;
+          started_at = Mtime_clock.elapsed_ns ();
+        } in
+        t.proposal_build <- Some work;
+        let* proposal_opt =
+          Lwt.finalize
+            (fun () ->
+              C_proposal_work_gate.run
+                t.proposal_work_gate
+                ~relevant:(fun () ->
+                  t.running
+                  && C_engine.am_i_leader t.engine
+                  && proposal_work_current t work)
+                (fun () -> t.config.make_proposal height))
+            (fun () ->
+              clear_proposal_build t ~gen ~height ~round ~step;
+              Lwt.return_unit)
+        in
+        if t.engine.generation = gen
+           && t.engine.state.height = height
+           && t.engine.state.round = round
+           && t.engine.state.step = step then
+          match proposal_opt with
+          | Some plan ->
+            C_engine.do_propose
+              ?parent_commit:plan.parent_commit
+              t.engine
+              plan.header
+              plan.tx_hashes
+              ~sign_fn:t.config.sign_fn;
+            Lwt.return (t.engine.state.step <> step)
+          | None ->
+            t.proposal_retry <- Some {
+              work with
+              started_at = Mtime_clock.elapsed_ns ();
+            };
+            log_node t.config.my_addr
+              "event = make_proposal_none height = %Ld round = %d"
+              height
+              round;
+            Lwt.return_false
+        else begin
+          log_node t.config.my_addr
+            "event = make_proposal_stale old_generation = %d new_generation = %d old_height = %Ld new_height = %Ld old_round = %d new_round = %d old_step = %s new_step = %s"
+            gen
+            t.engine.generation
+            height
+            t.engine.state.height
+            round
+            t.engine.state.round
+            (round_step_label step)
+            (round_step_label t.engine.state.step);
+          Lwt.return_false
+        end
     end
   end else
     Lwt.return_false
@@ -933,21 +1010,162 @@ let admit_resource_attestation t attestation =
             t.resource_admission
             attestation
 
+let admit_current_proposal t (p : C_types.propose) =
+  let open Lwt.Syntax in
+  let signature_valid =
+    match C_types.pubkey_of_addr t.engine.vs p.proposer with
+    | None -> false
+    | Some pubkey -> C_hash.verify_propose ~pubkey_raw:pubkey p
+  in
+  let envelope_valid =
+    C_types.proposal_is_well_formed
+      ~chain_id:t.config.chain_id
+      ~validator_set:t.engine.vs
+      p
+    && C_hash.parent_commit_hash_opt p.parent_commit
+       = p.header.parent_commit_hash
+  in
+  if not signature_valid
+     || not envelope_valid
+     || not
+          (proposal_verify_relevant
+             ~current_round:t.engine.state.round
+             ~current_step:t.engine.state.step
+             ~proposal_round:p.round)
+  then
+    Lwt.return_unit
+  else
+    let* preview =
+      C_proposal_work_gate.run
+        t.proposal_work_gate
+        ~relevant:(fun () -> proposal_verify_current t p)
+        (fun () ->
+          let gen = t.engine.generation in
+          let height = t.engine.state.height in
+          let round = t.engine.state.round in
+          let step = t.engine.state.step in
+          mark_proposal_verify t ~gen ~height ~round ~step;
+          let* valid =
+            Lwt.finalize
+              (fun () -> t.config.verify_proposal p)
+              (fun () ->
+                clear_proposal_verify t ~gen ~height ~round ~step;
+                Lwt.return_unit)
+          in
+          Lwt.return_some valid)
+    in
+    match preview with
+    | None ->
+      Lwt.return_unit
+    | Some _ when not (proposal_verify_current t p) ->
+      Lwt.return_unit
+    | Some preview_ok ->
+      let* () =
+        if preview_ok then
+          let payload = C_codec.encode_propose p in
+          Octra_net.P2p_swarm.broadcast t.swarm
+            { msg_type = Frame.msg_cons_propose; payload }
+        else
+          Lwt.return_unit
+      in
+      if preview_ok && p.round > t.engine.state.round then
+        defer_verified_proposal t p;
+      ignore
+        (C_engine.on_propose
+           t.engine
+           p
+           ~verify_fn:(verify_engine_signature t)
+           ~execute_fn:(fun _ -> preview_ok)
+           ~sign_fn:t.config.sign_fn);
+      Lwt.return_unit
+
+let replay_pending_proposal t =
+  let height = t.engine.state.height in
+  let round = t.engine.state.round in
+  Hashtbl.filter_map_inplace
+    (fun _ (p : C_types.propose) ->
+      if p.epoch_id < height then None else Some p)
+    t.pending_proposals;
+  let key = proposal_round_key height round in
+  match Hashtbl.find_opt t.pending_proposals key with
+  | None -> Lwt.return_unit
+  | Some p ->
+    Hashtbl.remove t.pending_proposals key;
+    log_node t.config.my_addr
+      "event = replay_pending_proposal epoch = %Ld round = %d"
+      height
+      round;
+    admit_current_proposal t p
+
+let vote_type_rank = function
+  | C_types.Prevote -> 0
+  | C_types.Precommit -> 1
+
+let compare_future_vote (left : C_types.vote) (right : C_types.vote) =
+  match
+    Int.compare
+      (vote_type_rank left.vote_type)
+      (vote_type_rank right.vote_type)
+  with
+  | 0 ->
+    (match Int.compare left.round right.round with
+     | 0 -> String.compare left.validator right.validator
+     | value -> value)
+  | value -> value
+
+let replay_future_votes t =
+  let height = t.engine.state.height in
+  let round = t.engine.state.round in
+  let ready = ref [] in
+  Hashtbl.filter_map_inplace
+    (fun _ (vote : C_types.vote) ->
+      if vote.epoch_id < height then
+        None
+      else if vote.epoch_id = height && vote.round = round then begin
+        ready := vote :: !ready;
+        None
+      end else
+        Some vote)
+    t.future_votes;
+  List.sort compare_future_vote !ready
+  |> List.iter (fun (vote : C_types.vote) ->
+    match C_types.pubkey_of_addr t.engine.vs vote.validator with
+    | Some pubkey when C_hash.verify_vote ~pubkey_raw:pubkey vote ->
+      C_engine.on_vote t.engine vote ~sign_fn:t.config.sign_fn
+    | _ -> ());
+  if !ready <> [] then
+    log_node t.config.my_addr
+      "event = replay_future_votes epoch = %Ld round = %d count = %d"
+      height
+      round
+      (List.length !ready)
+
 let rec process_outputs_once t =
   let open Lwt.Syntax in
   C_engine.on_ready t.engine ~sign_fn:t.config.sign_fn;
+  let* () = replay_pending_proposal t in
+  replay_future_votes t;
   replay_deferred_proposal t;
   let current_height = t.engine.state.height in
-  Hashtbl.filter_map_inplace (fun epoch finalize ->
+  let validator_set_hash = C_config.validator_set_hash t.engine.vs in
+  Hashtbl.filter_map_inplace (fun epoch pending ->
     if Int64.compare epoch t.engine.C_engine.finalized_height <= 0 then None
+    else if pending.validator_set_hash <> validator_set_hash then begin
+      warn_node t.config.my_addr
+        "event = drop_pending_finalize epoch = %Ld reason = validator_set_changed"
+        epoch;
+      None
+    end
     else if Int64.compare epoch current_height = 0 then begin
-      let accepted = C_engine.accept_finalize_batch t.engine finalize in
+      let accepted =
+        C_engine.accept_finalize_batch t.engine pending.finalize
+      in
       log_node t.config.my_addr
         "event = pending_finalize_current epoch = %Ld accepted = %b"
         epoch accepted;
       None
     end else
-      Some finalize
+      Some pending
   ) t.pending_finalizes;
   let outputs = C_engine.drain_outputs t.engine in
   let has_finalized =
@@ -1283,57 +1501,19 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                 ~engine_head:t.engine.state.height
                 ~local_head:(t.config.local_head_epoch ())
                 ~proposal:p.epoch_id with
-        | Proposal_stale
+        | Proposal_stale ->
+          Lwt.return_unit
         | Proposal_future ->
+          if defer_pending_proposal t p then
+            log_node t.config.my_addr
+              "event = defer_pending_proposal epoch = %Ld round = %d local_height = %Ld"
+              p.epoch_id
+              p.round
+              t.engine.state.height;
           Lwt.return_unit
         | Proposal_current ->
-          if not
-            (proposal_verify_relevant
-               ~current_round:t.engine.state.round
-               ~current_step:t.engine.state.step
-               ~proposal_round:p.round)
-          then
-            Lwt.return_unit
-          else begin
-            let* preview =
-              C_proposal_work_gate.run
-                t.proposal_work_gate
-                ~relevant:(fun () -> proposal_verify_current t p)
-                (fun () ->
-                  let gen = t.engine.generation in
-                  let height = t.engine.state.height in
-                  let round = t.engine.state.round in
-                  let step = t.engine.state.step in
-                  mark_proposal_verify t ~gen ~height ~round ~step;
-                  let* valid =
-                    Lwt.finalize
-                      (fun () -> t.config.verify_proposal p)
-                      (fun () ->
-                        clear_proposal_verify t ~gen ~height ~round ~step;
-                        Lwt.return_unit)
-                  in
-                  Lwt.return_some valid)
-            in
-            match preview with
-            | None ->
-              Lwt.return_unit
-            | Some _ when not (proposal_verify_current t p) ->
-              Lwt.return_unit
-            | Some preview_ok ->
-              let* () =
-                if preview_ok then
-                  Octra_net.P2p_swarm.broadcast t.swarm
-                    { msg_type = Frame.msg_cons_propose; payload = frame.payload }
-                else Lwt.return_unit
-              in
-              if preview_ok && p.round > t.engine.state.round then
-                defer_verified_proposal t p;
-              ignore (C_engine.on_propose t.engine p
-                ~verify_fn:(verify_engine_signature t)
-                ~execute_fn:(fun _ -> preview_ok)
-                ~sign_fn:t.config.sign_fn);
-              process_outputs t
-          end
+          let* () = admit_current_proposal t p in
+          process_outputs t
         )
       (fun exn ->
         warn_node t.config.my_addr "event = bad_propose error = %s"
@@ -1353,8 +1533,20 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           | Some pk -> C_hash.verify_vote ~pubkey_raw:pk v
           | None -> false
         in
+        let deferred =
+          valid
+          && defer_future_vote t v
+        in
+        if deferred then
+          log_node t.config.my_addr
+            "event = defer_future_vote type = %s epoch = %Ld round = %d validator = %s local_height = %Ld"
+            (vote_step_label v.vote_type)
+            v.epoch_id
+            v.round
+            v.validator
+            t.engine.state.height;
         let evidence =
-          if valid then begin
+          if valid && not deferred then begin
           match C_engine.conflicting_vote t.engine v with
           | None ->
             C_engine.on_vote t.engine v ~sign_fn:t.config.sign_fn;
@@ -2223,22 +2415,7 @@ let start t =
   if C_engine.is_pristine t.engine then
     C_engine.start_height t.engine t.engine.state.height;
   let* () = broadcast_round_sync t ~request:true in
-
-  let* () = if C_engine.am_i_leader t.engine then begin
-    log_node t.config.my_addr "event = local_leader_propose height = %Ld"
-      t.engine.state.height;
-    let* proposal_opt = t.config.make_proposal t.engine.state.height in
-    (match proposal_opt with
-    | Some plan ->
-      C_engine.do_propose
-        ?parent_commit:plan.parent_commit
-        t.engine
-        plan.header
-        plan.tx_hashes
-        ~sign_fn:t.config.sign_fn;
-      Lwt.return_unit
-    | None -> Lwt.return_unit)
-  end else Lwt.return_unit in
+  let* _ = try_current_leader_proposal t in
   process_outputs t
 
 let stop t =

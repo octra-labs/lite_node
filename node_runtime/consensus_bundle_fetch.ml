@@ -37,7 +37,6 @@ type finalized_deps = {
     validate:(C_driver.bundle_response_record -> bool) ->
     C_driver.bundle_response_record option Lwt.t;
   store_accepted_bundle : accepted -> unit;
-  queue_missing_bundle : epoch_id:int64 -> unit;
 }
 
 type proposal_deps = {
@@ -80,7 +79,7 @@ let proposal_bundle_of_accepted bundle =
 let fetch_finalized (deps : finalized_deps) ~epoch_id =
   let open Lwt.Syntax in
   Log.warn "consensus"
-    "missed canonical bundle for finalized epoch = %Ld action = query_peers"
+    "event = finalized_bundle_query epoch = %Ld action = query_peers"
     epoch_id;
   let bundle_holder = ref None in
   let validate response =
@@ -94,18 +93,18 @@ let fetch_finalized (deps : finalized_deps) ~epoch_id =
   match finalized ~response ~bundle:!bundle_holder with
   | Finalized_missing ->
     Log.error "consensus"
-      "bundle fetch failed epoch = %Ld reason = no_valid_response"
+      "event = finalized_bundle_fetch epoch = %Ld result = failed reason = no_valid_response"
       epoch_id;
     Lwt.return_unit
   | Finalized_validate_bug ->
     Log.error "consensus"
-      "bundle fetch failed epoch = %Ld reason = validate_holder_unset"
+      "event = finalized_bundle_fetch epoch = %Ld result = failed reason = validate_holder_unset"
       epoch_id;
     Lwt.return_unit
   | Finalized_accepted accepted ->
     deps.store_accepted_bundle accepted;
     Log.info "consensus"
-      "bundle fetch success epoch = %Ld n = %d peer = %s"
+      "event = finalized_bundle_fetch epoch = %Ld result = success txs = %d peer = %s"
       epoch_id
       (List.length accepted.bundle.Bundle.txs)
       (short14 accepted.responder_addr);
@@ -124,9 +123,8 @@ let ensure_finalized (deps : finalized_deps) ~epoch_id =
   if deps.cached_bundle () then
     Lwt.return Finalized_ready
   else begin
-    deps.queue_missing_bundle ~epoch_id;
     Log.warn "consensus"
-      "finalized epoch = %Ld deferred reason = canonical_bundle_unavailable"
+      "event = finalized_bundle_wait epoch = %Ld reason = canonical_bundle_unavailable"
       epoch_id;
     Lwt.return Finalized_deferred
   end

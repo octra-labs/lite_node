@@ -10,6 +10,7 @@ type gates = {
   p2p_upgrade_ready : unit -> bool;
   catchup_active : unit -> bool;
   catchup_gap_active : unit -> bool;
+  pending_finalized : unit -> bool;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   mark_quarantine : string -> unit;
@@ -26,6 +27,7 @@ type node_gates_input = {
   p2p_upgrade_ready : unit -> bool;
   catchup_active : bool ref;
   catchup_queue : Consensus_catchup_queue.t;
+  pending_finalized : unit -> bool;
   runtime_state : Consensus_runtime_state.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
@@ -40,6 +42,7 @@ type node_gates_runtime = {
   log_blocked : string -> int -> unit;
   catchup_active : bool ref;
   catchup_queue : Consensus_catchup_queue.t;
+  pending_finalized : unit -> bool;
   runtime_state : Consensus_runtime_state.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;

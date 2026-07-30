@@ -173,6 +173,28 @@ let receipt_save ?(program = false) (receipt : Contract.exec_result) =
     error = receipt.Contract.error;
   }
 
+let direct_receipt_json ?(program = false) ~epoch ~now ~target ~method_name
+    receipt =
+  let saved = receipt_save ~program receipt in
+  let target_fields =
+    if program then
+      [
+        "program", `String target;
+        "contract", `String target;
+      ]
+    else
+      ["contract", `String target]
+  in
+  Yojson.Safe.to_string (`Assoc (target_fields @ [
+    "method", `String method_name;
+    "success", `Bool saved.success;
+    "effort", `Int saved.effort_used;
+    "events", saved.events_json;
+    "error", (match saved.error with Some error -> `String error | None -> `Null);
+    "epoch", `Int epoch;
+    "ts", `Float now;
+  ]))
+
 let multi_exec_call_report ~index ~program ~method_name ~amount ~success ~effort ~error ~return_value =
   `Assoc [
     "index", `Int index;

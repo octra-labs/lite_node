@@ -67,21 +67,18 @@ type storage_cache_entry = {
   storage_json : Yojson.Safe.t list;
   mutable seeded_in_native : bool;
   weight : int;
-  mutable touched_at : float;
 }
 
 let storage_payload_cache : (string, storage_cache_entry) Hashtbl.t =
   Hashtbl.create 8
 
-let code_seed_cache : (string, float) Hashtbl.t =
+let code_seed_cache : (string, unit) Hashtbl.t =
   Hashtbl.create 8
 
-let storage_payload_cache_ttl_secs = 300.0
 let storage_payload_cache_limit = 16
 let storage_payload_cache_byte_limit = 48 * 1024 * 1024
 let storage_payload_cache_bytes = ref 0
 let code_seed_cache_limit = 128
-let code_seed_cache_ttl_secs = 300.0
 
 let code_cache_key code_b64 =
   Digestif.SHA256.(to_hex (digest_string code_b64))
@@ -206,44 +203,6 @@ let remove_storage_cache key =
     storage_payload_cache_bytes :=
       max 0 (!storage_payload_cache_bytes - entry.weight)
 
-let oldest_storage_cache_key () =
-  Hashtbl.fold
-    (fun key entry oldest ->
-      match oldest with
-      | None -> Some (key, entry.touched_at)
-      | Some (_, touched_at) when entry.touched_at < touched_at ->
-        Some (key, entry.touched_at)
-      | Some _ ->
-        oldest)
-    storage_payload_cache
-    None
-  |> Option.map fst
-
-let prune_storage_payload_cache incoming_count incoming_weight =
-  let now = Unix.gettimeofday () in
-  let stale =
-    Hashtbl.fold
-      (fun key entry keys ->
-        if now -. entry.touched_at > storage_payload_cache_ttl_secs then
-          key :: keys
-        else
-          keys)
-      storage_payload_cache
-      [] in
-  List.iter remove_storage_cache stale;
-  while
-    Hashtbl.length storage_payload_cache + incoming_count
-    > storage_payload_cache_limit
-    || !storage_payload_cache_bytes + incoming_weight
-       > storage_payload_cache_byte_limit
-  do
-    match oldest_storage_cache_key () with
-    | None ->
-      storage_payload_cache_bytes := 0
-    | Some key ->
-      remove_storage_cache key
-  done
-
 let storage_payload_cache_stats () =
   Hashtbl.length storage_payload_cache, !storage_payload_cache_bytes
 
@@ -254,12 +213,17 @@ let clear_storage_payload_cache () =
   Hashtbl.reset storage_payload_cache;
   storage_payload_cache_bytes := 0
 
+let reserve_storage_payload_cache incoming_weight =
+  if
+    Hashtbl.length storage_payload_cache >= storage_payload_cache_limit
+    || !storage_payload_cache_bytes + incoming_weight
+       > storage_payload_cache_byte_limit
+  then
+    clear_storage_payload_cache ()
+
 let cached_storage_entry storage_cache_key storage_tbl =
-  prune_storage_payload_cache 0 0;
   match Hashtbl.find_opt storage_payload_cache storage_cache_key with
-  | Some entry ->
-    entry.touched_at <- Unix.gettimeofday ();
-    entry
+  | Some entry -> entry
   | None ->
     let weight = storage_payload_weight storage_tbl in
     let entry =
@@ -267,42 +231,24 @@ let cached_storage_entry storage_cache_key storage_tbl =
         storage_json = make_storage_pairs_json storage_tbl;
         seeded_in_native = false;
         weight;
-        touched_at = Unix.gettimeofday ();
       } in
     if weight <= storage_payload_cache_byte_limit then begin
-      prune_storage_payload_cache 1 weight;
+      reserve_storage_payload_cache weight;
       Hashtbl.replace storage_payload_cache storage_cache_key entry;
       storage_payload_cache_bytes := !storage_payload_cache_bytes + weight
     end;
     entry
 
-let prune_code_seed_cache () =
-  let now = Unix.gettimeofday () in
-  Hashtbl.filter_map_inplace
-    (fun _ touched_at ->
-      if now -. touched_at > code_seed_cache_ttl_secs then None
-      else Some touched_at)
-    code_seed_cache;
-  if Hashtbl.length code_seed_cache > code_seed_cache_limit then
-    Hashtbl.reset code_seed_cache
-
 let code_seeded code_key =
-  prune_code_seed_cache ();
-  match Hashtbl.find_opt code_seed_cache code_key with
-  | Some _ ->
-    Hashtbl.replace code_seed_cache code_key (Unix.gettimeofday ());
-    true
-  | None ->
-    false
+  Hashtbl.mem code_seed_cache code_key
 
 let mark_code_seeded code_key =
-  prune_code_seed_cache ();
   if
     not (Hashtbl.mem code_seed_cache code_key)
     && Hashtbl.length code_seed_cache >= code_seed_cache_limit
   then
     Hashtbl.reset code_seed_cache;
-  Hashtbl.replace code_seed_cache code_key (Unix.gettimeofday ())
+  Hashtbl.replace code_seed_cache code_key ()
 
 let decode_storage_tbl = function
   | `List items ->

@@ -9,6 +9,7 @@ module Epoch_exec = Octra_core.Epoch_exec
 module Preverify_commit = Octra_core.Preverify_commit
 module Preverify_receipt = Octra_core.Preverify_receipt
 module Program_trust = Octra_vm.Program_trust
+module Receipt_view = Octra_vm.Receipt_view
 module Transcript = Octra_core.Circle_hfhe_transcript
 module Transaction = Octra_core.Transaction
 module Tx_effects = Octra_vm.Tx_effects
@@ -43,11 +44,39 @@ let context ~program_trust backend env (tx : Transaction.t) effects tx_hash =
     }
 
 let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
+    ?(save_receipt_raw=(fun ~tx_hash:_ ~json:_ -> ()))
     ~program_trust backend env (tx : Transaction.t) =
   let effects =
     Tx_effects.create
       ~ledger:backend.Epoch_exec.ledger
       ~store:backend.store
+  in
+  let staged_receipts = ref [] in
+  let stage_receipt ~tx_hash ~json =
+    if List.exists (fun (hash, _) -> String.equal hash tx_hash) !staged_receipts
+    then
+      raise
+        (Tx_effects.Commit_failed
+           ("duplicate VM receipt for " ^ tx_hash))
+    else
+      staged_receipts := (tx_hash, json) :: !staged_receipts
+  in
+  let stage_direct_receipt ?(program = false) ~tx_hash ~target ~method_name
+      receipt =
+    stage_receipt
+      ~tx_hash
+      ~json:
+        (Receipt_view.direct_receipt_json
+           ~program
+           ~epoch:env.Epoch_exec.epoch_id
+           ~now:env.epoch_ts
+           ~target
+           ~method_name
+           receipt)
+  in
+  let flush_receipts () =
+    List.rev !staged_receipts
+    |> List.iter (fun (tx_hash, json) -> save_receipt_raw ~tx_hash ~json)
   in
   let outcome = ref None in
   let fee_persisted = ref false in
@@ -122,6 +151,15 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
         bytecode_raw
         tx.nonce
     in
+    stage_direct_receipt
+      ~program:
+        (match tx.op_type with
+         | Transaction.ProgramDeploy -> true
+         | _ -> false)
+      ~tx_hash:(Transaction.hash tx)
+      ~target:contract_addr
+      ~method_name:"constructor"
+      receipt;
     {
       Vm.contract_addr;
       receipt;
@@ -185,7 +223,12 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
                    ("circle receipt mismatch for "
                     ^ Transaction.hash current))
         end);
-      circle_save = (fun _ ~tx_hash:_ _ _ -> ());
+      circle_save = (fun current ~tx_hash call result ->
+        stage_direct_receipt
+          ~tx_hash
+          ~target:current.Transaction.to_
+          ~method_name:call.Call_plan.method_name
+          result.Circle_exec.receipt);
       circle_commit = (fun current result ->
         Circle_exec.commit_call_result backend.store current.to_ result);
       circle_log_ok = (fun _ _ _ _ -> ());
@@ -202,7 +245,13 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
              call.params
              current.from
              current.amount));
-      program_save = (fun _ ~tx_hash:_ _ _ -> ());
+      program_save = (fun current ~tx_hash call receipt ->
+        stage_direct_receipt
+          ~program:true
+          ~tx_hash
+          ~target:current.Transaction.to_
+          ~method_name:call.Call_plan.method_name
+          receipt);
       program_log_ok = (fun _ _ _ _ -> ());
       multi_execute_call = (fun ~ctx ~limit ~target ~method_name ~params
           ~caller ~amount ->
@@ -217,7 +266,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
           params
           caller
           amount);
-      save_receipt_raw = (fun ~tx_hash:_ ~json:_ -> ());
+      save_receipt_raw = stage_receipt;
       reject_malformed = (fun reason ->
         reject "malformed_transaction" reason);
       max_multi_exec_calls = Vm.max_multi_exec_calls ~env:Sys.getenv_opt;
@@ -225,36 +274,44 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
       now = (fun () -> env.epoch_ts);
     }
   in
-  Lwt.catch
-    (fun () ->
-      let open Lwt.Syntax in
-      let* () =
-        match tx.op_type with
-        | Transaction.ContractUpgrade ->
-          Vm.run_program_upgrade_tx
-            runtime
-            ~trusted_program_keys:program_trust
-            ~program_journal:(Tx_effects.program effects)
-            ~store:backend.store
-            tx
-        | _ ->
-          Vm.run_vm_tx deps tx
-      in
-      match !outcome with
-      | Some value -> Lwt.return value
-      | None ->
+  let open Lwt.Syntax in
+  let* result =
+    Lwt.catch
+      (fun () ->
+        let* () =
+          match tx.op_type with
+          | Transaction.ContractUpgrade ->
+            Vm.run_program_upgrade_tx
+              runtime
+              ~trusted_program_keys:program_trust
+              ~program_journal:(Tx_effects.program effects)
+              ~store:backend.store
+              tx
+          | _ ->
+            Vm.run_vm_tx deps tx
+        in
+        match !outcome with
+        | Some value -> Lwt.return value
+        | None ->
+          discard ();
+          Lwt.return
+            (Error
+               ("vm_transition_incomplete", "VM transition produced no outcome")))
+      (fun error ->
         discard ();
-        Lwt.return
-          (Error
-             ("vm_transition_incomplete", "VM transition produced no outcome")))
-    (fun error ->
-      discard ();
-      match error with
-      | Circle_receipt_mismatch _ -> Lwt.fail error
-      | _ ->
-        Lwt.return
-          (Error
-             ("vm_transition_exception", Printexc.to_string error)))
+        match error with
+        | Circle_receipt_mismatch _ -> Lwt.fail error
+        | _ ->
+          Lwt.return
+            (Error
+               ("vm_transition_exception", Printexc.to_string error)))
+  in
+  begin
+    match result with
+    | Ok _ -> flush_receipts ()
+    | Error _ -> ()
+  end;
+  Lwt.return result
 
 let circle_receipt preverify tx =
   match preverify with
@@ -309,7 +366,8 @@ let preverify_circle ~backend ~env ~program_trust tx =
   | Ok (Epoch_exec.Confirmed _), None ->
     Lwt.return_error "circle_receipt_capture_missing"
 
-let process_tx ?preverify ~backend ~(env : Epoch_exec.env) ~program_trust tx =
+let process_tx ?preverify ?save_receipt_raw ~backend
+    ~(env : Epoch_exec.env) ~program_trust tx =
   match tx.Transaction.op_type with
   | Transaction.CircleBalanceCellPut
   | Transaction.CircleRegisterCellPut ->
@@ -335,11 +393,12 @@ let process_tx ?preverify ~backend ~(env : Epoch_exec.env) ~program_trust tx =
       | Error e ->
         Lwt.return_error ("circle_preverify_receipt", e)
       | Ok None ->
-        run ~program_trust backend env tx
+        run ?save_receipt_raw ~program_trust backend env tx
       | Ok (Some circle) ->
         run
           ~hfhe_mode:(Transcript.Consume circle.transcript)
           ~expected_circle:circle
+          ?save_receipt_raw
           ~program_trust
           backend
           env
@@ -351,7 +410,7 @@ let process_tx ?preverify ~backend ~(env : Epoch_exec.env) ~program_trust tx =
   | Transaction.ProgramExec
   | Transaction.MultiExec
   | Transaction.ContractUpgrade ->
-    run ~program_trust backend env tx
+    run ?save_receipt_raw ~program_trust backend env tx
   | Transaction.CircleDeploy
   | Transaction.CircleProgramUpdate ->
     let open Lwt.Syntax in

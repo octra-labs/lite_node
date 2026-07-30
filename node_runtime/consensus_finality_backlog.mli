@@ -2,15 +2,14 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type outcome =
-  | Continue
+  | Clean
   | Armed
   | Blocked
 
 type deps = {
-  read_journal : unit -> Consensus_finality_journal.read_result;
-  head_epoch : unit -> int;
-  root_at_epoch : int -> string option;
-  current_root : unit -> string option;
+  read_backlog :
+    unit ->
+    (Consensus_finality_journal.record list, string) result;
   write_finality : Octra_consensus.C_types.finalize -> unit;
   store_finalized :
     epoch:int ->
@@ -24,17 +23,9 @@ type deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     unit;
-  set_proposal :
-    Octra_core.Transaction.t list ->
-    string list ->
-    unit;
-  reset_proposal_state : unit -> unit;
   set_consensus_finalized : bool -> unit;
   clear_state_attested : unit -> unit;
-  commit_journal : epoch:int64 -> state_root:string -> unit;
   mark_quarantine : string -> unit;
 }
 
-val run :
-  deps ->
-  outcome
+val run : deps -> outcome

@@ -33,7 +33,7 @@ type deps = {
     proposal_id:string ->
     Bundle_fetch.accepted ->
     unit;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  sleep : float -> unit Lwt.t;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
@@ -61,7 +61,7 @@ type node_deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     unit;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
+  sleep : float -> unit Lwt.t;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
@@ -95,7 +95,7 @@ let node_deps input =
         ~tx_hashes:bundle.tx_hashes
         ~txs:bundle.txs
         ~receipts_json:bundle.receipts_json);
-    queue_missing_bundle = input.queue_missing_bundle;
+    sleep = input.sleep;
     post_finalize = input.post_finalize;
   }
 
@@ -118,10 +118,6 @@ let bundle_deps (deps : deps) header proposal_id =
         ~validate);
     store_accepted_bundle = (fun accepted ->
       deps.store_accepted_bundle ~proposal_id accepted);
-    queue_missing_bundle = (fun ~epoch_id ->
-      deps.queue_missing_bundle
-        ~target_epoch:epoch_id
-        ~reason:"finalized_bundle_missing");
   }
 
 let journal_bundle tx_hashes txs receipts_json =
@@ -141,6 +137,20 @@ let persist_available_bundle (deps : deps) finalize proposal_id =
   | None ->
     false
 
+let rec await_bundle (deps : deps) header proposal_id delay =
+  let open Lwt.Syntax in
+  let* state =
+    Bundle_fetch.ensure_finalized
+      (bundle_deps deps header proposal_id)
+      ~epoch_id:header.C_types.epoch_id
+  in
+  match state with
+  | Bundle_fetch.Finalized_ready ->
+    Lwt.return_unit
+  | Bundle_fetch.Finalized_deferred ->
+    let* () = deps.sleep delay in
+    await_bundle deps header proposal_id (min 5.0 (delay *. 2.0))
+
 let run (deps : deps) finalize =
   let open Lwt.Syntax in
   let header = finalize.C_types.header in
@@ -154,24 +164,16 @@ let run (deps : deps) finalize =
   deps.write_finality finalize;
   deps.chaos_after_finality_log ();
   Log.info "consensus"
-    "BFT finalized epoch = %Ld round = %d txs = %d"
+    "event = finalized_certificate epoch = %Ld round = %d txs = %d"
     header.C_types.epoch_id
     round
     (deps.cached_bundle_len ~proposal_id);
-  let* bundle_state =
-    Bundle_fetch.ensure_finalized
-      (bundle_deps deps header proposal_id)
-      ~epoch_id:header.C_types.epoch_id
-  in
-  match bundle_state with
-  | Bundle_fetch.Finalized_deferred ->
-    Lwt.return_unit
-  | Bundle_fetch.Finalized_ready ->
-    if
-      not bundle_persisted
-      && not (persist_available_bundle deps finalize proposal_id)
-    then
-      failwith "finalized bundle ready without cached data";
-    deps.post_finalize
-      ~epoch_id:header.C_types.epoch_id
-      ~proposed_root:header.C_types.proposed_state_root
+  let* () = await_bundle deps header proposal_id 1.0 in
+  if
+    not bundle_persisted
+    && not (persist_available_bundle deps finalize proposal_id)
+  then
+    failwith "finalized bundle ready without cached data";
+  deps.post_finalize
+    ~epoch_id:header.C_types.epoch_id
+    ~proposed_root:header.C_types.proposed_state_root

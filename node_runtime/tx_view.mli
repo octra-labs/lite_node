@@ -286,6 +286,8 @@ type payload_limits = {
   message_program_len : int;
 }
 
+val payload_limits : payload_limits
+
 val payload_admission :
   limits:payload_limits ->
   Octra_core.Transaction.t ->

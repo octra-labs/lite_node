@@ -155,7 +155,7 @@ let run_standard_or_sender ~consensus_mode (deps : standard_or_sender_deps) txs 
   | false, _ ->
     Sender.run deps.sender txs
 
-let runtime_shared ?preverify (runtime : runtime) =
+let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
   let backend = lazy (runtime.backend ()) in
   let env = lazy (runtime.env ()) in
   let private_transition =
@@ -181,26 +181,40 @@ let runtime_shared ?preverify (runtime : runtime) =
           ~ledger:(Lazy.force backend).Epoch_exec.ledger
           ~store:(Lazy.force backend).Epoch_exec.store
           (fun () ->
-            if Transaction.bft_crypto_active ()
-              && Transaction.bft_crypto_op tx.Transaction.op_type
-            then
-              let* private_result =
-                Octra_core.Private_transition.process
-                  (Lazy.force private_transition)
+            let* result =
+              if Transaction.bft_crypto_active ()
+                && Transaction.bft_crypto_op tx.Transaction.op_type
+              then
+                let* private_result =
+                  Octra_core.Private_transition.process
+                    (Lazy.force private_transition)
+                    ~backend:(Lazy.force backend)
+                    ~env:(Lazy.force env)
+                    tx in
+                Lwt.return
+                  (Result.map
+                     (fun fee -> Epoch_exec.Confirmed fee)
+                     private_result)
+              else
+                Consensus_vm_transition.process_tx
+                  ?preverify
+                  ?save_receipt_raw
                   ~backend:(Lazy.force backend)
                   ~env:(Lazy.force env)
-                  tx in
-              Lwt.return
-                (Result.map
-                   (fun fee -> Epoch_exec.Confirmed fee)
-                   private_result)
-            else
-              Consensus_vm_transition.process_tx
-                ?preverify
-                ~backend:(Lazy.force backend)
-                ~env:(Lazy.force env)
-                ~program_trust:runtime.program_trust
-                tx)
+                  ~program_trust:runtime.program_trust
+                  tx
+            in
+            begin
+              match result with
+              | Ok (Epoch_exec.Confirmed _) ->
+                Epoch_exec.register_confirmed_sender_key
+                  ~backend:(Lazy.force backend)
+                  ~env:(Lazy.force env)
+                  tx
+              | Ok (Epoch_exec.Rejected_after_fee _)
+              | Error _ -> ()
+            end;
+            Lwt.return result)
       in
       Lwt.return result);
     confirm = (fun tx ->
@@ -228,17 +242,17 @@ let runtime_sender (runtime : runtime) =
       runtime.exit ());
   }
 
-let runtime_deps ?preverify (runtime : runtime) =
+let runtime_deps ?preverify ?save_receipt_raw (runtime : runtime) =
   {
     log_shared = runtime.log_shared;
-    shared = runtime_shared ?preverify runtime;
+    shared = runtime_shared ?preverify ?save_receipt_raw runtime;
     sender = runtime_sender runtime;
   }
 
-let run_runtime ?preverify (runtime : runtime) txs =
+let run_runtime ?preverify ?save_receipt_raw (runtime : runtime) txs =
   run_standard_or_sender
     ~consensus_mode:runtime.consensus_mode
-    (runtime_deps ?preverify runtime)
+    (runtime_deps ?preverify ?save_receipt_raw runtime)
     txs
 
 let run_node ?preverify (runtime : node_runtime) ordered_txs =
@@ -308,6 +322,11 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
     let* () =
       run_runtime
         ?preverify
+        ~save_receipt_raw:(fun ~tx_hash ~json ->
+          Octra_core.Store_chaindata.save_receipt_raw
+            runtime.chaindata
+            ~tx_hash
+            ~json)
         {
         consensus_mode = runtime.consensus_mode;
         current_epoch = runtime.current_epoch;

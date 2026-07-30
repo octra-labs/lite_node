@@ -33,7 +33,7 @@ type deps = {
   reset_proposal_state : unit -> unit;
   set_consensus_finalized : bool -> unit;
   clear_state_attested : unit -> unit;
-  commit_journal : unit -> unit;
+  commit_journal : epoch:int64 -> state_root:string -> unit;
   mark_quarantine : string -> unit;
 }
 
@@ -54,7 +54,9 @@ let applied deps record target =
     match deps.root_at_epoch target with
     | Some root
       when root = record.Journal.finalize.C_types.header.proposed_state_root ->
-      deps.commit_journal ();
+      deps.commit_journal
+        ~epoch:record.finalize.C_types.epoch_id
+        ~state_root:root;
       Log.info "finality"
         "event = finality_journal_recovery action = commit_applied epoch = %d"
         target;

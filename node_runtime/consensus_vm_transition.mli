@@ -10,6 +10,7 @@ val preverify_circle :
 
 val process_tx :
   ?preverify:Octra_core.Preverify_commit.t ->
+  ?save_receipt_raw:(tx_hash:string -> json:string -> unit) ->
   backend:Octra_core.Epoch_exec.backend ->
   env:Octra_core.Epoch_exec.env ->
   program_trust:Octra_vm.Program_trust.t ->

@@ -148,7 +148,7 @@ let default_join_log =
 
 let run_join ~log ~tasks ~close_chaindata ~exit_fatal =
   Lwt.catch
-    (fun () -> Lwt.join tasks)
+    (fun () -> Lwt.pick tasks)
     (fun e ->
       log.fatal
         (Printf.sprintf "event = lwt_main_failed reason = %s"

@@ -118,11 +118,13 @@ val run_standard_or_sender :
 
 val runtime_deps :
   ?preverify:Octra_core.Preverify_commit.t ->
+  ?save_receipt_raw:(tx_hash:string -> json:string -> unit) ->
   runtime ->
   standard_or_sender_deps
 
 val run_runtime :
   ?preverify:Octra_core.Preverify_commit.t ->
+  ?save_receipt_raw:(tx_hash:string -> json:string -> unit) ->
   runtime ->
   Transaction.t list ->
   unit Lwt.t

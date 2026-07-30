@@ -14,8 +14,6 @@ val addr_valid : Octra_core.Transaction.t -> bool
 
 val sig_valid : Octra_core.Transaction.t -> string option -> bool
 
-val payload_valid : Octra_core.Transaction.t -> bool
-
 val admit :
   now:float ->
   max_drift:float ->

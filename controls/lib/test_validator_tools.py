@@ -42,7 +42,9 @@ from validator_guard import require_hashed_file
 from validator_process import process_plan
 from validator_process import process_pids
 from validator_process import remaining_owners
+from validator_process import active_data_owners
 from validator_process import wait_stopped
+from validator_recover import recover
 from validator_status import promotion_readiness
 
 TMP_ROOT = CONFIG_ROOT / "tmp"
@@ -161,6 +163,22 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
+    def test_network_rejects_entitlement_snapshot_after_activation(self):
+        values = network_values(self.entitlement)
+        payload = json.loads(self.entitlement.read_text(encoding="utf-8"))
+        payload["snapshot_epoch"] = 100
+        self.entitlement.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
+    def test_network_rejects_invalid_entitlement_state_root(self):
+        values = network_values(self.entitlement)
+        payload = json.loads(self.entitlement.read_text(encoding="utf-8"))
+        payload["state_root"] = "invalid"
+        self.entitlement.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
     def test_bundle_validator_binds_binary_hash(self):
         bundle = WORK / "network.env"
         binary = WORK / "octra_node.exe"
@@ -187,7 +205,15 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_proposal_protocol_activation_follows_checkpoint(self):
+    def test_network_allows_checkpoint_rotation(self):
+        values = network_values(self.entitlement)
+        values["OCTRA_CHECKPOINT_EPOCH"] = "250"
+        values["OCTRA_CHECKPOINT_STATE_ROOT"] = "5" * 64
+        values["OCTRA_CHECKPOINT_TXID_HI"] = "900"
+        validated = validate_network(values, WORK)
+        self.assertEqual(validated["OCTRA_CHECKPOINT_EPOCH"], "250")
+
+    def test_proposal_protocol_activation_cannot_precede_emission(self):
         values = network_values(self.entitlement)
         values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"] = "99"
         with self.assertRaises(ValidatorError):
@@ -395,11 +421,13 @@ class ValidatorToolsTest(unittest.TestCase):
         exported_path = Path(__file__).resolve().parent.parent / "run.sh"
         script_path = source_path if source_path.is_file() else exported_path
         script = script_path.read_text(encoding="utf-8")
+        recovery = script.index("validator_recover.py")
         guard = script.index("validator_guard.py")
         source = script.index('. "$CONFIG"')
         cleanup = script.index("validator_process.py")
         runtime = script.index('mkdir -p "$ROOT/data"')
         start = script.index('pm2 start "$OCTRA_OPERATOR_BINARY"')
+        self.assertLess(recovery, guard)
         self.assertLess(guard, source)
         self.assertLess(source, cleanup)
         self.assertLess(cleanup, start)
@@ -465,6 +493,83 @@ class ValidatorToolsTest(unittest.TestCase):
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--concurrency") + 1], "4")
         self.assertEqual(command[command.index("--source-concurrency") + 1], "1")
+
+    def test_unattended_configuration_syncs_by_default(self):
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        args = parser().parse_args([
+            "--sync-binary",
+            str(sync_binary),
+            "--sync-stage",
+            str(WORK / "stage"),
+            "--yes",
+        ])
+        with mock.patch("validator_config.run", side_effect=RuntimeError("captured")):
+            with self.assertRaisesRegex(RuntimeError, "captured"):
+                maybe_sync(args, str(WORK / "data"), network_values(self.entitlement))
+
+    def test_recovery_keeps_valid_offline_state(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        config = WORK / "node.env"
+        write_env(config, {
+            "OCTRA_CHECKPOINT_EPOCH": "99",
+            "OCTRA_CHECKPOINT_STATE_ROOT": "3" * 64,
+            "OCTRA_CHECKPOINT_TXID_HI": "500",
+            "OCTRA_DATA_DIR": str(data),
+        })
+        with mock.patch("validator_recover.pm2_entries") as inspect:
+            recover(config)
+        inspect.assert_not_called()
+
+    def test_recovery_downloads_verified_state(self):
+        data = WORK / "data"
+        bundle = WORK / "network.env"
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        network = network_values(self.entitlement)
+        write_env(bundle, network)
+        config = WORK / "node.env"
+        write_env(config, {
+            **network,
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+            "OCTRA_OPERATOR_SYNC_BINARY_HASH": hashlib.sha256(b"client").hexdigest(),
+            "OCTRA_OPERATOR_SYNC_CONCURRENCY": "4",
+            "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
+            "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
+        })
+
+        def install(*_):
+            (data / "irmin_store").mkdir(parents=True)
+            (data / "chaindata").mkdir()
+            (data / "HEAD.json").write_text(
+                '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+                encoding="utf-8",
+            )
+
+        with mock.patch("validator_recover.pm2_entries", return_value=[]):
+            with mock.patch("validator_recover.sync_snapshot", side_effect=install) as sync:
+                recover(config)
+        sync.assert_called_once()
+
+    def test_recovery_preserves_nonempty_invalid_state(self):
+        data = WORK / "data"
+        data.mkdir()
+        evidence = data / "unknown"
+        evidence.write_bytes(b"preserve")
+        config = WORK / "node.env"
+        write_env(config, {"OCTRA_DATA_DIR": str(data)})
+        with self.assertRaisesRegex(ValidatorError, "evidence-preserving"):
+            recover(config)
+        self.assertEqual(evidence.read_bytes(), b"preserve")
 
     def test_config_root_matches_layout(self):
         source = Path(__file__).resolve()
@@ -621,6 +726,28 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(
             process_pids(entries, ["octra-new", "octra-old"]),
             [199, 201],
+        )
+
+    def test_active_data_owners_block_recovery(self):
+        entries = [
+            {
+                "name": "octra-validator",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/octra",
+                    "status": "online",
+                },
+            },
+            {
+                "name": "octra-observer",
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": "/data/other",
+                    "status": "online",
+                },
+            },
+        ]
+        self.assertEqual(
+            active_data_owners(entries, "/data/octra"),
+            ["octra-validator"],
         )
 
     def test_remaining_owners_detects_name_and_data_dir(self):

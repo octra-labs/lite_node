@@ -1224,11 +1224,17 @@ CAMLprim value caml_pvac_serialize_pubkey(value v_pk) {
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
 
     std::vector<uint8_t> buf;
+    char err_buf[256] = {0};
+    caml_release_runtime_system();
     try {
         buf = pvac_ser::serialize_pubkey(pk);
     } catch (const std::exception& e) {
-        caml_failwith(e.what());
+        snprintf(err_buf, sizeof(err_buf), "%s", e.what());
+    } catch (...) {
+        snprintf(err_buf, sizeof(err_buf), "serialize_pubkey failed: unknown error");
     }
+    caml_acquire_runtime_system();
+    if (err_buf[0]) caml_failwith(err_buf);
 
     v_bytes = caml_alloc_string(buf.size());
     std::memcpy(Bytes_val(v_bytes), buf.data(), buf.size());
@@ -1243,16 +1249,22 @@ CAMLprim value caml_pvac_serialize_pubkey_legacy_v2(value v_pk) {
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
 
     std::vector<uint8_t> buf;
+    char err_buf[256] = {0};
+    caml_release_runtime_system();
     try {
         auto raw = pvac_ser::serialize_pubkey_raw(pk);
         if (raw.size() < 39)
-            caml_failwith("serialize_pubkey_legacy_v2: invalid pubkey size");
+            throw std::runtime_error("serialize_pubkey_legacy_v2: invalid pubkey size");
         raw[4] = pvac_ser::VERSION_V2;
         raw.resize(raw.size() - 33);
         buf = pvac::compress::pack(raw);
     } catch (const std::exception& e) {
-        caml_failwith(e.what());
+        snprintf(err_buf, sizeof(err_buf), "%s", e.what());
+    } catch (...) {
+        snprintf(err_buf, sizeof(err_buf), "serialize_pubkey_legacy_v2 failed: unknown error");
     }
+    caml_acquire_runtime_system();
+    if (err_buf[0]) caml_failwith(err_buf);
 
     v_bytes = caml_alloc_string(buf.size());
     std::memcpy(Bytes_val(v_bytes), buf.data(), buf.size());

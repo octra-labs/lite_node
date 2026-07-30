@@ -34,6 +34,7 @@ val node_backend :
   max_fhe:int ->
   max_stealth:int ->
   Octra_core.Store_irmin.t ->
+  Octra_core.Ledger.t ->
   backend
 
 val run :

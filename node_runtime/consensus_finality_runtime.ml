@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Log = Octra_log
+module C_codec = Octra_consensus.C_codec
 
 type replay_deps = {
   current_epoch : unit -> int;
@@ -40,7 +41,6 @@ type node_deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     unit;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
   deactivate_gap : unit -> unit;
   set_consensus_finalized : bool -> unit;
   current_epoch : unit -> int;
@@ -64,7 +64,6 @@ type node_runtime = {
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
   proposal_state : Consensus_proposal_state.t;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
   catchup_queue : Consensus_catchup_queue.t;
   consensus_finalized : bool ref;
   current_epoch : int ref;
@@ -88,11 +87,43 @@ type t = {
 
 let create_with_failure deps on_failure =
   let apply_deps = Consensus_finalized_apply.node_deps deps.apply in
-  let apply_finalized finalize =
-    Lwt.catch
-      (fun () ->
-        Consensus_finalized_apply.run apply_deps finalize)
-      (on_failure finalize)
+  let active_apply = ref None in
+  let rec apply_finalized finalize =
+    let epoch = finalize.Octra_consensus.C_types.epoch_id in
+    let encoded = C_codec.encode_finalize finalize in
+    match !active_apply with
+    | Some (active_epoch, active_encoded, pending) ->
+      if encoded = active_encoded then begin
+        Log.info "consensus"
+          "event = finalized_apply_join epoch = %Ld"
+          epoch;
+        pending
+      end else if Int64.equal epoch active_epoch then
+        Lwt.fail_with "conflicting concurrent finalized apply"
+      else
+        let open Lwt.Syntax in
+        let* () = pending in
+        apply_finalized finalize
+    | None ->
+      let pending, resolver = Lwt.wait () in
+      active_apply := Some (epoch, encoded, pending);
+      let running =
+        Lwt.catch
+          (fun () ->
+            Consensus_finalized_apply.run
+              apply_deps
+              finalize)
+          (on_failure finalize)
+      in
+      Lwt.on_any
+        running
+        (fun () ->
+          active_apply := None;
+          Lwt.wakeup_later resolver ())
+        (fun exn ->
+          active_apply := None;
+          Lwt.wakeup_later_exn resolver exn);
+      pending
   in
   let replay =
     Consensus_finalized_replay.node_runner
@@ -141,7 +172,7 @@ let create_node deps =
           driver = deps.driver;
           set_proposal = deps.set_proposal;
           store_proposal_bundle = deps.store_proposal_bundle;
-          queue_missing_bundle = deps.queue_missing_bundle;
+          sleep = deps.sleep;
           post_finalize = (fun ~epoch_id ~proposed_root ->
             Consensus_post_finalize.run
               {
@@ -204,7 +235,6 @@ let node_deps_of_runtime runtime =
     driver = (fun () -> !(runtime.driver_ref));
     set_proposal = Consensus_proposal_state.set runtime.proposal_state;
     store_proposal_bundle = runtime.bundles.store_bundle;
-    queue_missing_bundle = runtime.queue_missing_bundle;
     deactivate_gap = (fun () ->
       Consensus_catchup_queue.deactivate_gap runtime.catchup_queue);
     set_consensus_finalized = (fun finalized ->

@@ -38,7 +38,6 @@ type node_deps = {
     txs:Octra_core.Transaction.t list ->
     receipts_json:string list ->
     unit;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
   deactivate_gap : unit -> unit;
   set_consensus_finalized : bool -> unit;
   current_epoch : unit -> int;
@@ -62,7 +61,6 @@ type node_runtime = {
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
   proposal_state : Consensus_proposal_state.t;
-  queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
   catchup_queue : Consensus_catchup_queue.t;
   consensus_finalized : bool ref;
   current_epoch : int ref;

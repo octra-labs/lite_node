@@ -41,18 +41,31 @@ let normalize_url raw =
       | _ -> Error "state sync source must be an absolute HTTP URL"
     with _ -> Error "invalid state sync source URL"
 
+let decimal_octet raw =
+  let length = String.length raw in
+  if length = 0
+     || length > 3
+     || (length > 1 && raw.[0] = '0')
+     || not
+          (String.for_all
+             (function
+               | '0' .. '9' -> true
+               | _ -> false)
+             raw) then
+    None
+  else
+    match int_of_string_opt raw with
+    | Some value when value <= 255 -> Some value
+    | _ -> None
+
 let ipv4_octets host =
   match String.split_on_char '.' host with
   | [a; b; c; d] ->
-      begin
-        try
-          let values = List.map int_of_string [a; b; c; d] in
-          if List.for_all (fun value -> value >= 0 && value <= 255) values then
-            Some values
-          else
-            None
-        with _ -> None
-      end
+    begin
+      match List.map decimal_octet [a; b; c; d] with
+      | [Some a; Some b; Some c; Some d] -> Some [a; b; c; d]
+      | _ -> None
+    end
   | _ -> None
 
 let loopback_host host =
@@ -75,10 +88,31 @@ let private_ipv4 host =
       end
   | _ -> false
 
+let ipv6_first_hextet host =
+  if not (String.contains host ':') then
+    None
+  else
+    try
+      let normalized =
+        Unix.inet_addr_of_string host
+        |> Unix.string_of_inet_addr
+        |> String.lowercase_ascii
+      in
+      match String.index_opt normalized ':' with
+      | Some 0 -> Some 0
+      | Some index ->
+        String.sub normalized 0 index
+        |> fun value -> int_of_string_opt ("0x" ^ value)
+      | None -> None
+    with _ ->
+      None
+
 let private_ipv6 host =
-  String.starts_with ~prefix:"fc" host
-  || String.starts_with ~prefix:"fd" host
-  || String.starts_with ~prefix:"fe80:" host
+  match ipv6_first_hextet host with
+  | Some value ->
+    value land 0xfe00 = 0xfc00
+    || value land 0xffc0 = 0xfe80
+  | None -> false
 
 let private_host host =
   loopback_host host || private_ipv4 host || private_ipv6 host
