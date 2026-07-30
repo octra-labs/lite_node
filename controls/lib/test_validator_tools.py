@@ -47,6 +47,8 @@ from validator_process import active_data_owners
 from validator_process import wait_stopped
 from validator_recover import recover
 from validator_status import promotion_readiness
+from validator_state_sync_source import disable_source
+from validator_state_sync_source import enable_source
 
 TMP_ROOT = CONFIG_ROOT / "tmp"
 WORK = TMP_ROOT / "validator_tools_test"
@@ -226,6 +228,104 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
+
+    def test_state_sync_source_requires_signed_matching_snapshot(self):
+        values = network_values(self.entitlement)
+        config = WORK / "node.env"
+        write_env(config, values)
+        checkpoint_hash = "a" * 64
+        manifest_hash = "b" * 64
+        snapshot_root = WORK / "snapshots"
+        snapshot = snapshot_root / checkpoint_hash
+        snapshot.mkdir(parents=True)
+        certificate = WORK / "certificate.json"
+        certificate.write_text(json.dumps({
+            "version": "octra-state-sync",
+            "checkpoint": {
+                "chain_id": values["OCTRA_CHAIN_ID"],
+                "epoch": values["OCTRA_CHECKPOINT_EPOCH"],
+                "state_root": values["OCTRA_CHECKPOINT_STATE_ROOT"],
+                "txid_hi": values["OCTRA_CHECKPOINT_TXID_HI"],
+                "config_hash": values["OCTRA_CONSENSUS_CONFIG_HASH"],
+            },
+            "checkpoint_hash": checkpoint_hash,
+            "manifest": {
+                "checkpoint_hash": checkpoint_hash,
+                "snapshot_id": checkpoint_hash,
+            },
+            "manifest_hash": manifest_hash,
+        }), encoding="utf-8")
+        (snapshot / ".ready.json").write_text(json.dumps({
+            "version": "octra-state-sync-snapshot-ready",
+            "head_epoch": int(values["OCTRA_CHECKPOINT_EPOCH"]),
+            "state_root": values["OCTRA_CHECKPOINT_STATE_ROOT"],
+            "commit_id": "commit-1",
+            "created_at": 1,
+        }), encoding="utf-8")
+        (snapshot / "HEAD.json").write_text(json.dumps({
+            "epoch_id": int(values["OCTRA_CHECKPOINT_EPOCH"]),
+            "state_root": values["OCTRA_CHECKPOINT_STATE_ROOT"],
+            "txid_hi": values["OCTRA_CHECKPOINT_TXID_HI"],
+            "commit_id": "commit-1",
+        }), encoding="utf-8")
+        manifest_binary = WORK / "octra_state_sync_manifest.exe"
+        manifest_binary.write_bytes(b"binary")
+        with mock.patch(
+            "validator_state_sync_source.subprocess.run",
+        ) as invoke:
+            enable_source(
+                config,
+                certificate,
+                snapshot_root,
+                manifest_binary,
+            )
+        configured = parse_env(config)
+        self.assertEqual(configured["OCTRA_STATE_SYNC_ENABLE"], "1")
+        self.assertEqual(
+            configured["OCTRA_STATE_SYNC_CERT"],
+            str(certificate.resolve()),
+        )
+        self.assertEqual(
+            configured["OCTRA_STATE_SYNC_SNAPSHOT_DIR"],
+            str(snapshot_root.resolve()),
+        )
+        self.assertIn("--command", invoke.call_args.args[0])
+        self.assertIn("verify", invoke.call_args.args[0])
+        disable_source(config)
+        disabled = parse_env(config)
+        self.assertNotIn("OCTRA_STATE_SYNC_ENABLE", disabled)
+        self.assertNotIn("OCTRA_STATE_SYNC_CERT", disabled)
+        self.assertNotIn("OCTRA_STATE_SYNC_SNAPSHOT_DIR", disabled)
+
+    def test_state_sync_source_rejects_snapshot_root_mismatch(self):
+        values = network_values(self.entitlement)
+        config = WORK / "node.env"
+        write_env(config, values)
+        certificate = WORK / "certificate.json"
+        certificate.write_text(json.dumps({
+            "checkpoint": {
+                "chain_id": values["OCTRA_CHAIN_ID"],
+                "epoch": values["OCTRA_CHECKPOINT_EPOCH"],
+                "state_root": values["OCTRA_CHECKPOINT_STATE_ROOT"],
+                "txid_hi": values["OCTRA_CHECKPOINT_TXID_HI"],
+                "config_hash": values["OCTRA_CONSENSUS_CONFIG_HASH"],
+            },
+            "checkpoint_hash": "a" * 64,
+            "manifest": {
+                "checkpoint_hash": "a" * 64,
+                "snapshot_id": "a" * 64,
+            },
+            "manifest_hash": "b" * 64,
+        }), encoding="utf-8")
+        snapshot_root = WORK / "snapshots"
+        snapshot_root.mkdir()
+        with self.assertRaises(ValidatorError):
+            enable_source(
+                config,
+                certificate,
+                snapshot_root,
+                WORK / "octra_state_sync_manifest.exe",
+            )
 
     def test_advertise_uses_consensus_port(self):
         self.assertEqual(
