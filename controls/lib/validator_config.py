@@ -63,8 +63,9 @@ MIN_VALIDATOR_DISK = 1800 * 1000 ** 3
 MIN_VALIDATOR_FREE = 500 * 1000 ** 3
 MIN_OBSERVER_DISK = 900 * 1000 ** 3
 MIN_OBSERVER_FREE = 200 * 1000 ** 3
+RUST_TOOLCHAIN = "1.80.1"
 
-def canonical_pm2_name(name):
+def operator_pm2_name(name):
     return name if name.startswith("octra-") else f"octra-{name}"
 
 def emit(**fields):
@@ -108,23 +109,27 @@ def install_runtime():
     if not ubuntu_host():
         raise ValidatorError("automatic installation supports Ubuntu and Debian")
     packages = [
+        "build-essential",
         "ca-certificates",
+        "cargo",
         "curl",
-        "docker-buildx",
-        "docker.io",
         "git",
-        "libev4",
-        "libgmp10",
-        "liblmdb0",
-        "libsqlite3-0",
+        "libev-dev",
+        "libgmp-dev",
+        "liblmdb-dev",
+        "libsqlite3-dev",
+        "m4",
         "nodejs",
         "npm",
+        "opam",
+        "pkg-config",
         "python3",
         "python3-nacl",
+        "rustc",
     ]
     run(elevated(["apt-get", "update"]), cwd=Path("/"))
     run(elevated(["apt-get", "install", "-y", *packages]), cwd=Path("/"))
-    run(elevated(["systemctl", "enable", "--now", "docker"]), cwd=Path("/"))
+    install_rust_toolchain()
     run(elevated(["npm", "install", "-g", "pm2"]), cwd=Path("/"))
     run(["pm2", "install", "pm2-logrotate"])
     run(["pm2", "set", "pm2-logrotate:max_size", "100M"])
@@ -165,53 +170,147 @@ def tool_version(raw):
         raise ValidatorError("invalid tool version")
     return (parts + (0, 0, 0))[:3]
 
-def source_build_file():
-    exported = ROOT / "controls/source_build.Dockerfile"
-    if exported.is_file():
-        return exported
-    return ROOT / "docs/release/validator_tools/source_build.Dockerfile"
+def rust_environment():
+    cargo_bin = str(Path.home() / ".cargo/bin")
+    return {
+        **os.environ,
+        "PATH": os.pathsep.join([cargo_bin, os.environ.get("PATH", "")]),
+    }
 
-def docker_command():
-    docker = shutil.which("docker")
-    if docker is None:
-        raise ValidatorError("source build requires docker")
-    direct = subprocess.run(
-        [docker, "info"],
+def install_rust_toolchain():
+    environment = rust_environment()
+    rustc = shutil.which("rustc", path=environment["PATH"])
+    if rustc is not None:
+        version = subprocess.run(
+            [rustc, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        ).stdout
+        if tool_version(version) >= (1, 80, 0):
+            return
+    stage = ROOT / "tmp/rustup"
+    stage.mkdir(parents=True, exist_ok=True)
+    installer = stage / "rustup-init.sh"
+    run([
+        "curl",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "https://sh.rustup.rs",
+        "--output",
+        str(installer),
+    ], env=environment)
+    run([
+        "sh",
+        str(installer),
+        "-y",
+        "--no-modify-path",
+        "--profile",
+        "minimal",
+        "--default-toolchain",
+        RUST_TOOLCHAIN,
+    ], env=environment)
+
+def ensure_build_toolchain():
+    environment = rust_environment()
+    commands = ["cargo", "g++", "make", "opam", "rustc"]
+    missing = [
+        command
+        for command in commands
+        if shutil.which(command, path=environment["PATH"]) is None
+    ]
+    if missing:
+        raise ValidatorError("missing build tools: " + ",".join(missing))
+    rustc = subprocess.run(
+        ["rustc", "--version"],
+        check=True,
         capture_output=True,
         text=True,
-    )
-    if direct.returncode == 0 or os.geteuid() == 0:
-        return [docker]
-    sudo = shutil.which("sudo")
-    if sudo is None:
-        raise ValidatorError("docker access requires sudo")
-    return [sudo, docker]
+        env=environment,
+    ).stdout
+    if tool_version(rustc) < (1, 80, 0):
+        raise ValidatorError("source build requires rustc 1.80 or newer")
+    return environment
 
 def build_candidate():
-    if os.uname().machine not in {"amd64", "x86_64"}:
+    if sys.platform != "linux" or os.uname().machine not in {"amd64", "x86_64"}:
         raise ValidatorError("source build requires Linux x86_64")
-    dockerfile = source_build_file()
     locked = ROOT / "octra_node.opam.locked"
-    if not dockerfile.is_file() or not locked.is_file():
-        raise ValidatorError("source build metadata is incomplete")
-    output = ROOT / "tmp/source_build/output"
-    if output.parent.exists():
-        shutil.rmtree(output.parent)
-    output.mkdir(parents=True)
-    environment = {**os.environ, "DOCKER_BUILDKIT": "1"}
+    if not locked.is_file():
+        raise ValidatorError("source build lock is missing")
+    environment = ensure_build_toolchain()
+    switch = "octra-validator-4.14.2"
+    run(
+        ["opam", "init", "--bare", "--disable-sandboxing", "-y"],
+        env=environment,
+    )
+    switches = subprocess.run(
+        ["opam", "switch", "list", "--short"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.splitlines()
+    if switch not in switches:
+        run(
+            ["opam", "switch", "create", switch, "4.14.2", "-y"],
+            env=environment,
+        )
+    compiler = subprocess.run(
+        ["opam", "exec", "--switch", switch, "--", "ocamlc", "-version"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
+    if compiler != "4.14.2":
+        raise ValidatorError(f"source build compiler mismatch: {compiler}")
     run([
-        *docker_command(),
-        "build",
-        "--platform",
-        "linux/amd64",
-        "--file",
-        str(dockerfile),
-        "--output",
-        f"type=local,dest={output}",
-        str(ROOT),
+        "opam",
+        "install",
+        "--switch",
+        switch,
+        ".",
+        "--deps-only",
+        "--with-test",
+        "--locked",
+        "--require-checksums",
+        "-y",
     ], env=environment)
-    target = ROOT / "_build/default/bin"
-    target.mkdir(parents=True, exist_ok=True)
+    run([
+        "make",
+        "-C",
+        "mcl",
+        "MCL_FP_BIT=256",
+        "MCL_FR_BIT=256",
+        "lib/libmcl.a",
+    ], env=environment)
+    run([
+        "opam",
+        "exec",
+        "--switch",
+        switch,
+        "--",
+        "dune",
+        "build",
+        "--root",
+        str(ROOT),
+        "--profile",
+        "release",
+        "bin/octra_node.exe",
+        "bin/octra_pvac_worker.exe",
+        "bin/octra_state_sync_client.exe",
+        "bin/octra_state_sync_manifest.exe",
+        "bin/bft_control_tx.exe",
+    ], env=environment)
     for name in [
         "octra_node.exe",
         "octra_pvac_worker.exe",
@@ -219,10 +318,8 @@ def build_candidate():
         "octra_state_sync_manifest.exe",
         "bft_control_tx.exe",
     ]:
-        source = output / name
-        if not source.is_file():
+        if not (ROOT / "_build/default/bin" / name).is_file():
             raise ValidatorError(f"source build artifact is missing: {name}")
-        shutil.copy2(source, target / name)
 
 def memory_bytes():
     path = Path("/proc/meminfo")
@@ -523,8 +620,6 @@ def main():
     if not control_binary.is_file():
         raise ValidatorError(f"validator control binary is missing: {control_binary}")
     control_hash = sha256_file(control_binary)
-    if binary_hash != values["OCTRA_BINARY_HASH"]:
-        raise ValidatorError(f"candidate hash mismatch: {binary_hash}")
     role = args.role
     if not role and not args.yes:
         role = ask("Node role", "observer")
@@ -561,6 +656,7 @@ def main():
         "OCTRA_DATA_DIR": data_dir,
         "OCTRA_LOG_COLOR": "never",
         "OCTRA_LOG_LEVEL": "info",
+        "OCTRA_BINARY_HASH": binary_hash,
         "OCTRA_OPERATOR_BINARY": str(binary),
         "OCTRA_OPERATOR_CONFIG": str(Path(args.config).resolve()),
         "OCTRA_OPERATOR_CONTROL_BINARY": str(control_binary),
@@ -568,7 +664,7 @@ def main():
         "OCTRA_OPERATOR_LOG_DIR": str((ROOT / "data/operator_logs").resolve()),
         "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle_copy),
         "OCTRA_OPERATOR_NETWORK_SHA256": bundle_hash,
-        "OCTRA_OPERATOR_PM2_NAME": canonical_pm2_name(name),
+        "OCTRA_OPERATOR_PM2_NAME": operator_pm2_name(name),
         "OCTRA_OPERATOR_ROLE": role,
         "OCTRA_OPERATOR_RPC_URL": rpc_url(args.rpc),
         "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),

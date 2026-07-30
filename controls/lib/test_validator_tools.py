@@ -23,7 +23,7 @@ from validator_common import rpc_url
 from validator_common import validate_checkpoint
 from validator_common import validate_network
 from validator_common import write_env
-from validator_config import canonical_pm2_name
+from validator_config import operator_pm2_name
 from validator_config import build_candidate
 from validator_config import ROOT as CONFIG_ROOT
 from validator_config import tool_version
@@ -66,7 +66,6 @@ def network_values(entitlement):
         "OCTRA_BFT_PROPOSAL_VERIFY_GRACE_MS": "180000",
         "OCTRA_BFT_PROPOSE_TIMEOUT_MS": "180000",
         "OCTRA_BFT_RELEASE_PROFILE": "devnet_full_v1",
-        "OCTRA_BINARY_HASH": "1" * 64,
         "OCTRA_BOOTSTRAP_PEERS": "10.0.0.1:19000,10.0.0.2:19000",
         "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
         "OCTRA_CHECKPOINT_EPOCH": "99",
@@ -76,7 +75,7 @@ def network_values(entitlement):
         "OCTRA_EMISSION_ACTIVATION_EPOCH": "100",
         "OCTRA_EPOCH_DURATION": "10",
         "OCTRA_FHE_MAX_PER_EPOCH": "1",
-        "OCTRA_P2P_REQUIRE_BINARY_HASH": "1",
+        "OCTRA_P2P_REQUIRE_BINARY_HASH": "0",
         "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH": "100",
         "OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH": "200",
         "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH": "150",
@@ -116,7 +115,7 @@ class ValidatorToolsTest(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_wallet_is_canonical_and_private(self):
+    def test_wallet_is_valid_and_private(self):
         wallet_path = WORK / "data/wallet.json"
         wallet = ensure_wallet(wallet_path)
         self.assertEqual(len(wallet["address"]), 47)
@@ -180,19 +179,13 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_bundle_validator_binds_binary_hash(self):
+    def test_bundle_validator_is_source_build_independent(self):
         bundle = WORK / "network.env"
-        binary = WORK / "octra_node.exe"
-        binary.write_bytes(b"candidate")
         values = network_values(self.entitlement)
-        values["OCTRA_BINARY_HASH"] = hashlib.sha256(b"candidate").hexdigest()
         write_env(bundle, values)
-        loaded, digest = validate_bundle(bundle, binary)
-        self.assertEqual(loaded["OCTRA_BINARY_HASH"], values["OCTRA_BINARY_HASH"])
+        loaded, digest = validate_bundle(bundle)
+        self.assertNotIn("OCTRA_BINARY_HASH", loaded)
         self.assertEqual(digest, hashlib.sha256(bundle.read_bytes()).hexdigest())
-        binary.write_bytes(b"other")
-        with self.assertRaises(ValidatorError):
-            validate_bundle(bundle, binary)
 
     def test_network_requires_permissionless_validator_activation(self):
         values = network_values(self.entitlement)
@@ -323,9 +316,9 @@ class ValidatorToolsTest(unittest.TestCase):
             resume_join_transaction(config, values, "ready", args)
         )
 
-    def test_pm2_name_is_canonical(self):
-        self.assertEqual(canonical_pm2_name("val01"), "octra-val01")
-        self.assertEqual(canonical_pm2_name("octra-val01"), "octra-val01")
+    def test_operator_pm2_name(self):
+        self.assertEqual(operator_pm2_name("val01"), "octra-val01")
+        self.assertEqual(operator_pm2_name("octra-val01"), "octra-val01")
 
     def test_promotion_readiness_tracks_observer_marker(self):
         values = {"OCTRA_OPERATOR_ROLE": "observer"}
@@ -346,7 +339,7 @@ class ValidatorToolsTest(unittest.TestCase):
         (WORK / "ready_to_vote.json").write_text("{}\n", encoding="utf-8")
         self.assertEqual(promotion_readiness(values, WORK), "ready")
 
-    def test_permissionless_validator_uses_canonical_readiness(self):
+    def test_permissionless_validator_uses_chain_readiness(self):
         values = {
             "OCTRA_OPERATOR_ROLE": "validator",
             "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "100",
@@ -584,31 +577,23 @@ class ValidatorToolsTest(unittest.TestCase):
             tool_version("rustc invalid")
 
     def test_source_build_metadata_is_pinned(self):
-        source = CONFIG_ROOT / "docs/release/validator_tools/source_build.Dockerfile"
-        exported = CONFIG_ROOT / "controls/source_build.Dockerfile"
-        dockerfile = source if source.is_file() else exported
-        value = dockerfile.read_text(encoding="utf-8")
-        self.assertIn("FROM rust@sha256:", value)
-        self.assertIn("FROM ocaml/opam@sha256:", value)
-        self.assertIn("liblmdb-dev", value)
-        self.assertIn("opam install --locked --deps-only --require-checksums", value)
         self.assertTrue((CONFIG_ROOT / "octra_node.opam.locked").is_file())
-        dockerignore = (CONFIG_ROOT / ".dockerignore").read_text(encoding="utf-8")
-        self.assertIn("._*", dockerignore.splitlines())
         install_path = Path(__file__).resolve().parent / "install.sh"
         exported_install = Path(__file__).resolve().parent.parent / "install.sh"
         installer = install_path if install_path.is_file() else exported_install
         install_value = installer.read_text(encoding="utf-8")
-        self.assertIn("docker-buildx", install_value)
+        self.assertIn("build-essential", install_value)
+        self.assertIn("liblmdb-dev", install_value)
         self.assertIn("liblmdb0", install_value)
+        self.assertIn("https://sh.rustup.rs", install_value)
+        self.assertIn("RUST_TOOLCHAIN=1.80.1", install_value)
         config_path = Path(__file__).resolve().with_name("validator_config.py")
         config_value = config_path.read_text(encoding="utf-8")
-        self.assertIn("docker-buildx", config_value)
-        self.assertIn("liblmdb0", config_value)
+        self.assertIn('switch = "octra-validator-4.14.2"', config_value)
+        self.assertIn('"--locked"', config_value)
+        self.assertIn('"--require-checksums"', config_value)
 
     def test_source_build_exports_all_runtime_artifacts(self):
-        dockerfile = WORK / "source_build.Dockerfile"
-        dockerfile.write_text("FROM scratch\n", encoding="utf-8")
         (WORK / "octra_node.opam.locked").write_text(
             'opam-version: "2.0"\n',
             encoding="utf-8",
@@ -624,39 +609,45 @@ class ValidatorToolsTest(unittest.TestCase):
 
         def run_build(command, cwd=WORK, env=None):
             commands.append((command, cwd, env))
-            output = WORK / "tmp/source_build/output"
-            output.mkdir(parents=True, exist_ok=True)
-            for name in names:
-                (output / name).write_bytes(name.encode("ascii"))
+            if "dune" in command:
+                target = WORK / "_build/default/bin"
+                target.mkdir(parents=True)
+                for name in names:
+                    (target / name).write_bytes(name.encode("ascii"))
+
+        def run_probe(command, **_):
+            if command == ["opam", "switch", "list", "--short"]:
+                return subprocess.CompletedProcess(command, 0, "octra-validator-4.14.2\n", "")
+            if command[-2:] == ["ocamlc", "-version"]:
+                return subprocess.CompletedProcess(command, 0, "4.14.2\n", "")
+            raise AssertionError(command)
 
         with mock.patch("validator_config.ROOT", WORK):
-            with mock.patch(
-                "validator_config.source_build_file",
-                return_value=dockerfile,
-            ):
+            with mock.patch("validator_config.sys.platform", "linux"):
                 with mock.patch(
-                    "validator_config.docker_command",
-                    return_value=["docker"],
+                    "validator_config.os.uname",
+                    return_value=mock.Mock(machine="x86_64"),
                 ):
                     with mock.patch(
-                        "validator_config.os.uname",
-                        return_value=mock.Mock(machine="x86_64"),
+                        "validator_config.ensure_build_toolchain",
+                        return_value={"PATH": "test"},
                     ):
                         with mock.patch(
-                            "validator_config.run",
-                            side_effect=run_build,
+                            "validator_config.subprocess.run",
+                            side_effect=run_probe,
                         ):
-                            build_candidate()
-        command, cwd, environment = commands[0]
-        self.assertEqual(cwd, WORK)
-        self.assertEqual(command[0:4], [
-            "docker",
-            "build",
-            "--platform",
-            "linux/amd64",
-        ])
-        self.assertEqual(environment["DOCKER_BUILDKIT"], "1")
+                            with mock.patch(
+                                "validator_config.run",
+                                side_effect=run_build,
+                            ):
+                                build_candidate()
+        command_values = [command for command, _, _ in commands]
+        install = next(command for command in command_values if command[:2] == ["opam", "install"])
+        build = next(command for command in command_values if "dune" in command)
+        self.assertIn("--locked", install)
+        self.assertIn("--require-checksums", install)
         for name in names:
+            self.assertIn(f"bin/{name}", build)
             self.assertEqual(
                 (WORK / "_build/default/bin" / name).read_bytes(),
                 name.encode("ascii"),
@@ -685,7 +676,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 "OCTRA_PVAC_VERIFY_WORKER_HASH",
             )
 
-    def test_control_builder_creates_canonical_bond_proof(self):
+    def test_control_builder_creates_deterministic_bond_proof(self):
         built = CONFIG_ROOT / "_build/default/bin/bft_control_tx.exe"
         packaged = CONFIG_ROOT / "artifacts/bft_control_tx.exe"
         binary = built if built.is_file() else packaged

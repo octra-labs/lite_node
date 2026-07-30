@@ -598,18 +598,15 @@ CAMLprim value caml_pvac_dec_value(value v_pk, value v_sk, value v_ct) {
     DBG_SIZE("ct.edges", ct.E.size());
 
     pvac::Fp result;
-    std::string err;
-    bool failed = false;
+    char err_buf[256] = {0};
     try {
         result = pvac::dec_value(pk, sk, ct);
     } catch (const std::exception& e) {
-        err = e.what();
-        failed = true;
+        snprintf(err_buf, sizeof(err_buf), "%s", e.what());
     } catch (...) {
-        err = "pvac: dec_value: unknown C++ exception";
-        failed = true;
+        snprintf(err_buf, sizeof(err_buf), "pvac: dec_value: unknown C++ exception");
     }
-    if (failed) caml_failwith(err.c_str());
+    if (err_buf[0]) caml_failwith(err_buf);
 
     DBG_EXIT("dec_value");
     int64_t decoded;
@@ -630,17 +627,26 @@ CAMLprim value caml_pvac_dec_values(value v_pk, value v_sk, value v_ct) {
     DBG_SIZE("ct.edges", ct.E.size());
 
     std::vector<pvac::Fp> results;
+    char err_buf[256] = {0};
     try {
         results = pvac::dec_values(pk, sk, ct);
     } catch (const std::exception& e) {
-        caml_failwith(e.what());
+        snprintf(err_buf, sizeof(err_buf), "%s", e.what());
+    } catch (...) {
+        snprintf(err_buf, sizeof(err_buf), "pvac: dec_values: unknown C++ exception");
+    }
+    if (err_buf[0]) {
+        std::vector<pvac::Fp>().swap(results);
+        caml_failwith(err_buf);
     }
 
     v_arr = caml_alloc(results.size(), 0);
     for (size_t i = 0; i < results.size(); ++i) {
         int64_t v;
-        if (!pvac::fp_to_i64(results[i], v))
+        if (!pvac::fp_to_i64(results[i], v)) {
+            std::vector<pvac::Fp>().swap(results);
             caml_failwith("pvac: decrypted field value is outside int64 range");
+        }
         Store_field(v_arr, i, caml_copy_int64(v));
     }
 
@@ -1708,26 +1714,30 @@ CAMLprim value caml_pvac_deserialize_zero_proof(value v_bytes) {
     DBG_ENTER("deserialize_zero_proof");
     DBG_SIZE("input_bytes", bytes_len(v_bytes));
 
-    std::vector<uint8_t> input(bytes_data(v_bytes), bytes_data(v_bytes) + bytes_len(v_bytes));
     pvac::ZeroProof* zp = nullptr;
     char err_buf[256] = {0};
-    caml_release_runtime_system();
-    try {
-        pvac_ser::Reader r(input.data(), input.size());
-        zp = new pvac::ZeroProof();
-        *zp = pvac_ser::read_zero_proof_raw(r);
-        if (r.failed) {
-            snprintf(err_buf, sizeof(err_buf), "%s", r.error);
-            delete zp; zp = nullptr;
+    {
+        std::vector<uint8_t> input(
+            bytes_data(v_bytes),
+            bytes_data(v_bytes) + bytes_len(v_bytes));
+        caml_release_runtime_system();
+        try {
+            pvac_ser::Reader r(input.data(), input.size());
+            zp = new pvac::ZeroProof();
+            *zp = pvac_ser::read_zero_proof_raw(r);
+            if (r.failed) {
+                snprintf(err_buf, sizeof(err_buf), "%s", r.error);
+                delete zp; zp = nullptr;
+            }
+        } catch (const std::exception& e) {
+            if (zp) { delete zp; zp = nullptr; }
+            snprintf(err_buf, sizeof(err_buf), "%s", e.what());
+        } catch (...) {
+            if (zp) { delete zp; zp = nullptr; }
+            snprintf(err_buf, sizeof(err_buf), "deserialize_zero_proof failed: unknown error");
         }
-    } catch (const std::exception& e) {
-        if (zp) { delete zp; zp = nullptr; }
-        snprintf(err_buf, sizeof(err_buf), "%s", e.what());
-    } catch (...) {
-        if (zp) { delete zp; zp = nullptr; }
-        snprintf(err_buf, sizeof(err_buf), "deserialize_zero_proof failed: unknown error");
+        caml_acquire_runtime_system();
     }
-    caml_acquire_runtime_system();
     if (err_buf[0]) caml_failwith(err_buf);
 
     DBG_SIZE("zp.V", zp->proof.V.size());

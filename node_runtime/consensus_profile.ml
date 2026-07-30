@@ -1,11 +1,11 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-let int_value getenv name fallback =
+let int_value getenv name default =
   match getenv name with
-  | None -> fallback
+  | None -> default
   | Some raw ->
-    try int_of_string raw with _ -> fallback
+    try int_of_string raw with _ -> default
 
 let bool_value getenv name =
   match getenv name with
@@ -170,7 +170,7 @@ let circle_hfhe_abi = "bound_range_commitment_v2"
 let program_fhe_abi = "proof_verify_view_only_v1"
 
 let runtime_env getenv = Startup_runtime_limits.{
-  int_value = (fun name fallback -> int_value getenv name fallback);
+  int_value = (fun name default -> int_value getenv name default);
   opt = getenv;
 }
 
@@ -195,7 +195,7 @@ let hash getenv =
   let epoch_min_ms = Epoch_cadence.minimum_ms_of getenv in
   let proposal_limits = Startup_runtime_limits.proposal_limits env
     ~default_max_ou:Octra_core.Tx_staging.max_ou_per_epoch in
-  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v12" (fun buf ->
+  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v14" (fun buf ->
     put_int buf proposal_limits.max_txs;
     put_int buf epoch_min_ms;
     put_int buf proposal_limits.max_bytes;
@@ -219,6 +219,8 @@ let hash getenv =
       (Octra_core.Emission_schedule.consensus_id schedule);
     Octra_net.Oce1.put_string buf
       (Octra_core.Validator_policy.consensus_id validator_policy);
+    Octra_net.Oce1.put_string buf
+      (Option.value ~default:"" (getenv "OCTRA_FEE_RECIPIENT"));
     Octra_net.Oce1.put_string buf
       (Octra_consensus.C_protocol.consensus_id getenv);
     Octra_net.Oce1.put_string buf Octra_core.Fee_policy.consensus_id;

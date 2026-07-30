@@ -25,7 +25,7 @@ let relaxed = {
 
 let strict ?(min_shadow_epochs = 0) () = {
   require_chain_id = true;
-  require_binary_hash = true;
+  require_binary_hash = false;
   require_config_hash = true;
   require_catchup = true;
   min_shadow_epochs;

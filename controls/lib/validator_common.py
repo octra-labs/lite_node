@@ -28,7 +28,6 @@ NETWORK_KEYS = frozenset({
     "OCTRA_BFT_PROPOSE_TIMEOUT_MS",
     "OCTRA_BFT_TIMEOUT_BASE_MS",
     "OCTRA_BFT_TIMEOUT_ROUND_MS",
-    "OCTRA_BINARY_HASH",
     "OCTRA_BOOTSTRAP_PEERS",
     "OCTRA_BUNDLE_CACHE_CAP",
     "OCTRA_CATCHUP_MAX_LAG",
@@ -45,12 +44,6 @@ NETWORK_KEYS = frozenset({
     "OCTRA_FHE_MAX_PER_EPOCH",
     "OCTRA_MULTI_EXEC_MAX_CALLS",
     "OCTRA_P2P_REQUIRE_BINARY_HASH",
-    "OCTRA_P2P_ROLLBACK_ACTIVATE_EPOCH",
-    "OCTRA_P2P_ROLLBACK_BINARY_HASH",
-    "OCTRA_P2P_ROLLBACK_CONFIG_HASH",
-    "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH",
-    "OCTRA_P2P_UPGRADE_BINARY_HASH",
-    "OCTRA_P2P_UPGRADE_CONFIG_HASH",
     "OCTRA_PEERS",
     "OCTRA_PREVERIFY_CACHE_MAX",
     "OCTRA_PREVERIFY_CACHE_TTL",
@@ -100,7 +93,6 @@ FORBIDDEN_KEYS = frozenset({
 })
 REQUIRED_KEYS = frozenset({
     "OCTRA_BFT_RELEASE_PROFILE",
-    "OCTRA_BINARY_HASH",
     "OCTRA_BOOTSTRAP_PEERS",
     "OCTRA_CHAIN_ID",
     "OCTRA_CHECKPOINT_EPOCH",
@@ -211,7 +203,7 @@ def address_from_pubkey(public_key):
     body = base58_encode(hashlib.sha256(public_key).digest())
     return "oct" + body.rjust(44, "1")
 
-def canonical_address(value):
+def valid_address(value):
     return len(value) == 47 and value.startswith("oct") and all(char in BASE58 for char in value[3:])
 
 def decode_public_key(value):
@@ -233,8 +225,8 @@ def signer_entries(raw):
             raise ValidatorError("invalid validator entry")
         address, encoded = parts
         public_key = decode_public_key(encoded)
-        if not canonical_address(address):
-            raise ValidatorError(f"noncanonical validator address: {address}")
+        if not valid_address(address):
+            raise ValidatorError(f"invalid validator address: {address}")
         if address_from_pubkey(public_key) != address:
             raise ValidatorError(f"validator address and public key mismatch: {address}")
         if address in seen_addresses or public_key in seen_keys:
@@ -393,8 +385,8 @@ def validate_network(values, bundle_dir):
         raise ValidatorError("release profile must be devnet_full_v1")
     if not values["OCTRA_CHAIN_ID"].startswith("octra-devnet-"):
         raise ValidatorError("chain id must identify devnet")
-    if values["OCTRA_P2P_REQUIRE_BINARY_HASH"] != "1":
-        raise ValidatorError("binary hash admission must be enabled")
+    if values["OCTRA_P2P_REQUIRE_BINARY_HASH"] != "0":
+        raise ValidatorError("binary hash admission must be disabled")
     if values["OCTRA_FHE_MAX_PER_EPOCH"] != "1":
         raise ValidatorError("first quorum run requires one FHE operation per epoch")
     if values["OCTRA_STEALTH_MAX_PER_EPOCH"] != "1":
@@ -423,8 +415,6 @@ def validate_network(values, bundle_dir):
         raise ValidatorError("proposal protocol activation cannot precede emission")
     if validator_activation < activation:
         raise ValidatorError("validator admission cannot precede emission")
-    if not HEX64.fullmatch(values["OCTRA_BINARY_HASH"]):
-        raise ValidatorError("invalid binary hash")
     if not HEX64.fullmatch(values["OCTRA_CONSENSUS_CONFIG_HASH"]):
         raise ValidatorError("invalid consensus config hash")
     if not HEX64.fullmatch(values["OCTRA_CHECKPOINT_STATE_ROOT"]):
@@ -502,8 +492,8 @@ def load_wallet(path):
         raise ValidatorError("wallet key verification failed") from error
     if public_key != expected_public or address_from_pubkey(public_key) != address:
         raise ValidatorError("wallet identity mismatch")
-    if not canonical_address(address):
-        raise ValidatorError("wallet address is noncanonical")
+    if not valid_address(address):
+        raise ValidatorError("wallet address is invalid")
     private_mode(wallet_path)
     return payload
 

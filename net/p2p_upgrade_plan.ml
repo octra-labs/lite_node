@@ -56,34 +56,37 @@ let rollback_of_env ~current_config_hash ~activate_epoch =
             Ok (Some { rollback_epoch; rollback_binary_hash; rollback_config_hash })
     with _ -> Error "OCTRA_P2P_ROLLBACK_ACTIVATE_EPOCH is invalid"
 
-let of_env ~current_config_hash =
-  match Sys.getenv_opt "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH",
-        Sys.getenv_opt "OCTRA_P2P_UPGRADE_BINARY_HASH" with
-  | None, None -> Ok None
-  | Some _, None -> Error "OCTRA_P2P_UPGRADE_BINARY_HASH is required"
-  | None, Some _ -> Error "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH is required"
-  | Some epoch_raw, Some binary_raw ->
-    try
-      let activate_epoch = Int64.of_string (String.trim epoch_raw) in
-      if Int64.compare activate_epoch 0L <= 0 then
-        Error "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH must be positive"
-      else
-        match normalize_hash "OCTRA_P2P_UPGRADE_BINARY_HASH" binary_raw with
-        | Error e -> Error e
-        | Ok target_binary_hash ->
-          let config_raw =
-            match Sys.getenv_opt "OCTRA_P2P_UPGRADE_CONFIG_HASH" with
-            | Some h -> h
-            | None -> current_config_hash
-          in
-          match normalize_hash "OCTRA_P2P_UPGRADE_CONFIG_HASH" config_raw with
+let of_env ~current_config_hash ~require_binary_hash =
+  if not require_binary_hash then
+    Ok None
+  else
+    match Sys.getenv_opt "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH",
+          Sys.getenv_opt "OCTRA_P2P_UPGRADE_BINARY_HASH" with
+    | None, None -> Ok None
+    | Some _, None -> Error "OCTRA_P2P_UPGRADE_BINARY_HASH is required"
+    | None, Some _ -> Error "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH is required"
+    | Some epoch_raw, Some binary_raw ->
+      try
+        let activate_epoch = Int64.of_string (String.trim epoch_raw) in
+        if Int64.compare activate_epoch 0L <= 0 then
+          Error "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH must be positive"
+        else
+          match normalize_hash "OCTRA_P2P_UPGRADE_BINARY_HASH" binary_raw with
           | Error e -> Error e
-          | Ok target_config_hash ->
-            match rollback_of_env ~current_config_hash ~activate_epoch with
+          | Ok target_binary_hash ->
+            let config_raw =
+              match Sys.getenv_opt "OCTRA_P2P_UPGRADE_CONFIG_HASH" with
+              | Some h -> h
+              | None -> current_config_hash
+            in
+            match normalize_hash "OCTRA_P2P_UPGRADE_CONFIG_HASH" config_raw with
             | Error e -> Error e
-            | Ok rollback ->
-              Ok (Some { activate_epoch; target_binary_hash; target_config_hash; rollback })
-    with _ -> Error "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH is invalid"
+            | Ok target_config_hash ->
+              match rollback_of_env ~current_config_hash ~activate_epoch with
+              | Error e -> Error e
+              | Ok rollback ->
+                Ok (Some { activate_epoch; target_binary_hash; target_config_hash; rollback })
+      with _ -> Error "OCTRA_P2P_UPGRADE_ACTIVATE_EPOCH is invalid"
 
 let active ~epoch = function
   | None -> false
@@ -114,20 +117,23 @@ let transport_hash ~config_hash ~binary_hash =
   P2p_peer_record.transport_config_hash ~config_hash ~binary_hash
 
 let handshake_hash ~epoch ~config_hash ~binary_hash ~require_binary_hash plan =
-  match plan with
-  | Some p when Int64.compare epoch p.activate_epoch < 0 ->
-    schedule_hash ~base_config_hash:config_hash p
-  | Some _ ->
-    transport_hash ~config_hash ~binary_hash
-  | None ->
-    if require_binary_hash then transport_hash ~config_hash ~binary_hash
-    else config_hash
+  if not require_binary_hash then
+    config_hash
+  else
+    match plan with
+    | Some p when Int64.compare epoch p.activate_epoch < 0 ->
+      schedule_hash ~base_config_hash:config_hash p
+    | Some _ ->
+      transport_hash ~config_hash ~binary_hash
+    | None ->
+      transport_hash ~config_hash ~binary_hash
 
 let binary_required ~epoch ~require_binary_hash = function
+  | _ when not require_binary_hash -> false
   | Some plan -> Int64.compare epoch plan.activate_epoch >= 0
-  | None -> require_binary_hash
+  | None -> true
 
-let ready ~epoch ~config_hash ~binary_hash = function
+let ready ~epoch ~config_hash ~binary_hash ~require_binary_hash = function
   | None -> Ready
   | Some p when Int64.compare epoch p.activate_epoch < 0 -> Ready
   | Some p ->
@@ -137,7 +143,8 @@ let ready ~epoch ~config_hash ~binary_hash = function
         rb.rollback_binary_hash, rb.rollback_config_hash
       | _ -> p.target_binary_hash, p.target_config_hash
     in
-    if binary_hash <> target_binary_hash then Not_ready "binary_hash"
+    if require_binary_hash && binary_hash <> target_binary_hash then
+      Not_ready "binary_hash"
     else if config_hash <> target_config_hash then Not_ready "config_hash"
     else Ready
 

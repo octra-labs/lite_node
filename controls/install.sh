@@ -6,6 +6,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE_BUILD=0
 DATA_ROOT=${OCTRA_DATA_ROOT:-/var/lib/octra}
+RUST_TOOLCHAIN=1.80.1
 
 case "$DATA_ROOT" in
   /*) ;;
@@ -78,22 +79,46 @@ run_operator() {
   fi
 }
 
+install_rust_toolchain() {
+  RUSTUP="$OPERATOR_HOME/.cargo/bin/rustup"
+  if [ ! -x "$RUSTUP" ]; then
+    RUSTUP_STAGE="$ROOT/tmp/rustup"
+    run_operator mkdir -p "$RUSTUP_STAGE"
+    run_operator curl \
+      --proto '=https' \
+      --tlsv1.2 \
+      --fail \
+      --location \
+      --silent \
+      --show-error \
+      https://sh.rustup.rs \
+      --output "$RUSTUP_STAGE/rustup-init.sh"
+    run_operator sh "$RUSTUP_STAGE/rustup-init.sh" \
+      -y \
+      --no-modify-path \
+      --profile minimal \
+      --default-toolchain "$RUST_TOOLCHAIN"
+  fi
+  run_operator "$RUSTUP" set profile minimal
+  run_operator "$RUSTUP" toolchain install "$RUST_TOOLCHAIN"
+  run_operator "$RUSTUP" default "$RUST_TOOLCHAIN"
+}
+
 PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs npm python3 python3-nacl'
 
 if [ "$SOURCE_BUILD" -eq 1 ]; then
-  PACKAGES="$PACKAGES docker-buildx docker.io git"
+  PACKAGES="$PACKAGES build-essential git libev-dev libgmp-dev liblmdb-dev libsqlite3-dev m4 opam pkg-config"
 fi
 
 printf 'event = install phase = packages\n'
 run_root apt-get update
 run_root apt-get install -y $PACKAGES
-if [ "$SOURCE_BUILD" -eq 1 ]; then
-  run_root systemctl enable --now docker
-  run_root usermod -aG docker "$OPERATOR_USER"
-fi
 run_root npm install -g pm2
 run_root chown -R "$OPERATOR_USER:$OPERATOR_USER" "$ROOT"
 run_root install -d -m 700 -o "$OPERATOR_USER" -g "$OPERATOR_USER" "$DATA_ROOT"
+if [ "$SOURCE_BUILD" -eq 1 ]; then
+  install_rust_toolchain
+fi
 
 printf 'event = install phase = process_manager user = %s\n' "$OPERATOR_USER"
 run_operator pm2 install pm2-logrotate

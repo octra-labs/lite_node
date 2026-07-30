@@ -284,7 +284,11 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height
       ?runtime_profile_hash
       ()
   in
-  match Octra_net.P2p_upgrade_plan.of_env ~current_config_hash:network_config_hash with
+  match
+    Octra_net.P2p_upgrade_plan.of_env
+      ~current_config_hash:network_config_hash
+      ~require_binary_hash:env.require_binary_hash
+  with
   | Error e -> Error e
   | Ok upgrade_plan ->
     match
@@ -391,6 +395,7 @@ let upgrade_ready state ~epoch ~consensus_config_hash cfg =
       ~epoch
       ~config_hash:consensus_config_hash
       ~binary_hash:cfg.binary_hash
+      ~require_binary_hash:cfg.require_binary_hash
       cfg.upgrade_plan
   with
   | Octra_net.P2p_upgrade_plan.Ready ->

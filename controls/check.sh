@@ -30,7 +30,6 @@ fi
 
 test -f nodes.config
 test -f octra_node.opam.locked
-test -f controls/source_build.Dockerfile
 sh -n controls/check.sh
 sh -n controls/config_val.sh
 sh -n controls/enroll.sh
@@ -53,14 +52,8 @@ fi
 PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import validator_bundle, validator_config, validator_enroll, validator_guard, validator_process, validator_recover, validator_rpc, validator_status'
 PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest controls/lib/test_validator_tools.py
 if [ -f config/network.env ]; then
-  if [ -f artifacts/octra_node.exe ]; then
-    PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/validator_bundle.py \
-      --network config/network.env \
-      --binary artifacts/octra_node.exe
-  else
-    PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/validator_bundle.py \
-      --network config/network.env
-  fi
+  PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/validator_bundle.py \
+    --network config/network.env
 fi
 
 printf 'status = pass gate = validator_tools\n'

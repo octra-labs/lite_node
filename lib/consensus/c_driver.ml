@@ -226,25 +226,25 @@ let create ~config ~validator_set ~swarm ~start_height =
 let set_validator_set_activation_handler t handler =
   t.on_validator_set_activated <- handler
 
-let grace_ms name ~fallback ~limit =
+let grace_ms name ~default ~limit =
   match Sys.getenv_opt name with
-  | None -> fallback
+  | None -> default
   | Some raw ->
     try
       let value = int_of_string raw in
-      if value < 0 || value > limit then fallback else value
-    with _ -> fallback
+      if value < 0 || value > limit then default else value
+    with _ -> default
 
 let proposal_build_grace_ms () =
   grace_ms "OCTRA_BFT_PROPOSAL_BUILD_GRACE_MS"
-    ~fallback:180_000
+    ~default:180_000
     ~limit:300_000
 
 let proposal_retry_ms = 500
 
 let proposal_verify_grace_ms () =
   grace_ms "OCTRA_BFT_PROPOSAL_VERIFY_GRACE_MS"
-    ~fallback:180_000
+    ~default:180_000
     ~limit:300_000
 
 let within_grace started_at grace_ms =
@@ -414,6 +414,12 @@ let future_vote_key (v : C_types.vote) =
     v.round
     v.validator
 
+type future_vote_result =
+  | Future_vote_not_applicable
+  | Future_vote_deferred
+  | Future_vote_same
+  | Future_vote_conflict of C_types.vote
+
 let pending_vote_count t = Hashtbl.length t.pending_votes
 
 let pending_finalize_count t = Hashtbl.length t.pending_finalizes
@@ -441,15 +447,17 @@ let defer_future_vote t (v : C_types.vote) =
      || v.round < 0
      || v.round > C_engine.max_round_ahead
   then
-    false
+    Future_vote_not_applicable
   else
     let key = future_vote_key v in
-    if Hashtbl.mem t.future_votes key then
-      false
-    else begin
+    match Hashtbl.find_opt t.future_votes key with
+    | Some prior when prior.proposal_id = v.proposal_id ->
+      Future_vote_same
+    | Some prior ->
+      Future_vote_conflict prior
+    | None ->
       Hashtbl.add t.future_votes key v;
-      true
-    end
+      Future_vote_deferred
 
 let queue_future_finalize t (f : C_types.finalize) =
   if Int64.compare f.epoch_id t.engine.state.height <= 0 then ()
@@ -821,6 +829,28 @@ let vote_evidence_frame evidence =
     payload = C_evidence.encode_vote_conflict evidence;
   }
 
+let record_vote_conflict ?conn t prior vote =
+  match C_evidence.vote_conflict prior vote with
+  | None -> None
+  | Some evidence ->
+    let evidence_id = C_evidence.vote_conflict_id evidence in
+    let remembered = remember_vote_evidence t evidence in
+    error_node t.config.my_addr
+      "event = vote_equivocation epoch = %Ld round = %d validator = %s evidence = %s stored = %b"
+      vote.epoch_id
+      vote.round
+      (String.sub vote.validator 0 (min 12 (String.length vote.validator)))
+      (Digestif.SHA256.to_hex
+        (Digestif.SHA256.of_raw_string evidence_id)
+       |> fun hex -> String.sub hex 0 16)
+      remembered;
+    (match conn with
+     | Some value ->
+       Octra_net.P2p_swarm.report_bad_peer t.swarm value
+         ~reason:"vote_equivocation"
+     | None -> ());
+    if remembered then Some evidence else None
+
 let maybe_activate_scheduled_validator_set t ~target_epoch =
   let open Lwt.Syntax in
   let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
@@ -1127,24 +1157,40 @@ let replay_future_votes t =
       end else
         Some vote)
     t.future_votes;
-  List.sort compare_future_vote !ready
-  |> List.iter (fun (vote : C_types.vote) ->
+  let evidence =
+    List.sort compare_future_vote !ready
+    |> List.filter_map (fun (vote : C_types.vote) ->
     match C_types.pubkey_of_addr t.engine.vs vote.validator with
     | Some pubkey when C_hash.verify_vote ~pubkey_raw:pubkey vote ->
-      C_engine.on_vote t.engine vote ~sign_fn:t.config.sign_fn
-    | _ -> ());
-  if !ready <> [] then
-    log_node t.config.my_addr
-      "event = replay_future_votes epoch = %Ld round = %d count = %d"
-      height
-      round
-      (List.length !ready)
+      (match C_engine.conflicting_vote t.engine vote with
+       | Some prior -> record_vote_conflict t prior vote
+       | None ->
+         C_engine.on_vote t.engine vote ~sign_fn:t.config.sign_fn;
+         None)
+    | _ -> None)
+  in
+  (match !ready with
+   | [] -> ()
+   | _ ->
+     log_node t.config.my_addr
+       "event = replay_future_votes epoch = %Ld round = %d count = %d"
+       height
+       round
+       (List.length !ready));
+  evidence
 
 let rec process_outputs_once t =
   let open Lwt.Syntax in
   C_engine.on_ready t.engine ~sign_fn:t.config.sign_fn;
   let* () = replay_pending_proposal t in
-  replay_future_votes t;
+  let replayed_evidence = replay_future_votes t in
+  let* () =
+    Lwt_list.iter_s
+      (fun evidence ->
+        Octra_net.P2p_swarm.broadcast t.swarm
+          (vote_evidence_frame evidence))
+      replayed_evidence
+  in
   replay_deferred_proposal t;
   let current_height = t.engine.state.height in
   let validator_set_hash = C_config.validator_set_hash t.engine.vs in
@@ -1533,42 +1579,35 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           | Some pk -> C_hash.verify_vote ~pubkey_raw:pk v
           | None -> false
         in
-        let deferred =
-          valid
-          && defer_future_vote t v
+        let future =
+          if valid then defer_future_vote t v
+          else Future_vote_not_applicable
         in
-        if deferred then
-          log_node t.config.my_addr
-            "event = defer_future_vote type = %s epoch = %Ld round = %d validator = %s local_height = %Ld"
-            (vote_step_label v.vote_type)
-            v.epoch_id
-            v.round
-            v.validator
-            t.engine.state.height;
+        (match future with
+         | Future_vote_deferred ->
+           log_node t.config.my_addr
+             "event = defer_future_vote type = %s epoch = %Ld round = %d validator = %s local_height = %Ld"
+             (vote_step_label v.vote_type)
+             v.epoch_id
+             v.round
+             v.validator
+             t.engine.state.height
+         | _ -> ());
         let evidence =
-          if valid && not deferred then begin
-          match C_engine.conflicting_vote t.engine v with
-          | None ->
-            C_engine.on_vote t.engine v ~sign_fn:t.config.sign_fn;
-            None
-          | Some prior ->
-            (match C_evidence.vote_conflict prior v with
-             | None -> None
-             | Some evidence ->
-               let evidence_id = C_evidence.vote_conflict_id evidence in
-               let remembered = remember_vote_evidence t evidence in
-               error_node t.config.my_addr
-                 "event = vote_equivocation epoch = %Ld round = %d validator = %s evidence = %s stored = %b"
-                 v.epoch_id v.round
-                 (String.sub v.validator 0 (min 12 (String.length v.validator)))
-                 (Digestif.SHA256.to_hex
-                   (Digestif.SHA256.of_raw_string evidence_id)
-                  |> fun hex -> String.sub hex 0 16)
-                 remembered;
-               Octra_net.P2p_swarm.report_bad_peer t.swarm _conn
-                 ~reason:"vote_equivocation";
-               if remembered then Some evidence else None)
-          end else None
+          if not valid then None
+          else
+            match future with
+            | Future_vote_conflict prior ->
+              record_vote_conflict ~conn:_conn t prior v
+            | Future_vote_not_applicable ->
+              (match C_engine.conflicting_vote t.engine v with
+               | Some prior -> record_vote_conflict ~conn:_conn t prior v
+               | None ->
+                 C_engine.on_vote t.engine v ~sign_fn:t.config.sign_fn;
+                 None)
+            | Future_vote_deferred
+            | Future_vote_same ->
+              None
         in
         let* () =
           match evidence with

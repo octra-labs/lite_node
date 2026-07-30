@@ -119,8 +119,8 @@ def validate(values):
         and values.get("OCTRA_VALIDATOR_READY_STRICT") == "1"
     ):
         validate_ready_marker(data_dir, values, wallet)
-    if values.get("OCTRA_P2P_REQUIRE_BINARY_HASH") != "1":
-        raise ValidatorError("binary hash admission is disabled")
+    if values.get("OCTRA_P2P_REQUIRE_BINARY_HASH") != "0":
+        raise ValidatorError("binary hash admission must be disabled")
     if values.get("OCTRA_BFT_RELEASE_PROFILE") != "devnet_full_v1":
         raise ValidatorError("invalid release profile")
     if values.get("OCTRA_FHE_MAX_PER_EPOCH") != "1":
