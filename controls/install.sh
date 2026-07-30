@@ -78,15 +78,19 @@ run_operator() {
   fi
 }
 
-PACKAGES='ca-certificates curl libev4 libgmp10 libsqlite3-0 nodejs npm python3 python3-nacl'
+PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs npm python3 python3-nacl'
 
 if [ "$SOURCE_BUILD" -eq 1 ]; then
-  PACKAGES="$PACKAGES build-essential cargo git libev-dev libgmp-dev libsqlite3-dev m4 opam pkg-config rustc"
+  PACKAGES="$PACKAGES docker-buildx docker.io git"
 fi
 
 printf 'event = install phase = packages\n'
 run_root apt-get update
 run_root apt-get install -y $PACKAGES
+if [ "$SOURCE_BUILD" -eq 1 ]; then
+  run_root systemctl enable --now docker
+  run_root usermod -aG docker "$OPERATOR_USER"
+fi
 run_root npm install -g pm2
 run_root chown -R "$OPERATOR_USER:$OPERATOR_USER" "$ROOT"
 run_root install -d -m 700 -o "$OPERATOR_USER" -g "$OPERATOR_USER" "$DATA_ROOT"

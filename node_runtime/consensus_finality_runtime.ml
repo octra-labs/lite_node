@@ -52,6 +52,8 @@ type node_deps = {
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
   apply_timeout_seconds : float;
+  bundle_wait_expired : epoch_id:int64 -> unit;
+  bundle_wait_recovered : epoch_id:int64 -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
@@ -173,6 +175,9 @@ let create_node deps =
           set_proposal = deps.set_proposal;
           store_proposal_bundle = deps.store_proposal_bundle;
           sleep = deps.sleep;
+          bundle_wait_timeout_seconds = deps.apply_timeout_seconds;
+          bundle_wait_expired = deps.bundle_wait_expired;
+          bundle_wait_recovered = deps.bundle_wait_recovered;
           post_finalize = (fun ~epoch_id ~proposed_root ->
             Consensus_post_finalize.run
               {
@@ -209,6 +214,9 @@ let create_node deps =
       stop_after_fatal ())
 
 let node_deps_of_runtime runtime =
+  let bundle_wait_reason epoch_id =
+    "finalized_bundle_unavailable:" ^ Int64.to_string epoch_id
+  in
   {
     check_finality = (fun finalize ->
       Octra_consensus.Finality_log.check_write
@@ -248,6 +256,20 @@ let node_deps_of_runtime runtime =
     commit_finality_journal = (fun () ->
       Consensus_finality_journal.promote runtime.data_dir);
     apply_timeout_seconds = runtime.apply_timeout_seconds;
+    bundle_wait_expired = (fun ~epoch_id ->
+      ignore
+        (Consensus_runtime_state.enter_quarantine
+           runtime.runtime_state
+           ~epoch:(Int64.to_int epoch_id)
+           ~reason:(bundle_wait_reason epoch_id)));
+    bundle_wait_recovered = (fun ~epoch_id ->
+      if
+        Consensus_runtime_state.quarantine_active runtime.runtime_state
+        && String.equal
+             (Consensus_runtime_state.quarantine_reason runtime.runtime_state)
+             (bundle_wait_reason epoch_id)
+      then
+        Consensus_runtime_state.clear_quarantine runtime.runtime_state);
     remove_pending_finalized = runtime.finality.remove_finalized;
     fatal_exit = runtime.fatal_exit;
     catchup_active = (fun () -> !(runtime.catchup_active));

@@ -195,7 +195,7 @@ let hash getenv =
   let epoch_min_ms = Epoch_cadence.minimum_ms_of getenv in
   let proposal_limits = Startup_runtime_limits.proposal_limits env
     ~default_max_ou:Octra_core.Tx_staging.max_ou_per_epoch in
-  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v11" (fun buf ->
+  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v12" (fun buf ->
     put_int buf proposal_limits.max_txs;
     put_int buf epoch_min_ms;
     put_int buf proposal_limits.max_bytes;

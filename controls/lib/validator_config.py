@@ -86,9 +86,9 @@ def ask_bool(label, default):
         return False
     raise ValidatorError(f"invalid yes or no answer: {value}")
 
-def run(command, cwd=ROOT):
+def run(command, cwd=ROOT, env=None):
     emit(event="run", command=command[0])
-    subprocess.run(command, cwd=cwd, check=True)
+    subprocess.run(command, cwd=cwd, check=True, env=env)
 
 def elevated(command):
     if os.geteuid() == 0:
@@ -108,25 +108,23 @@ def install_runtime():
     if not ubuntu_host():
         raise ValidatorError("automatic installation supports Ubuntu and Debian")
     packages = [
-        "build-essential",
         "ca-certificates",
-        "cargo",
         "curl",
+        "docker-buildx",
+        "docker.io",
         "git",
-        "libev-dev",
-        "libgmp-dev",
-        "libsqlite3-dev",
-        "m4",
+        "libev4",
+        "libgmp10",
+        "liblmdb0",
+        "libsqlite3-0",
         "nodejs",
         "npm",
-        "opam",
-        "pkg-config",
         "python3",
         "python3-nacl",
-        "rustc",
     ]
     run(elevated(["apt-get", "update"]), cwd=Path("/"))
     run(elevated(["apt-get", "install", "-y", *packages]), cwd=Path("/"))
+    run(elevated(["systemctl", "enable", "--now", "docker"]), cwd=Path("/"))
     run(elevated(["npm", "install", "-g", "pm2"]), cwd=Path("/"))
     run(["pm2", "install", "pm2-logrotate"])
     run(["pm2", "set", "pm2-logrotate:max_size", "100M"])
@@ -167,53 +165,64 @@ def tool_version(raw):
         raise ValidatorError("invalid tool version")
     return (parts + (0, 0, 0))[:3]
 
-def ensure_build_toolchain():
-    commands = ["cargo", "g++", "make", "opam", "rustc"]
-    missing = [command for command in commands if shutil.which(command) is None]
-    if missing:
-        raise ValidatorError("missing build tools: " + ",".join(missing))
-    rustc = subprocess.run(
-        ["rustc", "--version"],
-        check=True,
+def source_build_file():
+    exported = ROOT / "controls/source_build.Dockerfile"
+    if exported.is_file():
+        return exported
+    return ROOT / "docs/release/validator_tools/source_build.Dockerfile"
+
+def docker_command():
+    docker = shutil.which("docker")
+    if docker is None:
+        raise ValidatorError("source build requires docker")
+    direct = subprocess.run(
+        [docker, "info"],
         capture_output=True,
         text=True,
-    ).stdout
-    if tool_version(rustc) < (1, 80, 0):
-        raise ValidatorError("source build requires rustc 1.80 or newer")
+    )
+    if direct.returncode == 0 or os.geteuid() == 0:
+        return [docker]
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        raise ValidatorError("docker access requires sudo")
+    return [sudo, docker]
 
 def build_candidate():
-    ensure_build_toolchain()
-    switch = "octra-validator-4.14.2"
-    run(["opam", "init", "--bare", "--disable-sandboxing", "-y"])
-    switches = subprocess.run(
-        ["opam", "switch", "list", "--short"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    if switch not in switches:
-        run(["opam", "switch", "create", switch, "4.14.2", "-y"])
-    run(["opam", "install", "--switch", switch, ".", "--deps-only", "--with-test", "-y"])
-    run(["make", "-C", "mcl", "MCL_FP_BIT=256", "MCL_FR_BIT=256", "lib/libmcl.a"])
+    if os.uname().machine not in {"amd64", "x86_64"}:
+        raise ValidatorError("source build requires Linux x86_64")
+    dockerfile = source_build_file()
+    locked = ROOT / "octra_node.opam.locked"
+    if not dockerfile.is_file() or not locked.is_file():
+        raise ValidatorError("source build metadata is incomplete")
+    output = ROOT / "tmp/source_build/output"
+    if output.parent.exists():
+        shutil.rmtree(output.parent)
+    output.mkdir(parents=True)
+    environment = {**os.environ, "DOCKER_BUILDKIT": "1"}
     run([
-        "opam",
-        "exec",
-        "--switch",
-        switch,
-        "--",
-        "dune",
+        *docker_command(),
         "build",
-        "--root",
+        "--platform",
+        "linux/amd64",
+        "--file",
+        str(dockerfile),
+        "--output",
+        f"type=local,dest={output}",
         str(ROOT),
-        "--profile",
-        "release",
-        "bin/octra_node.exe",
-        "bin/octra_pvac_worker.exe",
-        "bin/octra_state_sync_client.exe",
-        "bin/octra_state_sync_manifest.exe",
-        "bin/bft_control_tx.exe",
-    ])
+    ], env=environment)
+    target = ROOT / "_build/default/bin"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in [
+        "octra_node.exe",
+        "octra_pvac_worker.exe",
+        "octra_state_sync_client.exe",
+        "octra_state_sync_manifest.exe",
+        "bft_control_tx.exe",
+    ]:
+        source = output / name
+        if not source.is_file():
+            raise ValidatorError(f"source build artifact is missing: {name}")
+        shutil.copy2(source, target / name)
 
 def memory_bytes():
     path = Path("/proc/meminfo")

@@ -29,6 +29,8 @@ else
 fi
 
 test -f nodes.config
+test -f octra_node.opam.locked
+test -f controls/source_build.Dockerfile
 sh -n controls/check.sh
 sh -n controls/config_val.sh
 sh -n controls/enroll.sh

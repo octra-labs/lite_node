@@ -24,13 +24,16 @@ let opt_text_ok = function
   | None -> true
   | Some s -> String.length s <= 100_000_000
 
+let u32_int_ok value =
+  value >= 0 && value <= 0xffff_ffff
+
 let sane t =
   t.chain_id <> ""
   && t.address <> ""
   && Int64.compare t.head_epoch 0L >= 0
   && hash_ok t.state_root
   && digits t.balance
-  && t.nonce >= 0
+  && u32_int_ok t.nonce
   && opt_text_ok t.public_key
   && opt_text_ok t.encrypted_balance
   && digits t.decrypt_allowance

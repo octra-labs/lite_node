@@ -49,6 +49,8 @@ type node_deps = {
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
   apply_timeout_seconds : float;
+  bundle_wait_expired : epoch_id:int64 -> unit;
+  bundle_wait_recovered : epoch_id:int64 -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;

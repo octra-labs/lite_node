@@ -3027,6 +3027,11 @@ let promote_active_validator_set ~backend ~env =
           Lwt.return_unit
     end
 
+let advance_validator_set ~backend ~env =
+  let open Lwt.Syntax in
+  let* () = promote_active_validator_set ~backend ~env in
+  schedule_validator_snapshot ~backend ~env
+
 let register_confirmed_sender_key ~backend ~env (tx : Transaction.t) =
   let stored =
     match backend.ops.find_opt tx.from with
@@ -3098,8 +3103,7 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
         incr pos;
         Lwt.return_unit
       ) txs_canonical in
-      let* () = promote_active_validator_set ~backend ~env in
-      let* () = schedule_validator_snapshot ~backend ~env in
+      let* () = advance_validator_set ~backend ~env in
       let* emission_remaining_opt = Store_irmin.get_meta backend.store "emission_remaining" in
       let emission_remaining =
         match Emission_policy.remaining emission_remaining_opt with

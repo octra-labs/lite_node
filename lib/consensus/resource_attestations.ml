@@ -472,15 +472,16 @@ let useful_hash_chain_evidence_hash evidence =
   proof_payload_hash (encode_useful_hash_chain_evidence evidence)
 
 let verify_useful_hash_chain_attestation ~challenge ~min_iterations ~max_iterations attestation evidence =
-  match useful_hash_chain_result ~input:evidence.input ~iterations:evidence.iterations with
-  | None -> false
-  | Some expected_result ->
-      attestation.kind = PoUW
-      && evidence.iterations >= min_iterations
-      && evidence.iterations <= max_iterations
-      && evidence.result = expected_result
-      && attestation.commitment = useful_hash_chain_task_id ~challenge ~input:evidence.input ~iterations:evidence.iterations
-      && attestation.proof_hash = useful_hash_chain_evidence_hash evidence
+  if evidence.iterations < min_iterations || evidence.iterations > max_iterations then
+    false
+  else
+    match useful_hash_chain_result ~input:evidence.input ~iterations:evidence.iterations with
+    | None -> false
+    | Some expected_result ->
+        attestation.kind = PoUW
+        && evidence.result = expected_result
+        && attestation.commitment = useful_hash_chain_task_id ~challenge ~input:evidence.input ~iterations:evidence.iterations
+        && attestation.proof_hash = useful_hash_chain_evidence_hash evidence
 
 let useful_plugin_task_id ~challenge ~plugin ~subject ~resource_hash ~work_units =
   Octra_net.Hash_domain.hash_encoded "octra:pouw_plugin_task:v1" (fun buf ->

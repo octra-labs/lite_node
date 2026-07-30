@@ -54,6 +54,7 @@ type runtime = {
     int ->
     Octra_core.Private_result_policy.t;
   add_rejected_fee : Z.t -> unit;
+  advance_validator_set : unit -> unit Lwt.t;
 }
 
 type node_runtime = {
@@ -250,10 +251,14 @@ let runtime_deps ?preverify ?save_receipt_raw (runtime : runtime) =
   }
 
 let run_runtime ?preverify ?save_receipt_raw (runtime : runtime) txs =
-  run_standard_or_sender
-    ~consensus_mode:runtime.consensus_mode
-    (runtime_deps ?preverify ?save_receipt_raw runtime)
-    txs
+  let open Lwt.Syntax in
+  let* () =
+    run_standard_or_sender
+      ~consensus_mode:runtime.consensus_mode
+      (runtime_deps ?preverify ?save_receipt_raw runtime)
+      txs
+  in
+  runtime.advance_validator_set ()
 
 let run_node ?preverify (runtime : node_runtime) ordered_txs =
   let open Lwt.Syntax in
@@ -349,6 +354,13 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         private_result_policy = runtime.private_result_policy;
         add_rejected_fee = (fun fee ->
           runtime.confirmed_fees := Z.add !(runtime.confirmed_fees) fee);
+        advance_validator_set = (fun () ->
+          let backend =
+            Epoch_exec.make_live_backend runtime.store runtime.ledger
+          in
+          Epoch_exec.advance_validator_set
+            ~backend
+            ~env:(runtime.standard_env ()));
       }
         ordered_txs
     in

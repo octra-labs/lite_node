@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
-// Prepared by Denis CMIX for the Octra network.
-// Use, modify, adapt, and redistribute this example as you see fit.
-
 use rust_circle_sdk::{
     BalanceRoomInput,
     decode_request,

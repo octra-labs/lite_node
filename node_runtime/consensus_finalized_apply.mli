@@ -31,6 +31,9 @@ type deps = {
     Bundle_fetch.accepted ->
     unit;
   sleep : float -> unit Lwt.t;
+  bundle_wait_timeout_seconds : float;
+  bundle_wait_expired : epoch_id:int64 -> unit;
+  bundle_wait_recovered : epoch_id:int64 -> unit;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
@@ -59,6 +62,9 @@ type node_deps = {
     receipts_json:string list ->
     unit;
   sleep : float -> unit Lwt.t;
+  bundle_wait_timeout_seconds : float;
+  bundle_wait_expired : epoch_id:int64 -> unit;
+  bundle_wait_recovered : epoch_id:int64 -> unit;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 

@@ -894,7 +894,7 @@ let receipt ~chaindata ~tx_hash =
     err_lwt (Rpc.not_found "receipt not found")
 
 let receipt_params ~chaindata params =
-  match Rpc.require_string params 0 "hash" with
+  match Rpc.require_hash params 0 "hash" with
   | Error e ->
     err_lwt e
   | Ok tx_hash ->

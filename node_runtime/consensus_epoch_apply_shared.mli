@@ -52,6 +52,7 @@ type runtime = {
     int ->
     Octra_core.Private_result_policy.t;
   add_rejected_fee : Z.t -> unit;
+  advance_validator_set : unit -> unit Lwt.t;
 }
 
 type node_runtime = {

@@ -24,6 +24,7 @@ from validator_common import validate_checkpoint
 from validator_common import validate_network
 from validator_common import write_env
 from validator_config import canonical_pm2_name
+from validator_config import build_candidate
 from validator_config import ROOT as CONFIG_ROOT
 from validator_config import tool_version
 from validator_config import install_verified_snapshot
@@ -581,6 +582,85 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(tool_version("rustc 1.80"), (1, 80, 0))
         with self.assertRaises(ValidatorError):
             tool_version("rustc invalid")
+
+    def test_source_build_metadata_is_pinned(self):
+        source = CONFIG_ROOT / "docs/release/validator_tools/source_build.Dockerfile"
+        exported = CONFIG_ROOT / "controls/source_build.Dockerfile"
+        dockerfile = source if source.is_file() else exported
+        value = dockerfile.read_text(encoding="utf-8")
+        self.assertIn("FROM rust@sha256:", value)
+        self.assertIn("FROM ocaml/opam@sha256:", value)
+        self.assertIn("liblmdb-dev", value)
+        self.assertIn("opam install --locked --deps-only --require-checksums", value)
+        self.assertTrue((CONFIG_ROOT / "octra_node.opam.locked").is_file())
+        dockerignore = (CONFIG_ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("._*", dockerignore.splitlines())
+        install_path = Path(__file__).resolve().parent / "install.sh"
+        exported_install = Path(__file__).resolve().parent.parent / "install.sh"
+        installer = install_path if install_path.is_file() else exported_install
+        install_value = installer.read_text(encoding="utf-8")
+        self.assertIn("docker-buildx", install_value)
+        self.assertIn("liblmdb0", install_value)
+        config_path = Path(__file__).resolve().with_name("validator_config.py")
+        config_value = config_path.read_text(encoding="utf-8")
+        self.assertIn("docker-buildx", config_value)
+        self.assertIn("liblmdb0", config_value)
+
+    def test_source_build_exports_all_runtime_artifacts(self):
+        dockerfile = WORK / "source_build.Dockerfile"
+        dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+        (WORK / "octra_node.opam.locked").write_text(
+            'opam-version: "2.0"\n',
+            encoding="utf-8",
+        )
+        commands = []
+        names = [
+            "octra_node.exe",
+            "octra_pvac_worker.exe",
+            "octra_state_sync_client.exe",
+            "octra_state_sync_manifest.exe",
+            "bft_control_tx.exe",
+        ]
+
+        def run_build(command, cwd=WORK, env=None):
+            commands.append((command, cwd, env))
+            output = WORK / "tmp/source_build/output"
+            output.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                (output / name).write_bytes(name.encode("ascii"))
+
+        with mock.patch("validator_config.ROOT", WORK):
+            with mock.patch(
+                "validator_config.source_build_file",
+                return_value=dockerfile,
+            ):
+                with mock.patch(
+                    "validator_config.docker_command",
+                    return_value=["docker"],
+                ):
+                    with mock.patch(
+                        "validator_config.os.uname",
+                        return_value=mock.Mock(machine="x86_64"),
+                    ):
+                        with mock.patch(
+                            "validator_config.run",
+                            side_effect=run_build,
+                        ):
+                            build_candidate()
+        command, cwd, environment = commands[0]
+        self.assertEqual(cwd, WORK)
+        self.assertEqual(command[0:4], [
+            "docker",
+            "build",
+            "--platform",
+            "linux/amd64",
+        ])
+        self.assertEqual(environment["DOCKER_BUILDKIT"], "1")
+        for name in names:
+            self.assertEqual(
+                (WORK / "_build/default/bin" / name).read_bytes(),
+                name.encode("ascii"),
+            )
 
     def test_hashed_file_rejects_tampering(self):
         worker = WORK / "octra_pvac_worker.exe"

@@ -34,6 +34,9 @@ type deps = {
     Bundle_fetch.accepted ->
     unit;
   sleep : float -> unit Lwt.t;
+  bundle_wait_timeout_seconds : float;
+  bundle_wait_expired : epoch_id:int64 -> unit;
+  bundle_wait_recovered : epoch_id:int64 -> unit;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
@@ -62,6 +65,9 @@ type node_deps = {
     receipts_json:string list ->
     unit;
   sleep : float -> unit Lwt.t;
+  bundle_wait_timeout_seconds : float;
+  bundle_wait_expired : epoch_id:int64 -> unit;
+  bundle_wait_recovered : epoch_id:int64 -> unit;
   post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
 }
 
@@ -96,6 +102,9 @@ let node_deps input =
         ~txs:bundle.txs
         ~receipts_json:bundle.receipts_json);
     sleep = input.sleep;
+    bundle_wait_timeout_seconds = input.bundle_wait_timeout_seconds;
+    bundle_wait_expired = input.bundle_wait_expired;
+    bundle_wait_recovered = input.bundle_wait_recovered;
     post_finalize = input.post_finalize;
   }
 
@@ -137,7 +146,7 @@ let persist_available_bundle (deps : deps) finalize proposal_id =
   | None ->
     false
 
-let rec await_bundle (deps : deps) header proposal_id delay =
+let rec await_bundle (deps : deps) header proposal_id delay remaining quarantined =
   let open Lwt.Syntax in
   let* state =
     Bundle_fetch.ensure_finalized
@@ -146,10 +155,30 @@ let rec await_bundle (deps : deps) header proposal_id delay =
   in
   match state with
   | Bundle_fetch.Finalized_ready ->
+    if quarantined then begin
+      Log.warn "consensus"
+        "event = finalized_bundle_wait epoch = %Ld action = recover"
+        header.C_types.epoch_id;
+      deps.bundle_wait_recovered ~epoch_id:header.C_types.epoch_id
+    end;
     Lwt.return_unit
   | Bundle_fetch.Finalized_deferred ->
-    let* () = deps.sleep delay in
-    await_bundle deps header proposal_id (min 5.0 (delay *. 2.0))
+    if not quarantined && remaining <= 0. then begin
+      Log.error "consensus"
+        "event = finalized_bundle_wait epoch = %Ld action = quarantine"
+        header.C_types.epoch_id;
+      deps.bundle_wait_expired ~epoch_id:header.C_types.epoch_id;
+      await_bundle deps header proposal_id delay remaining true
+    end else
+      let wait = if quarantined then delay else min delay remaining in
+      let* () = deps.sleep wait in
+      await_bundle
+        deps
+        header
+        proposal_id
+        (min 5.0 (delay *. 2.0))
+        (if quarantined then remaining else remaining -. wait)
+        quarantined
 
 let run (deps : deps) finalize =
   let open Lwt.Syntax in
@@ -168,7 +197,15 @@ let run (deps : deps) finalize =
     header.C_types.epoch_id
     round
     (deps.cached_bundle_len ~proposal_id);
-  let* () = await_bundle deps header proposal_id 1.0 in
+  let* () =
+    await_bundle
+      deps
+      header
+      proposal_id
+      1.0
+      (max 0.001 deps.bundle_wait_timeout_seconds)
+      false
+  in
   if
     not bundle_persisted
     && not (persist_available_bundle deps finalize proposal_id)
