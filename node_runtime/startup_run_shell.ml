@@ -15,6 +15,11 @@ let task_plan ~base_tasks ~observer ~observer_loop ~tick_loop ~optional =
   @ role_tasks ~observer ~observer_loop ~tick_loop
   @ optional_task optional
 
+let transport_tasks ~p2p ~rpc ~swarm =
+  match swarm with
+  | Some _ -> [rpc ()]
+  | None -> [p2p (); rpc ()]
+
 let node_tasks ~p2p_task ~rpc_task ~observer ~observer_loop ~tick_loop
     ~swarm_task =
   task_plan
@@ -130,15 +135,14 @@ let observer_loop () =
   loop ()
 
 let node_launch_tasks (deps : node_launch_deps) =
-  launch_tasks
-    {
-      p2p = deps.p2p;
-      rpc = deps.rpc;
-      observer = deps.observer;
-      observer_loop;
-      tick_loop = deps.tick_loop;
-      swarm = (fun () -> node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps);
-    }
+  let swarm_task = node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps in
+  task_plan
+    ~base_tasks:
+      (transport_tasks ~p2p:deps.p2p ~rpc:deps.rpc ~swarm:swarm_task)
+    ~observer:deps.observer
+    ~observer_loop
+    ~tick_loop:deps.tick_loop
+    ~optional:swarm_task
 
 let default_join_log =
   {

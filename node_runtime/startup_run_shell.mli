@@ -19,6 +19,12 @@ val task_plan :
   optional:'a option ->
   'a list
 
+val transport_tasks :
+  p2p:(unit -> 'a) ->
+  rpc:(unit -> 'a) ->
+  swarm:'b option ->
+  'a list
+
 val node_tasks :
   p2p_task:'a ->
   rpc_task:'a ->
