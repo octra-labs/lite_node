@@ -113,7 +113,11 @@ install_rust_toolchain() {
     "$RUSTUP" default "$RUST_TOOLCHAIN"
 }
 
-PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs npm python3 python3-nacl'
+PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs python3 python3-nacl'
+# nodesource packages already include npm.
+if ! command -v npm >/dev/null 2>&1; then
+  PACKAGES="$PACKAGES npm"
+fi
 
 if [ "$SOURCE_BUILD" -eq 1 ]; then
   PACKAGES="$PACKAGES build-essential git libev-dev libgmp-dev liblmdb-dev libsqlite3-dev m4 opam pkg-config"
