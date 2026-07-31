@@ -1719,8 +1719,10 @@ let rejected_by_addr_rows t addr ~limit ~offset =
         capped_replace t.rejected_rows_page_cache key rows;
         rows
 
-let rejected_by_epoch_rows t epoch_id =
-  let hashes = Chaindata_index.rejected_by_epoch t.index epoch_id in
+let rejected_by_epoch_rows t epoch_id ~limit ~offset =
+  let hashes =
+    Chaindata_index.rejected_by_epoch t.index epoch_id ~limit ~offset
+  in
   List.filter_map (fun hash ->
     match Chaindata_index.get_rejected t.index hash with
     | Some s -> rejected_to_row hash s

@@ -111,7 +111,14 @@ let negative_cache_seconds = 5.0
 let manifest_warning_at = ref 0.0
 let manifest_warning_seconds = 30.0
 let active_chunk_reads = ref 0
-let max_active_chunk_reads = 2
+
+let chunk_read_limit raw =
+  match Option.bind raw int_of_string_opt with
+  | Some value -> min 64 (max 1 value)
+  | None -> 8
+
+let max_active_chunk_reads =
+  chunk_read_limit (Sys.getenv_opt "OCTRA_STATE_SYNC_MAX_ACTIVE_CHUNK_READS")
 
 type chunk_read_error =
   | Chunk_busy
@@ -163,43 +170,25 @@ let configured_exporter_set () =
       |> List.filter (fun entry -> entry <> "")
       |> Manifest.validator_set_of_entries
 
-let certificate_validator_set validator_set =
-  let converted =
-    validator_set.Octra_consensus.C_types.validators
-  |> List.fold_left (fun state validator ->
-    match state with
-    | Error _ as error -> error
-    | Ok validators ->
-        if String.length validator.Octra_consensus.C_types.pubkey <> 32 then
-          Error "consensus validator public key has invalid encoding"
-        else
-          match
-            Octra_consensus.C_types.weight_of_addr
-              validator_set
-              validator.address
-          with
-          | None -> Error "consensus validator weight is missing"
-          | Some weight ->
-            Ok ((Octra_consensus.C_types.{
-              address = validator.address;
-              pubkey = Base64.encode_exn validator.pubkey;
-            }, weight) :: validators)
-  ) (Ok [])
-  |> Result.map List.rev
-  in
-  match converted with
-  | Error _ as error -> error
-  | Ok validators when validator_set.weighted ->
-    Octra_consensus.C_types.make_weighted_validator_set validators
-  | Ok validators ->
-    Ok
-      (Octra_consensus.C_types.make_validator_set
-         (List.map fst validators))
+let configured_validator_set () =
+  match Sys.getenv_opt "OCTRA_VALIDATORS" with
+  | None -> Error "state sync validators are not configured"
+  | Some value ->
+      value
+      |> String.split_on_char ','
+      |> List.map String.trim
+      |> List.filter (fun entry -> entry <> "")
+      |> Manifest.validator_set_of_entries
 
 let hash_hex value =
   if String.length value = 32 then Ok (Manifest.raw_to_hex value)
   else if Manifest.is_lower_hex_64 value then Ok value
   else Error "consensus config hash has invalid encoding"
+
+let configured_config_hash () =
+  match Sys.getenv_opt "OCTRA_CONSENSUS_CONFIG_HASH" with
+  | Some value -> hash_hex (String.trim value)
+  | None -> Error "state sync config hash is not configured"
 
 let read_file_limited path limit =
   let input = open_in_bin path in
@@ -235,8 +224,8 @@ let warn_manifest_unavailable reason =
     Log.warn "state_sync" "event = manifest_unavailable reason = %s" reason
   end
 
-let load_certificate ~chain_id ~config_hash ~validator_set =
-  match configured_certificate_path (), certificate_validator_set validator_set with
+let load_certificate ~chain_id ~config_hash:_ ~validator_set:_ =
+  match configured_certificate_path (), configured_validator_set () with
   | (Error _ as error), _ | _, (Error _ as error) -> error
   | Ok path, Ok validator_set ->
       try
@@ -247,7 +236,7 @@ let load_certificate ~chain_id ~config_hash ~validator_set =
             Octra_consensus.C_config.validator_set_hash validator_set
             |> Manifest.raw_to_hex
           in
-          match configured_exporter_set (), hash_hex config_hash with
+          match configured_exporter_set (), configured_config_hash () with
           | Error _ as error, _ | _, (Error _ as error) -> error
           | Ok exporter_set, Ok expected_config ->
               let exporter_hash =

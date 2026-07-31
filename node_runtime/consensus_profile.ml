@@ -168,6 +168,7 @@ let crypto_engine () =
 
 let circle_hfhe_abi = "bound_range_commitment_v2"
 let program_fhe_abi = "proof_verify_view_only_v1"
+let consensus_rules_id = "pvac_alias_rejection_epoch_time_bound"
 
 let runtime_env getenv = Startup_runtime_limits.{
   int_value = (fun name default -> int_value getenv name default);
@@ -195,7 +196,7 @@ let hash getenv =
   let epoch_min_ms = Epoch_cadence.minimum_ms_of getenv in
   let proposal_limits = Startup_runtime_limits.proposal_limits env
     ~default_max_ou:Octra_core.Tx_staging.max_ou_per_epoch in
-  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v14" (fun buf ->
+  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v16" (fun buf ->
     put_int buf proposal_limits.max_txs;
     put_int buf epoch_min_ms;
     put_int buf proposal_limits.max_bytes;
@@ -231,6 +232,7 @@ let hash getenv =
     Octra_net.Oce1.put_string buf (crypto_engine ());
     Octra_net.Oce1.put_string buf circle_hfhe_abi;
     Octra_net.Oce1.put_string buf program_fhe_abi;
+    Octra_net.Oce1.put_string buf consensus_rules_id;
     Octra_net.Oce1.put_string buf Octra_vm.Program_package.compiler_profile_id;
     Octra_net.Oce1.put_string buf (migration_root getenv);
     Octra_net.Oce1.put_list Octra_net.Oce1.put_string buf (admit_ops getenv);

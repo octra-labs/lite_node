@@ -54,6 +54,8 @@ val account_proof_params :
 
 val epoch_proof_of_header :
   chain_id:string ->
+  prev_epoch_index_root:string ->
+  epoch_index_root:string ->
   Octra_core.Epochlog.epoch_header ->
   string list ->
   (Octra_consensus.C_light_epoch.t, string) result

@@ -7,6 +7,9 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE_BUILD=0
 DATA_ROOT=${OCTRA_DATA_ROOT:-/var/lib/octra}
 RUST_TOOLCHAIN=1.80.1
+TOOLCHAIN_ROOT="$ROOT/runtime_data/toolchains"
+CARGO_HOME="$TOOLCHAIN_ROOT/cargo"
+RUSTUP_HOME="$TOOLCHAIN_ROOT/rustup"
 
 case "$DATA_ROOT" in
   /*) ;;
@@ -69,21 +72,23 @@ if [ -z "$OPERATOR_HOME" ]; then
   exit 1
 fi
 
+PM2_HOME="$OPERATOR_HOME/.pm2"
+PM2_SERVICE="pm2-$OPERATOR_USER.service"
+
 run_operator() {
   if [ "$CURRENT_USER" = "$OPERATOR_USER" ]; then
-    env HOME="$OPERATOR_HOME" "$@"
+    env -C "$ROOT" HOME="$OPERATOR_HOME" PM2_HOME="$PM2_HOME" "$@"
   elif [ "$(id -u)" -eq 0 ]; then
-    runuser -u "$OPERATOR_USER" -- env HOME="$OPERATOR_HOME" PATH="$PATH" "$@"
+    runuser -u "$OPERATOR_USER" -- env -C "$ROOT" HOME="$OPERATOR_HOME" PM2_HOME="$PM2_HOME" PATH="$PATH" "$@"
   else
-    sudo -H -u "$OPERATOR_USER" env HOME="$OPERATOR_HOME" PATH="$PATH" "$@"
+    sudo -H -u "$OPERATOR_USER" env -C "$ROOT" HOME="$OPERATOR_HOME" PM2_HOME="$PM2_HOME" PATH="$PATH" "$@"
   fi
 }
 
 install_rust_toolchain() {
-  RUSTUP="$OPERATOR_HOME/.cargo/bin/rustup"
+  RUSTUP="$CARGO_HOME/bin/rustup"
   if [ ! -x "$RUSTUP" ]; then
-    RUSTUP_STAGE="$ROOT/tmp/rustup"
-    run_operator mkdir -p "$RUSTUP_STAGE"
+    run_operator mkdir -p "$TOOLCHAIN_ROOT"
     run_operator curl \
       --proto '=https' \
       --tlsv1.2 \
@@ -92,16 +97,20 @@ install_rust_toolchain() {
       --silent \
       --show-error \
       https://sh.rustup.rs \
-      --output "$RUSTUP_STAGE/rustup-init.sh"
-    run_operator sh "$RUSTUP_STAGE/rustup-init.sh" \
+      --output "$TOOLCHAIN_ROOT/rustup-init.sh"
+    run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+      sh "$TOOLCHAIN_ROOT/rustup-init.sh" \
       -y \
       --no-modify-path \
       --profile minimal \
       --default-toolchain "$RUST_TOOLCHAIN"
   fi
-  run_operator "$RUSTUP" set profile minimal
-  run_operator "$RUSTUP" toolchain install "$RUST_TOOLCHAIN"
-  run_operator "$RUSTUP" default "$RUST_TOOLCHAIN"
+  run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    "$RUSTUP" set profile minimal
+  run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    "$RUSTUP" toolchain install "$RUST_TOOLCHAIN"
+  run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
+    "$RUSTUP" default "$RUST_TOOLCHAIN"
 }
 
 PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs npm python3 python3-nacl'
@@ -113,7 +122,9 @@ fi
 printf 'event = install phase = packages\n'
 run_root apt-get update
 run_root apt-get install -y $PACKAGES
-run_root npm install -g pm2
+if ! command -v pm2 >/dev/null 2>&1; then
+  run_root npm install -g pm2
+fi
 run_root chown -R "$OPERATOR_USER:$OPERATOR_USER" "$ROOT"
 run_root install -d -m 700 -o "$OPERATOR_USER" -g "$OPERATOR_USER" "$DATA_ROOT"
 if [ "$SOURCE_BUILD" -eq 1 ]; then
@@ -121,12 +132,9 @@ if [ "$SOURCE_BUILD" -eq 1 ]; then
 fi
 
 printf 'event = install phase = process_manager user = %s\n' "$OPERATOR_USER"
-run_operator pm2 install pm2-logrotate
-run_operator pm2 set pm2-logrotate:max_size 100M
-run_operator pm2 set pm2-logrotate:retain 10
-run_operator pm2 set pm2-logrotate:compress true
-run_root env "PATH=$PATH" pm2 startup systemd -u "$OPERATOR_USER" --hp "$OPERATOR_HOME"
-run_operator pm2 save --force
+if ! systemctl is-enabled --quiet "$PM2_SERVICE" >/dev/null 2>&1; then
+  run_root env "PATH=$PATH" pm2 startup systemd -u "$OPERATOR_USER" --hp "$OPERATOR_HOME"
+fi
 
 printf 'status = ready source_build = %s user = %s data_root = %s\n' "$SOURCE_BUILD" "$OPERATOR_USER" "$DATA_ROOT"
 printf 'next = configure user = %s script = %s/controls/config_val.sh\n' "$OPERATOR_USER" "$ROOT"

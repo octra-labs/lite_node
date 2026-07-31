@@ -522,15 +522,22 @@ let cached_proposal_bundle (deps : deps) ~proposal_id =
   | None ->
     None
 
+let current_validator_set (deps : deps) =
+  match !(deps.driver_ref) with
+  | Some driver -> Octra_consensus.C_driver.active_validator_set driver
+  | None -> deps.validator_set
+
+let previous_epoch_ts (deps : deps) epoch =
+  match deps.finality.find_finalized (Int64.to_int epoch) with
+  | Some finalize ->
+    Some finalize.Octra_consensus.C_types.header.ts
+  | None ->
+    Consensus_driver_read.epoch_time deps.driver_read_deps epoch
+
 let verify_proposal_deps (deps : deps) =
   Consensus_proposal.{
     now = deps.now;
-    previous_epoch_ts = (fun epoch ->
-      match deps.finality.find_finalized (Int64.to_int epoch) with
-      | Some finalize ->
-        Some finalize.Octra_consensus.C_types.header.ts
-      | None ->
-        Consensus_driver_read.epoch_time deps.driver_read_deps epoch);
+    previous_epoch_ts = previous_epoch_ts deps;
     quarantine_active = deps.gates.quarantine_active;
     quarantine_reason = deps.gates.quarantine_reason;
     mark_quarantine = deps.gates.mark_quarantine;
@@ -621,6 +628,7 @@ let make_proposal_deps (deps : deps) =
     head_txid_hi = deps.head_txid_hi;
     freeze = Consensus_bundle_cache.freeze deps.proposal_bundles;
     now = deps.now;
+    previous_epoch_ts = previous_epoch_ts deps;
   }
 
 let finalized_deps (deps : deps) =
@@ -657,7 +665,7 @@ let before_precommit (deps : deps) ~epoch_id ~round ~proposal_id ~proposed_state
     (Consensus_proposal.handle_before_precommit
       {
         chain_id = deps.chain_id;
-        validator_set = deps.validator_set;
+        validator_set = (fun () -> current_validator_set deps);
         current_tx_hashes = deps.current_tx_hashes;
         cached_bundle = Consensus_bundle_cache.peek_raw deps.proposal_bundles;
         sync_bundle = (fun ~tx_hashes ~txs ~receipts_json:_ ->
@@ -681,7 +689,11 @@ let config (deps : deps) =
     my_addr = deps.my_addr;
     sign_fn = deps.sign_fn;
     verify_fn = (fun addr msg sig_bytes ->
-      match Octra_consensus.C_types.pubkey_of_addr deps.validator_set addr with
+      match
+        Octra_consensus.C_types.pubkey_of_addr
+          (current_validator_set deps)
+          addr
+      with
       | Some pk ->
         Octra_consensus.C_hash.verify_ed25519
           ~pubkey_raw:pk

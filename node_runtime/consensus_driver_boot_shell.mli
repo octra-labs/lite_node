@@ -101,6 +101,10 @@ val committed_reads :
   Consensus_driver_read.deps ->
   Consensus_driver_read.deps
 
+val validator_state_height :
+  committed_head_epoch:(unit -> int) ->
+  int64
+
 val enabled :
   int ->
   bool

@@ -15,8 +15,8 @@ type read_ctx = {
   program_trust_hash : string option;
   runtime_profile_hash : string option;
   validator_view_pub : string;
-  validator_set : Octra_consensus.C_types.validator_set;
-  scheduled_validator_set : Octra_consensus.C_config.scheduled option;
+  validator_set_ref : Octra_consensus.C_types.validator_set ref;
+  scheduled_validator_set_ref : Octra_consensus.C_config.scheduled option ref;
   current_epoch : int ref;
   total_tx_count : int ref;
   encrypted : unit -> Z.t;
@@ -58,9 +58,8 @@ val validator_set_proof :
   chain_id:string ->
   program_trust_hash:string option ->
   runtime_profile_hash:string option ->
-  driver_ref:Octra_consensus.C_driver.t option ref ->
-  validator_set:Octra_consensus.C_types.validator_set ->
-  scheduled_validator_set:Octra_consensus.C_config.scheduled option ->
+  validator_set_ref:Octra_consensus.C_types.validator_set ref ->
+  scheduled_validator_set_ref:Octra_consensus.C_config.scheduled option ref ->
   rpc_result
 
 val consensus_peer_states :

@@ -71,17 +71,19 @@ let verify_epoch_chain ~root epochs =
   match last epochs with
   | None -> false
   | Some tip ->
-    List.for_all C_light_epoch.verify epochs
-    && verify_chain epochs
-    && tip.chain_id = root.C_light_root.chain_id
-    && tip.epoch_id = root.head_epoch
-    && String.lowercase_ascii tip.state_root = raw_to_hex root.state_root
+    begin
+      match root.C_light_root.epoch_index_root with
+      | None -> false
+      | Some epoch_index_root ->
+        List.for_all C_light_epoch.verify epochs
+        && verify_chain epochs
+        && tip.chain_id = root.chain_id
+        && tip.epoch_id = root.head_epoch
+        && String.lowercase_ascii tip.epoch_index_root =
+           raw_to_hex epoch_index_root
+    end
 
 let verify_tx ~root ~epochs tx =
-  verify_epoch_chain ~root epochs && C_light_epoch.verify_tx_inclusion tx
-
-let verify_account ~root account =
-  C_light_account.verify account
-  && account.chain_id = root.C_light_root.chain_id
-  && account.head_epoch = root.head_epoch
-  && account.state_root = root.state_root
+  verify_epoch_chain ~root epochs
+  && C_light_epoch.tx_position_ok tx
+  && List.exists (C_light_epoch.same tx.epoch) epochs

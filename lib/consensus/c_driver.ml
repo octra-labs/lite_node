@@ -142,8 +142,6 @@ type t = {
   mutable output_loop_requested : bool;
 }
 
-let epoch_slot_seconds = 10.0
-
 let raw_to_hex s =
   String.concat "" (List.init (String.length s)
     (fun i -> Printf.sprintf "%02x" (Char.code s.[i])))
@@ -1371,9 +1369,43 @@ let rec process_outputs_once t =
               Hashtbl.clear t.durable_votes;
               C_engine.start_height t.engine next;
               let now_ns = Mtime_clock.elapsed_ns () in
-              let slot_ns = Int64.of_float (epoch_slot_seconds *. 1e9) in
+              let slot_ns =
+                Int64.of_float (Epoch_time.interval_seconds *. 1e9)
+              in
               let target_ns = Int64.add t.epoch_start_mono slot_ns in
-              let remaining_ns = Int64.sub target_ns now_ns in
+              let monotonic_remaining_ns = Int64.sub target_ns now_ns in
+              let epoch_time_remaining_ns =
+                Int64.mul
+                  (Epoch_time.next_delay_ms
+                     ~now:(Unix.gettimeofday ())
+                     ~previous:header.ts)
+                  1_000_000L
+              in
+              let remaining_ns =
+                if epoch_time_remaining_ns > monotonic_remaining_ns then
+                  epoch_time_remaining_ns
+                else
+                  monotonic_remaining_ns
+              in
+              let carry_ms =
+                if now_ns > target_ns then
+                  Int64.div
+                    (Int64.sub now_ns target_ns)
+                    1_000_000L
+                else
+                  0L
+              in
+              let wait_ms =
+                if remaining_ns > 0L then
+                  Int64.div remaining_ns 1_000_000L
+                else
+                  0L
+              in
+              log_node t.config.my_addr
+                "event = epoch_pacer height = %Ld carry_ms = %Ld wait_ms = %Ld"
+                next
+                carry_ms
+                wait_ms;
               let* () =
                 if remaining_ns > 100_000_000L then
                   Lwt_unix.sleep (Int64.to_float remaining_ns /. 1e9)
@@ -2398,6 +2430,8 @@ let clear_round_local_state t ~height ~round =
     t.deferred_proposals
 
 let start_height t height =
+  let open Lwt.Syntax in
+  let* () = maybe_activate_scheduled_validator_set t ~target_epoch:height in
   clear_height_local_state t;
   C_engine.start_height t.engine height;
   process_outputs t
@@ -2451,8 +2485,14 @@ let start t =
     (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
 
   let* () = Lwt_unix.sleep 3.0 in
-  if C_engine.is_pristine t.engine then
-    C_engine.start_height t.engine t.engine.state.height;
+  let* () =
+    if C_engine.is_pristine t.engine then
+      start_height t t.engine.state.height
+    else
+      maybe_activate_scheduled_validator_set
+        t
+        ~target_epoch:t.engine.state.height
+  in
   let* () = broadcast_round_sync t ~request:true in
   let* _ = try_current_leader_proposal t in
   process_outputs t
@@ -2464,4 +2504,5 @@ let stop t =
 let current_height t = t.engine.state.height
 let current_round t = t.engine.state.round
 let current_step t = t.engine.state.step
+let active_validator_set t = t.engine.vs
 let am_i_leader t = C_engine.am_i_leader t.engine

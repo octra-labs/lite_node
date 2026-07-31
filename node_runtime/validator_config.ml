@@ -507,13 +507,19 @@ let node_startup_admission ~getenv ~activation_epoch ~address ~voting
   match Octra_core.Validator_policy.of_env getenv with
   | Error error -> [Startup_refuse [error]]
   | Ok policy ->
+    let next_activation_epoch =
+      match cfg.transition with
+      | Scheduled { activate_epoch; _ }
+      | Already_active { activate_epoch } -> Some activate_epoch
+      | No_transition -> activation_epoch ()
+    in
     startup_admission
       ~permissionless:(Octra_core.Validator_policy.lifecycle_enabled policy)
       ~address
       ~voting
       ~role_label
       ~allow_unsafe_quorum:(getenv "OCTRA_ALLOW_UNSAFE_QUORUM" = Some "1")
-      ~next_activation_epoch:(activation_epoch ())
+      ~next_activation_epoch
       cfg
 
 let emit_startup_events deps =

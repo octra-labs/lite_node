@@ -192,7 +192,8 @@ let list_saved_epochs chaindata =
   |> List.rev
 
 let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
-    ~consensus_config_hash ~consensus_validator_set ~scheduled_validator_set
+    ~consensus_config_hash_ref ~consensus_validator_set_ref
+    ~scheduled_validator_set_ref
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
     ~program_trust ~migration_entitlements ~chaindata ~consensus_driver_ref
     ~epoch_visibility =
@@ -212,9 +213,9 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     tree_ref;
     wallet;
     chain_id;
-    consensus_config_hash;
-    consensus_validator_set;
-    scheduled_validator_set;
+    consensus_config_hash_ref;
+    consensus_validator_set_ref;
+    scheduled_validator_set_ref;
     current_epoch;
     total_tx_count;
     validator_view_sk;
@@ -242,9 +243,9 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~tree_ref
     ~wallet
     ~chain_id
-    ~consensus_config_hash:!consensus_config_hash_ref
-    ~consensus_validator_set:!consensus_validator_set_ref
-    ~scheduled_validator_set:!scheduled_validator_set_ref
+    ~consensus_config_hash_ref
+    ~consensus_validator_set_ref
+    ~scheduled_validator_set_ref
     ~current_epoch
     ~total_tx_count
     ~validator_view_sk

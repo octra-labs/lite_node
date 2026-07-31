@@ -1061,6 +1061,13 @@ CAMLprim value caml_pvac_pubkey_is_key_bound_extension(value v_legacy, value v_b
     CAMLreturn(Val_bool(pubkey_is_key_bound_extension_impl(legacy, bound)));
 }
 
+CAMLprim value caml_pvac_pubkey_supports_alias_rejection(value v_pk) {
+    CAMLparam1(v_pk);
+    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    CAMLreturn(Val_bool(
+        pk.circuit_prf_profile == pvac::CircuitPrfProfile::MIMC_X5_V7));
+}
+
 static bool legacy_layer_matches_bound_extension(
     const pvac::Layer& legacy,
     const pvac::Layer& bound,

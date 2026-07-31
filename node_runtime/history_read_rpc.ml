@@ -388,7 +388,13 @@ let transactions_by_epoch chaindata ~params ~current_epoch_id =
              (Store_chaindata.get_visible_epoch_index_status chaindata eid))
       else
         let rejected_start = Unix.gettimeofday () in
-        let rejected_rows = Store_chaindata.rejected_by_epoch_rows chaindata eid in
+        let rejected_rows =
+          Store_chaindata.rejected_by_epoch_rows
+            chaindata
+            eid
+            ~limit
+            ~offset
+        in
         let rejected_ms = (Unix.gettimeofday () -. rejected_start) *. 1000.0 in
         let json_start = Unix.gettimeofday () in
         let result =

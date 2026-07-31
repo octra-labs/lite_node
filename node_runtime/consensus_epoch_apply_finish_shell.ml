@@ -145,6 +145,7 @@ let run (deps : deps) (request : request) =
     deps.finalize
       Finalize.{
         tree_ref = request.tree_ref;
+        chain_id = request.epoch_env.chain_id;
         epoch_id;
         epoch_ts;
         epoch_start = request.epoch_start;

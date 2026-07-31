@@ -2,7 +2,7 @@ _build/
 _cargo_target/
 target/
 data/
-tmp/
+runtime_data/
 .keys/
 *.a
 *.bc

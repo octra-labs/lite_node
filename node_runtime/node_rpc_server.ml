@@ -26,9 +26,9 @@ type config = {
   tree_ref : Tree.t ref;
   wallet : Wallet.t;
   chain_id : string;
-  consensus_config_hash : string;
-  consensus_validator_set : Octra_consensus.C_types.validator_set;
-  scheduled_validator_set : Octra_consensus.C_config.scheduled option;
+  consensus_config_hash_ref : string ref;
+  consensus_validator_set_ref : Octra_consensus.C_types.validator_set ref;
+  scheduled_validator_set_ref : Octra_consensus.C_config.scheduled option ref;
   current_epoch : int ref;
   total_tx_count : int ref;
   validator_view_sk : string;
@@ -48,9 +48,9 @@ type ctx = {
   tree_ref : Tree.t ref;
   wallet : Wallet.t;
   chain_id : string;
-  consensus_config_hash : string;
-  consensus_validator_set : Octra_consensus.C_types.validator_set;
-  scheduled_validator_set : Octra_consensus.C_config.scheduled option;
+  consensus_config_hash_ref : string ref;
+  consensus_validator_set_ref : Octra_consensus.C_types.validator_set ref;
+  scheduled_validator_set_ref : Octra_consensus.C_config.scheduled option ref;
   current_epoch : int ref;
   total_tx_count : int ref;
   validator_view_sk : string;
@@ -90,7 +90,7 @@ let with_account =
 
 let status_read_ctx (ctx : ctx) =
   let runtime_profile_hash =
-    if ctx.consensus_config_hash = String.make 32 '\x00' then None
+    if !(ctx.consensus_config_hash_ref) = String.make 32 '\x00' then None
     else Some (Consensus_profile.hash Sys.getenv_opt)
   in
   Status_read_rpc.{
@@ -105,8 +105,8 @@ let status_read_ctx (ctx : ctx) =
     program_trust_hash = Octra_vm.Program_trust.config_hash ctx.program_trust;
     runtime_profile_hash;
     validator_view_pub = ctx.validator_view_pub;
-    validator_set = ctx.consensus_validator_set;
-    scheduled_validator_set = ctx.scheduled_validator_set;
+    validator_set_ref = ctx.consensus_validator_set_ref;
+    scheduled_validator_set_ref = ctx.scheduled_validator_set_ref;
     current_epoch = ctx.current_epoch;
     total_tx_count = ctx.total_tx_count;
     encrypted = ctx.deps.encrypted_supply;
@@ -450,9 +450,9 @@ let start (cfg : config) =
     tree_ref = cfg.tree_ref;
     wallet = cfg.wallet;
     chain_id = cfg.chain_id;
-    consensus_config_hash = cfg.consensus_config_hash;
-    consensus_validator_set = cfg.consensus_validator_set;
-    scheduled_validator_set = cfg.scheduled_validator_set;
+    consensus_config_hash_ref = cfg.consensus_config_hash_ref;
+    consensus_validator_set_ref = cfg.consensus_validator_set_ref;
+    scheduled_validator_set_ref = cfg.scheduled_validator_set_ref;
     current_epoch = cfg.current_epoch;
     total_tx_count = cfg.total_tx_count;
     validator_view_sk = cfg.validator_view_sk;
@@ -468,26 +468,30 @@ let start (cfg : config) =
       ~process:(fun meta body_str ->
         Rpc_dispatch.process_body meta body_str rpc_ctx routes)
   in
-  let fallback =
+  let state_http req body =
     State_sync_http.handle
       ~data_dir:cfg.data_dir
       ~ledger:cfg.ledger
       ~tree_ref:cfg.tree_ref
       ~validator:address
       ~chain_id:cfg.chain_id
-      ~config_hash:cfg.consensus_config_hash
-      ~validator_set:cfg.consensus_validator_set
+      ~config_hash:!(cfg.consensus_config_hash_ref)
+      ~validator_set:!(cfg.consensus_validator_set_ref)
       ~current_epoch:cfg.current_epoch
       ~chaindata:cfg.chaindata
       ~encrypted_supply:cfg.deps.encrypted_supply
+      req
+      body
   in
-  let fallback_handler req body =
+  let state_http_handler req body =
     if state_sensitive_http req then
-      stable_http cfg.epoch_visibility fallback req body
+      stable_http cfg.epoch_visibility state_http req body
     else
-      fallback req body
+      state_http req body
   in
   let callback =
-    Rpc_http.route_rpc_or_fallback ~rpc_handler ~fallback_handler
+    Rpc_http.route_rpc_or_fallback
+      ~rpc_handler
+      ~fallback_handler:state_http_handler
   in
   Rpc_http.create_server ~port:cfg.port ~callback

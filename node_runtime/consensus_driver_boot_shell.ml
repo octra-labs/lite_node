@@ -103,6 +103,9 @@ let make_install (deps : deps) =
     ~scheduled_validator_set:deps.p2p_refs.scheduled_validator_set
     ~set_swarm:deps.p2p_refs.set_swarm
 
+let validator_state_height ~committed_head_epoch =
+  Int64.of_int (committed_head_epoch ())
+
 let start_p2p (deps : deps) =
   Startup_p2p_shell.start_node
     Startup_p2p_shell.{
@@ -112,7 +115,6 @@ let start_p2p (deps : deps) =
       fatal = (fun reason ->
         Log.fatal "init" "event = p2p_start_refused reason = %s" reason;
         deps.exit_error ());
-      current_epoch = (fun () -> !(deps.current_epoch));
       read_active_validator_meta = deps.read_active_validator_meta;
       read_pending_validator_meta = deps.read_pending_validator_meta;
       read_head_hash = deps.read_head_hash;
@@ -130,7 +132,9 @@ let start_p2p (deps : deps) =
       role_label = deps.role_label;
       read_persistent_pending = deps.read_persistent_pending;
       read_persistent_marker = deps.read_persistent_marker;
-      current_height = (fun () -> Int64.of_int !(deps.current_epoch));
+      current_height = (fun () ->
+        validator_state_height
+          ~committed_head_epoch:deps.committed_head_epoch);
     }
 
 let startup_finality (deps : deps) =

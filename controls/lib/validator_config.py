@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import os
+import pwd
 import shutil
 import socket
 import subprocess
@@ -27,6 +28,7 @@ from validator_common import state_sync_sources
 from validator_common import validate_checkpoint
 from validator_common import validator_entries
 from validator_common import write_env
+from validator_enroll import membership
 
 SOURCE = Path(__file__).resolve()
 ROOT = SOURCE.parents[2] if SOURCE.parents[1].name == "controls" else SOURCE.parents[3]
@@ -59,11 +61,15 @@ DEFAULT_DATA = ROOT / "data"
 IDENTITY_WALLET = ROOT / ".keys/validator/wallet.json"
 MIN_VALIDATOR_CPU = 8
 MIN_VALIDATOR_RAM = 31 * 1024 ** 3
-MIN_VALIDATOR_DISK = 1800 * 1000 ** 3
+MIN_VALIDATOR_DISK = 900 * 1000 ** 3
 MIN_VALIDATOR_FREE = 500 * 1000 ** 3
 MIN_OBSERVER_DISK = 900 * 1000 ** 3
 MIN_OBSERVER_FREE = 200 * 1000 ** 3
 RUST_TOOLCHAIN = "1.80.1"
+TOOLCHAIN_ROOT = ROOT / "runtime_data/toolchains"
+CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
+RUSTUP_HOME = TOOLCHAIN_ROOT / "rustup"
+OPAM_ROOT = TOOLCHAIN_ROOT / "opam"
 
 def operator_pm2_name(name):
     return name if name.startswith("octra-") else f"octra-{name}"
@@ -105,6 +111,16 @@ def ubuntu_host():
     text = path.read_text(encoding="utf-8")
     return "ID=ubuntu" in text or "ID=debian" in text
 
+def pm2_service_enabled(user):
+    result = subprocess.run(
+        ["systemctl", "is-enabled", "--quiet", f"pm2-{user}.service"],
+        cwd=ROOT,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
 def install_runtime():
     if not ubuntu_host():
         raise ValidatorError("automatic installation supports Ubuntu and Debian")
@@ -130,26 +146,24 @@ def install_runtime():
     run(elevated(["apt-get", "update"]), cwd=Path("/"))
     run(elevated(["apt-get", "install", "-y", *packages]), cwd=Path("/"))
     install_rust_toolchain()
-    run(elevated(["npm", "install", "-g", "pm2"]), cwd=Path("/"))
-    run(["pm2", "install", "pm2-logrotate"])
-    run(["pm2", "set", "pm2-logrotate:max_size", "100M"])
-    run(["pm2", "set", "pm2-logrotate:retain", "10"])
-    run(["pm2", "set", "pm2-logrotate:compress", "true"])
+    if shutil.which("pm2") is None:
+        run(elevated(["npm", "install", "-g", "pm2"]), cwd=ROOT)
     user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-    home = str(Path.home())
     if not user:
         raise ValidatorError("cannot determine PM2 service user")
-    run(elevated([
-        "env",
-        f"PATH={os.environ.get('PATH', '')}",
-        "pm2",
-        "startup",
-        "systemd",
-        "-u",
-        user,
-        "--hp",
-        home,
-    ]), cwd=Path("/"))
+    home = pwd.getpwnam(user).pw_dir
+    if not pm2_service_enabled(user):
+        run(elevated([
+            "env",
+            f"PATH={os.environ.get('PATH', '')}",
+            "pm2",
+            "startup",
+            "systemd",
+            "-u",
+            user,
+            "--hp",
+            home,
+        ]), cwd=ROOT)
 
 def missing_runtime():
     commands = ["curl", "pm2", "python3"]
@@ -171,10 +185,14 @@ def tool_version(raw):
     return (parts + (0, 0, 0))[:3]
 
 def rust_environment():
-    cargo_bin = str(Path.home() / ".cargo/bin")
+    TOOLCHAIN_ROOT.mkdir(parents=True, exist_ok=True)
+    cargo_bin = str(CARGO_HOME / "bin")
     return {
         **os.environ,
+        "CARGO_HOME": str(CARGO_HOME),
+        "OPAMROOT": str(OPAM_ROOT),
         "PATH": os.pathsep.join([cargo_bin, os.environ.get("PATH", "")]),
+        "RUSTUP_HOME": str(RUSTUP_HOME),
     }
 
 def install_rust_toolchain():
@@ -190,7 +208,7 @@ def install_rust_toolchain():
         ).stdout
         if tool_version(version) >= (1, 80, 0):
             return
-    stage = ROOT / "tmp/rustup"
+    stage = ROOT / "runtime_data/rustup"
     stage.mkdir(parents=True, exist_ok=True)
     installer = stage / "rustup-init.sh"
     run([
@@ -350,7 +368,7 @@ def resource_report(data_dir, role):
         if memory < MIN_VALIDATOR_RAM:
             raise ValidatorError("validator requires at least 32 GiB RAM")
         if usage.total < MIN_VALIDATOR_DISK or usage.free < MIN_VALIDATOR_FREE:
-            raise ValidatorError("validator requires a 2 TB class disk with 500 GB free")
+            raise ValidatorError("validator requires a 1 TB class disk with 500 GB free")
     elif usage.total < MIN_OBSERVER_DISK or usage.free < MIN_OBSERVER_FREE:
         raise ValidatorError("observer requires a 1 TB class disk with 200 GB free")
 
@@ -369,6 +387,10 @@ def validate_advertise(value, consensus_port):
     if int(value.rsplit(":", 1)[1]) != consensus_port:
         raise ValidatorError("advertised and consensus ports must match")
     return value
+
+def require_validator_membership(role, state):
+    if role == "validator" and not state["active"] and not state["scheduled"]:
+        raise ValidatorError("validator identity is not active or scheduled")
 
 def resolve_digest(args, network):
     if args.network_sha:
@@ -569,7 +591,7 @@ def parser():
     value.add_argument("--sync", action="store_true")
     value.add_argument("--sync-binary", default=str(DEFAULT_SYNC_BINARY))
     value.add_argument("--sync-concurrency", type=int, default=4)
-    value.add_argument("--sync-source-concurrency", type=int, default=1)
+    value.add_argument("--sync-source-concurrency", type=int, default=4)
     value.add_argument("--sync-stage")
     value.add_argument("--sync-url", action="append")
     value.add_argument("--worker", default=str(DEFAULT_WORKER))
@@ -625,6 +647,9 @@ def main():
         role = ask("Node role", "observer")
     if role not in {"observer", "validator"}:
         raise ValidatorError("node role must be observer or validator")
+    p2p_port = valid_port(args.p2p_port)
+    api_port = valid_port(args.api_port)
+    consensus_port = valid_port(args.consensus_port)
     name = args.name or (ask("Node name", socket.gethostname()) if not args.yes else socket.gethostname())
     if not NAME.fullmatch(name):
         raise ValidatorError("invalid node name")
@@ -632,12 +657,14 @@ def main():
     resource_report(data_dir, role)
     maybe_sync(args, data_dir, values)
     wallet = bind_wallet(data_dir)
-    members = dict(validator_entries(values["OCTRA_VALIDATORS"]))
-    if role == "validator" and members.get(wallet["address"]) != wallet["pub"]:
-        raise ValidatorError("local identity is not in the active validator set")
-    p2p_port = valid_port(args.p2p_port)
-    api_port = valid_port(args.api_port)
-    consensus_port = valid_port(args.consensus_port)
+    if role == "validator":
+        require_validator_membership(
+            role,
+            membership(
+                {**values, "OCTRA_API_PORT": str(api_port)},
+                wallet,
+            ),
+        )
     advertise = args.advertise
     if not advertise and not args.yes:
         advertise = ask(

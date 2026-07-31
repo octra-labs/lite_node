@@ -1,2 +1,2 @@
 (dirs
- (:standard \ tmp archive libv_litecore))
+ (:standard \ runtime_data archive libv_litecore))

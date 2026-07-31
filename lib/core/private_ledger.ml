@@ -693,6 +693,26 @@ let legacy_audit_commitment = function
     | _, None -> Error "legacy commitment migration requires reconstructable commitment history")
   | None -> Error "legacy commitment migration requires node history audit"
 
+let history_migration_required status old_pubkey =
+  match status.PM.cipher_class with
+  | PM.Legacy_hfhe -> Ok true
+  | PM.V3 ->
+    begin
+      match old_pubkey with
+      | None -> Error "encrypted balance has no pvac pubkey"
+      | Some blob ->
+        Result.map not (FB.blob_supports_alias_rejection blob)
+    end
+  | PM.Empty
+  | PM.Foreign
+  | PM.Malformed _ -> Ok false
+
+let history_migration_reason status =
+  if status.PM.needs_legacy_public_replay then
+    status.reason
+  else
+    "pvac pubkey proof circuit requires public or commitment history migration"
+
 let verify_legacy_public_migration new_pubkey amount payload =
   match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
   | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
@@ -917,13 +937,22 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
             let* migration_status =
               Proof_pool.run (fun () -> PM.status_of_cipher current_cipher)
             in
-            if payload.legacy_zero_reset && not migration_status.needs_legacy_public_replay then
+            let* history_required_result =
+              Proof_pool.run
+                (fun () ->
+                  history_migration_required migration_status old_pk)
+            in
+            match history_required_result with
+            | Error reason ->
+              Lwt.return (error "key_switch_rejected" reason)
+            | Ok history_required ->
+            if payload.legacy_zero_reset && not history_required then
               Lwt.return (error "key_switch_rejected" "legacy zero reset requires a legacy hfhe balance")
             else if migration_status.can_key_switch then
               Lwt.return
                 (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
                   ~new_cipher:None ~source_cipher:current_cipher)
-            else if migration_status.needs_legacy_public_replay then
+            else if history_required then
               if payload.legacy_zero_reset then
                   let* checked =
                     verify_new_key new_pubkey "legacy zero reset failed: "
@@ -979,7 +1008,10 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
                   | Ok (), None ->
                     Lwt.return (error "key_switch_rejected" "legacy public migration lost new cipher"))
               else
-                Lwt.return (error "key_switch_rejected" migration_status.reason)
+                Lwt.return
+                  (error
+                    "key_switch_rejected"
+                    (history_migration_reason migration_status))
             else if not migration_status.can_v3_migrate then
               Lwt.return (error "key_switch_rejected" migration_status.reason)
             else
@@ -1079,16 +1111,25 @@ let prepare_key_switch_plan ledger tx =
           let* status =
             Proof_pool.run (fun () -> PM.status_of_cipher current_cipher)
           in
+          let* history_required_result =
+            Proof_pool.run
+              (fun () -> history_migration_required status old_pk)
+          in
+          begin
+            match history_required_result with
+            | Error reason ->
+              Lwt.return (error "key_switch_rejected" reason)
+            | Ok history_required ->
           let prepared =
             if payload.legacy_zero_reset
-              && not status.needs_legacy_public_replay
+              && not history_required
             then
               error
                 "key_switch_rejected"
                 "legacy zero reset requires a legacy hfhe balance"
             else if status.can_key_switch then
               Ok None
-            else if status.needs_legacy_public_replay then
+            else if history_required then
               if payload.legacy_zero_reset then
                 Result.map Option.some (prepared_legacy_zero_reset payload)
               else if payload.legacy_commitment_migration then
@@ -1100,7 +1141,9 @@ let prepare_key_switch_plan ledger tx =
               else if payload.legacy_public_migration then
                 Result.map Option.some (prepared_legacy_public payload)
               else
-                error "key_switch_rejected" status.reason
+                error
+                  "key_switch_rejected"
+                  (history_migration_reason status)
             else if not status.can_v3_migrate then
               error "key_switch_rejected" status.reason
             else
@@ -1118,6 +1161,7 @@ let prepare_key_switch_plan ledger tx =
                    source_cipher = current_cipher;
                  })
                prepared)
+          end
     end
 
 let key_switch_plan ?legacy_public_replay ledger tx =

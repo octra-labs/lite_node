@@ -12,6 +12,7 @@ type effects = {
 
 type input = {
   tree_ref : Octra_core.Tree.t ref;
+  chain_id : string;
   epoch_id : int;
   epoch_ts : float;
   epoch_start : float;

@@ -328,6 +328,40 @@ let write_verified_marker root certificate sources =
     "verified_at", `String (Int64.of_float (Unix.gettimeofday ()) |> Int64.to_string);
   ])
 
+let finalize_one ~data_dir file =
+  match Journal.prepare_file ~stage:data_dir file with
+  | Error reason -> Lwt.fail_with reason
+  | Ok (destination, partial, _) ->
+      Lwt_preemptive.detach
+        (fun () -> Journal.finalize_file ~destination ~partial file)
+        () >>= function
+      | Ok () -> Lwt.return_unit
+      | Error reason -> Lwt.fail_with (file.Manifest.path ^ ": " ^ reason)
+
+let finalize_group ~parallelism ~data_dir files =
+  let pending = Queue.create () in
+  List.iter (fun file -> Queue.add file pending) files;
+  let lock = Lwt_mutex.create () in
+  let take () =
+    Lwt_mutex.with_lock lock (fun () ->
+      Lwt.return (Queue.take_opt pending))
+  in
+  let rec worker () =
+    take () >>= function
+    | None -> Lwt.return_unit
+    | Some file -> finalize_one ~data_dir file >>= worker
+  in
+  Lwt.join (List.init (max 1 (min 8 parallelism)) (fun _ -> worker ()))
+
+let finalize_files ~parallelism ~data_dir files =
+  let regular, head =
+    files
+    |> List.sort (fun left right -> String.compare left.Manifest.path right.path)
+    |> List.partition (fun file -> file.Manifest.path <> "HEAD.json")
+  in
+  finalize_group ~parallelism ~data_dir regular >>= fun () ->
+  Lwt_list.iter_s (finalize_one ~data_dir) head
+
 let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let body = certificate.Manifest.manifest in
   let checkpoint = certificate.checkpoint in
@@ -467,28 +501,11 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
     "event = sync_download_complete hash = %s bytes = %Ld\n%!"
     certificate.manifest_hash
     body.total_size;
-  let files =
-    List.sort (fun left right ->
-      match left.Manifest.path = "HEAD.json", right.Manifest.path = "HEAD.json" with
-      | true, false -> 1
-      | false, true -> -1
-      | _ -> String.compare left.path right.path
-    ) body.files
-  in
   Printf.printf
     "event = sync_finalize_start hash = %s files = %d\n%!"
     certificate.manifest_hash
     body.file_count;
-  Lwt_list.iter_s (fun file ->
-    match Journal.prepare_file ~stage:data_dir file with
-    | Error reason -> Lwt.fail_with reason
-    | Ok (destination, partial, _) ->
-        Lwt_preemptive.detach
-          (fun () -> Journal.finalize_file ~destination ~partial file)
-          () >>= function
-        | Ok () -> Lwt.return_unit
-        | Error reason -> Lwt.fail_with (file.path ^ ": " ^ reason)
-  ) files >>= fun () ->
+  finalize_files ~parallelism:!concurrency ~data_dir body.files >>= fun () ->
   Printf.printf
     "event = sync_finalize_complete hash = %s files = %d\n%!"
     certificate.manifest_hash

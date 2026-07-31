@@ -186,19 +186,16 @@ let light_epoch (p : Octra_consensus.C_light_epoch.t) =
   `Assoc [
     "chain_id", `String p.chain_id;
     "epoch_id", `String (Int64.to_string p.epoch_id);
-    "prev_state_root", `String p.prev_state_root;
-    "state_root", `String p.state_root;
-    "tx_list_hash", `String p.tx_list_hash;
     "tx_hashes", `List (List.map (fun h -> `String h) p.tx_hashes);
     "start_txid", `String (Int64.to_string p.start_txid);
     "tx_count", `Int p.tx_count;
-    "proposer", `String p.proposer;
-    "commit_round", `Int p.commit_round;
+    "prev_epoch_index_root", `String p.prev_epoch_index_root;
+    "epoch_index_root", `String p.epoch_index_root;
   ]
 
 let epoch_proof proof =
   `Assoc [
-    "version", `String "octra-epoch-proof-v1";
+    "proof_kind", `String "epoch_inclusion";
     "epoch", light_epoch proof;
   ]
 
@@ -207,7 +204,7 @@ let tx_json_value raw =
 
 let tx_inclusion_proof proof ~tx_json =
   `Assoc [
-    "version", `String "octra-tx-inclusion-proof-v1";
+    "proof_kind", `String "tx_inclusion";
     "tx_hash", `String proof.Octra_consensus.C_light_epoch.tx_hash;
     "index", `Int proof.index;
     "epoch", light_epoch proof.epoch;

@@ -39,6 +39,7 @@ type node_deps = {
 }
 
 type node_request = {
+  chain_id : string;
   epoch_id : int;
   epoch_ts : float;
   proposer_addr : string;
@@ -240,10 +241,10 @@ let reward_line ~fees ~proposer ~short ~validator_count plan =
     (Z.to_string plan.each_validator)
     validator_count
 
-let env ~epoch_id ~epoch_ts ~proposer_addr ~validator_pubkeys
+let env ~chain_id ~epoch_id ~epoch_ts ~proposer_addr ~validator_pubkeys
     ~ready_state_root_at ~ready_max_lag =
   Epoch_exec.{
-    chain_id = "";
+    chain_id;
     epoch_id;
     proposer_addr;
     validator_addrs = List.map fst validator_pubkeys;
@@ -286,6 +287,7 @@ let run_node deps request =
   in
   let footer_env =
     env
+      ~chain_id:request.chain_id
       ~epoch_id:request.epoch_id
       ~epoch_ts:request.epoch_ts
       ~proposer_addr:request.proposer_addr

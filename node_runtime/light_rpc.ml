@@ -99,7 +99,7 @@ let account_witness ~chain_id ~addr h value =
               ~public_key:a.Ledger.public_key
               ~encrypted_balance:a.Ledger.encrypted_balance
               ~decrypt_allowance:(Z.to_string a.Ledger.decrypt_allowance) in
-          if Octra_consensus.C_light_account.verify proof then
+          if Octra_consensus.C_light_account.witness_ok proof then
             Ok (Rpc_view.account_witness ~inclusion:true proof)
           else
             Error "invalid account witness"
@@ -170,18 +170,20 @@ let collect_epoch_tx_hashes read_tx ~epoch_id ~start_txid ~tx_count =
   in
   collect 0 []
 
-let epoch_proof_of_header ~chain_id h tx_hashes =
+let epoch_proof_of_header
+    ~chain_id
+    ~prev_epoch_index_root
+    ~epoch_index_root
+    h
+    tx_hashes =
   let proof = Octra_consensus.C_light_epoch.{
     chain_id;
     epoch_id = Int64.of_int h.Octra_core.Epochlog.id;
-    prev_state_root = String.lowercase_ascii h.prev_state_root;
-    state_root = String.lowercase_ascii h.state_root;
-    tx_list_hash = Octra_consensus.C_light_epoch.tx_list_hash_hex tx_hashes;
     tx_hashes;
     start_txid = h.start_txid;
     tx_count = h.tx_count;
-    proposer = h.proposer.creator_addr;
-    commit_round = h.proposer.commit_round;
+    prev_epoch_index_root;
+    epoch_index_root;
   } in
   if Octra_consensus.C_light_epoch.verify proof then Ok proof
   else Error "epoch proof verification failed"
@@ -190,16 +192,37 @@ let epoch_proof ~chain_id chaindata eid =
   match Octra_core.Store_chaindata.get_bound_epoch_header chaindata eid with
   | Error e -> Error e
   | Ok h ->
-    let tx_hashes =
-      collect_epoch_tx_hashes
-        (Octra_core.Store_chaindata.read_tx_at_txid chaindata)
-        ~epoch_id:eid
-        ~start_txid:h.start_txid
-        ~tx_count:h.tx_count
+    let _, epoch_index_root =
+      Octra_core.Store_chaindata.get_epoch_index_commitment chaindata eid in
+    let prev_epoch_index_root =
+      if eid = 0 then
+        Some Octra_core.Epoch_index_commitment.genesis_root
+      else
+        Octra_core.Store_chaindata.get_epoch_index_commitment chaindata (eid - 1)
+        |> snd
     in
-    match tx_hashes with
-    | None -> Error "epoch tx list incomplete"
-    | Some tx_hashes -> epoch_proof_of_header ~chain_id h tx_hashes
+    begin
+      match prev_epoch_index_root, epoch_index_root with
+      | None, _ -> Error "previous epoch index root missing"
+      | _, None -> Error "epoch index root missing"
+      | Some prev_epoch_index_root, Some epoch_index_root ->
+        let tx_hashes =
+          collect_epoch_tx_hashes
+            (Octra_core.Store_chaindata.read_tx_at_txid chaindata)
+            ~epoch_id:eid
+            ~start_txid:h.start_txid
+            ~tx_count:h.tx_count
+        in
+        match tx_hashes with
+        | None -> Error "epoch tx list incomplete"
+        | Some tx_hashes ->
+          epoch_proof_of_header
+            ~chain_id
+            ~prev_epoch_index_root
+            ~epoch_index_root
+            h
+            tx_hashes
+    end
 
 let epoch_proof_params ~chain_id chaindata params =
   match epoch_proof_id params with
@@ -224,7 +247,7 @@ let tx_inclusion_of_epoch ~tx_hash epoch =
   | None -> Error "transaction not present in epoch proof"
   | Some index ->
     let proof = Octra_consensus.C_light_epoch.{ epoch; tx_hash; index } in
-    if Octra_consensus.C_light_epoch.verify_tx_inclusion proof then Ok proof
+    if Octra_consensus.C_light_epoch.tx_position_ok proof then Ok proof
     else Error "tx inclusion verification failed"
 
 let tx_inclusion_proof ~chain_id chaindata tx_hash =

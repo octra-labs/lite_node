@@ -193,6 +193,12 @@ module FheBalance = struct
     try Ok (Pvac_ffi.deserialize_pubkey (Bytes.of_string blob))
     with e -> Error (Printf.sprintf "load_pubkey failed: %s" (Printexc.to_string e))
 
+  let pubkey_supports_alias_rejection pk =
+    Pvac_ffi.pubkey_supports_alias_rejection pk
+
+  let blob_supports_alias_rejection blob =
+    Result.map pubkey_supports_alias_rejection (load_pubkey_result blob)
+
   let cipher_base_layers cipher_str =
     if cipher_str = "0" || cipher_str = "" then Ok 0
     else

@@ -278,6 +278,19 @@ def wait_scheduled(values, wallet, args):
         time.sleep(args.poll_seconds)
     raise ValidatorError("validator selection timed out")
 
+def wait_active_commit(values, wallet, state, args):
+    if state["scheduled"] or not state["active"]:
+        return state
+    initial_head, _ = node_status(local_rpc(values))
+    deadline = time.monotonic() + args.wait_seconds
+    while time.monotonic() < deadline:
+        current = membership(values, wallet)
+        head, _ = node_status(local_rpc(values))
+        if current["active"] and head > initial_head:
+            return current
+        time.sleep(args.poll_seconds)
+    raise ValidatorError("validator activation commit timed out")
+
 def set_validator_mode(config, values, state, restart):
     if not state["active"] and not state["scheduled"]:
         raise ValidatorError("validator is not active or scheduled")
@@ -293,7 +306,11 @@ def set_validator_mode(config, values, state, restart):
         activate_epoch=state["activate_epoch"],
     )
     if restart:
-        subprocess.run([str(ROOT / "controls/run.sh")], cwd=ROOT, check=True)
+        subprocess.run(
+            ["sh", str(ROOT / "controls/run.sh")],
+            cwd=ROOT,
+            check=True,
+        )
 
 def transaction_status(url, tx_hash):
     value = transaction(url, tx_hash)
@@ -415,6 +432,7 @@ def main():
             if not resume_join_transaction(args.config, values, "ready", args):
                 submit_ready(args.config, values, wallet, wallet_path, args)
             state = wait_scheduled(values, wallet, args)
+        state = wait_active_commit(values, wallet, state, args)
         set_validator_mode(
             args.config,
             values,

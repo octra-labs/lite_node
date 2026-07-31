@@ -4,14 +4,11 @@
 type t = {
   chain_id : string;
   epoch_id : int64;
-  prev_state_root : string;
-  state_root : string;
-  tx_list_hash : string;
   tx_hashes : string list;
   start_txid : int64;
   tx_count : int;
-  proposer : string;
-  commit_round : int;
+  prev_epoch_index_root : string;
+  epoch_index_root : string;
 }
 
 type tx_inclusion = {
@@ -27,14 +24,13 @@ let is_hex_char = function
 let hex64 s =
   String.length s = 64 && String.for_all is_hex_char s
 
-let raw_to_hex s =
-  String.concat "" (List.init (String.length s) (fun i ->
-    Printf.sprintf "%02x" (Char.code s.[i])))
-
-let tx_list_hash_hex tx_hashes =
-  tx_hashes
-  |> C_engine.tx_list_hash_for_header
-  |> raw_to_hex
+let computed_epoch_index_root t =
+  Octra_net.Epoch_index_commitment.next_root_from_hashes_i64
+    ~prev:t.prev_epoch_index_root
+    ~epoch_id:t.epoch_id
+    ~start_txid:t.start_txid
+    t.tx_hashes
+  |> snd
 
 let sane t =
   t.chain_id <> ""
@@ -42,22 +38,32 @@ let sane t =
   && Int64.compare t.start_txid 0L >= 0
   && t.tx_count >= 0
   && List.length t.tx_hashes = t.tx_count
-  && hex64 t.prev_state_root
-  && hex64 t.state_root
-  && hex64 t.tx_list_hash
   && List.for_all hex64 t.tx_hashes
-  && t.commit_round >= 0
+  && hex64 t.prev_epoch_index_root
+  && hex64 t.epoch_index_root
 
 let verify t =
-  sane t && String.lowercase_ascii t.tx_list_hash = tx_list_hash_hex t.tx_hashes
+  sane t
+  && String.lowercase_ascii t.epoch_index_root = computed_epoch_index_root t
 
 let verify_chain_step ~prev t =
   verify prev
   && verify t
   && Int64.succ prev.epoch_id = t.epoch_id
-  && String.lowercase_ascii t.prev_state_root = String.lowercase_ascii prev.state_root
+  && t.chain_id = prev.chain_id
+  && String.lowercase_ascii t.prev_epoch_index_root =
+     String.lowercase_ascii prev.epoch_index_root
 
-let verify_tx_inclusion proof =
+let same a b =
+  a.chain_id = b.chain_id
+  && a.epoch_id = b.epoch_id
+  && a.tx_hashes = b.tx_hashes
+  && a.start_txid = b.start_txid
+  && a.tx_count = b.tx_count
+  && a.prev_epoch_index_root = b.prev_epoch_index_root
+  && a.epoch_index_root = b.epoch_index_root
+
+let tx_position_ok proof =
   verify proof.epoch
   && proof.index >= 0
   && proof.index < proof.epoch.tx_count

@@ -14,6 +14,7 @@ type pre_state = {
 }
 
 type node_env = {
+  chain_id : string;
   current_epoch : unit -> int;
   epoch_ts : int -> float option;
   driver : unit -> Octra_consensus.C_driver.t option;
@@ -36,6 +37,7 @@ val current_validator_pubkeys :
   (string * string) list
 
 val standard :
+  chain_id:string ->
   epoch_id:int ->
   proposer_addr:string ->
   validator_pubkeys:(string * string) list ->

@@ -1,28 +1,19 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-let minimum_ms = 10_000
+let minimum_ms =
+  Int64.to_int Octra_consensus.Epoch_time.interval_ms
 let maximum_ms = 30_000
 let round_step_ms = 2_000
 
 let clamp_ms value =
   max minimum_ms (min maximum_ms value)
 
-let minimum_ms_of env =
-  match env "OCTRA_EPOCH_DURATION" with
-  | None -> minimum_ms
-  | Some raw ->
-    try
-      float_of_string raw
-      *. 1000.
-      |> Float.round
-      |> int_of_float
-      |> clamp_ms
-    with _ ->
-      minimum_ms
+let minimum_ms_of _ =
+  minimum_ms
 
-let minimum_seconds_of env =
-  float_of_int (minimum_ms_of env) /. 1000.
+let minimum_seconds_of _ =
+  Octra_consensus.Epoch_time.interval_seconds
 
 let duration_ms ~minimum_ms:configured ~commit_round =
   let base = clamp_ms configured in

@@ -249,33 +249,32 @@ let validator_set json =
 let epoch json =
   let* chain_id = str "chain_id" json in
   let* epoch_id = i64 "epoch_id" json in
-  let* prev_state_root = str "prev_state_root" json in
-  let* state_root = str "state_root" json in
-  let* tx_list_hash = str "tx_list_hash" json in
   let* tx_hashes = list "tx_hashes" (function
     | `String s -> Ok (String.lowercase_ascii s)
     | _ -> Error "tx hash string expected") json in
   let* start_txid = i64 "start_txid" json in
   let* tx_count = intv "tx_count" json in
-  let* proposer = str "proposer" json in
-  let* commit_round = intv "commit_round" json in
+  let* prev_epoch_index_root =
+    str "prev_epoch_index_root" json in
+  let* epoch_index_root_text =
+    str "epoch_index_root" json in
   Ok C_light_epoch.{
     chain_id;
     epoch_id;
-    prev_state_root = String.lowercase_ascii prev_state_root;
-    state_root = String.lowercase_ascii state_root;
-    tx_list_hash = String.lowercase_ascii tx_list_hash;
     tx_hashes;
     start_txid;
     tx_count;
-    proposer;
-    commit_round;
+    prev_epoch_index_root = String.lowercase_ascii prev_epoch_index_root;
+    epoch_index_root = String.lowercase_ascii epoch_index_root_text;
   }
 
 let epoch_proof json =
-  let* () = version "octra-epoch-proof-v1" json in
-  let* inner = field "epoch" json in
-  epoch inner
+  let* proof_kind = str "proof_kind" json in
+  if proof_kind <> "epoch_inclusion" then
+    Error ("proof kind mismatch: " ^ proof_kind)
+  else
+    let* inner = field "epoch" json in
+    epoch inner
 
 let account json =
   let* proof_kind = str "proof_kind" json in

@@ -887,7 +887,7 @@ let epoch_transactions_page_response ~epoch_id ~expected_confirmed_count ~offset
     "rejected_count", `Int rejected_count;
     "offset", `Int offset;
     "limit", `Int limit;
-    "has_more", `Bool (confirmed_count = limit);
+    "has_more", `Bool (confirmed_count = limit || rejected_count = limit);
     "transactions", `List transactions;
     "rejected", `List rejected;
   ]

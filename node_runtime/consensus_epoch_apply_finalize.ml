@@ -12,6 +12,7 @@ type effects = {
 
 type input = {
   tree_ref : Octra_core.Tree.t ref;
+  chain_id : string;
   epoch_id : int;
   epoch_ts : float;
   epoch_start : float;
@@ -81,6 +82,7 @@ let run effects input =
     Footer.run_node
       effects.footer
       {
+        chain_id = input.chain_id;
         epoch_id = input.epoch_id;
         epoch_ts = input.epoch_ts;
         proposer_addr = input.proposer_addr;

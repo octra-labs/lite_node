@@ -40,7 +40,6 @@ NETWORK_KEYS = frozenset({
     "OCTRA_CONSENSUS_CONFIG_HASH",
     "OCTRA_EMISSION_ACTIVATION_EPOCH",
     "OCTRA_EMISSION_PROFILE",
-    "OCTRA_EPOCH_DURATION",
     "OCTRA_FHE_MAX_PER_EPOCH",
     "OCTRA_MULTI_EXEC_MAX_CALLS",
     "OCTRA_P2P_REQUIRE_BINARY_HASH",
@@ -100,7 +99,6 @@ REQUIRED_KEYS = frozenset({
     "OCTRA_CHECKPOINT_TXID_HI",
     "OCTRA_CONSENSUS_CONFIG_HASH",
     "OCTRA_EMISSION_ACTIVATION_EPOCH",
-    "OCTRA_EPOCH_DURATION",
     "OCTRA_FHE_MAX_PER_EPOCH",
     "OCTRA_P2P_REQUIRE_BINARY_HASH",
     "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH",
@@ -391,8 +389,6 @@ def validate_network(values, bundle_dir):
         raise ValidatorError("first quorum run requires one FHE operation per epoch")
     if values["OCTRA_STEALTH_MAX_PER_EPOCH"] != "1":
         raise ValidatorError("first quorum run requires one stealth operation per epoch")
-    if values["OCTRA_EPOCH_DURATION"] != "10":
-        raise ValidatorError("first quorum run requires a ten second minimum cadence")
     activation = nonnegative_int(values, "OCTRA_EMISSION_ACTIVATION_EPOCH")
     nonnegative_int(values, "OCTRA_CHECKPOINT_EPOCH")
     nonnegative_int(values, "OCTRA_CHECKPOINT_TXID_HI")

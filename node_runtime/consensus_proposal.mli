@@ -204,6 +204,7 @@ type make_proposal_deps = {
   head_txid_hi : unit -> int64 option;
   freeze : string -> Consensus_bundle_cache.frozen -> unit;
   now : unit -> float;
+  previous_epoch_ts : int64 -> float option;
 }
 
 type verify_proposal_deps = {
@@ -273,7 +274,7 @@ type verify_proposal_deps = {
 
 type before_precommit_deps = {
   chain_id : string;
-  validator_set : Octra_consensus.C_types.validator_set;
+  validator_set : unit -> Octra_consensus.C_types.validator_set;
   current_tx_hashes : unit -> string list;
   cached_bundle : string -> Consensus_bundle_cache.encoded option;
   sync_bundle :

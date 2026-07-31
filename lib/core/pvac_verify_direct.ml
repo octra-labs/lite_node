@@ -4,6 +4,13 @@
 module FB = Crypto.FheBalance
 module P = Pvac_verify_protocol
 
+let proof_pubkey blob =
+  match FB.load_pubkey_result blob with
+  | Error error -> Error error
+  | Ok pubkey when not (FB.pubkey_supports_alias_rejection pubkey) ->
+    Error "pvac pubkey proof circuit lacks alias rejection"
+  | Ok pubkey -> Ok pubkey
+
 let decode_commitment encoded =
   try
     let value = Base64.decode_exn encoded |> Bytes.of_string in
@@ -72,7 +79,7 @@ let verify_circle_cell (value : P.circle_cell) =
     Error "proof exceeds verifier resource policy"
   else
     match
-      FB.load_pubkey_result value.pubkey,
+      proof_pubkey value.pubkey,
       FB.decode_cipher value.cipher,
       decode_commitment value.ciphertext_commitment
     with
@@ -100,7 +107,7 @@ let execute request =
     Ok ()
   | P.Encrypt value ->
     begin
-      match FB.load_pubkey_result value.pubkey with
+      match proof_pubkey value.pubkey with
       | Error error -> Error error
       | Ok pubkey ->
         FB.verify_encrypt_proof
@@ -113,7 +120,7 @@ let execute request =
     end
   | P.Claim value ->
     begin
-      match FB.load_pubkey_result value.pubkey with
+      match proof_pubkey value.pubkey with
       | Error error -> Error error
       | Ok pubkey ->
         FB.verify_claim_amount_v5
@@ -124,7 +131,7 @@ let execute request =
     end
   | P.Key_switch_claim value ->
     begin
-      match FB.load_pubkey_result value.pubkey with
+      match proof_pubkey value.pubkey with
       | Error error -> Error error
       | Ok pubkey ->
         FB.verify_key_switch_claim_amount
@@ -135,7 +142,7 @@ let execute request =
     end
   | P.Range value ->
     begin
-      match FB.load_pubkey_result value.pubkey with
+      match proof_pubkey value.pubkey with
       | Error error -> Error error
       | Ok pubkey ->
         if FB.verify_range pubkey value.cipher value.proof then Ok ()
@@ -143,7 +150,7 @@ let execute request =
     end
   | P.Zero value ->
     begin
-      match FB.load_pubkey_result value.pubkey with
+      match proof_pubkey value.pubkey with
       | Error error -> Error error
       | Ok pubkey ->
         if FB.verify_zero pubkey value.cipher value.proof then Ok ()
@@ -152,7 +159,7 @@ let execute request =
   | P.Range_bound value ->
     begin
       match
-        FB.load_pubkey_result value.pubkey,
+        proof_pubkey value.pubkey,
         FB.decode_cipher value.cipher
       with
       | Error error, _ -> Error error

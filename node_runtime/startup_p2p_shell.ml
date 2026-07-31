@@ -25,7 +25,7 @@ type deps = {
   getenv : string -> string option;
   info : string -> unit;
   warn : string -> unit;
-  current_epoch : unit -> int;
+  current_height : unit -> int64;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
@@ -37,7 +37,7 @@ type node_request = {
   getenv : string -> string option;
   info : string -> unit;
   warn : string -> unit;
-  current_epoch : unit -> int;
+  current_height : unit -> int64;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
@@ -84,7 +84,6 @@ type node_start_runtime = {
   info : string -> unit;
   warn : string -> unit;
   fatal : string -> unit;
-  current_epoch : unit -> int;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
@@ -131,7 +130,7 @@ let install_refs ~consensus_config_hash ~consensus_validator_set
   }
 
 let current_height (deps : deps) =
-  Int64.of_int (deps.current_epoch ())
+  deps.current_height ()
 
 let best_root (deps : deps) =
   match deps.read_head_hash () with
@@ -178,7 +177,7 @@ let deps_of_request (request : node_request) =
     getenv = request.getenv;
     info = request.info;
     warn = request.warn;
-    current_epoch = request.current_epoch;
+    current_height = request.current_height;
     read_active_validator_meta = request.read_active_validator_meta;
     read_pending_validator_meta = request.read_pending_validator_meta;
     read_head_hash = request.read_head_hash;
@@ -230,7 +229,7 @@ let request_of_runtime runtime =
     getenv = runtime.getenv;
     info = runtime.info;
     warn = runtime.warn;
-    current_epoch = runtime.current_epoch;
+    current_height = runtime.current_height;
     read_active_validator_meta = runtime.read_active_validator_meta;
     read_pending_validator_meta = runtime.read_pending_validator_meta;
     read_head_hash = runtime.read_head_hash;

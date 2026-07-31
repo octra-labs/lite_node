@@ -22,8 +22,8 @@ type read_ctx = {
   program_trust_hash : string option;
   runtime_profile_hash : string option;
   validator_view_pub : string;
-  validator_set : Octra_consensus.C_types.validator_set;
-  scheduled_validator_set : Octra_consensus.C_config.scheduled option;
+  validator_set_ref : Octra_consensus.C_types.validator_set ref;
+  scheduled_validator_set_ref : Octra_consensus.C_config.scheduled option ref;
   current_epoch : int ref;
   total_tx_count : int ref;
   encrypted : unit -> Z.t;
@@ -70,35 +70,10 @@ let signed_root signer head =
     | Ok root ->
       ok root
 
-let active_validator_set ~driver_ref ~fallback =
-  match !driver_ref with
-  | None ->
-    fallback
-  | Some driver ->
-    driver.Octra_consensus.C_driver.engine.Octra_consensus.C_engine.vs
-
-let active_scheduled_validator_set ~driver_ref ~fallback =
-  match !driver_ref with
-  | None ->
-    fallback
-  | Some driver ->
-    match driver.Octra_consensus.C_driver.config.scheduled_validator_set_config with
-    | None ->
-      fallback
-    | Some cfg ->
-      Some Octra_consensus.C_config.{
-        activate_epoch = cfg.Octra_consensus.C_driver.activate_epoch;
-        validator_set = cfg.validator_set;
-      }
-
 let current_validator_config ~chain_id ~program_trust_hash
-    ~runtime_profile_hash ~driver_ref ~validator_set ~scheduled_validator_set =
-  let validator_set = active_validator_set ~driver_ref ~fallback:validator_set in
-  let scheduled =
-    active_scheduled_validator_set
-      ~driver_ref
-      ~fallback:scheduled_validator_set
-  in
+    ~runtime_profile_hash ~validator_set_ref ~scheduled_validator_set_ref =
+  let validator_set = !validator_set_ref in
+  let scheduled = !scheduled_validator_set_ref in
   let config_hash =
     Octra_consensus.C_config.hash
       ~chain_id
@@ -111,15 +86,14 @@ let current_validator_config ~chain_id ~program_trust_hash
   validator_set, scheduled, config_hash
 
 let validator_set_proof ~chain_id ~program_trust_hash
-    ~runtime_profile_hash ~driver_ref ~validator_set ~scheduled_validator_set =
+    ~runtime_profile_hash ~validator_set_ref ~scheduled_validator_set_ref =
   let validator_set, scheduled, config_hash =
     current_validator_config
       ~chain_id
       ~program_trust_hash
       ~runtime_profile_hash
-      ~driver_ref
-      ~validator_set
-      ~scheduled_validator_set
+      ~validator_set_ref
+      ~scheduled_validator_set_ref
   in
   Lwt.return
     (Status_rpc.validator_set_proof
@@ -191,9 +165,8 @@ let signer_of_ctx ctx =
       ~chain_id:ctx.chain_id
       ~program_trust_hash:ctx.program_trust_hash
       ~runtime_profile_hash:ctx.runtime_profile_hash
-      ~driver_ref:ctx.driver_ref
-      ~validator_set:ctx.validator_set
-      ~scheduled_validator_set:ctx.scheduled_validator_set
+      ~validator_set_ref:ctx.validator_set_ref
+      ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
   in
   signer
     ~chain_id:ctx.chain_id
@@ -230,9 +203,8 @@ let validator_set_proof_params _params ctx =
     ~chain_id:ctx.chain_id
     ~program_trust_hash:ctx.program_trust_hash
     ~runtime_profile_hash:ctx.runtime_profile_hash
-    ~driver_ref:ctx.driver_ref
-    ~validator_set:ctx.validator_set
-    ~scheduled_validator_set:ctx.scheduled_validator_set
+    ~validator_set_ref:ctx.validator_set_ref
+    ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
 
 let epoch_proof_params params ctx =
   Light_rpc.epoch_proof_params ~chain_id:ctx.chain_id ctx.chaindata params

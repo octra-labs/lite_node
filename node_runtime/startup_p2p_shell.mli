@@ -25,7 +25,7 @@ type deps = {
   getenv : string -> string option;
   info : string -> unit;
   warn : string -> unit;
-  current_epoch : unit -> int;
+  current_height : unit -> int64;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
@@ -37,7 +37,7 @@ type node_request = {
   getenv : string -> string option;
   info : string -> unit;
   warn : string -> unit;
-  current_epoch : unit -> int;
+  current_height : unit -> int64;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
@@ -84,7 +84,6 @@ type node_start_runtime = {
   info : string -> unit;
   warn : string -> unit;
   fatal : string -> unit;
-  current_epoch : unit -> int;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;

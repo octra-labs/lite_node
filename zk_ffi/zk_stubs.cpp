@@ -18,7 +18,7 @@ constexpr size_t MAGIC_SIZE = 6;
 constexpr size_t VK_HEADER_SIZE = MAGIC_SIZE + 4;
 constexpr size_t VK_FIXED_SIZE = VK_HEADER_SIZE + G1_SIZE + 3 * G2_SIZE;
 constexpr size_t PROOF_SIZE = MAGIC_SIZE + G1_SIZE + G2_SIZE + G1_SIZE;
-constexpr uint32_t MAX_N_PUBLIC = 1024;
+constexpr uint32_t MAX_N_PUBLIC = 32;
 constexpr size_t SCRATCH_SIZE = 128;
 
 constexpr int IO_BE = MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN;

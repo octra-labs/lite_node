@@ -45,6 +45,7 @@ external cipher_base_layers : cipher -> int = "caml_pvac_cipher_base_layers"
 external cipher_shape : cipher -> cipher_shape = "caml_pvac_cipher_shape"
 external cipher_is_wrapped_scalar : cipher -> bool = "caml_pvac_cipher_is_wrapped_scalar"
 external pubkey_is_key_bound_extension : pubkey -> pubkey -> bool = "caml_pvac_pubkey_is_key_bound_extension"
+external pubkey_supports_alias_rejection : pubkey -> bool = "caml_pvac_pubkey_supports_alias_rejection"
 external cipher_is_key_bound_extension : cipher -> cipher -> bool = "caml_pvac_cipher_is_key_bound_extension"
 
 external make_zero_proof : pubkey -> seckey -> cipher -> zero_proof = "caml_pvac_make_zero_proof"

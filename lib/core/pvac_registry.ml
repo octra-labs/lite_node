@@ -85,6 +85,8 @@ let load_pubkey raw =
 let canonicalize_blob raw =
   match load_pubkey raw with
   | Error e -> Error e
+  | Ok pk when not (FB.pubkey_supports_alias_rejection pk) ->
+    Error "pvac pubkey proof circuit lacks alias rejection"
   | Ok pk -> Ok (Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
 
 let status_of_blob ~canonical_binding = function

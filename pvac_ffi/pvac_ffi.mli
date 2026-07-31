@@ -45,6 +45,7 @@ val cipher_base_layers : cipher -> int
 val cipher_shape : cipher -> cipher_shape
 val cipher_is_wrapped_scalar : cipher -> bool
 val pubkey_is_key_bound_extension : pubkey -> pubkey -> bool
+val pubkey_supports_alias_rejection : pubkey -> bool
 val cipher_is_key_bound_extension : cipher -> cipher -> bool
 
 val make_zero_proof : pubkey -> seckey -> cipher -> zero_proof

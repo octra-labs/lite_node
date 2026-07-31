@@ -3,6 +3,8 @@
 
 val client_progress_body_cap : int
 
+val chunk_read_limit : string option -> int
+
 val read_body :
   Cohttp_lwt.Body.t ->
   (string, string) result Lwt.t

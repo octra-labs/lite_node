@@ -15,6 +15,7 @@ type pre_state = {
 }
 
 type node_env = {
+  chain_id : string;
   current_epoch : unit -> int;
   epoch_ts : int -> float option;
   driver : unit -> Octra_consensus.C_driver.t option;
@@ -49,6 +50,7 @@ let current_validator_pubkeys env =
     ~fallback:(fun () -> env.validator_fallback (env.current_epoch ()))
 
 let standard
+    ~chain_id
     ~epoch_id
     ~proposer_addr
     ~validator_pubkeys
@@ -56,7 +58,7 @@ let standard
     ~ready_state_root_at
     ~ready_max_lag =
   Epoch_exec.{
-    chain_id = "";
+    chain_id;
     epoch_id;
     proposer_addr;
     validator_addrs = List.map fst validator_pubkeys;
@@ -70,6 +72,7 @@ let standard
 let standard_for_proposer env ~proposer_addr ~prev_state_root =
   let epoch_id = env.current_epoch () in
   standard
+    ~chain_id:env.chain_id
     ~epoch_id
     ~proposer_addr
     ~validator_pubkeys:(current_validator_pubkeys env)

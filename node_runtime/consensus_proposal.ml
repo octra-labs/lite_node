@@ -204,6 +204,7 @@ type make_proposal_deps = {
   head_txid_hi : unit -> int64 option;
   freeze : string -> Consensus_bundle_cache.frozen -> unit;
   now : unit -> float;
+  previous_epoch_ts : int64 -> float option;
 }
 
 type verify_proposal_deps = {
@@ -271,7 +272,7 @@ type verify_proposal_deps = {
 
 type before_precommit_deps = {
   chain_id : string;
-  validator_set : Octra_consensus.C_types.validator_set;
+  validator_set : unit -> Octra_consensus.C_types.validator_set;
   current_tx_hashes : unit -> string list;
   cached_bundle : string -> Consensus_bundle_cache.encoded option;
   sync_bundle :
@@ -1228,7 +1229,7 @@ let handle_before_precommit deps ~epoch_id ~round ~proposal_id
     (match
        precommit_record_matches
          ~chain_id:deps.chain_id
-         ~validator_set:deps.validator_set
+         ~validator_set:(deps.validator_set ())
          ~epoch_id
          ~round
          ~proposal_id
@@ -1693,6 +1694,24 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
   | Proposal_defer ->
     Lwt.return_none
   | Proposal_admit ->
+    let now = deps.now () in
+    let delay_ms =
+      if epoch_id <= 0L then
+        0L
+      else
+        match deps.previous_epoch_ts (Int64.pred epoch_id) with
+        | Some previous ->
+          Octra_consensus.Epoch_time.next_delay_ms ~now ~previous
+        | None ->
+          Octra_consensus.Epoch_time.interval_ms
+    in
+    if delay_ms > 0L then begin
+      Octra_log.info "consensus"
+        "defer proposal reason = epoch_time epoch = %Ld delay_ms = %Ld"
+        epoch_id
+        delay_ms;
+      Lwt.return_none
+    end else
     begin
       match deps.parent_commit ~epoch_id with
       | Error reason ->

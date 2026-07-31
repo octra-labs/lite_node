@@ -25,13 +25,22 @@ from validator_common import validate_network
 from validator_common import write_env
 from validator_config import operator_pm2_name
 from validator_config import build_candidate
+from validator_config import CARGO_HOME
+from validator_config import OPAM_ROOT
 from validator_config import ROOT as CONFIG_ROOT
+from validator_config import RUSTUP_HOME
+from validator_config import TOOLCHAIN_ROOT
+from validator_config import rust_environment
 from validator_config import tool_version
 from validator_config import install_verified_snapshot
+from validator_config import install_runtime
 from validator_config import load_verified_snapshot
 from validator_config import maybe_sync
 from validator_config import parser
+from validator_config import pm2_service_enabled
 from validator_config import resolve_sync_stage
+from validator_config import resource_report
+from validator_config import require_validator_membership
 from validator_config import validate_advertise
 from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
@@ -39,6 +48,8 @@ from validator_enroll import exact_member
 from validator_enroll import next_nonce
 from validator_enroll import require_admission_active
 from validator_enroll import resume_join_transaction
+from validator_enroll import set_validator_mode
+from validator_enroll import wait_active_commit
 from validator_guard import require_hashed_file
 from validator_process import process_plan
 from validator_process import process_pids
@@ -50,8 +61,8 @@ from validator_status import promotion_readiness
 from validator_state_sync_source import disable_source
 from validator_state_sync_source import enable_source
 
-TMP_ROOT = CONFIG_ROOT / "tmp"
-WORK = TMP_ROOT / "validator_tools_test"
+RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
+WORK = RUNTIME_DATA_ROOT / "validator_tools_test"
 
 def identity():
     key = SigningKey.generate()
@@ -75,7 +86,6 @@ def network_values(entitlement):
         "OCTRA_CHECKPOINT_TXID_HI": "500",
         "OCTRA_CONSENSUS_CONFIG_HASH": "4" * 64,
         "OCTRA_EMISSION_ACTIVATION_EPOCH": "100",
-        "OCTRA_EPOCH_DURATION": "10",
         "OCTRA_FHE_MAX_PER_EPOCH": "1",
         "OCTRA_P2P_REQUIRE_BINARY_HASH": "0",
         "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH": "100",
@@ -111,9 +121,9 @@ class ValidatorToolsTest(unittest.TestCase):
     def tearDown(self):
         if WORK.exists():
             shutil.rmtree(WORK)
-        if TMP_ROOT.exists():
+        if RUNTIME_DATA_ROOT.exists():
             try:
-                TMP_ROOT.rmdir()
+                RUNTIME_DATA_ROOT.rmdir()
             except OSError:
                 pass
 
@@ -123,6 +133,64 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(len(wallet["address"]), 47)
         self.assertEqual(os.stat(wallet_path).st_mode & 0o777, 0o600)
         self.assertEqual(ensure_wallet(wallet_path), wallet)
+
+    def test_validator_accepts_one_tb_disk(self):
+        usage = mock.Mock(
+            total=900 * 1000 ** 3,
+            free=500 * 1000 ** 3,
+        )
+        with mock.patch("validator_config.os.cpu_count", return_value=8):
+            with mock.patch(
+                "validator_config.memory_bytes",
+                return_value=31 * 1024 ** 3,
+            ):
+                with mock.patch(
+                    "validator_config.shutil.disk_usage",
+                    return_value=usage,
+                ):
+                    resource_report(WORK, "validator")
+
+    def test_validator_rejects_smaller_disk(self):
+        usage = mock.Mock(
+            total=899 * 1000 ** 3,
+            free=500 * 1000 ** 3,
+        )
+        with mock.patch("validator_config.os.cpu_count", return_value=8):
+            with mock.patch(
+                "validator_config.memory_bytes",
+                return_value=31 * 1024 ** 3,
+            ):
+                with mock.patch(
+                    "validator_config.shutil.disk_usage",
+                    return_value=usage,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidatorError,
+                        "1 TB class disk",
+                    ):
+                        resource_report(WORK, "validator")
+
+    def test_validator_accepts_active_on_chain_identity(self):
+        require_validator_membership(
+            "validator",
+            {"active": True, "scheduled": False},
+        )
+
+    def test_validator_accepts_scheduled_on_chain_identity(self):
+        require_validator_membership(
+            "validator",
+            {"active": False, "scheduled": True},
+        )
+
+    def test_validator_rejects_unselected_identity(self):
+        with self.assertRaisesRegex(
+            ValidatorError,
+            "not active or scheduled",
+        ):
+            require_validator_membership(
+                "validator",
+                {"active": False, "scheduled": False},
+            )
 
     def test_network_bundle_round_trip(self):
         bundle = WORK / "network.env"
@@ -387,6 +455,48 @@ class ValidatorToolsTest(unittest.TestCase):
         ):
             require_admission_active(values)
 
+    def test_validator_mode_runs_control_through_shell(self):
+        config = WORK / "node.env"
+        values = {"OCTRA_OPERATOR_ROLE": "observer"}
+        state = {
+            "active": True,
+            "scheduled": False,
+            "activate_epoch": 100,
+        }
+        with mock.patch("validator_enroll.subprocess.run") as invoke:
+            set_validator_mode(config, values, state, True)
+        invoke.assert_called_once_with(
+            ["sh", str(CONFIG_ROOT / "controls/run.sh")],
+            cwd=CONFIG_ROOT,
+            check=True,
+        )
+        self.assertEqual(parse_env(config)["OCTRA_OPERATOR_ROLE"], "validator")
+
+    def test_active_validator_waits_for_committed_head(self):
+        values = {"OCTRA_API_PORT": "8080"}
+        wallet = {"address": identity()[0], "pub": identity()[1]}
+        state = {
+            "active": True,
+            "scheduled": False,
+            "activate_epoch": 100,
+        }
+        args = mock.Mock(wait_seconds=1, poll_seconds=0.1)
+        with mock.patch(
+            "validator_enroll.node_status",
+            side_effect=[(100, "a" * 64), (101, "b" * 64)],
+        ), mock.patch(
+            "validator_enroll.membership",
+            return_value=state,
+        ), mock.patch(
+            "validator_enroll.time.monotonic",
+            side_effect=[0.0, 0.0],
+        ), mock.patch("validator_enroll.time.sleep") as pause:
+            self.assertEqual(
+                wait_active_commit(values, wallet, state, args),
+                state,
+            )
+        pause.assert_not_called()
+
     def test_join_resumes_confirmed_transaction(self):
         config = WORK / "node.env"
         config.write_text("", encoding="utf-8")
@@ -535,6 +645,66 @@ class ValidatorToolsTest(unittest.TestCase):
         script = script_path.read_text(encoding="utf-8")
         self.assertIn("OCTRA_DATA_ROOT", script)
         self.assertIn('run_root install -d -m 700 -o "$OPERATOR_USER"', script)
+        self.assertIn('TOOLCHAIN_ROOT="$ROOT/runtime_data/toolchains"', script)
+        self.assertIn('CARGO_HOME="$TOOLCHAIN_ROOT/cargo"', script)
+        self.assertIn('RUSTUP_HOME="$TOOLCHAIN_ROOT/rustup"', script)
+        self.assertIn('env -C "$ROOT"', script)
+        self.assertIn('if ! command -v pm2', script)
+        self.assertIn('systemctl is-enabled --quiet "$PM2_SERVICE"', script)
+        self.assertNotIn("pm2-logrotate", script)
+        self.assertNotIn("pm2 install", script)
+        self.assertNotIn("pm2 save --force", script)
+
+    def test_pm2_service_enabled_reads_systemd(self):
+        probe = subprocess.CompletedProcess([], 0)
+        with mock.patch("validator_config.subprocess.run", return_value=probe) as run:
+            self.assertTrue(pm2_service_enabled("octra"))
+        self.assertEqual(
+            run.call_args.args[0],
+            ["systemctl", "is-enabled", "--quiet", "pm2-octra.service"],
+        )
+        self.assertFalse(run.call_args.kwargs["check"])
+
+    def test_install_runtime_preserves_existing_pm2(self):
+        account = mock.Mock(pw_dir="/home/octra")
+        with mock.patch("validator_config.ubuntu_host", return_value=True):
+            with mock.patch("validator_config.install_rust_toolchain"):
+                with mock.patch("validator_config.shutil.which", return_value="/usr/local/bin/pm2"):
+                    with mock.patch("validator_config.pm2_service_enabled", return_value=True):
+                        with mock.patch("validator_config.pwd.getpwnam", return_value=account):
+                            with mock.patch("validator_config.os.geteuid", return_value=0):
+                                with mock.patch.dict(
+                                    "validator_config.os.environ",
+                                    {"USER": "octra"},
+                                    clear=True,
+                                ):
+                                    with mock.patch("validator_config.run") as run:
+                                        install_runtime()
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0], ["apt-get", "update"])
+        self.assertEqual(commands[1][:3], ["apt-get", "install", "-y"])
+        self.assertFalse(any(command[0] == "npm" for command in commands))
+        self.assertFalse(any("startup" in command for command in commands))
+
+    def test_install_runtime_initializes_missing_pm2(self):
+        account = mock.Mock(pw_dir="/home/octra")
+        with mock.patch("validator_config.ubuntu_host", return_value=True):
+            with mock.patch("validator_config.install_rust_toolchain"):
+                with mock.patch("validator_config.shutil.which", return_value=None):
+                    with mock.patch("validator_config.pm2_service_enabled", return_value=False):
+                        with mock.patch("validator_config.pwd.getpwnam", return_value=account):
+                            with mock.patch("validator_config.os.geteuid", return_value=0):
+                                with mock.patch.dict(
+                                    "validator_config.os.environ",
+                                    {"USER": "octra", "PATH": "/usr/bin"},
+                                    clear=True,
+                                ):
+                                    with mock.patch("validator_config.run") as run:
+                                        install_runtime()
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["npm", "install", "-g", "pm2"], commands)
+        startup = next(command for command in commands if "startup" in command)
+        self.assertEqual(startup[-4:], ["-u", "octra", "--hp", "/home/octra"])
 
     def test_gate_reports_missing_python_runtime(self):
         source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
@@ -555,7 +725,7 @@ class ValidatorToolsTest(unittest.TestCase):
     def test_sync_budget_matches_seed_capacity(self):
         args = parser().parse_args([])
         self.assertEqual(args.sync_concurrency, 4)
-        self.assertEqual(args.sync_source_concurrency, 1)
+        self.assertEqual(args.sync_source_concurrency, 4)
         self.assertIsNone(args.sync_stage)
 
     def test_default_sync_stage_is_sibling(self):
@@ -586,7 +756,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 maybe_sync(args, str(WORK / "data"), network_values(self.entitlement))
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--concurrency") + 1], "4")
-        self.assertEqual(command[command.index("--source-concurrency") + 1], "1")
+        self.assertEqual(command[command.index("--source-concurrency") + 1], "4")
 
     def test_unattended_configuration_syncs_by_default(self):
         sync_binary = WORK / "state_sync_client"
@@ -675,6 +845,19 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(tool_version("rustc 1.80"), (1, 80, 0))
         with self.assertRaises(ValidatorError):
             tool_version("rustc invalid")
+
+    def test_source_toolchains_are_repo_local(self):
+        with mock.patch.object(Path, "mkdir") as mkdir:
+            environment = rust_environment()
+        mkdir.assert_called_once_with(parents=True, exist_ok=True)
+        self.assertEqual(TOOLCHAIN_ROOT, CONFIG_ROOT / "runtime_data/toolchains")
+        self.assertEqual(environment["CARGO_HOME"], str(CARGO_HOME))
+        self.assertEqual(environment["RUSTUP_HOME"], str(RUSTUP_HOME))
+        self.assertEqual(environment["OPAMROOT"], str(OPAM_ROOT))
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep)[0],
+            str(CARGO_HOME / "bin"),
+        )
 
     def test_source_build_metadata_is_pinned(self):
         self.assertTrue((CONFIG_ROOT / "octra_node.opam.locked").is_file())

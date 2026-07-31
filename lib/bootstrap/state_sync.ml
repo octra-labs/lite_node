@@ -91,8 +91,9 @@ let roots = [
 ]
 
 let list_files base =
-  let compact_ready =
+  let control_ready =
     Sys.file_exists (Filename.concat base ".compact-ready.json")
+    || Sys.file_exists (Filename.concat base ".ready.json")
   in
   List.fold_left (fun acc root ->
     let abs = Filename.concat base root in
@@ -107,7 +108,7 @@ let list_files base =
   ) [] roots
   |> List.sort_uniq String.compare
   |> List.filter (fun rel ->
-    rel <> "irmin_store/store.control" || compact_ready)
+    rel <> "irmin_store/store.control" || control_ready)
   |> List.filter (fun rel -> regular_file (Filename.concat base rel))
 
 let head_equal a b =

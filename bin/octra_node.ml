@@ -390,6 +390,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             exit = exit_error;
           };
           epoch_env = Consensus_epoch_apply_env.{
+            chain_id = startup_network.chain_id;
             current_epoch = (fun () -> !current_epoch);
             epoch_ts = (fun epoch ->
               match override_epoch_ts with

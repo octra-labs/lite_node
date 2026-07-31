@@ -67,7 +67,7 @@ let make ~chain_id ~address ~head_epoch ~state_root ~balance ~nonce ~public_key 
     account_hash;
   }
 
-let verify t =
+let witness_ok t =
   sane t
   && t.account_hash =
      hash_fields

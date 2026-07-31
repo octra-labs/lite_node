@@ -530,9 +530,29 @@ let max_fhe_cipher_bytes = 1_048_576
 let max_fhe_pubkey_bytes = 18_000_000
 let fhe_decode_bytes_per_effort = 16
 
-let max_zk_vk_bytes = 131_072
+let max_zk_public_inputs = 32
+let max_zk_vk_bytes = 2_570
 let max_zk_proof_bytes = 1_024
-let max_zk_inputs_bytes = 32_768
+let max_zk_inputs_bytes = max_zk_public_inputs * 32
+let groth16_public_input_effort = 20_000
+
+let groth16_public_inputs raw =
+  if String.length raw < 10 || String.sub raw 0 6 <> "OG16V1" then
+    None
+  else if
+    Char.code raw.[6] <> 0
+    || Char.code raw.[7] <> 0
+    || Char.code raw.[8] <> 0
+  then
+    None
+  else
+    Some (Char.code raw.[9])
+
+let groth16_shape_ok vk proof inputs count =
+  count <= max_zk_public_inputs
+  && String.length vk = 10 + 64 + (3 * 128) + ((count + 1) * 64)
+  && String.length proof = 6 + 64 + 128 + 64
+  && String.length inputs = count * 32
 let fhe_verifier_lane = Mutex.create ()
 
 let with_fhe_verifier_lane f =
@@ -2676,13 +2696,26 @@ let exec_one st op =
           || String.length inputs_raw > max_zk_inputs_bytes then
          (setr st rd (VBool false); true)
        else
-         (try
-            let ok = Zk_ffi.groth16_verify_bn254
-              (Bytes.of_string vk_raw)
-              (Bytes.of_string proof_raw)
-              (Bytes.of_string inputs_raw) in
-            setr st rd (VBool ok); true
-          with _ -> setr st rd (VBool false); true)
+         (match groth16_public_inputs vk_raw with
+          | None ->
+            setr st rd (VBool false);
+            true
+          | Some count when
+              not (groth16_shape_ok vk_raw proof_raw inputs_raw count) ->
+            setr st rd (VBool false);
+            true
+          | Some count when
+              not (add_dyn_effort st (count * groth16_public_input_effort)) ->
+            setr st rd (VBool false);
+            true
+          | Some _ ->
+            (try
+               let ok = Zk_ffi.groth16_verify_bn254
+                 (Bytes.of_string vk_raw)
+                 (Bytes.of_string proof_raw)
+                 (Bytes.of_string inputs_raw) in
+               setr st rd (VBool ok); true
+             with _ -> setr st rd (VBool false); true))
      | _ -> revert st)
   | FHE_VERIFY_BOUND (rd, rpk, rct, rproof, rcommit) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_bound_cap) then

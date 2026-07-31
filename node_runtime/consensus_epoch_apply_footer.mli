@@ -36,6 +36,7 @@ type node_deps = {
 }
 
 type node_request = {
+  chain_id : string;
   epoch_id : int;
   epoch_ts : float;
   proposer_addr : string;
@@ -97,6 +98,7 @@ val reward_line :
   Epoch_exec.reward_plan ->
   string
 val env :
+  chain_id:string ->
   epoch_id:int ->
   epoch_ts:float ->
   proposer_addr:string ->

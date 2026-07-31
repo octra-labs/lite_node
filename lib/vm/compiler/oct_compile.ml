@@ -330,17 +330,13 @@ let load_required load path =
   | Some source -> source
   | None -> failwith (Printf.sprintf "file not found: %s" path)
 
-let load_import load imp =
-  match load imp.Oct_lang.imp_path with
-  | None -> failwith (Printf.sprintf "import not found: %s" imp.imp_path)
-  | Some source -> Oct_parse.parse source
-
-let imported_interfaces load ast =
+let imported_interfaces load_import ast =
   ast.Oct_lang.imports
-  |> List.concat_map (fun imp ->
-    let dep_ast = load_import load imp in
-    dep_ast.interfaces
-    |> List.filter (fun iface -> List.mem iface.Oct_lang.if_name imp.imp_names))
+  |> List.concat_map (fun (imp : Oct_lang.import_decl) ->
+    let dep_ast = load_import imp in
+    dep_ast.Oct_lang.interfaces
+    |> List.filter
+         (fun iface -> List.mem iface.Oct_lang.if_name imp.Oct_lang.imp_names))
 
 let merge_interfaces ast interfaces =
   { ast with Oct_lang.interfaces = interfaces @ ast.Oct_lang.interfaces }
@@ -367,19 +363,39 @@ let compile source =
 let compile_multi_mode ~program_only (resolver : string -> string option) main_path =
   try
     let loaded_sources = ref [] in
+    let source_cache = Hashtbl.create 16 in
+    let ast_cache = Hashtbl.create 16 in
     let load path =
-      match resolver path with
-      | Some source ->
-        loaded_sources := (path, source) :: !loaded_sources;
-        Some source
-      | None -> None
+      match Hashtbl.find_opt source_cache path with
+      | Some source -> Some source
+      | None ->
+        match resolver path with
+        | Some source ->
+          Hashtbl.add source_cache path source;
+          loaded_sources := (path, source) :: !loaded_sources;
+          Some source
+        | None -> None
+    in
+    let load_import imp =
+      let path = imp.Oct_lang.imp_path in
+      match Hashtbl.find_opt ast_cache path with
+      | Some ast -> ast
+      | None ->
+        let source =
+          match load path with
+          | Some source -> source
+          | None -> failwith (Printf.sprintf "import not found: %s" path)
+        in
+        let ast = Oct_parse.parse source in
+        Hashtbl.add ast_cache path ast;
+        ast
     in
     let main_source = load_required load main_path in
     let ast = Oct_parse.parse main_source in
     if program_only && ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
       error_result "Program declaration required"
     else
-      let interfaces = imported_interfaces load ast in
+      let interfaces = imported_interfaces load_import ast in
       let source_material = canonical_sources !loaded_sources in
       let merged_ast = merge_interfaces ast interfaces in
       compile_ast ~source_mode:"multi" ~source_material merged_ast

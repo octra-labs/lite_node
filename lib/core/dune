@@ -23,6 +23,7 @@
   eqaf
   cstruct
   octra_log
+  octra_net
   octra_consensus
   octra_crypto_guard
   pvac_ffi))

@@ -929,20 +929,36 @@ let scan_all_rejected t f =
     )
   with Not_found -> ()
 
-let rejected_by_epoch t epoch_id =
+let rejected_by_epoch t epoch_id ~limit ~offset =
   try
     Lmdb.Cursor.go Lmdb.Ro t.rej_epoch (fun c ->
-      ignore (Lmdb.Cursor.seek c (Int32.of_int epoch_id));
-      let acc = ref [] in
-      (try
-        let (_, v0) = Lmdb.Cursor.current c in
-        acc := copy v0 :: !acc;
-        (try while true do
-          let v = Lmdb.Cursor.next_dup c in
-          acc := copy v :: !acc
-        done with Not_found -> ())
-      with Not_found -> ());
-      List.rev !acc
+      let key = Int32.of_int epoch_id in
+      ignore (Lmdb.Cursor.seek c key);
+      let found, _ = Lmdb.Cursor.current c in
+      if found <> key || limit <= 0 then []
+      else
+        let total = Lmdb.Cursor.count c in
+        if offset >= total then []
+        else begin
+          ignore (Lmdb.Cursor.first_dup c);
+          (try for _ = 1 to offset do
+            ignore (Lmdb.Cursor.next_dup c)
+          done with Not_found -> ());
+          let count = min limit (total - offset) in
+          let acc = ref [] in
+          let read = ref 0 in
+          (try
+            let _, first = Lmdb.Cursor.current c in
+            acc := copy first :: !acc;
+            incr read;
+            while !read < count do
+              let value = Lmdb.Cursor.next_dup c in
+              acc := copy value :: !acc;
+              incr read
+            done
+          with Not_found -> ());
+          List.rev !acc
+        end
     )
   with Not_found -> []
 
