@@ -48,14 +48,13 @@ let store_empty_bundle (deps : deps) prepared =
   | Some header -> deps.store_empty_bundle_for_header header
   | None -> ()
 
-let step (deps : deps) ~consensus_mode ~epoch_duration =
+let step (deps : deps) ~consensus_mode =
   let now = deps.now () in
   let current_epoch = deps.current_epoch () in
   let elapsed = now -. deps.last_epoch_time () in
   let prepared = tick_state deps ~consensus_mode ~current_epoch in
   let effective_duration =
     Epoch_cadence.duration_seconds
-      ~minimum_seconds:epoch_duration
       ~commit_round:(Option.value prepared.commit_round ~default:0)
   in
   let tick_plan =
@@ -90,13 +89,13 @@ let step (deps : deps) ~consensus_mode ~epoch_duration =
        Lwt.return_unit)
     (fun () -> Lwt.return tick_plan.next_sleep)
 
-let rec run (deps : deps) ~consensus_mode ~epoch_duration =
+let rec run (deps : deps) ~consensus_mode =
   Lwt.bind
-    (step deps ~consensus_mode ~epoch_duration)
+    (step deps ~consensus_mode)
     (fun next_sleep ->
       Lwt.bind
         (deps.sleep next_sleep)
-        (fun () -> run deps ~consensus_mode ~epoch_duration))
+        (fun () -> run deps ~consensus_mode))
 
 let node_deps runtime =
   {
@@ -117,5 +116,5 @@ let node_deps runtime =
     sleep = runtime.sleep;
   }
 
-let run_node runtime ~consensus_mode ~epoch_duration =
-  run (node_deps runtime) ~consensus_mode ~epoch_duration
+let run_node runtime ~consensus_mode =
+  run (node_deps runtime) ~consensus_mode

@@ -24,6 +24,7 @@ from validator_common import validate_checkpoint
 from validator_common import validate_network
 from validator_common import write_env
 from validator_config import operator_pm2_name
+from validator_config import BUILD_WORK
 from validator_config import build_candidate
 from validator_config import CARGO_HOME
 from validator_config import OPAM_ROOT
@@ -70,7 +71,7 @@ def identity():
     encoded = base64.b64encode(public_key).decode("ascii")
     return address_from_pubkey(public_key), encoded
 
-def network_values(entitlement):
+def network_values():
     validators = ",".join(":".join(identity()) for _ in range(5))
     exporter = ":".join(identity())
     program_key = base64.b64encode(bytes(SigningKey.generate().verify_key)).decode("ascii")
@@ -93,7 +94,6 @@ def network_values(entitlement):
         "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH": "150",
         "OCTRA_PROGRAM_RELEASE_KEYS": f"release={program_key}",
         "OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH": "100",
-        "OCTRA_PVAC_MIGRATION_ENTITLEMENTS": str(entitlement),
         "OCTRA_PVAC_MIGRATION_ROOT": "2" * 64,
         "OCTRA_STEALTH_MAX_PER_EPOCH": "1",
         "OCTRA_STATE_SYNC_EXPORTERS": exporter,
@@ -107,16 +107,6 @@ class ValidatorToolsTest(unittest.TestCase):
         if WORK.exists():
             shutil.rmtree(WORK)
         WORK.mkdir(parents=True)
-        self.entitlement = WORK / "entitlements.json"
-        self.entitlement.write_text(json.dumps({
-            "schema": "octra_pvac_migration_entitlements_v2",
-            "chain_id": "octra-devnet-bft-v1",
-            "snapshot_epoch": 99,
-            "state_root": "3" * 64,
-            "activation_epoch": 100,
-            "root": "2" * 64,
-            "entries": [],
-        }), encoding="utf-8")
 
     def tearDown(self):
         if WORK.exists():
@@ -194,7 +184,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_network_bundle_round_trip(self):
         bundle = WORK / "network.env"
-        values = network_values(self.entitlement)
+        values = network_values()
         write_env(bundle, values)
         digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
         _, loaded_digest, loaded = load_network(bundle, digest)
@@ -204,13 +194,13 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(loaded["OCTRA_PEERS"], values["OCTRA_BOOTSTRAP_PEERS"])
 
     def test_network_rejects_unsafe_override(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         values["OCTRA_ALLOW_UNSAFE_QUORUM"] = "1"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
     def test_network_rejects_address_key_mismatch(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         entries = values["OCTRA_VALIDATORS"].split(",")
         address, _ = entries[0].split(":", 1)
         _, other_key = identity()
@@ -220,57 +210,45 @@ class ValidatorToolsTest(unittest.TestCase):
             validate_network(values, WORK)
 
     def test_network_rejects_activation_drift(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         values["OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH"] = "101"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_entitlement_metadata_drift(self):
-        values = network_values(self.entitlement)
-        payload = json.loads(self.entitlement.read_text(encoding="utf-8"))
-        payload["chain_id"] = "octra-devnet-other"
-        self.entitlement.write_text(json.dumps(payload), encoding="utf-8")
+    def test_network_rejects_missing_migration_root(self):
+        values = network_values()
+        del values["OCTRA_PVAC_MIGRATION_ROOT"]
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_entitlement_snapshot_after_activation(self):
-        values = network_values(self.entitlement)
-        payload = json.loads(self.entitlement.read_text(encoding="utf-8"))
-        payload["snapshot_epoch"] = 100
-        self.entitlement.write_text(json.dumps(payload), encoding="utf-8")
-        with self.assertRaises(ValidatorError):
-            validate_network(values, WORK)
-
-    def test_network_rejects_invalid_entitlement_state_root(self):
-        values = network_values(self.entitlement)
-        payload = json.loads(self.entitlement.read_text(encoding="utf-8"))
-        payload["state_root"] = "invalid"
-        self.entitlement.write_text(json.dumps(payload), encoding="utf-8")
+    def test_network_rejects_invalid_migration_root(self):
+        values = network_values()
+        values["OCTRA_PVAC_MIGRATION_ROOT"] = "invalid"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
     def test_bundle_validator_is_source_build_independent(self):
         bundle = WORK / "network.env"
-        values = network_values(self.entitlement)
+        values = network_values()
         write_env(bundle, values)
         loaded, digest = validate_bundle(bundle)
         self.assertNotIn("OCTRA_BINARY_HASH", loaded)
         self.assertEqual(digest, hashlib.sha256(bundle.read_bytes()).hexdigest())
 
     def test_network_requires_permissionless_validator_activation(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         del values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"]
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
     def test_network_requires_proposal_protocol_activation(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         del values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"]
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
     def test_network_allows_checkpoint_rotation(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         values["OCTRA_CHECKPOINT_EPOCH"] = "250"
         values["OCTRA_CHECKPOINT_STATE_ROOT"] = "5" * 64
         values["OCTRA_CHECKPOINT_TXID_HI"] = "900"
@@ -278,19 +256,19 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(validated["OCTRA_CHECKPOINT_EPOCH"], "250")
 
     def test_proposal_protocol_activation_cannot_precede_emission(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"] = "99"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
     def test_validator_activation_cannot_precede_emission(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"] = "99"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
     def test_network_rejects_public_plain_http_state_sync(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         values["OCTRA_STATE_SYNC_SOURCES"] = (
             "http://203.0.113.1:8080,https://seed-b.example"
         )
@@ -298,7 +276,7 @@ class ValidatorToolsTest(unittest.TestCase):
             validate_network(values, WORK)
 
     def test_state_sync_source_requires_signed_matching_snapshot(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         config = WORK / "node.env"
         write_env(config, values)
         checkpoint_hash = "a" * 64
@@ -366,7 +344,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertNotIn("OCTRA_STATE_SYNC_SNAPSHOT_DIR", disabled)
 
     def test_state_sync_source_rejects_snapshot_root_mismatch(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         config = WORK / "node.env"
         write_env(config, values)
         certificate = WORK / "certificate.json"
@@ -558,7 +536,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(promotion_readiness(values, WORK), "not_required")
 
     def test_verified_snapshot_installs_atomically(self):
-        values = network_values(self.entitlement)
+        values = network_values()
         snapshot = WORK / "stage/snapshots/abc"
         data = snapshot / "data"
         (data / "irmin_store").mkdir(parents=True)
@@ -597,7 +575,7 @@ class ValidatorToolsTest(unittest.TestCase):
             encoding="utf-8",
         )
         with self.assertRaises(ValidatorError):
-            validate_checkpoint(data, network_values(self.entitlement))
+            validate_checkpoint(data, network_values())
 
     def test_checkpoint_allows_progress_for_restart(self):
         data = WORK / "data"
@@ -607,7 +585,7 @@ class ValidatorToolsTest(unittest.TestCase):
             '{"epoch_id":101,"state_root":"' + "5" * 64 + '","txid_hi":"510"}\n',
             encoding="utf-8",
         )
-        values = network_values(self.entitlement)
+        values = network_values()
         validate_checkpoint(data, values, allow_progress=True)
         with self.assertRaises(ValidatorError):
             validate_checkpoint(data, values)
@@ -753,7 +731,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ])
         with mock.patch("validator_config.run", side_effect=RuntimeError("captured")) as invoke:
             with self.assertRaisesRegex(RuntimeError, "captured"):
-                maybe_sync(args, str(WORK / "data"), network_values(self.entitlement))
+                maybe_sync(args, str(WORK / "data"), network_values())
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--concurrency") + 1], "4")
         self.assertEqual(command[command.index("--source-concurrency") + 1], "4")
@@ -770,7 +748,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ])
         with mock.patch("validator_config.run", side_effect=RuntimeError("captured")):
             with self.assertRaisesRegex(RuntimeError, "captured"):
-                maybe_sync(args, str(WORK / "data"), network_values(self.entitlement))
+                maybe_sync(args, str(WORK / "data"), network_values())
 
     def test_recovery_keeps_valid_offline_state(self):
         data = WORK / "data"
@@ -796,7 +774,7 @@ class ValidatorToolsTest(unittest.TestCase):
         bundle = WORK / "network.env"
         sync_binary = WORK / "state_sync_client"
         sync_binary.write_bytes(b"client")
-        network = network_values(self.entitlement)
+        network = network_values()
         write_env(bundle, network)
         config = WORK / "node.env"
         write_env(config, {
@@ -851,6 +829,7 @@ class ValidatorToolsTest(unittest.TestCase):
             environment = rust_environment()
         mkdir.assert_called_once_with(parents=True, exist_ok=True)
         self.assertEqual(TOOLCHAIN_ROOT, CONFIG_ROOT / "runtime_data/toolchains")
+        self.assertEqual(environment["T" + "MPDIR"], str(BUILD_WORK))
         self.assertEqual(environment["CARGO_HOME"], str(CARGO_HOME))
         self.assertEqual(environment["RUSTUP_HOME"], str(RUSTUP_HOME))
         self.assertEqual(environment["OPAMROOT"], str(OPAM_ROOT))

@@ -70,11 +70,10 @@ let network_config ~env =
     chain_id = string_env env "OCTRA_CHAIN_ID" "octra-mainnet";
   }
 
-let epoch_duration ~env =
-  Epoch_cadence.minimum_seconds_of env
+let epoch_duration =
+  Epoch_cadence.minimum_seconds
 
-let node_start_messages ~version ~validator ~storage ~store_path
-    ~epoch_duration config =
+let node_start_messages ~version ~validator ~storage ~store_path config =
   [
     Printf.sprintf
       "node version = %s validator = %s storage = %s"
@@ -93,13 +92,12 @@ let node_start_messages ~version ~validator ~storage ~store_path
   ]
 
 let log_node_start ~info ~version ~validator ~storage ~store_path
-    ~epoch_duration config =
+    config =
   node_start_messages
     ~version
     ~validator
     ~storage
     ~store_path
-    ~epoch_duration
     config
   |> List.iter info
 

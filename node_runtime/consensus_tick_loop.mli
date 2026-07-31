@@ -35,13 +35,11 @@ type node_runtime = {
 val step :
   deps ->
   consensus_mode:bool ->
-  epoch_duration:float ->
   float Lwt.t
 
 val run :
   deps ->
   consensus_mode:bool ->
-  epoch_duration:float ->
   unit Lwt.t
 
 val node_deps :
@@ -51,5 +49,4 @@ val node_deps :
 val run_node :
   node_runtime ->
   consensus_mode:bool ->
-  epoch_duration:float ->
   unit Lwt.t

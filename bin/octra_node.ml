@@ -127,6 +127,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       match
         Pvac_migration_entitlement.load_env
           ~chain_id:startup_network.chain_id
+          ~data_dir
           ~getenv:env_opt
       with
       | Ok value -> value
@@ -248,8 +249,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             reason;
           exit_error ()
     end;
-
-    let epoch_duration = Startup_process_shell.epoch_duration ~env:env_opt in
 
     let current_epoch =
       ref (Startup_node_boot_shell.run_node
@@ -603,7 +602,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         sleep = Lwt_unix.sleep;
       }
       ~consensus_mode
-      ~epoch_duration
       in
 
     let Startup_network_boot_shell.{
@@ -629,7 +627,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               Octra_core.Validator_set_update.pending_meta_key);
           data_dir;
           store_path = Startup_store_shell.irmin_path data_dir;
-          epoch_duration;
           current_epoch;
           chaindata;
           finality = finality_callbacks;

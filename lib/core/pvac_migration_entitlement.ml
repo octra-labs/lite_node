@@ -26,6 +26,7 @@ type t =
 let schema = "octra_pvac_migration_entitlements_v2"
 let max_artifact_bytes = 64 * 1024 * 1024
 let max_entries = 1_000_000
+let state_name = "migration_state.json"
 
 let source_cipher_hash cipher =
   Digestif.SHA256.(digest_string cipher |> to_hex)
@@ -79,7 +80,7 @@ let put_int buf value =
 let put_z buf value =
   put_string buf (Z.to_string value)
 
-let canonical_entry buf entry =
+let encode_entry buf entry =
   let decision = entry.decision in
   put_string buf entry.address;
   put_string buf entry.source_cipher_hash;
@@ -92,7 +93,7 @@ let canonical_entry buf entry =
   List.iter (put_string buf) decision.blockers;
   put_string buf decision.reason
 
-let canonical_payload ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
+let encoded_payload ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   let buf = Buffer.create 4096 in
   put_string buf schema;
   put_string buf chain_id;
@@ -100,11 +101,11 @@ let canonical_payload ~chain_id ~snapshot_epoch ~state_root ~activation_epoch en
   put_string buf state_root;
   put_int buf activation_epoch;
   put_int buf (List.length entries);
-  List.iter (canonical_entry buf) entries;
+  List.iter (encode_entry buf) entries;
   Buffer.contents buf
 
 let root_of ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
-  canonical_payload
+  encoded_payload
     ~chain_id
     ~snapshot_epoch
     ~state_root
@@ -113,7 +114,7 @@ let root_of ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   |> Digestif.SHA256.digest_string
   |> Digestif.SHA256.to_hex
 
-let canonical_commitment value =
+let valid_commitment value =
   try
     let point = Bytes.of_string (Base64.decode_exn value) in
     if Bytes.length point <> 32 then
@@ -127,8 +128,8 @@ let canonical_commitment value =
 
 let validate_decision decision =
   match decision.Replay.commitment_net with
-  | Some value when not (canonical_commitment value) ->
-    Error "migration commitment is not canonical"
+  | Some value when not (valid_commitment value) ->
+    Error "migration commitment has invalid encoding"
   | _ when
       (match decision.public_net with
        | Some amount ->
@@ -433,7 +434,7 @@ let configured getenv name =
   | Some _
   | None -> None
 
-let load_file ~chain_id ~expected_root path =
+let read_file path =
   let channel = open_in_bin path in
   Fun.protect
     ~finally:(fun () -> close_in_noerr channel)
@@ -454,30 +455,41 @@ let load_file ~chain_id ~expected_root path =
         let after = Unix.fstat descriptor in
         if has_suffix || after.Unix.st_size <> before.Unix.st_size then
           Error "migration entitlement artifact changed while loading"
-        else
-          load_json
-            ~chain_id
-            ~expected_root
-            (Yojson.Safe.from_string body))
+        else Ok body)
 
-let load_env ~chain_id ~getenv =
-  match configured getenv "OCTRA_PVAC_MIGRATION_ENTITLEMENTS",
-        configured getenv "OCTRA_PVAC_MIGRATION_ROOT" with
-  | None, None ->
+let load_body ~chain_id ~expected_root body =
+  try
+    load_json
+      ~chain_id
+      ~expected_root
+      (Yojson.Safe.from_string body)
+  with exn ->
+    Error ("migration entitlement parse failed: " ^ Printexc.to_string exn)
+
+let load_file ~chain_id ~expected_root path =
+  bind
+    (read_file path)
+    (load_body ~chain_id ~expected_root)
+
+let state_path data_dir =
+  Filename.concat (Filename.concat data_dir "pvac") state_name
+
+let load_env ~chain_id ~data_dir ~getenv =
+  match configured getenv "OCTRA_PVAC_MIGRATION_ROOT" with
+  | None ->
     Ok (disabled ~chain_id)
-  | Some path, Some expected_root when path <> "" && valid_hash expected_root ->
-    begin
+  | Some expected_root when not (valid_hash expected_root) ->
+    Error "OCTRA_PVAC_MIGRATION_ROOT must be lowercase sha256 hex"
+  | Some expected_root ->
+    let path = state_path data_dir in
+    if not (Sys.file_exists path) then
+      Error "migration entitlement state is missing from node data"
+    else begin
       try
         load_file ~chain_id ~expected_root path
       with exn ->
         Error ("migration entitlement load failed: " ^ Printexc.to_string exn)
     end
-  | Some _, Some _ ->
-    Error "OCTRA_PVAC_MIGRATION_ROOT must be lowercase sha256 hex"
-  | Some _, None ->
-    Error "migration entitlement path and root must be configured together"
-  | None, Some _ ->
-    Error "migration entitlement path and root must be configured together"
 
 let option_json encode = function
   | None -> `Null

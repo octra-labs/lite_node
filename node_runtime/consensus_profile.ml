@@ -79,13 +79,11 @@ let valid_migration_root value =
        value
 
 let validate_migration getenv profile =
-  match getenv "OCTRA_PVAC_MIGRATION_ENTITLEMENTS",
-        getenv "OCTRA_PVAC_MIGRATION_ROOT" with
-  | Some path, Some root
-      when path <> "" && valid_migration_root root ->
+  match getenv "OCTRA_PVAC_MIGRATION_ROOT" with
+  | Some root when valid_migration_root root ->
     Ok ()
   | _ ->
-    Error (profile ^ " requires migration entitlement path and root")
+    Error (profile ^ " requires migration entitlement root")
 
 let validate_validator_schedule validator_policy schedule =
   match validator_policy, schedule with
@@ -193,7 +191,7 @@ let hash getenv =
     Octra_core.Validator_policy.of_env_exn getenv
   in
   let private_limits = Startup_runtime_limits.private_limits env in
-  let epoch_min_ms = Epoch_cadence.minimum_ms_of getenv in
+  let epoch_min_ms = Epoch_cadence.minimum_ms in
   let proposal_limits = Startup_runtime_limits.proposal_limits env
     ~default_max_ou:Octra_core.Tx_staging.max_ou_per_epoch in
   Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v16" (fun buf ->

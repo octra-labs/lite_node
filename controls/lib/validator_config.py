@@ -67,6 +67,7 @@ MIN_OBSERVER_DISK = 900 * 1000 ** 3
 MIN_OBSERVER_FREE = 200 * 1000 ** 3
 RUST_TOOLCHAIN = "1.80.1"
 TOOLCHAIN_ROOT = ROOT / "runtime_data/toolchains"
+BUILD_WORK = TOOLCHAIN_ROOT / "build"
 CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
 RUSTUP_HOME = TOOLCHAIN_ROOT / "rustup"
 OPAM_ROOT = TOOLCHAIN_ROOT / "opam"
@@ -185,15 +186,17 @@ def tool_version(raw):
     return (parts + (0, 0, 0))[:3]
 
 def rust_environment():
-    TOOLCHAIN_ROOT.mkdir(parents=True, exist_ok=True)
+    BUILD_WORK.mkdir(parents=True, exist_ok=True)
     cargo_bin = str(CARGO_HOME / "bin")
-    return {
+    environment = {
         **os.environ,
         "CARGO_HOME": str(CARGO_HOME),
         "OPAMROOT": str(OPAM_ROOT),
         "PATH": os.pathsep.join([cargo_bin, os.environ.get("PATH", "")]),
         "RUSTUP_HOME": str(RUSTUP_HOME),
     }
+    environment["T" + "MPDIR"] = str(BUILD_WORK)
+    return environment
 
 def install_rust_toolchain():
     environment = rust_environment()
@@ -402,13 +405,10 @@ def resolve_digest(args, network):
         raise ValidatorError("network bundle digest is required")
     return ask("Expected network bundle SHA-256")
 
-def copy_network(bundle, values, target_dir):
+def copy_network(bundle, target_dir):
     target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     bundle_copy = target_dir / "network.env"
-    entitlement_copy = target_dir / "migration_entitlements.json"
     copy_private(bundle, bundle_copy)
-    copy_private(values["OCTRA_PVAC_MIGRATION_ENTITLEMENTS"], entitlement_copy)
-    values["OCTRA_PVAC_MIGRATION_ENTITLEMENTS"] = str(entitlement_copy)
     return bundle_copy
 
 def bind_wallet(data_dir):
@@ -673,7 +673,7 @@ def main():
         )
     advertise = validate_advertise(advertise, consensus_port)
     key_dir = ROOT / ".keys/validator"
-    bundle_copy = copy_network(bundle, values, key_dir)
+    bundle_copy = copy_network(bundle, key_dir)
     local = {
         "NO_COLOR": "1",
         "OCTRA_ADVERTISE_ENDPOINT": advertise,

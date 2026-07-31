@@ -776,17 +776,25 @@ let prev_root_decision ~epoch_id ~target_root ~current_root ~max_wait_tries
     }
 
 let build_preview_plan ~root_to_raw32 ~epoch_id ~start_txid ~prev_eic_root
-    ~prev_ledger_root ~fallback_ledger_root ~input_txs ~preview =
+    ~prev_ledger_root ~fallback_ledger_root ~input_txs:_ ~preview =
   match preview with
   | Build_preview_error e ->
-    let final_hashes = List.map Transaction.hash input_txs in
     {
-      final_txs = input_txs;
-      final_hashes;
+      final_txs = [];
+      final_hashes = [];
       rejected_hashes = [];
       proposed_state_root = fallback_ledger_root;
       preview_consensus_root = None;
       preview_error = Some e;
+    }
+  | Build_preview_ok { confirmed; rejected = _ :: _ as rejected; _ } ->
+    {
+      final_txs = confirmed;
+      final_hashes = List.map Transaction.hash confirmed;
+      rejected_hashes = List.map Transaction.hash rejected;
+      proposed_state_root = fallback_ledger_root;
+      preview_consensus_root = None;
+      preview_error = Some "preview_rejected_transactions";
     }
   | Build_preview_ok { post_state_root; confirmed; rejected } ->
     let final_hashes = List.map Transaction.hash confirmed in
@@ -856,6 +864,43 @@ let build_preview_output ~root_to_raw32 ~epoch_id ~start_txid ~prev_eic_root
         plan.final_hashes;
     rejected_count = List.length plan.rejected_hashes;
   }
+
+type preview_partition =
+  | Preview_partition_stable of Transaction.t list
+  | Preview_partition_retry of {
+      confirmed : Transaction.t list;
+      rejected_hashes : string list;
+    }
+  | Preview_partition_invalid
+
+let sorted_hashes txs =
+  List.map Transaction.hash txs
+  |> List.sort String.compare
+
+let distinct hashes =
+  List.length hashes = List.length (List.sort_uniq String.compare hashes)
+
+let preview_partition ~input_txs ~confirmed ~rejected =
+  let input_hashes = sorted_hashes input_txs in
+  let confirmed_hashes = sorted_hashes confirmed in
+  let rejected_hashes = sorted_hashes rejected in
+  let output_hashes =
+    List.sort String.compare (confirmed_hashes @ rejected_hashes)
+  in
+  if
+    not (distinct input_hashes)
+    || not (distinct output_hashes)
+    || input_hashes <> output_hashes
+  then
+    Preview_partition_invalid
+  else
+    match rejected with
+    | [] -> Preview_partition_stable confirmed
+    | _ ->
+      Preview_partition_retry {
+        confirmed;
+        rejected_hashes = List.map Transaction.hash rejected;
+      }
 
 let raw32_to_hex r =
   Text.hash32_hex r
@@ -1783,77 +1828,114 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
         pre_shape;
       let proposer = deps.proposer () in
       let validator_pubkeys = deps.validator_pubkeys epoch_id in
-      let preverify = Octra_core.Preverify_commit.create pre_shape.receipts in
       let epoch_ts = deps.now () in
-      let* preview_result =
-        deps.preview {
-          epoch_id;
-          epoch_ts;
-          proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
-          expected_prev_root = prev_ledger_root;
-          prev_state_root = prev_root;
-          parent_commit;
-          proposer;
-          validator_pubkeys;
-          preverify;
-          txs = tx_list;
-        }
+      let rec preview_until_stable attempt remaining =
+        if attempt > List.length tx_list + 1 then
+          Lwt.return_error "preview_retry_limit"
+        else
+          let remaining_hashes = List.map Transaction.hash remaining in
+          let receipts =
+            Octra_core.Preverify_worker.receipts_for_hashes
+              pre_shape.batch.ready
+              remaining_hashes
+          in
+          let preverify = Octra_core.Preverify_commit.create receipts in
+          let* preview_result =
+            deps.preview {
+              epoch_id;
+              epoch_ts;
+              proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
+              expected_prev_root = prev_ledger_root;
+              prev_state_root = prev_root;
+              parent_commit;
+              proposer;
+              validator_pubkeys;
+              preverify;
+              txs = remaining;
+            }
+          in
+          match preview_result with
+          | Stdlib.Error error ->
+            Lwt.return_error error
+          | Stdlib.Ok result ->
+            let artifacts = result.Octra_core.Epoch_exec.artifacts in
+            let confirmed = List.map fst artifacts.confirmed in
+            let rejected =
+              List.map
+                (fun (item : Octra_core.Epoch_exec.tx_reject) -> item.tx)
+                artifacts.rejected
+            in
+            begin
+              match preview_partition ~input_txs:remaining ~confirmed ~rejected with
+              | Preview_partition_invalid ->
+                Lwt.return_error "preview_partition_mismatch"
+              | Preview_partition_stable stable_txs ->
+                Lwt.return_ok
+                  (build_preview_output
+                     ~root_to_raw32
+                     ~epoch_id
+                     ~start_txid:(deps.next_txid ())
+                     ~prev_eic_root:(deps.prev_eic_root ())
+                     ~prev_ledger_root
+                     ~fallback_ledger_root:prev_root
+                     ~input_txs:stable_txs
+                     ~batch:pre_shape.batch
+                     ~preview_result:(Stdlib.Ok result))
+              | Preview_partition_retry { confirmed; rejected_hashes } ->
+                Octra_log.warn "consensus"
+                  "event = proposal_preview_retry epoch = %Ld attempt = %d rejected = %d remaining = %d"
+                  epoch_id
+                  attempt
+                  (List.length rejected_hashes)
+                  (List.length confirmed);
+                deps.remove_rejected rejected_hashes;
+                deps.notify_staging_update ();
+                preview_until_stable (attempt + 1) confirmed
+            end
       in
-      let build_output =
-        build_preview_output
-          ~root_to_raw32
-          ~epoch_id
-          ~start_txid:(deps.next_txid ())
-          ~prev_eic_root:(deps.prev_eic_root ())
-          ~prev_ledger_root
-          ~fallback_ledger_root:prev_root
-          ~input_txs:tx_list
-          ~batch:pre_shape.batch
-          ~preview_result
-      in
-      let build_plan = build_output.plan in
-      let final_tx_list = build_plan.final_txs in
-      let final_tx_hashes = build_plan.final_hashes in
-      let rejected_count = build_output.rejected_count in
-      if rejected_count > 0 then begin
+      let* stable_preview = preview_until_stable 1 tx_list in
+      match stable_preview with
+      | Stdlib.Error error ->
         Octra_log.warn "consensus"
-          "proposal_preview_rejected = %d total = %d action = drop_rejected_before_propose"
-          rejected_count
-          (List.length tx_list);
-        deps.remove_rejected build_plan.rejected_hashes;
-        deps.notify_staging_update ()
-      end;
-      log_preview_result ~epoch_id (List.length final_tx_list) build_plan;
-      deps.set_proposal final_tx_list final_tx_hashes;
-      let proposal_envelope =
-        build_proposal_envelope
-          ~chain_id
-          ~epoch_id
-          ~prev_state_root:prev_root
-          ~final_hashes:final_tx_hashes
-          ~final_txs:final_tx_list
-          ~receipts_json:build_output.receipts_json
-          ~proposed_state_root:build_plan.proposed_state_root
-          ~creator_addr:proposer
-          ~next_txid:(deps.next_txid ())
-          ~head_txid_hi:(deps.head_txid_hi ())
-          ~parent_commit
-          ~ts:epoch_ts
-      in
-      Octra_log.info "consensus"
-        "proposing epoch = %Ld txs = %d txid_hi = %Ld"
-        epoch_id
-        (List.length final_tx_list)
-        proposal_envelope.txid_hi;
-      deps.store_bundle
-        ~proposal_id:proposal_envelope.proposal_id
-        ~tx_hashes:proposal_envelope.tx_hashes
-        ~txs:proposal_envelope.txs
-        ~receipts_json:proposal_envelope.receipts_json;
-      deps.freeze freeze_key proposal_envelope.frozen_bundle;
-      Lwt.return_some Octra_consensus.C_driver.{
-        header = proposal_envelope.header;
-        tx_hashes = final_tx_hashes;
-        parent_commit = proposal_envelope.parent_commit;
-      }
+          "defer proposal reason = preview_failed epoch = %Ld detail = %s"
+          epoch_id
+          error;
+        Lwt.return_none
+      | Stdlib.Ok build_output ->
+        let build_plan = build_output.plan in
+        let final_tx_list = build_plan.final_txs in
+        let final_tx_hashes = build_plan.final_hashes in
+        log_preview_result ~epoch_id (List.length final_tx_list) build_plan;
+        deps.set_proposal final_tx_list final_tx_hashes;
+        let proposal_envelope =
+          build_proposal_envelope
+            ~chain_id
+            ~epoch_id
+            ~prev_state_root:prev_root
+            ~final_hashes:final_tx_hashes
+            ~final_txs:final_tx_list
+            ~receipts_json:build_output.receipts_json
+            ~proposed_state_root:build_plan.proposed_state_root
+            ~creator_addr:proposer
+            ~next_txid:(deps.next_txid ())
+            ~head_txid_hi:(deps.head_txid_hi ())
+            ~parent_commit
+            ~ts:epoch_ts
+        in
+        Octra_log.info "consensus"
+          "proposing epoch = %Ld txs = %d txid_hi = %Ld"
+          epoch_id
+          (List.length final_tx_list)
+          proposal_envelope.txid_hi;
+        deps.store_bundle
+          ~proposal_id:proposal_envelope.proposal_id
+          ~tx_hashes:proposal_envelope.tx_hashes
+          ~txs:proposal_envelope.txs
+          ~receipts_json:proposal_envelope.receipts_json;
+        deps.freeze freeze_key proposal_envelope.frozen_bundle;
+        Lwt.return_some Octra_consensus.C_driver.{
+          header = proposal_envelope.header;
+          tx_hashes = final_tx_hashes;
+          parent_commit = proposal_envelope.parent_commit;
+        }
     end

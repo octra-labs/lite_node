@@ -24,6 +24,7 @@ val create :
 
 val load_env :
   chain_id:string ->
+  data_dir:string ->
   getenv:(string -> string option) ->
   (t, string) result
 

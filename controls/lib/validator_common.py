@@ -53,7 +53,6 @@ NETWORK_KEYS = frozenset({
     "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH",
     "OCTRA_PROGRAM_RELEASE_KEYS",
     "OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH",
-    "OCTRA_PVAC_MIGRATION_ENTITLEMENTS",
     "OCTRA_PVAC_MIGRATION_ROOT",
     "OCTRA_QUARANTINE_AHEAD_DRIFT_TOLERANCE",
     "OCTRA_QUARANTINE_AHEAD_GRACE_EPOCHS",
@@ -106,7 +105,6 @@ REQUIRED_KEYS = frozenset({
     "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH",
     "OCTRA_PROGRAM_RELEASE_KEYS",
     "OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH",
-    "OCTRA_PVAC_MIGRATION_ENTITLEMENTS",
     "OCTRA_PVAC_MIGRATION_ROOT",
     "OCTRA_STEALTH_MAX_PER_EPOCH",
     "OCTRA_STATE_SYNC_EXPORTERS",
@@ -114,18 +112,6 @@ REQUIRED_KEYS = frozenset({
     "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH",
     "OCTRA_VALIDATORS",
 })
-ENTITLEMENT_KEYS = frozenset({
-    "schema",
-    "chain_id",
-    "snapshot_epoch",
-    "state_root",
-    "activation_epoch",
-    "root",
-    "entries",
-})
-ENTITLEMENT_SCHEMA = "octra_pvac_migration_entitlements_v2"
-ENTITLEMENT_MAX_BYTES = 64 * 1024 * 1024
-
 class ValidatorError(RuntimeError):
     pass
 
@@ -333,43 +319,7 @@ def nonnegative_int(values, key):
         raise ValidatorError(f"negative integer: {key}")
     return value
 
-def validate_entitlement(path, values):
-    artifact = Path(path)
-    try:
-        if artifact.stat().st_size > ENTITLEMENT_MAX_BYTES:
-            raise ValidatorError("migration entitlement artifact exceeds size cap")
-        payload = json.loads(artifact.read_text(encoding="utf-8"))
-    except ValidatorError:
-        raise
-    except Exception as error:
-        raise ValidatorError("invalid migration entitlement artifact") from error
-    if not isinstance(payload, dict) or set(payload) != ENTITLEMENT_KEYS:
-        raise ValidatorError("invalid migration entitlement fields")
-    expected = {
-        "schema": ENTITLEMENT_SCHEMA,
-        "chain_id": values["OCTRA_CHAIN_ID"],
-        "activation_epoch": int(values["OCTRA_PVAC_MIGRATION_ACTIVATION_EPOCH"]),
-        "root": values["OCTRA_PVAC_MIGRATION_ROOT"],
-    }
-    for key, value in expected.items():
-        if payload.get(key) != value:
-            raise ValidatorError(f"migration entitlement mismatch: {key}")
-    snapshot_epoch = payload.get("snapshot_epoch")
-    state_root = payload.get("state_root")
-    if (
-        isinstance(snapshot_epoch, bool)
-        or not isinstance(snapshot_epoch, int)
-        or snapshot_epoch < 0
-    ):
-        raise ValidatorError("invalid migration entitlement snapshot epoch")
-    if snapshot_epoch >= expected["activation_epoch"]:
-        raise ValidatorError("migration entitlement snapshot must precede activation")
-    if not isinstance(state_root, str) or not HEX64.fullmatch(state_root):
-        raise ValidatorError("invalid migration entitlement state root")
-    if not isinstance(payload.get("entries"), list):
-        raise ValidatorError("migration entitlement entries must be a list")
-
-def validate_network(values, bundle_dir):
+def validate_network(values, _bundle_dir):
     unknown = set(values) - NETWORK_KEYS
     if unknown:
         raise ValidatorError("unsupported network keys: " + ",".join(sorted(unknown)))
@@ -427,14 +377,6 @@ def validate_network(values, bundle_dir):
     peers = values.get("OCTRA_PEERS", values["OCTRA_BOOTSTRAP_PEERS"])
     endpoint_list(peers)
     values["OCTRA_PEERS"] = peers
-    entitlement = Path(values["OCTRA_PVAC_MIGRATION_ENTITLEMENTS"])
-    if not entitlement.is_absolute():
-        entitlement = Path(bundle_dir) / entitlement
-    entitlement = entitlement.resolve()
-    if not entitlement.is_file():
-        raise ValidatorError(f"migration entitlement file is missing: {entitlement}")
-    validate_entitlement(entitlement, values)
-    values["OCTRA_PVAC_MIGRATION_ENTITLEMENTS"] = str(entitlement)
     return values
 
 def validate_network_binding(values, network):

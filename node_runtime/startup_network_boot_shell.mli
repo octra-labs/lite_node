@@ -19,7 +19,6 @@ type deps = {
   read_pending_validator_meta : unit -> string option;
   data_dir : string;
   store_path : string;
-  epoch_duration : float;
   current_epoch : int ref;
   chaindata : Octra_core.Store_chaindata.t;
   finality : Consensus_finality_state.callbacks;

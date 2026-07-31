@@ -103,8 +103,6 @@ def validate(values):
     bundle_hash = values.get("OCTRA_OPERATOR_NETWORK_SHA256", "")
     _, _, network = load_network(bundle, bundle_hash)
     validate_network_binding(values, network)
-    entitlement = require_file(values, "OCTRA_PVAC_MIGRATION_ENTITLEMENTS")
-    private_mode(entitlement)
     members = dict(validator_entries(values.get("OCTRA_VALIDATORS", "")))
     permissionless = values.get("OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH", "").isdigit()
     if (
