@@ -140,8 +140,8 @@ let direct_call_meta = function
     {
       scope = "contract";
       target_key = "addr";
-      failure_type = "contract_call_failed";
-      exception_type = "contract_call_exception";
+      failure_type = "program_exec_failed";
+      exception_type = "program_exec_exception";
     }
 
 let direct_call_decision domain receipt =

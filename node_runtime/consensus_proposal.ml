@@ -119,6 +119,12 @@ type build_preview_output = {
   rejected_count : int;
 }
 
+type preview_reject = {
+  hash : string;
+  error_type : string;
+  reason : string;
+}
+
 type proposal_roots = {
   prev_ledger_root : string;
   prev_state_root : string;
@@ -195,7 +201,7 @@ type make_proposal_deps = {
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
-  remove_rejected : string list -> unit;
+  remove_rejected : preview_reject list -> unit;
   notify_staging_update : unit -> unit;
   set_proposal : Transaction.t list -> string list -> unit;
   head_txid_hi : unit -> int64 option;
@@ -863,7 +869,7 @@ type preview_partition =
   | Preview_partition_stable of Transaction.t list
   | Preview_partition_retry of {
       confirmed : Transaction.t list;
-      rejected_hashes : string list;
+      rejections : preview_reject list;
     }
   | Preview_partition_invalid
 
@@ -877,7 +883,10 @@ let distinct hashes =
 let preview_partition ~input_txs ~confirmed ~rejected =
   let input_hashes = sorted_hashes input_txs in
   let confirmed_hashes = sorted_hashes confirmed in
-  let rejected_hashes = sorted_hashes rejected in
+  let rejected_txs =
+    List.map (fun (item : Octra_core.Epoch_exec.tx_reject) -> item.tx) rejected
+  in
+  let rejected_hashes = sorted_hashes rejected_txs in
   let output_hashes =
     List.sort String.compare (confirmed_hashes @ rejected_hashes)
   in
@@ -893,7 +902,14 @@ let preview_partition ~input_txs ~confirmed ~rejected =
     | _ ->
       Preview_partition_retry {
         confirmed;
-        rejected_hashes = List.map Transaction.hash rejected;
+        rejections =
+          List.map
+            (fun (item : Octra_core.Epoch_exec.tx_reject) -> {
+              hash = Transaction.hash item.tx;
+              error_type = item.error_type;
+              reason = item.reason;
+            })
+            rejected;
       }
 
 let raw32_to_hex r =
@@ -1854,11 +1870,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
           | Stdlib.Ok result ->
             let artifacts = result.Octra_core.Epoch_exec.artifacts in
             let confirmed = List.map fst artifacts.confirmed in
-            let rejected =
-              List.map
-                (fun (item : Octra_core.Epoch_exec.tx_reject) -> item.tx)
-                artifacts.rejected
-            in
+            let rejected = artifacts.rejected in
             begin
               match preview_partition ~input_txs:remaining ~confirmed ~rejected with
               | Preview_partition_invalid ->
@@ -1875,14 +1887,14 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
                      ~input_txs:stable_txs
                      ~batch:pre_shape.batch
                      ~preview_result:(Stdlib.Ok result))
-              | Preview_partition_retry { confirmed; rejected_hashes } ->
+              | Preview_partition_retry { confirmed; rejections } ->
                 Octra_log.warn "consensus"
                   "event = proposal_preview_retry epoch = %Ld attempt = %d rejected = %d remaining = %d"
                   epoch_id
                   attempt
-                  (List.length rejected_hashes)
+                  (List.length rejections)
                   (List.length confirmed);
-                deps.remove_rejected rejected_hashes;
+                deps.remove_rejected rejections;
                 deps.notify_staging_update ();
                 preview_until_stable (attempt + 1) confirmed
             end

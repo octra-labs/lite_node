@@ -119,6 +119,12 @@ type build_preview_output = {
   rejected_count : int;
 }
 
+type preview_reject = {
+  hash : string;
+  error_type : string;
+  reason : string;
+}
+
 type proposal_roots = {
   prev_ledger_root : string;
   prev_state_root : string;
@@ -195,7 +201,7 @@ type make_proposal_deps = {
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
-  remove_rejected : string list -> unit;
+  remove_rejected : preview_reject list -> unit;
   notify_staging_update : unit -> unit;
   set_proposal : Transaction.t list -> string list -> unit;
   head_txid_hi : unit -> int64 option;

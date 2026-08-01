@@ -24,7 +24,13 @@ let total_ou = ref Z.zero
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
 let virtual_nonces : (string, int) Hashtbl.t = Hashtbl.create 100
 
-type drop_reason = Evicted | Expired
+type drop_reason = Evicted | Expired | Rejected
+
+type rejection = {
+  hash : string;
+  error_type : string;
+  reason : string;
+}
 
 type drop_record = {
   d_hash : string;
@@ -40,7 +46,7 @@ type drop_record = {
 
 let dropped_cache : (string, drop_record) Hashtbl.t = Hashtbl.create 200
 let dropped_max = 10_000
-let dropped_ttl = 600.
+let dropped_ttl = 86_400.
 
 let record_drop hash tx reason detail =
   if Hashtbl.length dropped_cache >= dropped_max then begin
@@ -66,7 +72,12 @@ let cleanup_dropped () =
 let lookup_dropped hash =
   match Hashtbl.find_opt dropped_cache hash with
   | Some d ->
-    let reason_str = match d.d_reason with Evicted -> "evicted" | Expired -> "expired" in
+    let reason_str =
+      match d.d_reason with
+      | Evicted -> "evicted"
+      | Expired -> "expired"
+      | Rejected -> "rejected"
+    in
     Some (reason_str, d.d_detail, d.d_ts, d.d_from, d.d_to, d.d_nonce, d.d_ou, d.d_op_type)
   | None -> None
 
@@ -313,14 +324,7 @@ let remove_by_hash h =
   | Some entry -> evict entry; true
   | None -> false
 
-let remove_processed hashes =
-  let touched = Hashtbl.create 16 in
-  List.iter (fun h ->
-    (match Hashtbl.find_opt hash_index h with
-     | Some entry -> Hashtbl.replace touched entry.tx.Transaction.from ()
-     | None -> ());
-    ignore (remove_by_hash h)
-  ) hashes;
+let clear_virtual_state touched =
   Hashtbl.iter (fun addr () ->
     let has_pending = Hashtbl.fold (fun _ e found ->
       found || e.tx.Transaction.from = addr) staging false in
@@ -330,29 +334,48 @@ let remove_processed hashes =
     end
   ) touched
 
+let remove_processed hashes =
+  let touched = Hashtbl.create 16 in
+  List.iter (fun h ->
+    (match Hashtbl.find_opt hash_index h with
+     | Some entry -> Hashtbl.replace touched entry.tx.Transaction.from ()
+     | None -> ());
+    ignore (remove_by_hash h)
+  ) hashes;
+  clear_virtual_state touched
+
+let remove_rejected rejections =
+  let touched = Hashtbl.create 16 in
+  List.iter (fun rejection ->
+    match Hashtbl.find_opt hash_index rejection.hash with
+    | None -> ()
+    | Some entry ->
+      Hashtbl.replace touched entry.tx.Transaction.from ();
+      evict entry;
+      record_drop
+        entry.hash
+        entry.tx
+        Rejected
+        (rejection.error_type ^ ": " ^ rejection.reason)
+  ) rejections;
+  clear_virtual_state touched
+
 let staging_ttl = 600.
 
 let expire_old () =
   let now = Unix.gettimeofday () in
-  let expired = Hashtbl.fold (fun _ e acc ->
+  let expired = Hashtbl.fold (fun _ (e : entry) acc ->
     if now -. e.added_at > staging_ttl then e :: acc else acc
   ) staging [] in
   let touched = Hashtbl.create 16 in
-  List.iter (fun e ->
+  List.iter (fun (e : entry) ->
     Hashtbl.replace touched e.tx.Transaction.from ();
     evict e;
     record_drop e.hash e.tx Expired "TTL exceeded"
   ) expired;
 
-  Hashtbl.iter (fun addr () ->
-    let has_pending = Hashtbl.fold (fun _ e found ->
-      found || e.tx.Transaction.from = addr) staging false in
-    if not has_pending then begin
-      Hashtbl.remove virtual_balances addr;
-      Hashtbl.remove virtual_nonces addr
-    end
-  ) touched;
-  List.map (fun e -> (e.hash, e.tx)) expired
+  clear_virtual_state touched;
+  List.map (fun (e : entry) -> (e.hash, e.tx)) expired
 
 let staging_total_ou () = !total_ou
 

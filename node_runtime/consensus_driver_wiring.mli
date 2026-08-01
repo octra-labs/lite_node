@@ -94,7 +94,7 @@ type standard_adapters = {
   staging_txs : unit -> Octra_core.Transaction.t list;
   staging_epoch_txs : unit -> Octra_core.Transaction.t list;
   staging_total : unit -> int;
-  remove_rejected : string list -> unit;
+  remove_rejected : Consensus_proposal.preview_reject list -> unit;
   proposer : unit -> string;
   head_txid_hi : unit -> int64 option;
   set_proposal : Octra_core.Transaction.t list -> string list -> unit;
@@ -134,7 +134,7 @@ type deps = {
   staging_txs : unit -> Transaction.t list;
   staging_epoch_txs : unit -> Transaction.t list;
   staging_total : unit -> int;
-  remove_rejected : string list -> unit;
+  remove_rejected : Consensus_proposal.preview_reject list -> unit;
   notify_staging_update : unit -> unit;
   build_preverify : Consensus_preverify_role.build;
   validate_preverify : Consensus_preverify_role.validate;

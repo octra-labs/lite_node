@@ -96,7 +96,7 @@ type standard_adapters = {
   staging_txs : unit -> Transaction.t list;
   staging_epoch_txs : unit -> Transaction.t list;
   staging_total : unit -> int;
-  remove_rejected : string list -> unit;
+  remove_rejected : Consensus_proposal.preview_reject list -> unit;
   proposer : unit -> string;
   head_txid_hi : unit -> int64 option;
   set_proposal : Transaction.t list -> string list -> unit;
@@ -136,7 +136,7 @@ type deps = {
   staging_txs : unit -> Transaction.t list;
   staging_epoch_txs : unit -> Transaction.t list;
   staging_total : unit -> int;
-  remove_rejected : string list -> unit;
+  remove_rejected : Consensus_proposal.preview_reject list -> unit;
   notify_staging_update : unit -> unit;
   build_preverify : Consensus_preverify_role.build;
   validate_preverify : Consensus_preverify_role.validate;
@@ -411,7 +411,16 @@ let node_standard_adapters runtime =
     staging_epoch_txs = (fun () ->
       Staging.get_epoch_txs ~capacity:runtime.staging_epoch_capacity);
     staging_total = (fun () -> List.length (Staging.all ()));
-    remove_rejected = Staging.remove_processed;
+    remove_rejected = (fun rejections ->
+      rejections
+      |> List.map
+           (fun (item : Consensus_proposal.preview_reject) ->
+             Staging.{
+               hash = item.hash;
+               error_type = item.error_type;
+               reason = item.reason;
+             })
+      |> Staging.remove_rejected);
     proposer = (fun () -> runtime.wallet_addr);
     head_txid_hi = (fun () ->
       match runtime.cached_head () with
