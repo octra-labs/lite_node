@@ -20,6 +20,7 @@ type proposal =
 type proposal_bundle = {
   txs : Octra_core.Transaction.t list;
   receipts_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
 }
 
 type finalized_state =
@@ -42,6 +43,7 @@ type finalized_deps = {
 type proposal_deps = {
   cached_proposal_bundle : unit -> proposal_bundle option;
   local_preverify_bundle : unit -> proposal_bundle Lwt.t;
+  local_bundle_valid : proposal_bundle -> bool;
   driver_available : unit -> bool;
   validate_bundle :
     Octra_consensus.C_driver.bundle_response_record ->

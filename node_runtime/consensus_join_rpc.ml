@@ -454,9 +454,19 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
           end
       end
   in
+  let partition =
+    match Octra_core.Tx_outcome.decode ~confirmed:txs record.receipts_json with
+    | Stdlib.Ok value -> value
+    | Stdlib.Error e ->
+      failwith
+        (Printf.sprintf
+           "join outcome mismatch epoch = %Ld reason = %s"
+           record.epoch_id
+           e)
+  in
   (match Octra_core.Preverify_receipt_policy.check
            ~epoch_id:(Int64.to_int record.epoch_id)
-           ~receipts:record.receipts_json
+           ~receipts:partition.preverify
            txs with
    | Stdlib.Ok () -> ()
    | Stdlib.Error e ->

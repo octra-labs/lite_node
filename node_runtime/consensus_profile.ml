@@ -166,7 +166,7 @@ let crypto_engine () =
 
 let circle_hfhe_abi = "bound_range_commitment_v2"
 let program_fhe_abi = "proof_verify_view_only_v1"
-let consensus_rules_id = "pvac_alias_rejection_epoch_time_bound"
+let consensus_rules_id = "finalized_rejection_commitment"
 
 let runtime_env getenv = Startup_runtime_limits.{
   int_value = (fun name default -> int_value getenv name default);

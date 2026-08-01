@@ -38,7 +38,7 @@ let consensus_control_payload_max = 16 * 1024
 let proposal_payload_max = 256 * 1024
 let finalize_payload_max = 1024 * 1024
 let bundle_payload_max = 8 * 1024 * 1024
-let catchup_payload_max = 5 * 1024 * 1024
+let catchup_payload_max = 8 * 1024 * 1024
 let attestation_payload_max = 256 * 1024
 let epoch_payload_max = 8 * 1024 * 1024
 

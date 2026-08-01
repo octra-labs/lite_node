@@ -110,12 +110,8 @@ let first_disabled_bft_tx txs =
     (fun tx -> not (is_shared_bft_tx tx))
     txs
 
-let canonical_order txs =
-  List.sort
-    (fun (a : Transaction.t) (b : Transaction.t) ->
-       let c = String.compare a.Transaction.from b.Transaction.from in
-       if c <> 0 then c else compare a.Transaction.nonce b.Transaction.nonce)
-    txs
+let consensus_order txs =
+  Transaction.consensus_order txs
 
 let process_standard ~backend ~env tx =
   let open Lwt.Syntax in
@@ -143,7 +139,7 @@ let run deps txs =
        | Error (error_type, reason) ->
          deps.reject tx ~error_type ~reason;
          Lwt.return_unit)
-    (canonical_order txs)
+    (consensus_order txs)
 
 let run_standard_or_sender ~consensus_mode (deps : standard_or_sender_deps) txs =
   match consensus_mode, first_disabled_bft_tx txs with

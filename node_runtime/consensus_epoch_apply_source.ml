@@ -13,6 +13,8 @@ type effect =
 type selected = {
   txs : Transaction.t list;
   receipts_json : string list;
+  preverify_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
   effects : effect list;
 }
 
@@ -21,6 +23,7 @@ type fatal =
   | Missing_finalized_header
   | Receipt_root_mismatch of { proposal_id : string }
   | Missing_canonical_bundle of { proposal_id : string }
+  | Outcome_invalid of string
 
 type deps = {
   check_override_receipts :
@@ -94,17 +97,48 @@ let fatal_lines ~epoch_id = function
         (proposal_id_short proposal_id);
       "recovery = restart_node_and_bundle_catchup_or_wipe_state";
     ]
+  | Outcome_invalid error ->
+    [
+      Printf.sprintf
+        "epoch_outcome epoch = %d status = invalid reason = %s action = refuse_apply"
+        epoch_id
+        error;
+    ]
 
 let selected ?(effects = []) txs receipts_json =
-  { txs; receipts_json; effects }
+  match Octra_core.Tx_outcome.split receipts_json with
+  | Error error -> Error (Outcome_invalid error)
+  | Ok partition ->
+    match
+      Octra_core.Tx_outcome.merge
+        ~confirmed:txs
+        ~rejections:partition.rejections
+    with
+    | Error error -> Error (Outcome_invalid error)
+    | Ok _ ->
+      Ok {
+        txs;
+        receipts_json;
+        preverify_json = partition.preverify;
+        rejections = partition.rejections;
+        effects;
+      }
 
 let choose_override (deps : deps) request txs =
   let receipts =
     Option.value request.override_receipts_json ~default:[]
   in
-  match deps.check_override_receipts ~epoch_id:request.epoch_id ~receipts txs with
-  | Ok () -> Ok (selected txs receipts)
-  | Error e -> Error (Override_preverify_failed e)
+  match selected txs receipts with
+  | Error _ as error -> error
+  | Ok selected ->
+    match
+      deps.check_override_receipts
+        ~epoch_id:request.epoch_id
+        ~receipts:selected.preverify_json
+        txs
+    with
+    | Ok () -> Ok selected
+    | Error e -> Error (Override_preverify_failed e)
 
 let choose_consensus (deps : deps) request =
   match deps.find_finalized request.epoch_id with
@@ -115,12 +149,12 @@ let choose_consensus (deps : deps) request =
     match deps.cached_bundle proposal_id with
     | Some (_tx_hashes, txs, receipts_json) ->
       if deps.receipt_root_matches header receipts_json then
-        Ok (selected txs receipts_json)
+        selected txs receipts_json
       else
         Error (Receipt_root_mismatch { proposal_id })
     | None ->
       if deps.header_has_empty_bundle header then
-        Ok (selected [] [] ~effects:[Store_empty_bundle header])
+        selected [] [] ~effects:[Store_empty_bundle header]
       else
         Error (Missing_canonical_bundle { proposal_id })
 
@@ -128,17 +162,24 @@ let choose (deps : deps) request =
   match request.override_ordered_txs with
   | Some txs -> choose_override deps request txs
   | None when request.consensus_mode -> choose_consensus deps request
-  | None -> Ok (selected (deps.staging_txs ()) [])
+  | None -> selected (deps.staging_txs ()) []
 
 let run (deps : deps) request ~apply_effect ~fatal ~exit =
   match choose deps request with
   | Ok selected ->
     List.iter apply_effect selected.effects;
-    selected.txs, selected.receipts_json
+    selected
   | Error error ->
     fatal_lines ~epoch_id:request.epoch_id error
     |> List.iter fatal;
-    exit ()
+    let txs, receipts_json = exit () in
+    {
+      txs;
+      receipts_json;
+      preverify_json = receipts_json;
+      rejections = [];
+      effects = [];
+    }
 
 let deps_of_node (deps : node_deps) =
   {

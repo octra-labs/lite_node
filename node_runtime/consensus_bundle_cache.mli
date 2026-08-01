@@ -9,6 +9,7 @@ type decoded = {
   tx_hashes : string list;
   txs : Transaction.t list;
   receipts_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
 }
 
 type frozen = {

@@ -14,6 +14,7 @@ type deps = {
   bft_mode : unit -> bool;
   account_path_profile_enabled : bool;
   swarm : unit -> Octra_net.P2p_swarm.t option;
+  find_drop : string -> Octra_core.Tx_drop.row option;
 }
 
 type config = {

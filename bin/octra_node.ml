@@ -9,6 +9,7 @@ module Webhooks = Octra_core.Webhooks
 module Epochlog = Octra_core.Epochlog
 module Store_chaindata = Octra_core.Store_chaindata
 module Store_irmin = Octra_core.Store_irmin
+module Tx_drop = Octra_core.Tx_drop
 module Pvac_migration_entitlement = Octra_core.Pvac_migration_entitlement
 module Pvac_verify_worker = Octra_core.Pvac_verify_worker
 module Consensus_catchup_shell = Octra_node_runtime.Consensus_catchup_shell
@@ -20,11 +21,13 @@ module Consensus_epoch_apply_checked = Octra_node_runtime.Consensus_epoch_apply_
 module Consensus_epoch_apply_env = Octra_node_runtime.Consensus_epoch_apply_env
 module Consensus_epoch_apply_finish_shell = Octra_node_runtime.Consensus_epoch_apply_finish_shell
 module Consensus_epoch_apply_shared = Octra_node_runtime.Consensus_epoch_apply_shared
+module Consensus_epoch_apply_sender = Octra_node_runtime.Consensus_epoch_apply_sender
 module Consensus_epoch_apply_source = Octra_node_runtime.Consensus_epoch_apply_source
 module Consensus_epoch_apply_start_shell = Octra_node_runtime.Consensus_epoch_apply_start_shell
 module Consensus_finality_state = Octra_node_runtime.Consensus_finality_state
 module Consensus_join_rpc = Octra_node_runtime.Consensus_join_rpc
 module Consensus_key_switch_preverify = Octra_node_runtime.Consensus_key_switch_preverify
+module Consensus_private_preverify = Octra_node_runtime.Consensus_private_preverify
 module Consensus_preverify_role = Octra_node_runtime.Consensus_preverify_role
 module Consensus_proposal_preview_shell = Octra_node_runtime.Consensus_proposal_preview_shell
 module Consensus_proposal_state = Octra_node_runtime.Consensus_proposal_state
@@ -106,6 +109,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~init_mode
       ~data_dir
       ~exit_fatal:exit_error;
+    let drop_db = Tx_drop.open_db data_dir in
+    let save_drops drops =
+      match Tx_drop.save_many drop_db (List.map Staging.drop_row drops) with
+      | Ok () -> ()
+      | Error reason ->
+        Log.warn "staging"
+          "event = drop_persist_failed reason = %s"
+          reason
+    in
 
     let startup_network =
       Startup_process_shell.network_config ~env:env_opt
@@ -430,6 +442,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let Consensus_epoch_apply_start_shell.{
       ordered_txs;
       epoch_receipts_json;
+      preverify_receipts_json;
+      epoch_rejections;
       epoch_start;
       pending_tx_saves;
       confirmed_fees;
@@ -443,7 +457,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       match
         Octra_core.Preverify_commit.gate_of_strings
           ~required:consensus_mode
-          epoch_receipts_json
+          preverify_receipts_json
       with
       | Ok gate -> gate
       | Error reason ->
@@ -495,6 +509,25 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ordered_txs
     in
     let deferred_stealth_txs = shared_result.deferred_stealth_txs in
+    let epoch_ts =
+      match epoch_env.Consensus_epoch_apply_env.epoch_ts !current_epoch with
+      | Some value -> value
+      | None -> failwith "finalized epoch timestamp missing"
+    in
+    begin
+      match
+        Consensus_epoch_apply_sender.save_live_rejections
+          ~chaindata
+          ~epoch_id:!current_epoch
+          ~ts:epoch_ts
+          ~processed_hashes
+          ~notify_rejected:(fun tx reason ->
+            Webhooks.notify (Webhooks.TxRejected (tx, reason)))
+          epoch_rejections
+      with
+      | Ok () -> ()
+      | Error error -> failwith ("finalized rejection persist failed: " ^ error)
+    end;
     let* _finish =
       Consensus_epoch_apply_finish_shell.run_node
         Consensus_epoch_apply_finish_shell.{
@@ -502,6 +535,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           store;
           ledger;
           chaindata;
+          save_drops;
           finality_state;
           current_epoch;
           last_epoch_time;
@@ -730,10 +764,17 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let key_switch_preverify =
       Consensus_key_switch_preverify.create ledger
     in
-    List.iter
-      (fun tx ->
-         ignore (Consensus_key_switch_preverify.admit key_switch_preverify tx))
-      (Staging.all ());
+    let private_preverify =
+      Consensus_private_preverify.create
+        ~result_policy:(fun () -> private_result_policy !current_epoch)
+        ledger
+    in
+    if consensus_mode then
+      List.iter
+        (fun tx ->
+           ignore (Consensus_key_switch_preverify.admit key_switch_preverify tx);
+           ignore (Consensus_private_preverify.admit private_preverify tx))
+        (Staging.all ());
     let stealth_preverify =
       Preverify_submit.{
         get_pvac_pubkey =
@@ -754,27 +795,42 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       }
     in
     let preverify_admit tx =
-      Consensus_key_switch_preverify.retain
-        key_switch_preverify
-        (fun hash -> Option.is_some (Staging.find_by_hash hash));
-      ignore (Consensus_key_switch_preverify.admit key_switch_preverify tx);
-      match
-        Preverify_submit.launch_for_tx
-          stealth_preverify
-          ~tx_hash:(Transaction.hash tx)
-          tx
-      with
-      | Preverify_submit.Busy ->
-        Error
-          (Printf.sprintf
-             "pre_verify_busy pending = %d limit = %d"
-             (Preverify_cache.pending_count ())
-             (Preverify_cache.pending_max ()))
-      | Preverify_submit.Unmanaged
-      | Preverify_submit.Started
-      | Preverify_submit.Existing -> Ok ()
+      if consensus_mode then begin
+        Consensus_key_switch_preverify.retain
+          key_switch_preverify
+          (fun hash -> Option.is_some (Staging.find_by_hash hash));
+        Consensus_private_preverify.retain
+          private_preverify
+          (fun hash -> Option.is_some (Staging.find_by_hash hash));
+        ignore (Consensus_key_switch_preverify.admit key_switch_preverify tx);
+        ignore (Consensus_private_preverify.admit private_preverify tx);
+        Ok ()
+      end
+      else
+        match
+          Preverify_submit.launch_for_tx
+            stealth_preverify
+            ~tx_hash:(Transaction.hash tx)
+            tx
+        with
+        | Preverify_submit.Busy ->
+          Error
+            (Printf.sprintf
+               "pre_verify_busy pending = %d limit = %d"
+               (Preverify_cache.pending_count ())
+               (Preverify_cache.pending_max ()))
+        | Preverify_submit.Unmanaged
+        | Preverify_submit.Started
+        | Preverify_submit.Existing -> Ok ()
     in
-    let rest_runtime = Rest.{ swarm_ref; preverify_admit } in
+    let rest_runtime =
+      Rest.{
+        swarm_ref;
+        preverify_admit;
+        save_drops;
+        find_drop = Tx_drop.find drop_db;
+      }
+    in
     let run_preverify prepared txs =
       Octra_core.Preverify_worker.run_many
         ~ledger
@@ -791,14 +847,27 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~prepared
         txs
     in
+    let prepared_lookup private_lookup key_switch_lookup tx =
+      let open Lwt.Syntax in
+      let* available = private_lookup tx in
+      match available with
+      | Octra_core.Preverify_availability.Unmanaged -> key_switch_lookup tx
+      | Octra_core.Preverify_availability.Pending
+      | Octra_core.Preverify_availability.Ready _
+      | Octra_core.Preverify_availability.Invalid _ -> Lwt.return available
+    in
     let build_preverify =
       run_preverify
-        (Consensus_key_switch_preverify.observe key_switch_preverify)
+        (prepared_lookup
+           (Consensus_private_preverify.observe private_preverify)
+           (Consensus_key_switch_preverify.observe key_switch_preverify))
       |> Consensus_preverify_role.build
     in
     let validate_preverify =
       run_preverify
-        (Consensus_key_switch_preverify.await key_switch_preverify)
+        (prepared_lookup
+           (Consensus_private_preverify.await private_preverify)
+           (Consensus_key_switch_preverify.await key_switch_preverify))
       |> Consensus_preverify_role.validate
     in
     Consensus_driver_boot_shell.run
@@ -875,7 +944,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         mark_quarantine;
         validator_pubkeys_for_epoch;
         proposal_capacity = Staging.max_ou_per_epoch;
-        notify_staging_update = Rest.notify_staging_update;
         quarantine_mismatch_threshold;
         soft_catchup_max_lag;
         quarantine_ahead_streak_threshold;

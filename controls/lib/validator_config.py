@@ -20,6 +20,7 @@ from validator_common import ensure_wallet
 from validator_common import exporter_entries
 from validator_common import load_wallet
 from validator_common import load_network
+from validator_common import parse_env
 from validator_common import read_digest
 from validator_common import rpc_url
 from validator_common import sha256_file
@@ -74,6 +75,63 @@ OPAM_ROOT = TOOLCHAIN_ROOT / "opam"
 
 def operator_pm2_name(name):
     return name if name.startswith("octra-") else f"octra-{name}"
+
+def runtime_binding(config):
+    key_dir = ROOT / ".keys/validator"
+    return {
+        "OCTRA_BINARY_HASH": sha256_file(DEFAULT_BINARY),
+        "OCTRA_OPERATOR_BINARY": str(DEFAULT_BINARY.resolve()),
+        "OCTRA_OPERATOR_CONFIG": str(Path(config).resolve()),
+        "OCTRA_OPERATOR_CONTROL_BINARY": str(DEFAULT_CONTROL_BINARY.resolve()),
+        "OCTRA_OPERATOR_CONTROL_BINARY_HASH": sha256_file(DEFAULT_CONTROL_BINARY),
+        "OCTRA_OPERATOR_LOG_DIR": str((ROOT / "data/operator_logs").resolve()),
+        "OCTRA_OPERATOR_NETWORK_BUNDLE": str((key_dir / "network.env").resolve()),
+        "OCTRA_OPERATOR_SYNC_BINARY": str(DEFAULT_SYNC_BINARY.resolve()),
+        "OCTRA_OPERATOR_SYNC_BINARY_HASH": sha256_file(DEFAULT_SYNC_BINARY),
+        "OCTRA_PVAC_VERIFY_WORKER": str(DEFAULT_WORKER.resolve()),
+        "OCTRA_PVAC_VERIFY_WORKER_HASH": sha256_file(DEFAULT_WORKER),
+    }
+
+def require_runtime_files():
+    files = [
+        DEFAULT_BINARY,
+        DEFAULT_CONTROL_BINARY,
+        DEFAULT_SYNC_BINARY,
+        DEFAULT_WORKER,
+    ]
+    missing = [str(path) for path in files if not path.is_file()]
+    if missing:
+        raise ValidatorError("candidate files are missing: " + ",".join(missing))
+
+def require_network_binding(values):
+    expected = values.get("OCTRA_OPERATOR_NETWORK_SHA256", "")
+    packaged = ROOT / "config/network.env"
+    installed = ROOT / ".keys/validator/network.env"
+    if not expected:
+        raise ValidatorError("network hash is missing from node config")
+    for path in (packaged, installed):
+        if not path.is_file() or sha256_file(path) != expected:
+            raise ValidatorError(f"candidate network bundle mismatch: {path}")
+
+def require_runtime_binding(config):
+    values = parse_env(config)
+    require_runtime_files()
+    require_network_binding(values)
+    expected = runtime_binding(config)
+    stale = [key for key, value in expected.items() if values.get(key) != value]
+    if stale:
+        raise ValidatorError(
+            "candidate paths are stale; run controls/run.sh --rebind-runtime: "
+            + ",".join(stale)
+        )
+
+def rebind_runtime(config):
+    values = parse_env(config)
+    require_runtime_files()
+    require_network_binding(values)
+    write_env(config, {**values, **runtime_binding(config)})
+    require_runtime_binding(config)
+    emit(event="runtime_binding", status="ready", root=ROOT)
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
@@ -576,6 +634,7 @@ def parser():
     value.add_argument("--api-port", default="8080")
     value.add_argument("--binary", default=str(DEFAULT_BINARY))
     value.add_argument("--build", action="store_true")
+    value.add_argument("--check-runtime", action="store_true")
     value.add_argument("--config", default=str(DEFAULT_CONFIG))
     value.add_argument("--consensus-port", default="19000")
     value.add_argument("--control-binary", default=str(DEFAULT_CONTROL_BINARY))
@@ -587,6 +646,7 @@ def parser():
     value.add_argument("--network-sha")
     value.add_argument("--p2p-port", default="9000")
     value.add_argument("--role", choices=["observer", "validator"])
+    value.add_argument("--rebind-runtime", action="store_true")
     value.add_argument("--rpc", default="https://devnet.octrascan.io/rpc")
     value.add_argument("--sync", action="store_true")
     value.add_argument("--sync-binary", default=str(DEFAULT_SYNC_BINARY))
@@ -600,6 +660,14 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.check_runtime and args.rebind_runtime:
+        raise ValidatorError("runtime check and rebind are mutually exclusive")
+    if args.check_runtime:
+        require_runtime_binding(args.config)
+        return
+    if args.rebind_runtime:
+        rebind_runtime(args.config)
+        return
     install = args.install
     if not args.yes and not install and missing_runtime():
         install = ask_bool("Install validator runtime packages", True)

@@ -14,7 +14,7 @@ let max_round = 1_000_000
 let max_proposal_txs = 2_048
 let max_validators = 4_096
 let max_catchup_records = 16
-let max_json_bytes = 5_000_000
+let max_json_bytes = 8 * 1024 * 1024
 
 type round_sync = {
   chain_id : string;

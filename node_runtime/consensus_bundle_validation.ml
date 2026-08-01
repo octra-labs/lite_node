@@ -9,6 +9,7 @@ type accepted = {
   tx_hashes : string list;
   txs : Transaction.t list;
   receipts_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
 }
 
 let parse_txs txs_json =
@@ -37,10 +38,24 @@ let tx_list_hash_matches header tx_hashes =
   in
   tx_list_hash = header.C_types.tx_list_hash
 
-let preverify receipts_json txs =
-  match Octra_core.Preverify_commit.check_strings receipts_json txs with
-  | Ok () -> Ok ()
-  | Error e -> Error ("bundle preverify: " ^ e)
+let artifacts receipts_json txs =
+  match Octra_core.Tx_outcome.split receipts_json with
+  | Error error -> Error ("bundle outcome: " ^ error)
+  | Ok artifacts ->
+    begin
+      match
+        Octra_core.Preverify_commit.check_strings artifacts.preverify txs
+      with
+      | Error error -> Error ("bundle preverify: " ^ error)
+      | Ok () ->
+        match
+          Octra_core.Tx_outcome.merge
+            ~confirmed:txs
+            ~rejections:artifacts.rejections
+        with
+        | Error error -> Error ("bundle outcome: " ^ error)
+        | Ok _ -> Ok artifacts
+    end
 
 let response_hashes r =
   List.map Text.hash32_hex r.C_driver.tx_hashes
@@ -61,13 +76,14 @@ let finalized ~header (r : C_driver.bundle_response_record) =
       else if not (receipt_root_matches header r.receipts_json) then
         Error "bundle receipt_root mismatch"
       else
-        match preverify r.receipts_json txs with
+        match artifacts r.receipts_json txs with
         | Error _ as e -> e
-        | Ok () ->
+        | Ok artifacts ->
           Ok {
             tx_hashes;
             txs;
             receipts_json = r.receipts_json;
+            rejections = artifacts.rejections;
           }
 
 let proposal ~header ~expected_hashes (r : C_driver.bundle_response_record) =
@@ -85,11 +101,12 @@ let proposal ~header ~expected_hashes (r : C_driver.bundle_response_record) =
       if recomputed <> expected_hashes then
         Error "bundle tx hash mismatch"
       else
-        match preverify r.receipts_json txs with
+        match artifacts r.receipts_json txs with
         | Error _ as e -> e
-        | Ok () ->
+        | Ok artifacts ->
           Ok {
             tx_hashes = expected_hashes;
             txs;
             receipts_json = r.receipts_json;
+            rejections = artifacts.rejections;
           }

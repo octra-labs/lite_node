@@ -79,6 +79,12 @@ type live_tx_sink_deps = {
   processed_hashes : string list ref;
 }
 
+type rejection_sink_effects = {
+  save_rejected : rejected_record -> unit;
+  warn_rejected : string -> unit;
+  notify_rejected : Transaction.t -> string -> unit;
+}
+
 type ('backend, 'env) epoch_exec_deps = {
   backend : unit -> 'backend;
   standard_env : unit -> 'env;
@@ -141,6 +147,23 @@ val make_tx_sink :
 val live_tx_sink :
   live_tx_sink_deps ->
   tx_sink
+
+val save_rejections :
+  epoch_id:int ->
+  ts:float ->
+  processed_hashes:string list ref ->
+  rejection_sink_effects ->
+  Octra_core.Tx_outcome.rejection list ->
+  (unit, string) result
+
+val save_live_rejections :
+  chaindata:Octra_core.Store_chaindata.t ->
+  epoch_id:int ->
+  ts:float ->
+  processed_hashes:string list ref ->
+  notify_rejected:(Transaction.t -> string -> unit) ->
+  Octra_core.Tx_outcome.rejection list ->
+  (unit, string) result
 
 val nonce_mismatch_reason : expected:int -> got:int -> string
 

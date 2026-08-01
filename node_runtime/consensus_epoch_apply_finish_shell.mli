@@ -65,6 +65,7 @@ type node_deps = {
   store : Octra_core.Store_irmin.t;
   ledger : Octra_core.Ledger.t;
   chaindata : Octra_core.Store_chaindata.t;
+  save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   finality_state : Consensus_finality_state.t;
   current_epoch : int ref;
   last_epoch_time : float ref;

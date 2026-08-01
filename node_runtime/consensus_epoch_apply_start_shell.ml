@@ -32,6 +32,8 @@ type request = {
 type result = {
   ordered_txs : Transaction.t list;
   epoch_receipts_json : string list;
+  preverify_receipts_json : string list;
+  epoch_rejections : Octra_core.Tx_outcome.rejection list;
   epoch_start : float;
   pending_tx_saves : (Transaction.t * int) list ref;
   confirmed_fees : Z.t ref;
@@ -50,9 +52,9 @@ let source_request (request : request) =
   }
 
 let run deps request =
-  let ordered_txs, epoch_receipts_json =
-    Source.run_node deps.source (source_request request)
-  in
+  let selected = Source.run_node deps.source (source_request request) in
+  let ordered_txs = selected.Source.txs in
+  let epoch_receipts_json = selected.receipts_json in
   let epoch_start = deps.now () in
   let pending_tx_saves : (Transaction.t * int) list ref = ref [] in
   let confirmed_fees = ref Z.zero in
@@ -72,6 +74,8 @@ let run deps request =
   Lwt.return {
     ordered_txs;
     epoch_receipts_json;
+    preverify_receipts_json = selected.preverify_json;
+    epoch_rejections = selected.rejections;
     epoch_start;
     pending_tx_saves;
     confirmed_fees;

@@ -496,6 +496,17 @@ let hash tx =
   |> Digestif.SHA256.digest_string
   |> Digestif.SHA256.to_hex
 
+let compare_consensus a b =
+  let sender = String.compare a.from b.from in
+  if sender <> 0 then sender
+  else
+    let nonce = compare a.nonce b.nonce in
+    if nonce <> 0 then nonce
+    else String.compare (hash a) (hash b)
+
+let consensus_order txs =
+  List.sort compare_consensus txs
+
 let parse_raw_json s =
   match Yojson.Safe.from_string s |> of_yojson with
   | Ok t -> Some t | _ -> None

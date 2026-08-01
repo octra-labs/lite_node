@@ -81,7 +81,6 @@ type deps = {
     epoch:int ->
     (string * string) list;
   proposal_capacity : Z.t;
-  notify_staging_update : unit -> unit;
   quarantine_mismatch_threshold : int;
   soft_catchup_max_lag : int;
   quarantine_ahead_streak_threshold : int;
@@ -475,7 +474,6 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
     read_local_ledger_root_raw = deps.read_local_ledger_root_raw;
     sleep = deps.sleep;
     quarantine_mismatch_threshold = deps.quarantine_mismatch_threshold;
-    notify_staging_update = deps.notify_staging_update;
     build_preverify = deps.build_preverify;
     validate_preverify = deps.validate_preverify;
     proposal_bundles = deps.proposal_bundles;

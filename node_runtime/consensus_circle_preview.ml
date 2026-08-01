@@ -15,7 +15,7 @@ let fail effects tag reason =
   with error ->
     Lwt.return
       (Error
-         ("circle_call_rollback_failed", Printexc.to_string error))
+         ("circle_call_rollback_exception", Printexc.to_string error))
 
 let fail_after_fee effects backend tx error_type reason =
   try
@@ -38,7 +38,7 @@ let fail_after_fee effects backend tx error_type reason =
   with error ->
     Lwt.return
       (Error
-         ("circle_call_rollback_failed", Printexc.to_string error))
+         ("circle_call_rollback_exception", Printexc.to_string error))
 
 let reject_plan effects rejected =
   let rejected = Call_plan.direct_exec_reject Call_plan.Circle_exec rejected in

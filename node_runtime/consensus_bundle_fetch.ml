@@ -22,6 +22,7 @@ type proposal =
 type proposal_bundle = {
   txs : Octra_core.Transaction.t list;
   receipts_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
 }
 
 type finalized_state =
@@ -42,6 +43,7 @@ type finalized_deps = {
 type proposal_deps = {
   cached_proposal_bundle : unit -> proposal_bundle option;
   local_preverify_bundle : unit -> proposal_bundle Lwt.t;
+  local_bundle_valid : proposal_bundle -> bool;
   driver_available : unit -> bool;
   validate_bundle : C_driver.bundle_response_record -> Bundle.accepted option;
   query_bundle :
@@ -74,6 +76,7 @@ let proposal_bundle_of_accepted bundle =
   {
     txs = bundle.Bundle.txs;
     receipts_json = bundle.receipts_json;
+    rejections = bundle.rejections;
   }
 
 let fetch_finalized (deps : finalized_deps) ~epoch_id =
@@ -161,6 +164,22 @@ let fetch_proposal (deps : proposal_deps) ~local_tx_count ~expected_hash_count =
       ~local_tx_count
       ~expected_hash_count
 
+let local_complete_or_fetch (deps : proposal_deps) ~local_tx_count
+    ~expected_hash_count =
+  let open Lwt.Syntax in
+  let* local = deps.local_preverify_bundle () in
+  if deps.local_bundle_valid local then
+    Lwt.return local
+  else if deps.driver_available () then begin
+    Log.info "consensus"
+      "verify_proposal committed_bundle = fetch_outcome_artifacts";
+    fetch_proposal deps ~local_tx_count ~expected_hash_count
+  end else begin
+    Log.warn "consensus"
+      "verify_proposal committed_bundle = local_root_mismatch driver = unavailable";
+    Lwt.return local
+  end
+
 let ensure_proposal (deps : proposal_deps) ~epoch_id:_ ~proposal_id_short ~expected_hash_count
     ~local_tx_count ~missing_count ~hashes_empty =
   match deps.cached_proposal_bundle () with
@@ -171,10 +190,9 @@ let ensure_proposal (deps : proposal_deps) ~epoch_id:_ ~proposal_id_short ~expec
       (List.length bundle.txs);
     Lwt.return bundle
   | None when hashes_empty ->
-    Lwt.return { txs = []; receipts_json = [] }
+    Lwt.return { txs = []; receipts_json = []; rejections = [] }
   | None when missing_count = 0 ->
-    local_proposal_fallback deps
-      ~reason:"local_complete"
+    local_complete_or_fetch deps
       ~local_tx_count
       ~expected_hash_count
   | None ->

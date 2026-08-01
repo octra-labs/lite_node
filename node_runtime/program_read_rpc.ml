@@ -36,14 +36,28 @@ let compile_rpc handler input =
       (Octra_core.Rpc.err (-32005) "Program compiler busy" None)
   else begin
     compile_active := true;
-    Lwt.finalize
+    Lwt.catch
       (fun () ->
-        Lwt_preemptive.detach
-          (fun () -> immediate (handler input))
-          ())
-      (fun () ->
-        compile_active := false;
-        Lwt.return_unit)
+        Lwt.finalize
+          (fun () ->
+            Lwt_preemptive.detach
+              (fun () -> immediate (handler input))
+              ())
+          (fun () ->
+            compile_active := false;
+            Lwt.return_unit))
+      (function
+        | Out_of_memory as error -> Lwt.fail error
+        | Lwt.Canceled as error -> Lwt.fail error
+        | Stack_overflow ->
+          Lwt.return_error
+            (Octra_core.Rpc.err
+               (-32000)
+               "Program compiler complexity limit exceeded"
+               None)
+        | _ ->
+          Lwt.return_error
+            (Octra_core.Rpc.err (-32000) "Program compiler failed" None))
   end
 
 let dispatch adapters =

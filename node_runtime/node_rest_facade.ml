@@ -14,6 +14,8 @@ module Wallet = Octra_core.Crypto.Wallet
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
   preverify_admit : Transaction.t -> (unit, string) result;
+  save_drops : Staging.drop_record list -> unit;
+  find_drop : string -> Octra_core.Tx_drop.row option;
 }
 
 let cli_has_flag name =
@@ -75,7 +77,8 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
       in
       match Staging.add_smart ~lookup tx with
       | Error e -> Error e
-      | Ok _ ->
+      | Ok drops ->
+        runtime.save_drops drops;
         begin
           let admission =
             try runtime.preverify_admit tx
@@ -196,6 +199,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     bft_mode;
     account_path_profile_enabled = Env.flag "OCTRA_PROFILE_ACCOUNT_PATHS";
     swarm = (fun () -> !(runtime.swarm_ref));
+    find_drop = runtime.find_drop;
   } in
   Node_rpc_server.start Node_rpc_server.{
     port;

@@ -9,6 +9,7 @@ module Transaction = Octra_core.Transaction
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result Lwt.t
 
 type 'handler dispatch_adapters = {
+  transaction : 'handler;
   chaindata_params_read :
     (Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
@@ -125,7 +126,7 @@ let lookup_confirmed_tx_with_heal chaindata txh =
 let confirmed_tx_epoch_with_heal chaindata hash =
   Option.map fst (lookup_confirmed_tx_with_heal chaindata hash)
 
-let transaction chaindata ~params =
+let transaction ~find_drop chaindata ~params =
   match Rpc.require_hash params 0 "hash" with
   | Error e ->
     err e
@@ -143,7 +144,21 @@ let transaction chaindata ~params =
       if Option.is_some pending || Option.is_some confirmed ||
          Option.is_some rejected
       then None
-      else Staging.lookup_dropped txh
+      else
+        match Staging.lookup_dropped txh with
+        | Some _ as row -> row
+        | None ->
+          Option.map
+            (fun row ->
+               (row.Octra_core.Tx_drop.reason,
+                row.detail,
+                row.dropped_at,
+                row.from_addr,
+                row.to_addr,
+                row.nonce,
+                row.ou,
+                row.op_type))
+            (find_drop txh)
     in
     match
       Tx_view.transaction_lookup_response
@@ -432,7 +447,7 @@ let transactions_by_epoch chaindata ~params ~current_epoch_id =
 
 let dispatch adapters =
   [
-    "octra_transaction", adapters.chaindata_params_read transaction;
+    "octra_transaction", adapters.transaction;
     "octra_transactions", adapters.chaindata_params_read transactions;
     "octra_recentTransactions", adapters.chaindata_params_read recent_transactions;
     "octra_transactionsByAddress", adapters.chaindata_address_read transactions_by_address;

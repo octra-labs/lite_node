@@ -42,6 +42,17 @@ let map_size_default = 64 * 1024 * 1024 * 1024
 let addr_recent_limit = 128
 let copy s = Bytes.unsafe_to_string (Bytes.of_string s)
 
+let rejected_addr_ref ~epoch_id ~hash =
+  Printf.sprintf "~%020d:%s" epoch_id hash
+
+let rejected_hash_of_addr_ref value =
+  if String.length value > 22
+     && value.[0] = '~'
+     && value.[21] = ':' then
+    String.sub value 22 (String.length value - 22)
+  else
+    value
+
 let open_index_map readonly card ~key ~value ~name env =
   if readonly then
     Lmdb.Map.open_existing card ~key ~value ~name env
@@ -362,7 +373,9 @@ let commit_write t =
           ) b.epochs;
           List.iter (fun (hash, addr, json, epoch_id) ->
             Lmdb.Map.set t.rejected ~txn hash json;
-            (try Lmdb.Map.add t.rej_addr ~txn addr hash with Lmdb.Exists -> ());
+            (try Lmdb.Map.remove t.rej_addr ~txn ~value:hash addr with Not_found -> ());
+            let addr_ref = rejected_addr_ref ~epoch_id ~hash in
+            (try Lmdb.Map.add t.rej_addr ~txn addr addr_ref with Lmdb.Exists -> ());
             (try Lmdb.Map.add t.rej_epoch ~txn (Int32.of_int epoch_id) hash with Lmdb.Exists -> ())
           ) (List.rev b.rejected);
           List.iter (fun (tx_hash, json) ->
@@ -538,10 +551,10 @@ let rejected_by_addr t addr ~limit ~offset =
         let n = ref 0 in
         (try
           let (_, v0) = Lmdb.Cursor.current c in
-          acc := copy v0 :: !acc; incr n;
+          acc := rejected_hash_of_addr_ref (copy v0) :: !acc; incr n;
           while !n < max_to_collect do
             let v = Lmdb.Cursor.next_dup c in
-            acc := copy v :: !acc; incr n
+            acc := rejected_hash_of_addr_ref (copy v) :: !acc; incr n
           done
         with Not_found -> ());
         List.rev !acc
@@ -568,10 +581,10 @@ let rejected_by_addr_rev t addr ~limit ~offset =
         let n = ref 0 in
         (try
           let (_, v0) = Lmdb.Cursor.current c in
-          acc := copy v0 :: !acc; incr n;
+          acc := rejected_hash_of_addr_ref (copy v0) :: !acc; incr n;
           while !n < max_to_collect do
             let v = Lmdb.Cursor.prev_dup c in
-            acc := copy v :: !acc; incr n
+            acc := rejected_hash_of_addr_ref (copy v) :: !acc; incr n
           done
         with Not_found -> ());
         List.rev !acc

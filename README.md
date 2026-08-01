@@ -1,9 +1,8 @@
 ## Octra Lite Node
 
 This repository provides a complete, lightweight Node implementation for the Octra Network, offering full support for all runtime types, virtual machines, isolated execution environments, data storage, and distribution protocols. It also supports all core support and call-execution modules. You can combine nodes into your own private network — without participating in the main network — and subsequently configure synchronization with the main network to achieve maximum data isolation, should the need arise.
-Please note that this package will be updated over time to establish a canonical version, taking into account factors such as new node connections, load handling, and test results.
 
-For the light node, you might also consider using a Raspberry Pi, as shown in this post:
+For the lite node, you might also consider using a Raspberry Pi, as shown in this post:
 https://x.com/lambda0xE/status/2060325624426705227?s=20
 
 ## Toolchain
@@ -27,6 +26,7 @@ cd /opt/octra/libv_litecore
 
 ```bash
 opam install . --deps-only --with-test --locked
+mkdir -p mcl/obj mcl/lib
 make -C mcl MCL_FP_BIT=256 MCL_FR_BIT=256 lib/libmcl.a
 opam exec -- dune build --root . --profile release \
   bin/octra_node.exe \

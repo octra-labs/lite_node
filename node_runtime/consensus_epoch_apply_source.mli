@@ -12,6 +12,8 @@ type effect =
 type selected = {
   txs : Transaction.t list;
   receipts_json : string list;
+  preverify_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
   effects : effect list;
 }
 
@@ -20,6 +22,7 @@ type fatal =
   | Missing_finalized_header
   | Receipt_root_mismatch of { proposal_id : string }
   | Missing_canonical_bundle of { proposal_id : string }
+  | Outcome_invalid of string
 
 type deps = {
   check_override_receipts :
@@ -69,8 +72,8 @@ val run :
   apply_effect:(effect -> unit) ->
   fatal:(string -> unit) ->
   exit:(unit -> Transaction.t list * string list) ->
-  Transaction.t list * string list
+  selected
 val run_node :
   node_deps ->
   request ->
-  Transaction.t list * string list
+  selected

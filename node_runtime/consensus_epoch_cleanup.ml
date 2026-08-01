@@ -17,7 +17,8 @@ type deps = {
   remove_processed : string list -> unit;
   clear_deferred : unit -> int;
   reset_private_counters : unit -> unit;
-  expire_old_count : unit -> int;
+  expire_old : unit -> Staging.drop_record list;
+  save_drops : Staging.drop_record list -> unit;
   cleanup_dropped : unit -> unit;
   sweep_low_fee : unit -> unit;
   retain_live_preverify : unit -> unit;
@@ -45,10 +46,11 @@ type node_refs = {
   stealth_in_epoch_counter : int ref;
   fhe_in_epoch_counter : int ref;
   swarm_opt : P2p_swarm.t option ref;
+  save_drops : Staging.drop_record list -> unit;
 }
 
 let refs ~last_epoch_time ~tree ~deferred_stealth_txs
-    ~stealth_in_epoch_counter ~fhe_in_epoch_counter ~swarm_opt =
+    ~stealth_in_epoch_counter ~fhe_in_epoch_counter ~swarm_opt ~save_drops =
   {
     last_epoch_time;
     tree;
@@ -56,6 +58,7 @@ let refs ~last_epoch_time ~tree ~deferred_stealth_txs
     stealth_in_epoch_counter;
     fhe_in_epoch_counter;
     swarm_opt;
+    save_drops;
   }
 
 let cleanup deps ctx =
@@ -66,8 +69,11 @@ let cleanup deps ctx =
   let deferred = deps.clear_deferred () in
   if deferred > 0 then deps.log_deferred deferred;
   deps.reset_private_counters ();
-  let expired = deps.expire_old_count () in
-  if expired > 0 then deps.log_expired expired;
+  let expired = deps.expire_old () in
+  if expired <> [] then begin
+    deps.save_drops expired;
+    deps.log_expired (List.length expired)
+  end;
   deps.cleanup_dropped ();
   deps.sweep_low_fee ();
   deps.retain_live_preverify ();
@@ -121,7 +127,8 @@ let node_deps refs =
     reset_private_counters = (fun () ->
       refs.stealth_in_epoch_counter := 0;
       refs.fhe_in_epoch_counter := 0);
-    expire_old_count = (fun () -> List.length (Staging.expire_old ()));
+    expire_old = Staging.expire_old;
+    save_drops = refs.save_drops;
     cleanup_dropped = Staging.cleanup_dropped;
     sweep_low_fee = (fun () -> ignore (Node_rest_facade.sweep_low_fee_stealth ()));
     retain_live_preverify = (fun () ->

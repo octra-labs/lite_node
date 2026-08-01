@@ -69,6 +69,7 @@ type node_effects = {
   data_dir : string;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
+  save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   irmin_last_epoch : unit -> int;
   exit : unit -> unit;
 }
@@ -237,7 +238,8 @@ let node_effects refs effects input =
           ~deferred_stealth_txs:refs.deferred_stealth_txs
           ~stealth_in_epoch_counter:refs.stealth_in_epoch_counter
           ~fhe_in_epoch_counter:refs.fhe_in_epoch_counter
-          ~swarm_opt:refs.swarm_opt)
+          ~swarm_opt:refs.swarm_opt
+          ~save_drops:effects.save_drops)
         {
           now = input.now;
           epoch_id;

@@ -196,64 +196,13 @@ let source_binding ledger pre_state_hash tx =
         transition_hash = None;
       }
 
-let plan_result make task =
+let verify_private result_policy ledger tx =
   let open Lwt.Syntax in
-  let* result = task in
-  match result with
-  | Ok plan -> Lwt.return_ok (make plan)
-  | Error failure -> Lwt.return_error failure.Private_ledger.reason
-
-let verify_encrypt result_policy ledger tx =
-  plan_result
-    (fun plan -> Private_ledger.Prepared_encrypt plan)
-    (Private_ledger.encrypt_plan ~result_policy ledger tx)
-
-let verify_decrypt result_policy ledger tx =
-  plan_result
-    (fun plan -> Private_ledger.Prepared_decrypt plan)
-    (Private_ledger.decrypt_plan ~result_policy ledger tx)
-
-let verify_stealth result_policy ledger tx =
-  let open Lwt.Syntax in
-  let* plan = Private_ledger.stealth_plan ~result_policy ledger tx in
-  match plan with
-  | Error failure -> Lwt.return_error failure.Private_ledger.reason
-  | Ok plan ->
-    let* range = Private_ledger.stealth_inline_range ledger tx plan in
-    begin
-      match range with
-      | Error failure -> Lwt.return_error failure.Private_ledger.reason
-      | Ok range ->
-        begin
-          match Private_ledger.stealth_accept_range range with
-          | Error failure -> Lwt.return_error failure.Private_ledger.reason
-          | Ok () ->
-            let* binding = Private_ledger.stealth_binding ledger tx plan in
-            begin
-              match binding with
-              | Error failure ->
-                Lwt.return_error failure.Private_ledger.reason
-              | Ok () ->
-                Lwt.return_ok (Private_ledger.Prepared_stealth plan)
-            end
-        end
-    end
-
-let verify_claim result_policy ledger tx =
-  let open Lwt.Syntax in
-  let* plan = Private_ledger.claim_plan ledger tx in
-  match plan with
-  | Error failure -> Lwt.return_error failure.Private_ledger.tag
-  | Ok plan ->
-    let* balance =
-      Private_ledger.claim_balance_plan ~result_policy ledger tx plan
-    in
-    begin
-      match balance with
-      | Error failure -> Lwt.return_error failure.Private_ledger.reason
-      | Ok balance ->
-        Lwt.return_ok (Private_ledger.Prepared_claim (plan, balance))
-    end
+  let* result = Private_ledger.verify_private ~result_policy ledger tx in
+  Lwt.return
+    (Result.map_error
+       (fun rejection -> rejection.Private_ledger.private_preverify_reason)
+       result)
 
 let verify_key_switch ?legacy_replay ledger tx =
   let open Lwt.Syntax in
@@ -278,11 +227,20 @@ let verify_key_switch ?legacy_replay ledger tx =
     Lwt.return_ok (Private_ledger.Prepared_key_switch plan)
   | Error failure -> Lwt.return_error failure.Private_ledger.reason
 
-let prepared_key_switch prepared ledger tx =
+let prepared_matches tx prepared =
+  match tx.T.op_type, prepared with
+  | T.EncryptOp, Private_ledger.Prepared_encrypt _
+  | T.DecryptOp, Private_ledger.Prepared_decrypt _
+  | T.KeySwitch, Private_ledger.Prepared_key_switch _
+  | T.StealthOp, Private_ledger.Prepared_stealth _
+  | T.ClaimOp, Private_ledger.Prepared_claim _ -> true
+  | _ -> false
+
+let prepared_operation verify prepared tx =
   let open Lwt.Syntax in
   match prepared with
   | None ->
-    let* result = verify_key_switch ledger tx in
+    let* result = verify tx in
     Lwt.return (Result.fold ~ok:(fun value -> A.Ready value)
       ~error:(fun reason -> A.Invalid reason) result)
   | Some lookup ->
@@ -290,15 +248,15 @@ let prepared_key_switch prepared ledger tx =
     begin
       match available with
       | A.Unmanaged ->
-        let* result = verify_key_switch ledger tx in
+        let* result = verify tx in
         Lwt.return (Result.fold ~ok:(fun value -> A.Ready value)
           ~error:(fun reason -> A.Invalid reason) result)
       | A.Pending -> Lwt.return A.Pending
       | A.Invalid reason -> Lwt.return (A.Invalid reason)
-      | A.Ready (Private_ledger.Prepared_key_switch _ as value) ->
+      | A.Ready value when prepared_matches tx value ->
         Lwt.return (A.Ready value)
       | A.Ready _ ->
-        Lwt.return (A.Invalid "key switch prepared operation mismatch")
+        Lwt.return (A.Invalid "prepared operation mismatch")
     end
 
 let run_heavy
@@ -318,27 +276,9 @@ let run_heavy
            ~error:(fun reason -> A.Invalid reason)
            result)
     else
-      prepared_key_switch prepared ledger tx
-  | T.EncryptOp, Some ledger ->
-    let* result = verify_encrypt result_policy ledger tx in
-    Lwt.return
-      (Result.fold ~ok:(fun value -> A.Ready value)
-         ~error:(fun reason -> A.Invalid reason) result)
-  | T.DecryptOp, Some ledger ->
-    let* result = verify_decrypt result_policy ledger tx in
-    Lwt.return
-      (Result.fold ~ok:(fun value -> A.Ready value)
-         ~error:(fun reason -> A.Invalid reason) result)
-  | T.StealthOp, Some ledger ->
-    let* result = verify_stealth result_policy ledger tx in
-    Lwt.return
-      (Result.fold ~ok:(fun value -> A.Ready value)
-         ~error:(fun reason -> A.Invalid reason) result)
-  | T.ClaimOp, Some ledger ->
-    let* result = verify_claim result_policy ledger tx in
-    Lwt.return
-      (Result.fold ~ok:(fun value -> A.Ready value)
-         ~error:(fun reason -> A.Invalid reason) result)
+      prepared_operation (verify_key_switch ledger) prepared tx
+  | (T.EncryptOp | T.DecryptOp | T.StealthOp | T.ClaimOp), Some ledger ->
+    prepared_operation (verify_private result_policy ledger) prepared tx
   | T.PrivateOp, _ -> Lwt.return (A.Invalid "private_disabled")
   | T.RecryptOp, _ -> Lwt.return (A.Invalid "recrypt_disabled")
   | T.CircleBalanceCellPut, _ ->
@@ -421,7 +361,7 @@ let run
       let* v = run_heavy ?ledger ?legacy_replay ?prepared ~result_policy tx in
       match v with
       | A.Unmanaged -> Lwt.return (Skip "preverify operation is unmanaged")
-      | A.Pending -> Lwt.return (Defer "key_switch_preverify_pending")
+      | A.Pending -> Lwt.return (Defer "private_preverify_pending")
       | A.Invalid e -> Lwt.return (Skip e)
       | A.Ready prepared ->
         begin

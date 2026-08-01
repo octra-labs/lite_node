@@ -4,6 +4,7 @@
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
 type 'handler dispatch_adapters = {
+  transaction : 'handler;
   chaindata_params_read :
     (Octra_core.Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
@@ -26,6 +27,7 @@ val confirmed_tx_epoch_with_heal :
   int option
 
 val transaction :
+  find_drop:(string -> Octra_core.Tx_drop.row option) ->
   Octra_core.Store_chaindata.t ->
   params:Yojson.Safe.t ->
   rpc_result

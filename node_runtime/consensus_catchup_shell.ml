@@ -480,9 +480,22 @@ let validate_record ~chain_id ~expected_validator_set_hash ~prev_eic
       match C_catchup.verify_record_receipts ~record with
       | Error e -> Error e
       | Ok () ->
+        match
+          Octra_core.Tx_outcome.decode
+            ~confirmed:parsed_txs
+            record.receipts_json
+        with
+        | Error e ->
+          Error (
+            Printf.sprintf
+              "catchup outcome mismatch epoch = %Ld reason = %s"
+              record.epoch_id
+              e
+          )
+        | Ok partition ->
         match Octra_core.Preverify_receipt_policy.check
                 ~epoch_id:(Int64.to_int record.epoch_id)
-                ~receipts:record.receipts_json
+                ~receipts:partition.preverify
                 parsed_txs with
         | Error e ->
           Error (

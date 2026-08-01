@@ -42,6 +42,8 @@ from validator_config import pm2_service_enabled
 from validator_config import resolve_sync_stage
 from validator_config import resource_report
 from validator_config import require_validator_membership
+from validator_config import require_runtime_binding
+from validator_config import rebind_runtime
 from validator_config import validate_advertise
 from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
@@ -598,23 +600,71 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(values["OCTRA_CHAIN_ID"], f"$(touch {marker})")
 
-    def test_run_rebinds_candidate_path(self):
+    def test_run_requires_explicit_candidate_binding(self):
         source_path = Path(__file__).resolve().parent / "run.sh"
         exported_path = Path(__file__).resolve().parent.parent / "run.sh"
         script_path = source_path if source_path.is_file() else exported_path
         script = script_path.read_text(encoding="utf-8")
+        binding = script.index("--check-runtime")
         recovery = script.index("validator_recover.py")
         guard = script.index("validator_guard.py")
         source = script.index('. "$CONFIG"')
         cleanup = script.index("validator_process.py")
         runtime = script.index('mkdir -p "$ROOT/data"')
         start = script.index('pm2 start "$OCTRA_OPERATOR_BINARY"')
+        self.assertLess(binding, recovery)
         self.assertLess(recovery, guard)
         self.assertLess(guard, source)
         self.assertLess(source, cleanup)
         self.assertLess(cleanup, start)
         self.assertLess(runtime, start)
         self.assertNotIn("pm2 restart", script)
+
+    def test_runtime_rebind_preserves_node_state(self):
+        root = WORK / "candidate"
+        config = root / ".keys/validator/node.env"
+        packaged_network = root / "config/network.env"
+        installed_network = root / ".keys/validator/network.env"
+        binary = root / "artifacts/octra_node.exe"
+        worker = root / "artifacts/octra_pvac_worker.exe"
+        sync_binary = root / "artifacts/octra_state_sync_client.exe"
+        control_binary = root / "artifacts/bft_control_tx.exe"
+        for path, body in (
+            (packaged_network, b"network\n"),
+            (installed_network, b"network\n"),
+            (binary, b"node"),
+            (worker, b"worker"),
+            (sync_binary, b"sync"),
+            (control_binary, b"control"),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        network_hash = hashlib.sha256(b"network\n").hexdigest()
+        write_env(config, {
+            "OCTRA_DATA_DIR": "/srv/octra/data/node",
+            "OCTRA_OPERATOR_BINARY": "/old/artifacts/octra_node.exe",
+            "OCTRA_OPERATOR_NETWORK_SHA256": network_hash,
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_STATE_SYNC_ENABLE": "1",
+        })
+        paths = {
+            "ROOT": root,
+            "DEFAULT_BINARY": binary,
+            "DEFAULT_WORKER": worker,
+            "DEFAULT_SYNC_BINARY": sync_binary,
+            "DEFAULT_CONTROL_BINARY": control_binary,
+        }
+        with mock.patch.multiple("validator_config", **paths):
+            with self.assertRaisesRegex(ValidatorError, "candidate paths are stale"):
+                require_runtime_binding(config)
+            rebind_runtime(config)
+            require_runtime_binding(config)
+        values = parse_env(config)
+        self.assertEqual(values["OCTRA_DATA_DIR"], "/srv/octra/data/node")
+        self.assertEqual(values["OCTRA_OPERATOR_ROLE"], "validator")
+        self.assertEqual(values["OCTRA_STATE_SYNC_ENABLE"], "1")
+        self.assertEqual(values["OCTRA_OPERATOR_BINARY"], str(binary.resolve()))
+        self.assertEqual(values["OCTRA_BINARY_HASH"], hashlib.sha256(b"node").hexdigest())
 
     def test_install_prepares_operator_data_root(self):
         source_path = Path(__file__).resolve().parent / "install.sh"

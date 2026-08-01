@@ -16,6 +16,7 @@ type deps = {
   bft_mode : unit -> bool;
   account_path_profile_enabled : bool;
   swarm : unit -> Octra_net.P2p_swarm.t option;
+  find_drop : string -> Octra_core.Tx_drop.row option;
 }
 
 type config = {
@@ -148,6 +149,12 @@ let octra_transactions_by_epoch params ctx =
     ctx.chaindata
     ~params
     ~current_epoch_id:(!(ctx.tree_ref)).Tree.epoch_id
+
+let octra_transaction params ctx =
+  History_read_rpc.transaction
+    ~find_drop:ctx.deps.find_drop
+    ctx.chaindata
+    ~params
 
 let staging_remove params ctx =
   Submit_rpc.staging_remove
@@ -326,6 +333,7 @@ let account_dispatch_adapters =
 
 let history_dispatch =
   History_read_rpc.dispatch History_read_rpc.{
+    transaction = octra_transaction;
     chaindata_params_read;
     chaindata_address_read;
     transactions_by_epoch = octra_transactions_by_epoch;

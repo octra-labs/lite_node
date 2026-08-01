@@ -55,6 +55,32 @@ type key_switch_artifact =
       artifact_failure : failure;
     }
 
+type private_op =
+  | Private_encrypt
+  | Private_decrypt
+  | Private_stealth
+  | Private_claim
+
+type private_account =
+  | Private_account_missing
+  | Private_account of string
+
+type private_claim =
+  | Private_claim_none
+  | Private_claim_invalid
+  | Private_claim_missing of int
+  | Private_claim_output of int * string
+
+type private_source = {
+  source_tx_hash : string;
+  source_op : private_op;
+  source_account : private_account;
+  source_key_hash : string option;
+  source_claim : private_claim;
+  source_policy : Private_result_policy.t;
+  source_verifier : string;
+}
+
 let key_switch_cache_cap = 32
 
 let key_switch_cache : (string, key_switch_plan) Hashtbl.t =
@@ -118,6 +144,26 @@ type prepared =
   | Prepared_stealth of stealth_plan
   | Prepared_claim of claim_plan * balance_plan
 
+type private_rejection = {
+  private_error : failure;
+  private_preverify_reason : string;
+}
+
+type private_artifact =
+  | Verified_private of {
+      private_source : private_source;
+      private_prepared : prepared;
+    }
+  | Rejected_private of {
+      private_source : private_source;
+      private_rejection : private_rejection;
+    }
+
+type private_binding =
+  | Private_bound of prepared
+  | Private_source_changed
+  | Private_artifact_invalid of private_rejection
+
 type key_switch_binding =
   | Key_switch_bound of prepared
   | Key_switch_source_changed
@@ -178,6 +224,8 @@ let error ?user_reason tag reason =
 
 let key_switch_worker_retry_tag = "key_switch_worker_retry"
 
+let private_worker_retry_tag = "private_worker_retry"
+
 let key_switch_worker_error prefix worker_failure =
   let tag =
     match worker_failure with
@@ -192,6 +240,28 @@ let key_switch_worker_error prefix worker_failure =
 
 let key_switch_failure_retryable failure =
   String.equal failure.tag key_switch_worker_retry_tag
+
+let private_failure_retryable failure =
+  String.equal failure.tag private_worker_retry_tag
+
+let private_reject ?preverify_reason private_error =
+  {
+    private_error;
+    private_preverify_reason =
+      Option.value preverify_reason ~default:private_error.reason;
+  }
+
+let private_worker_error tag prefix user_prefix worker_failure =
+  match worker_failure with
+  | VW.Proof_rejected reason ->
+    error tag (prefix ^ reason) ~user_reason:(user_prefix ^ reason)
+  | VW.Worker_busy
+  | VW.Worker_unavailable _
+  | VW.Worker_timed_out
+  | VW.Worker_memory_exceeded
+  | VW.Worker_failed _ ->
+    error private_worker_retry_tag
+      (prefix ^ VW.verification_failure_message worker_failure)
 
 let digest value =
   Digestif.SHA256.digest_string value
@@ -273,9 +343,9 @@ let json_payload op raw =
   | None -> error "malformed_transaction" (op ^ ": missing encrypted_data") ~user_reason:(op ^ ": malformed encrypted_data")
   | Some s ->
     try Ok (Yojson.Safe.from_string s)
-    with e ->
+    with _ ->
       error "malformed_transaction"
-        (op ^ ": cannot parse encrypted_data: " ^ Printexc.to_string e)
+        (op ^ ": malformed encrypted_data")
         ~user_reason:(op ^ ": malformed encrypted_data")
 
 let safe_json raw =
@@ -407,6 +477,81 @@ let parse_claim raw =
       | Error e -> error "invalid_claim_data" ("cannot parse V5 claim payload: " ^ e)
       | Ok claim -> Ok claim
 
+let private_verifier = "pvac_private_preverify"
+
+let private_op tx =
+  match tx.T.op_type with
+  | T.EncryptOp -> Some Private_encrypt
+  | T.DecryptOp -> Some Private_decrypt
+  | T.StealthOp -> Some Private_stealth
+  | T.ClaimOp -> Some Private_claim
+  | _ -> None
+
+let private_account ledger address =
+  match Ledger.find_opt ledger address with
+  | None -> Private_account_missing
+  | Some account ->
+    account.Ledger.encrypted_balance
+    |> Option.value ~default:"0"
+    |> digest
+    |> fun encrypted_hash -> Private_account encrypted_hash
+
+let private_claim_source ledger tx =
+  let open Lwt.Syntax in
+  match tx.T.op_type with
+  | T.ClaimOp ->
+    begin
+      match parse_claim tx.T.encrypted_data with
+      | Error _ -> Lwt.return Private_claim_invalid
+      | Ok claim ->
+        let output_id = claim.SC.output_id in
+        let* output = Ledger.get_stealth_output_by_id ledger output_id in
+        begin
+          match output with
+          | None -> Lwt.return (Private_claim_missing output_id)
+          | Some value ->
+            let output_hash =
+              Ledger_types.stealth_output_to_yojson value
+              |> Yojson.Safe.to_string
+              |> digest
+            in
+            Lwt.return (Private_claim_output (output_id, output_hash))
+        end
+    end
+  | _ -> Lwt.return Private_claim_none
+
+let private_source ~result_policy ledger tx =
+  let open Lwt.Syntax in
+  match private_op tx with
+  | None ->
+    Lwt.return
+      (error
+         "private_artifact_rejected"
+         "private artifact operation is not supported")
+  | Some source_op ->
+    let source_account = private_account ledger tx.T.from in
+    let* source_key = Ledger.get_pvac_pubkey ledger tx.T.from in
+    let source_key_hash = Option.map PR.key_hash source_key in
+    let* source_claim = private_claim_source ledger tx in
+    Lwt.return_ok {
+      source_tx_hash = T.hash tx;
+      source_op;
+      source_account;
+      source_key_hash;
+      source_claim;
+      source_policy = result_policy;
+      source_verifier = private_verifier;
+    }
+
+let private_source_equal left right =
+  String.equal left.source_tx_hash right.source_tx_hash
+  && left.source_op = right.source_op
+  && left.source_account = right.source_account
+  && left.source_key_hash = right.source_key_hash
+  && left.source_claim = right.source_claim
+  && left.source_policy = right.source_policy
+  && String.equal left.source_verifier right.source_verifier
+
 let kat_state ledger addr =
   let expected = PR.expected_kat () in
   match Ledger.get_pvac_kat ledger addr with
@@ -467,8 +612,13 @@ let guard_refresh_source cipher =
   | Error e -> error "key_switch_rejected" e
   | Ok () -> Ok ()
 
-let encrypt_balance_plan result_policy blob current (payload : encrypt_payload) =
-  Proof_pool.run (fun () ->
+let encrypt_balance_plan
+    ?(worker_priority = Compute_pool.Required)
+    result_policy
+    blob
+    current
+    (payload : encrypt_payload) =
+  Proof_pool.run ~priority:worker_priority (fun () ->
     match FB.load_pubkey_result blob with
     | Error e ->
       error "bad_zero_proof"
@@ -488,13 +638,20 @@ let encrypt_balance_plan result_policy blob current (payload : encrypt_payload) 
         | Error e -> error "encrypt_balance_failed" e
         | Ok next_cipher -> Ok { current_cipher = current; next_cipher })
 
-let verify_encrypt result_policy blob current amount (payload : encrypt_payload) =
+let verify_encrypt
+    worker_priority
+    result_policy
+    blob
+    current
+    amount
+    (payload : encrypt_payload) =
   let open Lwt.Syntax in
   match guard_private_input current "encrypt_balance_failed" "encrypt" with
   | Error e -> Lwt.return (Error e)
   | Ok () ->
     let* verified =
-      VW.verify_encrypt
+      VW.verify_encrypt_classified_with_priority
+        worker_priority
         ~pubkey:blob
         ~cipher:payload.cipher
         ~amount
@@ -504,13 +661,20 @@ let verify_encrypt result_policy blob current amount (payload : encrypt_payload)
     in
     begin
       match verified with
-      | Error e ->
+      | Error worker_failure ->
         Lwt.return
-          (error "bad_zero_proof"
-            ("encrypt: " ^ e)
-            ~user_reason:("encrypt: bound zero proof failed: " ^ e))
+          (private_worker_error
+             "bad_zero_proof"
+             "encrypt: "
+             "encrypt: bound zero proof failed: "
+             worker_failure)
       | Ok () ->
-        encrypt_balance_plan result_policy blob current payload
+        encrypt_balance_plan
+          ~worker_priority
+          result_policy
+          blob
+          current
+          payload
     end
 
 let prepare_encrypt_plan
@@ -533,6 +697,7 @@ let prepare_encrypt_plan
         | Ok () -> encrypt_balance_plan result_policy blob current payload
 
 let encrypt_plan
+    ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -547,12 +712,23 @@ let encrypt_plan
       match current_cipher ledger tx.T.from "encrypt_balance_failed" with
       | Error e -> Lwt.return (Error e)
       | Ok current ->
-        verify_encrypt result_policy blob current tx.T.amount payload
+        verify_encrypt
+          worker_priority
+          result_policy
+          blob
+          current
+          tx.T.amount
+          payload
 
 let max_decrypt_amount = Z.of_string "1000000000000"
 
-let decrypt_balance_plan result_policy blob current (payload : decrypt_payload) =
-  Proof_pool.run (fun () ->
+let decrypt_balance_plan
+    ?(worker_priority = Compute_pool.Required)
+    result_policy
+    blob
+    current
+    (payload : decrypt_payload) =
+  Proof_pool.run ~priority:worker_priority (fun () ->
     match FB.load_pubkey_result blob with
     | Error e ->
       error "bad_zero_proof"
@@ -575,7 +751,13 @@ let decrypt_balance_plan result_policy blob current (payload : decrypt_payload) 
         | Ok next_cipher ->
           Ok { current_cipher = current; next_cipher })
 
-let verify_decrypt result_policy blob current amount (payload : decrypt_payload) =
+let verify_decrypt
+    worker_priority
+    result_policy
+    blob
+    current
+    amount
+    (payload : decrypt_payload) =
   let open Lwt.Syntax in
   match guard_private_input current "decrypt_cipher_failed" "decrypt" with
   | Error e -> Lwt.return (Error e)
@@ -589,7 +771,8 @@ let verify_decrypt result_policy blob current amount (payload : decrypt_payload)
             ~user_reason:"decrypt: range_proof_balance required: proves remaining encrypted balance >= 0")
       | Some range_proof ->
         let* verified =
-          VW.verify_encrypt
+          VW.verify_encrypt_classified_with_priority
+            worker_priority
             ~pubkey:blob
             ~cipher:payload.cipher
             ~amount
@@ -599,19 +782,29 @@ let verify_decrypt result_policy blob current amount (payload : decrypt_payload)
         in
         begin
           match verified with
-          | Error e ->
+          | Error worker_failure ->
             Lwt.return
-              (error "bad_zero_proof"
-                ("decrypt: " ^ e)
-                ~user_reason:("decrypt: bound zero proof failed: " ^ e))
+              (private_worker_error
+                 "bad_zero_proof"
+                 "decrypt: "
+                 "decrypt: bound zero proof failed: "
+                 worker_failure)
           | Ok () ->
-            let* plan = decrypt_balance_plan result_policy blob current payload in
+            let* plan =
+              decrypt_balance_plan
+                ~worker_priority
+                result_policy
+                blob
+                current
+                payload
+            in
             begin
               match plan with
               | Error _ as e -> Lwt.return e
               | Ok plan ->
                 let* range =
-                  VW.verify_range
+                  VW.verify_range_classified_with_priority
+                    worker_priority
                     ~pubkey:blob
                     ~cipher:plan.next_cipher
                     ~proof:range_proof
@@ -619,11 +812,18 @@ let verify_decrypt result_policy blob current amount (payload : decrypt_payload)
                 begin
                   match range with
                   | Ok () -> Lwt.return (Ok plan)
-                  | Error _ ->
+                  | Error (VW.Proof_rejected _) ->
                     Lwt.return
                       (error "bad_range_proof_balance"
-                        "decrypt: range_proof_balance verification failed: remaining balance may be negative"
-                        ~user_reason:"decrypt: range_proof_balance verification failed: remaining balance may be negative")
+                         "decrypt: range_proof_balance verification failed: remaining balance may be negative"
+                         ~user_reason:"decrypt: range_proof_balance verification failed: remaining balance may be negative")
+                  | Error worker_failure ->
+                    Lwt.return
+                      (private_worker_error
+                         "bad_range_proof_balance"
+                         "decrypt range: "
+                         "decrypt range: "
+                         worker_failure)
                 end
             end
         end
@@ -656,6 +856,7 @@ let prepare_decrypt_plan
           | Ok () -> decrypt_balance_plan result_policy blob current payload
 
 let decrypt_plan
+    ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -677,7 +878,13 @@ let decrypt_plan
         match current_cipher ledger tx.T.from "decrypt_cipher_failed" with
         | Error e -> Lwt.return (Error e)
         | Ok current ->
-          verify_decrypt result_policy blob current tx.T.amount payload
+          verify_decrypt
+            worker_priority
+            result_policy
+            blob
+            current
+            tx.T.amount
+            payload
 
 let current_plan ledger addr tag plan =
   match current_cipher ledger addr tag with
@@ -1399,6 +1606,7 @@ let apply_key_switch ?legacy_public_replay ledger tx =
   | Ok plan -> apply_key_switch_plan ledger tx plan
 
 let prepare_stealth_plan
+    ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -1424,7 +1632,7 @@ let prepare_stealth_plan
         match guard_private_input current "encrypted_balance_update_failed" "stealth" with
         | Error e -> Lwt.return (Error e)
         | Ok () ->
-          Proof_pool.run (fun () ->
+          Proof_pool.run ~priority:worker_priority (fun () ->
             with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
               match FB.decode_cipher ptd.PT.delta_cipher with
               | Error e ->
@@ -1456,11 +1664,14 @@ let prepare_stealth_plan
                   }))
 
 let stealth_plan
+    ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = prepare_stealth_plan ~result_policy ledger tx in
+  let* plan =
+    prepare_stealth_plan ~worker_priority ~result_policy ledger tx
+  in
   match plan with
   | Error _ as result -> Lwt.return result
   | Ok plan ->
@@ -1477,7 +1688,7 @@ let stealth_plan
         | Error e -> Lwt.return (Error e)
         | Ok blob ->
           let* commitment =
-            Proof_pool.run (fun () ->
+            Proof_pool.run ~priority:worker_priority (fun () ->
               with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
                 if
                   FB.verify_commitment
@@ -1498,7 +1709,21 @@ let stealth_plan
           end
       end
 
-let stealth_inline_range ledger tx plan =
+let range_status prefix = function
+  | Ok () -> Ok true
+  | Error (VW.Proof_rejected _) -> Ok false
+  | Error worker_failure ->
+    private_worker_error
+      "bad_range_proof"
+      prefix
+      prefix
+      worker_failure
+
+let stealth_inline_range
+    ?(worker_priority = Compute_pool.Required)
+    ledger
+    tx
+    plan =
   let open Lwt.Syntax in
   let* blob_result =
     load_pk_blob_plain ledger tx.T.from
@@ -1509,21 +1734,29 @@ let stealth_inline_range ledger tx plan =
   | Error e -> Lwt.return (Error e)
   | Ok blob ->
     let* delta =
-      VW.verify_range
+      VW.verify_range_classified_with_priority
+        worker_priority
         ~pubkey:blob
         ~cipher:plan.stealth_delta_cipher
         ~proof:plan.stealth_range_proof_delta
     in
-    let* balance =
-      VW.verify_range
-        ~pubkey:blob
-        ~cipher:plan.stealth_next_cipher
-        ~proof:plan.stealth_range_proof_balance
-    in
-    Lwt.return_ok {
-      delta_ok = Result.is_ok delta;
-      balance_ok = Result.is_ok balance;
-    }
+    begin
+      match range_status "stealth delta range: " delta with
+      | Error failure -> Lwt.return_error failure
+      | Ok delta_ok ->
+        let* balance =
+          VW.verify_range_classified_with_priority
+            worker_priority
+            ~pubkey:blob
+            ~cipher:plan.stealth_next_cipher
+            ~proof:plan.stealth_range_proof_balance
+        in
+        begin
+          match range_status "stealth balance range: " balance with
+          | Error failure -> Lwt.return_error failure
+          | Ok balance_ok -> Lwt.return_ok { delta_ok; balance_ok }
+        end
+    end
 
 let stealth_accept_range range =
   if not range.delta_ok then
@@ -1533,7 +1766,11 @@ let stealth_accept_range range =
   else
     Ok ()
 
-let stealth_binding ledger tx plan =
+let stealth_binding
+    ?(worker_priority = Compute_pool.Required)
+    ledger
+    tx
+    plan =
   let open Lwt.Syntax in
   match parse_stealth tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
@@ -1552,7 +1789,8 @@ let stealth_binding ledger tx plan =
         | Error e -> Lwt.return (Error e)
         | Ok blob ->
           let* verified =
-            VW.verify_claim
+            VW.verify_claim_classified_with_priority
+              worker_priority
               ~pubkey:blob
               ~cipher:plan.stealth_delta_cipher
               ~proof:ptd.PT.send_zero_proof
@@ -1561,10 +1799,17 @@ let stealth_binding ledger tx plan =
           begin
             match verified with
             | Ok () -> Lwt.return_ok ()
-            | Error e ->
+            | Error (VW.Proof_rejected reason) ->
               Lwt.return
                 (error "bad_send_binding"
-                  ("send_zero_proof does not bind delta_cipher to amount_commitment: " ^ e))
+                  ("send_zero_proof does not bind delta_cipher to amount_commitment: " ^ reason))
+            | Error worker_failure ->
+              Lwt.return
+                (private_worker_error
+                   "bad_send_binding"
+                   "stealth binding: "
+                   "stealth binding: "
+                   worker_failure)
           end
 
 let prepare_claim_plan ledger tx =
@@ -1594,7 +1839,10 @@ let prepare_claim_plan ledger tx =
             claim_cipher = claim.SC.claim_cipher;
           }
 
-let claim_plan ledger tx =
+let claim_plan
+    ?(worker_priority = Compute_pool.Required)
+    ledger
+    tx =
   let open Lwt.Syntax in
   let* plan = prepare_claim_plan ledger tx in
   match plan with
@@ -1621,7 +1869,7 @@ let claim_plan ledger tx =
             | Error e -> Lwt.return (Error e)
             | Ok blob ->
               let* commitment =
-                Proof_pool.run (fun () ->
+                Proof_pool.run ~priority:worker_priority (fun () ->
                   with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
                     if
                       FB.verify_commitment
@@ -1640,7 +1888,8 @@ let claim_plan ledger tx =
                 | Error _ as result -> Lwt.return result
                 | Ok () ->
                   let* verified =
-                    VW.verify_claim
+                    VW.verify_claim_classified_with_priority
+                      worker_priority
                       ~pubkey:blob
                       ~cipher:claim.SC.claim_cipher
                       ~proof:claim.SC.zero_proof
@@ -1648,11 +1897,18 @@ let claim_plan ledger tx =
                   in
                   begin
                     match verified with
-                    | Error e ->
+                    | Error (VW.Proof_rejected reason) ->
                       Lwt.return
                         (error
                            "bad_zero_proof"
-                           ("bound zero proof verification failed: " ^ e))
+                           ("bound zero proof verification failed: " ^ reason))
+                    | Error worker_failure ->
+                      Lwt.return
+                        (private_worker_error
+                           "bad_zero_proof"
+                           "claim proof: "
+                           "claim proof: "
+                           worker_failure)
                     | Ok () -> Lwt.return_ok plan
                   end
               end
@@ -1660,6 +1916,7 @@ let claim_plan ledger tx =
       end
 
 let claim_balance_plan
+    ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx
@@ -1679,7 +1936,7 @@ let claim_balance_plan
       match guard_private_input current "encrypted_balance_update_failed" "claim" with
       | Error e -> Lwt.return (Error e)
       | Ok () ->
-        Proof_pool.run (fun () ->
+        Proof_pool.run ~priority:worker_priority (fun () ->
           with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
             match FB.decode_cipher plan.claim_cipher with
             | Error e ->
@@ -1696,3 +1953,138 @@ let claim_balance_plan
                 error "encrypted_balance_update_failed" ("claimant encrypted balance update: " ^ e)
               | Ok next_cipher ->
                 Ok { current_cipher = current; next_cipher }))
+
+let verify_private
+    ?(worker_priority = Compute_pool.Required)
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  match tx.T.op_type with
+  | T.EncryptOp ->
+    let* result =
+      encrypt_plan ~worker_priority ~result_policy ledger tx
+    in
+    Lwt.return
+      (result
+       |> Result.map (fun plan -> Prepared_encrypt plan)
+       |> Result.map_error private_reject)
+  | T.DecryptOp ->
+    let* result =
+      decrypt_plan ~worker_priority ~result_policy ledger tx
+    in
+    Lwt.return
+      (result
+       |> Result.map (fun plan -> Prepared_decrypt plan)
+       |> Result.map_error private_reject)
+  | T.StealthOp ->
+    let* plan =
+      stealth_plan ~worker_priority ~result_policy ledger tx
+    in
+    begin
+      match plan with
+      | Error failure -> Lwt.return_error (private_reject failure)
+      | Ok plan ->
+        let* range =
+          stealth_inline_range ~worker_priority ledger tx plan
+        in
+        begin
+          match range with
+          | Error failure -> Lwt.return_error (private_reject failure)
+          | Ok range ->
+            begin
+              match stealth_accept_range range with
+              | Error failure -> Lwt.return_error (private_reject failure)
+              | Ok () ->
+                let* binding =
+                  stealth_binding ~worker_priority ledger tx plan
+                in
+                Lwt.return
+                  (binding
+                   |> Result.map (fun () -> Prepared_stealth plan)
+                   |> Result.map_error private_reject)
+            end
+        end
+    end
+  | T.ClaimOp ->
+    let* claim = claim_plan ~worker_priority ledger tx in
+    begin
+      match claim with
+      | Error failure ->
+        Lwt.return_error
+          (private_reject ~preverify_reason:failure.tag failure)
+      | Ok claim ->
+        let* balance =
+          claim_balance_plan
+            ~worker_priority
+            ~result_policy
+            ledger
+            tx
+            claim
+        in
+        Lwt.return
+          (balance
+           |> Result.map (fun balance -> Prepared_claim (claim, balance))
+           |> Result.map_error private_reject)
+    end
+  | _ ->
+    let private_error = {
+      tag = "private_artifact_rejected";
+      reason = "private artifact operation is not supported";
+      user_reason = "private artifact operation is not supported";
+    } in
+    Lwt.return_error (private_reject private_error)
+
+let preverify_private_artifact
+    ?(worker_priority = Compute_pool.Speculative)
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  let* source = private_source ~result_policy ledger tx in
+  match source with
+  | Error failure -> Lwt.return_error failure
+  | Ok private_source ->
+    let* result =
+      verify_private ~worker_priority ~result_policy ledger tx
+    in
+    begin
+      match result with
+      | Ok private_prepared ->
+        Lwt.return_ok
+          (Verified_private { private_source; private_prepared })
+      | Error private_rejection
+        when private_failure_retryable private_rejection.private_error ->
+        Lwt.return_error private_rejection.private_error
+      | Error private_rejection ->
+        Lwt.return_ok
+          (Rejected_private { private_source; private_rejection })
+    end
+
+let bind_private_artifact
+    ?(result_policy = Private_result_policy.Recoverable)
+    ledger
+    tx
+    artifact =
+  let open Lwt.Syntax in
+  let artifact_source =
+    match artifact with
+    | Verified_private verified -> verified.private_source
+    | Rejected_private rejected -> rejected.private_source
+  in
+  let* current = private_source ~result_policy ledger tx in
+  match current with
+  | Error private_error ->
+    Lwt.return
+      (Private_artifact_invalid (private_reject private_error))
+  | Ok current when not (private_source_equal artifact_source current) ->
+    Lwt.return Private_source_changed
+  | Ok _ ->
+    begin
+      match artifact with
+      | Verified_private verified ->
+        Lwt.return (Private_bound verified.private_prepared)
+      | Rejected_private rejected ->
+        Lwt.return
+          (Private_artifact_invalid rejected.private_rejection)
+    end

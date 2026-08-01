@@ -54,8 +54,8 @@ let decode_payload_json payload_json =
     match Circles.deploy_payload_of_yojson (Yojson.Safe.from_string payload_json) with
     | Ok payload -> Ok payload
     | Error e -> Error ("malformed_transaction", e)
-  with e ->
-    Error ("malformed_transaction", Printexc.to_string e)
+  with _ ->
+    Error ("malformed_transaction", "circle deploy payload is invalid")
 
 let decode_spawn_payload_json payload_json =
   if String.length payload_json > spawn_payload_json_cap then
@@ -103,8 +103,8 @@ let prepare source (payload : Circles.deploy_payload) =
           limits = payload.limits;
         } in
         Ok { circle_id; owner; code_raw; info }
-  with e ->
-    Error ("malformed_transaction", Printexc.to_string e)
+  with _ ->
+    Error ("malformed_transaction", "circle deploy input is invalid")
 
 let validate_runtime (payload : Circles.deploy_payload) =
   match payload.Circles.runtime with

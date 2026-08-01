@@ -125,16 +125,23 @@ let build_record deps ~epoch_id ~target_int elog tx_hashes txs_json parsed_txs =
           epoch_id error;
         None
       | Ok _ ->
-        match Octra_core.Preverify_receipt_policy.check
-          ~epoch_id:target_int
-          ~receipts:receipts_json
-          parsed_txs with
+        match Octra_core.Tx_outcome.decode ~confirmed:parsed_txs receipts_json with
         | Error e ->
           Octra_log.warn "catchup"
-            "lookup_catchup_range epoch = %Ld receipt_check_failed = %s"
+            "lookup_catchup_range epoch = %Ld outcome_check_failed = %s"
             epoch_id e;
           None
-        | Ok () ->
+        | Ok partition ->
+          match Octra_core.Preverify_receipt_policy.check
+            ~epoch_id:target_int
+            ~receipts:partition.preverify
+            parsed_txs with
+          | Error e ->
+            Octra_log.warn "catchup"
+              "lookup_catchup_range epoch = %Ld receipt_check_failed = %s"
+              epoch_id e;
+            None
+          | Ok () ->
           log_proposer_divergence ~epoch_id elog;
           let record =
             C_codec.{

@@ -531,7 +531,7 @@ let parse_circle_deploy_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_program_update_payload tx =
@@ -544,7 +544,7 @@ let parse_circle_program_update_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_asset_put_payload tx =
@@ -557,7 +557,7 @@ let parse_circle_asset_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_asset_put_encrypted_payload tx =
@@ -570,7 +570,7 @@ let parse_circle_asset_put_encrypted_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_sealed_slot_put_payload tx =
@@ -583,7 +583,7 @@ let parse_circle_sealed_slot_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_slot_policy_put_payload tx =
@@ -596,7 +596,7 @@ let parse_circle_slot_policy_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_state_descriptor_put_payload tx =
@@ -609,7 +609,7 @@ let parse_circle_state_descriptor_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_balance_cell_put_payload tx =
@@ -622,7 +622,7 @@ let parse_circle_balance_cell_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_register_cell_put_payload tx =
@@ -635,7 +635,7 @@ let parse_circle_register_cell_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_transport_policy_put_payload tx =
@@ -648,7 +648,7 @@ let parse_circle_transport_policy_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_hfhe_policy_put_payload tx =
@@ -661,7 +661,7 @@ let parse_circle_hfhe_policy_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_key_policy_put_payload tx =
@@ -674,7 +674,7 @@ let parse_circle_key_policy_put_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_key_grant_payload tx =
@@ -687,7 +687,7 @@ let parse_circle_key_grant_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_key_extend_payload tx =
@@ -700,7 +700,7 @@ let parse_circle_key_extend_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_key_revoke_payload tx =
@@ -713,7 +713,7 @@ let parse_circle_key_revoke_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_key_erase_payload tx =
@@ -726,7 +726,7 @@ let parse_circle_key_erase_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_outbox_open_payload tx =
@@ -739,7 +739,7 @@ let parse_circle_outbox_open_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_relay_claim_payload tx =
@@ -752,7 +752,7 @@ let parse_circle_relay_claim_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_relay_cancel_payload tx =
@@ -765,7 +765,7 @@ let parse_circle_relay_cancel_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let parse_circle_ingress_commit_payload tx =
@@ -778,7 +778,7 @@ let parse_circle_ingress_commit_payload tx =
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
-        Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+        Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
 let resolve_encrypted_circle_locator circle_id (payload : Circles.encrypted_asset_put_payload) =
@@ -911,7 +911,7 @@ let decode_circle_body_b64 tx =
         try
           Stdlib.Ok (body_b64, Base64.decode_exn body_b64)
         with e ->
-          Stdlib.Error ("malformed_transaction", Printexc.to_string e)
+          Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
       end
 
 let debit_fee ~(backend : backend) (tx : Transaction.t) =
@@ -1003,7 +1003,7 @@ let process_circle_program_update_tx ~(backend : backend) (tx : Transaction.t) =
                       Lwt.return (Stdlib.Ok tx.ou)
                 end
             with e ->
-              Lwt.return (Stdlib.Error ("malformed_transaction", Printexc.to_string e))
+              Lwt.return (Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e))
           end
     end
 
@@ -3061,10 +3061,7 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
   match gate_ok with
   | Error e -> Lwt.return (Error ("preverify_commit_gate:" ^ e))
   | Ok () ->
-  let txs_canonical = List.sort (fun (a : Transaction.t) (b : Transaction.t) ->
-    let c = String.compare a.from b.from in
-    if c <> 0 then c else compare a.nonce b.nonce
-  ) txs in
+  let ordered_txs = Transaction.consensus_order txs in
   match Ledger.begin_journal backend.ledger with
   | Error error -> Lwt.return (Error error)
   | Ok () ->
@@ -3102,7 +3099,7 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
            rejected := { tx; error_type = etype; reason } :: !rejected);
         incr pos;
         Lwt.return_unit
-      ) txs_canonical in
+      ) ordered_txs in
       let* () = advance_validator_set ~backend ~env in
       let* emission_remaining_opt = Store_irmin.get_meta backend.store "emission_remaining" in
       let emission_remaining =

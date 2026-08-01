@@ -23,11 +23,14 @@ type capped = {
 
 type verified_bundle = {
   txs : Transaction.t list;
+  candidates : Transaction.t list;
   receipts_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
   preverify : Octra_core.Preverify_commit.t;
 }
 
 type local_preverify_bundle = {
+  batch : Octra_core.Preverify_worker.batch;
   ready_txs : Transaction.t list;
   receipts_json : string list;
   skipped_count : int;
@@ -119,12 +122,6 @@ type build_preview_output = {
   rejected_count : int;
 }
 
-type preview_reject = {
-  hash : string;
-  error_type : string;
-  reason : string;
-}
-
 type proposal_roots = {
   prev_ledger_root : string;
   prev_state_root : string;
@@ -201,8 +198,6 @@ type make_proposal_deps = {
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
-  remove_rejected : preview_reject list -> unit;
-  notify_staging_update : unit -> unit;
   set_proposal : Transaction.t list -> string list -> unit;
   head_txid_hi : unit -> int64 option;
   freeze : string -> Consensus_bundle_cache.frozen -> unit;
@@ -483,8 +478,20 @@ val build_preview_output :
   fallback_ledger_root:string ->
   input_txs:Transaction.t list ->
   batch:Octra_core.Preverify_worker.batch ->
+  rejections:Octra_core.Tx_outcome.rejection list ->
   preview_result:(Octra_core.Epoch_exec.exec_result, string) result ->
   build_preview_output
+
+val rejection_tuples :
+  Octra_core.Epoch_exec.tx_reject list ->
+  (Transaction.t * string * string) list
+
+val verify_preview_partition :
+  candidates:Transaction.t list ->
+  confirmed:Transaction.t list ->
+  rejections:Octra_core.Tx_outcome.rejection list ->
+  (Octra_core.Epoch_exec.exec_result, string) result ->
+  (unit, string) result
 
 val raw32_to_hex : string -> string
 

@@ -11,7 +11,8 @@ type deps = {
   remove_processed : string list -> unit;
   clear_deferred : unit -> int;
   reset_private_counters : unit -> unit;
-  expire_old_count : unit -> int;
+  expire_old : unit -> Octra_core.Tx_staging.drop_record list;
+  save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   cleanup_dropped : unit -> unit;
   sweep_low_fee : unit -> unit;
   retain_live_preverify : unit -> unit;
@@ -41,6 +42,7 @@ val refs :
   stealth_in_epoch_counter:int ref ->
   fhe_in_epoch_counter:int ref ->
   swarm_opt:Octra_net.P2p_swarm.t option ref ->
+  save_drops:(Octra_core.Tx_staging.drop_record list -> unit) ->
   node_refs
 
 val run : deps -> ctx -> unit Lwt.t

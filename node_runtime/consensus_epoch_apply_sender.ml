@@ -79,6 +79,12 @@ type live_tx_sink_deps = {
   processed_hashes : string list ref;
 }
 
+type rejection_sink_effects = {
+  save_rejected : rejected_record -> unit;
+  warn_rejected : string -> unit;
+  notify_rejected : Transaction.t -> string -> unit;
+}
+
 type ('backend, 'env) epoch_exec_deps = {
   backend : unit -> 'backend;
   standard_env : unit -> 'env;
@@ -229,6 +235,61 @@ let live_tx_sink deps =
       record_tx = Octra_core.Metrics.record_tx;
       warn_rejected = Log.warn "tx" "%s";
     } : tx_sink_effects)
+
+let save_rejections ~epoch_id ~ts ~processed_hashes effects rejections =
+  let prior = !processed_hashes in
+  let hashes =
+    List.map
+      (fun (item : Octra_core.Tx_outcome.rejection) ->
+         Transaction.hash item.tx)
+      rejections
+  in
+  match List.find_opt (fun hash -> List.mem hash prior) hashes with
+  | Some hash -> Error ("rejection_hash_already_processed:" ^ hash)
+  | None ->
+    List.iter
+      (fun (item : Octra_core.Tx_outcome.rejection) ->
+         let rejected =
+           rejected_record
+             ~epoch_id
+             ~ts
+             ~error_type:item.error_type
+             ~reason:item.reason
+             item.tx
+         in
+         effects.save_rejected rejected;
+         effects.warn_rejected
+           (rejected_line
+              ~hash:rejected.hash
+              ~error_type:rejected.error_type
+              ~reason:rejected.reason);
+         effects.notify_rejected item.tx item.reason)
+      rejections;
+    processed_hashes := List.rev_append hashes prior;
+    Ok ()
+
+let save_live_rejections ~chaindata ~epoch_id ~ts ~processed_hashes
+    ~notify_rejected rejections =
+  save_rejections
+    ~epoch_id
+    ~ts
+    ~processed_hashes
+    {
+      save_rejected = (fun rejected ->
+        Octra_core.Store_chaindata.save_rejected chaindata
+          ~hash:rejected.hash
+          ~from_addr:rejected.from_addr
+          ~to_addr:rejected.to_addr
+          ~amount:rejected.amount
+          ~nonce:rejected.nonce
+          ~error_type:rejected.error_type
+          ~reason:rejected.reason
+          ~epoch_id:rejected.epoch_id
+          ~ts:rejected.ts);
+      warn_rejected = Log.warn "tx" "%s";
+      notify_rejected;
+    }
+    rejections
 
 let nonce_mismatch_reason ~expected ~got =
   Printf.sprintf "expected_nonce = %d got_nonce = %d" expected got

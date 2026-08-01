@@ -27,6 +27,8 @@ type key_switch_plan = {
 
 type key_switch_artifact
 
+type private_artifact
+
 type key_switch_apply = {
   old_key_hash : string;
   new_key_hash : string;
@@ -72,10 +74,20 @@ type prepared =
   | Prepared_stealth of stealth_plan
   | Prepared_claim of claim_plan * balance_plan
 
+type private_rejection = {
+  private_error : failure;
+  private_preverify_reason : string;
+}
+
 type key_switch_binding =
   | Key_switch_bound of prepared
   | Key_switch_source_changed
   | Key_switch_artifact_invalid of failure
+
+type private_binding =
+  | Private_bound of prepared
+  | Private_source_changed
+  | Private_artifact_invalid of private_rejection
 
 val hash_prepared : prepared -> string
 
@@ -96,6 +108,7 @@ val kat_state : Ledger.t -> string -> kat
 val backfill_kat : Ledger.t -> string -> unit
 
 val encrypt_plan :
+  ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -108,6 +121,7 @@ val prepare_encrypt_plan :
   (balance_plan, failure) result Lwt.t
 
 val decrypt_plan :
+  ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -157,11 +171,34 @@ val preverify_key_switch_artifact :
 
 val key_switch_failure_retryable : failure -> bool
 
+val private_failure_retryable : failure -> bool
+
 val bind_key_switch_artifact :
   Ledger.t ->
   Transaction.t ->
   key_switch_artifact ->
   key_switch_binding Lwt.t
+
+val preverify_private_artifact :
+  ?worker_priority:Compute_pool.priority ->
+  ?result_policy:Private_result_policy.t ->
+  Ledger.t ->
+  Transaction.t ->
+  (private_artifact, failure) result Lwt.t
+
+val verify_private :
+  ?worker_priority:Compute_pool.priority ->
+  ?result_policy:Private_result_policy.t ->
+  Ledger.t ->
+  Transaction.t ->
+  (prepared, private_rejection) result Lwt.t
+
+val bind_private_artifact :
+  ?result_policy:Private_result_policy.t ->
+  Ledger.t ->
+  Transaction.t ->
+  private_artifact ->
+  private_binding Lwt.t
 
 val prepare_key_switch_plan :
   Ledger.t ->
@@ -189,18 +226,21 @@ val apply_key_switch_plan :
   key_switch_outcome Lwt.t
 
 val stealth_plan :
+  ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (stealth_plan, failure) result Lwt.t
 
 val prepare_stealth_plan :
+  ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
   (stealth_plan, failure) result Lwt.t
 
 val stealth_inline_range :
+  ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
   stealth_plan ->
@@ -211,12 +251,14 @@ val stealth_accept_range :
   (unit, failure) result
 
 val stealth_binding :
+  ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
   stealth_plan ->
   (unit, failure) result Lwt.t
 
 val claim_plan :
+  ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
   (claim_plan, failure) result Lwt.t
@@ -227,6 +269,7 @@ val prepare_claim_plan :
   (claim_plan, failure) result Lwt.t
 
 val claim_balance_plan :
+  ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->

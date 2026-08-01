@@ -24,13 +24,7 @@ let total_ou = ref Z.zero
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
 let virtual_nonces : (string, int) Hashtbl.t = Hashtbl.create 100
 
-type drop_reason = Evicted | Expired | Rejected
-
-type rejection = {
-  hash : string;
-  error_type : string;
-  reason : string;
-}
+type drop_reason = Evicted | Expired
 
 type drop_record = {
   d_hash : string;
@@ -46,7 +40,23 @@ type drop_record = {
 
 let dropped_cache : (string, drop_record) Hashtbl.t = Hashtbl.create 200
 let dropped_max = 10_000
-let dropped_ttl = 86_400.
+let dropped_ttl = 600.
+
+let drop_row record =
+  Tx_drop.{
+    hash = record.d_hash;
+    from_addr = record.d_from;
+    to_addr = record.d_to;
+    nonce = record.d_nonce;
+    ou = record.d_ou;
+    op_type = record.d_op_type;
+    reason =
+      (match record.d_reason with
+       | Evicted -> "evicted"
+       | Expired -> "expired");
+    detail = record.d_detail;
+    dropped_at = record.d_ts;
+  }
 
 let record_drop hash tx reason detail =
   if Hashtbl.length dropped_cache >= dropped_max then begin
@@ -57,10 +67,13 @@ let record_drop hash tx reason detail =
     ) dropped_cache None in
     match oldest with Some (k, _) -> Hashtbl.remove dropped_cache k | None -> ()
   end;
-  Hashtbl.replace dropped_cache hash
+  let record =
     { d_hash = hash; d_from = tx.Transaction.from; d_to = tx.to_;
       d_nonce = tx.nonce; d_ou = tx.ou; d_op_type = tx.op_type;
       d_reason = reason; d_detail = detail; d_ts = Unix.gettimeofday () }
+  in
+  Hashtbl.replace dropped_cache hash record;
+  record
 
 let cleanup_dropped () =
   let now = Unix.gettimeofday () in
@@ -76,19 +89,13 @@ let lookup_dropped hash =
       match d.d_reason with
       | Evicted -> "evicted"
       | Expired -> "expired"
-      | Rejected -> "rejected"
     in
     Some (reason_str, d.d_detail, d.d_ts, d.d_from, d.d_to, d.d_nonce, d.d_ou, d.d_op_type)
   | None -> None
 
 let all () =
   Hashtbl.fold (fun _ e acc -> e.tx :: acc) staging []
-  |> List.sort (fun (a : Transaction.t) (b : Transaction.t) ->
-    let c = String.compare a.from b.from in
-    if c <> 0 then c
-    else let c = compare a.nonce b.nonce in
-    if c <> 0 then c
-    else String.compare (Transaction.hash a) (Transaction.hash b))
+  |> Transaction.consensus_order
 
 let clear () =
   List.iter Hashtbl.clear [staging; hash_index];
@@ -127,8 +134,7 @@ let evict_nonce_dependents sender nonce =
   let sorted = List.sort (fun a b -> compare a.tx.Transaction.nonce b.tx.Transaction.nonce) dependents in
   List.map (fun e ->
     evict e;
-    record_drop e.hash e.tx Evicted "nonce gap from eviction";
-    (e.hash, e.tx)
+    record_drop e.hash e.tx Evicted "nonce gap from eviction"
   ) sorted
 
 let init_virtual_state ~lookup addr =
@@ -196,9 +202,15 @@ let add_smart ~lookup tx =
           Error "insufficient balance for replacement"
         else begin
           evict existing;
-          record_drop existing.hash existing.tx Evicted "replaced by higher fee-rate";
+          let dropped =
+            record_drop
+              existing.hash
+              existing.tx
+              Evicted
+              "replaced by higher fee-rate"
+          in
           insert tx;
-          Ok [(existing.hash, existing.tx)]
+          Ok [dropped]
         end
     | None ->
       if not (check_virtual_balance tx.from total_cost) then
@@ -231,9 +243,15 @@ let add_smart ~lookup tx =
                   evicted_list
                 else begin
                   evict candidate;
-                  record_drop candidate.hash candidate.tx Evicted "outbid by higher fee-rate";
+                  let dropped =
+                    record_drop
+                      candidate.hash
+                      candidate.tx
+                      Evicted
+                      "outbid by higher fee-rate"
+                  in
                   let deps = evict_nonce_dependents candidate.tx.Transaction.from candidate.tx.Transaction.nonce in
-                  evict_loop ((candidate.hash, candidate.tx) :: deps @ evicted_list) rest
+                  evict_loop (dropped :: deps @ evicted_list) rest
                 end
             in
             let evicted_list = evict_loop [] sorted_by_rate in
@@ -344,22 +362,6 @@ let remove_processed hashes =
   ) hashes;
   clear_virtual_state touched
 
-let remove_rejected rejections =
-  let touched = Hashtbl.create 16 in
-  List.iter (fun rejection ->
-    match Hashtbl.find_opt hash_index rejection.hash with
-    | None -> ()
-    | Some entry ->
-      Hashtbl.replace touched entry.tx.Transaction.from ();
-      evict entry;
-      record_drop
-        entry.hash
-        entry.tx
-        Rejected
-        (rejection.error_type ^ ": " ^ rejection.reason)
-  ) rejections;
-  clear_virtual_state touched
-
 let staging_ttl = 600.
 
 let expire_old () =
@@ -368,14 +370,15 @@ let expire_old () =
     if now -. e.added_at > staging_ttl then e :: acc else acc
   ) staging [] in
   let touched = Hashtbl.create 16 in
-  List.iter (fun (e : entry) ->
-    Hashtbl.replace touched e.tx.Transaction.from ();
-    evict e;
-    record_drop e.hash e.tx Expired "TTL exceeded"
-  ) expired;
-
+  let records =
+    List.map (fun (e : entry) ->
+      Hashtbl.replace touched e.tx.Transaction.from ();
+      evict e;
+      record_drop e.hash e.tx Expired "TTL exceeded"
+    ) expired
+  in
   clear_virtual_state touched;
-  List.map (fun (e : entry) -> (e.hash, e.tx)) expired
+  records
 
 let staging_total_ou () = !total_ou
 

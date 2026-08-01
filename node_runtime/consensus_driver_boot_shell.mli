@@ -81,7 +81,6 @@ type deps = {
     epoch:int ->
     (string * string) list;
   proposal_capacity : Z.t;
-  notify_staging_update : unit -> unit;
   quarantine_mismatch_threshold : int;
   soft_catchup_max_lag : int;
   quarantine_ahead_streak_threshold : int;

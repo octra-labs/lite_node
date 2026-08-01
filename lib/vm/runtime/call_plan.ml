@@ -333,9 +333,8 @@ let plan_deploy_input_with_keys ~trusted ~bytecode_b64_opt ~deployer ~nonce ~tar
         }
       | (Deploy_invalid_bytecode _ | Deploy_address_mismatch) as rejected ->
         Deploy_input_rejected (deploy_payload_reject rejected)
-    with e ->
-      Deploy_input_exception
-        (Printf.sprintf "Deploy error: %s" (Printexc.to_string e))
+    with _ ->
+      Deploy_input_exception "Program deploy input failed"
 
 let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
   plan_deploy_input_with_keys
@@ -402,4 +401,4 @@ let parse_multi_exec_calls ~max_calls message =
           | Ok call -> loop (index + 1) (call :: acc) tail
       in
       loop 0 [] call_items
-  with e -> Error (Printexc.to_string e)
+  with _ -> Error "multi_exec payload is invalid"

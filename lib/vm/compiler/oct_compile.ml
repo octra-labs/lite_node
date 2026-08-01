@@ -22,6 +22,8 @@ type xcall_abi = {
   capabilities : Program_type_flow.capability list;
 }
 
+exception Compile_limit of string
+
 let error_result msg =
   { bytecode = ""; abi_json = ""; instructions = 0; error = Some msg; version = lang_version; verification_json = ""; certificate_json = ""; program_envelope = None; program_facts = None }
 
@@ -41,6 +43,39 @@ let canonical_sources sources =
   |> List.sort (fun (left, _) (right, _) -> String.compare left right)
   |> List.map (fun (path, source) -> `Assoc ["path", `String path; "source_hash", `String (sha256_hex source)])
   |> fun values -> Yojson.Safe.to_string (`List values)
+
+let total_length items length =
+  List.fold_left (fun total item -> total + length item) 0 items
+
+let require_ast_shape ast =
+  let imports = ast.Oct_lang.imports in
+  let interfaces = ast.Oct_lang.interfaces in
+  if List.length imports > Program_limits.max_imports then
+    raise (Compile_limit "Program import count exceeds compiler limit")
+  else if
+    total_length imports (fun imp -> List.length imp.Oct_lang.imp_names)
+    > Program_limits.max_import_names
+  then
+    raise (Compile_limit "Program import name count exceeds compiler limit")
+  else if List.length interfaces > Program_limits.max_interfaces then
+    raise (Compile_limit "Program interface count exceeds compiler limit")
+  else if
+    total_length interfaces (fun iface -> List.length iface.Oct_lang.if_methods)
+    > Program_limits.max_interface_methods
+  then
+    raise (Compile_limit "Program interface method count exceeds compiler limit")
+
+let interface_index ast =
+  let index = Hashtbl.create (List.length ast.Oct_lang.interfaces) in
+  List.iter
+    (fun iface ->
+       let name = iface.Oct_lang.if_name in
+       if Hashtbl.mem index name then
+         raise (Compile_limit ("Program interface is duplicated: " ^ name))
+       else
+         Hashtbl.add index name iface)
+    ast.Oct_lang.interfaces;
+  index
 
 let flow_kind = function
   | Oct_lang.TInt -> Program_type_flow.Int
@@ -292,6 +327,8 @@ let abi_json declaration abi =
   Printf.sprintf "{\"declaration\":%S,\"functions\":[%s],\"events\":[%s]}" declaration fns events
 
 let compile_ast ~source_mode ~source_material ast =
+  require_ast_shape ast;
+  ignore (interface_index ast);
   let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
   if program
@@ -331,18 +368,46 @@ let load_required load path =
   | None -> failwith (Printf.sprintf "file not found: %s" path)
 
 let imported_interfaces load_import ast =
-  ast.Oct_lang.imports
-  |> List.concat_map (fun (imp : Oct_lang.import_decl) ->
-    let dep_ast = load_import imp in
-    dep_ast.Oct_lang.interfaces
-    |> List.filter
-         (fun iface -> List.mem iface.Oct_lang.if_name imp.Oct_lang.imp_names))
+  let bindings = Hashtbl.create (List.length ast.Oct_lang.imports) in
+  let add_import acc (imp : Oct_lang.import_decl) name =
+    let interfaces = load_import imp in
+    match Hashtbl.find_opt interfaces name with
+    | None ->
+      raise
+        (Compile_limit
+           (Printf.sprintf
+              "Program interface %s is missing from %s"
+              name
+              imp.Oct_lang.imp_path))
+    | Some iface ->
+      begin
+        match Hashtbl.find_opt bindings name with
+        | None ->
+          Hashtbl.add bindings name imp.Oct_lang.imp_path;
+          iface :: acc
+        | Some path when String.equal path imp.Oct_lang.imp_path -> acc
+        | Some _ ->
+          raise
+            (Compile_limit
+               ("Program interface import is ambiguous: " ^ name))
+      end
+  in
+  List.fold_left
+    (fun acc (imp : Oct_lang.import_decl) ->
+       List.fold_left
+         (fun acc name -> add_import acc imp name)
+         acc
+         imp.Oct_lang.imp_names)
+    []
+    ast.Oct_lang.imports
+  |> List.rev
 
 let merge_interfaces ast interfaces =
   { ast with Oct_lang.interfaces = interfaces @ ast.Oct_lang.interfaces }
 
 let compile_exception = function
-  | Stack_overflow -> raise Stack_overflow
+  | Compile_limit message -> error_result message
+  | Stack_overflow -> error_result "Program compiler complexity limit exceeded"
   | Out_of_memory -> raise Out_of_memory
   | error ->
     error_result (Printf.sprintf "compile error: %s" (Printexc.to_string error))
@@ -364,7 +429,7 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
   try
     let loaded_sources = ref [] in
     let source_cache = Hashtbl.create 16 in
-    let ast_cache = Hashtbl.create 16 in
+    let interface_cache = Hashtbl.create 16 in
     let load path =
       match Hashtbl.find_opt source_cache path with
       | Some source -> Some source
@@ -378,8 +443,8 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
     in
     let load_import imp =
       let path = imp.Oct_lang.imp_path in
-      match Hashtbl.find_opt ast_cache path with
-      | Some ast -> ast
+      match Hashtbl.find_opt interface_cache path with
+      | Some interfaces -> interfaces
       | None ->
         let source =
           match load path with
@@ -387,11 +452,15 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
           | None -> failwith (Printf.sprintf "import not found: %s" path)
         in
         let ast = Oct_parse.parse source in
-        Hashtbl.add ast_cache path ast;
-        ast
+        require_ast_shape ast;
+        let interfaces = interface_index ast in
+        Hashtbl.add interface_cache path interfaces;
+        interfaces
     in
     let main_source = load_required load main_path in
     let ast = Oct_parse.parse main_source in
+    require_ast_shape ast;
+    ignore (interface_index ast);
     if program_only && ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
       error_result "Program declaration required"
     else

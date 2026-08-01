@@ -101,7 +101,7 @@ val is_shared_bft_tx : Transaction.t -> bool
 
 val all_shared_bft : Transaction.t list -> bool
 
-val canonical_order : Transaction.t list -> Transaction.t list
+val consensus_order : Transaction.t list -> Transaction.t list
 
 val process_standard :
   backend:Epoch_exec.backend ->

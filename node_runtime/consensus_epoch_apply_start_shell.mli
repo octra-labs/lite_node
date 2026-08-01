@@ -27,6 +27,8 @@ type request = {
 type result = {
   ordered_txs : Octra_core.Transaction.t list;
   epoch_receipts_json : string list;
+  preverify_receipts_json : string list;
+  epoch_rejections : Octra_core.Tx_outcome.rejection list;
   epoch_start : float;
   pending_tx_saves : (Octra_core.Transaction.t * int) list ref;
   confirmed_fees : Z.t ref;

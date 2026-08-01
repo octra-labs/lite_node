@@ -101,10 +101,12 @@ let create
 let short hash =
   String.sub hash 0 (min 12 (String.length hash))
 
-let log_lookup tx_hash status =
+let log_lookup tx status =
+  let tx_hash = Transaction.hash tx in
   Octra_log.info "consensus"
-    "event = preverify_lookup tx = %s status = %s"
+    "event = preverify_lookup tx = %s op = %s status = %s"
     (short tx_hash)
+    (Transaction.op_type_to_string tx.Transaction.op_type)
     status
 
 let wake_queued queued =
@@ -243,7 +245,7 @@ and start t queued =
            complete t queued.tx running result;
            Lwt.return_unit)
         (fun exn ->
-           fail t queued.hash running exn;
+           fail t queued.tx running exn;
            Lwt.return_unit))
   | Some (Queued _)
   | Some (Running _)
@@ -261,24 +263,28 @@ and complete t tx running result =
         match result with
         | Ok (Verification_ready _) ->
           Octra_log.info "consensus"
-            "event = preverify_job tx = %s status = ready elapsed_ms = %d"
+            "event = preverify_job tx = %s op = %s status = ready elapsed_ms = %d"
             (short tx_hash)
+            (Transaction.op_type_to_string tx.Transaction.op_type)
             elapsed_ms
         | Ok (Verification_rejected (_, reason)) ->
           Octra_log.info "consensus"
-            "event = preverify_job tx = %s status = invalid elapsed_ms = %d reason = %s"
+            "event = preverify_job tx = %s op = %s status = invalid elapsed_ms = %d reason = %s"
             (short tx_hash)
+            (Transaction.op_type_to_string tx.Transaction.op_type)
             elapsed_ms
             reason
         | Ok Verification_stale ->
           Octra_log.info "consensus"
-            "event = preverify_job tx = %s status = stale elapsed_ms = %d"
+            "event = preverify_job tx = %s op = %s status = stale elapsed_ms = %d"
             (short tx_hash)
+            (Transaction.op_type_to_string tx.Transaction.op_type)
             elapsed_ms
         | Error reason ->
           Octra_log.error "consensus"
-            "event = preverify_job tx = %s status = failed elapsed_ms = %d reason = %s"
+            "event = preverify_job tx = %s op = %s status = failed elapsed_ms = %d reason = %s"
             (short tx_hash)
+            (Transaction.op_type_to_string tx.Transaction.op_type)
             elapsed_ms
             reason
       end
@@ -289,14 +295,16 @@ and complete t tx running result =
   end;
   schedule t
 
-and fail t tx_hash running exn =
+and fail t tx running exn =
+  let tx_hash = Transaction.hash tx in
   begin
     match Hashtbl.find_opt t.entries tx_hash with
     | Some (Running current) when current.job == running.job ->
       remove t [tx_hash];
       Octra_log.error "consensus"
-        "event = preverify_job tx = %s status = failed reason = %s"
+        "event = preverify_job tx = %s op = %s status = failed reason = %s"
         (short tx_hash)
+        (Transaction.op_type_to_string tx.Transaction.op_type)
         (Printexc.to_string exn)
     | Some (Queued _)
     | Some (Running _)
@@ -386,13 +394,13 @@ let bind_complete t tx completion =
   let* binding = t.deps.bind tx artifact in
   match binding with
   | Bound prepared ->
-    log_lookup tx_hash "ready";
+    log_lookup tx "ready";
     Lwt.return (Bound prepared)
   | Source_changed ->
-    log_lookup tx_hash "stale";
+    log_lookup tx "stale";
     Lwt.return Source_changed
   | Source_invalid reason ->
-    log_lookup tx_hash "invalid";
+    log_lookup tx "invalid";
     Hashtbl.replace t.entries tx_hash
       (Complete {
          completion = Rejected (artifact, reason);
@@ -415,14 +423,14 @@ let observe t tx =
     let tx_hash = Transaction.hash tx in
     match Hashtbl.find_opt t.entries tx_hash with
     | None ->
-      log_lookup tx_hash "missing";
+      log_lookup tx "missing";
       ignore (admit t tx);
       Lwt.return Availability.Pending
     | Some (Queued _) ->
-      log_lookup tx_hash "queued";
+      log_lookup tx "queued";
       Lwt.return Availability.Pending
     | Some (Running _) ->
-      log_lookup tx_hash "pending";
+      log_lookup tx "pending";
       Lwt.return Availability.Pending
     | Some (Complete completed) ->
       let open Lwt.Syntax in
@@ -448,19 +456,19 @@ let rec await_with_restarts t tx source_restarts =
     let tx_hash = Transaction.hash tx in
     match Hashtbl.find_opt t.entries tx_hash with
     | None ->
-      log_lookup tx_hash "missing_wait";
+      log_lookup tx "missing_wait";
       ignore (admit_with_priority t Required tx);
       begin
         match Hashtbl.find_opt t.entries tx_hash with
         | None ->
-          log_lookup tx_hash "synchronous_retry";
+          log_lookup tx "synchronous_retry";
           Lwt.return Availability.Unmanaged
         | Some _ -> await_with_restarts t tx source_restarts
       end
     | Some (Queued queued) ->
       let queued = promote_required t queued in
       schedule t;
-      log_lookup tx_hash "queued_wait";
+      log_lookup tx "queued_wait";
       let open Lwt.Syntax in
       let* () = Lwt.protected queued.activated in
       await_with_restarts t tx source_restarts
@@ -469,7 +477,7 @@ let rec await_with_restarts t tx source_restarts =
       let* binding = bind_complete t tx completed.completion in
       await_binding t tx source_restarts binding
     | Some (Running running) ->
-      log_lookup tx_hash "waiting";
+      log_lookup tx "waiting";
       Lwt.catch
         (fun () ->
            let open Lwt.Syntax in
@@ -479,8 +487,8 @@ let rec await_with_restarts t tx source_restarts =
         (function
          | Lwt.Canceled -> Lwt.fail Lwt.Canceled
          | exn ->
-           fail t tx_hash running exn;
-           log_lookup tx_hash "synchronous_retry";
+           fail t tx running exn;
+           log_lookup tx "synchronous_retry";
            Lwt.return Availability.Unmanaged)
 
 and await_binding t tx source_restarts = function
@@ -492,13 +500,12 @@ and await_binding t tx source_restarts = function
   | Source_changed ->
     let tx_hash = Transaction.hash tx in
     remove t [tx_hash];
-    log_lookup tx_hash "source_change_limit";
+    log_lookup tx "source_change_limit";
     Lwt.return Availability.Unmanaged
 
 and await_result t tx source_restarts = function
   | Error _ ->
-    let tx_hash = Transaction.hash tx in
-    log_lookup tx_hash "synchronous_retry";
+    log_lookup tx "synchronous_retry";
     Lwt.return Availability.Unmanaged
   | Ok Verification_stale ->
     await_binding t tx source_restarts Source_changed

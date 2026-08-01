@@ -12,6 +12,7 @@ type decoded = {
   tx_hashes : string list;
   txs : Transaction.t list;
   receipts_json : string list;
+  rejections : Octra_core.Tx_outcome.rejection list;
 }
 
 type frozen = {
@@ -155,15 +156,31 @@ let decode (tx_hashes, txs_json, receipts_json as raw) =
       if recomputed <> tx_hashes then
         Error "bundle tx hash mismatch"
       else
-        match Octra_core.Preverify_commit.check_strings receipts_json parsed with
-        | Ok () ->
-          Ok {
-            tx_hashes;
-            txs = parsed;
-            receipts_json;
-          }
-        | Error e ->
-          Error ("bundle preverify: " ^ e)
+        match Octra_core.Tx_outcome.split receipts_json with
+        | Error error -> Error ("bundle outcome: " ^ error)
+        | Ok artifacts ->
+          begin
+            match
+              Octra_core.Preverify_commit.check_strings
+                artifacts.preverify
+                parsed
+            with
+            | Error error -> Error ("bundle preverify: " ^ error)
+            | Ok () ->
+              match
+                Octra_core.Tx_outcome.merge
+                  ~confirmed:parsed
+                  ~rejections:artifacts.rejections
+              with
+              | Error error -> Error ("bundle outcome: " ^ error)
+              | Ok _ ->
+                Ok {
+                  tx_hashes;
+                  txs = parsed;
+                  receipts_json;
+                  rejections = artifacts.rejections;
+                }
+          end
 
 let cached t pid =
   match lookup_raw t pid with

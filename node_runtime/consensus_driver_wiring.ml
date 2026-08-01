@@ -96,7 +96,6 @@ type standard_adapters = {
   staging_txs : unit -> Transaction.t list;
   staging_epoch_txs : unit -> Transaction.t list;
   staging_total : unit -> int;
-  remove_rejected : Consensus_proposal.preview_reject list -> unit;
   proposer : unit -> string;
   head_txid_hi : unit -> int64 option;
   set_proposal : Transaction.t list -> string list -> unit;
@@ -136,8 +135,6 @@ type deps = {
   staging_txs : unit -> Transaction.t list;
   staging_epoch_txs : unit -> Transaction.t list;
   staging_total : unit -> int;
-  remove_rejected : Consensus_proposal.preview_reject list -> unit;
-  notify_staging_update : unit -> unit;
   build_preverify : Consensus_preverify_role.build;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
@@ -209,7 +206,6 @@ type config_with_standard_input = {
   read_local_ledger_root_raw : unit -> string Lwt.t;
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
-  notify_staging_update : unit -> unit;
   build_preverify : Consensus_preverify_role.build;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
@@ -267,7 +263,6 @@ type node_driver_config_runtime = {
   read_local_ledger_root_raw : unit -> string Lwt.t;
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
-  notify_staging_update : unit -> unit;
   build_preverify : Consensus_preverify_role.build;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
@@ -411,16 +406,6 @@ let node_standard_adapters runtime =
     staging_epoch_txs = (fun () ->
       Staging.get_epoch_txs ~capacity:runtime.staging_epoch_capacity);
     staging_total = (fun () -> List.length (Staging.all ()));
-    remove_rejected = (fun rejections ->
-      rejections
-      |> List.map
-           (fun (item : Consensus_proposal.preview_reject) ->
-             Staging.{
-               hash = item.hash;
-               error_type = item.error_type;
-               reason = item.reason;
-             })
-      |> Staging.remove_rejected);
     proposer = (fun () -> runtime.wallet_addr);
     head_txid_hi = (fun () ->
       match runtime.cached_head () with
@@ -528,7 +513,11 @@ let validate_bundle ~header ~expected_hashes response =
 let cached_proposal_bundle (deps : deps) ~proposal_id =
   match Consensus_bundle_cache.cached_with_log deps.proposal_bundles proposal_id with
   | Some bundle ->
-    Some Consensus_bundle_fetch.{ txs = bundle.txs; receipts_json = bundle.receipts_json }
+    Some Consensus_bundle_fetch.{
+      txs = bundle.txs;
+      receipts_json = bundle.receipts_json;
+      rejections = bundle.rejections;
+    }
   | None ->
     None
 
@@ -638,8 +627,6 @@ let make_proposal_deps (deps : deps) =
     preview = deps.proposal_preview ~catch_exn:true;
     prev_eic_root = deps.prev_eic_root;
     next_txid = deps.next_txid;
-    remove_rejected = deps.remove_rejected;
-    notify_staging_update = deps.notify_staging_update;
     set_proposal = deps.set_proposal;
     head_txid_hi = deps.head_txid_hi;
     freeze = Consensus_bundle_cache.freeze deps.proposal_bundles;
@@ -770,8 +757,6 @@ let config_with_standard (input : config_with_standard_input) =
       staging_txs = standard.staging_txs;
       staging_epoch_txs = standard.staging_epoch_txs;
       staging_total = standard.staging_total;
-      remove_rejected = standard.remove_rejected;
-      notify_staging_update = input.notify_staging_update;
       build_preverify = input.build_preverify;
       validate_preverify = input.validate_preverify;
       proposal_bundles = input.proposal_bundles;
@@ -827,7 +812,6 @@ let node_driver_config (runtime : node_driver_config_runtime) =
       sleep = runtime.sleep;
       quarantine_mismatch_threshold =
         runtime.quarantine_mismatch_threshold;
-      notify_staging_update = runtime.notify_staging_update;
       build_preverify = runtime.build_preverify;
       validate_preverify = runtime.validate_preverify;
       proposal_bundles = runtime.proposal_bundles;

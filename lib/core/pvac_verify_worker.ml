@@ -52,28 +52,28 @@ let scheduler =
     ~required_burst:Resource_lanes.preverify_required_burst
     ()
 
-let float_env name fallback lower upper =
+let float_env name default lower upper =
   match Sys.getenv_opt name with
-  | None -> fallback
+  | None -> default
   | Some raw ->
     begin
       try
         let value = float_of_string raw in
-        if value < lower || value > upper then fallback else value
+        if value < lower || value > upper then default else value
       with _ ->
-        fallback
+        default
     end
 
-let int_env name fallback lower upper =
+let int_env name default lower upper =
   match Sys.getenv_opt name with
-  | None -> fallback
+  | None -> default
   | Some raw ->
     begin
       try
         let value = int_of_string raw in
-        if value < lower || value > upper then fallback else value
+        if value < lower || value > upper then default else value
       with _ ->
-        fallback
+        default
     end
 
 let timeout_seconds () =
@@ -477,6 +477,24 @@ let verify_encrypt_with_priority
     ~commitment
     ~blinding =
   result ~priority
+    (P.Encrypt {
+       pubkey;
+       cipher;
+       amount;
+       proof;
+       commitment;
+       blinding;
+     })
+
+let verify_encrypt_classified_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~amount
+    ~proof
+    ~commitment
+    ~blinding =
+  classified_result ~priority
     (P.Encrypt {
        pubkey;
        cipher;
