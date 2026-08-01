@@ -431,6 +431,16 @@ let run (deps : deps) =
              "max_epochs = %d reason = %s"
              deps.max_stealth_defer
              reason)
+      | Unavailable_gate unavailable ->
+        deps.set_defer_count tx_hash unavailable.next_count;
+        deps.log_defer
+          ~count:unavailable.next_count
+          ~max:deps.max_stealth_defer
+          ~status:(
+            "unavailable:"
+            ^ Tx_view.preverify_unavailable_message unavailable.reason)
+          ~tx:(deps.short_hash tx_hash);
+        deps.defer ()
       | Defer_gate defer ->
         deps.set_defer_count tx_hash defer.next_count;
         deps.log_defer

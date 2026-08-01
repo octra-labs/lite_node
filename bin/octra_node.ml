@@ -24,6 +24,8 @@ module Consensus_epoch_apply_source = Octra_node_runtime.Consensus_epoch_apply_s
 module Consensus_epoch_apply_start_shell = Octra_node_runtime.Consensus_epoch_apply_start_shell
 module Consensus_finality_state = Octra_node_runtime.Consensus_finality_state
 module Consensus_join_rpc = Octra_node_runtime.Consensus_join_rpc
+module Consensus_key_switch_preverify = Octra_node_runtime.Consensus_key_switch_preverify
+module Consensus_preverify_role = Octra_node_runtime.Consensus_preverify_role
 module Consensus_proposal_preview_shell = Octra_node_runtime.Consensus_proposal_preview_shell
 module Consensus_proposal_state = Octra_node_runtime.Consensus_proposal_state
 module Consensus_runtime_boot_shell = Octra_node_runtime.Consensus_runtime_boot_shell
@@ -33,6 +35,7 @@ module Epoch_visibility = Octra_node_runtime.Epoch_visibility
 module Log = Octra_node_runtime.Log
 module Rest = Octra_node_runtime.Node_rest_facade
 module Preverify_cache = Octra_node_runtime.Preverify_cache
+module Preverify_submit = Octra_node_runtime.Preverify_submit
 module Startup_process_shell = Octra_node_runtime.Startup_process_shell
 module Startup_network_boot_shell = Octra_node_runtime.Startup_network_boot_shell
 module Startup_node_boot_shell = Octra_node_runtime.Startup_node_boot_shell
@@ -59,8 +62,6 @@ let validator_pubkeys_for_epoch = Octra_node_runtime.Validators.pubkeys_for_epoc
 
 let swarm_ref : Octra_net.P2p_swarm.t option ref = ref None
 let tx_gossip_guard = Octra_net.P2p_tx_gossip_guard.create ()
-
-let rest_runtime = Rest.{ swarm_ref }
 
 let irmin_get_meta store key = Rest.run_s (Store_irmin.get_meta store key)
 let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
@@ -726,6 +727,80 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         env = circle_preverify.env;
       }
     in
+    let key_switch_preverify =
+      Consensus_key_switch_preverify.create ledger
+    in
+    List.iter
+      (fun tx ->
+         ignore (Consensus_key_switch_preverify.admit key_switch_preverify tx))
+      (Staging.all ());
+    let stealth_preverify =
+      Preverify_submit.{
+        get_pvac_pubkey =
+          (fun addr -> Ledger.get_pvac_pubkey ledger addr);
+        sender_enc =
+          (fun addr ->
+            Option.value
+              ~default:"0"
+              (Ledger.find ledger addr).encrypted_balance);
+        start_task = Preverify_cache.start_task;
+        verify_ranges =
+          (fun ~pubkey_blob ~sender_enc ptd ->
+            Octra_node_runtime.Tx_view.preverify_stealth_ranges
+              ~pubkey_blob
+              ~sender_enc
+              ptd);
+        now = Unix.gettimeofday;
+      }
+    in
+    let preverify_admit tx =
+      Consensus_key_switch_preverify.retain
+        key_switch_preverify
+        (fun hash -> Option.is_some (Staging.find_by_hash hash));
+      ignore (Consensus_key_switch_preverify.admit key_switch_preverify tx);
+      match
+        Preverify_submit.launch_for_tx
+          stealth_preverify
+          ~tx_hash:(Transaction.hash tx)
+          tx
+      with
+      | Preverify_submit.Busy ->
+        Error
+          (Printf.sprintf
+             "pre_verify_busy pending = %d limit = %d"
+             (Preverify_cache.pending_count ())
+             (Preverify_cache.pending_max ()))
+      | Preverify_submit.Unmanaged
+      | Preverify_submit.Started
+      | Preverify_submit.Existing -> Ok ()
+    in
+    let rest_runtime = Rest.{ swarm_ref; preverify_admit } in
+    let run_preverify prepared txs =
+      Octra_core.Preverify_worker.run_many
+        ~ledger
+        ~result_policy:(private_result_policy !current_epoch)
+        ~circle_preverify:
+          (Consensus_circle_preverify.run circle_preverify)
+        ~circle_cell_preverify:
+          (Consensus_circle_cell_preverify.run circle_cell_preverify)
+        ~legacy_replay:(fun ~address ~cipher ->
+          legacy_replay
+            ~epoch:!current_epoch
+            ~address
+            ~cipher)
+        ~prepared
+        txs
+    in
+    let build_preverify =
+      run_preverify
+        (Consensus_key_switch_preverify.observe key_switch_preverify)
+      |> Consensus_preverify_role.build
+    in
+    let validate_preverify =
+      run_preverify
+        (Consensus_key_switch_preverify.await key_switch_preverify)
+      |> Consensus_preverify_role.validate
+    in
     Consensus_driver_boot_shell.run
       Consensus_driver_boot_shell.{
         env = env_opt;
@@ -782,20 +857,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         raw_to_hex;
         read_prev_ledger_root = (fun () -> Store_irmin.get_head_hash store);
         find_account = Ledger.find_opt ledger;
-        run_preverify = (fun txs ->
-          Octra_core.Preverify_worker.run_many
-            ~ledger
-            ~result_policy:(private_result_policy !current_epoch)
-            ~circle_preverify:
-              (Consensus_circle_preverify.run circle_preverify)
-            ~circle_cell_preverify:
-              (Consensus_circle_cell_preverify.run circle_cell_preverify)
-            ~legacy_replay:(fun ~address ~cipher ->
-              legacy_replay
-                ~epoch:!current_epoch
-                ~address
-                ~cipher)
-            txs);
+        build_preverify;
+        validate_preverify;
         proposal_preview;
         apply_catchup_record;
         catchup_base_eic = catchup_base_eic_root;

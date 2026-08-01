@@ -330,11 +330,31 @@ val preverify_stealth_payload :
   Octra_core.Transaction.t ->
   Octra_core.Crypto.PrivateTransferV4.t option
 
+type preverify_unavailable =
+  | Compute_queue_busy
+  | Proof_queue_busy
+  | Proof_worker_unavailable of string
+  | Proof_worker_timed_out
+  | Proof_worker_memory_exceeded
+  | Proof_worker_failed of string
+
+type preverify_error =
+  | Preverify_invalid of string
+  | Preverify_unavailable of preverify_unavailable
+
+val preverify_unavailable_message :
+  preverify_unavailable ->
+  string
+
+val run_preverify_compute :
+  (unit -> 'a) ->
+  ('a, preverify_unavailable) result Lwt.t
+
 val preverify_stealth_ranges :
   pubkey_blob:string ->
   sender_enc:string ->
   Octra_core.Crypto.PrivateTransferV4.t ->
-  ((bool * bool), string) result Lwt.t
+  ((bool * bool), preverify_error) result Lwt.t
 
 val post_signature_admission :
   preverify_has_capacity:bool ->

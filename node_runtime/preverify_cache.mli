@@ -7,16 +7,25 @@ type result = Preverify_submit.result = {
   sender_enc_snapshot : string;
 }
 
+type task_result = Preverify_submit.task_result =
+  | Checked of result
+  | Unavailable of Tx_view.preverify_unavailable
+
 type state =
   | Missing
   | Pending
   | Ready
+  | Unavailable_state of Tx_view.preverify_unavailable
   | Failed of string
 
 type gate =
   | Ready_gate
   | Failed_gate of string
   | Timeout_gate of string
+  | Unavailable_gate of {
+    next_count : int;
+    reason : Tx_view.preverify_unavailable;
+  }
   | Defer_gate of {
     next_count : int;
     status : string;
@@ -27,10 +36,6 @@ val pending_count :
   int
 
 val cache_ttl :
-  unit ->
-  float
-
-val pending_ceiling :
   unit ->
   float
 
@@ -47,12 +52,13 @@ val has_capacity :
   bool
 
 val start_task :
-  (unit -> result Lwt.t) ->
-  result Lwt.t
+  string ->
+  (unit -> task_result Lwt.t) ->
+  Preverify_submit.admit
 
 val insert_with_cap :
   string ->
-  result Lwt.t ->
+  task_result Lwt.t ->
   unit
 
 val remove :

@@ -10,6 +10,7 @@ module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
+  preverify_admit : Transaction.t -> (unit, string) result;
 }
 
 val run_s :

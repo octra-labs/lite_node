@@ -702,7 +702,8 @@ def main():
         "OCTRA_P2P_PORT": str(p2p_port),
         "OCTRA_PVAC_VERIFY_WORKER": str(worker),
         "OCTRA_PVAC_VERIFY_WORKER_HASH": worker_hash,
-        "OCTRA_VERIFY_WORKERS": "1",
+        "OCTRA_PROOF_POOL_WORKERS": "2",
+        "OCTRA_PVAC_VERIFY_WORKERS": "1",
     }
     write_env(args.config, {**values, **local})
     emit(event="configured", role=role, address=wallet["address"])

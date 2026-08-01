@@ -138,7 +138,8 @@ type deps = {
   staging_total : unit -> int;
   remove_rejected : string list -> unit;
   notify_staging_update : unit -> unit;
-  run_preverify : Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->
@@ -209,7 +210,8 @@ type config_with_standard_input = {
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
   notify_staging_update : unit -> unit;
-  run_preverify : Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->
@@ -266,9 +268,8 @@ type node_driver_config_runtime = {
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
   notify_staging_update : unit -> unit;
-  run_preverify :
-    Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->
@@ -535,6 +536,9 @@ let previous_epoch_ts (deps : deps) epoch =
     Consensus_driver_read.epoch_time deps.driver_read_deps epoch
 
 let verify_proposal_deps (deps : deps) =
+  let validate_runner =
+    Consensus_preverify_role.run_validate deps.validate_preverify
+  in
   Consensus_proposal.{
     now = deps.now;
     previous_epoch_ts = previous_epoch_ts deps;
@@ -560,14 +564,14 @@ let verify_proposal_deps (deps : deps) =
     quarantine_mismatch_threshold = deps.quarantine_mismatch_threshold;
     staging_txs = deps.staging_txs;
     cached_bundle = cached_proposal_bundle deps;
-    run_preverify = deps.run_preverify;
-    run_preverify_once = (fun ~state_root ~tx_hashes txs ->
+    validate_preverify_once = (fun ~state_root ~tx_hashes txs ->
       Consensus_bundle_cache.run_preverify_once
         deps.proposal_bundles
+        ~purpose:Consensus_bundle_cache.Validate_proposal
         ~state_root
         ~tx_hashes
         ~txs
-        deps.run_preverify);
+        validate_runner);
     driver_available = driver_available deps;
     validate_bundle;
     query_bundle = query_bundle deps;
@@ -586,6 +590,9 @@ let verify_proposal_deps (deps : deps) =
   }
 
 let make_proposal_deps (deps : deps) =
+  let build_runner =
+    Consensus_preverify_role.run_build deps.build_preverify
+  in
   Consensus_proposal.{
     start_height = (fun target_epoch ->
       match !(deps.driver_ref) with
@@ -608,14 +615,14 @@ let make_proposal_deps (deps : deps) =
       (not (deps.gates.consensus_mode ()))
       || Transaction.bft_consensus_admits_op
            tx.Transaction.op_type);
-    run_preverify = deps.run_preverify;
-    run_preverify_once = (fun ~state_root ~tx_hashes txs ->
+    build_preverify_once = (fun ~state_root ~tx_hashes txs ->
       Consensus_bundle_cache.run_preverify_once
         deps.proposal_bundles
+        ~purpose:Consensus_bundle_cache.Build_proposal
         ~state_root
         ~tx_hashes
         ~txs
-        deps.run_preverify);
+        build_runner);
     staging_total = deps.staging_total;
     proposer = deps.proposer;
     validator_pubkeys = proposal_validator_pubkeys deps;
@@ -756,7 +763,8 @@ let config_with_standard (input : config_with_standard_input) =
       staging_total = standard.staging_total;
       remove_rejected = standard.remove_rejected;
       notify_staging_update = input.notify_staging_update;
-      run_preverify = input.run_preverify;
+      build_preverify = input.build_preverify;
+      validate_preverify = input.validate_preverify;
       proposal_bundles = input.proposal_bundles;
       store_bundle = input.store_bundle;
       driver_ref = input.driver_ref;
@@ -811,7 +819,8 @@ let node_driver_config (runtime : node_driver_config_runtime) =
       quarantine_mismatch_threshold =
         runtime.quarantine_mismatch_threshold;
       notify_staging_update = runtime.notify_staging_update;
-      run_preverify = runtime.run_preverify;
+      build_preverify = runtime.build_preverify;
+      validate_preverify = runtime.validate_preverify;
       proposal_bundles = runtime.proposal_bundles;
       store_bundle = runtime.store_bundle;
       driver_ref = runtime.driver_ref;

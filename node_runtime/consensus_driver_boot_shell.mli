@@ -54,9 +54,8 @@ type deps = {
   raw_to_hex : string -> string;
   read_prev_ledger_root : unit -> string option Lwt.t;
   find_account : string -> Octra_core.Ledger.account option;
-  run_preverify :
-    Octra_core.Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_preview :
     ?catch_exn:bool ->
     Consensus_proposal.build_preview_request ->

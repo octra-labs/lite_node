@@ -553,15 +553,30 @@ let groth16_shape_ok vk proof inputs count =
   && String.length vk = 10 + 64 + (3 * 128) + ((count + 1) * 64)
   && String.length proof = 6 + 64 + 128 + 64
   && String.length inputs = count * 32
+
+type fhe_verification =
+  | Fhe_verified
+  | Fhe_rejected
+  | Fhe_unavailable
+
 let fhe_verifier_lane = Mutex.create ()
 
 let with_fhe_verifier_lane f =
   if not (Mutex.try_lock fhe_verifier_lane) then
-    false
+    Fhe_unavailable
   else
     Fun.protect
       ~finally:(fun () -> Mutex.unlock fhe_verifier_lane)
       f
+
+let fhe_verification_of_worker_result = function
+  | Ok () -> Fhe_verified
+  | Error (Octra_core.Pvac_verify_worker.Proof_rejected _) -> Fhe_rejected
+  | Error Octra_core.Pvac_verify_worker.Worker_busy
+  | Error (Octra_core.Pvac_verify_worker.Worker_unavailable _)
+  | Error Octra_core.Pvac_verify_worker.Worker_timed_out
+  | Error Octra_core.Pvac_verify_worker.Worker_memory_exceeded
+  | Error (Octra_core.Pvac_verify_worker.Worker_failed _) -> Fhe_unavailable
 
 let encoded_worker_pubkey pk =
   Pvac_ffi.serialize_pubkey pk |> Bytes.to_string
@@ -681,6 +696,16 @@ let view_guard st =
 
 let getr st r = st.regs.(r)
 let setr st r v = st.regs.(r) <- v
+
+let finish_fhe_verification st rd = function
+  | Fhe_verified ->
+    setr st rd (VBool true);
+    true
+  | Fhe_rejected ->
+    setr st rd (VBool false);
+    true
+  | Fhe_unavailable ->
+    revert_with_reason st "fhe verifier unavailable"
 
 let is_numeric = numeric_value
 
@@ -2627,24 +2652,18 @@ let exec_one st op =
          if raw_len > max_fhe_proof_bytes then
            (setr st rd (VBool false); true)
          else
-           let ok =
+           let verification =
              with_fhe_verifier_lane (fun () ->
                match worker_zero_proof proof_bytes with
-               | None -> false
+               | None -> Fhe_rejected
                | Some proof ->
-                 begin
-                   match
-                     Octra_core.Pvac_verify_worker.verify_zero_sync
-                       ~pubkey:(encoded_worker_pubkey pk)
-                       ~cipher:(encoded_worker_cipher ct)
-                       ~proof
-                   with
-                   | Ok () -> true
-                   | Error _ -> false
-                 end)
+                 Octra_core.Pvac_verify_worker.try_verify_zero_sync_classified
+                   ~pubkey:(encoded_worker_pubkey pk)
+                   ~cipher:(encoded_worker_cipher ct)
+                   ~proof
+                 |> fhe_verification_of_worker_result)
            in
-           setr st rd (VBool ok);
-           true
+           finish_fhe_verification st rd verification
        | _ -> revert st)
   | FHE_VERIFY_RANGE (rd, rpk, rct, rproof) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_range_cap) then
@@ -2660,24 +2679,18 @@ let exec_one st op =
        if raw_len > max_fhe_proof_bytes then
          (setr st rd (VBool false); true)
        else
-         let ok =
+         let verification =
            with_fhe_verifier_lane (fun () ->
              match worker_range_proof proof_bytes with
-             | None -> false
+             | None -> Fhe_rejected
              | Some proof ->
-               begin
-                 match
-                   Octra_core.Pvac_verify_worker.verify_range_sync
-                     ~pubkey:(encoded_worker_pubkey pk)
-                     ~cipher:(encoded_worker_cipher ct)
-                     ~proof
-                 with
-                 | Ok () -> true
-                 | Error _ -> false
-               end)
+               Octra_core.Pvac_verify_worker.try_verify_range_sync_classified
+                 ~pubkey:(encoded_worker_pubkey pk)
+                 ~cipher:(encoded_worker_cipher ct)
+                 ~proof
+               |> fhe_verification_of_worker_result)
          in
-         setr st rd (VBool ok);
-         true
+         finish_fhe_verification st rd verification
      | _ -> revert st)
   | GROTH16_VERIFY_BN254 (rd, rvk, rproof, rinputs) ->
     if not st.is_view then
@@ -2732,28 +2745,22 @@ let exec_one st op =
          if raw_len > max_fhe_proof_bytes then
            (setr st rd (VBool false); true)
          else
-           let ok =
+           let verification =
              with_fhe_verifier_lane (fun () ->
                match
                  worker_zero_proof proof_bytes,
                  worker_commitment commit_bytes
                with
                | Some proof, Some commitment ->
-                 begin
-                   match
-                     Octra_core.Pvac_verify_worker.verify_claim_sync
-                       ~pubkey:(encoded_worker_pubkey pk)
-                       ~cipher:(encoded_worker_cipher ct)
-                       ~proof
-                       ~commitment
-                   with
-                   | Ok () -> true
-                   | Error _ -> false
-                 end
-               | _ -> false)
+                 Octra_core.Pvac_verify_worker.try_verify_claim_sync_classified
+                   ~pubkey:(encoded_worker_pubkey pk)
+                   ~cipher:(encoded_worker_cipher ct)
+                   ~proof
+                   ~commitment
+                 |> fhe_verification_of_worker_result
+               | _ -> Fhe_rejected)
            in
-           setr st rd (VBool ok);
-           true
+           finish_fhe_verification st rd verification
        | _ -> revert st)
   | FHE_COMMIT (rd, rpk, rct) ->
     if not (st.ctx.allow_fhe_capability Fhe_commit_cap) then

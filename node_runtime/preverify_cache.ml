@@ -7,22 +7,31 @@ type result = Preverify_submit.result = {
   sender_enc_snapshot : string;
 }
 
+type task_result = Preverify_submit.task_result =
+  | Checked of result
+  | Unavailable of Tx_view.preverify_unavailable
+
 type state =
   | Missing
   | Pending
   | Ready
+  | Unavailable_state of Tx_view.preverify_unavailable
   | Failed of string
 
 type gate =
   | Ready_gate
   | Failed_gate of string
   | Timeout_gate of string
+  | Unavailable_gate of {
+    next_count : int;
+    reason : Tx_view.preverify_unavailable;
+  }
   | Defer_gate of {
     next_count : int;
     status : string;
   }
 
-let cache : (string, result Lwt.t) Hashtbl.t = Hashtbl.create 100
+let cache : (string, task_result Lwt.t) Hashtbl.t = Hashtbl.create 100
 
 let cache_ts : (string, float) Hashtbl.t = Hashtbl.create 100
 
@@ -55,12 +64,6 @@ let cache_ttl () =
     ~min_value:1.
     ~max_value:3_600.
 
-let pending_ceiling () =
-  float_env "OCTRA_PREVERIFY_PENDING_CEILING"
-    ~fallback:90.
-    ~min_value:1.
-    ~max_value:7_200.
-
 let configured_max_entries () =
   int_env "OCTRA_PREVERIFY_CACHE_MAX"
     ~fallback:64
@@ -68,10 +71,7 @@ let configured_max_entries () =
     ~max_value:4_096
 
 let pending_max () =
-  int_env "OCTRA_PREVERIFY_PENDING_MAX"
-    ~fallback:2
-    ~min_value:1
-    ~max_value:16
+  Octra_core.Resource_lanes.preverify_speculative_queue_limit
 
 let now () =
   Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1e9
@@ -89,17 +89,16 @@ let gc_on_finish () =
   | _ ->
     true
 
-let start_task f =
-  incr pending;
-  Lwt.finalize f (fun () ->
-    pending := max 0 (!pending - 1);
-    if gc_on_finish () then Gc.major ();
-    Lwt.return_unit)
-
 let find hash =
   Hashtbl.find_opt cache hash
 
 let remove hash =
+  begin
+    match find hash with
+    | Some task when Lwt.is_sleeping task -> Lwt.cancel task
+    | Some _
+    | None -> ()
+  end;
   Hashtbl.remove cache hash;
   Hashtbl.remove cache_ts hash
 
@@ -129,14 +128,12 @@ let prune ?(ttl = -1.0) ?(max_entries = -1) () =
   let max_entries =
     if max_entries < 0 then configured_max_entries () else max_entries
   in
-  let pending_ceiling = pending_ceiling () in
   let now = now () in
   let plan =
     Preverify_submit.cache_prune_plan
       ~now
       ~ttl
       ~max_entries
-      ~pending_ceiling
       (entries ())
   in
   drop plan.Preverify_submit.prune_expired;
@@ -169,13 +166,36 @@ let insert_with_cap hash result_promise =
   Hashtbl.replace cache hash result_promise;
   Hashtbl.replace cache_ts hash now
 
+let start_task hash f =
+  if Hashtbl.mem cache hash then
+    Preverify_submit.Existing
+  else if not (has_capacity ()) then
+    Preverify_submit.Busy
+  else begin
+    incr pending;
+    let task =
+      Lwt.finalize
+        (fun () ->
+          try f ()
+          with exn -> Lwt.fail exn)
+        (fun () ->
+          pending := max 0 (!pending - 1);
+          if gc_on_finish () then Gc.major ();
+          Lwt.return_unit)
+    in
+    insert_with_cap hash task;
+    Preverify_submit.Started
+  end
+
 let state hash =
   match find hash with
   | Some task ->
     begin
       match Lwt.state task with
-      | Lwt.Return _ ->
+      | Lwt.Return (Checked _) ->
         Ready
+      | Lwt.Return (Unavailable reason) ->
+        Unavailable_state reason
       | Lwt.Fail exn ->
         Failed (Printexc.to_string exn)
       | Lwt.Sleep ->
@@ -190,31 +210,31 @@ let gate ~state ~defer_count ~max_defer =
     Ready_gate
   | Failed reason ->
     Failed_gate reason
-  | Missing | Pending ->
+  | Missing | Pending | Unavailable_state _ ->
     let next_count = defer_count + 1 in
     if next_count > max_defer then
       let reason =
         match state with
         | Missing -> "task not in cache"
         | Pending -> "still running"
+        | Unavailable_state reason ->
+          Tx_view.preverify_unavailable_message reason
         | Ready | Failed _ -> "unexpected cache state"
       in
       Timeout_gate reason
     else
-      let status =
-        match state with
-        | Missing -> "missing"
-        | Pending -> "pending"
-        | Ready | Failed _ -> "unexpected"
-      in
-      Defer_gate { next_count; status }
+      match state with
+      | Unavailable_state reason -> Unavailable_gate { next_count; reason }
+      | Missing -> Defer_gate { next_count; status = "missing" }
+      | Pending -> Defer_gate { next_count; status = "pending" }
+      | Ready | Failed _ -> Defer_gate { next_count; status = "unexpected" }
 
 let ready_result hash ~sender_enc_snapshot =
   match find hash with
   | Some task ->
     begin
       match Lwt.state task with
-      | Lwt.Return result
+      | Lwt.Return (Checked result)
         when String.equal result.sender_enc_snapshot sender_enc_snapshot ->
         Some result
       | _ ->
@@ -224,9 +244,8 @@ let ready_result hash ~sender_enc_snapshot =
     None
 
 let retain keep =
-  Hashtbl.filter_map_inplace
-    (fun key value -> if keep key then Some value else None)
-    cache;
-  Hashtbl.filter_map_inplace
-    (fun key ts -> if Hashtbl.mem cache key then Some ts else None)
-    cache_ts
+  Hashtbl.fold
+    (fun key _ dropped -> if keep key then dropped else key :: dropped)
+    cache
+    []
+  |> drop

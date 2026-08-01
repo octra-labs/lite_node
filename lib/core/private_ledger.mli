@@ -25,6 +25,8 @@ type key_switch_plan = {
   source_cipher : string;
 }
 
+type key_switch_artifact
+
 type key_switch_apply = {
   old_key_hash : string;
   new_key_hash : string;
@@ -69,6 +71,11 @@ type prepared =
   | Prepared_key_switch of key_switch_plan
   | Prepared_stealth of stealth_plan
   | Prepared_claim of claim_plan * balance_plan
+
+type key_switch_binding =
+  | Key_switch_bound of prepared
+  | Key_switch_source_changed
+  | Key_switch_artifact_invalid of failure
 
 val hash_prepared : prepared -> string
 
@@ -141,6 +148,20 @@ val key_switch_plan :
   Ledger.t ->
   Transaction.t ->
   (key_switch_plan, failure) result Lwt.t
+
+val preverify_key_switch_artifact :
+  ?worker_priority:Compute_pool.priority ->
+  Ledger.t ->
+  Transaction.t ->
+  (key_switch_artifact, failure) result Lwt.t
+
+val key_switch_failure_retryable : failure -> bool
+
+val bind_key_switch_artifact :
+  Ledger.t ->
+  Transaction.t ->
+  key_switch_artifact ->
+  key_switch_binding Lwt.t
 
 val prepare_key_switch_plan :
   Ledger.t ->

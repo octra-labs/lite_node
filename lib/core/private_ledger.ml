@@ -34,6 +34,27 @@ type key_switch_plan = {
   source_cipher : string;
 }
 
+type key_switch_source = {
+  source_cipher : string;
+  source_key_hash : string;
+}
+
+type key_switch_snapshot = {
+  snapshot_cipher : string;
+  snapshot_pubkey : string option;
+}
+
+type key_switch_artifact =
+  | Verified_key_switch of {
+      artifact_tx_hash : string;
+      artifact_plan : key_switch_plan;
+    }
+  | Rejected_key_switch of {
+      artifact_tx_hash : string;
+      artifact_source : key_switch_source;
+      artifact_failure : failure;
+    }
+
 let key_switch_cache_cap = 32
 
 let key_switch_cache : (string, key_switch_plan) Hashtbl.t =
@@ -97,6 +118,11 @@ type prepared =
   | Prepared_stealth of stealth_plan
   | Prepared_claim of claim_plan * balance_plan
 
+type key_switch_binding =
+  | Key_switch_bound of prepared
+  | Key_switch_source_changed
+  | Key_switch_artifact_invalid of failure
+
 let key_bound_stealth_output_marker = "pvac_key_bound_output_v1"
 
 let stealth_output_is_key_bound (so : Ledger_types.stealth_output) =
@@ -149,6 +175,23 @@ let error ?user_reason tag reason =
     | None -> reason
   in
   Error { tag; reason; user_reason }
+
+let key_switch_worker_retry_tag = "key_switch_worker_retry"
+
+let key_switch_worker_error prefix worker_failure =
+  let tag =
+    match worker_failure with
+    | VW.Proof_rejected _ -> "key_switch_rejected"
+    | VW.Worker_busy
+    | VW.Worker_unavailable _
+    | VW.Worker_timed_out
+    | VW.Worker_memory_exceeded
+    | VW.Worker_failed _ -> key_switch_worker_retry_tag
+  in
+  error tag (prefix ^ VW.verification_failure_message worker_failure)
+
+let key_switch_failure_retryable failure =
+  String.equal failure.tag key_switch_worker_retry_tag
 
 let digest value =
   Digestif.SHA256.digest_string value
@@ -378,6 +421,18 @@ let current_cipher ledger addr tag =
   match Ledger.find_opt ledger addr with
   | None -> error tag "account not found"
   | Some acc -> Ok (Option.value ~default:"0" acc.Ledger.encrypted_balance)
+
+let key_hash_of_pubkey = function
+  | Some blob -> PR.key_hash blob
+  | None -> "none"
+
+let load_key_switch_snapshot ledger tx =
+  let open Lwt.Syntax in
+  match current_cipher ledger tx.T.from "key_switch_rejected" with
+  | Error failure -> Lwt.return_error failure
+  | Ok snapshot_cipher ->
+    let* snapshot_pubkey = Ledger.get_pvac_pubkey ledger tx.T.from in
+    Lwt.return_ok { snapshot_cipher; snapshot_pubkey }
 
 let load_pk_blob ledger addr tag op =
   let open Lwt.Syntax in
@@ -906,7 +961,12 @@ let prepared_bound_migration old_pk current_cipher payload =
             "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"
     end
 
-let verify_key_switch_plan ?legacy_public_replay ledger tx =
+let verify_key_switch_plan
+    ?legacy_public_replay
+    ?snapshot
+    ?(worker_priority = Compute_pool.Required)
+    ledger
+    tx =
   let open Lwt.Syntax in
   match parse_key_switch tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
@@ -916,7 +976,7 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
         (error "key_switch_rejected" "AES KAT mismatch - incompatible key")
     else begin
       let* new_pubkey_result =
-        Proof_pool.run (fun () ->
+        Proof_pool.run ~priority:worker_priority (fun () ->
           match PR.decode_b64 payload.new_pubkey_b64 with
           | Error e -> Error e
           | Ok raw -> PR.canonicalize_blob raw)
@@ -924,21 +984,29 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
       match new_pubkey_result with
       | Error e -> Lwt.return (error "key_switch_rejected" e)
       | Ok new_pubkey ->
-          let* old_pk = Ledger.get_pvac_pubkey ledger tx.T.from in
-          let old_key_hash = match old_pk with
-            | Some blob -> PR.key_hash blob
-            | None -> "none"
+          let* old_pk =
+            match snapshot with
+            | Some value -> Lwt.return value.snapshot_pubkey
+            | None -> Ledger.get_pvac_pubkey ledger tx.T.from
           in
+          let old_key_hash = key_hash_of_pubkey old_pk in
           let new_key_hash = PR.key_hash new_pubkey in
-          let current = current_cipher ledger tx.T.from "key_switch_rejected" in
+          let current =
+            match snapshot with
+            | Some value -> Ok value.snapshot_cipher
+            | None -> current_cipher ledger tx.T.from "key_switch_rejected"
+          in
           match current with
           | Error e -> Lwt.return (Error e)
           | Ok current_cipher ->
             let* migration_status =
-              Proof_pool.run (fun () -> PM.status_of_cipher current_cipher)
+              Proof_pool.run
+                ~priority:worker_priority
+                (fun () -> PM.status_of_cipher current_cipher)
             in
             let* history_required_result =
               Proof_pool.run
+                ~priority:worker_priority
                 (fun () ->
                   history_migration_required migration_status old_pk)
             in
@@ -1038,7 +1106,8 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
                         "new encrypted balance must be a wrapped scalar")
                   else
                     let* old_checked =
-                      VW.verify_key_switch_claim
+                      VW.verify_key_switch_claim_classified_with_priority
+                        worker_priority
                         ~pubkey:old_blob
                         ~cipher:current_cipher
                         ~proof:old_zero_proof
@@ -1046,13 +1115,15 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
                     in
                     let* checked =
                       match old_checked with
-                      | Error e ->
+                      | Error worker_failure ->
                         Lwt.return
-                          (error "key_switch_rejected"
-                            ("old encrypted balance proof failed: " ^ e))
+                          (key_switch_worker_error
+                             "old encrypted balance proof failed: "
+                             worker_failure)
                       | Ok () ->
                         let* new_checked =
-                          VW.verify_claim
+                          VW.verify_claim_classified_with_priority
+                            worker_priority
                             ~pubkey:new_pubkey
                             ~cipher:new_cipher
                             ~proof:new_zero_proof
@@ -1060,10 +1131,11 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
                         in
                         begin
                           match new_checked with
-                          | Error e ->
+                          | Error worker_failure ->
                             Lwt.return
-                              (error "key_switch_rejected"
-                                ("new encrypted balance proof failed: " ^ e))
+                              (key_switch_worker_error
+                                 "new encrypted balance proof failed: "
+                                 worker_failure)
                           | Ok () ->
                             Lwt.return_ok ()
                         end
@@ -1080,7 +1152,7 @@ let verify_key_switch_plan ?legacy_public_replay ledger tx =
                       "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"))
     end
 
-let prepare_key_switch_plan ledger tx =
+let prepare_key_switch_plan_uncached ledger tx =
   let open Lwt.Syntax in
   match parse_key_switch tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
@@ -1164,6 +1236,16 @@ let prepare_key_switch_plan ledger tx =
           end
     end
 
+let prepare_key_switch_plan ledger tx =
+  let open Lwt.Syntax in
+  if key_switch_requests_legacy_audit tx then
+    prepare_key_switch_plan_uncached ledger tx
+  else
+    let* key = key_switch_cache_key ledger tx in
+    match Hashtbl.find_opt key_switch_cache key with
+    | Some plan -> Lwt.return_ok plan
+    | None -> prepare_key_switch_plan_uncached ledger tx
+
 let key_switch_plan ?legacy_public_replay ledger tx =
   let open Lwt.Syntax in
   let* result = verify_key_switch_plan ?legacy_public_replay ledger tx in
@@ -1175,6 +1257,94 @@ let key_switch_plan ?legacy_public_replay ledger tx =
     remember_key_switch_plan key plan;
     Lwt.return result
 
+let preverify_key_switch_artifact
+    ?(worker_priority = Compute_pool.Speculative)
+    ledger
+    tx =
+  let open Lwt.Syntax in
+  if key_switch_requests_legacy_audit tx then
+    Lwt.return
+      (error
+         "key_switch_artifact_rejected"
+         "legacy key switch requires history-bound verification")
+  else
+    let* snapshot_result = load_key_switch_snapshot ledger tx in
+    match snapshot_result with
+    | Error failure -> Lwt.return_error failure
+    | Ok snapshot ->
+      let artifact_source = {
+        source_cipher = snapshot.snapshot_cipher;
+        source_key_hash = key_hash_of_pubkey snapshot.snapshot_pubkey;
+      } in
+      let artifact_tx_hash = T.hash tx in
+      let* result =
+        verify_key_switch_plan ~snapshot ~worker_priority ledger tx
+      in
+      begin
+        match result with
+        | Ok artifact_plan ->
+          Lwt.return_ok
+            (Verified_key_switch { artifact_tx_hash; artifact_plan })
+        | Error artifact_failure when
+            key_switch_failure_retryable artifact_failure ->
+          Lwt.return_error artifact_failure
+        | Error artifact_failure ->
+          Lwt.return_ok
+            (Rejected_key_switch {
+               artifact_tx_hash;
+               artifact_source;
+               artifact_failure;
+             })
+      end
+
+let bind_key_switch_artifact ledger tx artifact =
+  let open Lwt.Syntax in
+  let artifact_tx_hash =
+    match artifact with
+    | Verified_key_switch verified -> verified.artifact_tx_hash
+    | Rejected_key_switch rejected -> rejected.artifact_tx_hash
+  in
+  if not (String.equal artifact_tx_hash (T.hash tx)) then
+    Lwt.return
+      (Key_switch_artifact_invalid {
+         tag = "key_switch_artifact_rejected";
+         reason = "key switch artifact transaction mismatch";
+         user_reason = "key switch artifact transaction mismatch";
+       })
+  else
+    let* snapshot_result = load_key_switch_snapshot ledger tx in
+    match snapshot_result with
+    | Error _ -> Lwt.return Key_switch_source_changed
+    | Ok snapshot ->
+      let current_cipher = snapshot.snapshot_cipher in
+      let current_key_hash = key_hash_of_pubkey snapshot.snapshot_pubkey in
+      begin
+        match artifact with
+        | Verified_key_switch verified ->
+          let plan = verified.artifact_plan in
+          if
+            String.equal current_cipher plan.source_cipher
+            && String.equal current_key_hash plan.old_key_hash
+          then begin
+            let* cache_key = key_switch_cache_key ledger tx in
+            remember_key_switch_plan cache_key plan;
+            Lwt.return (Key_switch_bound (Prepared_key_switch plan))
+          end
+          else
+            Lwt.return Key_switch_source_changed
+        | Rejected_key_switch rejected ->
+          if
+            String.equal current_cipher rejected.artifact_source.source_cipher
+            && String.equal
+                 current_key_hash
+                 rejected.artifact_source.source_key_hash
+          then
+            Lwt.return
+              (Key_switch_artifact_invalid rejected.artifact_failure)
+          else
+            Lwt.return Key_switch_source_changed
+      end
+
 let key_switch_plan_for_apply ?legacy_public_replay ledger tx =
   let open Lwt.Syntax in
   if key_switch_requests_legacy_audit tx then
@@ -1185,7 +1355,7 @@ let key_switch_plan_for_apply ?legacy_public_replay ledger tx =
     | Some plan -> Lwt.return_ok plan
     | None -> key_switch_plan ?legacy_public_replay ledger tx
 
-let apply_key_switch_plan ledger tx plan =
+let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
   let open Lwt.Syntax in
   match current_cipher ledger tx.T.from "key_switch_rejected" with
     | Error failure ->

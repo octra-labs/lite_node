@@ -56,17 +56,9 @@ let mem hash (t : t) =
   List.exists (fun (item : item) -> item.hash = hash) t.items
 
 let needs_preverify tx =
-  match tx.Transaction.op_type with
-  | Transaction.CircleCall -> true
-  | _ ->
-    match Resource_lanes.of_op tx.Transaction.op_type with
-  | Resource_lanes.Pvac | Resource_lanes.Fhe -> true
-  | Resource_lanes.Standard
-  | Resource_lanes.Program_deploy
-  | Resource_lanes.Program
-  | Resource_lanes.Circle_compute
-  | Resource_lanes.Circle_metadata
-  | Resource_lanes.Circle_assets -> false
+  tx.Transaction.op_type
+  |> Resource_lanes.of_op
+  |> Resource_lanes.preverify_managed
 
 let admit ?now t tx =
   if not (needs_preverify tx) then Rejected "lane_not_preverified"
@@ -101,7 +93,7 @@ let pending t =
     let c = compare a.added_at b.added_at in
     if c <> 0 then c else String.compare a.hash b.hash)
 
-let take_ready ~max_items t =
+let take_pending ~max_items t =
   if max_items <= 0 then []
   else
     let rec go left acc = function
@@ -110,6 +102,10 @@ let take_ready ~max_items t =
         if left = 0 then List.rev acc
         else go (left - 1) (item :: acc) rest in
     go max_items [] (pending t)
+
+let status t hash =
+  List.find_opt (fun (item : item) -> String.equal item.hash hash) t.items
+  |> Option.map (fun item -> item.status)
 
 let apply_receipt t receipt =
   let rec go seen acc = function
@@ -152,12 +148,7 @@ let failed t =
     | Pending | Ready -> None)
   |> List.sort (fun (a, _) (b, _) -> String.compare a b)
 
-let remove_ready t hashes =
-  let keep (item : item) =
-    match item.status with
-    | Ready -> not (List.exists (String.equal item.hash) hashes)
-    | Pending | Failed _ -> true in
-  let items = List.filter keep t.items in
+let rebuild t items =
   let used =
     List.fold_left (fun used (item : item) ->
       let lane_used =
@@ -169,3 +160,22 @@ let remove_ready t hashes =
       (List.map (fun lane -> lane, Resource_lanes.zero) Resource_lanes.all)
       items in
   { t with items; used }
+
+let remove t hashes =
+  t.items
+  |> List.filter (fun (item : item) ->
+       not (List.exists (String.equal item.hash) hashes))
+  |> rebuild t
+
+let retain t keep =
+  t.items
+  |> List.filter keep
+  |> rebuild t
+
+let remove_ready t hashes =
+  t.items
+  |> List.filter (fun (item : item) ->
+       match item.status with
+       | Ready -> not (List.exists (String.equal item.hash) hashes)
+       | Pending | Failed _ -> true)
+  |> rebuild t

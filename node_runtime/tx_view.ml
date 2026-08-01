@@ -675,6 +675,10 @@ let staging_error msg =
     "fee_too_low", msg
   else if String.length m > 12 && String.sub m 0 12 = "staging full" then
     "staging_full", msg
+  else if String.starts_with ~prefix:"pre_verify_busy" m then
+    "pre_verify_busy", msg
+  else if String.starts_with ~prefix:"pre_verify_unavailable" m then
+    "pre_verify_unavailable", msg
   else if String.length m > 11 && String.sub m 0 11 = "transaction" then
     "tx_too_large", msg
   else
@@ -814,10 +818,89 @@ let preverify_stealth_payload tx =
     end
   | _ -> None
 
+type preverify_unavailable =
+  | Compute_queue_busy
+  | Proof_queue_busy
+  | Proof_worker_unavailable of string
+  | Proof_worker_timed_out
+  | Proof_worker_memory_exceeded
+  | Proof_worker_failed of string
+
+type preverify_error =
+  | Preverify_invalid of string
+  | Preverify_unavailable of preverify_unavailable
+
+let preverify_unavailable_message = function
+  | Compute_queue_busy -> "compute queue remained full"
+  | Proof_queue_busy -> "proof queue remained full"
+  | Proof_worker_unavailable reason -> "proof worker unavailable: " ^ reason
+  | Proof_worker_timed_out -> "proof worker timed out"
+  | Proof_worker_memory_exceeded -> "proof worker memory limit exceeded"
+  | Proof_worker_failed reason -> "proof worker failed: " ^ reason
+
+let max_compute_queue_waits = 40
+
+let run_preverify_compute task =
+  let rec wait attempts =
+    let open Lwt.Syntax in
+    let* result =
+      Octra_core.Proof_pool.try_run
+        ~priority:Octra_core.Compute_pool.Speculative
+        task
+    in
+    match result with
+    | Some value -> Lwt.return_ok value
+    | None when attempts < max_compute_queue_waits ->
+      let* () = Lwt_unix.sleep 0.05 in
+      wait (attempts + 1)
+    | None -> Lwt.return_error Compute_queue_busy
+  in
+  wait 0
+
+let max_proof_queue_waits = 40
+
+let max_proof_worker_retries = 1
+
+let preverify_range ~pubkey ~cipher ~proof =
+  let rec verify queue_waits worker_retries =
+    let open Lwt.Syntax in
+    let* result =
+      Octra_core.Pvac_verify_worker.verify_range_classified_with_priority
+        Octra_core.Compute_pool.Speculative
+        ~pubkey
+        ~cipher
+        ~proof
+    in
+    match result with
+    | Ok () -> Lwt.return_ok true
+    | Error (Octra_core.Pvac_verify_worker.Proof_rejected _) ->
+      Lwt.return_ok false
+    | Error Octra_core.Pvac_verify_worker.Worker_busy
+      when queue_waits < max_proof_queue_waits ->
+      let* () = Lwt_unix.sleep 0.05 in
+      verify (queue_waits + 1) worker_retries
+    | Error Octra_core.Pvac_verify_worker.Worker_busy ->
+      Lwt.return_error Proof_queue_busy
+    | Error (Octra_core.Pvac_verify_worker.Worker_failed _)
+      when worker_retries < max_proof_worker_retries ->
+      let* () = Lwt_unix.sleep 0.25 in
+      verify queue_waits (worker_retries + 1)
+    | Error (Octra_core.Pvac_verify_worker.Worker_unavailable reason) ->
+      Lwt.return_error (Proof_worker_unavailable reason)
+    | Error Octra_core.Pvac_verify_worker.Worker_timed_out ->
+      Lwt.return_error Proof_worker_timed_out
+    | Error Octra_core.Pvac_verify_worker.Worker_memory_exceeded ->
+      Lwt.return_error Proof_worker_memory_exceeded
+    | Error (Octra_core.Pvac_verify_worker.Worker_failed reason) ->
+      Lwt.return_error (Proof_worker_failed reason)
+  in
+  verify 0 0
+
 let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
   let open Lwt.Syntax in
   let* new_enc =
-    Octra_core.Proof_pool.run (fun () ->
+    run_preverify_compute
+      (fun () ->
       match Crypto.FheBalance.load_pubkey_result pubkey_blob with
       | Error e -> Error e
       | Ok pk ->
@@ -827,21 +910,29 @@ let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
           ptd.Crypto.PrivateTransferV4.delta_cipher)
   in
   match new_enc with
-  | Error e -> Lwt.return_error e
-  | Ok new_enc ->
+  | Error reason -> Lwt.return_error (Preverify_unavailable reason)
+  | Ok (Error reason) -> Lwt.return_error (Preverify_invalid reason)
+  | Ok (Ok new_enc) ->
     let* delta =
-      Octra_core.Pvac_verify_worker.verify_range
+      preverify_range
         ~pubkey:pubkey_blob
         ~cipher:ptd.Crypto.PrivateTransferV4.delta_cipher
         ~proof:ptd.Crypto.PrivateTransferV4.range_proof_delta
     in
-    let* balance =
-      Octra_core.Pvac_verify_worker.verify_range
-        ~pubkey:pubkey_blob
-        ~cipher:new_enc
-        ~proof:ptd.Crypto.PrivateTransferV4.range_proof_balance
-    in
-    Lwt.return_ok (Result.is_ok delta, Result.is_ok balance)
+    begin
+      match delta with
+      | Error reason -> Lwt.return_error (Preverify_unavailable reason)
+      | Ok delta ->
+        let* balance =
+          preverify_range
+            ~pubkey:pubkey_blob
+            ~cipher:new_enc
+            ~proof:ptd.Crypto.PrivateTransferV4.range_proof_balance
+        in
+        match balance with
+        | Error reason -> Lwt.return_error (Preverify_unavailable reason)
+        | Ok balance -> Lwt.return_ok (delta, balance)
+    end
 
 let claim_payload_ok json =
   try

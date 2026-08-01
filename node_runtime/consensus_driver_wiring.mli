@@ -136,7 +136,8 @@ type deps = {
   staging_total : unit -> int;
   remove_rejected : string list -> unit;
   notify_staging_update : unit -> unit;
-  run_preverify : Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->
@@ -207,9 +208,8 @@ type config_with_standard_input = {
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
   notify_staging_update : unit -> unit;
-  run_preverify :
-    Octra_core.Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->
@@ -266,9 +266,8 @@ type node_driver_config_runtime = {
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
   notify_staging_update : unit -> unit;
-  run_preverify :
-    Octra_core.Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
     proposal_id:string ->

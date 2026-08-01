@@ -117,13 +117,19 @@ val find_frozen : t -> string -> frozen option
 
 val prune_frozen : t -> finalized_epoch:int64 -> unit
 
+type preverify_purpose =
+  | Build_proposal
+  | Validate_proposal
+
 val preverify_item_key :
+  purpose:preverify_purpose ->
   state_root:string ->
   tx_hash:string ->
   string
 
 val run_preverify_once :
   t ->
+  purpose:preverify_purpose ->
   state_root:string ->
   tx_hashes:string list ->
   txs:Transaction.t list ->

@@ -182,10 +182,7 @@ type make_proposal_deps = {
     unit;
   staging_txs : unit -> Transaction.t list;
   admits_tx : Transaction.t -> bool;
-  run_preverify :
-    Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
-  run_preverify_once :
+  build_preverify_once :
     state_root:string ->
     tx_hashes:string list ->
     Transaction.t list ->
@@ -227,10 +224,7 @@ type verify_proposal_deps = {
   quarantine_mismatch_threshold : int;
   staging_txs : unit -> Transaction.t list;
   cached_bundle : proposal_id:string -> Consensus_bundle_fetch.proposal_bundle option;
-  run_preverify :
-    Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
-  run_preverify_once :
+  validate_preverify_once :
     state_root:string ->
     tx_hashes:string list ->
     Transaction.t list ->
@@ -1535,7 +1529,7 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
         in
         let local_preverify txs =
           let run_many txs =
-            deps.run_preverify_once
+            deps.validate_preverify_once
               ~state_root:propose.header.prev_state_root
               ~tx_hashes:tx_hashes_hex
               txs
@@ -1593,7 +1587,7 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
         let* local =
           local_preverify_bundle
             ~run_many:(fun txs ->
-              deps.run_preverify_once
+              deps.validate_preverify_once
                 ~state_root:propose.header.prev_state_root
                 ~tx_hashes:tx_hashes_hex
                 txs)
@@ -1808,7 +1802,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
       let* pre_shape =
         build_preverify
           ~run_many:(fun txs ->
-            deps.run_preverify_once
+            deps.build_preverify_once
               ~state_root:prev_root
               ~tx_hashes:admitted_hashes
               txs)

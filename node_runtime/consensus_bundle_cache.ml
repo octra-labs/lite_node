@@ -253,8 +253,17 @@ let add_key_part buffer value =
   Buffer.add_char buffer ':';
   Buffer.add_string buffer value
 
-let preverify_item_key ~state_root ~tx_hash =
+type preverify_purpose =
+  | Build_proposal
+  | Validate_proposal
+
+let preverify_purpose_tag = function
+  | Build_proposal -> "build"
+  | Validate_proposal -> "validate"
+
+let preverify_item_key ~purpose ~state_root ~tx_hash =
   let buffer = Buffer.create 256 in
+  add_key_part buffer (preverify_purpose_tag purpose);
   add_key_part buffer state_root;
   add_key_part buffer tx_hash;
   Octra_net.Hash_domain.hash
@@ -272,8 +281,8 @@ let evict_preverify t =
   in
   loop ()
 
-let run_preverify_item_once t ~state_root ~tx_hash verify =
-  let key = preverify_item_key ~state_root ~tx_hash in
+let run_preverify_item_once t ~purpose ~state_root ~tx_hash verify =
+  let key = preverify_item_key ~purpose ~state_root ~tx_hash in
   match Hashtbl.find_opt t.preverify key with
   | Some job ->
     Lwt.protected job
@@ -283,6 +292,11 @@ let run_preverify_item_once t ~state_root ~tx_hash verify =
     in
     Hashtbl.add t.preverify key job;
     Queue.push key t.preverify_fifo;
+    Lwt.on_success job (fun checked ->
+      if not (Octra_core.Preverify_worker.checked_cacheable checked) then
+        match Hashtbl.find_opt t.preverify key with
+        | Some current when current == job -> Hashtbl.remove t.preverify key
+        | Some _ | None -> ());
     Lwt.on_failure job (fun _ ->
       match Hashtbl.find_opt t.preverify key with
       | Some current when current == job ->
@@ -291,7 +305,7 @@ let run_preverify_item_once t ~state_root ~tx_hash verify =
     evict_preverify t;
     Lwt.protected job
 
-let run_preverify_once t ~state_root ~tx_hashes ~txs verify =
+let run_preverify_once t ~purpose ~state_root ~tx_hashes ~txs verify =
   let recomputed = List.map Transaction.hash txs in
   if recomputed <> tx_hashes then
     Lwt.fail_with "consensus preverify hash mismatch"
@@ -300,6 +314,7 @@ let run_preverify_once t ~state_root ~tx_hashes ~txs verify =
       let tx_hash = Transaction.hash tx in
       run_preverify_item_once
         t
+        ~purpose
         ~state_root
         ~tx_hash
         (fun () ->

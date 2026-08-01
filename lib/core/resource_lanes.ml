@@ -57,6 +57,23 @@ let all = [
   Fhe;
 ]
 
+let preverify_lanes = [Circle_compute; Pvac; Fhe]
+
+let preverify_managed lane =
+  List.mem lane preverify_lanes
+
+let preverify_queue_limit = function
+  | Circle_compute -> 1
+  | Pvac
+  | Fhe -> 6
+  | Standard
+  | Program_deploy
+  | Program
+  | Circle_metadata
+  | Circle_assets -> 0
+
+let preverify_required_burst = 4
+
 let of_op = function
   | Transaction.Standard
   | Transaction.ValidatorSetUpdate
@@ -150,6 +167,14 @@ let default_budget = function
     max_ou = Z.of_int 20_000_000;
     max_proof = 32;
   }
+
+let preverify_required_queue_limit = 128
+
+let preverify_speculative_queue_limit =
+  List.fold_left
+    (fun limit lane -> max limit (preverify_queue_limit lane))
+    1
+    preverify_lanes
 
 let proof_cost op =
   match op with

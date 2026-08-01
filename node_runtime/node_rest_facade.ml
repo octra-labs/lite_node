@@ -13,6 +13,7 @@ module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
+  preverify_admit : Transaction.t -> (unit, string) result;
 }
 
 let cli_has_flag name =
@@ -75,40 +76,58 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
       match Staging.add_smart ~lookup tx with
       | Error e -> Error e
       | Ok _ ->
-        let swarm_opt = !(runtime.swarm_ref) in
-        let peer_count =
-          match swarm_opt with
-          | Some swarm -> Octra_net.P2p_swarm.peer_count swarm
-          | None -> 0
-        in
-        let effects =
-          Tx_view.staging_submit_effects
-            ~relay
-            ~peer_count
-            ~total_txs:(List.length (Staging.all ()))
-            ~total_ou:!Staging.total_ou
-            ~max_ou:Staging.max_ou
-            ~tx_hash
-        in
-        WSServer.notify_new_tx tx;
-        notify_staging_update
-          ~total_txs:effects.Tx_view.total_txs
-          ~total_ou:effects.total_ou
-          ~max_ou:effects.max_ou
-          ();
         begin
-          match swarm_opt, effects.relay_payload with
-          | Some swarm, Some payload ->
-            Lwt.async (fun () ->
-              Octra_net.P2p_swarm.broadcast swarm
-                {
-                  Octra_net.P2p_frame.msg_type =
-                    Octra_net.P2p_frame.msg_tx_gossip;
-                  payload;
-                })
-          | _ -> ()
-        end;
-        Ok tx_hash
+          let admission =
+            try runtime.preverify_admit tx
+            with exn ->
+              Error
+                ("pre_verify_unavailable reason = " ^ Printexc.to_string exn)
+          in
+          match admission with
+          | Error reason ->
+            ignore (Staging.remove_by_hash tx_hash);
+            Preverify_cache.remove tx_hash;
+            Log.warn "staging"
+              "event = preverify_admit status = deferred tx = %s reason = %s"
+              (Text.hash_short tx_hash)
+              reason;
+            Error reason
+          | Ok () ->
+            let swarm_opt = !(runtime.swarm_ref) in
+            let peer_count =
+              match swarm_opt with
+              | Some swarm -> Octra_net.P2p_swarm.peer_count swarm
+              | None -> 0
+            in
+            let effects =
+              Tx_view.staging_submit_effects
+                ~relay
+                ~peer_count
+                ~total_txs:(List.length (Staging.all ()))
+                ~total_ou:!Staging.total_ou
+                ~max_ou:Staging.max_ou
+                ~tx_hash
+            in
+            WSServer.notify_new_tx tx;
+            notify_staging_update
+              ~total_txs:effects.Tx_view.total_txs
+              ~total_ou:effects.total_ou
+              ~max_ou:effects.max_ou
+              ();
+            begin
+              match swarm_opt, effects.relay_payload with
+              | Some swarm, Some payload ->
+                Lwt.async (fun () ->
+                  Octra_net.P2p_swarm.broadcast swarm
+                    {
+                      Octra_net.P2p_frame.msg_type =
+                        Octra_net.P2p_frame.msg_tx_gossip;
+                      payload;
+                    })
+              | _ -> ()
+            end;
+            Ok tx_hash
+        end
 
 let max_timestamp_drift = 300.0
 
@@ -155,34 +174,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
       | Error msg ->
         let (t, r) = Tx_view.staging_error msg in
         Error (t, r)
-      | Ok tx_hash ->
-        begin
-          match tx.Transaction.op_type with
-          | Transaction.StealthOp ->
-            Preverify_submit.launch_for_tx
-              {
-                get_pvac_pubkey =
-                  (fun addr -> Ledger.get_pvac_pubkey ledger addr);
-                sender_enc =
-                  (fun addr ->
-                    Option.value
-                      ~default:"0"
-                      (Ledger.find ledger addr).encrypted_balance);
-                start_task = Preverify_cache.start_task;
-                insert_task = Preverify_cache.insert_with_cap;
-                verify_ranges =
-                  (fun ~pubkey_blob ~sender_enc ptd ->
-                    Tx_view.preverify_stealth_ranges
-                      ~pubkey_blob
-                      ~sender_enc
-                      ptd);
-                now = Unix.gettimeofday;
-              }
-              ~tx_hash
-              tx
-          | _ -> ()
-        end;
-        Ok tx_hash
+      | Ok tx_hash -> Ok tx_hash
 
 let run_s = Node_rpc_server.run_s
 

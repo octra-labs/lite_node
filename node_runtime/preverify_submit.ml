@@ -7,6 +7,16 @@ type result = {
   sender_enc_snapshot : string;
 }
 
+type task_result =
+  | Checked of result
+  | Unavailable of Tx_view.preverify_unavailable
+
+type admit =
+  | Unmanaged
+  | Started
+  | Existing
+  | Busy
+
 type cache_entry = {
   cache_key : string;
   cache_ts : float;
@@ -29,26 +39,24 @@ type io = {
   ptd : Octra_core.Crypto.PrivateTransferV4.t;
   get_pvac_pubkey : string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : (unit -> result Lwt.t) -> result Lwt.t;
-  insert_task : string -> result Lwt.t -> unit;
+  start_task : string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
     pubkey_blob:string ->
     sender_enc:string ->
     Octra_core.Crypto.PrivateTransferV4.t ->
-    ((bool * bool), string) Stdlib.result Lwt.t;
+    ((bool * bool), Tx_view.preverify_error) Stdlib.result Lwt.t;
   now : unit -> float;
 }
 
 type launcher = {
   get_pvac_pubkey : string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : (unit -> result Lwt.t) -> result Lwt.t;
-  insert_task : string -> result Lwt.t -> unit;
+  start_task : string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
     pubkey_blob:string ->
     sender_enc:string ->
     Octra_core.Crypto.PrivateTransferV4.t ->
-    ((bool * bool), string) Stdlib.result Lwt.t;
+    ((bool * bool), Tx_view.preverify_error) Stdlib.result Lwt.t;
   now : unit -> float;
 }
 
@@ -66,7 +74,7 @@ let rec take_keys n entries =
   | _, [] -> []
   | n, entry :: rest -> entry.cache_key :: take_keys (n - 1) rest
 
-let cache_prune_plan ~now ~ttl ~max_entries ~pending_ceiling:_ entries =
+let cache_prune_plan ~now ~ttl ~max_entries entries =
   let expired =
     List.filter
       (fun entry ->
@@ -103,13 +111,15 @@ let hard_cap_plan ~max_entries entries =
     { hard_cap_drop = []; hard_cap_requested_drop = 0 }
 
 let result_of_ranges ~sender_enc_snapshot = function
-  | Error _ ->
-    { delta_ok = false; balance_ok = false; sender_enc_snapshot }
+  | Error (Tx_view.Preverify_invalid _) ->
+    Checked { delta_ok = false; balance_ok = false; sender_enc_snapshot }
+  | Error (Tx_view.Preverify_unavailable reason) ->
+    Unavailable reason
   | Ok (delta_ok, balance_ok) ->
-    { delta_ok; balance_ok; sender_enc_snapshot }
+    Checked { delta_ok; balance_ok; sender_enc_snapshot }
 
 let launch (io : io) =
-  Lwt.async (fun () ->
+  io.start_task io.tx_hash (fun () ->
     let open Lwt.Syntax in
     let t0 = io.now () in
     Log.info "pre_verify" "start tx = %s from = %s" (short16 io.tx_hash) io.sender;
@@ -120,32 +130,34 @@ let launch (io : io) =
         (String.length pubkey_blob)
         (io.now () -. t0);
       let sender_enc = io.sender_enc io.sender in
-      let task = io.start_task (fun () ->
-        let open Lwt.Syntax in
-        let* ranges =
-          io.verify_ranges ~pubkey_blob ~sender_enc io.ptd in
-        begin
-          match ranges with
-          | Error e ->
-            Log.warn "pre_verify" "bad pvac pubkey addr = %s reason = %s" io.sender e
-          | Ok (delta_ok, balance_ok) ->
-            Log.info "pre_verify" "done delta_ok = %b balance_ok = %b elapsed = %.1fs"
-              delta_ok
-              balance_ok
-              (io.now () -. t0)
-        end;
-        Lwt.return (result_of_ranges ~sender_enc_snapshot:sender_enc ranges))
-      in
-      io.insert_task io.tx_hash task;
-      Lwt.return_unit
+      let* ranges =
+        io.verify_ranges ~pubkey_blob ~sender_enc io.ptd in
+      begin
+        match ranges with
+        | Error (Tx_view.Preverify_invalid e) ->
+          Log.warn "pre_verify" "bad pvac pubkey addr = %s reason = %s" io.sender e
+        | Error (Tx_view.Preverify_unavailable reason) ->
+          Log.warn "pre_verify" "unavailable addr = %s reason = %s"
+            io.sender
+            (Tx_view.preverify_unavailable_message reason)
+        | Ok (delta_ok, balance_ok) ->
+          Log.info "pre_verify" "done delta_ok = %b balance_ok = %b elapsed = %.1fs"
+            delta_ok
+            balance_ok
+            (io.now () -. t0)
+      end;
+      Lwt.return (result_of_ranges ~sender_enc_snapshot:sender_enc ranges)
     | None ->
       Log.warn "pre_verify" "no pvac pubkey addr = %s" io.sender;
-      Lwt.return_unit)
+      Lwt.return
+        (result_of_ranges
+           ~sender_enc_snapshot:(io.sender_enc io.sender)
+           (Error (Tx_view.Preverify_invalid "pvac pubkey missing"))))
 
 let launch_for_tx (launcher : launcher) ~tx_hash tx =
   match Tx_view.preverify_stealth_payload tx with
   | None ->
-    ()
+    Unmanaged
   | Some ptd ->
     launch {
       tx_hash;
@@ -154,7 +166,6 @@ let launch_for_tx (launcher : launcher) ~tx_hash tx =
       get_pvac_pubkey = launcher.get_pvac_pubkey;
       sender_enc = launcher.sender_enc;
       start_task = launcher.start_task;
-      insert_task = launcher.insert_task;
       verify_ranges = launcher.verify_ranges;
       now = launcher.now;
     }

@@ -2,12 +2,27 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module P = Pvac_verify_protocol
+module Scheduler = Compute_pool
+
+type priority = Scheduler.priority =
+  | Required
+  | Speculative
 
 type outcome =
   | Completed of P.response
   | Timed_out
   | Memory_exceeded
+  | Busy
+  | Unavailable of string
   | Failed of string
+
+type verification_failure =
+  | Proof_rejected of string
+  | Worker_busy
+  | Worker_unavailable of string
+  | Worker_timed_out
+  | Worker_memory_exceeded
+  | Worker_failed of string
 
 type stream = {
   fd : Unix.file_descr;
@@ -15,8 +30,8 @@ type stream = {
   mutable open_ : bool;
 }
 
-let capacity =
-  match Sys.getenv_opt "OCTRA_VERIFY_WORKERS" with
+let capacity_of_getenv getenv =
+  match getenv "OCTRA_PVAC_VERIFY_WORKERS" with
   | None -> 1
   | Some raw ->
     begin
@@ -27,57 +42,15 @@ let capacity =
         1
     end
 
-let max_queue =
-  match Sys.getenv_opt "OCTRA_VERIFY_QUEUE" with
-  | None -> 8
-  | Some raw ->
-    begin
-      try
-        let value = int_of_string raw in
-        if value < 1 || value > 32 then 8 else value
-      with _ ->
-        8
-    end
+let capacity = capacity_of_getenv Sys.getenv_opt
 
-let slot_mutex = Mutex.create ()
-
-let slot_ready = Condition.create ()
-
-let active_slots = ref 0
-
-let waiting_slots = ref 0
-
-let acquire_slot () =
-  Mutex.lock slot_mutex;
-  if !active_slots < capacity then begin
-    incr active_slots;
-    Mutex.unlock slot_mutex;
-    true
-  end else if !waiting_slots >= max_queue then begin
-    Mutex.unlock slot_mutex;
-    false
-  end else begin
-    incr waiting_slots;
-    while !active_slots >= capacity do
-      Condition.wait slot_ready slot_mutex
-    done;
-    decr waiting_slots;
-    incr active_slots;
-    Mutex.unlock slot_mutex;
-    true
-  end
-
-let release_slot () =
-  Mutex.lock slot_mutex;
-  decr active_slots;
-  Condition.signal slot_ready;
-  Mutex.unlock slot_mutex
-
-let with_slot task =
-  if acquire_slot () then
-    Fun.protect ~finally:release_slot task
-  else
-    Failed "worker_queue_full"
+let scheduler =
+  Scheduler.create
+    ~capacity
+    ~required_limit:Resource_lanes.preverify_required_queue_limit
+    ~speculative_limit:Resource_lanes.preverify_speculative_queue_limit
+    ~required_burst:Resource_lanes.preverify_required_burst
+    ()
 
 let float_env name fallback lower upper =
   match Sys.getenv_opt name with
@@ -417,29 +390,77 @@ let run_process worker request =
     close_all ();
     Failed (Printexc.to_string error)
 
-let run_sync request =
-  with_slot (fun () ->
-    match worker_path () with
-    | None -> Failed "worker_missing"
-    | Some worker -> run_process worker request)
+let run_unmanaged request =
+  match worker_path () with
+  | None -> Unavailable "worker_missing"
+  | Some worker -> run_process worker request
 
-let run request =
-  Lwt_preemptive.detach (fun () -> run_sync request) ()
+let run_sync ?(priority = Required) request =
+  match
+    Scheduler.run_sync scheduler priority (fun () -> run_unmanaged request)
+  with
+  | Some outcome -> outcome
+  | None -> Busy
 
-let outcome_result = function
-  | Completed response when response.accepted -> Ok ()
-  | Completed response -> Error response.reason
-  | Timed_out -> Error "proof worker timed out"
-  | Memory_exceeded -> Error "proof worker memory limit exceeded"
-  | Failed reason -> Error ("proof worker failed: " ^ reason)
+let try_run_sync ?(priority = Speculative) request =
+  match
+    Scheduler.try_run_sync scheduler priority (fun () -> run_unmanaged request)
+  with
+  | Some outcome -> outcome
+  | None -> Busy
 
-let result request =
+let run ?(priority = Required) request =
   let open Lwt.Syntax in
-  let* outcome = run request in
+  let* outcome =
+    Scheduler.run_threaded scheduler priority run_unmanaged request
+  in
+  match outcome with
+  | Some value -> Lwt.return value
+  | None -> Lwt.return Busy
+
+let scheduler_stats () =
+  Scheduler.stats scheduler
+
+let verification_failure_message = function
+  | Proof_rejected reason -> reason
+  | Worker_busy -> "proof worker queue is full"
+  | Worker_unavailable reason -> "proof worker unavailable: " ^ reason
+  | Worker_timed_out -> "proof worker timed out"
+  | Worker_memory_exceeded -> "proof worker memory limit exceeded"
+  | Worker_failed reason -> "proof worker failed: " ^ reason
+
+let classified_outcome_result = function
+  | Completed response when response.accepted -> Ok ()
+  | Completed response -> Error (Proof_rejected response.reason)
+  | Busy -> Error Worker_busy
+  | Unavailable reason -> Error (Worker_unavailable reason)
+  | Timed_out -> Error Worker_timed_out
+  | Memory_exceeded -> Error Worker_memory_exceeded
+  | Failed reason -> Error (Worker_failed reason)
+
+let outcome_result outcome =
+  classified_outcome_result outcome
+  |> Result.map_error verification_failure_message
+
+let classified_result ?(priority = Required) request =
+  let open Lwt.Syntax in
+  let* outcome = run ~priority request in
+  Lwt.return (classified_outcome_result outcome)
+
+let result ?(priority = Required) request =
+  let open Lwt.Syntax in
+  let* outcome = run ~priority request in
   Lwt.return (outcome_result outcome)
 
-let result_sync request =
-  run_sync request |> outcome_result
+let result_sync ?(priority = Required) request =
+  run_sync ~priority request |> outcome_result
+
+let try_classified_result_sync ?(priority = Speculative) request =
+  try_run_sync ~priority request |> classified_outcome_result
+
+let try_result_sync ?(priority = Speculative) request =
+  try_classified_result_sync ~priority request
+  |> Result.map_error verification_failure_message
 
 let ready_sync () =
   result_sync P.Ping
@@ -447,8 +468,15 @@ let ready_sync () =
 let ready () =
   result P.Ping
 
-let verify_encrypt ~pubkey ~cipher ~amount ~proof ~commitment ~blinding =
-  result
+let verify_encrypt_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~amount
+    ~proof
+    ~commitment
+    ~blinding =
+  result ~priority
     (P.Encrypt {
        pubkey;
        cipher;
@@ -458,14 +486,79 @@ let verify_encrypt ~pubkey ~cipher ~amount ~proof ~commitment ~blinding =
        blinding;
      })
 
+let verify_encrypt ~pubkey ~cipher ~amount ~proof ~commitment ~blinding =
+  verify_encrypt_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~amount
+    ~proof
+    ~commitment
+    ~blinding
+
+let verify_claim_with_priority priority ~pubkey ~cipher ~proof ~commitment =
+  result ~priority (P.Claim { pubkey; cipher; proof; commitment })
+
 let verify_claim ~pubkey ~cipher ~proof ~commitment =
-  result (P.Claim { pubkey; cipher; proof; commitment })
+  verify_claim_with_priority Required ~pubkey ~cipher ~proof ~commitment
+
+let verify_claim_classified_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  classified_result ~priority (P.Claim { pubkey; cipher; proof; commitment })
+
+let verify_claim_classified ~pubkey ~cipher ~proof ~commitment =
+  verify_claim_classified_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
+let verify_key_switch_claim_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  result ~priority (P.Key_switch_claim { pubkey; cipher; proof; commitment })
 
 let verify_key_switch_claim ~pubkey ~cipher ~proof ~commitment =
-  result (P.Key_switch_claim { pubkey; cipher; proof; commitment })
+  verify_key_switch_claim_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
+let verify_key_switch_claim_classified_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  classified_result ~priority
+    (P.Key_switch_claim { pubkey; cipher; proof; commitment })
+
+let verify_key_switch_claim_classified ~pubkey ~cipher ~proof ~commitment =
+  verify_key_switch_claim_classified_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
+let verify_range_with_priority priority ~pubkey ~cipher ~proof =
+  result ~priority (P.Range { pubkey; cipher; proof })
+
+let verify_range_classified_with_priority priority ~pubkey ~cipher ~proof =
+  classified_result ~priority (P.Range { pubkey; cipher; proof })
 
 let verify_range ~pubkey ~cipher ~proof =
-  result (P.Range { pubkey; cipher; proof })
+  verify_range_with_priority Required ~pubkey ~cipher ~proof
 
 let verify_zero_sync ~pubkey ~cipher ~proof =
   result_sync (P.Zero { pubkey; cipher; proof })
@@ -479,14 +572,34 @@ let verify_range_sync ~pubkey ~cipher ~proof =
 let verify_range_bound_sync ~pubkey ~cipher ~proof ~commitment =
   result_sync (P.Range_bound { pubkey; cipher; proof; commitment })
 
-let verify_circle_cell
+let try_verify_zero_sync ~pubkey ~cipher ~proof =
+  try_result_sync (P.Zero { pubkey; cipher; proof })
+
+let try_verify_zero_sync_classified ~pubkey ~cipher ~proof =
+  try_classified_result_sync (P.Zero { pubkey; cipher; proof })
+
+let try_verify_claim_sync ~pubkey ~cipher ~proof ~commitment =
+  try_result_sync (P.Claim { pubkey; cipher; proof; commitment })
+
+let try_verify_claim_sync_classified ~pubkey ~cipher ~proof ~commitment =
+  try_classified_result_sync
+    (P.Claim { pubkey; cipher; proof; commitment })
+
+let try_verify_range_sync ~pubkey ~cipher ~proof =
+  try_result_sync (P.Range { pubkey; cipher; proof })
+
+let try_verify_range_sync_classified ~pubkey ~cipher ~proof =
+  try_classified_result_sync (P.Range { pubkey; cipher; proof })
+
+let verify_circle_cell_with_priority
+    priority
     ~pubkey
     ~cipher
     ~ciphertext_commitment
     ~proof_kind
     ~proof
     ~amount_commitment =
-  result
+  result ~priority
     (P.Circle_cell {
        pubkey;
        cipher;
@@ -495,6 +608,22 @@ let verify_circle_cell
        proof;
        amount_commitment;
      })
+
+let verify_circle_cell
+    ~pubkey
+    ~cipher
+    ~ciphertext_commitment
+    ~proof_kind
+    ~proof
+    ~amount_commitment =
+  verify_circle_cell_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~ciphertext_commitment
+    ~proof_kind
+    ~proof
+    ~amount_commitment
 
 let verify_circle_cell_sync
     ~pubkey

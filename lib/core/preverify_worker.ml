@@ -4,6 +4,7 @@
 module R = Preverify_receipt
 module Q = Preverify_queue
 module T = Transaction
+module A = Preverify_availability
 
 type ready = {
   tx : T.t;
@@ -13,7 +14,12 @@ type ready = {
 type skip = {
   tx : T.t;
   reason : string;
+  kind : skip_kind;
 }
+
+and skip_kind =
+  | Deferred
+  | Invalid
 
 type batch = {
   ready : ready list;
@@ -22,6 +28,7 @@ type batch = {
 
 type verdict =
   | Ready of R.t
+  | Defer of string
   | Skip of string
 
 type checked =
@@ -271,29 +278,82 @@ let verify_key_switch ?legacy_replay ledger tx =
     Lwt.return_ok (Private_ledger.Prepared_key_switch plan)
   | Error failure -> Lwt.return_error failure.Private_ledger.reason
 
+let prepared_key_switch prepared ledger tx =
+  let open Lwt.Syntax in
+  match prepared with
+  | None ->
+    let* result = verify_key_switch ledger tx in
+    Lwt.return (Result.fold ~ok:(fun value -> A.Ready value)
+      ~error:(fun reason -> A.Invalid reason) result)
+  | Some lookup ->
+    let* available = lookup tx in
+    begin
+      match available with
+      | A.Unmanaged ->
+        let* result = verify_key_switch ledger tx in
+        Lwt.return (Result.fold ~ok:(fun value -> A.Ready value)
+          ~error:(fun reason -> A.Invalid reason) result)
+      | A.Pending -> Lwt.return A.Pending
+      | A.Invalid reason -> Lwt.return (A.Invalid reason)
+      | A.Ready (Private_ledger.Prepared_key_switch _ as value) ->
+        Lwt.return (A.Ready value)
+      | A.Ready _ ->
+        Lwt.return (A.Invalid "key switch prepared operation mismatch")
+    end
+
 let run_heavy
     ?ledger
     ?legacy_replay
+    ?prepared
     ?(result_policy = Private_result_policy.Recoverable)
     tx =
+  let open Lwt.Syntax in
   match tx.T.op_type, ledger with
-  | T.EncryptOp, Some ledger -> verify_encrypt result_policy ledger tx
-  | T.DecryptOp, Some ledger -> verify_decrypt result_policy ledger tx
-  | T.StealthOp, Some ledger -> verify_stealth result_policy ledger tx
-  | T.ClaimOp, Some ledger -> verify_claim result_policy ledger tx
-  | T.KeySwitch, Some ledger -> verify_key_switch ?legacy_replay ledger tx
-  | T.PrivateOp, _ -> Lwt.return (Error "private_disabled")
-  | T.RecryptOp, _ -> Lwt.return (Error "recrypt_disabled")
-  | T.CircleBalanceCellPut, _ -> Lwt.return (Error "circle_balance_preverify_not_ready")
-  | T.CircleRegisterCellPut, _ -> Lwt.return (Error "circle_register_preverify_not_ready")
-  | _, None -> Lwt.return (Error "ledger_required")
-  | _ -> Lwt.return (Error "lane_not_heavy")
+  | T.KeySwitch, Some ledger ->
+    if Private_ledger.key_switch_requests_legacy_audit tx then
+      let* result = verify_key_switch ?legacy_replay ledger tx in
+      Lwt.return
+        (Result.fold
+           ~ok:(fun value -> A.Ready value)
+           ~error:(fun reason -> A.Invalid reason)
+           result)
+    else
+      prepared_key_switch prepared ledger tx
+  | T.EncryptOp, Some ledger ->
+    let* result = verify_encrypt result_policy ledger tx in
+    Lwt.return
+      (Result.fold ~ok:(fun value -> A.Ready value)
+         ~error:(fun reason -> A.Invalid reason) result)
+  | T.DecryptOp, Some ledger ->
+    let* result = verify_decrypt result_policy ledger tx in
+    Lwt.return
+      (Result.fold ~ok:(fun value -> A.Ready value)
+         ~error:(fun reason -> A.Invalid reason) result)
+  | T.StealthOp, Some ledger ->
+    let* result = verify_stealth result_policy ledger tx in
+    Lwt.return
+      (Result.fold ~ok:(fun value -> A.Ready value)
+         ~error:(fun reason -> A.Invalid reason) result)
+  | T.ClaimOp, Some ledger ->
+    let* result = verify_claim result_policy ledger tx in
+    Lwt.return
+      (Result.fold ~ok:(fun value -> A.Ready value)
+         ~error:(fun reason -> A.Invalid reason) result)
+  | T.PrivateOp, _ -> Lwt.return (A.Invalid "private_disabled")
+  | T.RecryptOp, _ -> Lwt.return (A.Invalid "recrypt_disabled")
+  | T.CircleBalanceCellPut, _ ->
+    Lwt.return (A.Invalid "circle_balance_preverify_not_ready")
+  | T.CircleRegisterCellPut, _ ->
+    Lwt.return (A.Invalid "circle_register_preverify_not_ready")
+  | _, None -> Lwt.return (A.Invalid "ledger_required")
+  | _ -> Lwt.return (A.Invalid "lane_not_heavy")
 
 let run
     ?ledger
     ?circle_preverify
     ?circle_cell_preverify
     ?legacy_replay
+    ?prepared
     ?pre_state_hash
     ?pre_state_root
     ?(result_policy = Private_result_policy.Recoverable)
@@ -358,10 +418,12 @@ let run
         | _, _, _, None -> Lwt.return (Skip "state_binding_required")
       end
     else
-      let* v = run_heavy ?ledger ?legacy_replay ~result_policy tx in
+      let* v = run_heavy ?ledger ?legacy_replay ?prepared ~result_policy tx in
       match v with
-      | Error e -> Lwt.return (Skip e)
-      | Ok prepared ->
+      | A.Unmanaged -> Lwt.return (Skip "preverify operation is unmanaged")
+      | A.Pending -> Lwt.return (Defer "key_switch_preverify_pending")
+      | A.Invalid e -> Lwt.return (Skip e)
+      | A.Ready prepared ->
         begin
           match ledger, pre_state_hash with
           | Some ledger, Some pre_state_hash ->
@@ -401,6 +463,7 @@ let isolate_snapshot selected txs =
         {
           tx;
           reason = snapshot_isolation_reason selected;
+          kind = Deferred;
         } :: skipped)
     txs
     ([], [])
@@ -420,6 +483,7 @@ let deferred_snapshot_transitions selected_skip txs =
         Some {
           tx;
           reason = "circle_preverify_deferred";
+          kind = Deferred;
         })
     txs
 
@@ -472,6 +536,7 @@ let isolate_private_transitions txs =
         {
           tx;
           reason = "private_transition_dependency_deferred";
+          kind = Deferred;
         } :: skipped
       | _ -> tx :: ready, skipped)
     txs
@@ -535,6 +600,7 @@ let run_many
     ?circle_preverify
     ?circle_cell_preverify
     ?legacy_replay
+    ?prepared
     ?(result_policy = Private_result_policy.Recoverable)
     txs =
   let open Lwt.Syntax in
@@ -555,6 +621,7 @@ let run_many
           ?circle_preverify
           ?circle_cell_preverify
           ?legacy_replay
+          ?prepared
           ~pre_state_hash
           ~pre_state_root
           ~result_policy
@@ -563,7 +630,13 @@ let run_many
       match verdict with
       | Ready receipt ->
         Lwt.return (Checked_ready { tx; receipt = Some receipt })
+      | Defer reason ->
+        Lwt.return (Checked_skip { tx; reason; kind = Deferred })
       | Skip reason ->
-        Lwt.return (Checked_skip { tx; reason })
+        Lwt.return (Checked_skip { tx; reason; kind = Invalid })
   in
   run_checked verify txs
+
+let checked_cacheable = function
+  | Checked_ready _ -> true
+  | Checked_skip item -> item.kind = Invalid

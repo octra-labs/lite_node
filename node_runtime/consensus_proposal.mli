@@ -182,10 +182,7 @@ type make_proposal_deps = {
     unit;
   staging_txs : unit -> Transaction.t list;
   admits_tx : Transaction.t -> bool;
-  run_preverify :
-    Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
-  run_preverify_once :
+  build_preverify_once :
     state_root:string ->
     tx_hashes:string list ->
     Transaction.t list ->
@@ -229,10 +226,7 @@ type verify_proposal_deps = {
   cached_bundle :
     proposal_id:string ->
     Consensus_bundle_fetch.proposal_bundle option;
-  run_preverify :
-    Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
-  run_preverify_once :
+  validate_preverify_once :
     state_root:string ->
     tx_hashes:string list ->
     Transaction.t list ->

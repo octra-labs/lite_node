@@ -54,9 +54,8 @@ type deps = {
   raw_to_hex : string -> string;
   read_prev_ledger_root : unit -> string option Lwt.t;
   find_account : string -> Octra_core.Ledger.account option;
-  run_preverify :
-    Octra_core.Transaction.t list ->
-    Octra_core.Preverify_worker.batch Lwt.t;
+  build_preverify : Consensus_preverify_role.build;
+  validate_preverify : Consensus_preverify_role.validate;
   proposal_preview :
     ?catch_exn:bool ->
     Consensus_proposal.build_preview_request ->
@@ -477,7 +476,8 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
     sleep = deps.sleep;
     quarantine_mismatch_threshold = deps.quarantine_mismatch_threshold;
     notify_staging_update = deps.notify_staging_update;
-    run_preverify = deps.run_preverify;
+    build_preverify = deps.build_preverify;
+    validate_preverify = deps.validate_preverify;
     proposal_bundles = deps.proposal_bundles;
     store_bundle = deps.bundle_runtime.store_bundle;
     driver_ref = deps.driver_ref;
