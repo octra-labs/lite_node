@@ -740,7 +740,14 @@ let account_profile_from_view ~tag ~addr ~view ~t0 ~t1 ~t2 ~t3 ~t4 =
     ~rejected_ms:((t3 -. t2) *. 1000.0)
     ~json_ms:((t4 -. t3) *. 1000.0)
 
-let address_transactions_response ~addr ~total ~offset ~limit ~transactions ~rejected =
+let address_transactions_response
+    ~addr
+    ~total
+    ~offset
+    ~limit
+    ~transactions
+    ~rejected
+    ~dropped =
   let count = List.length transactions in
   `Assoc [
     "address", `String addr;
@@ -751,6 +758,7 @@ let address_transactions_response ~addr ~total ~offset ~limit ~transactions ~rej
     "has_more", `Bool (page_has_more ~offset ~count ~total);
     "transactions", `List transactions;
     "rejected", `List rejected;
+    "dropped", `List dropped;
   ]
 
 let token_transactions_response ~addr ~total ~offset ~limit ~has_more ~incoming ~outgoing
@@ -822,7 +830,8 @@ let address_transactions_result
     ~incomplete
     ~missing
     ~rows
-    ~rejected =
+    ~rejected
+    ~dropped =
   if incomplete then
     Error (address_incomplete_error
       ~addr
@@ -836,7 +845,8 @@ let address_transactions_result
       ~offset:page.offset
       ~limit:page.limit
       ~transactions:(mask_rows rows)
-      ~rejected:(mask_rows rejected))
+      ~rejected:(mask_rows rejected)
+      ~dropped)
 
 let token_transactions_result
     ~mask_rows

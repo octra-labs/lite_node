@@ -829,6 +829,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         preverify_admit;
         save_drops;
         find_drop = Tx_drop.find drop_db;
+        drops_by_addr = Tx_drop.by_addr drop_db;
       }
     in
     let run_preverify prepared txs =

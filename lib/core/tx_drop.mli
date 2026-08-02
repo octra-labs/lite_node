@@ -30,4 +30,11 @@ val find :
   string ->
   row option
 
+val by_addr :
+  t ->
+  string ->
+  limit:int ->
+  offset:int ->
+  row list
+
 val close : t -> unit

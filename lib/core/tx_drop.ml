@@ -17,6 +17,7 @@ type t = {
   db : Sqlite3.db;
   put : Sqlite3.stmt;
   get : Sqlite3.stmt;
+  by_addr : Sqlite3.stmt;
   trim : Sqlite3.stmt;
   max_rows : int;
 }
@@ -59,6 +60,10 @@ let open_db ?(max_rows = 10_000) data_dir =
      dropped_at REAL NOT NULL)";
   exec db
     "CREATE INDEX IF NOT EXISTS dropped_time ON dropped(dropped_at,hash)";
+  exec db
+    "CREATE INDEX IF NOT EXISTS dropped_from ON dropped(from_addr,dropped_at,hash)";
+  exec db
+    "CREATE INDEX IF NOT EXISTS dropped_to ON dropped(to_addr,dropped_at,hash)";
   {
     db;
     put = Sqlite3.prepare db
@@ -68,6 +73,10 @@ let open_db ?(max_rows = 10_000) data_dir =
     get = Sqlite3.prepare db
       "SELECT from_addr,to_addr,nonce,ou,op_type,reason,detail,dropped_at \
        FROM dropped WHERE hash=?";
+    by_addr = Sqlite3.prepare db
+      "SELECT hash,from_addr,to_addr,nonce,ou,op_type,reason,detail,dropped_at \
+       FROM dropped WHERE from_addr=? OR to_addr=? \
+       ORDER BY dropped_at DESC,hash DESC LIMIT ? OFFSET ?";
     trim = Sqlite3.prepare db
       "DELETE FROM dropped WHERE hash IN (\
        SELECT hash FROM dropped ORDER BY dropped_at DESC,hash DESC \
@@ -145,6 +154,30 @@ let save_many t rows =
       ignore (Sqlite3.exec t.db "ROLLBACK");
       Error (Printexc.to_string exn)
 
+let row_at statement ~hash ~offset =
+  let text index =
+    Sqlite3.column statement (offset + index)
+    |> Sqlite3.Data.to_string_exn
+  in
+  match Transaction.op_type_of_string (text 4) with
+  | Error _ -> None
+  | Ok op_type ->
+    Some {
+      hash;
+      from_addr = text 0;
+      to_addr = text 1;
+      nonce =
+        Sqlite3.column statement (offset + 2)
+        |> Sqlite3.Data.to_int_exn;
+      ou = Z.of_string (text 3);
+      op_type;
+      reason = text 5;
+      detail = text 6;
+      dropped_at =
+        Sqlite3.column statement (offset + 7)
+        |> Sqlite3.Data.to_float_exn;
+    }
+
 let find t hash =
   try
     ignore (Sqlite3.reset t.get);
@@ -157,40 +190,46 @@ let find t hash =
       (fun () ->
          match Sqlite3.step t.get with
          | Sqlite3.Rc.ROW ->
-           let text index =
-             Sqlite3.column t.get index
-             |> Sqlite3.Data.to_string_exn
-           in
-           let nonce =
-             Sqlite3.column t.get 2
-             |> Sqlite3.Data.to_int_exn
-           in
-           let dropped_at =
-             Sqlite3.column t.get 7
-             |> Sqlite3.Data.to_float_exn
-           in
-           begin
-             match Transaction.op_type_of_string (text 4) with
-             | Error _ -> None
-             | Ok op_type ->
-               Some {
-                 hash;
-                 from_addr = text 0;
-                 to_addr = text 1;
-                 nonce;
-                 ou = Z.of_string (text 3);
-                 op_type;
-                 reason = text 5;
-                 detail = text 6;
-                 dropped_at;
-               }
-           end
+           row_at t.get ~hash ~offset:0
          | Sqlite3.Rc.DONE -> None
          | _ -> None)
   with _ -> None
 
+let by_addr t addr ~limit ~offset =
+  if limit <= 0 then []
+  else
+    try
+      ignore (Sqlite3.reset t.by_addr);
+      ignore (Sqlite3.clear_bindings t.by_addr);
+      ignore (Sqlite3.bind_text t.by_addr 1 addr);
+      ignore (Sqlite3.bind_text t.by_addr 2 addr);
+      ignore (Sqlite3.bind_int t.by_addr 3 limit);
+      ignore (Sqlite3.bind_int t.by_addr 4 (max 0 offset));
+      Fun.protect
+        ~finally:(fun () ->
+          ignore (Sqlite3.reset t.by_addr);
+          ignore (Sqlite3.clear_bindings t.by_addr))
+        (fun () ->
+          let rec read rows =
+            match Sqlite3.step t.by_addr with
+            | Sqlite3.Rc.ROW ->
+              let hash =
+                Sqlite3.column t.by_addr 0
+                |> Sqlite3.Data.to_string_exn
+              in
+              begin
+                match row_at t.by_addr ~hash ~offset:1 with
+                | Some row -> read (row :: rows)
+                | None -> read rows
+              end
+            | Sqlite3.Rc.DONE -> List.rev rows
+            | _ -> []
+          in
+          read [])
+    with _ -> []
+
 let close t =
   List.iter
     (fun statement -> ignore (Sqlite3.finalize statement))
-    [t.put; t.get; t.trim];
+    [t.put; t.get; t.by_addr; t.trim];
   ignore (Sqlite3.db_close t.db)

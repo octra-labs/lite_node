@@ -42,8 +42,14 @@ let is_hex c =
   ('0' <= c && c <= '9')
   || ('a' <= c && c <= 'f')
 
-let hex64 s =
-  String.length s = 64 && String.for_all is_hex s
+let hex_len length value =
+  String.length value = length && String.for_all is_hex value
+
+let hex64 value =
+  hex_len 64 value
+
+let circle_stable_root value =
+  hex64 value || hex_len 128 value
 
 let lane_of_string = function
   | "program" -> Ok Resource_lanes.Program
@@ -347,7 +353,7 @@ let validate r =
       not (hex64 circle.snapshot_hash)
       || not (Crypto.Address.is_valid_address circle.circle_id)
       || not (hex64 circle.code_hash)
-      || not (hex64 circle.stable_root)
+      || not (circle_stable_root circle.stable_root)
       || not (hex64 circle.public_reads_hash)
       || not (hex64 circle.context_hash)
       || Result.is_error

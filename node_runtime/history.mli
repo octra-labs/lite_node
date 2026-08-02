@@ -395,6 +395,7 @@ val address_transactions_response :
   limit:int ->
   transactions:Yojson.Safe.t list ->
   rejected:Yojson.Safe.t list ->
+  dropped:Yojson.Safe.t list ->
   Yojson.Safe.t
 
 val token_transactions_response :
@@ -441,6 +442,7 @@ val address_transactions_result :
   missing:int ->
   rows:'a list ->
   rejected:'a list ->
+  dropped:Yojson.Safe.t list ->
   (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 
 val token_transactions_result :

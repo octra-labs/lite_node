@@ -16,6 +16,11 @@ type runtime = {
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;
+  drops_by_addr :
+    string ->
+    limit:int ->
+    offset:int ->
+    Octra_core.Tx_drop.row list;
 }
 
 let cli_has_flag name =
@@ -200,6 +205,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     account_path_profile_enabled = Env.flag "OCTRA_PROFILE_ACCOUNT_PATHS";
     swarm = (fun () -> !(runtime.swarm_ref));
     find_drop = runtime.find_drop;
+    drops_by_addr = runtime.drops_by_addr;
   } in
   Node_rpc_server.start Node_rpc_server.{
     port;

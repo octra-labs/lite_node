@@ -15,6 +15,11 @@ type deps = {
   account_path_profile_enabled : bool;
   swarm : unit -> Octra_net.P2p_swarm.t option;
   find_drop : string -> Octra_core.Tx_drop.row option;
+  drops_by_addr :
+    string ->
+    limit:int ->
+    offset:int ->
+    Octra_core.Tx_drop.row list;
 }
 
 type config = {

@@ -13,6 +13,11 @@ type runtime = {
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;
+  drops_by_addr :
+    string ->
+    limit:int ->
+    offset:int ->
+    Octra_core.Tx_drop.row list;
 }
 
 val run_s :

@@ -5,11 +5,13 @@ module Rpc = Octra_core.Rpc
 module Store_chaindata = Octra_core.Store_chaindata
 module Staging = Octra_core.Tx_staging
 module Transaction = Octra_core.Transaction
+module Tx_drop = Octra_core.Tx_drop
 
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result Lwt.t
 
 type 'handler dispatch_adapters = {
   transaction : 'handler;
+  transactions_by_address : 'handler;
   chaindata_params_read :
     (Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
@@ -229,7 +231,24 @@ let address_history_status chaindata addr ~limit ~offset ~profile_tag =
        ~limit
        ~offset)
 
-let transactions_by_address chaindata ~params ~addr =
+let drop_json (row : Tx_drop.row) =
+  `Assoc [
+    "hash", `String row.hash;
+    "tx_hash", `String row.hash;
+    "status", `String "dropped";
+    "from", `String row.from_addr;
+    "to", `String row.to_addr;
+    "to_", `String row.to_addr;
+    "nonce", `Int row.nonce;
+    "ou", `String (Z.to_string row.ou);
+    "op_type", `String (Transaction.op_type_to_string row.op_type);
+    "reason", `String row.reason;
+    "detail", `String row.detail;
+    "dropped_at", `Float row.dropped_at;
+    "timestamp", `Float row.dropped_at;
+  ]
+
+let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
   let page = History.rpc_page params in
   let open Lwt.Syntax in
   let* status =
@@ -247,6 +266,10 @@ let transactions_by_address chaindata ~params ~addr =
       ~limit:page.limit
       ~offset:page.offset
   in
+  let dropped =
+    drops_by_addr addr ~limit:page.limit ~offset:page.offset
+    |> List.map drop_json
+  in
   match
     History.address_transactions_result
       ~mask_rows:Tx_view.mask_stealth_rows
@@ -257,6 +280,7 @@ let transactions_by_address chaindata ~params ~addr =
       ~missing:status.missing
       ~rows:status.rows
       ~rejected
+      ~dropped
   with
   | Ok response ->
     ok response
@@ -450,7 +474,7 @@ let dispatch adapters =
     "octra_transaction", adapters.transaction;
     "octra_transactions", adapters.chaindata_params_read transactions;
     "octra_recentTransactions", adapters.chaindata_params_read recent_transactions;
-    "octra_transactionsByAddress", adapters.chaindata_address_read transactions_by_address;
+    "octra_transactionsByAddress", adapters.transactions_by_address;
     "octra_tokenTransfersByAddress", adapters.chaindata_address_read token_transfers_by_address;
     "octra_rejectedByAddress", adapters.chaindata_address_read rejected_by_address;
     "octra_transactionsByEpoch", adapters.transactions_by_epoch;

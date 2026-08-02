@@ -17,6 +17,11 @@ type deps = {
   account_path_profile_enabled : bool;
   swarm : unit -> Octra_net.P2p_swarm.t option;
   find_drop : string -> Octra_core.Tx_drop.row option;
+  drops_by_addr :
+    string ->
+    limit:int ->
+    offset:int ->
+    Octra_core.Tx_drop.row list;
 }
 
 type config = {
@@ -155,6 +160,14 @@ let octra_transaction params ctx =
     ~find_drop:ctx.deps.find_drop
     ctx.chaindata
     ~params
+
+let octra_transactions_by_address params ctx =
+  with_address params (fun addr ->
+    History_read_rpc.transactions_by_address
+      ~drops_by_addr:ctx.deps.drops_by_addr
+      ctx.chaindata
+      ~params
+      ~addr)
 
 let staging_remove params ctx =
   Submit_rpc.staging_remove
@@ -334,6 +347,7 @@ let account_dispatch_adapters =
 let history_dispatch =
   History_read_rpc.dispatch History_read_rpc.{
     transaction = octra_transaction;
+    transactions_by_address = octra_transactions_by_address;
     chaindata_params_read;
     chaindata_address_read;
     transactions_by_epoch = octra_transactions_by_epoch;

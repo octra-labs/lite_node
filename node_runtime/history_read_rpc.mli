@@ -5,6 +5,7 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
 type 'handler dispatch_adapters = {
   transaction : 'handler;
+  transactions_by_address : 'handler;
   chaindata_params_read :
     (Octra_core.Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
@@ -43,6 +44,7 @@ val recent_transactions :
   rpc_result
 
 val transactions_by_address :
+  drops_by_addr:(string -> limit:int -> offset:int -> Octra_core.Tx_drop.row list) ->
   Octra_core.Store_chaindata.t ->
   params:Yojson.Safe.t ->
   addr:string ->
