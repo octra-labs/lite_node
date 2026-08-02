@@ -560,9 +560,32 @@ def sync_snapshot(
     concurrency,
     source_concurrency,
 ):
+    validate_sync_layout(stage, data_path)
+    command = sync_client_command(
+        sync_binary,
+        stage,
+        values,
+        sources,
+        concurrency,
+        source_concurrency,
+    )
+    run(command)
+    snapshot = load_verified_snapshot(stage, values)
+    install_verified_snapshot(snapshot, data_path)
+    if not state_ready(data_path):
+        raise ValidatorError("state sync completed without a valid checkpoint")
+    validate_checkpoint(data_path, values, allow_progress=True)
+
+def sync_client_command(
+    sync_binary,
+    stage,
+    values,
+    sources,
+    concurrency,
+    source_concurrency,
+):
     validators = validator_entries(values["OCTRA_VALIDATORS"])
     exporters = exporter_entries(values["OCTRA_STATE_SYNC_EXPORTERS"])
-    validate_sync_layout(stage, data_path)
     command = [
         str(sync_binary),
         "--stage",
@@ -586,12 +609,58 @@ def sync_snapshot(
         command.extend(["--exporter", f"{address}:{pubkey}"])
     if any(source.startswith("http://") for source in sources):
         command.append("--allow-private-http")
-    run(command)
-    snapshot = load_verified_snapshot(stage, values)
-    install_verified_snapshot(snapshot, data_path)
-    if not state_ready(data_path):
-        raise ValidatorError("state sync completed without a valid checkpoint")
-    validate_checkpoint(data_path, values, allow_progress=True)
+    return command
+
+def check_sync_sources(sync_binary, stage, values, sources):
+    expected = "error = snapshot exceeds configured byte limit"
+    for position, source in enumerate(sources, 1):
+        command = sync_client_command(
+            sync_binary,
+            Path(stage) / f"source-{position}",
+            values,
+            [source],
+            1,
+            1,
+        )
+        command.extend([
+            "--retries",
+            "1",
+            "--timeout",
+            "10",
+            "--max-bytes",
+            "1",
+        ])
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=40,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValidatorError(
+                f"state sync source check timed out: {source}"
+            ) from error
+        lines = [
+            line.strip()
+            for line in (result.stdout + "\n" + result.stderr).splitlines()
+            if line.strip()
+        ]
+        if (
+            result.returncode != 1
+            or expected not in lines
+            or any(
+                line.startswith("event = manifest_source_rejected")
+                for line in lines
+            )
+        ):
+            detail = " | ".join(lines[-3:]) or f"exit {result.returncode}"
+            raise ValidatorError(
+                f"state sync source check failed: {source}: {detail}"
+            )
+        emit(event="state_sync_source", status="ready", source=source)
 
 def maybe_sync(args, data_dir, values):
     if state_ready(data_dir):
@@ -635,6 +704,7 @@ def parser():
     value.add_argument("--binary", default=str(DEFAULT_BINARY))
     value.add_argument("--build", action="store_true")
     value.add_argument("--check-runtime", action="store_true")
+    value.add_argument("--check-sync", action="store_true")
     value.add_argument("--config", default=str(DEFAULT_CONFIG))
     value.add_argument("--consensus-port", default="19000")
     value.add_argument("--control-binary", default=str(DEFAULT_CONTROL_BINARY))
@@ -660,10 +730,32 @@ def parser():
 
 def main():
     args = parser().parse_args()
-    if args.check_runtime and args.rebind_runtime:
-        raise ValidatorError("runtime check and rebind are mutually exclusive")
+    modes = [args.check_runtime, args.check_sync, args.rebind_runtime]
+    if sum(bool(mode) for mode in modes) > 1:
+        raise ValidatorError("runtime and state sync checks are mutually exclusive")
     if args.check_runtime:
         require_runtime_binding(args.config)
+        return
+    if args.check_sync:
+        network = args.network
+        if not network and not args.yes:
+            network = ask("Network bundle path", str(ROOT / "config/network.env"))
+        if not network:
+            raise ValidatorError("network bundle path is required")
+        expected_hash = resolve_digest(args, network)
+        _, _, values = load_network(network, expected_hash)
+        sync_binary = Path(args.sync_binary).resolve()
+        if not sync_binary.is_file():
+            raise ValidatorError(f"state sync client is missing: {sync_binary}")
+        sources = args.sync_url or state_sync_sources(
+            values["OCTRA_STATE_SYNC_SOURCES"]
+        )
+        if args.sync_url:
+            sources = state_sync_sources(",".join(args.sync_url))
+        stage = Path(
+            args.sync_stage or ROOT / "runtime_data/state_sync_check"
+        ).expanduser().resolve()
+        check_sync_sources(sync_binary, stage, values, sources)
         return
     if args.rebind_runtime:
         rebind_runtime(args.config)

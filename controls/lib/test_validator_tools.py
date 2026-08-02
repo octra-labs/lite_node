@@ -27,6 +27,7 @@ from validator_config import operator_pm2_name
 from validator_config import BUILD_WORK
 from validator_config import build_candidate
 from validator_config import CARGO_HOME
+from validator_config import check_sync_sources
 from validator_config import OPAM_ROOT
 from validator_config import ROOT as CONFIG_ROOT
 from validator_config import RUSTUP_HOME
@@ -785,6 +786,59 @@ class ValidatorToolsTest(unittest.TestCase):
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--concurrency") + 1], "4")
         self.assertEqual(command[command.index("--source-concurrency") + 1], "4")
+
+    def test_sync_source_check_uses_each_published_source(self):
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        sources = ["https://seed-a.example", "https://seed-b.example"]
+        result = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "error = snapshot exceeds configured byte limit\n",
+        )
+        with mock.patch(
+            "validator_config.subprocess.run",
+            return_value=result,
+        ) as invoke:
+            check_sync_sources(
+                sync_binary,
+                WORK / "state_sync_check",
+                network_values(),
+                sources,
+            )
+        self.assertEqual(invoke.call_count, 2)
+        for call, source in zip(invoke.call_args_list, sources):
+            command = call.args[0]
+            self.assertEqual(command.count("--source"), 1)
+            self.assertEqual(command[command.index("--source") + 1], source)
+            self.assertEqual(command[command.index("--max-bytes") + 1], "1")
+
+    def test_sync_source_check_rejects_route_mismatch(self):
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        result = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "event = manifest_source_rejected source = https://seed-a.example "
+            "error = HTTP 404\n"
+            "error = no source returned a valid quorum certificate\n",
+        )
+        with mock.patch(
+            "validator_config.subprocess.run",
+            return_value=result,
+        ):
+            with self.assertRaisesRegex(
+                ValidatorError,
+                "state sync source check failed",
+            ):
+                check_sync_sources(
+                    sync_binary,
+                    WORK / "state_sync_check",
+                    network_values(),
+                    ["https://seed-a.example"],
+                )
 
     def test_unattended_configuration_syncs_by_default(self):
         sync_binary = WORK / "state_sync_client"
