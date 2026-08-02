@@ -350,6 +350,12 @@ val wire_size : Transaction.t -> int
 
 val totals : Transaction.t list -> totals
 
+val select_staged :
+  hash_tx:(Transaction.t -> string) ->
+  hashes:string list ->
+  Transaction.t list ->
+  Transaction.t list
+
 val within_limits : limits:limits -> Transaction.t list -> bool
 
 val cap : limits:limits -> Transaction.t list -> capped

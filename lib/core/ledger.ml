@@ -29,6 +29,10 @@ type t = {
   mutable epoch_journals : epoch_journal list;
 }
 
+type transfer_error =
+  | Debit_rejected of string
+  | Credit_rejected of string
+
 let run_s p =
   match Lwt.state p with
   | Lwt.Return v -> v
@@ -242,8 +246,49 @@ let debit ?encrypted_balance l addr amount nonce =
       l.total_supply <- Z.sub l.total_supply amount;
       Hashtbl.add l.spent_nonces (addr, nonce) (); Ok ()
 
-let debit_amount_only l addr amount =
+let transfer l ~from ~to_ ~amount ~fee nonce =
+  let total_cost = Z.add amount fee in
+  if Z.sign total_cost < 0 then Error (Debit_rejected "negative debit amount")
+  else
+    match get_account_internal l from with
+    | None -> Error (Debit_rejected "Sender not found")
+    | Some sender ->
+      if Z.lt sender.balance total_cost then
+        Error (Debit_rejected "Insufficient balance")
+      else if nonce <> sender.nonce + 1 then
+        Error (Debit_rejected "Invalid nonce")
+      else if Hashtbl.mem l.spent_nonces (from, nonce) then
+        Error (Debit_rejected "Nonce already spent")
+      else if Z.sign amount < 0 then
+        Error (Credit_rejected "negative credit amount")
+      else if Z.sign fee < 0 then
+        Error (Credit_rejected "negative fee amount")
+      else
+        let sender = {
+          sender with
+          balance = Z.sub sender.balance total_cost;
+          nonce;
+        } in
+        if String.equal from to_ then
+          set_account_internal l from {
+            sender with balance = Z.add sender.balance amount;
+          }
+        else begin
+          let receiver =
+            match get_account_internal l to_ with
+            | Some account -> account
+            | None -> empty_account
+          in
+          set_account_internal l from sender;
+          set_account_internal l to_ {
+            receiver with balance = Z.add receiver.balance amount;
+          }
+        end;
+        l.total_supply <- Z.sub l.total_supply fee;
+        Hashtbl.add l.spent_nonces (from, nonce) ();
+        Ok ()
 
+let debit_amount_only l addr amount =
   if Z.sign amount < 0 then Error "negative debit_amount_only"
   else match get_account_internal l addr with
   | None -> Error "Account not found"

@@ -130,8 +130,11 @@ let stale_sample_plan ~live_head_attested ~stale_retries =
 let within_ahead_grace ~head ~ahead_by ~grace_epochs ~drift_tolerance =
   head < grace_epochs || ahead_by <= drift_tolerance
 
-let ahead_no_quorum_plan ~head ~ahead_by ~grace_epochs ~drift_tolerance =
-  if within_ahead_grace ~head ~ahead_by ~grace_epochs ~drift_tolerance then
+let ahead_no_quorum_plan ~head ~ahead_by ~grace_epochs ~drift_tolerance
+    ~quarantine_active =
+  if quarantine_active then
+    Probe_current_head
+  else if within_ahead_grace ~head ~ahead_by ~grace_epochs ~drift_tolerance then
     Wait_current_head
   else
     Probe_current_head

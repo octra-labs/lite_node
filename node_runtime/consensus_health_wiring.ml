@@ -80,6 +80,7 @@ type driver_probe_deps = {
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
   quarantine_active : unit -> bool;
+  quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
   repair_empty_fork :
@@ -270,9 +271,16 @@ let runtime_state_ops (deps : runtime_state_ops_deps) =
         deps.warn_quarantine ~epoch ~reason);
     clear_quarantine = (fun reason ->
       let epoch = deps.current_epoch () in
-      if Consensus_runtime_state.quarantine_active deps.state then
-        deps.info_quarantine ~epoch ~reason;
-      Consensus_runtime_state.clear_quarantine deps.state);
+      match
+        Consensus_runtime_state.clear_quarantine deps.state ~evidence:reason
+      with
+      | Consensus_runtime_state.Cleared ->
+        deps.info_quarantine ~epoch ~reason
+      | Consensus_runtime_state.Inactive -> ()
+      | Consensus_runtime_state.Refused active_reason ->
+        Octra_log.warn "consensus"
+          "event = quarantine_clear_refused active_reason = %s evidence = %s epoch = %d"
+          active_reason reason epoch);
   }
 
 let node_runtime_state_ops (deps : node_runtime_state_ops_deps) =
@@ -496,6 +504,8 @@ let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
     drain_pending_finalized = runtime.drain_pending_finalized;
     quarantine_active = (fun () ->
       Consensus_runtime_state.quarantine_active runtime.runtime_state);
+    quarantine_reason = (fun () ->
+      Consensus_runtime_state.quarantine_reason runtime.runtime_state);
     ahead_streak = (fun () ->
       Consensus_runtime_state.ahead_streak runtime.runtime_state);
     incr_ahead_streak = (fun () ->
@@ -614,6 +624,7 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
     run_catchup_to_target = (fun ~target_epoch ~reason ->
       deps.run_catchup_to_target driver ~target_epoch ~reason);
     quarantine_active = deps.quarantine_active;
+    quarantine_reason = deps.quarantine_reason;
     ahead_streak = deps.ahead_streak;
     incr_ahead_streak = deps.incr_ahead_streak;
   }

@@ -13,6 +13,11 @@ type t = {
   ahead_of_target_streak : int ref;
 }
 
+type clear_result =
+  | Cleared
+  | Inactive
+  | Refused of string
+
 let create () = {
   state_attested = ref false;
   state_attested_head = ref None;
@@ -74,20 +79,82 @@ let attested_head t head =
       | Some attested -> attested = head
       | None -> false)
 
+let starts_with prefix value =
+  let prefix_len = String.length prefix in
+  String.length value >= prefix_len
+  && String.sub value 0 prefix_len = prefix
+
+let root_attestation_recovers reason =
+  List.exists
+    (fun prefix -> starts_with prefix reason)
+    [
+      "peer_root_mismatch_at_head ";
+      "ahead_of_target_by_";
+      "lag_";
+      "prev_state_root_mismatch_streak = ";
+      "state_root_mismatch_streak = ";
+    ]
+
+let catchup_recovers reason =
+  root_attestation_recovers reason
+  || starts_with "lag_" reason
+  || starts_with "catchup_" reason
+
+let recoverable_reason reason =
+  catchup_recovers reason
+  || starts_with "bundle_wait_timeout_epoch_" reason
+
+let root_evidence evidence =
+  List.mem
+    evidence
+    [
+      "genesis_in_sync";
+      "in_sync";
+      "ahead_wait_current_head";
+      "ahead_current_root_quorum";
+      "soft_lag_current_root";
+    ]
+
+let clear_allowed ~reason ~evidence =
+  String.equal reason evidence
+  || String.equal evidence "fork_empty_rollback"
+  || (catchup_recovers reason
+      && starts_with "catchup_complete:" evidence
+      && not (starts_with "catchup_complete:already_in_sync:" evidence))
+  || (root_attestation_recovers reason && root_evidence evidence)
+  || (root_attestation_recovers reason
+      && starts_with "direct_finalized_apply:" evidence)
+
 let enter_quarantine t ~epoch ~reason =
   let entered = not (quarantine_active t) in
   if entered then begin
     t.quarantine_active := true;
     clear_state_attested t;
-    t.quarantine_since_epoch := epoch
+    t.quarantine_since_epoch := epoch;
+    t.quarantine_reason := reason
+  end else if
+    recoverable_reason (quarantine_reason t)
+    && not (recoverable_reason reason)
+  then begin
+    t.quarantine_reason := reason;
+    clear_state_attested t
   end;
-  t.quarantine_reason := reason;
   entered
 
-let clear_quarantine t =
+let reset_quarantine t =
   t.quarantine_active := false;
   t.quarantine_reason := "";
   t.quarantine_since_epoch := -1;
   t.prev_root_mismatch_streak := 0;
   t.state_root_mismatch_streak := 0;
   t.ahead_of_target_streak := 0
+
+let clear_quarantine t ~evidence =
+  if not (quarantine_active t) then Inactive
+  else
+    let reason = quarantine_reason t in
+    if clear_allowed ~reason ~evidence then begin
+      reset_quarantine t;
+      Cleared
+    end else
+      Refused reason

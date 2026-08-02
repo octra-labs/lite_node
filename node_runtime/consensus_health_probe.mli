@@ -110,6 +110,7 @@ val ahead_no_quorum_plan :
   ahead_by:int ->
   grace_epochs:int ->
   drift_tolerance:int ->
+  quarantine_active:bool ->
   ahead_no_quorum_plan
 
 val ahead_current_root_plan :

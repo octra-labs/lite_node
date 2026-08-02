@@ -269,7 +269,10 @@ let node_deps_of_runtime runtime =
              (Consensus_runtime_state.quarantine_reason runtime.runtime_state)
              (bundle_wait_reason epoch_id)
       then
-        Consensus_runtime_state.clear_quarantine runtime.runtime_state);
+        ignore
+          (Consensus_runtime_state.clear_quarantine
+             runtime.runtime_state
+             ~evidence:(bundle_wait_reason epoch_id)));
     remove_pending_finalized = runtime.finality.remove_finalized;
     fatal_exit = runtime.fatal_exit;
     catchup_active = (fun () -> !(runtime.catchup_active));

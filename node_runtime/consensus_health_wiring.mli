@@ -80,6 +80,7 @@ type driver_probe_deps = {
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
   quarantine_active : unit -> bool;
+  quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
   repair_empty_fork :

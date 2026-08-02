@@ -3,6 +3,11 @@
 
 type t
 
+type clear_result =
+  | Cleared
+  | Inactive
+  | Refused of string
+
 val create : unit -> t
 val state_attested : t -> bool
 val quarantine_active : t -> bool
@@ -18,5 +23,6 @@ val incr_ahead_streak : t -> unit
 val clear_state_attested : t -> unit
 val set_state_attested : t -> head:int -> root:string -> unit
 val attested_head : t -> int -> bool
+val root_attestation_recovers : string -> bool
 val enter_quarantine : t -> epoch:int -> reason:string -> bool
-val clear_quarantine : t -> unit
+val clear_quarantine : t -> evidence:string -> clear_result

@@ -121,17 +121,6 @@ let apply_receipt t receipt =
         go seen (item :: acc) rest in
   go false [] t.items
 
-let apply_det t receipt =
-  match Preverify_receipt.validate receipt with
-  | Error _ -> None
-  | Ok () ->
-    apply_receipt t {
-      hash = receipt.Preverify_receipt.tx_hash;
-      lane = receipt.Preverify_receipt.lane;
-      ok = receipt.Preverify_receipt.ok;
-      detail = receipt.Preverify_receipt.reason;
-    }
-
 let ready_hashes t =
   t.items
   |> List.filter_map (fun (item : item) ->

@@ -4,6 +4,7 @@
 let magic = "OEPL"
 let version = 2
 let header_size = 16
+let max_record_len = 16 * 1024 * 1024
 
 type proposer_info = {
   creator_addr : string;
@@ -76,6 +77,11 @@ let read_u32_le buf off =
   lor (Bytes.get_uint8 buf (off+1) lsl 8)
   lor (Bytes.get_uint8 buf (off+2) lsl 16)
   lor (Bytes.get_uint8 buf (off+3) lsl 24)
+
+let record_length_valid ~remaining record_len =
+  record_len >= 4
+  && record_len <= max_record_len
+  && record_len <= remaining
 
 let checksum payload =
   let d = Digestif.SHA256.digest_string payload in
@@ -201,6 +207,8 @@ let scan_records fd =
     let n = Unix.read fd hdr 0 4 in
     if n < 4 then raise Exit;
     let record_len = read_u32_le hdr 0 in
+    let remaining = file_size - !pos - 4 in
+    if not (record_length_valid ~remaining record_len) then raise Exit;
     let payload_len = record_len - 4 in
     let record_buf = Bytes.create record_len in
     let rd = ref 0 in
@@ -253,6 +261,7 @@ let append t h =
   let payload = epoch_to_json h in
   let payload_len = String.length payload in
   let record_len = payload_len + 4 in
+  if record_len > max_record_len then failwith "epochlog: record exceeds size limit";
   let chk = checksum payload in
   let buf = Bytes.create (4 + record_len) in
   write_u32_le buf 0 record_len;
@@ -279,6 +288,8 @@ let read_all t =
     let n = Unix.read t.fd hdr 0 4 in
     if n < 4 then raise Exit;
     let record_len = read_u32_le hdr 0 in
+    let remaining = file_size - !pos - 4 in
+    if not (record_length_valid ~remaining record_len) then raise Exit;
     let record_buf = Bytes.create record_len in
     let rd = ref 0 in
     (try while !rd < record_len do
@@ -311,7 +322,12 @@ let offset_after t epoch_id =
     if n < 4 then None
     else
       let record_len = read_u32_le hdr 0 in
-      Some (off + 4 + record_len)
+      let file_size = (Unix.fstat t.fd).Unix.st_size in
+      let remaining = file_size - off - 4 in
+      if record_length_valid ~remaining record_len then
+        Some (off + 4 + record_len)
+      else
+        None
   end else
     None
 
@@ -335,18 +351,22 @@ let get t epoch_id =
     if n < 4 then None
     else begin
       let record_len = read_u32_le hdr 0 in
-      let payload_len = record_len - 4 in
-      let record_buf = Bytes.create record_len in
-      let rd = ref 0 in
-      (try while !rd < record_len do
-        let n = Unix.read t.fd record_buf !rd (record_len - !rd) in
-        if n = 0 then raise Exit;
-        rd := !rd + n
-      done with Exit -> ());
-      if !rd < record_len then None
+      let file_size = (Unix.fstat t.fd).Unix.st_size in
+      let remaining = file_size - off - 4 in
+      if not (record_length_valid ~remaining record_len) then None
       else
-        let payload = Bytes.sub_string record_buf 0 payload_len in
-        epoch_of_json payload
+        let payload_len = record_len - 4 in
+        let record_buf = Bytes.create record_len in
+        let rd = ref 0 in
+        (try while !rd < record_len do
+          let n = Unix.read t.fd record_buf !rd (record_len - !rd) in
+          if n = 0 then raise Exit;
+          rd := !rd + n
+        done with Exit -> ());
+        if !rd < record_len then None
+        else
+          let payload = Bytes.sub_string record_buf 0 payload_len in
+          epoch_of_json payload
     end
   end else
     None

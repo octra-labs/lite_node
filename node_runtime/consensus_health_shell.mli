@@ -45,6 +45,7 @@ type deps = {
     reason:string ->
     unit Lwt.t;
   quarantine_active : unit -> bool;
+  quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
 }

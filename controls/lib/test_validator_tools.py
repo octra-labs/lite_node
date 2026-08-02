@@ -127,7 +127,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(os.stat(wallet_path).st_mode & 0o777, 0o600)
         self.assertEqual(ensure_wallet(wallet_path), wallet)
 
-    def test_validator_accepts_one_tb_disk(self):
+    def test_validator_reports_resources(self):
         usage = mock.Mock(
             total=900 * 1000 ** 3,
             free=500 * 1000 ** 3,
@@ -143,25 +143,37 @@ class ValidatorToolsTest(unittest.TestCase):
                 ):
                     resource_report(WORK, "validator")
 
-    def test_validator_rejects_smaller_disk(self):
+    def test_validator_accepts_operator_resources(self):
         usage = mock.Mock(
-            total=899 * 1000 ** 3,
-            free=500 * 1000 ** 3,
+            total=80 * 1000 ** 3,
+            free=60 * 1000 ** 3,
         )
-        with mock.patch("validator_config.os.cpu_count", return_value=8):
+        with mock.patch("validator_config.os.cpu_count", return_value=2):
             with mock.patch(
                 "validator_config.memory_bytes",
-                return_value=31 * 1024 ** 3,
+                return_value=4 * 1024 ** 3,
             ):
                 with mock.patch(
                     "validator_config.shutil.disk_usage",
                     return_value=usage,
                 ):
-                    with self.assertRaisesRegex(
-                        ValidatorError,
-                        "1 TB class disk",
-                    ):
-                        resource_report(WORK, "validator")
+                    resource_report(WORK, "validator")
+
+    def test_observer_accepts_operator_resources(self):
+        usage = mock.Mock(
+            total=80 * 1000 ** 3,
+            free=60 * 1000 ** 3,
+        )
+        with mock.patch("validator_config.os.cpu_count", return_value=2):
+            with mock.patch(
+                "validator_config.memory_bytes",
+                return_value=4 * 1024 ** 3,
+            ):
+                with mock.patch(
+                    "validator_config.shutil.disk_usage",
+                    return_value=usage,
+                ):
+                    resource_report(WORK, "observer")
 
     def test_validator_accepts_active_on_chain_identity(self):
         require_validator_membership(

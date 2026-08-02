@@ -19,6 +19,7 @@ type stats = {
   mutable last_epoch_time : float;
   hourly_volume : (int, Z.t) Hashtbl.t;
   address_stats : (string, address_stat) Hashtbl.t;
+  mutable top_addresses : (string * address_stat) list;
 }
 
 let global_stats = {
@@ -31,7 +32,57 @@ let global_stats = {
   last_epoch_time = 0.;
   hourly_volume = Hashtbl.create 24;
   address_stats = Hashtbl.create 1000;
+  top_addresses = [];
 }
+
+let address_limit = 4096
+
+let take n lst =
+  let rec go n = function
+    | _ when n <= 0 -> []
+    | [] -> []
+    | h :: t -> h :: go (n - 1) t
+  in
+  go n lst
+
+let address_volume stat =
+  Z.add stat.total_sent stat.total_received
+
+let compare_address (left_addr, left) (right_addr, right) =
+  let by_volume = Z.compare (address_volume right) (address_volume left) in
+  if by_volume <> 0 then by_volume else String.compare left_addr right_addr
+
+let update_top addr stat =
+  let others =
+    List.filter (fun (known, _) -> known <> addr) global_stats.top_addresses
+  in
+  global_stats.top_addresses <-
+    (addr, stat) :: others
+    |> List.sort compare_address
+    |> take 10
+
+let ranked addr =
+  List.exists
+    (fun (known, _) -> String.equal known addr)
+    global_stats.top_addresses
+
+let rec first_unranked seq =
+  match seq () with
+  | Seq.Nil -> None
+  | Seq.Cons (addr, rest) ->
+    if ranked addr then first_unranked rest else Some addr
+
+let reserve_address () =
+  if Hashtbl.length global_stats.address_stats < address_limit then true
+  else
+    match first_unranked (Hashtbl.to_seq_keys global_stats.address_stats) with
+    | None -> false
+    | Some addr ->
+      Hashtbl.remove global_stats.address_stats addr;
+      true
+
+let tracked_count () =
+  Hashtbl.length global_stats.address_stats
 
 let update_address addr is_sender amount =
   let stat =
@@ -43,7 +94,8 @@ let update_address addr is_sender amount =
         total_sent = Z.zero; total_received = Z.zero;
         last_active = Unix.gettimeofday ()
       } in
-      Hashtbl.add global_stats.address_stats addr s; s
+      if reserve_address () then Hashtbl.add global_stats.address_stats addr s;
+      s
   in
   stat.last_active <- Unix.gettimeofday ();
   if is_sender then (
@@ -52,7 +104,8 @@ let update_address addr is_sender amount =
   ) else (
     stat.received_count <- stat.received_count + 1;
     stat.total_received <- Z.add stat.total_received amount
-  )
+  );
+  update_top addr stat
 
 let record_tx (tx : Transaction.t) =
   global_stats.total_txs <- global_stats.total_txs + 1;
@@ -69,12 +122,6 @@ let record_epoch_complete tx_count duration =
     if tps > global_stats.peak_tps then
       global_stats.peak_tps <- tps
 
-let take n lst =
-  let rec go n = function
-    | _ when n <= 0 -> [] | [] -> []
-    | h :: t -> h :: go (n - 1) t
-  in go n lst
-
 let address_stat_to_yojson (addr, stat) =
   let fb = Denomination.format_balance in
   `Assoc [
@@ -89,15 +136,6 @@ let address_stat_to_yojson (addr, stat) =
 
 let get_metrics () =
   let fb = Denomination.format_balance in
-  let top =
-    global_stats.address_stats
-    |> Hashtbl.to_seq |> List.of_seq
-    |> List.sort (fun (_, a) (_, b) ->
-      Z.compare
-        (Z.add b.total_sent b.total_received)
-        (Z.add a.total_sent a.total_received))
-    |> take 10
-  in
   `Assoc [
     "total_transactions", `Int global_stats.total_txs;
     "total_volume", `String (fb global_stats.total_volume);
@@ -106,5 +144,6 @@ let get_metrics () =
     "peak_tps", `Float global_stats.peak_tps;
     "last_epoch_txs", `Int global_stats.last_epoch_txs;
     "last_epoch_duration", `Float global_stats.last_epoch_time;
-    "top_addresses", `List (List.map address_stat_to_yojson top);
+    "top_addresses",
+      `List (List.map address_stat_to_yojson global_stats.top_addresses);
   ]

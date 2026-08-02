@@ -31,22 +31,20 @@ let accept ?created_account kind =
   Accepted { created_account; kind }
 
 let apply_standard ledger tx =
-  let fee = tx.T.ou in
-  let total_cost = Z.add tx.T.amount fee in
-  match L.debit ledger tx.T.from total_cost tx.T.nonce with
-  | Error err -> reject "insufficient_balance" err err
-  | Ok () ->
-    let created_account =
-      if L.mem ledger tx.T.to_ then
-        None
-      else begin
-        ignore (L.add_account ledger tx.T.to_ Z.zero);
-        Some tx.T.to_
-      end
-    in
-    match L.credit ledger tx.T.to_ tx.T.amount with
-    | Error err -> reject ?created_account "supply_violation" err err
-    | Ok () -> accept ?created_account Applied_standard
+  let created_account =
+    if L.mem ledger tx.T.to_ then None else Some tx.T.to_ in
+  match
+    L.transfer
+      ledger
+      ~from:tx.T.from
+      ~to_:tx.T.to_
+      ~amount:tx.T.amount
+      ~fee:tx.T.ou
+      tx.T.nonce
+  with
+  | Error (L.Debit_rejected err) -> reject "insufficient_balance" err err
+  | Error (L.Credit_rejected err) -> reject "supply_violation" err err
+  | Ok () -> accept ?created_account Applied_standard
 
 let apply_op01_burn ledger tx =
   match L.apply_op01_burn ledger ~from:tx.T.from ~to_:tx.T.to_ tx.T.amount tx.T.nonce with

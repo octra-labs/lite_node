@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Transaction = Octra_core.Transaction
+module String_map = Map.Make (String)
 
 type limits = {
   max_txs : int;
@@ -365,6 +366,18 @@ let totals txs =
     bytes;
     ou;
   }
+
+let select_staged ~hash_tx ~hashes txs =
+  let index =
+    List.fold_left
+      (fun index tx ->
+        let hash = hash_tx tx in
+        if String_map.mem hash index then index
+        else String_map.add hash tx index)
+      String_map.empty
+      txs
+  in
+  List.filter_map (fun hash -> String_map.find_opt hash index) hashes
 
 let within_limits ~limits txs =
   let t = totals txs in
@@ -1573,12 +1586,10 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
         let pid = Octra_consensus.C_hash.proposal_id propose.header in
         let staging_snapshot = deps.staging_txs () in
         let tx_list_local =
-          List.filter_map
-            (fun hash ->
-              List.find_opt
-                (fun tx -> Transaction.hash tx = hash)
-                staging_snapshot)
-            tx_hashes_hex
+          select_staged
+            ~hash_tx:Transaction.hash
+            ~hashes:tx_hashes_hex
+            staging_snapshot
         in
         let missing_count =
           List.length tx_hashes_hex - List.length tx_list_local

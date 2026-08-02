@@ -48,6 +48,7 @@ type deps = {
     reason:string ->
     unit Lwt.t;
   quarantine_active : unit -> bool;
+  quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
 }
@@ -164,11 +165,25 @@ let quarantine_peer_root_mismatch (deps : deps) ~head count =
 
 let accept_current_root (deps : deps) ~head ~root reason =
   let open Lwt.Syntax in
-  deps.set_state_attested ~head ~root;
-  deps.set_catchup_in_progress false;
-  deps.clear_quarantine reason;
-  let* () = deps.drain_pending_finalized () in
-  deps.wake_ready ()
+  let quarantine_active = deps.quarantine_active () in
+  let quarantine_reason = deps.quarantine_reason () in
+  if
+    quarantine_active
+    && not (Consensus_runtime_state.root_attestation_recovers quarantine_reason)
+  then begin
+    deps.clear_state_attested ();
+    deps.set_catchup_in_progress false;
+    Log.warn "catchup"
+      "event = quarantine_preserved reason = %s evidence = %s head = %d"
+      quarantine_reason reason head;
+    Lwt.return_unit
+  end else begin
+    deps.set_state_attested ~head ~root;
+    deps.set_catchup_in_progress false;
+    deps.clear_quarantine reason;
+    let* () = deps.drain_pending_finalized () in
+    deps.wake_ready ()
+  end
 
 let wake_if_ready (deps : deps) wake_ready =
   let open Lwt.Syntax in
@@ -344,7 +359,8 @@ let run ?(stale_retries = 1) cfg deps =
                             ~head:our_head_int
                             ~ahead_by:n
                             ~grace_epochs:cfg.quarantine_ahead_grace_epochs
-                            ~drift_tolerance:cfg.quarantine_ahead_drift_tolerance with
+                            ~drift_tolerance:cfg.quarantine_ahead_drift_tolerance
+                            ~quarantine_active:(deps.quarantine_active ()) with
                     | H.Wait_current_head ->
                       Log.warn "catchup"
                         "event = ahead_wait_current_head ahead = %d head = %d current_quorum = false grace = %d tolerance = %d"

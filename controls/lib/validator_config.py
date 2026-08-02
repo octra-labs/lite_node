@@ -60,12 +60,6 @@ DEFAULT_CONTROL_BINARY = (
 DEFAULT_CONFIG = ROOT / ".keys/validator/node.env"
 DEFAULT_DATA = ROOT / "data"
 IDENTITY_WALLET = ROOT / ".keys/validator/wallet.json"
-MIN_VALIDATOR_CPU = 8
-MIN_VALIDATOR_RAM = 31 * 1024 ** 3
-MIN_VALIDATOR_DISK = 900 * 1000 ** 3
-MIN_VALIDATOR_FREE = 500 * 1000 ** 3
-MIN_OBSERVER_DISK = 900 * 1000 ** 3
-MIN_OBSERVER_FREE = 200 * 1000 ** 3
 RUST_TOOLCHAIN = "1.80.1"
 TOOLCHAIN_ROOT = ROOT / "runtime_data/toolchains"
 BUILD_WORK = TOOLCHAIN_ROOT / "build"
@@ -423,15 +417,6 @@ def resource_report(data_dir, role):
         disk_free_gib=round(usage.free / 1024 ** 3, 1),
         role=role,
     )
-    if role == "validator":
-        if cpu < MIN_VALIDATOR_CPU:
-            raise ValidatorError(f"validator requires at least {MIN_VALIDATOR_CPU} CPU threads")
-        if memory < MIN_VALIDATOR_RAM:
-            raise ValidatorError("validator requires at least 32 GiB RAM")
-        if usage.total < MIN_VALIDATOR_DISK or usage.free < MIN_VALIDATOR_FREE:
-            raise ValidatorError("validator requires a 1 TB class disk with 500 GB free")
-    elif usage.total < MIN_OBSERVER_DISK or usage.free < MIN_OBSERVER_FREE:
-        raise ValidatorError("observer requires a 1 TB class disk with 200 GB free")
 
 def valid_port(value):
     try:
