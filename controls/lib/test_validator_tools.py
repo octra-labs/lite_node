@@ -28,7 +28,7 @@ from validator_config import BUILD_WORK
 from validator_config import build_candidate
 from validator_config import CARGO_HOME
 from validator_config import check_sync_sources
-from validator_config import OPAM_ROOT
+from validator_config import OPAM_SWITCH
 from validator_config import ROOT as CONFIG_ROOT
 from validator_config import RUSTUP_HOME
 from validator_config import TOOLCHAIN_ROOT
@@ -689,6 +689,20 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn('TOOLCHAIN_ROOT="$ROOT/runtime_data/toolchains"', script)
         self.assertIn('CARGO_HOME="$TOOLCHAIN_ROOT/cargo"', script)
         self.assertIn('RUSTUP_HOME="$TOOLCHAIN_ROOT/rustup"', script)
+        self.assertIn('OCAML_TOOLCHAIN=4.14.2', script)
+        self.assertIn('OCAML_SWITCH="$TOOLCHAIN_ROOT/ocaml"', script)
+        self.assertIn(
+            'opam init --bare --disable-sandboxing --no-setup --yes',
+            script,
+        )
+        self.assertIn('opam switch create', script)
+        self.assertIn(
+            'opam switch link "$OCAML_SWITCH" "$ROOT" --yes',
+            script,
+        )
+        self.assertIn('"setenv=CARGO_HOME=\\\"$CARGO_HOME\\\""', script)
+        self.assertIn('"setenv+=RUSTUP_HOME=\\\"$RUSTUP_HOME\\\""', script)
+        self.assertIn('"setenv+=PATH+=\\\"$CARGO_HOME/bin\\\""', script)
         self.assertIn('env -C "$ROOT"', script)
         self.assertIn('if ! command -v pm2', script)
         self.assertIn('systemctl is-enabled --quiet "$PM2_SERVICE"', script)
@@ -948,7 +962,8 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(environment["T" + "MPDIR"], str(BUILD_WORK))
         self.assertEqual(environment["CARGO_HOME"], str(CARGO_HOME))
         self.assertEqual(environment["RUSTUP_HOME"], str(RUSTUP_HOME))
-        self.assertEqual(environment["OPAMROOT"], str(OPAM_ROOT))
+        self.assertEqual(OPAM_SWITCH, TOOLCHAIN_ROOT / "ocaml")
+        self.assertNotIn("OPAMROOT", environment)
         self.assertEqual(
             environment["PATH"].split(os.pathsep)[0],
             str(CARGO_HOME / "bin"),
@@ -964,10 +979,11 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn("liblmdb-dev", install_value)
         self.assertIn("liblmdb0", install_value)
         self.assertIn("https://sh.rustup.rs", install_value)
+        self.assertIn("OCAML_TOOLCHAIN=4.14.2", install_value)
         self.assertIn("RUST_TOOLCHAIN=1.80.1", install_value)
         config_path = Path(__file__).resolve().with_name("validator_config.py")
         config_value = config_path.read_text(encoding="utf-8")
-        self.assertIn('switch = "octra-validator-4.14.2"', config_value)
+        self.assertIn("switch = str(OPAM_SWITCH)", config_value)
         self.assertIn('"--locked"', config_value)
         self.assertIn('"--require-checksums"', config_value)
 
@@ -995,7 +1011,12 @@ class ValidatorToolsTest(unittest.TestCase):
 
         def run_probe(command, **_):
             if command == ["opam", "switch", "list", "--short"]:
-                return subprocess.CompletedProcess(command, 0, "octra-validator-4.14.2\n", "")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    str(OPAM_SWITCH) + "\n",
+                    "",
+                )
             if command[-2:] == ["ocamlc", "-version"]:
                 return subprocess.CompletedProcess(command, 0, "4.14.2\n", "")
             raise AssertionError(command)

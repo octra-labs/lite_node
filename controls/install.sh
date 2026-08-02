@@ -6,10 +6,12 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE_BUILD=0
 DATA_ROOT=${OCTRA_DATA_ROOT:-/var/lib/octra}
+OCAML_TOOLCHAIN=4.14.2
 RUST_TOOLCHAIN=1.80.1
 TOOLCHAIN_ROOT="$ROOT/runtime_data/toolchains"
 CARGO_HOME="$TOOLCHAIN_ROOT/cargo"
 RUSTUP_HOME="$TOOLCHAIN_ROOT/rustup"
+OCAML_SWITCH="$TOOLCHAIN_ROOT/ocaml"
 
 case "$DATA_ROOT" in
   /*) ;;
@@ -113,6 +115,39 @@ install_rust_toolchain() {
     "$RUSTUP" default "$RUST_TOOLCHAIN"
 }
 
+install_ocaml_toolchain() {
+  run_operator mkdir -p "$TOOLCHAIN_ROOT"
+  if [ ! -f "$OPERATOR_HOME/.opam/config" ]; then
+    run_operator opam init --bare --disable-sandboxing --no-setup --yes
+  fi
+  if ! run_operator opam exec --switch "$OCAML_SWITCH" \
+    -- ocamlc -version >/dev/null 2>&1; then
+    run_operator opam switch create \
+      "$OCAML_SWITCH" "$OCAML_TOOLCHAIN" --yes
+  fi
+  run_operator opam switch link "$OCAML_SWITCH" "$ROOT" --yes
+  INSTALLED_OCAML=$(run_operator opam exec --switch "$OCAML_SWITCH" \
+    -- ocamlc -version)
+  if [ "$INSTALLED_OCAML" != "$OCAML_TOOLCHAIN" ]; then
+    printf 'status = refused reason = ocaml_toolchain_mismatch expected = %s actual = %s\n' \
+      "$OCAML_TOOLCHAIN" "$INSTALLED_OCAML" >&2
+    exit 1
+  fi
+}
+
+bind_build_toolchains() {
+  run_operator opam option --switch "$OCAML_SWITCH" \
+    "setenv=CARGO_HOME=\"$CARGO_HOME\""
+  run_operator opam option --switch "$OCAML_SWITCH" \
+    "setenv+=RUSTUP_HOME=\"$RUSTUP_HOME\""
+  run_operator opam option --switch "$OCAML_SWITCH" \
+    "setenv+=PATH+=\"$CARGO_HOME/bin\""
+  OPAM_ENVIRONMENT="$OCAML_SWITCH/_opam/.opam-switch/environment"
+  if [ -f "$OPAM_ENVIRONMENT" ]; then
+    run_operator unlink "$OPAM_ENVIRONMENT"
+  fi
+}
+
 PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs npm python3 python3-nacl'
 
 if [ "$SOURCE_BUILD" -eq 1 ]; then
@@ -128,7 +163,9 @@ fi
 run_root chown -R "$OPERATOR_USER:$OPERATOR_USER" "$ROOT"
 run_root install -d -m 700 -o "$OPERATOR_USER" -g "$OPERATOR_USER" "$DATA_ROOT"
 if [ "$SOURCE_BUILD" -eq 1 ]; then
+  install_ocaml_toolchain
   install_rust_toolchain
+  bind_build_toolchains
 fi
 
 printf 'event = install phase = process_manager user = %s\n' "$OPERATOR_USER"

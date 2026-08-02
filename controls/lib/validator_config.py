@@ -65,7 +65,7 @@ TOOLCHAIN_ROOT = ROOT / "runtime_data/toolchains"
 BUILD_WORK = TOOLCHAIN_ROOT / "build"
 CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
 RUSTUP_HOME = TOOLCHAIN_ROOT / "rustup"
-OPAM_ROOT = TOOLCHAIN_ROOT / "opam"
+OPAM_SWITCH = TOOLCHAIN_ROOT / "ocaml"
 
 def operator_pm2_name(name):
     return name if name.startswith("octra-") else f"octra-{name}"
@@ -243,7 +243,6 @@ def rust_environment():
     environment = {
         **os.environ,
         "CARGO_HOME": str(CARGO_HOME),
-        "OPAMROOT": str(OPAM_ROOT),
         "PATH": os.pathsep.join([cargo_bin, os.environ.get("PATH", "")]),
         "RUSTUP_HOME": str(RUSTUP_HOME),
     }
@@ -311,6 +310,20 @@ def ensure_build_toolchain():
         raise ValidatorError("source build requires rustc 1.80 or newer")
     return environment
 
+def bind_build_toolchains(environment, switch):
+    updates = [
+        "setenv=" + f'CARGO_HOME="{CARGO_HOME}"',
+        "setenv+=" + f'RUSTUP_HOME="{RUSTUP_HOME}"',
+        "setenv+=" + f'PATH+="{CARGO_HOME / "bin"}"',
+    ]
+    for update in updates:
+        run(
+            ["opam", "option", "--switch", switch, update],
+            env=environment,
+        )
+    environment_cache = OPAM_SWITCH / "_opam/.opam-switch/environment"
+    environment_cache.unlink(missing_ok=True)
+
 def build_candidate():
     if sys.platform != "linux" or os.uname().machine not in {"amd64", "x86_64"}:
         raise ValidatorError("source build requires Linux x86_64")
@@ -318,9 +331,16 @@ def build_candidate():
     if not locked.is_file():
         raise ValidatorError("source build lock is missing")
     environment = ensure_build_toolchain()
-    switch = "octra-validator-4.14.2"
+    switch = str(OPAM_SWITCH)
     run(
-        ["opam", "init", "--bare", "--disable-sandboxing", "-y"],
+        [
+            "opam",
+            "init",
+            "--bare",
+            "--disable-sandboxing",
+            "--no-setup",
+            "-y",
+        ],
         env=environment,
     )
     switches = subprocess.run(
@@ -336,6 +356,11 @@ def build_candidate():
             ["opam", "switch", "create", switch, "4.14.2", "-y"],
             env=environment,
         )
+    run(
+        ["opam", "switch", "link", switch, str(ROOT), "-y"],
+        env=environment,
+    )
+    bind_build_toolchains(environment, switch)
     compiler = subprocess.run(
         ["opam", "exec", "--switch", switch, "--", "ocamlc", "-version"],
         cwd=ROOT,
