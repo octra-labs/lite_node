@@ -248,6 +248,17 @@ let drop_json (row : Tx_drop.row) =
     "timestamp", `Float row.dropped_at;
   ]
 
+let drop_is_superseded chaindata (row : Tx_drop.row) =
+  Option.is_some (Staging.find_by_hash row.hash)
+  || Option.is_some (Store_chaindata.get_tx_by_hash chaindata row.hash)
+  || Option.is_some (Store_chaindata.get_rejected_tx chaindata row.hash)
+
+let drop_is_private (row : Tx_drop.row) =
+  match row.op_type with
+  | Transaction.StealthOp
+  | Transaction.ClaimOp -> true
+  | _ -> false
+
 let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
   let page = History.rpc_page params in
   let open Lwt.Syntax in
@@ -268,6 +279,8 @@ let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
   in
   let dropped =
     drops_by_addr addr ~limit:page.limit ~offset:page.offset
+    |> List.filter (fun row ->
+      not (drop_is_private row || drop_is_superseded chaindata row))
     |> List.map drop_json
   in
   match

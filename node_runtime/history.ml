@@ -822,6 +822,27 @@ let recent_transactions_result ~mask_rows ~(page : page) ~incomplete ~missing ~r
     Ok (recent_transactions_response
       ~transactions:(mask_rows rows))
 
+let row_hash = function
+  | `Assoc fields ->
+    (match List.assoc_opt "hash" fields with
+     | Some (`String hash) -> Some hash
+     | _ ->
+       match List.assoc_opt "tx_hash" fields with
+       | Some (`String hash) -> Some hash
+       | _ -> None)
+  | _ -> None
+
+let has_hash hash rows =
+  List.exists (fun row -> row_hash row = Some hash) rows
+
+let distinct_drops ~rows ~rejected dropped =
+  List.filter
+    (fun row ->
+      match row_hash row with
+      | Some hash -> not (has_hash hash rows || has_hash hash rejected)
+      | None -> false)
+    dropped
+
 let address_transactions_result
     ~mask_rows
     ~addr
@@ -839,6 +860,7 @@ let address_transactions_result
       ~limit:page.limit
       ~missing)
   else
+    let dropped = distinct_drops ~rows ~rejected dropped in
     Ok (address_transactions_response
       ~addr
       ~total
@@ -846,7 +868,7 @@ let address_transactions_result
       ~limit:page.limit
       ~transactions:(mask_rows rows)
       ~rejected:(mask_rows rejected)
-      ~dropped)
+      ~dropped:(mask_rows dropped))
 
 let token_transactions_result
     ~mask_rows

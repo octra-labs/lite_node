@@ -16,16 +16,22 @@ type signed_rpc_auth_error =
   | Rpc_malformed of string
   | Rpc_auth_error of string
 
-let display_from tx =
-  match tx.Transaction.op_type with
+let display_from_op op value =
+  match op with
   | Transaction.StealthOp
   | Transaction.ClaimOp -> anon
-  | _ -> tx.Transaction.from
+  | _ -> value
+
+let display_to_op op value =
+  match op with
+  | Transaction.ClaimOp -> anon
+  | _ -> value
+
+let display_from tx =
+  display_from_op tx.Transaction.op_type tx.Transaction.from
 
 let display_to tx =
-  match tx.Transaction.op_type with
-  | Transaction.ClaimOp -> anon
-  | _ -> tx.Transaction.to_
+  display_to_op tx.Transaction.op_type tx.Transaction.to_
 
 let mask_stealth_row row =
   match row with
@@ -42,7 +48,7 @@ let mask_stealth_row row =
           (fun (k, v) ->
             match k with
             | "from" -> k, `String anon
-            | "to" when mask_to -> k, `String anon
+            | ("to" | "to_") when mask_to -> k, `String anon
             | _ -> k, v)
           fields)
     else row
@@ -122,8 +128,8 @@ let rpc_dropped ~hash ~reason ~detail ~dropped_at ~from_addr ~to_addr ~nonce ~ou
     "reason", `String reason;
     "detail", `String detail;
     "dropped_at", `Float dropped_at;
-    "from", `String from_addr;
-    "to_", `String to_addr;
+    "from", `String (display_from_op op_type from_addr);
+    "to_", `String (display_to_op op_type to_addr);
     "nonce", `Int nonce;
     "ou", `String (Z.to_string ou);
     "op_type", `String (Transaction.op_type_to_string op_type);
