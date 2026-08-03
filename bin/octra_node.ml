@@ -25,6 +25,7 @@ module Consensus_epoch_apply_sender = Octra_node_runtime.Consensus_epoch_apply_s
 module Consensus_epoch_apply_source = Octra_node_runtime.Consensus_epoch_apply_source
 module Consensus_epoch_apply_start_shell = Octra_node_runtime.Consensus_epoch_apply_start_shell
 module Consensus_finality_state = Octra_node_runtime.Consensus_finality_state
+module Consensus_finality_journal = Octra_node_runtime.Consensus_finality_journal
 module Consensus_join_rpc = Octra_node_runtime.Consensus_join_rpc
 module Consensus_key_switch_preverify = Octra_node_runtime.Consensus_key_switch_preverify
 module Consensus_private_preverify = Octra_node_runtime.Consensus_private_preverify
@@ -37,6 +38,7 @@ module Epoch_atomic = Octra_node_runtime.Epoch_atomic
 module Epoch_visibility = Octra_node_runtime.Epoch_visibility
 module Log = Octra_node_runtime.Log
 module Rest = Octra_node_runtime.Node_rest_facade
+module Rule_graph = Octra_core.Rule_graph
 module Preverify_cache = Octra_node_runtime.Preverify_cache
 module Preverify_submit = Octra_node_runtime.Preverify_submit
 module Startup_process_shell = Octra_node_runtime.Startup_process_shell
@@ -46,6 +48,8 @@ module Startup_node_launch_shell = Octra_node_runtime.Startup_node_launch_shell
 module Startup_private_profile = Octra_node_runtime.Startup_private_profile
 module Startup_runtime_limits = Octra_node_runtime.Startup_runtime_limits
 module Startup_store_shell = Octra_node_runtime.Startup_store_shell
+module State_sync_http = Octra_node_runtime.State_sync_http
+module Sync_publish = Octra_node_runtime.Sync_publish
 module Program_trust = Octra_vm.Program_trust
 
 let addr_short = Octra_node_runtime.Text.addr_short
@@ -228,6 +232,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~exit_fatal:exit_error;
 
     let chaindata = Store_chaindata.open_chaindata (data_dir ^ "/chaindata") in
+    let rules =
+      Rule_graph.create
+        ~chain_id:startup_network.chain_id
+        ~root_at:(fun epoch ->
+          match Store_chaindata.get_bound_epoch_header chaindata epoch with
+          | Ok header -> Rule_graph.Root header.Epochlog.state_root
+          | Error "epoch not found" -> Rule_graph.Missing
+          | Error reason -> Rule_graph.Unreadable reason)
+    in
     let (startup_txlog_seg, startup_txlog_off) =
       Store_chaindata.txlog_position chaindata in
     Log.info "init" "event = txlog_open seg = %d off = %d"
@@ -286,6 +299,35 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           exit_fatal = exit_error;
         })
     in
+    begin
+      match Rule_graph.circle_activation rules with
+      | None ->
+        Log.info "init" "event = rule_graph status = prior"
+      | Some activation ->
+        if !current_epoch <= activation.anchor_epoch then
+          Log.info "init"
+            "event = rule_graph status = awaiting_anchor anchor_epoch = %d activation_epoch = %d"
+            activation.anchor_epoch
+            activation.activation_epoch
+        else
+          match
+            Rule_graph.circle rules ~epoch:activation.activation_epoch
+          with
+          | Ok Rule_graph.Active ->
+            Log.info "init"
+              "event = rule_graph status = bound anchor_epoch = %d activation_epoch = %d"
+              activation.anchor_epoch
+              activation.activation_epoch
+          | Ok Rule_graph.Prior ->
+            Log.fatal "init"
+              "event = rule_graph status = rejected reason = activation_unreachable";
+            exit_error ()
+          | Error fault ->
+            Log.fatal "init"
+              "event = rule_graph status = rejected reason = %s"
+              (Rule_graph.fault_message fault);
+            exit_error ()
+    end;
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -472,6 +514,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           store;
           chaindata;
           program_trust;
+          rules;
           wallet_addr = wallet.address;
           pre_state_hash;
           standard_env = (fun () ->
@@ -700,6 +743,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           backend =
             Consensus_proposal_preview_shell.node_backend
               ~program_trust
+              ~rules
               ~legacy_replay
               ~private_result_policy
               ~max_fhe:max_fhe_per_epoch
@@ -733,6 +777,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         store;
         ledger;
         program_trust;
+        rules;
         env = (fun ~pre_state_root ->
           let epoch_id = !current_epoch in
           let validator_pubkeys =
@@ -921,7 +966,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         read_persistent_pending = (fun () ->
           Store_irmin.get_meta store
             Octra_core.Validator_set_update.pending_meta_key);
-        read_persistent_marker = Store_irmin.get_meta store;
         root_of_head_hash = hex_to_raw32_lossy;
         root_to_raw32;
         raw_to_hex;
@@ -959,6 +1003,32 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         exit_error;
       };
 
+    let sync_task () =
+      Sync_publish.run
+        Sync_publish.{
+          data_dir;
+          chain_id;
+          store;
+          chaindata;
+          wallet;
+          config_hash = State_sync_http.configured_config_hash;
+          trusted_validator_set = State_sync_http.configured_validator_set;
+          head = Octra_core.Head_manifest.get_cached;
+          read_finality = (fun epoch ->
+            Consensus_finality_journal.read_committed_epoch
+              ~chain_id
+              ~epoch
+              data_dir);
+          exporter_set = State_sync_http.exporter_set;
+          certificate_path = (fun () ->
+            State_sync_http.certificate_path ~data_dir);
+          now = Unix.gettimeofday;
+          sleep = Lwt_unix.sleep;
+          info = Log.info "state_sync" "%s";
+          warn = Log.warn "state_sync" "%s";
+        }
+    in
+
     let rpc_task =
       Rest.start_task rest_runtime
         ~port:api_port ~data_dir ~store ~ledger ~tree_ref:tree ~wallet
@@ -973,6 +1043,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Startup_node_launch_shell.{
         p2p_port;
         rpc = rpc_task;
+        services = [sync_task];
         observer = observer_mode;
         tick_loop;
         swarm = !swarm_opt;

@@ -213,7 +213,10 @@ let describe store circle_id =
                 begin
                   match wasm_descriptor_result with
                   | Error e ->
-                    Lwt.return (Error ("invalid circle wasm: " ^ e))
+                    Lwt.return
+                      (Error
+                         ("invalid circle wasm: "
+                          ^ Octra_core.Circle_wasm_host.error_message e))
                   | Ok wasm_descriptor ->
                     Lwt.return (Ok {
                       circle_id;
@@ -233,7 +236,9 @@ let describe store circle_id =
 let load ?(trusted = []) store circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
-  | None -> Lwt.return (Error "circle not found")
+  | None ->
+    Lwt.return
+      (Error (Octra_core.Circle_wasm_host.Rejected "circle not found"))
   | Some info ->
     prune_loaded_cache ();
     let cache_key = loaded_cache_key circle_id info in
@@ -245,14 +250,21 @@ let load ?(trusted = []) store circle_id =
     let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 store circle_id in
     begin
       match code_opt with
-      | None -> Lwt.return (Error "circle program not found")
+      | None ->
+        Lwt.return
+          (Error
+             (Octra_core.Circle_wasm_host.Rejected
+                "circle program not found"))
       | Some code_b64 ->
         begin
           try
             let raw_code = Base64.decode_exn code_b64 in
             let actual_code_hash = Octra_core.Circles.sha256_hex raw_code in
             if actual_code_hash <> info.code_hash then
-              Lwt.return (Error "circle code hash mismatch")
+              Lwt.return
+                (Error
+                   (Octra_core.Circle_wasm_host.Rejected
+                      "circle code hash mismatch"))
             else
               match info.runtime with
               | Octra_core.Circles.Octb ->
@@ -265,7 +277,10 @@ let load ?(trusted = []) store circle_id =
                       code = Octb admitted;
                     })
                   | Error e ->
-                    Lwt.return (Error ("invalid circle bytecode: " ^ e))
+                    Lwt.return
+                      (Error
+                         (Octra_core.Circle_wasm_host.Rejected
+                            ("invalid circle bytecode: " ^ e)))
                 end
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
@@ -273,7 +288,7 @@ let load ?(trusted = []) store circle_id =
                 begin
                   match wasm_descriptor_result with
                   | Error e ->
-                    Lwt.return (Error ("invalid circle wasm: " ^ e))
+                    Lwt.return (Error e)
                   | Ok wasm_descriptor ->
                     begin
                       match
@@ -281,7 +296,10 @@ let load ?(trusted = []) store circle_id =
                           wasm_descriptor.manifest
                       with
                       | Error e ->
-                        Lwt.return (Error ("invalid circle wasm manifest: " ^ e))
+                        Lwt.return
+                          (Error
+                             (Octra_core.Circle_wasm_host.Rejected
+                                ("invalid circle wasm manifest: " ^ e)))
                       | Ok public_reads ->
                         let loaded = {
                           circle_id;
@@ -303,7 +321,10 @@ let load ?(trusted = []) store circle_id =
                     end
                 end
           with e ->
-            Lwt.return (Error ("invalid circle code: " ^ Printexc.to_string e))
+            Lwt.return
+              (Error
+                 (Octra_core.Circle_wasm_host.Rejected
+                    ("invalid circle code: " ^ Printexc.to_string e)))
         end
     end
     end

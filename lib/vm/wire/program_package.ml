@@ -238,7 +238,7 @@ let decode_base64 encoded =
   | Ok _
   | Error _ -> Error Invalid_encoding
 
-let compile_sources package =
+let compile_sources_with compile package =
   let sources = Hashtbl.create (List.length package.sources) in
   let used = Hashtbl.create (List.length package.sources) in
   List.iter
@@ -253,13 +253,19 @@ let compile_sources package =
   in
   let result =
     match package.compiler_profile with
-    | 1 -> Oct_compile.compile_program_multi resolver package.main
+    | 1 -> compile resolver package.main
     | _ -> Oct_compile.error_result "unsupported Program compiler profile"
   in
   result, used
 
-let build package =
-  let result, used = compile_sources package in
+let compile_sources package =
+  compile_sources_with Oct_compile.compile_program_multi_first package
+
+let compile_sources_checked package =
+  compile_sources_with Oct_compile.compile_program_multi package
+
+let build_with compile package =
+  let result, used = compile package in
   match result.Oct_compile.error, result.program_envelope with
   | Some reason, _ -> Error (Compile_failed reason)
   | None, None -> Error Envelope_missing
@@ -280,9 +286,12 @@ let build package =
           bind (encode { package with envelope }) (fun encoded ->
             Ok { package = encoded; envelope; result }))
 
+let build package =
+  build_with compile_sources package
+
 let compile ~main ~sources =
   bind (normalize ~main sources) (fun sources ->
-    build {
+    build_with compile_sources_checked {
       compiler_profile;
       main;
       sources;

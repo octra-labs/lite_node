@@ -131,7 +131,10 @@ let validate_runtime (payload : Circles.deploy_payload) =
               | Ok _ -> Lwt.return (Ok ())
               | Error e -> Lwt.return (Error ("circle_runtime_invalid", e))
             end
-          | Error e -> Lwt.return (Error ("circle_runtime_invalid", e))
+          | Error e ->
+            Lwt.return
+              (Error
+                 ("circle_runtime_invalid", Circle_wasm_host.error_message e))
         end
     end
 

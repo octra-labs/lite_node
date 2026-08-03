@@ -10,6 +10,7 @@ module Preverify_commit = Octra_core.Preverify_commit
 module Preverify_receipt = Octra_core.Preverify_receipt
 module Program_trust = Octra_vm.Program_trust
 module Receipt_view = Octra_vm.Receipt_view
+module Rule_graph = Octra_core.Rule_graph
 module Transcript = Octra_core.Circle_hfhe_transcript
 module Transaction = Octra_core.Transaction
 module Tx_effects = Octra_vm.Tx_effects
@@ -45,7 +46,7 @@ let context ~program_trust backend env (tx : Transaction.t) effects tx_hash =
 
 let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
     ?(save_receipt_raw=(fun ~tx_hash:_ ~json:_ -> ()))
-    ~program_trust backend env (tx : Transaction.t) =
+    ~circle_mode ~program_trust backend env (tx : Transaction.t) =
   let effects =
     Tx_effects.create
       ~ledger:backend.Epoch_exec.ledger
@@ -189,6 +190,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
             ~ctx
             ~limit:call.Call_plan.effort_limit
             ~hfhe_mode
+            ~update_policy:(circle_mode = Rule_graph.Active)
             backend.store
             current.to_
             call.method_name
@@ -300,7 +302,9 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
       (fun error ->
         discard ();
         match error with
-        | Circle_receipt_mismatch _ -> Lwt.fail error
+        | Circle_receipt_mismatch _
+        | Circle_exec.Execution_unavailable _ -> Lwt.fail error
+        | _ when hfhe_mode = Transcript.Capture -> Lwt.fail error
         | _ ->
           Lwt.return
             (Error
@@ -344,13 +348,14 @@ let circle_cell_transition_hash preverify tx =
         end
     end
 
-let preverify_circle ~backend ~env ~program_trust tx =
+let preverify_circle ~circle_mode ~backend ~env ~program_trust tx =
   let open Lwt.Syntax in
   let capture = ref None in
   let* result =
     run
       ~hfhe_mode:Transcript.Capture
       ~circle_capture:capture
+      ~circle_mode
       ~program_trust
       backend
       env
@@ -358,16 +363,24 @@ let preverify_circle ~backend ~env ~program_trust tx =
   in
   match result, !capture with
   | Ok (Epoch_exec.Confirmed _), Some binding -> Lwt.return_ok binding
-  | Ok (Epoch_exec.Rejected_after_fee rejected), _ ->
-    Lwt.return_error
-      (rejected.error_type ^ ":" ^ rejected.reason)
+  | Ok (Epoch_exec.Rejected_after_fee rejected), Some binding ->
+    begin
+      match circle_mode with
+      | Rule_graph.Prior ->
+        Lwt.return_error
+          (rejected.error_type ^ ":" ^ rejected.reason)
+      | Rule_graph.Active ->
+        Lwt.return_ok binding
+    end
+  | Ok (Epoch_exec.Rejected_after_fee _), None ->
+    Lwt.return_error "circle_rejection_capture_missing"
   | Error (error_type, reason), _ ->
     Lwt.return_error (error_type ^ ":" ^ reason)
   | Ok (Epoch_exec.Confirmed _), None ->
     Lwt.return_error "circle_receipt_capture_missing"
 
 let process_tx ?preverify ?save_receipt_raw ~backend
-    ~(env : Epoch_exec.env) ~program_trust tx =
+    ~(env : Epoch_exec.env) ~circle_mode ~program_trust tx =
   match tx.Transaction.op_type with
   | Transaction.CircleBalanceCellPut
   | Transaction.CircleRegisterCellPut ->
@@ -393,12 +406,13 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Error e ->
         Lwt.return_error ("circle_preverify_receipt", e)
       | Ok None ->
-        run ?save_receipt_raw ~program_trust backend env tx
+        run ?save_receipt_raw ~circle_mode ~program_trust backend env tx
       | Ok (Some circle) ->
         run
           ~hfhe_mode:(Transcript.Consume circle.transcript)
           ~expected_circle:circle
           ?save_receipt_raw
+          ~circle_mode
           ~program_trust
           backend
           env
@@ -410,7 +424,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
   | Transaction.ProgramExec
   | Transaction.MultiExec
   | Transaction.ContractUpgrade ->
-    run ?save_receipt_raw ~program_trust backend env tx
+    run ?save_receipt_raw ~circle_mode ~program_trust backend env tx
   | Transaction.CircleDeploy
   | Transaction.CircleProgramUpdate ->
     let open Lwt.Syntax in

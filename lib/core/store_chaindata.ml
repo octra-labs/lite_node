@@ -19,6 +19,34 @@ type token_rows_page = {
 }
 
 let max_txlog_record_len = 128_000_000
+let rebuild_tx_batch = 50_000
+let rebuild_epoch_batch = 10_000
+
+module String_set = Set.Make (String)
+
+type rebuild_report = {
+  transactions : int64;
+  epochs : int;
+  last_epoch : int;
+  epoch_index_root : string;
+}
+
+type rebuild_tx_state = {
+  tx_next : int64;
+  tx_batch : int;
+  tx_hashes : String_set.t;
+  tx_phase : rebuild_tx_phase;
+}
+
+and rebuild_tx_phase = Initial | Indexed
+
+type rebuild_epoch_state = {
+  epoch_next : int;
+  epoch_txid : int64;
+  epoch_batch : int;
+  epoch_root : string;
+  prior_state_root : string option;
+}
 
 type page_profile = {
   fetched : int;
@@ -264,6 +292,11 @@ let split_payload payload =
   if String.length payload < 64 then ("", payload)
   else (String.sub payload 0 64, String.sub payload 64 (String.length payload - 64))
 
+let visible_tx_json hash tx_json =
+  match Tx_archive.decode ~hash ~json:tx_json with
+  | Ok value -> Tx_archive.visible_json value
+  | Error _ -> tx_json
+
 let find_sub_from s sub start =
   let sl = String.length s in
   let nl = String.length sub in
@@ -430,8 +463,8 @@ let get_tx_by_hash t hash =
   | Some (seg_id, offset, len, epoch_id) ->
     (try
        let (_eid, payload) = Txlog.read_record t.txlog ~seg_id ~offset ~len in
-       let (_h, tx_json) = split_payload payload in
-       Some (epoch_id, tx_json)
+       let (stored_hash, tx_json) = split_payload payload in
+       Some (epoch_id, visible_tx_json stored_hash tx_json)
      with _ -> None)
 
 let capped_replace cache key value =
@@ -476,7 +509,8 @@ let read_tx_record_at_txid t txid =
       (try
          let (epoch_id, payload) = Txlog.read_record t.txlog ~seg_id ~offset ~len in
          let (hash, tx_json) = split_payload payload in
-         Some (hash, epoch_id, tx_json, seg_id, offset, len)
+         Some
+           (hash, epoch_id, visible_tx_json hash tx_json, seg_id, offset, len)
        with _ -> None)
 
 let get_tx_by_txid t txid =
@@ -486,7 +520,7 @@ let get_tx_by_txid t txid =
     (try
        let (_eid, payload) = Txlog.read_record t.txlog ~seg_id ~offset ~len in
        let (h, tx_json) = split_payload payload in
-       Some (h, tx_json)
+       Some (h, visible_tx_json h tx_json)
      with _ -> None)
 
 let tx_count t = Int64.to_int t.next_txid
@@ -1453,6 +1487,7 @@ let txs_by_epoch_rows_status t epoch_id ~limit ~offset =
                       incr missing_tx_loc
                     else
                       let (hash, tx_json) = split_payload payload in
+                      let tx_json = visible_tx_json hash tx_json in
                       if String.length hash <> 64 then
                         incr malformed_records
                       else begin
@@ -1624,6 +1659,85 @@ let get_bound_epoch_header t epoch_id =
   | Some _, None -> Error "epoch log entry missing"
   | Some indexed, Some durable when indexed = durable -> Ok durable
   | Some _, Some _ -> Error "epoch metadata does not match epoch log"
+
+type epoch_boundary = {
+  header : Epochlog.epoch_header;
+  txid_hi : int64;
+  txlog_seg : int;
+  txlog_off : int;
+  epochlog_off : int;
+  index_hash : string;
+  index_root : string;
+}
+
+let epoch_txid_hi (header : Epochlog.epoch_header) =
+  if header.tx_count < 0 then Error "epoch transaction count is negative"
+  else if Int64.compare header.start_txid 0L < 0 then
+    Error "epoch start transaction id is negative"
+  else if header.tx_count = 0 then
+    Ok (Int64.pred header.start_txid)
+  else
+    let delta = Int64.of_int (header.tx_count - 1) in
+    if Int64.compare header.start_txid (Int64.sub Int64.max_int delta) > 0 then
+      Error "epoch transaction range overflows"
+    else
+      Ok (Int64.add header.start_txid delta)
+
+let txlog_boundary t epoch_id tx_count txid_hi =
+  if Int64.compare txid_hi 0L < 0 then Ok (0, Txlog.header_size)
+  else
+    match Chaindata_index.get_txid_loc_raw t.index txid_hi with
+    | None -> Error "epoch transaction boundary is missing"
+    | Some (segment, offset, length)
+      when segment < 0
+           || offset < Txlog.header_size
+           || length < 8
+           || length > max_txlog_record_len ->
+        Error "epoch transaction boundary is invalid"
+    | Some (segment, offset, length) ->
+        if offset > max_int - 4 - length then
+          Error "epoch transaction boundary overflows"
+        else
+          try
+            let stored_epoch, _ =
+              Txlog.read_record t.txlog ~seg_id:segment ~offset ~len:length
+            in
+            if stored_epoch > epoch_id
+               || (tx_count > 0 && stored_epoch <> epoch_id) then
+              Error "epoch transaction boundary points to another epoch"
+            else
+              Ok (segment, offset + 4 + length)
+          with exn ->
+            Error ("epoch transaction boundary cannot be read: " ^ Printexc.to_string exn)
+
+let epoch_boundary t epoch_id =
+  match get_bound_epoch_header t epoch_id with
+  | Error _ as error -> error
+  | Ok header ->
+      begin
+        match epoch_txid_hi header with
+        | Error _ as error -> error
+        | Ok txid_hi ->
+            begin
+              match txlog_boundary t epoch_id header.tx_count txid_hi,
+                Epochlog.offset_after t.epochlog epoch_id,
+                get_epoch_index_commitment t epoch_id with
+              | Ok (txlog_seg, txlog_off), Some epochlog_off,
+                (Some index_hash, Some index_root) ->
+                  Ok {
+                    header;
+                    txid_hi;
+                    txlog_seg;
+                    txlog_off;
+                    epochlog_off;
+                    index_hash;
+                    index_root;
+                  }
+              | Error reason, _, _ -> Error reason
+              | _, None, _ -> Error "epoch log boundary is missing"
+              | _, _, _ -> Error "epoch index commitment is incomplete"
+            end
+      end
 
 let list_epoch_ids t =
   Chaindata_index.list_epoch_ids t.index
@@ -1812,30 +1926,238 @@ let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
   t.next_txid <- Int64.add inflight_start_txid 0L;
   (n_tx, n_ep, n_addr, n_txid)
 
-let rebuild_index t =
-  let next_txid = ref 0L in
-  Chaindata_index.begin_rebuild_write t.index;
-  Txlog.scan_all t.txlog (fun seg_id offset len epoch_id payload ->
-    let txid = !next_txid in
-    next_txid := Int64.add !next_txid 1L;
-    (try
-       let (hash, tx_json) = split_payload payload in
-       let j = Yojson.Safe.from_string tx_json in
-       let open Yojson.Safe.Util in
-       let from_addr = try j |> member "from" |> to_string with _ -> "" in
-       let to_addr = try j |> member "to_" |> to_string with _ -> "" in
-       let op_type = try j |> member "op_type" |> to_string with _ -> "standard" in
-       let encrypted_data = try j |> member "encrypted_data" |> to_string with _ -> "" in
-       let message = try j |> member "message" |> to_string with _ -> "" in
-       let addrs = extract_call_recipient ~op_type ~encrypted_data
-         ~message ~from_addr ~to_addr in
-       Chaindata_index.buffer_tx t.index ~hash ~seg_id ~offset ~len
-         ~epoch_id ~txid ~from_addr ~to_addr ~addrs
-     with _ -> ())
-  );
-  List.iter (fun h ->
-    Chaindata_index.buffer_epoch t.index h.Epochlog.id (Epochlog.epoch_to_json h)
-  ) (Epochlog.read_all t.epochlog);
-  Chaindata_index.buffer_meta t.index "next_txid" (Int64.to_string !next_txid);
+let lower_hex_hash value =
+  String.length value = 64
+  && String.for_all (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false) value
+
+let decode_rebuild_tx ~public_key_of payload =
+  if String.length payload < 65 then Error "transaction payload is too short"
+  else
+    let hash, tx_json = split_payload payload in
+    if not (lower_hex_hash hash) then Error "transaction hash is invalid"
+    else
+      match Tx_archive.decode ~hash ~json:tx_json with
+      | Error _ as error -> error
+      | Ok value ->
+          begin
+            match Tx_archive.verify ~public_key_of value with
+            | Error _ as error -> error
+            | Ok () -> Ok (hash, Tx_archive.tx value)
+          end
+
+let flush_tx_rebuild t state =
+  Chaindata_index.buffer_meta t.index "next_txid" (Int64.to_string state.tx_next);
   Chaindata_index.commit_write t.index;
-  t.next_txid <- !next_txid
+  Chaindata_index.begin_write t.index;
+  {
+    state with
+    tx_batch = 0;
+    tx_hashes = String_set.empty;
+    tx_phase = Indexed;
+  }
+
+let rebuild_tx_record ~public_key_of t state (record : Txlog.scan_record) =
+  match decode_rebuild_tx ~public_key_of record.payload with
+  | Error _ as error -> error
+  | Ok (hash, tx) ->
+      let committed_duplicate =
+        match state.tx_phase with
+        | Initial -> false
+        | Indexed -> Chaindata_index.get_tx_loc_raw t.index hash <> None
+      in
+      if String_set.mem hash state.tx_hashes || committed_duplicate then
+        Error "transaction hash is duplicated"
+      else
+        let op_type = Transaction.op_type_to_string tx.op_type in
+        let encrypted_data = Option.value ~default:"" tx.encrypted_data in
+        let message = Option.value ~default:"" tx.message in
+        let addrs =
+          extract_call_recipient
+            ~op_type
+            ~encrypted_data
+            ~message
+            ~from_addr:tx.from
+            ~to_addr:tx.to_
+        in
+        Chaindata_index.buffer_tx
+          t.index
+          ~hash
+          ~seg_id:record.segment
+          ~offset:record.offset
+          ~len:record.length
+          ~epoch_id:record.epoch
+          ~txid:state.tx_next
+          ~from_addr:tx.from
+          ~to_addr:tx.to_
+          ~addrs;
+        let state = {
+          tx_next = Int64.succ state.tx_next;
+          tx_batch = state.tx_batch + 1;
+          tx_hashes = String_set.add hash state.tx_hashes;
+          tx_phase = state.tx_phase;
+        } in
+        if state.tx_batch >= rebuild_tx_batch then Ok (flush_tx_rebuild t state)
+        else Ok state
+
+let epoch_hashes t header =
+  let rec loop txid remaining hashes =
+    if remaining = 0 then Ok (List.rev hashes)
+    else
+      match Chaindata_index.get_txid_loc_raw t.index txid with
+      | None -> Error (Printf.sprintf "transaction id is missing: %Ld" txid)
+      | Some (segment, offset, length) ->
+          try
+            let epoch, payload =
+              Txlog.read_record t.txlog ~seg_id:segment ~offset ~len:length
+            in
+            if epoch <> header.Epochlog.id then
+              Error
+                (Printf.sprintf
+                   "transaction epoch mismatch: txid = %Ld"
+                   txid)
+            else
+              let hash, _ = split_payload payload in
+              if not (lower_hex_hash hash) then
+                Error
+                  (Printf.sprintf
+                     "transaction hash is invalid: txid = %Ld"
+                     txid)
+              else
+                loop (Int64.succ txid) (remaining - 1) (hash :: hashes)
+          with exn -> Error (Printexc.to_string exn)
+  in
+  loop header.Epochlog.start_txid header.tx_count []
+
+let flush_epoch_rebuild t state =
+  Chaindata_index.buffer_meta
+    t.index
+    "repaired_upto_epoch"
+    (string_of_int (state.epoch_next - 1));
+  Chaindata_index.buffer_meta t.index "index_schema_version" "v2_ascii64_int32be";
+  Chaindata_index.commit_write t.index;
+  Chaindata_index.begin_write t.index;
+  { state with epoch_batch = 0 }
+
+let rebuild_epoch_record t tx_total state (header : Epochlog.epoch_header) =
+  if header.id <> state.epoch_next then
+    Error (Printf.sprintf "epoch sequence mismatch: expected = %d actual = %d"
+      state.epoch_next header.id)
+  else if header.start_txid <> state.epoch_txid then
+    Error
+      (Printf.sprintf
+         "epoch transaction start mismatch: epoch = %d"
+         header.id)
+  else if header.tx_count < 0
+       || header.tx_count > Octra_consensus.C_codec.max_proposal_txs then
+    Error
+      (Printf.sprintf
+         "epoch transaction count is invalid: epoch = %d"
+         header.id)
+  else if
+    Int64.compare
+      (Int64.of_int header.tx_count)
+      (Int64.sub tx_total state.epoch_txid) > 0
+  then
+    Error
+      (Printf.sprintf
+         "epoch transaction range exceeds txlog: epoch = %d"
+         header.id)
+  else
+    match state.prior_state_root with
+    | Some prior when header.prev_state_root <> prior ->
+        Error
+          (Printf.sprintf
+             "epoch state root continuity mismatch: epoch = %d"
+             header.id)
+    | _ ->
+        match epoch_hashes t header with
+        | Error _ as error -> error
+        | Ok hashes ->
+            let epoch_hash, epoch_root =
+              Epoch_index_commitment.next_root_from_hashes
+                ~prev:state.epoch_root
+                ~epoch_id:header.id
+                ~start_txid:header.start_txid
+                hashes
+            in
+            Chaindata_index.buffer_epoch t.index header.id (Epochlog.epoch_to_json header);
+            set_epoch_index_commitment
+              t
+              ~epoch_id:header.id
+              ~epoch_hash
+              ~root:epoch_root;
+            let state = {
+              epoch_next = state.epoch_next + 1;
+              epoch_txid = Int64.add state.epoch_txid (Int64.of_int header.tx_count);
+              epoch_batch = state.epoch_batch + 1;
+              epoch_root;
+              prior_state_root = Some header.state_root;
+            } in
+            if state.epoch_batch >= rebuild_epoch_batch then
+              Ok (flush_epoch_rebuild t state)
+            else Ok state
+
+let rebuild_index ?(public_key_of = fun _ -> None) t =
+  try
+    Chaindata_index.begin_rebuild_write t.index;
+    let tx_initial = {
+      tx_next = 0L;
+      tx_batch = 0;
+      tx_hashes = String_set.empty;
+      tx_phase = Initial;
+    } in
+    match
+      Txlog.fold_strict
+        t.txlog
+        ~init:tx_initial
+        ~f:(rebuild_tx_record ~public_key_of t)
+    with
+    | Error error ->
+        Chaindata_index.abort_write t.index;
+        Error (Txlog.scan_error_message error)
+    | Ok tx_state ->
+        let tx_state = flush_tx_rebuild t tx_state in
+        let epoch_initial = {
+          epoch_next = 0;
+          epoch_txid = 0L;
+          epoch_batch = 0;
+          epoch_root = Epoch_index_commitment.genesis_root;
+          prior_state_root = None;
+        } in
+        match
+          Epochlog.fold_strict
+            t.epochlog
+            ~init:epoch_initial
+            ~f:(rebuild_epoch_record t tx_state.tx_next)
+        with
+        | Error error ->
+            Chaindata_index.abort_write t.index;
+            Error (Epochlog.read_error_message error)
+        | Ok epoch_state when epoch_state.epoch_next = 0 ->
+            Chaindata_index.abort_write t.index;
+            Error "epochlog is empty"
+        | Ok epoch_state when epoch_state.epoch_txid <> tx_state.tx_next ->
+            Chaindata_index.abort_write t.index;
+            Error "txlog contains transactions outside epoch ranges"
+        | Ok epoch_state ->
+            let epoch_state = flush_epoch_rebuild t epoch_state in
+            Chaindata_index.buffer_meta
+              t.index
+              "next_txid"
+              (Int64.to_string tx_state.tx_next);
+            Chaindata_index.commit_write t.index;
+            t.next_txid <- tx_state.tx_next;
+            Hashtbl.clear t.epoch_status_cache;
+            Hashtbl.clear t.epoch_rows_page_cache;
+            Hashtbl.clear t.addr_rows_page_cache;
+            Hashtbl.clear t.rejected_rows_page_cache;
+            Hashtbl.clear t.token_rows_page_cache;
+            Ok {
+              transactions = tx_state.tx_next;
+              epochs = epoch_state.epoch_next;
+              last_epoch = epoch_state.epoch_next - 1;
+              epoch_index_root = epoch_state.epoch_root;
+            }
+  with exn ->
+    Chaindata_index.abort_write t.index;
+    Error (Printexc.to_string exn)

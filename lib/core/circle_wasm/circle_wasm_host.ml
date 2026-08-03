@@ -63,6 +63,14 @@ type exec_result = {
   error : string option;
 }
 
+type exec_error =
+  | Rejected of string
+  | Unavailable of string
+
+let error_message = function
+  | Rejected message
+  | Unavailable message -> message
+
 type storage_cache_entry = {
   storage_json : Yojson.Safe.t list;
   mutable seeded_in_native : bool;
@@ -108,12 +116,14 @@ let read_process_json payload =
   let body = Yojson.Safe.to_string payload in
   let* native =
     Lwt_preemptive.detach
-      (fun () -> Circle_wasm_native.run_json body)
+      (fun () -> Circle_wasm_native.run_json_classified body)
       ()
   in
   match native with
-  | Error e ->
-    Lwt.return (Error e)
+  | Error (Circle_wasm_native.Rejected e) ->
+    Lwt.return (Error (Rejected e))
+  | Error (Circle_wasm_native.Unavailable e) ->
+    Lwt.return (Error (Unavailable e))
   | Ok raw ->
     begin
       try
@@ -121,9 +131,10 @@ let read_process_json payload =
       with e ->
         Lwt.return
           (Error
-             (Printf.sprintf
-                "invalid native wasm runtime response: %s"
-                (Printexc.to_string e)))
+             (Unavailable
+                (Printf.sprintf
+                   "invalid native wasm runtime response: %s"
+                   (Printexc.to_string e))))
     end
 
 let export_info_of_yojson = function
@@ -530,7 +541,7 @@ let validate code_b64 =
   | Error _ as e ->
     Lwt.return e
   | Ok json ->
-    Lwt.return (descriptor_of_yojson json)
+    Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
 let describe code_b64 =
   let payload =
@@ -543,7 +554,7 @@ let describe code_b64 =
   | Error _ as e ->
     Lwt.return e
   | Ok json ->
-    Lwt.return (descriptor_of_yojson json)
+    Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
 let execute
     ~code_b64
@@ -561,7 +572,8 @@ let execute
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
-  ~is_view =
+    ~is_view
+    ~update_policy =
   let code_key = code_cache_key code_b64 in
   let initial_allow_code_cache_only = code_seeded code_key in
   let initial_allow_cache_only =
@@ -651,14 +663,15 @@ let execute
              public_reads);
         "fuel_limit", `Int fuel_limit;
         "is_view", `Bool is_view;
+        "update_policy", `Bool update_policy;
       ] in
     let* json_result = read_process_json payload in
     match json_result with
-    | Error e
+    | Error (Rejected e)
       when use_code_cache_only
            && string_starts_with ~prefix:"missing wasm module cache:" e ->
       dispatch ~allow_cache_only ~allow_code_cache_only:false
-    | Error e
+    | Error (Rejected e)
       when use_cache_only
            && string_starts_with ~prefix:"missing storage cache:" e ->
       dispatch ~allow_cache_only:false ~allow_code_cache_only
@@ -681,100 +694,106 @@ let execute
       ~allow_code_cache_only:initial_allow_code_cache_only
   in
   match json_result with
-  | Error _ as e ->
-    Lwt.return e
+  | Error e ->
+    Lwt.return (Error e)
   | Ok (`Assoc fields) ->
     begin
-      match
-        List.assoc_opt "success" fields,
-        List.assoc_opt "status_code" fields,
-        List.assoc_opt "effort_used" fields,
-        List.assoc_opt "response_b64" fields,
-        List.assoc_opt "storage_pairs" fields,
-        List.assoc_opt "events" fields,
-        List.assoc_opt "hfhe_receipt_entries" fields
-      with
-      | Some (`Bool success),
-        Some (`Int status_code),
-        Some (`Int effort_used),
-        Some response_json,
-        Some storage_json,
-        Some events_json,
-        Some hfhe_transcript_json ->
-        begin
-          let storage_decode_result =
-            match storage_json with
-            | `Null ->
-              Ok (Hashtbl.copy storage_tbl)
-            | _ ->
-              decode_storage_tbl storage_json in
-          let spawns_json =
-            match List.assoc_opt "spawns" fields with
-            | Some value -> value
-            | None -> `Null
-          in
-          let assets_json =
-            match List.assoc_opt "assets" fields with
-            | Some value -> value
-            | None -> `Null
-          in
-          let encrypted_assets_json =
-            match List.assoc_opt "encrypted_assets" fields with
-            | Some value -> value
-            | None -> `Null
-          in
-          match
-            storage_decode_result,
-            decode_events events_json,
-            decode_spawns spawns_json,
-            decode_assets assets_json,
-            decode_encrypted_assets encrypted_assets_json,
-            Circle_hfhe_transcript.entries_of_json hfhe_transcript_json,
-            (match response_json with
-             | `Null -> Ok None
-             | _ ->
-               begin
-                 match decode_b64_field "wasm response" response_json with
-                 | Ok raw ->
-                   begin
-                     match Circle_wasm_codec.decode_response raw with
-                     | Ok value -> Ok (Some value)
-                     | Error e -> Error e
-                   end
-                 | Error e -> Error e
-               end)
-          with
-          | Ok storage_tbl, Ok events, Ok spawns, Ok assets,
-            Ok encrypted_assets, Ok hfhe_transcript, Ok response_value ->
-            let error =
-              match List.assoc_opt "error" fields with
-              | Some (`String msg) -> Some msg
-              | _ -> None in
-            Lwt.return
-              (Ok {
-                 success;
-                 effort_used;
-                 response_value;
-                 response_status = status_code;
-                 storage_tbl;
-                 events;
-                 spawns;
-                 assets;
-                 encrypted_assets;
-                 hfhe_transcript;
-                 error;
-               })
-          | Error e, _, _, _, _, _, _
-          | _, Error e, _, _, _, _, _
-          | _, _, Error e, _, _, _, _
-          | _, _, _, Error e, _, _, _
-          | _, _, _, _, Error e, _, _
-          | _, _, _, _, _, Error e, _
-          | _, _, _, _, _, _, Error e ->
-            Lwt.return (Error e)
-        end
+      match List.assoc_opt "unavailable" fields with
+      | Some (`String reason) ->
+        Lwt.return (Error (Unavailable reason))
       | _ ->
-        Lwt.return (Error "invalid wasm execution response")
+        begin
+          match
+            List.assoc_opt "success" fields,
+            List.assoc_opt "status_code" fields,
+            List.assoc_opt "effort_used" fields,
+            List.assoc_opt "response_b64" fields,
+            List.assoc_opt "storage_pairs" fields,
+            List.assoc_opt "events" fields,
+            List.assoc_opt "hfhe_receipt_entries" fields
+          with
+          | Some (`Bool success),
+            Some (`Int status_code),
+            Some (`Int effort_used),
+            Some response_json,
+            Some storage_json,
+            Some events_json,
+            Some hfhe_transcript_json ->
+            begin
+              let storage_decode_result =
+                match storage_json with
+                | `Null ->
+                  Ok (Hashtbl.copy storage_tbl)
+                | _ ->
+                  decode_storage_tbl storage_json in
+              let spawns_json =
+                match List.assoc_opt "spawns" fields with
+                | Some value -> value
+                | None -> `Null
+              in
+              let assets_json =
+                match List.assoc_opt "assets" fields with
+                | Some value -> value
+                | None -> `Null
+              in
+              let encrypted_assets_json =
+                match List.assoc_opt "encrypted_assets" fields with
+                | Some value -> value
+                | None -> `Null
+              in
+              match
+                storage_decode_result,
+                decode_events events_json,
+                decode_spawns spawns_json,
+                decode_assets assets_json,
+                decode_encrypted_assets encrypted_assets_json,
+                Circle_hfhe_transcript.entries_of_json hfhe_transcript_json,
+                (match response_json with
+                 | `Null -> Ok None
+                 | _ ->
+                   begin
+                     match decode_b64_field "wasm response" response_json with
+                     | Ok raw ->
+                       begin
+                         match Circle_wasm_codec.decode_response raw with
+                         | Ok value -> Ok (Some value)
+                         | Error e -> Error e
+                       end
+                     | Error e -> Error e
+                   end)
+              with
+              | Ok storage_tbl, Ok events, Ok spawns, Ok assets,
+                Ok encrypted_assets, Ok hfhe_transcript, Ok response_value ->
+                let error =
+                  match List.assoc_opt "error" fields with
+                  | Some (`String msg) -> Some msg
+                  | _ -> None in
+                Lwt.return
+                  (Ok {
+                     success;
+                     effort_used;
+                     response_value;
+                     response_status = status_code;
+                     storage_tbl;
+                     events;
+                     spawns;
+                     assets;
+                     encrypted_assets;
+                     hfhe_transcript;
+                     error;
+                   })
+              | Error e, _, _, _, _, _, _
+              | _, Error e, _, _, _, _, _
+              | _, _, Error e, _, _, _, _
+              | _, _, _, Error e, _, _, _
+              | _, _, _, _, Error e, _, _
+              | _, _, _, _, _, Error e, _
+              | _, _, _, _, _, _, Error e ->
+                Lwt.return (Error (Rejected e))
+            end
+          | _ ->
+            Lwt.return (Error (Rejected "invalid wasm execution response"))
+        end
     end
   | Ok _ ->
-    Lwt.return (Error "invalid wasm execution response")
+    Lwt.return (Error (Rejected "invalid wasm execution response"))

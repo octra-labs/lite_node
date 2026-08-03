@@ -4,6 +4,7 @@
 type deps = {
   p2p_port : int;
   rpc : unit -> unit Lwt.t;
+  services : (unit -> unit Lwt.t) list;
   observer : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;

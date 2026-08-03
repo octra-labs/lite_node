@@ -24,6 +24,7 @@ type deps = {
 
 let node_backend
     ~program_trust
+    ~rules
     ~legacy_replay
     ~private_result_policy
     ~max_fhe
@@ -33,6 +34,10 @@ let node_backend
   {
     run = (fun ~epoch_id ~proposal_id ~expected_prev_root ~preverify ~reward
         ~env ~txs ->
+      match Octra_core.Rule_graph.circle rules ~epoch:epoch_id with
+      | Error fault ->
+        Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
+      | Ok circle_mode ->
       Octra_core.State_preview.with_preview
         ~base_store:store
         ~base_ledger:ledger
@@ -71,6 +76,7 @@ let node_backend
             else
               Consensus_vm_transition.process_tx
                 ~preverify
+                ~circle_mode
                 ~program_trust
                 ~backend
                 ~env

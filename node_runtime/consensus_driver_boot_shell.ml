@@ -48,7 +48,6 @@ type deps = {
   read_head_hash : unit -> string option;
   get_meta : string -> string option;
   read_persistent_pending : unit -> string option Lwt.t;
-  read_persistent_marker : string -> string option Lwt.t;
   root_of_head_hash : string -> string;
   root_to_raw32 : string -> string;
   raw_to_hex : string -> string;
@@ -129,7 +128,6 @@ let start_p2p (deps : deps) =
       voting = deps.voting;
       role_label = deps.role_label;
       read_persistent_pending = deps.read_persistent_pending;
-      read_persistent_marker = deps.read_persistent_marker;
       current_height = (fun () ->
         validator_state_height
           ~committed_head_epoch:deps.committed_head_epoch);

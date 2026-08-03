@@ -62,9 +62,7 @@ type admission_deps = {
 
 type persistent_update_deps = {
   read_pending : unit -> string option Lwt.t;
-  read_marker : string -> string option Lwt.t;
   warn : string -> unit;
-  current_height : unit -> int64;
 }
 
 type node_view = {
@@ -100,7 +98,6 @@ type node_start_runtime = {
   voting : bool;
   role_label : string;
   read_persistent_pending : unit -> string option Lwt.t;
-  read_persistent_marker : string -> string option Lwt.t;
   current_height : unit -> int64;
 }
 
@@ -178,8 +175,6 @@ val admit_validator_startup :
 
 val load_persistent_update :
   persistent_update_deps ->
-  runtime:Octra_core.Validator_ready_policy.runtime ->
-  requirements:Octra_core.Validator_ready_policy.requirements ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
 val admission_deps_of_runtime :
@@ -192,17 +187,8 @@ val persistent_update_deps_of_runtime :
 
 val load_runtime_persistent_update :
   node_start_runtime ->
-  node_view ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
 val start_node :
   node_start_runtime ->
   node_start
-
-val load_irmin_persistent_update :
-  store:Octra_core.Store_irmin.t ->
-  warn:(string -> unit) ->
-  current_height:(unit -> int64) ->
-  runtime:Octra_core.Validator_ready_policy.runtime ->
-  requirements:Octra_core.Validator_ready_policy.requirements ->
-  Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t

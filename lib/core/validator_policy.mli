@@ -26,5 +26,4 @@ val of_env_exn : (string -> string option) -> t
 val activation_epoch : t -> int option
 val consensus_id : t -> string
 val lifecycle_enabled : t -> bool
-val manual_update_allowed : t -> epoch:int -> bool
 val snapshot_activation : t -> source_epoch:int64 -> int64 option

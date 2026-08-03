@@ -84,6 +84,10 @@ let env_flag name =
 
 let state_sync_enabled () =
   env_flag "OCTRA_STATE_SYNC_ENABLE"
+  || Option.fold
+       ~none:false
+       ~some:(fun value -> String.trim value <> "")
+       (Sys.getenv_opt "OCTRA_STATE_SYNC_EXPORTERS")
 
 let respond_state_sync_disabled () =
   respond_error
@@ -155,12 +159,15 @@ let load_chunk ~data_dir ~snapshot_id ~path ~offset ~size ~sha256 =
         Lwt.return_unit)
   end
 
-let configured_certificate_path () =
+let certificate_path ~data_dir =
   match Sys.getenv_opt "OCTRA_STATE_SYNC_CERT" with
-  | Some path when String.trim path <> "" -> Ok (String.trim path)
-  | _ -> Error "state sync certificate is not configured"
+  | Some path when String.trim path <> "" -> String.trim path
+  | _ -> Filename.concat data_dir "state_sync/certificate.json"
 
-let configured_exporter_set () =
+let configured_certificate_path ~data_dir =
+  Ok (certificate_path ~data_dir)
+
+let exporter_set () =
   match Sys.getenv_opt "OCTRA_STATE_SYNC_EXPORTERS" with
   | None -> Error "state sync exporters are not configured"
   | Some value ->
@@ -224,26 +231,29 @@ let warn_manifest_unavailable reason =
     Log.warn "state_sync" "event = manifest_unavailable reason = %s" reason
   end
 
-let load_certificate ~chain_id ~config_hash:_ ~validator_set:_ =
-  match configured_certificate_path (), configured_validator_set () with
+let load_certificate ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ =
+  match configured_certificate_path ~data_dir, configured_validator_set () with
   | (Error _ as error), _ | _, (Error _ as error) -> error
-  | Ok path, Ok validator_set ->
+  | Ok path, Ok configured_validators ->
       try
         let stat = Unix.stat path in
         if stat.Unix.st_kind <> Unix.S_REG then Error "state sync certificate is not a file"
         else
-          let validator_hash =
-            Octra_consensus.C_config.validator_set_hash validator_set
+          let configured_hash =
+            Octra_consensus.C_config.validator_set_hash configured_validators
             |> Manifest.raw_to_hex
           in
-          match configured_exporter_set (), configured_config_hash () with
-          | Error _ as error, _ | _, (Error _ as error) -> error
+          match exporter_set (), configured_config_hash () with
+          | Error _ as error, _
+          | _, (Error _ as error) -> error
           | Ok exporter_set, Ok expected_config ->
               let exporter_hash =
                 Octra_consensus.C_config.validator_set_hash exporter_set
                 |> Manifest.raw_to_hex
               in
-              let cache_hash = validator_hash ^ exporter_hash ^ chain_id ^ expected_config in
+              let cache_hash =
+                configured_hash ^ exporter_hash ^ chain_id ^ expected_config
+              in
               let now = Unix.gettimeofday () in
               let cached =
                 match !certificate_cache with
@@ -263,7 +273,7 @@ let load_certificate ~chain_id ~config_hash:_ ~validator_set:_ =
                         | Ok certificate ->
                             begin
                               match Manifest.verify_certificate
-                                ~validator_set
+                                ~validator_set:configured_validators
                                 ~exporter_set
                                 certificate with
                               | Error _ as error -> error
@@ -305,11 +315,11 @@ let respond_certificate cached =
     ~body:cached.raw
     ()
 
-let handle_manifest ~chain_id ~config_hash ~validator_set =
+let handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
-    match load_certificate ~chain_id ~config_hash ~validator_set with
+    match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
     | Error reason ->
         warn_manifest_unavailable reason;
         respond_error
@@ -473,7 +483,7 @@ let handle_chunk ~data_dir ~chain_id ~config_hash ~validator_set query =
         `Bad_request
         "invalid chunk request"
     else
-    match load_certificate ~chain_id ~config_hash ~validator_set with
+    match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
     | Error reason ->
         respond_error
           ~error_type:"state_sync_unavailable"
@@ -582,7 +592,7 @@ let handle
         ~active_accounts:(Ledger.active_count ledger)
         ~head:(Octra_core.Head_manifest.get_cached ()))
   | `GET, "/state-sync/manifest" ->
-      handle_manifest ~chain_id ~config_hash ~validator_set
+      handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set
   | `GET, "/state-sync/head" ->
       handle_head ~current_epoch
   | `POST, "/state-sync/client-progress" ->

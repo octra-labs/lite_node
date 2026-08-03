@@ -4,7 +4,7 @@
  (name octra_core)
  (foreign_stubs
   (language c)
-  (names circle_wasm_native_stubs))
+  (names circle_wasm_native_stubs lmdb_handle_stubs))
  (c_library_flags (:include circle_wasm_native_clib_flags.sexp))
  (libraries
   lwt lwt.unix unix

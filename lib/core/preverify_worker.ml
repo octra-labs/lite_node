@@ -318,7 +318,8 @@ let run
           begin
             match circle with
             | Ok circle -> Lwt.return (circle_receipt tx circle)
-            | Error e -> Lwt.return (Skip e)
+            | Error (`Invalid e) -> Lwt.return (Skip e)
+            | Error (`Unavailable e) -> Lwt.return (Defer e)
           end
         | None, _, _ -> Lwt.return (Skip "circle_preverify_required")
         | _, None, _

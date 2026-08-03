@@ -40,6 +40,7 @@ let path_allowed rel =
   && rel <> "commit_journal.log"
   && (rel = "HEAD.json"
       || rel = "state_root"
+      || rel = "ledger.dat"
       || String.starts_with ~prefix:"irmin_store/" rel
       || String.starts_with ~prefix:"chaindata/" rel
       || String.starts_with ~prefix:"pvac/" rel
@@ -84,6 +85,7 @@ let rec walk_dir ~base ~rel acc =
 let roots = [
   "HEAD.json";
   "state_root";
+  "ledger.dat";
   "irmin_store";
   "chaindata";
   "pvac";
@@ -134,6 +136,9 @@ let valid_snapshot_id id =
 
 let snapshot_dir data_dir id =
   Filename.concat (snapshot_root data_dir) id
+
+let anchor_path data_dir =
+  Filename.concat data_dir "state_sync/anchor.json"
 
 let snapshot_ready_path dir =
   Filename.concat dir ".ready.json"

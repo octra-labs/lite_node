@@ -41,6 +41,7 @@ type 'a launch_tasks = {
 type node_launch_deps = {
   p2p : unit -> unit Lwt.t;
   rpc : unit -> unit Lwt.t;
+  services : (unit -> unit Lwt.t) list;
   observer : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
@@ -50,6 +51,7 @@ type node_launch_deps = {
 type node_launch_runtime = {
   p2p : unit -> unit Lwt.t;
   rpc : unit -> unit Lwt.t;
+  services : (unit -> unit Lwt.t) list;
   observer : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
@@ -82,14 +84,16 @@ let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
     driver_ref;
   }
 
-let make_node_launch_deps ~p2p ~rpc ~observer ~tick_loop ~swarm ~swarm_deps =
-  { p2p; rpc; observer; tick_loop; swarm; swarm_deps }
+let make_node_launch_deps ~p2p ~rpc ~services ~observer ~tick_loop ~swarm
+    ~swarm_deps =
+  { p2p; rpc; services; observer; tick_loop; swarm; swarm_deps }
 
-let make_node_launch_deps_with_swarm ~p2p ~rpc ~observer ~tick_loop ~swarm
-    ~guard ~find_tx ~find_account ~add_tx ~now ~max_drift ~driver_ref =
+let make_node_launch_deps_with_swarm ~p2p ~rpc ~services ~observer ~tick_loop
+    ~swarm ~guard ~find_tx ~find_account ~add_tx ~now ~max_drift ~driver_ref =
   make_node_launch_deps
     ~p2p
     ~rpc
+    ~services
     ~observer
     ~tick_loop
     ~swarm
@@ -138,7 +142,8 @@ let node_launch_tasks (deps : node_launch_deps) =
   let swarm_task = node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps in
   task_plan
     ~base_tasks:
-      (transport_tasks ~p2p:deps.p2p ~rpc:deps.rpc ~swarm:swarm_task)
+      (transport_tasks ~p2p:deps.p2p ~rpc:deps.rpc ~swarm:swarm_task
+       @ List.map (fun service -> service ()) deps.services)
     ~observer:deps.observer
     ~observer_loop
     ~tick_loop:deps.tick_loop
@@ -187,6 +192,7 @@ let run_node_runtime (runtime : node_launch_runtime) =
     (make_node_launch_deps_with_swarm
        ~p2p:runtime.p2p
        ~rpc:runtime.rpc
+       ~services:runtime.services
        ~observer:runtime.observer
        ~tick_loop:runtime.tick_loop
        ~swarm:runtime.swarm

@@ -455,6 +455,9 @@ let result ?(priority = Required) request =
 let result_sync ?(priority = Required) request =
   run_sync ~priority request |> outcome_result
 
+let classified_result_sync ?(priority = Required) request =
+  run_sync ~priority request |> classified_outcome_result
+
 let try_classified_result_sync ?(priority = Speculative) request =
   try_run_sync ~priority request |> classified_outcome_result
 
@@ -581,14 +584,24 @@ let verify_range ~pubkey ~cipher ~proof =
 let verify_zero_sync ~pubkey ~cipher ~proof =
   result_sync (P.Zero { pubkey; cipher; proof })
 
+let verify_zero_sync_classified ~pubkey ~cipher ~proof =
+  classified_result_sync (P.Zero { pubkey; cipher; proof })
+
 let verify_claim_sync ~pubkey ~cipher ~proof ~commitment =
   result_sync (P.Claim { pubkey; cipher; proof; commitment })
+
+let verify_claim_sync_classified ~pubkey ~cipher ~proof ~commitment =
+  classified_result_sync (P.Claim { pubkey; cipher; proof; commitment })
 
 let verify_range_sync ~pubkey ~cipher ~proof =
   result_sync (P.Range { pubkey; cipher; proof })
 
 let verify_range_bound_sync ~pubkey ~cipher ~proof ~commitment =
   result_sync (P.Range_bound { pubkey; cipher; proof; commitment })
+
+let verify_range_bound_sync_classified ~pubkey ~cipher ~proof ~commitment =
+  classified_result_sync
+    (P.Range_bound { pubkey; cipher; proof; commitment })
 
 let try_verify_zero_sync ~pubkey ~cipher ~proof =
   try_result_sync (P.Zero { pubkey; cipher; proof })

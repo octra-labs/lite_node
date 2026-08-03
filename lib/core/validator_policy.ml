@@ -80,11 +80,6 @@ let lifecycle_enabled = function
   | Inactive -> false
   | Bonded _ -> true
 
-let manual_update_allowed policy ~epoch =
-  match policy with
-  | Inactive -> true
-  | Bonded value -> epoch < value.activation_epoch
-
 let snapshot_activation policy ~source_epoch =
   match policy with
   | Inactive -> None

@@ -7,7 +7,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::slice;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmi::{AsContext, AsContextMut, Caller, Config, Engine, Error as WasmiError, Extern, ExternType, Func, Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -86,7 +86,12 @@ const ALLOWED_IMPORTS: &[&str] = &[
     "host_tensor_top1_i8_kv",
 ];
 
-const FLOAT_IMPORTS: &[&str] = &[
+const UPDATE_DISABLED_IMPORTS: &[&str] = &[
+    "host_session_get_len",
+    "host_session_get",
+    "host_session_put",
+    "host_tensor_session_has",
+    "host_tensor_session_reset",
     "host_tensor_load_i8_kv",
     "host_tensor_matmul_fp",
     "host_tensor_rmsnorm_fp",
@@ -124,6 +129,7 @@ struct Payload {
     hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
     public_reads: Option<Vec<PublicReadJson>>,
     is_view: Option<bool>,
+    update_policy: Option<bool>,
     fuel_limit: Option<u64>,
 }
 
@@ -245,6 +251,7 @@ struct HostState {
     encrypted_assets: Vec<EncryptedAssetPutJson>,
     circle_invoke_cache: Option<(Vec<u8>, Vec<u8>)>,
     hfhe_invoke_cache: Option<(Vec<u8>, Vec<u8>)>,
+    unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,7 +274,7 @@ struct TensorSessionEntry {
 struct ModuleCacheEntry {
     module: Arc<Module>,
     exports: Vec<ExportInfoJson>,
-    has_float_imports: bool,
+    has_update_disabled_imports: bool,
     updated_at: f64,
 }
 
@@ -282,6 +289,18 @@ fn storage_cache() -> &'static Mutex<HashMap<String, StorageCacheEntry>> {
     static STORAGE_CACHE: OnceLock<Mutex<HashMap<String, StorageCacheEntry>>> =
         OnceLock::new();
     STORAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_guard<T: Default>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = T::default();
+            cache.clear_poison();
+            guard
+        }
+    }
 }
 
 fn session_cache() -> &'static Mutex<HashMap<String, SessionCacheEntry>> {
@@ -323,13 +342,34 @@ struct Runtime {
     instance: Instance,
     exports: Vec<ExportInfoJson>,
     fuel_limit: u64,
-    has_float_imports: bool,
+    has_update_disabled_imports: bool,
+    update_policy: bool,
 }
 
 #[derive(Debug)]
 struct RequestFrame {
     method: String,
     params: Vec<FrameValue>,
+}
+
+#[derive(Debug)]
+enum HostFailure {
+    Rejected(String),
+    Unavailable(String),
+}
+
+fn rejected<T>(result: Result<T, String>) -> Result<T, HostFailure> {
+    result.map_err(HostFailure::Rejected)
+}
+
+fn host_failure(caller: &mut Caller<'_, HostState>, failure: HostFailure) -> WasmiError {
+    match failure {
+        HostFailure::Rejected(reason) => WasmiError::new(reason),
+        HostFailure::Unavailable(reason) => {
+            caller.data_mut().unavailable = Some(reason);
+            WasmiError::new("host unavailable")
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -394,7 +434,7 @@ pub extern "C" fn octra_circle_wasm_host_run_json(
             if !out_len.is_null() {
                 *out_len = 0;
             }
-            1
+            2
         },
     }
 }
@@ -475,18 +515,13 @@ fn run_execute(payload: &Payload) -> Result<JsonValue, String> {
     finish_execute(&mut runtime, export_name, &request_bytes)
 }
 
-fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]) -> Result<JsonValue, String> {
-    if !runtime.store.data().is_view && runtime.has_float_imports {
-        return Err("wasm_v1 float host imports are disabled for updates".to_owned());
-    }
-    let (code, response_bytes, effort_used) =
-        runtime.call_export(export_name, request_bytes)?;
-    if runtime.store.data().hfhe_receipt_mode == "consume"
-        && runtime.store.data().hfhe_receipt_index
-            != runtime.store.data().hfhe_receipt_expected.len()
-    {
-        return Err("hfhe receipt was not fully consumed".to_owned());
-    }
+fn execute_output(
+    runtime: &Runtime,
+    success: bool,
+    response_bytes: &[u8],
+    effort_used: u64,
+    error: Option<String>,
+) -> JsonValue {
     let state = runtime.store.data();
     let storage_pairs =
         if state.is_view {
@@ -505,10 +540,10 @@ fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]
                     .collect(),
             )
         };
-    Ok(json!({
-        "success": code == 0,
+    json!({
+        "success": success,
         "status_code": state.response_status,
-        "response_b64": if response_bytes.is_empty() { JsonValue::Null } else { JsonValue::String(encode_b64(&response_bytes)) },
+        "response_b64": if response_bytes.is_empty() { JsonValue::Null } else { JsonValue::String(encode_b64(response_bytes)) },
         "storage_pairs": storage_pairs,
         "events": state.events,
         "spawns": state.spawns,
@@ -516,8 +551,56 @@ fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]
         "encrypted_assets": state.encrypted_assets,
         "hfhe_receipt_entries": state.hfhe_receipt_entries,
         "effort_used": effort_used,
-        "error": if code == 0 { JsonValue::Null } else { JsonValue::String(format!("wasm export returned {}", code)) },
-    }))
+        "error": error,
+        "unavailable": state.unavailable,
+    })
+}
+
+fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]) -> Result<JsonValue, String> {
+    if runtime.update_policy
+        && !runtime.store.data().is_view
+        && runtime.has_update_disabled_imports
+    {
+        return Err("wasm_v1 nonpersistent host imports are disabled for updates".to_owned());
+    }
+    let (success, response_bytes, effort_used, error) =
+        match runtime.call_export(export_name, request_bytes) {
+            Ok((code, response_bytes, effort_used)) => (
+                code == 0,
+                response_bytes,
+                effort_used,
+                if code == 0 {
+                    None
+                } else {
+                    Some(format!("wasm export returned {code}"))
+                },
+            ),
+            Err(error) => {
+                let remaining = runtime
+                    .store
+                    .get_fuel()
+                    .map_err(|e| format!("wasm fuel read failed: {e}"))?;
+                (
+                    false,
+                    Vec::new(),
+                    runtime.fuel_limit.saturating_sub(remaining),
+                    Some(error),
+                )
+            }
+        };
+    if runtime.store.data().hfhe_receipt_mode == "consume"
+        && runtime.store.data().hfhe_receipt_index
+            != runtime.store.data().hfhe_receipt_expected.len()
+    {
+        return Err("hfhe receipt was not fully consumed".to_owned());
+    }
+    Ok(execute_output(
+        runtime,
+        success,
+        &response_bytes,
+        effort_used,
+        error,
+    ))
 }
 
 impl Runtime {
@@ -532,17 +615,15 @@ impl Runtime {
                 format!("{:x}", hasher.finalize())
             }
         };
-        let (module, exports, has_float_imports) = {
-            let mut guard = module_cache()
-                .lock()
-                .map_err(|_| "module cache poisoned".to_owned())?;
+        let (module, exports, has_update_disabled_imports) = {
+            let mut guard = cache_guard(module_cache());
             prune_module_cache_locked(&mut guard);
             if let Some(entry) = guard.get_mut(&module_key) {
                 entry.updated_at = now_secs();
                 (
                     entry.module.clone(),
                     entry.exports.clone(),
-                    entry.has_float_imports,
+                    entry.has_update_disabled_imports,
                 )
             } else {
                 let code_b64 =
@@ -555,19 +636,19 @@ impl Runtime {
                 validate_imports(&module)?;
                 let exports = collect_exports(&module);
                 validate_exports(&exports)?;
-                let has_float_imports = module
+                let has_update_disabled_imports = module
                     .imports()
-                    .any(|entry| FLOAT_IMPORTS.contains(&entry.name()));
+                    .any(|entry| UPDATE_DISABLED_IMPORTS.contains(&entry.name()));
                 guard.insert(
                     module_key,
                     ModuleCacheEntry {
                         module: module.clone(),
                         exports: exports.clone(),
-                        has_float_imports,
+                        has_update_disabled_imports,
                         updated_at: now_secs(),
                     },
                 );
-                (module, exports, has_float_imports)
+                (module, exports, has_update_disabled_imports)
             }
         };
 
@@ -611,7 +692,8 @@ impl Runtime {
             instance,
             exports,
             fuel_limit,
-            has_float_imports,
+            has_update_disabled_imports,
+            update_policy: payload.update_policy.unwrap_or(false),
         })
     }
 
@@ -762,6 +844,7 @@ impl HostState {
             encrypted_assets: Vec::new(),
             circle_invoke_cache: None,
             hfhe_invoke_cache: None,
+            unavailable: None,
         })
     }
 }
@@ -836,9 +919,7 @@ fn build_storage_from_payload(payload: &Payload) -> Result<Arc<BTreeMap<String, 
 
     if pairs_opt.is_none() {
         if let Some(key) = cache_key {
-            let mut guard = storage_cache()
-                .lock()
-                .map_err(|_| "storage cache poisoned".to_owned())?;
+            let mut guard = cache_guard(storage_cache());
             prune_storage_cache_locked(&mut guard);
             if let Some(entry) = guard.get_mut(&key) {
                 entry.updated_at = now_secs();
@@ -858,9 +939,7 @@ fn build_storage_from_payload(payload: &Payload) -> Result<Arc<BTreeMap<String, 
     }
 
     if let Some(key) = cache_key {
-        let mut guard = storage_cache()
-            .lock()
-            .map_err(|_| "storage cache poisoned".to_owned())?;
+        let mut guard = cache_guard(storage_cache());
         let shared = Arc::new(storage);
         let weight = storage_weight(&shared);
         prepare_storage_cache_insert(&mut guard, &key, weight);
@@ -1073,8 +1152,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                 |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32| -> Result<i32, WasmiError> {
                     let request_bytes = read_guest_bytes(&mut caller, req_ptr, req_len)?;
                     charge_host_fuel(&mut caller, HFHE_INVOKE_FUEL)?;
-                    let response_bytes = execute_hfhe_invoke(&mut caller, &request_bytes)
-                        .map_err(WasmiError::new)?;
+                    let response_bytes = match execute_hfhe_invoke(&mut caller, &request_bytes) {
+                        Ok(response) => response,
+                        Err(failure) => return Err(host_failure(&mut caller, failure)),
+                    };
                     let len = response_bytes.len() as i32;
                     caller.data_mut().hfhe_invoke_cache = Some((request_bytes, response_bytes));
                     Ok(len)
@@ -1100,8 +1181,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                         Some((cached_req, cached_res)) if cached_req == request_bytes => cached_res,
                         _ => {
                             charge_host_fuel(&mut caller, HFHE_INVOKE_FUEL)?;
-                            execute_hfhe_invoke(&mut caller, &request_bytes)
-                                .map_err(WasmiError::new)?
+                            match execute_hfhe_invoke(&mut caller, &request_bytes) {
+                                Ok(response) => response,
+                                Err(failure) => return Err(host_failure(&mut caller, failure)),
+                            }
                         }
                     };
                     if out_cap < 0 || (out_cap as usize) < response_bytes.len() {
@@ -1206,9 +1289,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                 |mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> Result<i32, WasmiError> {
                     let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
                     let cache_key = session_namespaced_key(caller.data(), &raw_key);
-                    let mut guard = session_cache()
-                        .lock()
-                        .map_err(|_| WasmiError::new("session cache poisoned"))?;
+                    let mut guard = cache_guard(session_cache());
                     prune_session_cache_locked(&mut guard);
                     Ok(guard
                         .get(&cache_key)
@@ -1232,9 +1313,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                  -> Result<i32, WasmiError> {
                     let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
                     let cache_key = session_namespaced_key(caller.data(), &raw_key);
-                    let mut guard = session_cache()
-                        .lock()
-                        .map_err(|_| WasmiError::new("session cache poisoned"))?;
+                    let mut guard = cache_guard(session_cache());
                     prune_session_cache_locked(&mut guard);
                     let value = match guard.get(&cache_key) {
                         Some(entry) => entry.value.clone(),
@@ -1263,9 +1342,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                     let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
                     let cache_key = session_namespaced_key(caller.data(), &raw_key);
                     let value = read_guest_bytes(&mut caller, value_ptr, value_len)?;
-                    let mut guard = session_cache()
-                        .lock()
-                        .map_err(|_| WasmiError::new("session cache poisoned"))?;
+                    let mut guard = cache_guard(session_cache());
                     prune_session_cache_locked(&mut guard);
                     guard.insert(
                         cache_key,
@@ -1297,9 +1374,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                     }
                     let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
                     let cache_key = tensor_session_namespaced_key(caller.data(), &raw_key);
-                    let mut guard = tensor_session_cache()
-                        .lock()
-                        .map_err(|_| WasmiError::new("tensor session cache poisoned"))?;
+                    let mut guard = cache_guard(tensor_session_cache());
                     prune_tensor_session_cache_locked(&mut guard);
                     match guard.get(&cache_key) {
                         Some(entry)
@@ -1348,9 +1423,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                         .filter(|value| *value <= MAX_TENSOR_SESSION_BYTES)
                         .ok_or_else(|| WasmiError::new("tensor session exceeds cap"))?;
                     charge_host_work(&mut caller, total_bytes)?;
-                    let mut guard = tensor_session_cache()
-                        .lock()
-                        .map_err(|_| WasmiError::new("tensor session cache poisoned"))?;
+                    let mut guard = cache_guard(tensor_session_cache());
                     prune_tensor_session_cache_locked(&mut guard);
                     guard.insert(
                         cache_key,
@@ -2355,9 +2428,7 @@ fn host_tensor_session_append_kv_fp(
     charge_host_work(caller, (n as usize).saturating_mul(2))?;
     let k_src = read_guest_f64_vec(caller, k_ptr, n as usize)?;
     let v_src = read_guest_f64_vec(caller, v_ptr, n as usize)?;
-    let mut guard = tensor_session_cache()
-        .lock()
-        .map_err(|_| WasmiError::new("tensor session cache poisoned"))?;
+    let mut guard = cache_guard(tensor_session_cache());
     prune_tensor_session_cache_locked(&mut guard);
     let entry = match guard.get_mut(&cache_key) {
         Some(entry) => entry,
@@ -2412,9 +2483,7 @@ fn host_tensor_session_attention_kv_fp(
     let q = read_guest_f64_vec(caller, q_ptr, n_q_heads * head_dim)?;
     let kv_dim = n_kv_heads * head_dim;
     let ctx = {
-        let mut guard = tensor_session_cache()
-            .lock()
-            .map_err(|_| WasmiError::new("tensor session cache poisoned"))?;
+        let mut guard = cache_guard(tensor_session_cache());
         prune_tensor_session_cache_locked(&mut guard);
         let entry = match guard.get_mut(&cache_key) {
             Some(entry) => entry,
@@ -3722,18 +3791,25 @@ fn match_hfhe_receipt_request(
 fn execute_hfhe_invoke(
     caller: &mut Caller<'_, HostState>,
     req_bytes: &[u8],
-) -> Result<Vec<u8>, String> {
-    let request = parse_request_frame(req_bytes)?;
-    let capability = hfhe_capability_name(&request.method)
-        .ok_or_else(|| format!("unsupported hfhe host method: {}", request.method))?;
+) -> Result<Vec<u8>, HostFailure> {
+    let request = rejected(parse_request_frame(req_bytes))?;
+    let capability = rejected(
+        hfhe_capability_name(&request.method)
+            .ok_or_else(|| format!("unsupported hfhe host method: {}", request.method)),
+    )?;
     if !caller.data().hfhe_caps.contains(capability) {
-        return Err(format!("hfhe capability denied: {}", request.method));
+        return Err(HostFailure::Rejected(format!(
+            "hfhe capability denied: {}",
+            request.method
+        )));
     }
     let method = request.method.clone();
     let mode = caller.data().hfhe_receipt_mode.clone();
     let is_verify = is_hfhe_verify_method(&method);
     if mode == "capture" && caller.data().hfhe_receipt_entries.len() >= MAX_HFHE_RECEIPT_ENTRIES {
-        return Err("hfhe receipt entry limit exceeded".to_owned());
+        return Err(HostFailure::Rejected(
+            "hfhe receipt entry limit exceeded".to_owned(),
+        ));
     }
     if mode == "capture"
         && is_verify
@@ -3745,34 +3821,42 @@ fn execute_hfhe_invoke(
             .count()
             >= MAX_HFHE_VERIFIER_ENTRIES
     {
-        return Err("hfhe verifier entry limit exceeded".to_owned());
+        return Err(HostFailure::Rejected(
+            "hfhe verifier entry limit exceeded".to_owned(),
+        ));
     }
     if mode == "consume" {
-        let expected = expected_hfhe_receipt_entry(caller)?;
+        let expected = rejected(expected_hfhe_receipt_entry(caller))?;
         let request_hash = hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", req_bytes);
-        match_hfhe_receipt_request(&expected, &method, &request_hash)?;
+        rejected(match_hfhe_receipt_request(&expected, &method, &request_hash))?;
         if is_verify {
-            let result = expected
-                .result
-                .ok_or_else(|| "hfhe verifier result missing".to_owned())?;
+            let result = rejected(
+                expected
+                    .result
+                    .ok_or_else(|| "hfhe verifier result missing".to_owned()),
+            )?;
             let response = frame_bool(result);
-            let entry = hfhe_receipt_entry(&method, req_bytes, &response)?;
-            consume_hfhe_receipt_entry(caller, entry)?;
+            let entry = rejected(hfhe_receipt_entry(&method, req_bytes, &response))?;
+            rejected(consume_hfhe_receipt_entry(caller, entry))?;
             return Ok(response);
         }
     } else if !caller.data().is_view && is_verify && mode != "capture" {
-        return Err(format!(
+        return Err(HostFailure::Rejected(format!(
             "hfhe proof verification requires a preverified receipt: {}",
             method
-        ));
+        )));
     }
     let response = execute_hfhe_direct(caller, req_bytes)?;
-    let entry = hfhe_receipt_entry(&method, req_bytes, &response)?;
+    let entry = rejected(hfhe_receipt_entry(&method, req_bytes, &response))?;
     match mode.as_str() {
         "capture" => caller.data_mut().hfhe_receipt_entries.push(entry),
-        "consume" => consume_hfhe_receipt_entry(caller, entry)?,
+        "consume" => rejected(consume_hfhe_receipt_entry(caller, entry))?,
         "direct" => (),
-        _ => return Err("invalid hfhe receipt mode".to_owned()),
+        _ => {
+            return Err(HostFailure::Rejected(
+                "invalid hfhe receipt mode".to_owned(),
+            ))
+        }
     }
     Ok(response)
 }
@@ -3780,33 +3864,42 @@ fn execute_hfhe_invoke(
 fn execute_hfhe_direct(
     caller: &mut Caller<'_, HostState>,
     req_bytes: &[u8],
-) -> Result<Vec<u8>, String> {
-    let request = parse_request_frame(req_bytes)?;
-    let capability = hfhe_capability_name(&request.method)
-        .ok_or_else(|| format!("unsupported hfhe host method: {}", request.method))?;
+) -> Result<Vec<u8>, HostFailure> {
+    let request = rejected(parse_request_frame(req_bytes))?;
+    let capability = rejected(
+        hfhe_capability_name(&request.method)
+            .ok_or_else(|| format!("unsupported hfhe host method: {}", request.method)),
+    )?;
     if !caller.data().hfhe_caps.contains(capability) {
-        return Err(format!("hfhe capability denied: {}", request.method));
+        return Err(HostFailure::Rejected(format!(
+            "hfhe capability denied: {}",
+            request.method
+        )));
     }
     let params = request.params;
     match request.method.as_str() {
         "fhe_load_pk" => {
-            let requested_addr = parse_string_param(&params, 0, "requested_addr")?;
-            let pubkey = caller
-                .data()
-                .hfhe_pubkeys
-                .get(&requested_addr)
-                .cloned()
-                .ok_or_else(|| format!("hfhe pubkey unavailable: {requested_addr}"))?;
+            let requested_addr = rejected(parse_string_param(&params, 0, "requested_addr"))?;
+            let pubkey = rejected(
+                caller
+                    .data()
+                    .hfhe_pubkeys
+                    .get(&requested_addr)
+                    .cloned()
+                    .ok_or_else(|| format!("hfhe pubkey unavailable: {requested_addr}")),
+            )?;
             Ok(frame_string(pubkey))
         }
         "fhe_encrypt" => {
-            let active = caller
-                .data()
-                .hfhe_active_key
-                .clone()
-                .ok_or_else(|| "hfhe active key unavailable".to_owned())?;
-            let amount = parse_int_param(&params, 0, "amount")?;
-            let seed_b64 = parse_string_param(&params, 1, "seed_b64")?;
+            let active = rejected(
+                caller
+                    .data()
+                    .hfhe_active_key
+                    .clone()
+                    .ok_or_else(|| "hfhe active key unavailable".to_owned()),
+            )?;
+            let amount = rejected(parse_int_param(&params, 0, "amount"))?;
+            let seed_b64 = rejected(parse_string_param(&params, 1, "seed_b64"))?;
             let value = call_hfhe_backend(json!({
                 "action": "encrypt_value_seeded",
                 "pubkey_b64": active.pubkey_b64,
@@ -3817,12 +3910,14 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_encrypt_zero" => {
-            let active = caller
-                .data()
-                .hfhe_active_key
-                .clone()
-                .ok_or_else(|| "hfhe active key unavailable".to_owned())?;
-            let seed_b64 = parse_string_param(&params, 0, "seed_b64")?;
+            let active = rejected(
+                caller
+                    .data()
+                    .hfhe_active_key
+                    .clone()
+                    .ok_or_else(|| "hfhe active key unavailable".to_owned()),
+            )?;
+            let seed_b64 = rejected(parse_string_param(&params, 0, "seed_b64"))?;
             let value = call_hfhe_backend(json!({
                 "action": "encrypt_zero_seeded",
                 "pubkey_b64": active.pubkey_b64,
@@ -3832,12 +3927,14 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_decrypt" => {
-            let active = caller
-                .data()
-                .hfhe_active_key
-                .clone()
-                .ok_or_else(|| "hfhe active key unavailable".to_owned())?;
-            let ciphertext = parse_string_param(&params, 0, "ciphertext")?;
+            let active = rejected(
+                caller
+                    .data()
+                    .hfhe_active_key
+                    .clone()
+                    .ok_or_else(|| "hfhe active key unavailable".to_owned()),
+            )?;
+            let ciphertext = rejected(parse_string_param(&params, 0, "ciphertext"))?;
             let value = call_hfhe_backend(json!({
                 "action": "decrypt_value",
                 "pubkey_b64": active.pubkey_b64,
@@ -3847,9 +3944,9 @@ fn execute_hfhe_direct(
             Ok(frame_int(expect_backend_string(value)?))
         }
         "fhe_add" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let lhs_ciphertext = parse_string_param(&params, 1, "lhs_ciphertext")?;
-            let rhs_ciphertext = parse_string_param(&params, 2, "rhs_ciphertext")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let lhs_ciphertext = rejected(parse_string_param(&params, 1, "lhs_ciphertext"))?;
+            let rhs_ciphertext = rejected(parse_string_param(&params, 2, "rhs_ciphertext"))?;
             let value = call_hfhe_backend(json!({
                 "action": "cipher_add",
                 "pubkey_b64": pubkey_b64,
@@ -3859,9 +3956,9 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_sub" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let lhs_ciphertext = parse_string_param(&params, 1, "lhs_ciphertext")?;
-            let rhs_ciphertext = parse_string_param(&params, 2, "rhs_ciphertext")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let lhs_ciphertext = rejected(parse_string_param(&params, 1, "lhs_ciphertext"))?;
+            let rhs_ciphertext = rejected(parse_string_param(&params, 2, "rhs_ciphertext"))?;
             let value = call_hfhe_backend(json!({
                 "action": "cipher_sub",
                 "pubkey_b64": pubkey_b64,
@@ -3871,9 +3968,9 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_scale" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let factor = parse_int_param(&params, 2, "factor")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let factor = rejected(parse_int_param(&params, 2, "factor"))?;
             let value = call_hfhe_backend(json!({
                 "action": "cipher_scale",
                 "pubkey_b64": pubkey_b64,
@@ -3883,9 +3980,9 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_add_const" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let amount = parse_int_param(&params, 2, "amount")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let amount = rejected(parse_int_param(&params, 2, "amount"))?;
             let value = call_hfhe_backend(json!({
                 "action": "cipher_add_const",
                 "pubkey_b64": pubkey_b64,
@@ -3895,9 +3992,9 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_sub_const" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let amount = parse_int_param(&params, 2, "amount")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let amount = rejected(parse_int_param(&params, 2, "amount"))?;
             let value = call_hfhe_backend(json!({
                 "action": "cipher_sub_const",
                 "pubkey_b64": pubkey_b64,
@@ -3907,8 +4004,8 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_pedersen" => {
-            let amount = parse_int_param(&params, 0, "amount")?;
-            let blinding_b64 = parse_string_param(&params, 1, "blinding_b64")?;
+            let amount = rejected(parse_int_param(&params, 0, "amount"))?;
+            let blinding_b64 = rejected(parse_string_param(&params, 1, "blinding_b64"))?;
             let value = call_hfhe_backend(json!({
                 "action": "pedersen_commit",
                 "amount": amount,
@@ -3917,8 +4014,8 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_commit" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
             let value = call_hfhe_backend(json!({
                 "action": "commit_cipher",
                 "pubkey_b64": pubkey_b64,
@@ -3927,9 +4024,9 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_bound_commitment" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let amount = parse_int_param(&params, 2, "amount")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let amount = rejected(parse_int_param(&params, 2, "amount"))?;
             let value = call_hfhe_backend(json!({
                 "action": "bound_commitment",
                 "pubkey_b64": pubkey_b64,
@@ -3939,9 +4036,9 @@ fn execute_hfhe_direct(
             Ok(frame_string(expect_backend_string(value)?))
         }
         "fhe_verify_zero" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let proof = parse_string_param(&params, 2, "proof")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let proof = rejected(parse_string_param(&params, 2, "proof"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_zero",
                 "pubkey_b64": pubkey_b64,
@@ -3951,10 +4048,11 @@ fn execute_hfhe_direct(
             Ok(frame_bool(expect_backend_bool(value)?))
         }
         "fhe_verify_range" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let proof = parse_string_param(&params, 2, "proof")?;
-            let amount_commitment = parse_string_param(&params, 3, "amount_commitment")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let proof = rejected(parse_string_param(&params, 2, "proof"))?;
+            let amount_commitment =
+                rejected(parse_string_param(&params, 3, "amount_commitment"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_range",
                 "pubkey_b64": pubkey_b64,
@@ -3965,10 +4063,11 @@ fn execute_hfhe_direct(
             Ok(frame_bool(expect_backend_bool(value)?))
         }
         "fhe_verify_bound" => {
-            let pubkey_b64 = parse_string_param(&params, 0, "pubkey_b64")?;
-            let ciphertext = parse_string_param(&params, 1, "ciphertext")?;
-            let proof = parse_string_param(&params, 2, "proof")?;
-            let amount_commitment = parse_string_param(&params, 3, "amount_commitment")?;
+            let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
+            let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
+            let proof = rejected(parse_string_param(&params, 2, "proof"))?;
+            let amount_commitment =
+                rejected(parse_string_param(&params, 3, "amount_commitment"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_bound",
                 "pubkey_b64": pubkey_b64,
@@ -3978,13 +4077,16 @@ fn execute_hfhe_direct(
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
-        _ => Err(format!("unsupported hfhe host method: {}", request.method)),
+        _ => Err(HostFailure::Rejected(format!(
+            "unsupported hfhe host method: {}",
+            request.method
+        ))),
     }
 }
 
-fn call_hfhe_backend(payload: JsonValue) -> Result<JsonValue, String> {
+fn call_hfhe_backend(payload: JsonValue) -> Result<JsonValue, HostFailure> {
     let input = serde_json::to_string(&payload)
-        .map_err(|e| format!("hfhe payload encode failed: {e}"))?;
+        .map_err(|e| HostFailure::Unavailable(format!("hfhe payload encode failed: {e}")))?;
     let mut out_ptr: *mut u8 = std::ptr::null_mut();
     let mut out_len: usize = 0;
     let mut err_ptr: *mut u8 = std::ptr::null_mut();
@@ -4001,24 +4103,29 @@ fn call_hfhe_backend(payload: JsonValue) -> Result<JsonValue, String> {
     };
     if rc != 0 {
         let message = unsafe { copy_and_free_malloc_string(err_ptr, err_len) };
-        return Err(if message.is_empty() {
+        return Err(HostFailure::Unavailable(if message.is_empty() {
             "hfhe backend failed".to_owned()
         } else {
             message
-        });
+        }));
     }
     let output = unsafe { copy_and_free_malloc_string(out_ptr, out_len) };
     let response: JsonValue = serde_json::from_str(&output)
-        .map_err(|e| format!("hfhe backend returned invalid json: {e}"))?;
+        .map_err(|e| HostFailure::Unavailable(format!("hfhe backend returned invalid json: {e}")))?;
     match response.get("ok").and_then(|value| value.as_bool()) {
         Some(true) => Ok(response.get("value").cloned().unwrap_or(JsonValue::Null)),
-        _ => Err(
-            response
+        _ => {
+            let reason = response
                 .get("error")
                 .and_then(|value| value.as_str())
                 .unwrap_or("hfhe backend failed")
-                .to_owned(),
-        ),
+                .to_owned();
+            if response.get("class").and_then(|value| value.as_str()) == Some("unavailable") {
+                Err(HostFailure::Unavailable(reason))
+            } else {
+                Err(HostFailure::Rejected(reason))
+            }
+        }
     }
 }
 
@@ -4034,18 +4141,22 @@ unsafe fn copy_and_free_malloc_string(ptr: *mut u8, len: usize) -> String {
     String::from_utf8(bytes).unwrap_or_else(|_| "hfhe backend failed".to_owned())
 }
 
-fn expect_backend_string(value: JsonValue) -> Result<String, String> {
+fn expect_backend_string(value: JsonValue) -> Result<String, HostFailure> {
     match value {
         JsonValue::String(value) => Ok(value),
         JsonValue::Number(value) => Ok(value.to_string()),
-        _ => Err("hfhe backend returned non-string value".to_owned()),
+        _ => Err(HostFailure::Unavailable(
+            "hfhe backend returned non-string value".to_owned(),
+        )),
     }
 }
 
-fn expect_backend_bool(value: JsonValue) -> Result<bool, String> {
+fn expect_backend_bool(value: JsonValue) -> Result<bool, HostFailure> {
     value
         .as_bool()
-        .ok_or_else(|| "hfhe backend returned non-bool value".to_owned())
+        .ok_or_else(|| {
+            HostFailure::Unavailable("hfhe backend returned non-bool value".to_owned())
+        })
 }
 
 fn state_path_key(raw_state_ref: &str) -> String {

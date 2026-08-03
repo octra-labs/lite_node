@@ -3,6 +3,8 @@
 
 let lang_version = "1.0 Rehovot"
 
+module String_set = Set.Make (String)
+
 type compile_result = {
   bytecode : string;
   abi_json : string;
@@ -38,7 +40,7 @@ let verification_json ast =
 let sha256_hex value =
   Digestif.SHA256.(digest_string value |> to_hex)
 
-let canonical_sources sources =
+let ordered_sources sources =
   sources
   |> List.sort (fun (left, _) (right, _) -> String.compare left right)
   |> List.map (fun (path, source) -> `Assoc ["path", `String path; "source_hash", `String (sha256_hex source)])
@@ -326,9 +328,7 @@ let abi_json declaration abi =
   in
   Printf.sprintf "{\"declaration\":%S,\"functions\":[%s],\"events\":[%s]}" declaration fns events
 
-let compile_ast ~source_mode ~source_material ast =
-  require_ast_shape ast;
-  ignore (interface_index ast);
+let compile_ast_ready ~source_mode ~source_material ast =
   let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
   if program
@@ -362,6 +362,28 @@ let compile_ast ~source_mode ~source_material ast =
         program_facts = Some program_facts;
       }
 
+let compile_ast ~source_mode ~source_material ast =
+  require_ast_shape ast;
+  ignore (interface_index ast);
+  compile_ast_ready ~source_mode ~source_material ast
+
+let first_interfaces interfaces =
+  interfaces
+  |> List.fold_left
+       (fun (seen, selected) iface ->
+         let name = iface.Oct_lang.if_name in
+         if String_set.mem name seen then seen, selected
+         else String_set.add name seen, iface :: selected)
+       (String_set.empty, [])
+  |> snd
+  |> List.rev
+
+let compile_ast_first ~source_mode ~source_material ast =
+  compile_ast_ready
+    ~source_mode
+    ~source_material
+    { ast with Oct_lang.interfaces = first_interfaces ast.Oct_lang.interfaces }
+
 let load_required load path =
   match load path with
   | Some source -> source
@@ -370,7 +392,7 @@ let load_required load path =
 let imported_interfaces load_import ast =
   let bindings = Hashtbl.create (List.length ast.Oct_lang.imports) in
   let add_import acc (imp : Oct_lang.import_decl) name =
-    let interfaces = load_import imp in
+    let interfaces = interface_index (load_import imp) in
     match Hashtbl.find_opt interfaces name with
     | None ->
       raise
@@ -402,6 +424,29 @@ let imported_interfaces load_import ast =
     ast.Oct_lang.imports
   |> List.rev
 
+let imported_interfaces_first load_import ast =
+  let select (seen, selected) (imp : Oct_lang.import_decl) =
+    let requested =
+      List.fold_left
+        (fun names name -> String_set.add name names)
+        String_set.empty
+        imp.Oct_lang.imp_names
+    in
+    (load_import imp).Oct_lang.interfaces
+    |> List.fold_left
+         (fun (seen, selected) iface ->
+           let name = iface.Oct_lang.if_name in
+           if not (String_set.mem name requested) || String_set.mem name seen then
+             seen, selected
+           else
+             String_set.add name seen, iface :: selected)
+         (seen, selected)
+  in
+  ast.Oct_lang.imports
+  |> List.fold_left select (String_set.empty, [])
+  |> snd
+  |> List.rev
+
 let merge_interfaces ast interfaces =
   { ast with Oct_lang.interfaces = interfaces @ ast.Oct_lang.interfaces }
 
@@ -425,11 +470,17 @@ let compile source =
     error_result (Printf.sprintf "line %d: %s" line msg)
   | error -> compile_exception error
 
-let compile_multi_mode ~program_only (resolver : string -> string option) main_path =
+let compile_multi_with
+    ~program_only
+    ~check_ast
+    ~select_interfaces
+    ~compile_ast
+    (resolver : string -> string option)
+    main_path =
   try
     let loaded_sources = ref [] in
     let source_cache = Hashtbl.create 16 in
-    let interface_cache = Hashtbl.create 16 in
+    let ast_cache = Hashtbl.create 16 in
     let load path =
       match Hashtbl.find_opt source_cache path with
       | Some source -> Some source
@@ -443,8 +494,8 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
     in
     let load_import imp =
       let path = imp.Oct_lang.imp_path in
-      match Hashtbl.find_opt interface_cache path with
-      | Some interfaces -> interfaces
+      match Hashtbl.find_opt ast_cache path with
+      | Some ast -> ast
       | None ->
         let source =
           match load path with
@@ -452,20 +503,18 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
           | None -> failwith (Printf.sprintf "import not found: %s" path)
         in
         let ast = Oct_parse.parse source in
-        require_ast_shape ast;
-        let interfaces = interface_index ast in
-        Hashtbl.add interface_cache path interfaces;
-        interfaces
+        check_ast ast;
+        Hashtbl.add ast_cache path ast;
+        ast
     in
     let main_source = load_required load main_path in
     let ast = Oct_parse.parse main_source in
-    require_ast_shape ast;
-    ignore (interface_index ast);
+    check_ast ast;
     if program_only && ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
       error_result "Program declaration required"
     else
-      let interfaces = imported_interfaces load_import ast in
-      let source_material = canonical_sources !loaded_sources in
+      let interfaces = select_interfaces load_import ast in
+      let source_material = ordered_sources !loaded_sources in
       let merged_ast = merge_interfaces ast interfaces in
       compile_ast ~source_mode:"multi" ~source_material merged_ast
   with
@@ -476,6 +525,28 @@ let compile_multi_mode ~program_only (resolver : string -> string option) main_p
   | Oct_gen.GenError (msg, line) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
   | error -> compile_exception error
+
+let check_ast ast =
+  require_ast_shape ast;
+  ignore (interface_index ast)
+
+let compile_multi_mode ~program_only resolver main_path =
+  compile_multi_with
+    ~program_only
+    ~check_ast
+    ~select_interfaces:imported_interfaces
+    ~compile_ast
+    resolver
+    main_path
+
+let compile_multi_first_mode ~program_only resolver main_path =
+  compile_multi_with
+    ~program_only
+    ~check_ast:(fun _ -> ())
+    ~select_interfaces:imported_interfaces_first
+    ~compile_ast:compile_ast_first
+    resolver
+    main_path
 
 let compile_multi resolver main_path =
   compile_multi_mode ~program_only:false resolver main_path
@@ -607,3 +678,6 @@ let admit_program_source source raw =
 
 let compile_program_multi resolver main_path =
   emit_program (compile_multi_mode ~program_only:true resolver main_path)
+
+let compile_program_multi_first resolver main_path =
+  emit_program (compile_multi_first_mode ~program_only:true resolver main_path)

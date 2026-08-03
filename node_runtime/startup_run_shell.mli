@@ -46,6 +46,7 @@ type 'a launch_tasks = {
 type node_launch_deps = {
   p2p : unit -> unit Lwt.t;
   rpc : unit -> unit Lwt.t;
+  services : (unit -> unit Lwt.t) list;
   observer : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
@@ -55,6 +56,7 @@ type node_launch_deps = {
 type node_launch_runtime = {
   p2p : unit -> unit Lwt.t;
   rpc : unit -> unit Lwt.t;
+  services : (unit -> unit Lwt.t) list;
   observer : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
@@ -88,6 +90,7 @@ val make_node_swarm_deps :
 val make_node_launch_deps :
   p2p:(unit -> unit Lwt.t) ->
   rpc:(unit -> unit Lwt.t) ->
+  services:(unit -> unit Lwt.t) list ->
   observer:bool ->
   tick_loop:(unit -> unit Lwt.t) ->
   swarm:Octra_net.P2p_swarm.t option ->
@@ -97,6 +100,7 @@ val make_node_launch_deps :
 val make_node_launch_deps_with_swarm :
   p2p:(unit -> unit Lwt.t) ->
   rpc:(unit -> unit Lwt.t) ->
+  services:(unit -> unit Lwt.t) list ->
   observer:bool ->
   tick_loop:(unit -> unit Lwt.t) ->
   swarm:Octra_net.P2p_swarm.t option ->

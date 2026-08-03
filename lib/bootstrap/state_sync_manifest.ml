@@ -36,16 +36,20 @@ type draft = {
   manifest_hash : string;
 }
 
+type authority =
+  | Checkpoint_quorum of Checkpoint.signature list
+  | Finalized of string
+
 type certificate = {
   checkpoint : Checkpoint.body;
   checkpoint_hash : string;
-  checkpoint_signatures : Checkpoint.signature list;
+  authority : authority;
   manifest : body;
   manifest_hash : string;
-  exporter_signature : Checkpoint.signature;
+  exporter_signatures : Checkpoint.signature list;
 }
 
-let version = "octra-state-sync"
+let format = "octra-state-sync"
 let manifest_limit = 32 * 1024 * 1024
 let file_limit = 200_000
 let chunk_limit = 262_144
@@ -151,7 +155,7 @@ let chunks_root files =
 
 let manifest_hash_raw (body : body) =
   Octra_net.Hash_domain.hash_encoded "octra:state_sync_manifest" (fun buffer ->
-    Octra_net.Oce1.put_string buffer version;
+    Octra_net.Oce1.put_string buffer format;
     Octra_net.Oce1.put_hash32 buffer body.checkpoint_hash;
     Octra_net.Oce1.put_string buffer body.snapshot_id;
     Octra_net.Oce1.put_option Octra_net.Oce1.put_string buffer body.irmin_commit;
@@ -186,7 +190,7 @@ let file_json file =
 
 let body_json (body : body) =
   `Assoc [
-    "version", `String version;
+    "version", `String format;
     "checkpoint_hash", `String body.checkpoint_hash;
     "snapshot_id", `String body.snapshot_id;
     "irmin_commit",
@@ -201,7 +205,7 @@ let body_json (body : body) =
 
 let draft_json (draft : draft) =
   `Assoc [
-    "version", `String version;
+    "version", `String format;
     "checkpoint", Checkpoint.body_json draft.checkpoint;
     "checkpoint_hash", `String draft.checkpoint_hash;
     "manifest", body_json draft.manifest;
@@ -209,16 +213,29 @@ let draft_json (draft : draft) =
   ]
 
 let certificate_json certificate =
-  `Assoc [
-    "version", `String version;
+  let common = [
     "checkpoint", Checkpoint.body_json certificate.checkpoint;
     "checkpoint_hash", `String certificate.checkpoint_hash;
-    "checkpoint_signatures",
-      `List (List.map Checkpoint.signature_json certificate.checkpoint_signatures);
     "manifest", body_json certificate.manifest;
     "manifest_hash", `String certificate.manifest_hash;
-    "exporter_signature", Checkpoint.signature_json certificate.exporter_signature;
-  ]
+  ] in
+  match certificate.authority, certificate.exporter_signatures with
+  | Checkpoint_quorum signatures, [exporter_signature] ->
+      `Assoc (
+        ("version", `String format)
+        :: ("checkpoint_signatures",
+          `List (List.map Checkpoint.signature_json signatures))
+        :: ("exporter_signature", Checkpoint.signature_json exporter_signature)
+        :: common)
+  | Finalized finality, exporter_signatures ->
+      `Assoc (
+        ("version", `String format)
+        :: ("finality", `String finality)
+        :: ("exporter_signatures",
+          `List (List.map Checkpoint.signature_json exporter_signatures))
+        :: common)
+  | Checkpoint_quorum _, _ ->
+      invalid_arg "checkpoint certificate requires one exporter signature"
 
 let parse_chunk = function
   | `Assoc fields ->
@@ -259,7 +276,7 @@ let parse_body = function
       ] in
       let* () = exact_fields names fields in
       let* parsed_version = assoc fields "version" >>= string_value in
-      if parsed_version <> version then Error "unsupported manifest version"
+      if parsed_version <> format then Error "unsupported manifest format"
       else
         let* checkpoint_hash = assoc fields "checkpoint_hash" >>= string_value in
         let* snapshot_id = assoc fields "snapshot_id" >>= string_value in
@@ -301,7 +318,7 @@ let parse_draft_json = function
           fields
       in
       let* parsed_version = assoc fields "version" >>= string_value in
-      if parsed_version <> version then Error "unsupported draft version"
+      if parsed_version <> format then Error "unsupported draft format"
       else
         let* checkpoint_json = assoc fields "checkpoint" in
         let* checkpoint = Checkpoint.parse_body checkpoint_json in
@@ -312,43 +329,73 @@ let parse_draft_json = function
         Ok { checkpoint; checkpoint_hash; manifest; manifest_hash }
   | _ -> Error "draft must be an object"
 
+let parse_signatures limit values =
+  if List.length values > limit then Error "signature count exceeds limit"
+  else
+    List.fold_left (fun state item ->
+      let* items = state in
+      let* signature = Checkpoint.parse_signature item in
+      Ok (signature :: items)
+    ) (Ok []) values
+    |> Result.map List.rev
+
+let parse_checkpoint_certificate fields =
+  let names = [
+    "version"; "checkpoint"; "checkpoint_hash"; "checkpoint_signatures";
+    "manifest"; "manifest_hash"; "exporter_signature";
+  ] in
+  let* () = exact_fields names fields in
+  let* checkpoint_json = assoc fields "checkpoint" in
+  let* checkpoint = Checkpoint.parse_body checkpoint_json in
+  let* checkpoint_hash = assoc fields "checkpoint_hash" >>= string_value in
+  let* signatures_json = assoc fields "checkpoint_signatures" >>= list_value in
+  let* checkpoint_signatures = parse_signatures 1_024 signatures_json in
+  let* manifest_json = assoc fields "manifest" in
+  let* manifest = parse_body manifest_json in
+  let* manifest_hash = assoc fields "manifest_hash" >>= string_value in
+  let* exporter_json = assoc fields "exporter_signature" in
+  let* exporter_signature = Checkpoint.parse_signature exporter_json in
+  Ok {
+    checkpoint;
+    checkpoint_hash;
+    authority = Checkpoint_quorum checkpoint_signatures;
+    manifest;
+    manifest_hash;
+    exporter_signatures = [exporter_signature];
+  }
+
+let parse_finalized_certificate fields =
+  let names = [
+    "version"; "checkpoint"; "checkpoint_hash"; "finality";
+    "manifest"; "manifest_hash"; "exporter_signatures";
+  ] in
+  let* () = exact_fields names fields in
+  let* checkpoint_json = assoc fields "checkpoint" in
+  let* checkpoint = Checkpoint.parse_body checkpoint_json in
+  let* checkpoint_hash = assoc fields "checkpoint_hash" >>= string_value in
+  let* finality = assoc fields "finality" >>= string_value in
+  let* manifest_json = assoc fields "manifest" in
+  let* manifest = parse_body manifest_json in
+  let* manifest_hash = assoc fields "manifest_hash" >>= string_value in
+  let* signatures_json = assoc fields "exporter_signatures" >>= list_value in
+  let* exporter_signatures = parse_signatures 1_024 signatures_json in
+  Ok {
+    checkpoint;
+    checkpoint_hash;
+    authority = Finalized finality;
+    manifest;
+    manifest_hash;
+    exporter_signatures;
+  }
+
 let parse_certificate_json = function
   | `Assoc fields ->
-      let names = [
-        "version"; "checkpoint"; "checkpoint_hash"; "checkpoint_signatures";
-        "manifest"; "manifest_hash"; "exporter_signature";
-      ] in
-      let* () = exact_fields names fields in
       let* parsed_version = assoc fields "version" >>= string_value in
-      if parsed_version <> version then Error "unsupported certificate version"
+      if parsed_version <> format then Error "unsupported certificate format"
+      else if List.mem_assoc "finality" fields then
+        parse_finalized_certificate fields
       else
-        let* checkpoint_json = assoc fields "checkpoint" in
-        let* checkpoint = Checkpoint.parse_body checkpoint_json in
-        let* checkpoint_hash = assoc fields "checkpoint_hash" >>= string_value in
-        let* signatures_json = assoc fields "checkpoint_signatures" >>= list_value in
-        if List.length signatures_json > 1_024 then Error "signature count exceeds limit"
-        else
-          let* checkpoint_signatures =
-            List.fold_left (fun state item ->
-              let* items = state in
-              let* signature = Checkpoint.parse_signature item in
-              Ok (signature :: items)
-            ) (Ok []) signatures_json
-            |> Result.map List.rev
-          in
-          let* manifest_json = assoc fields "manifest" in
-          let* manifest = parse_body manifest_json in
-          let* manifest_hash = assoc fields "manifest_hash" >>= string_value in
-          let* exporter_json = assoc fields "exporter_signature" in
-          let* exporter_signature = Checkpoint.parse_signature exporter_json in
-          Ok {
-            checkpoint;
-            checkpoint_hash;
-            checkpoint_signatures;
-            manifest;
-            manifest_hash;
-            exporter_signature;
-          }
+        parse_checkpoint_certificate fields
   | _ -> Error "certificate must be an object"
 
 let parse_limited parse raw =
@@ -440,6 +487,55 @@ let validate_body (body : body) =
           let root = chunks_root body.files in
           if root <> body.chunks_root then Error "chunk root mismatch" else Ok ()
 
+let decimal value =
+  value <> ""
+  && String.for_all (function '0'..'9' -> true | _ -> false) value
+
+let txlog_file path =
+  let prefix = "chaindata/txlog/seg" in
+  let suffix = ".dat" in
+  let first = String.length prefix in
+  let digits = String.length path - first - String.length suffix in
+  String.starts_with ~prefix path
+  && String.ends_with ~suffix path
+  && digits = 6
+  && decimal (String.sub path first digits)
+
+let pvac_file path =
+  let prefix = "pvac/blobs/" in
+  let suffix = ".pk" in
+  let first = String.length prefix in
+  let length = String.length path - first - String.length suffix in
+  String.starts_with ~prefix path
+  && String.ends_with ~suffix path
+  && length = 64
+  && is_lower_hex_64 (String.sub path first length)
+
+let reference_file path =
+  path = "HEAD.json"
+  || path = "state_root"
+  || path = "ledger.dat"
+  || path = "chaindata/epochlog/epochs.dat"
+  || txlog_file path
+  || pvac_file path
+
+let validate_reference_body body =
+  let* () = validate_body body in
+  let paths = List.map (fun file -> file.path) body.files in
+  match List.find_opt (fun path -> not (reference_file path)) paths with
+    | Some path -> Error ("reference snapshot file is unsupported: " ^ path)
+    | None when not (List.mem "HEAD.json" paths) ->
+        Error "reference snapshot has no HEAD"
+    | None when not (List.mem "state_root" paths) ->
+        Error "reference snapshot has no state root"
+    | None when not (List.mem "chaindata/epochlog/epochs.dat" paths) ->
+        Error "reference snapshot has no epochlog"
+    | None when not (List.exists txlog_file paths) ->
+        Error "reference snapshot has no txlog"
+    | None when not (List.mem "ledger.dat" paths) ->
+        Error "reference snapshot has no ledger image"
+    | None -> Ok ()
+
 let manifest_hash (body : body) =
   let* () = validate_body body in
   Ok (manifest_hash_raw body |> raw_to_hex)
@@ -493,6 +589,21 @@ let verify_draft (draft : draft) =
 let set_hash validator_set =
   Octra_consensus.C_config.validator_set_hash validator_set |> raw_to_hex
 
+let verify_exporters ~exporter_set ~required ~message signatures =
+  let signers = List.map (fun item -> item.Checkpoint.signer) signatures in
+  if signers <> List.sort_uniq String.compare signers then
+    Error "exporter signatures are not ordered"
+  else if List.length signatures < required then
+    Error "exporter signature threshold missing"
+  else
+    List.fold_left (fun state signature ->
+      let* () = state in
+      Checkpoint.verify_signature
+        ~signer_set:exporter_set
+        ~message
+        signature
+    ) (Ok ()) signatures
+
 let verify_certificate ~validator_set ~exporter_set certificate =
   let* () = validate_validator_set validator_set in
   let* () = validate_validator_set exporter_set in
@@ -503,26 +614,60 @@ let verify_certificate ~validator_set ~exporter_set certificate =
     manifest_hash = certificate.manifest_hash;
   } in
   let* _ = verify_draft draft in
-  if certificate.checkpoint.validator_set_hash <> set_hash validator_set then
-    Error "checkpoint validator set hash mismatch"
-  else
-    let* () =
-      Checkpoint.verify_quorum
-        ~validator_set
-        certificate.checkpoint
-        certificate.checkpoint_signatures
-    in
-    let* message =
-      let* () = validate_body certificate.manifest in
-      Ok (manifest_hash_raw certificate.manifest)
-    in
-    let* () =
-      Checkpoint.verify_signature
-        ~signer_set:exporter_set
-        ~message
-        certificate.exporter_signature
-    in
-    Ok certificate
+  let* message =
+    let* () = validate_body certificate.manifest in
+    Ok (manifest_hash_raw certificate.manifest)
+  in
+  match certificate.authority with
+  | Checkpoint_quorum signatures ->
+      if certificate.checkpoint.validator_set_hash <> set_hash validator_set then
+        Error "checkpoint validator set hash mismatch"
+      else
+        let* () =
+          Checkpoint.verify_quorum
+            ~validator_set
+            certificate.checkpoint
+            signatures
+        in
+        let* () =
+          verify_exporters
+            ~exporter_set
+            ~required:1
+            ~message
+            certificate.exporter_signatures
+        in
+        Ok certificate
+  | Finalized finality ->
+      let* () = validate_reference_body certificate.manifest in
+      let* _ =
+        Sync_anchor.verify
+          ~validator_set
+          certificate.checkpoint
+          finality
+      in
+      let* () =
+        verify_exporters
+          ~exporter_set
+          ~required:1
+          ~message
+          certificate.exporter_signatures
+      in
+      Ok certificate
+
+let is_reference certificate =
+  match certificate.authority with
+  | Finalized _ -> true
+  | Checkpoint_quorum _ -> false
+
+let checkpoint_signatures certificate =
+  match certificate.authority with
+  | Checkpoint_quorum signatures -> signatures
+  | Finalized _ -> []
+
+let finality certificate =
+  match certificate.authority with
+  | Finalized value -> Some value
+  | Checkpoint_quorum _ -> None
 
 let fresh ~now certificate =
   Int64.compare (Int64.add now 300L) certificate.checkpoint.created_at >= 0
@@ -689,18 +834,30 @@ let write_json path json =
     end
   in
   mkdir parent;
-  let temporary = path ^ ".tmp" in
-  let output =
-    open_out_gen [Open_wronly; Open_creat; Open_trunc; Open_binary] 0o644 temporary
+  let stamp = Int64.of_float (Unix.gettimeofday () *. 1_000_000.) in
+  let staged =
+    Printf.sprintf "%s.next.%d.%Ld" path (Unix.getpid ()) stamp
   in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr output)
-    (fun () ->
-      Yojson.Safe.to_channel output json;
-      output_char output '\n';
-      flush output;
-      Unix.fsync (Unix.descr_of_out_channel output));
-  Unix.rename temporary path;
+  let output =
+    open_out_gen
+      [Open_wronly; Open_creat; Open_excl; Open_binary]
+      0o644
+      staged
+  in
+  begin
+    try
+      Fun.protect
+        ~finally:(fun () -> close_out_noerr output)
+        (fun () ->
+          Yojson.Safe.to_channel output json;
+          output_char output '\n';
+          flush output;
+          Unix.fsync (Unix.descr_of_out_channel output))
+    with exn ->
+      (try Unix.unlink staged with _ -> ());
+      raise exn
+  end;
+  Unix.rename staged path;
   let directory = Unix.openfile parent [Unix.O_RDONLY] 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close directory)

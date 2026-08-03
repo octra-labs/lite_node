@@ -43,6 +43,7 @@ type runtime = {
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
   program_trust : Octra_vm.Program_trust.t;
+  circle_mode : Octra_core.Rule_graph.mode;
   legacy_replay :
     epoch:int ->
     address:string ->
@@ -60,6 +61,7 @@ type node_runtime = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   program_trust : Octra_vm.Program_trust.t;
+  rules : Octra_core.Rule_graph.t;
   wallet_addr : string;
   pre_state_hash : string;
   standard_env : unit -> Epoch_exec.env;

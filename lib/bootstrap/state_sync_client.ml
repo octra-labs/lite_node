@@ -7,7 +7,17 @@ module Manifest = State_sync_manifest
 module Checkpoint = State_sync_checkpoint
 module Journal = State_sync_journal
 module Source = State_sync_source
+module State_sync = State_sync
 module Verify = State_sync_verify
+module Store = Octra_core.Store_chaindata
+module Ledger_store = Octra_core.Store_irmin
+module Head = Octra_core.Head_manifest
+module Image = Octra_core.Ledger_image
+module String_map = Map.Make (String)
+module Epoch_map = Map.Make (struct
+  type t = int64
+  let compare = Int64.compare
+end)
 
 type task = {
   file : Manifest.file;
@@ -160,7 +170,7 @@ let fetch_manifest validator_set exporter_set source =
   in
   loop 0
 
-let select_manifest (results : (Source.t * Manifest.certificate) list) =
+let select_manifests (results : (Source.t * Manifest.certificate) list) =
   let ordered =
     List.sort (fun (_, left) (_, right) ->
       let epoch_order =
@@ -173,50 +183,61 @@ let select_manifest (results : (Source.t * Manifest.certificate) list) =
         else String.compare left.manifest_hash right.manifest_hash
     ) results
   in
-  match ordered with
+  let _, conflicting =
+    List.fold_left
+      (fun (epochs, conflicting) (_, (certificate : Manifest.certificate)) ->
+        let epoch = certificate.checkpoint.epoch in
+        match Epoch_map.find_opt epoch epochs with
+        | None ->
+            Epoch_map.add epoch certificate.checkpoint_hash epochs, conflicting
+        | Some checkpoint_hash ->
+            epochs, conflicting || checkpoint_hash <> certificate.checkpoint_hash)
+      (Epoch_map.empty, false)
+      ordered
+  in
+  if conflicting then
+    fail "conflicting quorum checkpoints at the same snapshot epoch";
+  let manifest_groups candidates =
+    candidates
+    |> List.fold_left
+         (fun groups (source, (certificate : Manifest.certificate)) ->
+           String_map.update
+             certificate.manifest_hash
+             (function
+               | None -> Some (certificate, [source])
+               | Some (selected, sources) -> Some (selected, source :: sources))
+             groups)
+         String_map.empty
+    |> String_map.bindings
+    |> List.map (fun (manifest_hash, (certificate, sources)) ->
+         manifest_hash, certificate, List.rev sources)
+    |> List.sort (fun (left_hash, _, left_sources) (right_hash, _, right_sources) ->
+         let count_order = compare (List.length right_sources) (List.length left_sources) in
+         if count_order <> 0 then count_order else String.compare left_hash right_hash)
+    |> List.map (fun (_, certificate, sources) -> certificate, sources)
+  in
+  let rec take_checkpoint checkpoint_hash selected = function
+    | ((_, (certificate : Manifest.certificate)) as item) :: rest
+      when certificate.checkpoint_hash = checkpoint_hash ->
+        take_checkpoint checkpoint_hash (item :: selected) rest
+    | rest -> List.rev selected, rest
+  in
+  let rec collect = function
+    | [] -> []
+    | (_, (certificate : Manifest.certificate)) :: _ as remaining ->
+        let selected, rest =
+          take_checkpoint certificate.checkpoint_hash [] remaining
+        in
+        manifest_groups selected @ collect rest
+  in
+  match collect ordered with
   | [] -> fail "no source returned a valid quorum certificate"
-  | (_, (selected : Manifest.certificate)) :: _ ->
-      let conflicting =
-        ordered
-        |> List.exists (fun (_, (certificate : Manifest.certificate)) ->
-          certificate.checkpoint.epoch = selected.checkpoint.epoch
-          && certificate.checkpoint_hash <> selected.checkpoint_hash)
-      in
-      if conflicting then fail "conflicting quorum checkpoints at the same snapshot epoch";
-      let candidates =
-        ordered
-        |> List.filter (fun (_, (certificate : Manifest.certificate)) ->
-          certificate.checkpoint_hash = selected.checkpoint_hash)
-      in
-      let counts = Hashtbl.create (List.length candidates) in
-      List.iter (fun (_, (certificate : Manifest.certificate)) ->
-        let count = Option.value ~default:0 (Hashtbl.find_opt counts certificate.manifest_hash) in
-        Hashtbl.replace counts certificate.manifest_hash (count + 1)
-      ) candidates;
-      let chosen_hash =
-        Hashtbl.to_seq counts
-        |> List.of_seq
-        |> List.sort (fun (left_hash, left_count) (right_hash, right_count) ->
-          let count_order = compare right_count left_count in
-          if count_order <> 0 then count_order else String.compare left_hash right_hash)
-        |> function
-        | (hash, _) :: _ -> hash
-        | [] -> fail "checkpoint has no byte manifest"
-      in
-      let selected =
-        match candidates
-          |> List.find_map (fun (_, certificate) ->
-            if certificate.Manifest.manifest_hash = chosen_hash then Some certificate else None)
-        with
-        | Some certificate -> certificate
-        | None -> fail "selected byte manifest disappeared"
-      in
-      let sources =
-        candidates
-        |> List.filter_map (fun (source, certificate) ->
-          if certificate.Manifest.manifest_hash = chosen_hash then Some source else None)
-      in
-      selected, sources
+  | candidates -> candidates
+
+let select_manifest results =
+  match select_manifests results with
+  | selected :: _ -> selected
+  | [] -> fail "checkpoint has no byte manifest"
 
 let random_salt path =
   if Sys.file_exists path then
@@ -285,6 +306,47 @@ let fetch_chunk source certificate task =
     let actual = Digestif.SHA256.(digest_string payload |> to_hex) in
     if actual <> task.chunk.sha256 then Lwt.fail_with "chunk hash mismatch"
     else Lwt.return payload
+
+let check_task certificate =
+  let choose selected file chunk =
+    match selected with
+    | None -> Some { file; partial = ""; chunk }
+    | Some task ->
+        let size_order = compare chunk.Manifest.size task.chunk.size in
+        let path_order = String.compare file.Manifest.path task.file.path in
+        let index_order = compare chunk.index task.chunk.index in
+        if size_order < 0
+           || (size_order = 0 && path_order < 0)
+           || (size_order = 0 && path_order = 0 && index_order < 0)
+        then Some { file; partial = ""; chunk }
+        else selected
+  in
+  certificate.Manifest.manifest.files
+  |> List.fold_left
+       (fun selected file ->
+          List.fold_left
+            (fun selected chunk -> choose selected file chunk)
+            selected
+            file.Manifest.chunks)
+       None
+
+let check_manifest_chunk certificate sources =
+  match check_task certificate with
+  | None -> Lwt.fail_with "state sync manifest has no chunk"
+  | Some task ->
+      let rec loop last_error = function
+        | [] ->
+            begin
+              match last_error with
+              | Some exn -> Lwt.fail exn
+              | None -> Lwt.fail_with "state sync manifest has no source"
+            end
+        | source :: rest ->
+            Lwt.catch
+              (fun () -> fetch_chunk source certificate task >|= fun _ -> ())
+              (fun exn -> loop (Some exn) rest)
+      in
+      loop None sources
 
 let prepare_sources values =
   let rec loop sources = function
@@ -361,6 +423,93 @@ let finalize_files ~parallelism ~data_dir files =
   in
   finalize_group ~parallelism ~data_dir regular >>= fun () ->
   Lwt_list.iter_s (finalize_one ~data_dir) head
+
+let validate_rebuild checkpoint (report : Store.rebuild_report) =
+  if Int64.compare checkpoint.Checkpoint.epoch (Int64.of_int max_int) >= 0 then
+    Error "checkpoint epoch exceeds platform limit"
+  else if report.transactions <> Int64.succ checkpoint.txid_hi then
+    Error "rebuilt transaction high-water does not match checkpoint"
+  else if report.last_epoch <> Int64.to_int checkpoint.epoch then
+    Error "rebuilt epoch high-water does not match checkpoint"
+  else if report.epochs <> report.last_epoch + 1 then
+    Error "rebuilt epoch sequence is incomplete"
+  else
+    match checkpoint.epoch_index_root with
+    | Some expected when report.epoch_index_root = expected -> Ok ()
+    | Some _ -> Error "rebuilt epoch index root does not match checkpoint"
+    | None -> Error "checkpoint epoch index root is missing"
+
+let rebuild_public_keys data_dir =
+  let path = Filename.concat data_dir "irmin_store" in
+  Ledger_store.open_store ~readonly:true path >>= fun ledger_store ->
+  Lwt.finalize
+    (fun () ->
+      Ledger_store.load_all_accounts ledger_store >|= fun accounts ->
+      List.fold_left
+        (fun keys (address, account) ->
+          match account.Octra_core.Ledger_types.public_key with
+          | Some public_key -> String_map.add address public_key keys
+          | None -> keys)
+        String_map.empty
+        accounts)
+    (fun () -> Ledger_store.close ledger_store)
+
+let rebuild_state checkpoint data_dir =
+  rebuild_public_keys data_dir >>= fun public_keys ->
+  Lwt_preemptive.detach
+    (fun () ->
+      try
+        let store =
+          Store.open_chaindata (Filename.concat data_dir "chaindata")
+        in
+        Fun.protect
+          ~finally:(fun () -> Store.close store)
+          (fun () ->
+            match
+              Store.rebuild_index
+                ~public_key_of:(fun address ->
+                  String_map.find_opt address public_keys)
+                store
+            with
+            | Error _ as error -> error
+            | Ok report -> validate_rebuild checkpoint report)
+      with exn -> Error (Printexc.to_string exn))
+    ()
+
+let restore_ledger checkpoint data_dir =
+  let source = Filename.concat data_dir "ledger.dat" in
+  let target = Filename.concat data_dir "irmin_store" in
+  Image.restore
+    ~source
+    ~target
+    ~expected_root:checkpoint.Checkpoint.ledger_state_root
+  >>= function
+  | Error _ as error -> Lwt.return error
+  | Ok report ->
+      begin
+        match Head.load_result data_dir with
+        | Head.Missing -> Lwt.return_error "restored HEAD.json is missing"
+        | Head.Corrupt reason ->
+            Lwt.return_error ("restored HEAD.json is corrupt: " ^ reason)
+        | Head.Present head
+          when not (Checkpoint.matches_head checkpoint head) ->
+            Lwt.return_error "restored HEAD.json does not match checkpoint"
+        | Head.Present head ->
+            Head.atomic_write
+              data_dir
+              { head with Head.irmin_commit = Some report.commit };
+            Lwt.return_ok report
+      end
+
+let remove_ledger data_dir =
+  let path = Filename.concat data_dir "ledger.dat" in
+  if Sys.file_exists path then begin
+    Unix.unlink path;
+    let descriptor = Unix.openfile data_dir [Unix.O_RDONLY] 0 in
+    Fun.protect
+      ~finally:(fun () -> Unix.close descriptor)
+      (fun () -> Unix.fsync descriptor)
+  end
 
 let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let body = certificate.Manifest.manifest in
@@ -510,6 +659,35 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
     "event = sync_finalize_complete hash = %s files = %d\n%!"
     certificate.manifest_hash
     body.file_count;
+  begin
+    if Manifest.is_reference certificate then begin
+      Printf.printf
+        "event = sync_ledger_start hash = %s epoch = %Ld\n%!"
+        certificate.manifest_hash
+        checkpoint.epoch;
+      restore_ledger checkpoint data_dir >>= function
+      | Error reason -> Lwt.fail_with reason
+      | Ok report ->
+          Printf.printf
+            "event = sync_ledger_complete hash = %s epoch = %Ld records = %d root = %s\n%!"
+            certificate.manifest_hash
+            checkpoint.epoch
+            report.Image.records
+            report.root;
+      Printf.printf
+        "event = sync_index_start hash = %s epoch = %Ld\n%!"
+        certificate.manifest_hash
+        checkpoint.epoch;
+      rebuild_state checkpoint data_dir >>= function
+      | Error reason -> Lwt.fail_with reason
+      | Ok () ->
+          Printf.printf
+            "event = sync_index_complete hash = %s epoch = %Ld\n%!"
+            certificate.manifest_hash
+            checkpoint.epoch;
+          Lwt.return_unit
+    end else Lwt.return_unit
+  end >>= fun () ->
   Printf.printf
     "event = sync_verify_start hash = %s epoch = %Ld\n%!"
     certificate.manifest_hash
@@ -517,6 +695,10 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
   verify_state checkpoint data_dir >>= function
   | Error reason -> Lwt.fail_with reason
   | Ok () ->
+      if Manifest.is_reference certificate then remove_ledger data_dir;
+      Manifest.write_json
+        (State_sync.anchor_path data_dir)
+        (Manifest.certificate_json certificate);
       write_verified_marker root certificate sources;
       Printf.printf
         "event = sync_verified hash = %s epoch = %Ld state_root = %s data = %s voting = false\n%!"
@@ -525,6 +707,35 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
         checkpoint.state_root
         data_dir;
       Lwt.return_unit
+
+let sync_manifests ~max_bytes ~stage ~check ~sync candidates =
+  let rec loop = function
+    | [] -> Lwt.fail (Sync_error "all state sync byte manifests failed")
+    | (certificate, matching_sources) :: rest ->
+        let attempt () =
+          if Int64.compare certificate.Manifest.manifest.total_size max_bytes > 0 then
+            check certificate matching_sources >>= fun () ->
+            Lwt.fail (Sync_error "snapshot exceeds configured byte limit")
+          else
+            let root =
+              Filename.concat
+                (Filename.concat stage "snapshots")
+                certificate.Manifest.manifest_hash
+            in
+            sync certificate matching_sources root
+        in
+        Lwt.catch
+          attempt
+          (fun exn ->
+            Printf.eprintf
+              "event = sync_manifest_failed hash = %s error = %s\n%!"
+              certificate.manifest_hash
+              (Printexc.to_string exn);
+            match rest with
+            | [] -> Lwt.fail exn
+            | _ -> loop rest)
+  in
+  loop candidates
 
 let run () =
   Arg.parse options (fun value -> fail ("unexpected argument: " ^ value)) usage;
@@ -565,16 +776,15 @@ let run () =
             (Printexc.to_string exn);
           Lwt.return_none))
     sources >>= fun results ->
-  let certificate, matching_sources =
-    results |> List.filter_map Fun.id |> select_manifest in
-  if Int64.compare certificate.Manifest.manifest.total_size !max_bytes > 0 then
-    fail "snapshot exceeds configured byte limit";
-  let root =
-    Filename.concat
-      (Filename.concat stage "snapshots")
-      certificate.Manifest.manifest_hash
+  let candidates =
+    results |> List.filter_map Fun.id |> select_manifests
   in
-  run_sync certificate matching_sources root
+  sync_manifests
+    ~max_bytes:!max_bytes
+    ~stage
+    ~check:check_manifest_chunk
+    ~sync:run_sync
+    candidates
 
 let main () =
   try Lwt_main.run (run ()) with

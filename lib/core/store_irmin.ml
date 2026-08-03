@@ -208,11 +208,13 @@ let get_account t addr =
   | Some s -> Lwt.return (account_of_json s)
   | None -> Lwt.return_none
 
-type account_merkle_proof = {
+type merkle_proof = {
   ledger_state_root : string;
   proof : string;
   value : string option;
 }
+
+type account_merkle_proof = merkle_proof
 
 let proof_path addr =
   ["accounts"; addr; "data"]
@@ -229,36 +231,56 @@ let proof_root = function
   | `Node h -> Some (Irmin.Type.to_string Store.Hash.t h)
   | `Contents _ -> None
 
+let tree_key t tree =
+  match Store.Tree.key tree with
+  | Some key -> Lwt.return_some key
+  | None -> Store.Tree.find_key t.repo tree
+
 let head_tree_key t =
   let* head = Store.Head.find t.store in
   match head with
   | None -> Lwt.return_none
   | Some commit ->
     let tree = Store.Commit.tree commit in
-    match Store.Tree.key tree with
-    | Some key -> Lwt.return_some (tree, key)
-    | None ->
-      let* key_opt = Store.Tree.find_key t.repo tree in
-      Lwt.return (Option.map (fun key -> tree, key) key_opt)
+    let* key = tree_key t tree in
+    Lwt.return (Option.map (fun key -> tree, key) key)
 
-let account_merkle_proof t addr =
-  let* key_opt = head_tree_key t in
-  match key_opt with
-  | None -> Lwt.return_error "missing store head"
-  | Some (tree, key) ->
-    let ledger_state_root = Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree) in
-    let path = proof_path addr in
+let prove_tree t tree path =
+  let* key = tree_key t tree in
+  match key with
+  | None -> Lwt.return_error "missing store tree key"
+  | Some key ->
+    let ledger_state_root =
+      Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree)
+    in
     let* proof, value =
-      Store.Tree.produce_proof t.repo key (fun tree ->
-        let* value = Store.Tree.find tree path in
-        Lwt.return (tree, value)) in
+      Store.Tree.produce_proof t.repo key (fun view ->
+        let* value = Store.Tree.find view path in
+        Lwt.return (view, value))
+    in
     Lwt.return_ok {
       ledger_state_root;
       proof = Base64.encode_exn (proof_bin proof);
       value;
     }
 
-let verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof =
+let merkle_proof t path =
+  let* key = head_tree_key t in
+  match key with
+  | None -> Lwt.return_error "missing store head"
+  | Some (tree, _) -> prove_tree t tree path
+
+let merkle_proof_at_epoch t epoch_id path =
+  let branch = Printf.sprintf "epoch_%d" epoch_id in
+  let* commit = Store.Branch.find t.repo branch in
+  match commit with
+  | None -> Lwt.return_error "epoch tag is missing"
+  | Some commit -> prove_tree t (Store.Commit.tree commit) path
+
+let account_merkle_proof t addr =
+  merkle_proof t (proof_path addr)
+
+let verify_merkle_proof_lwt ~ledger_state_root ~path ~proof =
   match Base64.decode proof with
   | Error (`Msg e) -> Lwt.return_error ("invalid proof base64: " ^ e)
   | Ok raw ->
@@ -268,7 +290,6 @@ let verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof =
       match proof_root (Store.Tree.Proof.before proof), proof_root (Store.Tree.Proof.after proof) with
       | Some before_root, Some after_root
         when before_root = ledger_state_root && after_root = ledger_state_root ->
-        let path = proof_path addr in
         let* result =
           Store.Tree.verify_proof proof (fun tree ->
             let* value = Store.Tree.find tree path in
@@ -279,6 +300,21 @@ let verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof =
         end
       | Some before_root, _ -> Lwt.return_error ("proof root mismatch: " ^ before_root)
       | None, _ -> Lwt.return_error "proof root is not a node"
+
+let verify_merkle_proof ~ledger_state_root ~path ~proof =
+  Lwt_main.run (verify_merkle_proof_lwt ~ledger_state_root ~path ~proof)
+
+let verify_merkle_proof_det ~ledger_state_root ~path ~proof =
+  match Lwt.state (verify_merkle_proof_lwt ~ledger_state_root ~path ~proof) with
+  | Lwt.Return result -> result
+  | Lwt.Fail exn -> Error (Printexc.to_string exn)
+  | Lwt.Sleep -> Error "proof verification did not settle"
+
+let verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof =
+  verify_merkle_proof_lwt
+    ~ledger_state_root
+    ~path:(proof_path addr)
+    ~proof
 
 let verify_account_merkle_proof ~ledger_state_root ~addr ~proof =
   Lwt_main.run (verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof)
@@ -1602,6 +1638,14 @@ let inspect_pvac_blobs t =
     corrupt = List.sort String.compare !corrupt;
   }
 
+let bound_pvac_hashes t =
+  let hashes = ref [] in
+  let* () =
+    iter_subtree t ["pvac_hashes"] (fun _ hash ->
+      if hash <> "none" then hashes := hash :: !hashes)
+  in
+  Lwt.return (List.sort_uniq String.compare !hashes)
+
 type bulk_tree = Store.tree
 
 let begin_bulk t =
@@ -1630,54 +1674,76 @@ type compact_store_result = {
 }
 
 let create_compact_store t ~expected_commit ~target =
-  let* head = Store.Head.find t.store in
-  match head with
-  | None -> Lwt.return (Error "source Irmin store has no head")
-  | Some commit ->
-    let commit_hash =
-      Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit)
-    in
-    if commit_hash <> expected_commit then
-      Lwt.return (Error "source Irmin commit does not match checkpoint")
-    else if Sys.file_exists target then
-      Lwt.return (Error "compact Irmin target already exists")
-    else
-      let tree_hash =
-        Irmin.Type.to_string Store.Hash.t
-          (Store.Tree.hash (Store.Commit.tree commit))
-      in
-      Lwt.catch
-        (fun () ->
-          let* () =
-            Store.create_one_commit_store
-              t.repo
-              (Store.Commit.key commit)
-              target
+  match Irmin.Type.of_string Store.Hash.t expected_commit with
+  | Error _ -> Lwt.return (Error "source Irmin commit hash is invalid")
+  | Ok hash when Irmin.Type.to_string Store.Hash.t hash <> expected_commit ->
+      Lwt.return (Error "source Irmin commit hash is not exact")
+  | Ok hash ->
+      let* commit = Store.Commit.of_hash t.repo hash in
+      match commit with
+      | None -> Lwt.return (Error "source Irmin commit is unavailable")
+      | Some commit ->
+        if Sys.file_exists target then
+          Lwt.return (Error "compact Irmin target already exists")
+        else
+          let commit_hash =
+            Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit)
           in
-          let* compact = open_store target in
-          Lwt.finalize
+          let tree_hash =
+            Irmin.Type.to_string Store.Hash.t
+              (Store.Tree.hash (Store.Commit.tree commit))
+          in
+          Lwt.catch
             (fun () ->
-              let* restored =
-                Store.Commit.of_hash compact.repo (Store.Commit.hash commit)
+              let* () =
+                Store.create_one_commit_store
+                  t.repo
+                  (Store.Commit.key commit)
+                  target
               in
-              match restored with
-              | None ->
-                Lwt.return (Error "compact Irmin commit is unavailable")
-              | Some restored ->
-                let restored_tree_hash =
-                  Irmin.Type.to_string Store.Hash.t
-                    (Store.Tree.hash (Store.Commit.tree restored))
-                in
-                if restored_tree_hash <> tree_hash then
-                  Lwt.return (Error "compact Irmin tree hash mismatch")
-                else
-                  let* () = Store.Head.set compact.store restored in
-                  Store.flush compact.repo;
-                  Lwt.return (Ok { commit_hash; tree_hash }))
-            (fun () -> close compact))
-        (fun exn ->
-          Lwt.return
-            (Error ("compact Irmin export failed: " ^ Printexc.to_string exn)))
+              ignore (Store.Gc.cancel t.repo);
+              let* compact = open_store target in
+              Lwt.finalize
+                (fun () ->
+                  let* restored =
+                    Store.Commit.of_hash compact.repo (Store.Commit.hash commit)
+                  in
+                  match restored with
+                  | None ->
+                    Lwt.return (Error "compact Irmin commit is unavailable")
+                  | Some restored ->
+                    let restored_tree_hash =
+                      Irmin.Type.to_string Store.Hash.t
+                        (Store.Tree.hash (Store.Commit.tree restored))
+                    in
+                    if restored_tree_hash <> tree_hash then
+                      Lwt.return (Error "compact Irmin tree hash mismatch")
+                    else
+                      let* () = Store.Head.set compact.store restored in
+                      Store.flush compact.repo;
+                      Lwt.return (Ok { commit_hash; tree_hash }))
+                (fun () -> close compact))
+            (fun exn ->
+              Lwt.return
+                (Error ("compact Irmin export failed: " ^ Printexc.to_string exn)))
+
+type epoch_binding = {
+  commit : string;
+  root : string;
+}
+
+let epoch_binding t epoch_id =
+  let branch = Printf.sprintf "epoch_%d" epoch_id in
+  let* commit = Store.Branch.find t.repo branch in
+  match commit with
+  | None -> Lwt.return_error "epoch Irmin binding is unavailable"
+  | Some commit ->
+      Lwt.return_ok {
+        commit = Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit);
+        root =
+          Irmin.Type.to_string Store.Hash.t
+            (Store.Tree.hash (Store.Commit.tree commit));
+      }
 
 let tag_epoch t epoch_id =
   let* head = Store.Head.find t.store in

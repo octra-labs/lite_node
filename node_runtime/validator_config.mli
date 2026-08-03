@@ -30,20 +30,12 @@ type t = {
 
 type persistent_update_deps = {
   read_pending : unit -> string option Lwt.t;
-  read_marker : string -> string option Lwt.t;
   log_invalid : string -> unit;
-  log_waiting :
-    activate_epoch:int64 ->
-    missing:string list ->
-    fingerprint:string ->
-    unit;
 }
 
 type persistent_update_node_deps = {
   read_pending : unit -> string option Lwt.t;
-  read_marker : string -> string option Lwt.t;
   warn : string -> unit;
-  current_height : unit -> int64;
 }
 
 type self_membership =
@@ -84,24 +76,12 @@ val pending_entries_of_raw :
   string option ->
   string list
 
-val readiness_missing :
-  runtime:Octra_core.Validator_ready_policy.runtime ->
-  requirements:Octra_core.Validator_ready_policy.requirements ->
-  update:Octra_core.Validator_set_update.t ->
-  (Octra_core.Validator_set_update.validator_entry * string option) list ->
-  string list
-
 val load_persistent_update :
   persistent_update_deps ->
-  runtime:Octra_core.Validator_ready_policy.runtime ->
-  requirements:Octra_core.Validator_ready_policy.requirements ->
-  current_height:int64 ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
 val load_node_persistent_update :
   persistent_update_node_deps ->
-  runtime:Octra_core.Validator_ready_policy.runtime ->
-  requirements:Octra_core.Validator_ready_policy.requirements ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
 val fingerprint_of_validator_set :

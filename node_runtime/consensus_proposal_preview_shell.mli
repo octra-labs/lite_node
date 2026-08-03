@@ -24,6 +24,7 @@ type deps = {
 
 val node_backend :
   program_trust:Octra_vm.Program_trust.t ->
+  rules:Octra_core.Rule_graph.t ->
   legacy_replay:
     (epoch:int ->
      address:string ->

@@ -4,6 +4,14 @@
 let error_json message =
   `Assoc [
     "ok", `Bool false;
+    "class", `String "rejected";
+    "error", `String message;
+  ]
+
+let unavailable_json message =
+  `Assoc [
+    "ok", `Bool false;
+    "class", `String "unavailable";
     "error", `String message;
   ]
 
@@ -25,6 +33,11 @@ let with_verifier_lane f =
     Fun.protect
       ~finally:(fun () -> Mutex.unlock verifier_lane)
       f
+
+let verification_value = function
+  | Ok () -> Ok true
+  | Error (VW.Proof_rejected _) -> Ok false
+  | Error failure -> Error (VW.verification_failure_message failure)
 
 let require_string fields key =
   match List.assoc_opt key fields with
@@ -199,18 +212,13 @@ let decode_range_proof_bounded value =
 let verify_zero_bounded pk ciphertext proof =
   match decode_verifier_cipher ciphertext, decode_zero_proof_bounded proof with
   | Ok cipher, Ok _ ->
-    begin
-      match
-        VW.verify_zero_sync
-          ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
-          ~cipher:(Crypto.FheBalance.encode_cipher cipher)
-          ~proof
-      with
-      | Ok () -> true
-      | Error _ -> false
-    end
+    VW.verify_zero_sync_classified
+      ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
+      ~cipher:(Crypto.FheBalance.encode_cipher cipher)
+      ~proof
+    |> verification_value
   | _ ->
-    false
+    Ok false
 
 let verify_range_bounded pk ciphertext proof amount_commitment =
   match
@@ -219,21 +227,16 @@ let verify_range_bounded pk ciphertext proof amount_commitment =
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok range_proof, Ok commitment ->
-    begin
-      match
-        VW.verify_range_bound_sync
-          ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
-          ~cipher:(Crypto.FheBalance.encode_cipher cipher)
-          ~proof:
-            (Crypto.FheBalance.range_proof_prefix
-             ^ Base64.encode_exn (Bytes.to_string range_proof))
-          ~commitment:(Base64.encode_exn (Bytes.to_string commitment))
-      with
-      | Ok () -> true
-      | Error _ -> false
-    end
+    VW.verify_range_bound_sync_classified
+      ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
+      ~cipher:(Crypto.FheBalance.encode_cipher cipher)
+      ~proof:
+        (Crypto.FheBalance.range_proof_prefix
+         ^ Base64.encode_exn (Bytes.to_string range_proof))
+      ~commitment:(Base64.encode_exn (Bytes.to_string commitment))
+    |> verification_value
   | _ ->
-    false
+    Ok false
 
 let verify_bound_bounded pk ciphertext proof amount_commitment =
   match
@@ -242,19 +245,14 @@ let verify_bound_bounded pk ciphertext proof amount_commitment =
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok _, Ok commitment ->
-    begin
-      match
-        VW.verify_claim_sync
-          ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
-          ~cipher:(Crypto.FheBalance.encode_cipher cipher)
-          ~proof
-          ~commitment:(Base64.encode_exn (Bytes.to_string commitment))
-      with
-      | Ok () -> true
-      | Error _ -> false
-    end
+    VW.verify_claim_sync_classified
+      ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
+      ~cipher:(Crypto.FheBalance.encode_cipher cipher)
+      ~proof
+      ~commitment:(Base64.encode_exn (Bytes.to_string commitment))
+    |> verification_value
   | _ ->
-    false
+    Ok false
 
 let run_action fields =
   let open Crypto.FheBalance in
@@ -422,76 +420,79 @@ let run_action fields =
   | Some (`String "verify_zero") ->
     begin
       match
-        with_verifier_lane
-          (fun () ->
-            match
-              require_pubkey fields "pubkey_b64",
-              require_string fields "ciphertext",
-              require_string fields "proof"
-            with
-            | Ok pk, Ok ciphertext, Ok proof ->
-              Ok (verify_zero_bounded pk ciphertext proof)
-            | Error e, _, _
-            | _, Error e, _
-            | _, _, Error e ->
-              Error e)
+        require_pubkey fields "pubkey_b64",
+        require_string fields "ciphertext",
+        require_string fields "proof"
       with
-      | Ok value -> value_json (`Bool value)
-      | Error e -> error_json e
+      | Ok pk, Ok ciphertext, Ok proof ->
+        begin
+          match
+            with_verifier_lane
+              (fun () -> verify_zero_bounded pk ciphertext proof)
+          with
+          | Ok value -> value_json (`Bool value)
+          | Error e -> unavailable_json e
+        end
+      | Error e, _, _
+      | _, Error e, _
+      | _, _, Error e ->
+        error_json e
     end
   | Some (`String "verify_range") ->
     begin
       match
-        with_verifier_lane
-          (fun () ->
-            match
-              require_pubkey fields "pubkey_b64",
-              require_string fields "ciphertext",
-              require_string fields "proof",
-              require_string fields "amount_commitment"
-            with
-            | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment ->
-              Ok
-                (verify_range_bounded
-                   pk
-                   ciphertext
-                   proof
-                   amount_commitment)
-            | Error e, _, _, _
-            | _, Error e, _, _
-            | _, _, Error e, _
-            | _, _, _, Error e ->
-              Error e)
+        require_pubkey fields "pubkey_b64",
+        require_string fields "ciphertext",
+        require_string fields "proof",
+        require_string fields "amount_commitment"
       with
-      | Ok value -> value_json (`Bool value)
-      | Error e -> error_json e
+      | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment ->
+        begin
+          match
+            with_verifier_lane
+              (fun () ->
+                verify_range_bounded
+                  pk
+                  ciphertext
+                  proof
+                  amount_commitment)
+          with
+          | Ok value -> value_json (`Bool value)
+          | Error e -> unavailable_json e
+        end
+      | Error e, _, _, _
+      | _, Error e, _, _
+      | _, _, Error e, _
+      | _, _, _, Error e ->
+        error_json e
     end
   | Some (`String "verify_bound") ->
     begin
       match
-        with_verifier_lane
-          (fun () ->
-            match
-              require_pubkey fields "pubkey_b64",
-              require_string fields "ciphertext",
-              require_string fields "proof",
-              require_string fields "amount_commitment"
-            with
-            | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment ->
-              Ok
-                (verify_bound_bounded
-                   pk
-                   ciphertext
-                   proof
-                   amount_commitment)
-            | Error e, _, _, _
-            | _, Error e, _, _
-            | _, _, Error e, _
-            | _, _, _, Error e ->
-              Error e)
+        require_pubkey fields "pubkey_b64",
+        require_string fields "ciphertext",
+        require_string fields "proof",
+        require_string fields "amount_commitment"
       with
-      | Ok value -> value_json (`Bool value)
-      | Error e -> error_json e
+      | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment ->
+        begin
+          match
+            with_verifier_lane
+              (fun () ->
+                verify_bound_bounded
+                  pk
+                  ciphertext
+                  proof
+                  amount_commitment)
+          with
+          | Ok value -> value_json (`Bool value)
+          | Error e -> unavailable_json e
+        end
+      | Error e, _, _, _
+      | _, Error e, _, _
+      | _, _, Error e, _
+      | _, _, _, Error e ->
+        error_json e
     end
   | Some (`String action) ->
     error_json ("unsupported action: " ^ action)
@@ -508,8 +509,8 @@ let call_json input_json =
         run_action fields
       | _ ->
         error_json "invalid payload"
-    with e ->
-      error_json (Printexc.to_string e)
+    with _ ->
+      unavailable_json "hfhe backend exception"
   in
   Yojson.Safe.to_string output_json
 

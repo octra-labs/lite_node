@@ -6,6 +6,8 @@ open Lwt.Syntax
 module Contract = Octra_vm.Contract
 module ContractVM = Octra_vm.Contract_vm
 
+exception Execution_unavailable of string
+
 type call_result = {
   receipt : Contract.exec_result;
   storage_tbl : (string, string) Hashtbl.t;
@@ -1008,7 +1010,9 @@ let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(d
   let* loaded_result = Circle_program.load ~trusted store circle_id in
   timing_mark "load_program";
   match loaded_result with
-  | Error e -> finish (failed_receipt e)
+  | Error e ->
+    finish
+      (failed_receipt (Octra_core.Circle_wasm_host.error_message e))
   | Ok loaded ->
     begin
       match loaded.code with
@@ -1127,11 +1131,13 @@ let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(d
                             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
                             ~public_reads:public_reads.snapshots
                             ~fuel_limit:(wasm_fuel_limit wasm_limit)
-                            ~is_view:true in
+                            ~is_view:true
+                            ~update_policy:false in
                         timing_mark "native_execute";
                         begin
                           match wasm_result with
-                          | Error e ->
+                          | Error (Octra_core.Circle_wasm_host.Rejected e)
+                          | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
                             finish (failed_receipt e)
                           | Ok result ->
                             let events =
@@ -1258,10 +1264,14 @@ and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(l
 let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
     ?(limit=1_000_000)
     ?(hfhe_mode=Octra_core.Circle_hfhe_transcript.Direct)
+    ?(update_policy=false)
     store circle_id method_name params caller value =
   let* loaded_result = Circle_program.load ~trusted store circle_id in
   match loaded_result with
-  | Error e -> Lwt.return (failed_call_result e)
+  | Error (Octra_core.Circle_wasm_host.Rejected e) ->
+    Lwt.return (failed_call_result e)
+  | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
+    Lwt.fail (Execution_unavailable e)
   | Ok loaded ->
     let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
     begin
@@ -1403,11 +1413,14 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
                               ~hfhe_mode
                               ~public_reads:public_reads.snapshots
                               ~fuel_limit:(wasm_fuel_limit wasm_limit)
-                              ~is_view:false in
+                              ~is_view:false
+                              ~update_policy in
                           begin
                             match wasm_result with
-                            | Error e ->
+                            | Error (Octra_core.Circle_wasm_host.Rejected e) ->
                               Lwt.return (failed_call_result e)
+                            | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
+                              Lwt.fail (Execution_unavailable e)
                             | Ok result ->
                               let events =
                                 List.map

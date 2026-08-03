@@ -348,6 +348,34 @@ let of_string s =
   try s |> Yojson.Safe.from_string |> of_yojson
   with exn -> Error (Printexc.to_string exn)
 
+let validator_set update =
+  let entries =
+    List.fold_left
+      (fun state entry ->
+        match state, Base64.decode entry.pubkey_b64 with
+        | Error _ as error, _ -> error
+        | Ok _, Error (`Msg reason) -> Error reason
+        | Ok items, Ok pubkey ->
+            Ok (
+              (Octra_consensus.C_types.{
+                address = entry.address;
+                pubkey;
+              }, entry.weight)
+              :: items))
+      (Ok [])
+      update.validators
+    |> Result.map List.rev
+  in
+  match entries with
+  | Error _ as error -> error
+  | Ok entries when update.weighted ->
+      Octra_consensus.C_types.make_weighted_validator_set entries
+  | Ok entries ->
+      Ok (
+        entries
+        |> List.map fst
+        |> Octra_consensus.C_types.make_validator_set)
+
 let empty_ready_extra = {
   chain_id = None;
   binary_hash = None;

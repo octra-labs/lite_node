@@ -5,6 +5,7 @@ module Checkpoint = Octra_bootstrap.State_sync_checkpoint
 module Manifest = Octra_bootstrap.State_sync_manifest
 module Journal = Octra_bootstrap.State_sync_journal
 module State_sync = Octra_bootstrap.State_sync
+module Sync_anchor = Octra_bootstrap.Sync_anchor
 module Verify = Octra_bootstrap.State_sync_verify
 
 let command = ref ""
@@ -18,13 +19,14 @@ let draft_path = ref ""
 let certificate_path = ref ""
 let wallet_path = ref ""
 let checkpoint_signature_paths = ref []
-let exporter_signature_path = ref ""
+let exporter_signature_paths = ref []
+let finality_path = ref ""
 let validator_entries = ref []
 let exporter_entries = ref []
 let historical = ref false
 
 let usage =
-  "octra_state_sync_manifest --command seal|build|sign-checkpoint|sign-manifest|assemble|verify"
+  "octra_state_sync_manifest --command seal|build|sign-checkpoint|sign-manifest|assemble|assemble-finalized|verify"
 
 let options = [
   "--command", Arg.Set_string command, "operation";
@@ -41,8 +43,10 @@ let options = [
   "--checkpoint-signature",
     Arg.String (fun value -> checkpoint_signature_paths := value :: !checkpoint_signature_paths),
     "checkpoint signature path";
-  "--exporter-signature", Arg.Set_string exporter_signature_path,
+  "--exporter-signature",
+    Arg.String (fun value -> exporter_signature_paths := value :: !exporter_signature_paths),
     "exporter signature path";
+  "--finality", Arg.Set_string finality_path, "finality journal or encoded certificate";
   "--validator", Arg.String (fun value -> validator_entries := value :: !validator_entries),
     "trusted validator address:pubkey";
   "--exporter", Arg.String (fun value -> exporter_entries := value :: !exporter_entries),
@@ -84,6 +88,40 @@ let parse_signature path =
   in
   match Checkpoint.parse_signature json with
   | Ok signature -> signature
+  | Error reason -> fail reason
+
+let load_finality () =
+  let raw = read_file_limited (require "finality" !finality_path) 4_000_000 in
+  let encoded =
+    match try Some (Yojson.Safe.from_string raw) with _ -> None with
+    | Some (`Assoc fields) ->
+        begin
+          match
+            List.assoc_opt "finalize" fields,
+            List.assoc_opt "validator_set" fields
+          with
+          | Some (`String finalize), Some (`String validator_set) ->
+              let value =
+                Sync_anchor.make
+                  ~steps:[]
+                  ~finalize:(
+                    finalize
+                    |> Base64.decode_exn
+                    |> Octra_consensus.C_codec.decode_finalize)
+                  ~validator_set:(
+                    validator_set
+                    |> Base64.decode_exn
+                    |> Octra_consensus.C_codec.decode_validator_set)
+              in
+              Sync_anchor.encode value
+          | _ -> fail "finality journal fields are incomplete"
+        end
+    | Some (`String value) -> value
+    | Some _ -> fail "finality input is invalid"
+    | None -> String.trim raw
+  in
+  match Sync_anchor.decode encoded with
+  | Ok _ -> encoded
   | Error reason -> fail reason
 
 let signer_set name entries =
@@ -332,21 +370,25 @@ let sign_manifest () =
 let assemble () =
   let draft = load_draft () in
   if !source_dir <> "" then verify_snapshot draft !source_dir;
-  let checkpoint_signatures =
+  let quorum_signatures =
     List.rev !checkpoint_signature_paths
     |> List.map parse_signature
     |> List.sort (fun left right -> String.compare left.Checkpoint.signer right.signer)
   in
-  let exporter_signature =
-    parse_signature (require "exporter-signature" !exporter_signature_path)
+  let exporter_signatures =
+    List.rev !exporter_signature_paths
+    |> List.map parse_signature
+    |> List.sort (fun left right -> String.compare left.Checkpoint.signer right.signer)
   in
+  if List.length exporter_signatures <> 1 then
+    fail "checkpoint certificate requires one exporter signature";
   let certificate = Manifest.{
     checkpoint = draft.checkpoint;
     checkpoint_hash = draft.checkpoint_hash;
-    checkpoint_signatures;
+    authority = Checkpoint_quorum quorum_signatures;
     manifest = draft.manifest;
     manifest_hash = draft.manifest_hash;
-    exporter_signature;
+    exporter_signatures;
   } in
   let validators = validator_set () in
   let exporters = exporter_set () in
@@ -360,9 +402,40 @@ let assemble () =
         "event = certificate_assembled checkpoint = %s manifest = %s signatures = %d quorum = %d exporter = %s\n%!"
         verified.checkpoint_hash
         verified.manifest_hash
-        (List.length verified.checkpoint_signatures)
+        (List.length (Manifest.checkpoint_signatures verified))
         validators.Octra_consensus.C_types.quorum
-        verified.exporter_signature.signer
+        (List.hd verified.exporter_signatures).signer
+
+let assemble_finalized () =
+  let draft = load_draft () in
+  if !source_dir <> "" then verify_snapshot draft !source_dir;
+  let finality_blob = load_finality () in
+  let exporter_signatures =
+    List.rev !exporter_signature_paths
+    |> List.map parse_signature
+    |> List.sort (fun left right -> String.compare left.Checkpoint.signer right.signer)
+  in
+  let certificate = Manifest.{
+    checkpoint = draft.checkpoint;
+    checkpoint_hash = draft.checkpoint_hash;
+    authority = Finalized finality_blob;
+    manifest = draft.manifest;
+    manifest_hash = draft.manifest_hash;
+    exporter_signatures;
+  } in
+  let validators = validator_set () in
+  let exporters = exporter_set () in
+  match Manifest.verify_certificate ~validator_set:validators ~exporter_set:exporters certificate with
+  | Error reason -> fail reason
+  | Ok verified ->
+      Manifest.write_json
+        (require "output" !output_path)
+        (Manifest.certificate_json verified);
+      Printf.printf
+        "event = certificate_assembled checkpoint = %s manifest = %s finality = true exporters = %d required = 1\n%!"
+        verified.checkpoint_hash
+        verified.manifest_hash
+        (List.length verified.exporter_signatures)
 
 let verify () =
   let certificate = load_certificate () in
@@ -385,7 +458,7 @@ let verify () =
         verified.checkpoint_hash
         verified.manifest_hash
         verified.checkpoint.epoch
-        (List.length verified.checkpoint_signatures)
+        (List.length (Manifest.checkpoint_signatures verified))
         verified.manifest.file_count
         verified.manifest.chunk_count
 
@@ -397,10 +470,11 @@ let run () =
   | "sign-checkpoint" -> sign_checkpoint ()
   | "sign-manifest" -> sign_manifest ()
   | "assemble" -> assemble ()
+  | "assemble-finalized" -> assemble_finalized ()
   | "verify" -> verify ()
   | _ ->
       fail
-        "command must be seal, build, sign-checkpoint, sign-manifest, assemble or verify"
+        "command must be seal, build, sign-checkpoint, sign-manifest, assemble, assemble-finalized or verify"
 
 let () =
   run ()

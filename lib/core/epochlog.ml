@@ -66,6 +66,19 @@ type t = {
   mutable tip : epoch_header option;
 }
 
+type read_error =
+  | Log_header_truncated
+  | Log_header_marker
+  | Log_header_version of int
+  | Log_prefix_truncated of int
+  | Log_length_invalid of int * int
+  | Log_record_truncated of int
+  | Log_checksum_mismatch of int
+  | Log_payload_invalid of int
+  | Log_epoch_duplicate of int
+  | Log_record_rejected of int * string
+  | Log_io of string
+
 let write_u32_le buf off v =
   Bytes.set_uint8 buf off (v land 0xFF);
   Bytes.set_uint8 buf (off+1) ((v lsr 8) land 0xFF);
@@ -86,6 +99,42 @@ let record_length_valid ~remaining record_len =
 let checksum payload =
   let d = Digestif.SHA256.digest_string payload in
   String.sub (Digestif.SHA256.to_raw_string d) 0 4
+
+let read_error_message = function
+  | Log_header_truncated -> "epochlog header is truncated"
+  | Log_header_marker -> "epochlog header marker is invalid"
+  | Log_header_version actual ->
+      Printf.sprintf "epochlog header format is invalid: %d" actual
+  | Log_prefix_truncated offset ->
+      Printf.sprintf "epochlog record prefix is truncated: offset = %d" offset
+  | Log_length_invalid (offset, length) ->
+      Printf.sprintf
+        "epochlog record length is invalid: offset = %d length = %d"
+        offset
+        length
+  | Log_record_truncated offset ->
+      Printf.sprintf "epochlog record is truncated: offset = %d" offset
+  | Log_checksum_mismatch offset ->
+      Printf.sprintf "epochlog checksum mismatch: offset = %d" offset
+  | Log_payload_invalid offset ->
+      Printf.sprintf "epochlog payload is invalid: offset = %d" offset
+  | Log_epoch_duplicate epoch ->
+      Printf.sprintf "epochlog contains duplicate epoch: %d" epoch
+  | Log_record_rejected (offset, reason) ->
+      Printf.sprintf
+        "epochlog record rejected: offset = %d reason = %s"
+        offset
+        reason
+  | Log_io reason -> "epochlog scan failed: " ^ reason
+
+let read_exact fd buffer offset length =
+  let rec loop position remaining =
+    if remaining = 0 then true
+    else
+      let count = Unix.read fd buffer position remaining in
+      count > 0 && loop (position + count) (remaining - count)
+  in
+  loop offset length
 
 let epoch_to_json h =
   let rewards_json =
@@ -305,6 +354,70 @@ let read_all t =
     pos := !pos + 4 + record_len
   done with Exit -> ());
   List.rev !results
+
+let fold_strict t ~init ~f =
+  let inspect () =
+    let size = (Unix.fstat t.fd).Unix.st_size in
+    let header = Bytes.create header_size in
+    ignore (Unix.lseek t.fd 0 Unix.SEEK_SET);
+    if size < header_size || not (read_exact t.fd header 0 header_size) then
+      Error Log_header_truncated
+    else if Bytes.sub_string header 0 4 <> magic then
+      Error Log_header_marker
+    else
+      let actual_version =
+        Bytes.get_uint8 header 4 lor (Bytes.get_uint8 header 5 lsl 8)
+      in
+      if actual_version <> 1 && actual_version <> version then
+        Error (Log_header_version actual_version)
+      else
+        let seen = Hashtbl.create 1024 in
+        let rec records state offset =
+          if offset = size then Ok state
+          else if size - offset < 4 then
+            Error (Log_prefix_truncated offset)
+          else
+            let prefix = Bytes.create 4 in
+            ignore (Unix.lseek t.fd offset Unix.SEEK_SET);
+            if not (read_exact t.fd prefix 0 4) then
+              Error (Log_prefix_truncated offset)
+            else
+              let length = read_u32_le prefix 0 in
+              let remaining = size - offset - 4 in
+              if not (record_length_valid ~remaining length) then
+                Error (Log_length_invalid (offset, length))
+              else
+                let bytes = Bytes.create length in
+                if not (read_exact t.fd bytes 0 length) then
+                  Error (Log_record_truncated offset)
+                else
+                  let payload_length = length - 4 in
+                  let payload = Bytes.sub_string bytes 0 payload_length in
+                  let stored = Bytes.sub_string bytes payload_length 4 in
+                  if stored <> checksum payload then
+                    Error (Log_checksum_mismatch offset)
+                  else
+                    match epoch_of_json payload with
+                    | None -> Error (Log_payload_invalid offset)
+                    | Some epoch when Hashtbl.mem seen epoch.id ->
+                        Error (Log_epoch_duplicate epoch.id)
+                    | Some epoch ->
+                        Hashtbl.add seen epoch.id ();
+                        match f state epoch with
+                        | Error reason -> Error (Log_record_rejected (offset, reason))
+                        | Ok state -> records state (offset + 4 + length)
+        in
+        records init header_size
+  in
+  try inspect () with
+  | Unix.Unix_error (error, call, path) ->
+      Error (Log_io (Printf.sprintf "%s: %s: %s" call path (Unix.error_message error)))
+  | Sys_error reason -> Error (Log_io reason)
+
+let read_all_strict t =
+  match fold_strict t ~init:[] ~f:(fun items epoch -> Ok (epoch :: items)) with
+  | Error _ as error -> error
+  | Ok items -> Ok (List.rev items)
 
 let last t = t.tip
 

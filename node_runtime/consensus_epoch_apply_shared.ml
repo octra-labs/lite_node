@@ -45,6 +45,7 @@ type runtime = {
   notify_confirmed : Transaction.t -> int -> unit;
   notify_rejected : Transaction.t -> string -> unit;
   program_trust : Octra_vm.Program_trust.t;
+  circle_mode : Octra_core.Rule_graph.mode;
   legacy_replay :
     epoch:int ->
     address:string ->
@@ -62,6 +63,7 @@ type node_runtime = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   program_trust : Octra_vm.Program_trust.t;
+  rules : Octra_core.Rule_graph.t;
   wallet_addr : string;
   pre_state_hash : string;
   standard_env : unit -> Epoch_exec.env;
@@ -198,6 +200,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
                   ?save_receipt_raw
                   ~backend:(Lazy.force backend)
                   ~env:(Lazy.force env)
+                  ~circle_mode:runtime.circle_mode
                   ~program_trust:runtime.program_trust
                   tx
             in
@@ -320,6 +323,16 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
   | Error e ->
     Lwt.fail_with ("finalized preverify gate failed: " ^ e)
   | Ok () ->
+    let circle_mode =
+      match
+        Octra_core.Rule_graph.circle
+          runtime.rules
+          ~epoch:(runtime.current_epoch ())
+      with
+      | Ok mode -> mode
+      | Error fault ->
+        failwith (Octra_core.Rule_graph.fault_message fault)
+    in
     let* () =
       run_runtime
         ?preverify
@@ -346,6 +359,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         notify_confirmed = runtime.notify_confirmed;
         notify_rejected = runtime.notify_rejected;
         program_trust = runtime.program_trust;
+        circle_mode;
         legacy_replay = runtime.legacy_replay;
         private_result_policy = runtime.private_result_policy;
         add_rejected_fee = (fun fee ->

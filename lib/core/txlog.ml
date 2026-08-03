@@ -5,6 +5,28 @@ let magic = "OTXL"
 let version = 1
 let header_size = 16
 let max_segment_size = 1_073_741_824
+let max_record_len = 128_000_000
+
+type scan_record = {
+  segment : int;
+  offset : int;
+  length : int;
+  epoch : int;
+  payload : string;
+}
+
+type scan_error =
+  | Segment_missing of int
+  | Header_truncated of int
+  | Header_marker of int
+  | Header_version of int * int
+  | Header_segment of int * int
+  | Prefix_truncated of int * int
+  | Length_invalid of int * int * int
+  | Record_truncated of int * int
+  | Checksum_mismatch of int * int
+  | Record_rejected of int * int * string
+  | Scan_io of string
 
 type t = {
   dir : string;
@@ -32,6 +54,57 @@ let read_u32_le buf off =
 let checksum epoch_bytes payload =
   let d = Digestif.SHA256.digest_string (epoch_bytes ^ payload) in
   String.sub (Digestif.SHA256.to_raw_string d) 0 4
+
+let scan_error_message = function
+  | Segment_missing segment ->
+      Printf.sprintf "txlog segment is missing: %d" segment
+  | Header_truncated segment ->
+      Printf.sprintf "txlog header is truncated: %d" segment
+  | Header_marker segment ->
+      Printf.sprintf "txlog header marker is invalid: segment = %d" segment
+  | Header_version (segment, actual) ->
+      Printf.sprintf
+        "txlog header format is invalid: segment = %d value = %d"
+        segment
+        actual
+  | Header_segment (expected, actual) ->
+      Printf.sprintf
+        "txlog header segment mismatch: expected = %d actual = %d"
+        expected
+        actual
+  | Prefix_truncated (segment, offset) ->
+      Printf.sprintf
+        "txlog record prefix is truncated: segment = %d offset = %d"
+        segment
+        offset
+  | Length_invalid (segment, offset, length) ->
+      Printf.sprintf
+        "txlog record length is invalid: segment = %d offset = %d length = %d"
+        segment offset length
+  | Record_truncated (segment, offset) ->
+      Printf.sprintf
+        "txlog record is truncated: segment = %d offset = %d"
+        segment
+        offset
+  | Checksum_mismatch (segment, offset) ->
+      Printf.sprintf
+        "txlog checksum mismatch: segment = %d offset = %d"
+        segment
+        offset
+  | Record_rejected (segment, offset, reason) ->
+      Printf.sprintf
+        "txlog record rejected: segment = %d offset = %d reason = %s"
+        segment offset reason
+  | Scan_io reason -> "txlog scan failed: " ^ reason
+
+let read_exact fd buffer offset length =
+  let rec loop position remaining =
+    if remaining = 0 then true
+    else
+      let count = Unix.read fd buffer position remaining in
+      count > 0 && loop (position + count) (remaining - count)
+  in
+  loop offset length
 
 let write_header fd seg_id =
   let buf = Bytes.make header_size '\000' in
@@ -270,6 +343,79 @@ let scan_all t f =
     Unix.close fd;
     incr seg_id
   done
+
+let fold_strict t ~init ~f =
+  let inspect_segment state segment =
+    let path = seg_path t.dir segment in
+    if not (Sys.file_exists path) then Error (Segment_missing segment)
+    else
+      let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+      Fun.protect
+        ~finally:(fun () -> Unix.close fd)
+        (fun () ->
+          let size = (Unix.fstat fd).Unix.st_size in
+          let header = Bytes.create header_size in
+          ignore (Unix.lseek fd 0 Unix.SEEK_SET);
+          if size < header_size || not (read_exact fd header 0 header_size) then
+            Error (Header_truncated segment)
+          else if Bytes.sub_string header 0 4 <> magic then
+            Error (Header_marker segment)
+          else
+            let actual_version =
+              Bytes.get_uint8 header 4 lor (Bytes.get_uint8 header 5 lsl 8)
+            in
+            if actual_version <> version then
+              Error (Header_version (segment, actual_version))
+            else
+              let actual_segment = read_u32_le header 6 in
+              if actual_segment <> segment then
+                Error (Header_segment (segment, actual_segment))
+              else
+                let rec records state offset =
+                  if offset = size then Ok state
+                  else if size - offset < 4 then
+                    Error (Prefix_truncated (segment, offset))
+                  else
+                    let prefix = Bytes.create 4 in
+                    ignore (Unix.lseek fd offset Unix.SEEK_SET);
+                    if not (read_exact fd prefix 0 4) then
+                      Error (Prefix_truncated (segment, offset))
+                    else
+                      let length = read_u32_le prefix 0 in
+                      let remaining = size - offset - 4 in
+                      if length < 8 || length > max_record_len || length > remaining then
+                        Error (Length_invalid (segment, offset, length))
+                      else
+                        let bytes = Bytes.create length in
+                        if not (read_exact fd bytes 0 length) then
+                          Error (Record_truncated (segment, offset))
+                        else
+                          let epoch = read_u32_le bytes 0 in
+                          let payload_length = length - 8 in
+                          let payload = Bytes.sub_string bytes 4 payload_length in
+                          let epoch_bytes = Bytes.sub_string bytes 0 4 in
+                          let stored = Bytes.sub_string bytes (4 + payload_length) 4 in
+                          if stored <> checksum epoch_bytes payload then
+                            Error (Checksum_mismatch (segment, offset))
+                          else
+                            let record = { segment; offset; length; epoch; payload } in
+                            match f state record with
+                            | Error reason -> Error (Record_rejected (segment, offset, reason))
+                            | Ok state -> records state (offset + 4 + length)
+                in
+                records state header_size)
+  in
+  let rec segments state segment =
+    if segment > t.current_seg then Ok state
+    else
+      match inspect_segment state segment with
+      | Error _ as error -> error
+      | Ok state -> segments state (segment + 1)
+  in
+  try segments init 0 with
+  | Unix.Unix_error (error, call, path) ->
+      Error (Scan_io (Printf.sprintf "%s: %s: %s" call path (Unix.error_message error)))
+  | Sys_error reason -> Error (Scan_io reason)
 
 let current_position t =
   (t.current_seg, t.current_offset)

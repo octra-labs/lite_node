@@ -62,9 +62,7 @@ type admission_deps = {
 
 type persistent_update_deps = {
   read_pending : unit -> string option Lwt.t;
-  read_marker : string -> string option Lwt.t;
   warn : string -> unit;
-  current_height : unit -> int64;
 }
 
 type node_view = {
@@ -100,7 +98,6 @@ type node_start_runtime = {
   voting : bool;
   role_label : string;
   read_persistent_pending : unit -> string option Lwt.t;
-  read_persistent_marker : string -> string option Lwt.t;
   current_height : unit -> int64;
 }
 
@@ -260,33 +257,12 @@ let admit_validator_startup (deps : admission_deps) ~address ~voting
          refuse = deps.refuse;
        }
 
-let load_persistent_update (deps : persistent_update_deps) ~runtime
-    ~requirements =
+let load_persistent_update (deps : persistent_update_deps) =
   Validator_config.load_node_persistent_update
     Validator_config.{
       read_pending = deps.read_pending;
-      read_marker = deps.read_marker;
       warn = deps.warn;
-      current_height = deps.current_height;
     }
-    ~runtime
-    ~requirements
-
-let load_irmin_persistent_update ~store ~warn ~current_height ~runtime
-    ~requirements =
-  load_persistent_update
-    {
-      read_pending = (fun () ->
-        Octra_core.Store_irmin.get_meta
-          store
-          Octra_core.Validator_set_update.pending_meta_key);
-      read_marker = (fun key ->
-        Octra_core.Store_irmin.get_meta store key);
-      warn;
-      current_height;
-    }
-    ~runtime
-    ~requirements
 
 let admission_deps_of_runtime runtime =
   {
@@ -302,16 +278,11 @@ let admission_deps_of_runtime runtime =
 let persistent_update_deps_of_runtime runtime =
   {
     read_pending = runtime.read_persistent_pending;
-    read_marker = runtime.read_persistent_marker;
     warn = runtime.warn;
-    current_height = runtime.current_height;
   }
 
-let load_runtime_persistent_update runtime view =
-  load_persistent_update
-    (persistent_update_deps_of_runtime runtime)
-    ~runtime:view.readiness_runtime
-    ~requirements:view.readiness_requirements
+let load_runtime_persistent_update runtime =
+  load_persistent_update (persistent_update_deps_of_runtime runtime)
 
 let validator_pubkeys validator_set =
   validator_set.Octra_consensus.C_types.validators
@@ -383,7 +354,7 @@ let start_node runtime =
       view;
       load_scheduled_validator_set_config = (fun () ->
         let open Lwt.Syntax in
-        let* loaded = load_runtime_persistent_update runtime view in
+        let* loaded = load_runtime_persistent_update runtime in
         match loaded with
         | None -> Lwt.return_none
         | Some config ->

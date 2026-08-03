@@ -978,7 +978,8 @@ let process_circle_program_update_tx ~(backend : backend) (tx : Transaction.t) =
                       | Error e ->
                         Lwt.return
                           (Stdlib.Error
-                             ("circle_runtime_invalid", e))
+                             ("circle_runtime_invalid",
+                              Circle_wasm_host.error_message e))
                     end
                 in
                 begin
@@ -2618,42 +2619,11 @@ let process_validator_evidence_tx ~backend ~env tx =
             end
         end
 
-let process_validator_set_update_tx ~backend ~env tx =
-  let open Lwt.Syntax in
-  if not
-       (Validator_policy.manual_update_allowed
-          backend.validator_policy
-          ~epoch:env.epoch_id)
-  then
-    Lwt.return
-      (Stdlib.Error
-         ("validator_set_update_rejected",
-          "manual validator updates are disabled"))
-  else if not (List.mem tx.Transaction.from env.validator_addrs) then
-    Lwt.return (Stdlib.Error ("validator_set_update_rejected", "sender is not an active validator"))
-  else if Z.sign tx.Transaction.amount <> 0 then
-    Lwt.return (Stdlib.Error ("validator_set_update_rejected", "amount must be zero"))
-  else
-    match Validator_set_update.of_message tx.Transaction.message with
-    | Error e -> Lwt.return (Stdlib.Error ("malformed_transaction", e))
-    | Ok update ->
-      if update.Validator_set_update.weighted then
-        Lwt.return
-          (Stdlib.Error
-             ("validator_set_update_rejected",
-              "weighted validator updates are protocol generated"))
-      else if Int64.compare update.Validator_set_update.activate_epoch (Int64.of_int env.epoch_id) <= 0 then
-        Lwt.return (Stdlib.Error ("validator_set_update_rejected", "activation epoch must be in the future"))
-      else
-        match backend.ops.debit tx.from tx.ou tx.nonce with
-        | Error err -> Lwt.return (Stdlib.Error ("insufficient_balance", err))
-        | Ok () ->
-          let* () =
-            backend.set_meta
-              Validator_set_update.pending_meta_key
-              (Validator_set_update.to_string update)
-          in
-          Lwt.return (Stdlib.Ok tx.ou)
+let process_validator_set_update_tx ~backend:_ ~env:_ _tx =
+  Lwt.return
+    (Stdlib.Error
+       ("validator_set_update_rejected",
+        "manual validator updates are disabled"))
 
 let normalize_ready_state_root value =
   if String.length value = 32 then

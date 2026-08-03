@@ -48,7 +48,6 @@ type deps = {
   read_head_hash : unit -> string option;
   get_meta : string -> string option;
   read_persistent_pending : unit -> string option Lwt.t;
-  read_persistent_marker : string -> string option Lwt.t;
   root_of_head_hash : string -> string;
   root_to_raw32 : string -> string;
   raw_to_hex : string -> string;

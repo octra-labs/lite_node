@@ -18,6 +18,8 @@ type read_result =
   | Valid of record
   | Invalid of string
 
+val history_limit : int64
+
 val persist_certificate :
   string ->
   validator_set:Octra_consensus.C_types.validator_set ->

@@ -4,6 +4,7 @@
 type deps = {
   p2p_port : int;
   rpc : unit -> unit Lwt.t;
+  services : (unit -> unit Lwt.t) list;
   observer : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
@@ -34,6 +35,7 @@ let run deps =
       Startup_run_shell.{
         p2p = p2p deps.p2p_port;
         rpc = deps.rpc;
+        services = deps.services;
         observer = deps.observer;
         tick_loop = deps.tick_loop;
         swarm = deps.swarm;

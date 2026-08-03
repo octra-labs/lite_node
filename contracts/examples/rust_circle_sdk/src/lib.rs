@@ -2165,7 +2165,7 @@ fn nibble_hex(value: u8) -> char {
 }
 
 #[link(wasm_import_module = "octra")]
-unsafe extern "C" {
+extern "C" {
     fn host_response_reset() -> i32;
     fn host_response_write(ptr: *const u8, len: i32) -> i32;
     fn host_response_finish(status_code: i32) -> i32;

@@ -43,7 +43,7 @@ static void copy_to_malloc_string(value v_string, uint8_t** out_ptr, size_t* out
 
 CAMLprim value caml_octra_circle_wasm_host_run_json(value v_input) {
   CAMLparam1(v_input);
-  CAMLlocal1(v_output);
+  CAMLlocal2(v_payload, v_result);
 
   uint8_t* input_ptr = NULL;
   size_t input_len = 0;
@@ -72,28 +72,24 @@ CAMLprim value caml_octra_circle_wasm_host_run_json(value v_input) {
   caml_acquire_runtime_system();
   free(input_ptr);
 
-  if (rc != 0) {
-    if (err_ptr != NULL && err_len > 0) {
-      char* message = malloc(err_len + 1);
-      if (message == NULL) {
-        octra_circle_wasm_host_free_bytes(err_ptr, err_len);
-        caml_failwith("octra_circle_wasm_host: alloc failed");
-      }
-      memcpy(message, err_ptr, err_len);
-      message[err_len] = '\0';
-      octra_circle_wasm_host_free_bytes(err_ptr, err_len);
-      caml_failwith(message);
+  if (rc == 0) {
+    v_payload = caml_alloc_string(out_len);
+    if (out_len > 0 && out_ptr != NULL) {
+      memcpy(Bytes_val(v_payload), out_ptr, out_len);
+      octra_circle_wasm_host_free_bytes(out_ptr, out_len);
     }
-    caml_failwith("octra_circle_wasm_host: unknown error");
+  } else {
+    v_payload = caml_alloc_string(err_len);
+    if (err_len > 0 && err_ptr != NULL) {
+      memcpy(Bytes_val(v_payload), err_ptr, err_len);
+      octra_circle_wasm_host_free_bytes(err_ptr, err_len);
+    }
   }
 
-  v_output = caml_alloc_string(out_len);
-  if (out_len > 0 && out_ptr != NULL) {
-    memcpy(Bytes_val(v_output), out_ptr, out_len);
-    octra_circle_wasm_host_free_bytes(out_ptr, out_len);
-  }
-
-  CAMLreturn(v_output);
+  v_result = caml_alloc_tuple(2);
+  Store_field(v_result, 0, Val_int(rc));
+  Store_field(v_result, 1, v_payload);
+  CAMLreturn(v_result);
 }
 
 static int hfhe_call_json_locked(

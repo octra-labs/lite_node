@@ -30,20 +30,12 @@ type t = {
 
 type persistent_update_deps = {
   read_pending : unit -> string option Lwt.t;
-  read_marker : string -> string option Lwt.t;
   log_invalid : string -> unit;
-  log_waiting :
-    activate_epoch:int64 ->
-    missing:string list ->
-    fingerprint:string ->
-    unit;
 }
 
 type persistent_update_node_deps = {
   read_pending : unit -> string option Lwt.t;
-  read_marker : string -> string option Lwt.t;
   warn : string -> unit;
-  current_height : unit -> int64;
 }
 
 type self_membership =
@@ -77,75 +69,28 @@ let validator_list_of_entries entries =
   List.filter_map validator_info_of_entry entries
 
 let driver_config_of_update update =
-  let validators =
-    update.Octra_core.Validator_set_update.validators
-    |> List.filter_map (fun v ->
-      match Validators.raw32_of_base64 v.Octra_core.Validator_set_update.pubkey_b64 with
-      | Some raw32 ->
-        Some (
-          Octra_consensus.C_types.{
-            address = v.address;
-            pubkey = raw32;
-          },
-          v.weight)
-      | None -> None)
-  in
-  if validators = [] then None
-  else
-    let validator_set =
-      if update.weighted then
-        Octra_consensus.C_types.make_weighted_validator_set validators
-      else
-        Ok (
-          validators
-          |> List.map fst
-          |> Octra_consensus.C_engine.make_validator_set)
-    in
-    match validator_set with
-    | Error _ -> None
-    | Ok validator_set ->
-      Some Octra_consensus.C_driver.{
-        activate_epoch = update.activate_epoch;
-        validator_set;
-        fingerprint = update.fingerprint;
-      }
+  match Octra_core.Validator_set_update.validator_set update with
+  | Error _ -> None
+  | Ok validator_set ->
+    Some Octra_consensus.C_driver.{
+      activate_epoch = update.activate_epoch;
+      validator_set;
+      fingerprint = update.fingerprint;
+    }
 
 let pending_entries_of_raw = function
   | None -> []
   | Some raw ->
     match Octra_core.Validator_set_update.of_string raw with
     | Error _ -> []
-    | Ok update ->
+    | Ok update when update.weighted ->
       List.map
         (fun v ->
           v.Octra_core.Validator_set_update.address ^ ":" ^ v.pubkey_b64)
         update.validators
+    | Ok _ -> []
 
-let readiness_missing ~runtime ~requirements
-    ~(update : Octra_core.Validator_set_update.t) readiness =
-  readiness
-  |> List.filter_map (fun (v, marker_opt) ->
-    match marker_opt with
-    | None -> Some v.Octra_core.Validator_set_update.address
-    | Some marker_raw ->
-      match Octra_core.Validator_set_update.ready_ext_of_string marker_raw with
-      | Ok marker when marker.ready.fingerprint = update.Octra_core.Validator_set_update.fingerprint ->
-        begin
-          match Octra_core.Validator_ready_policy.validate
-            ~runtime
-            ~requirements
-            marker with
-          | Ok () -> None
-          | Error reason ->
-            Some (v.Octra_core.Validator_set_update.address ^ ":" ^ reason)
-        end
-      | _ -> Some v.Octra_core.Validator_set_update.address)
-
-let short_fingerprint fingerprint =
-  String.sub fingerprint 0 (min 16 (String.length fingerprint))
-
-let load_persistent_update (deps : persistent_update_deps) ~runtime
-    ~requirements ~current_height =
+let load_persistent_update (deps : persistent_update_deps) =
   let open Lwt.Syntax in
   let* pending_opt = deps.read_pending () in
   match pending_opt with
@@ -155,60 +100,26 @@ let load_persistent_update (deps : persistent_update_deps) ~runtime
     | Error e ->
       deps.log_invalid e;
       Lwt.return_none
-    | Ok update ->
-      if update.weighted then
-        Lwt.return (driver_config_of_update update)
-      else
-        let* readiness =
-          Lwt_list.map_s
-            (fun v ->
-              let key =
-                Octra_core.Validator_set_update.ready_meta_key
-                  ~fingerprint:update.fingerprint
-                  ~address:v.Octra_core.Validator_set_update.address
-              in
-              let* marker = deps.read_marker key in
-              Lwt.return (v, marker))
-            update.validators
-        in
-        let missing =
-          readiness_missing
-            ~runtime
-            ~requirements
-            ~update
-            readiness
-        in
-        if missing <> [] then begin
-          if Int64.compare current_height update.activate_epoch >= 0 then
-            deps.log_waiting
-              ~activate_epoch:update.activate_epoch
-              ~missing
-              ~fingerprint:(short_fingerprint update.fingerprint);
+    | Ok update when update.weighted ->
+      begin
+        match driver_config_of_update update with
+        | Some config -> Lwt.return_some config
+        | None ->
+          deps.log_invalid "weighted validator set is invalid";
           Lwt.return_none
-        end else
-          Lwt.return (driver_config_of_update update)
+      end
+    | Ok _ ->
+      deps.log_invalid "manual validator updates are disabled";
+      Lwt.return_none
 
-let load_node_persistent_update (deps : persistent_update_node_deps) ~runtime
-    ~requirements =
+let load_node_persistent_update (deps : persistent_update_node_deps) =
   let update_deps = {
     read_pending = deps.read_pending;
-    read_marker = deps.read_marker;
     log_invalid = (fun e ->
       deps.warn
         (Printf.sprintf "persistent validator_set_update ignored: %s" e));
-    log_waiting = (fun ~activate_epoch ~missing ~fingerprint ->
-      deps.warn
-        (Printf.sprintf
-           "persistent validator_set_update waiting for readiness activate_epoch = %Ld missing = %s fingerprint = %s"
-           activate_epoch
-           (String.concat "," missing)
-           fingerprint));
   } in
-  load_persistent_update
-    update_deps
-    ~runtime
-    ~requirements
-    ~current_height:(deps.current_height ())
+  load_persistent_update update_deps
 
 let fingerprint_of_validator_set vs =
   let entries =
@@ -303,8 +214,9 @@ let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
   with
   | Error error, _
   | _, Error error -> Error error
+  | _, Ok (Some pending) when not pending.weighted ->
+    Error "manual validator updates are disabled"
   | Ok None, Ok None -> Ok cfg
-  | Ok None, Ok (Some pending) when not pending.weighted -> Ok cfg
   | Ok active_update, Ok pending_update ->
     let active_config =
       match active_update with

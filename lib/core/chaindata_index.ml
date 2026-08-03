@@ -36,6 +36,7 @@ type t = {
   receipts : (string, string, [ `Uni ]) Lmdb.Map.t;
   meta : (string, string, [ `Uni ]) Lmdb.Map.t;
   mutable batch : batch option;
+  mutable closed : bool;
 }
 
 let map_size_default = 64 * 1024 * 1024 * 1024
@@ -121,11 +122,25 @@ let open_index ?(readonly=false) path =
     receipts;
     meta;
     batch = None;
+    closed = false;
   }
 
 let close t =
-  if not t.readonly then Lmdb.Env.sync t.env;
-  Lmdb.Env.close t.env
+  if not t.closed then begin
+    if not t.readonly then Lmdb.Env.sync t.env;
+    Lmdb_handle.close t.tx_loc;
+    Lmdb_handle.close t.addr_tx;
+    Lmdb_handle.close t.addr_recent;
+    Lmdb_handle.close t.txid_loc;
+    Lmdb_handle.close t.epoch_meta;
+    Lmdb_handle.close t.rejected;
+    Lmdb_handle.close t.rej_addr;
+    Lmdb_handle.close t.rej_epoch;
+    Lmdb_handle.close t.receipts;
+    Lmdb_handle.close t.meta;
+    Lmdb.Env.close t.env;
+    t.closed <- true
+  end
 
 let encode_tx_loc ~seg_id ~offset ~len ~epoch_id =
   let buf = Bytes.create 20 in
@@ -277,17 +292,15 @@ let buffer_tx_loc_only t ~hash ~seg_id ~offset ~len ~epoch_id =
 let commit_tx_loc_only t =
   match t.batch with
   | None -> failwith "history_index: no batch to commit"
+  | Some b when b.clear_rebuild_tables ->
+    t.batch <- None;
+    raise
+      (Index_commit_failed
+         "commit_tx_loc_only: rebuild batch requires full commit")
   | Some b ->
     let result =
       try
         Lmdb.Txn.go Lmdb.Rw t.env (fun txn ->
-          if b.clear_rebuild_tables then begin
-            Lmdb.Map.drop ~txn ~delete:false t.tx_loc;
-            Lmdb.Map.drop ~txn ~delete:false t.txid_loc;
-            Lmdb.Map.drop ~txn ~delete:false t.epoch_meta;
-            Lmdb.Map.drop ~txn ~delete:false t.addr_tx;
-            Lmdb.Map.drop ~txn ~delete:false t.addr_recent
-          end;
           List.iter (fun tw ->
             let loc = encode_tx_loc ~seg_id:tw.seg_id ~offset:tw.offset
               ~len:tw.len ~epoch_id:tw.epoch_id in
@@ -315,7 +328,12 @@ let commit_write t =
             Lmdb.Map.drop ~txn ~delete:false t.txid_loc;
             Lmdb.Map.drop ~txn ~delete:false t.epoch_meta;
             Lmdb.Map.drop ~txn ~delete:false t.addr_tx;
-            Lmdb.Map.drop ~txn ~delete:false t.addr_recent
+            Lmdb.Map.drop ~txn ~delete:false t.addr_recent;
+            Lmdb.Map.drop ~txn ~delete:false t.rejected;
+            Lmdb.Map.drop ~txn ~delete:false t.rej_addr;
+            Lmdb.Map.drop ~txn ~delete:false t.rej_epoch;
+            Lmdb.Map.drop ~txn ~delete:false t.receipts;
+            Lmdb.Map.drop ~txn ~delete:false t.meta
           end;
           List.iter (fun tw ->
             let loc = encode_tx_loc ~seg_id:tw.seg_id ~offset:tw.offset ~len:tw.len ~epoch_id:tw.epoch_id in
@@ -383,7 +401,7 @@ let commit_write t =
           ) b.receipts;
           List.iter (fun (key, value) ->
             Lmdb.Map.set t.meta ~txn key value
-          ) b.meta_writes
+          ) (List.rev b.meta_writes)
         )
       with e ->
         let msg = Printf.sprintf "LMDB commit failed: %s" (Printexc.to_string e) in
