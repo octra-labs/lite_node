@@ -89,9 +89,7 @@ let validate_path path =
   path <> []
   && List.length path <= max_path_parts
   && List.for_all
-       (fun part ->
-         part <> ""
-         && String.length part <= max_part_bytes)
+       (fun part -> String.length part <= max_part_bytes)
        path
 
 let validate_order prior path =
@@ -286,7 +284,6 @@ let read_path reader count =
     if remaining = 0 then List.rev path
     else
       let part = read_string reader ~max:max_part_bytes "ledger image path part" in
-      if part = "" then failwith "ledger image path part is empty";
       loop (remaining - 1) (part :: path)
   in
   loop count []
