@@ -441,6 +441,7 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
       Consensus_parent_commit.create
         ~chain_id:deps.chain_id
         ~data_dir:deps.data_dir
+        ~chaindata:deps.chaindata
         deps.env
     with
     | Ok source -> source

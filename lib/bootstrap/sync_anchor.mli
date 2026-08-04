@@ -28,6 +28,10 @@ val validator_set :
   t ->
   Octra_consensus.C_types.validator_set
 
+val finality :
+  t ->
+  Octra_consensus.C_types.finalize
+
 val encode : t -> string
 val decode : string -> (t, string) result
 

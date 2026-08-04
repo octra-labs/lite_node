@@ -282,6 +282,84 @@ let fsync t =
   Txlog.fsync t.txlog;
   Epochlog.fsync t.epochlog
 
+let history_floor_key = "history_floor"
+
+let history_floor t =
+  match Chaindata_index.get_meta t.index history_floor_key with
+  | None -> Ok None
+  | Some encoded -> Result.map Option.some (History_floor.of_string encoded)
+
+let validate_history_floor t floor =
+  let epoch = History_floor.epoch floor in
+  let stored_hash, stored_root = get_epoch_index_commitment t epoch in
+  if t.next_txid <> History_floor.next_txid floor then
+    Error "history floor transaction high-water differs from index"
+  else if stored_hash <> Some (History_floor.epoch_index_hash floor) then
+    Error "history floor epoch hash differs from index"
+  else if stored_root <> Some (History_floor.epoch_index_root floor) then
+    Error "history floor epoch root differs from index"
+  else
+    Ok ()
+
+let seed_history_floor t floor =
+  let encoded = History_floor.to_string floor in
+  match history_floor t with
+  | Error _ as error -> error
+  | Ok (Some current) when History_floor.to_string current <> encoded ->
+      Error "history floor already differs"
+  | Ok (Some current) -> validate_history_floor t current
+  | Ok None ->
+      let segment, offset = Txlog.current_position t.txlog in
+      let epoch_offset = Epochlog.current_offset t.epochlog in
+      if segment <> 0
+         || offset <> Txlog.header_size
+         || epoch_offset <> Epochlog.header_size
+         || t.next_txid <> 0L
+         || Chaindata_index.list_epoch_ids t.index <> [] then
+        Error "history floor requires empty chaindata"
+      else
+        try
+          let next_txid = History_floor.next_txid floor in
+          Chaindata_index.begin_write t.index;
+          Chaindata_index.buffer_meta t.index history_floor_key encoded;
+          set_epoch_index_commitment
+            t
+            ~epoch_id:(History_floor.epoch floor)
+            ~epoch_hash:(History_floor.epoch_index_hash floor)
+            ~root:(History_floor.epoch_index_root floor);
+          Chaindata_index.buffer_meta
+            t.index
+            "repaired_upto_epoch"
+            (string_of_int (History_floor.epoch floor));
+          Chaindata_index.buffer_meta
+            t.index
+            "index_schema_version"
+            "v2_ascii64_int32be";
+          Chaindata_index.buffer_meta
+            t.index
+            "next_txid"
+            (Int64.to_string next_txid);
+          Chaindata_index.commit_write t.index;
+          t.next_txid <- next_txid;
+          fsync t;
+          Ok ()
+        with exn ->
+          (try Chaindata_index.abort_write t.index with _ -> ());
+          Error (Printexc.to_string exn)
+
+let last_epoch_id t =
+  match history_floor t with
+  | Error _ as error -> error
+  | Ok floor ->
+      let durable = Option.map (fun item -> item.Epochlog.id) (Epochlog.last t.epochlog) in
+      let floor = Option.map History_floor.epoch floor in
+      Ok
+        (match durable, floor with
+         | None, None -> None
+         | Some value, None
+         | None, Some value -> Some value
+         | Some left, Some right -> Some (max left right))
+
 type repair_result = {
   checked : int;
   repaired : int;
@@ -1686,7 +1764,16 @@ let epoch_txid_hi (header : Epochlog.epoch_header) =
 let txlog_boundary t epoch_id tx_count txid_hi =
   if Int64.compare txid_hi 0L < 0 then Ok (0, Txlog.header_size)
   else
-    match Chaindata_index.get_txid_loc_raw t.index txid_hi with
+    match history_floor t with
+    | Error _ as error -> error
+    | Ok (Some floor)
+      when Int64.compare txid_hi (History_floor.next_txid floor) < 0 ->
+        if tx_count = 0 && epoch_id > History_floor.epoch floor then
+          Ok (Txlog.current_position t.txlog)
+        else
+          Error "epoch transaction boundary precedes history floor"
+    | Ok _ ->
+      match Chaindata_index.get_txid_loc_raw t.index txid_hi with
     | None -> Error "epoch transaction boundary is missing"
     | Some (segment, offset, length)
       when segment < 0
@@ -1914,6 +2001,17 @@ let epochs_empty_after t ~from_epoch ~to_epoch =
 
 let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
                        ~head_epochlog_off ~inflight_start_txid ~inflight_tx_count =
+  let floor =
+    match history_floor t with
+    | Ok value -> value
+    | Error reason -> failwith reason
+  in
+  begin
+    match floor with
+    | Some value when head_epoch < History_floor.epoch value ->
+        invalid_arg "rollback target precedes history floor"
+    | _ -> ()
+  end;
   Txlog.truncate_to t.txlog ~seg_id:head_txlog_seg ~offset:head_txlog_off;
   Epochlog.truncate_to t.epochlog ~offset:head_epochlog_off;
   let (n_tx, n_ep, n_addr, n_txid) = Chaindata_index.cleanup_after_epoch t.index
@@ -1923,7 +2021,17 @@ let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
 
   Chaindata_index.set_meta_direct t.index "repaired_upto_epoch"
     (string_of_int head_epoch);
-  t.next_txid <- Int64.add inflight_start_txid 0L;
+  t.next_txid <- (
+    match floor with
+    | Some value when head_epoch = History_floor.epoch value ->
+        set_epoch_index_commitment_direct
+          t
+          ~epoch_id:head_epoch
+          ~epoch_hash:(History_floor.epoch_index_hash value)
+          ~root:(History_floor.epoch_index_root value);
+        History_floor.next_txid value
+    | _ -> Int64.add inflight_start_txid 0L);
+  Chaindata_index.set_meta_direct t.index "next_txid" (Int64.to_string t.next_txid);
   (n_tx, n_ep, n_addr, n_txid)
 
 let lower_hex_hash value =

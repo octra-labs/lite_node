@@ -12,12 +12,13 @@ type source = {
   chain_id : string;
   data_dir : string;
   activation_epoch : int64;
+  chaindata : Octra_core.Store_chaindata.t;
 }
 
-let create ~chain_id ~data_dir getenv =
+let create ~chain_id ~data_dir ~chaindata getenv =
   Protocol.activation_epoch_of getenv
   |> Result.map (fun activation_epoch ->
-    { chain_id; data_dir; activation_epoch })
+    { chain_id; data_dir; activation_epoch; chaindata })
 
 let required source epoch_id =
   Int64.compare epoch_id source.activation_epoch >= 0
@@ -42,6 +43,16 @@ let validate parent =
   | Parent.Valid -> Ok (Parent.canonical parent)
   | Parent.Invalid reason -> Error ("invalid parent commit: " ^ reason)
 
+let floor_parent source expected_epoch =
+  match Octra_core.Store_chaindata.history_floor source.chaindata with
+  | Error reason -> Error reason
+  | Ok (Some floor)
+    when Int64.of_int (Octra_core.History_floor.epoch floor) = expected_epoch ->
+      Octra_core.History_floor.parent_commit floor
+      |> validate
+      |> Result.map Option.some
+  | Ok _ -> Ok None
+
 let load source ~epoch_id =
   if Int64.compare epoch_id 0L <= 0 then
     missing source epoch_id "parent commit unavailable at genesis"
@@ -49,11 +60,21 @@ let load source ~epoch_id =
     let expected_epoch = Int64.pred epoch_id in
     match Finality_log.last source.data_dir with
     | None ->
-      missing source epoch_id "parent finality entry is missing"
+      begin
+        match floor_parent source expected_epoch with
+        | Ok (Some _) as parent -> parent
+        | Ok None -> missing source epoch_id "parent finality entry is missing"
+        | Error _ as error -> error
+      end
     | Some entry ->
       let finality_epoch = Int64.of_int entry.Finality_log.height in
       if Int64.compare finality_epoch expected_epoch < 0 then
-        missing source epoch_id "parent finality entry is behind"
+        begin
+          match floor_parent source expected_epoch with
+          | Ok (Some _) as parent -> parent
+          | Ok None -> missing source epoch_id "parent finality entry is behind"
+          | Error _ as error -> error
+        end
       else if Int64.compare finality_epoch expected_epoch > 0 then
         Error "parent finality entry is ahead"
       else

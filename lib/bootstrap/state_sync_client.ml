@@ -10,9 +10,12 @@ module Source = State_sync_source
 module State_sync = State_sync
 module Verify = State_sync_verify
 module Store = Octra_core.Store_chaindata
-module Ledger_store = Octra_core.Store_irmin
 module Head = Octra_core.Head_manifest
 module Image = Octra_core.Ledger_image
+module Migration = Octra_core.Pvac_migration_entitlement
+module Anchor = Sync_anchor
+module Floor = Octra_core.History_floor
+module C_types = Octra_consensus.C_types
 module String_map = Map.Make (String)
 module Epoch_map = Map.Make (struct
   type t = int64
@@ -31,6 +34,7 @@ let exporter_entries = ref []
 let stage_dir = ref ""
 let chain_id = ref ""
 let config_hash = ref ""
+let migration_root = ref None
 let concurrency = ref 8
 let source_concurrency = ref 2
 let retries = ref 8
@@ -52,6 +56,8 @@ let options = [
   "--stage", Arg.Set_string stage_dir, "staging root";
   "--chain-id", Arg.Set_string chain_id, "expected chain identifier";
   "--config-hash", Arg.Set_string config_hash, "expected consensus config hash";
+  "--migration-root", Arg.String (fun value -> migration_root := Some value),
+    "expected PVAC migration entitlement root";
   "--concurrency", Arg.Set_int concurrency, "global concurrent chunks";
   "--source-concurrency", Arg.Set_int source_concurrency, "concurrent chunks per source";
   "--retries", Arg.Set_int retries, "chunk attempts";
@@ -136,7 +142,7 @@ let fetch_manifest validator_set exporter_set source =
           | Error reason -> Lwt.fail_with reason
           | Ok certificate ->
               begin
-                match Manifest.verify_certificate
+                match Manifest.verify_reference_certificate
                   ~validator_set
                   ~exporter_set
                   certificate with
@@ -390,6 +396,36 @@ let write_verified_marker root certificate sources =
     "verified_at", `String (Int64.of_float (Unix.gettimeofday ()) |> Int64.to_string);
   ])
 
+let verify_migration_state checkpoint data_dir =
+  let path = Filename.concat data_dir Migration.state_relative_path in
+  match !migration_root with
+  | None ->
+      if Sys.file_exists path then Error "unexpected migration entitlement state"
+      else Ok ()
+  | Some expected_root ->
+      let getenv = function
+        | "OCTRA_PVAC_MIGRATION_ROOT" -> Some expected_root
+        | _ -> None
+      in
+      begin
+        match
+          Migration.load_env
+            ~chain_id:checkpoint.Checkpoint.chain_id
+            ~data_dir
+            ~getenv
+        with
+        | Error _ as error -> error
+        | Ok entitlements ->
+            if Int64.compare checkpoint.epoch (Int64.of_int max_int) > 0 then
+              Error "migration floor epoch exceeds platform limit"
+            else
+              Migration.bind_floor
+                entitlements
+                ~config_hash:checkpoint.config_hash
+                ~floor_config_hash:checkpoint.config_hash
+                ~floor_epoch:(Int64.to_int checkpoint.epoch)
+      end
+
 let finalize_one ~data_dir file =
   match Journal.prepare_file ~stage:data_dir file with
   | Error reason -> Lwt.fail_with reason
@@ -497,55 +533,59 @@ let restore_head ~root ~data_dir file =
     | Ok _ -> Error "retained HEAD hash mismatch"
     | Error reason -> Error reason
 
-let validate_rebuild checkpoint (report : Store.rebuild_report) =
-  if Int64.compare checkpoint.Checkpoint.epoch (Int64.of_int max_int) >= 0 then
+let floor_of_certificate certificate =
+  let checkpoint = certificate.Manifest.checkpoint in
+  if Int64.compare checkpoint.epoch (Int64.of_int max_int) > 0 then
     Error "checkpoint epoch exceeds platform limit"
-  else if report.transactions <> Int64.succ checkpoint.txid_hi then
-    Error "rebuilt transaction high-water does not match checkpoint"
-  else if report.last_epoch <> Int64.to_int checkpoint.epoch then
-    Error "rebuilt epoch high-water does not match checkpoint"
-  else if report.epochs <> report.last_epoch + 1 then
-    Error "rebuilt epoch sequence is incomplete"
   else
-    match checkpoint.epoch_index_root with
-    | Some expected when report.epoch_index_root = expected -> Ok ()
-    | Some _ -> Error "rebuilt epoch index root does not match checkpoint"
-    | None -> Error "checkpoint epoch index root is missing"
+    match Manifest.finality certificate with
+    | None -> Error "reference checkpoint finality is missing"
+    | Some encoded ->
+        begin
+          match Anchor.decode encoded with
+          | Error _ as error -> error
+          | Ok anchor ->
+              begin
+                match Anchor.verify_checkpoint checkpoint anchor with
+                | Error _ as error -> error
+                | Ok () ->
+                    begin
+                      match checkpoint.epoch_index_hash, checkpoint.epoch_index_root with
+                      | Some epoch_index_hash, Some epoch_index_root ->
+                          let finalize = Anchor.finality anchor in
+                          let parent_commit = C_types.{
+                            certificate = C_types.certificate_of_finalize finalize;
+                            validator_set = Anchor.validator_set anchor;
+                          } in
+                          Floor.create
+                            ~chain_id:checkpoint.chain_id
+                            ~epoch:(Int64.to_int checkpoint.epoch)
+                            ~state_root:checkpoint.state_root
+                            ~ledger_state_root:checkpoint.ledger_state_root
+                            ~txid_hi:checkpoint.txid_hi
+                            ~config_hash:checkpoint.config_hash
+                            ~validator_set_hash:checkpoint.validator_set_hash
+                            ~epoch_index_hash
+                            ~epoch_index_root
+                            ~parent_commit
+                      | _ -> Error "checkpoint epoch index commitment is missing"
+                    end
+              end
+        end
 
-let rebuild_public_keys data_dir =
-  let path = Filename.concat data_dir "irmin_store" in
-  Ledger_store.open_store ~readonly:true path >>= fun ledger_store ->
-  Lwt.finalize
-    (fun () ->
-      Ledger_store.load_all_accounts ledger_store >|= fun accounts ->
-      List.fold_left
-        (fun keys (address, account) ->
-          match account.Octra_core.Ledger_types.public_key with
-          | Some public_key -> String_map.add address public_key keys
-          | None -> keys)
-        String_map.empty
-        accounts)
-    (fun () -> Ledger_store.close ledger_store)
-
-let rebuild_state checkpoint data_dir =
-  rebuild_public_keys data_dir >>= fun public_keys ->
+let seed_state certificate data_dir =
   Lwt_preemptive.detach
     (fun () ->
       try
-        let store =
-          Store.open_chaindata (Filename.concat data_dir "chaindata")
-        in
-        Fun.protect
-          ~finally:(fun () -> Store.close store)
-          (fun () ->
-            match
-              Store.rebuild_index
-                ~public_key_of:(fun address ->
-                  String_map.find_opt address public_keys)
-                store
-            with
-            | Error _ as error -> error
-            | Ok report -> validate_rebuild checkpoint report)
+        match floor_of_certificate certificate with
+        | Error _ as error -> error
+        | Ok floor ->
+            let store =
+              Store.open_chaindata (Filename.concat data_dir "chaindata")
+            in
+            Fun.protect
+              ~finally:(fun () -> Store.close store)
+              (fun () -> Store.seed_history_floor store floor)
       with exn -> Error (Printexc.to_string exn))
     ()
 
@@ -768,14 +808,14 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
             report.Image.records
             report.root;
       Printf.printf
-        "event = sync_index_start hash = %s epoch = %Ld\n%!"
+        "event = sync_floor_start hash = %s epoch = %Ld\n%!"
         certificate.manifest_hash
         checkpoint.epoch;
-      rebuild_state checkpoint data_dir >>= function
+      seed_state certificate data_dir >>= function
       | Error reason -> Lwt.fail_with reason
       | Ok () ->
           Printf.printf
-            "event = sync_index_complete hash = %s epoch = %Ld\n%!"
+            "event = sync_floor_complete hash = %s epoch = %Ld\n%!"
             certificate.manifest_hash
             checkpoint.epoch;
           Lwt.return_unit
@@ -788,18 +828,23 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
   verify_state checkpoint data_dir >>= function
   | Error reason -> Lwt.fail_with reason
   | Ok () ->
-      if Manifest.is_reference certificate then remove_ledger data_dir;
-      Manifest.write_json
-        (State_sync.anchor_path data_dir)
-        (Manifest.certificate_json certificate);
-      write_verified_marker root certificate sources;
-      Printf.printf
-        "event = sync_verified hash = %s epoch = %Ld state_root = %s data = %s voting = false\n%!"
-        certificate.manifest_hash
-        checkpoint.epoch
-        checkpoint.state_root
-        data_dir;
-      Lwt.return_unit
+      begin
+        match verify_migration_state checkpoint data_dir with
+        | Error reason -> Lwt.fail_with reason
+        | Ok () ->
+            if Manifest.is_reference certificate then remove_ledger data_dir;
+            Manifest.write_json
+              (State_sync.anchor_path data_dir)
+              (Manifest.certificate_json certificate);
+            write_verified_marker root certificate sources;
+            Printf.printf
+              "event = sync_verified hash = %s epoch = %Ld state_root = %s data = %s voting = false\n%!"
+              certificate.manifest_hash
+              checkpoint.epoch
+              checkpoint.state_root
+              data_dir;
+            Lwt.return_unit
+      end
 
 let sync_manifests ~max_bytes ~stage ~check ~sync candidates =
   let rec loop = function
@@ -836,6 +881,12 @@ let run () =
   let _ = require "chain-id" !chain_id in
   let _ = require "config-hash" !config_hash in
   if not (Checkpoint.lower_hex 64 !config_hash) then fail "config hash must be lowercase hex64";
+  begin
+    match !migration_root with
+    | Some root when not (Checkpoint.lower_hex 64 root) ->
+        fail "migration root must be lowercase hex64"
+    | _ -> ()
+  end;
   if !concurrency < 1 || !concurrency > 32 then fail "concurrency must be in 1..32";
   if !source_concurrency < 1 || !source_concurrency > 8 then
     fail "source concurrency must be in 1..8";

@@ -38,45 +38,28 @@ let verify_chaindata checkpoint ledger_root data_dir =
     Fun.protect
       ~finally:(fun () -> Octra_core.Store_chaindata.close store)
       (fun () ->
-        let epoch = Int64.to_int checkpoint.Checkpoint.epoch in
-        let next_txid = Octra_core.Store_chaindata.next_txid store in
-        if next_txid <> Int64.succ checkpoint.txid_hi then
-          Error "restored chaindata txid high-water does not match checkpoint"
-        else
-          match Octra_core.Store_chaindata.get_bound_epoch_header store epoch with
-          | Error reason -> Error ("restored epoch binding failed: " ^ reason)
-          | Ok header when header.Octra_core.Epochlog.state_root <> checkpoint.state_root ->
-              Error "restored epoch state root does not match checkpoint"
-          | Ok header ->
-              let previous =
-                Octra_core.Startup_recovery.previous_eic_root store epoch
-              in
-              let status =
-                Octra_core.Store_chaindata.verify_epoch_index_commitment_raw
-                  store
-                  ~epoch_id:epoch
-                  ~start_txid:header.start_txid
-                  ~tx_count:header.tx_count
-                  ~prev_root:previous
-              in
-              if not status.eic_ok then
-                Error ("restored epoch index is invalid: "
-                  ^ String.concat "; " status.eic_errors)
-              else
-                match status.eic_actual_hash, status.eic_actual_root,
-                  checkpoint.epoch_index_hash, checkpoint.epoch_index_root with
-                | Some hash, Some root, Some expected_hash, Some expected_root
-                  when hash = expected_hash && root = expected_root ->
-                    let state_root =
-                      Octra_core.Epoch_index_commitment.folded_state_root
-                        ~ledger_state_root:ledger_root
-                        ~epoch_index_root:root
-                    in
-                    if state_root = checkpoint.state_root then Ok ()
-                    else Error "restored folded state root does not match checkpoint"
-                | Some _, Some _, Some _, Some _ ->
-                    Error "restored epoch index commitment does not match checkpoint"
-                | _ -> Error "restored epoch index commitment is incomplete")
+        match Octra_core.Store_chaindata.history_floor store with
+        | Error reason -> Error ("restored history floor is invalid: " ^ reason)
+        | Ok None -> Error "restored history floor is missing"
+        | Ok (Some floor) ->
+            let module Floor = Octra_core.History_floor in
+            let fields_match =
+              Floor.chain_id floor = checkpoint.Checkpoint.chain_id
+              && Int64.of_int (Floor.epoch floor) = checkpoint.epoch
+              && Floor.state_root floor = checkpoint.state_root
+              && Floor.ledger_state_root floor = checkpoint.ledger_state_root
+              && Floor.txid_hi floor = checkpoint.txid_hi
+              && Floor.config_hash floor = checkpoint.config_hash
+              && Floor.validator_set_hash floor = checkpoint.validator_set_hash
+              && Some (Floor.epoch_index_hash floor) = checkpoint.epoch_index_hash
+              && Some (Floor.epoch_index_root floor) = checkpoint.epoch_index_root
+            in
+            if not fields_match then
+              Error "restored history floor differs from checkpoint"
+            else if ledger_root <> Floor.ledger_state_root floor then
+              Error "restored ledger root differs from history floor"
+            else
+              Octra_core.Store_chaindata.validate_history_floor store floor)
   with exn ->
     Error ("restored chaindata verification failed: " ^ Printexc.to_string exn)
 

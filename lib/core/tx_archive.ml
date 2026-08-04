@@ -64,9 +64,13 @@ let allowed_keys =
     "signature";
     "public_key";
     "message";
+    "op_type";
   ]
 
-let operation_allowed_keys = String_set.add "op_type" allowed_keys
+let operation_allowed_keys =
+  allowed_keys
+  |> String_set.add "op_type"
+  |> String_set.add "encrypted_data"
 
 let required_keys =
   ["from"; "to_"; "amount"; "nonce"; "ou"; "timestamp"; "signature"]
@@ -78,6 +82,13 @@ let optional_string fields key =
   | Some (`String _) -> true
   | Some _ -> false
 
+let standard_op_type fields =
+  match List.assoc_opt "op_type" fields with
+  | None
+  | Some `Null
+  | Some (`String "standard") -> true
+  | Some _ -> false
+
 let signed_shape = function
   | `Assoc fields ->
       let keys = List.map fst fields in
@@ -87,6 +98,7 @@ let signed_shape = function
       && List.for_all (fun key -> String_set.mem key unique) required_keys
       && optional_string fields "public_key"
       && optional_string fields "message"
+      && standard_op_type fields
   | _ -> false
 
 let operation_shape = function
@@ -100,6 +112,7 @@ let operation_shape = function
            ("op_type" :: required_keys)
       && optional_string fields "public_key"
       && optional_string fields "message"
+      && optional_string fields "encrypted_data"
   | _ -> false
 
 let retain_proved_fields tx =
@@ -108,6 +121,12 @@ let retain_proved_fields tx =
     public_key = None;
     message = None;
     encrypted_data = None;
+  }
+
+let retain_signed_fields tx =
+  Transaction.{
+    (retain_proved_fields tx) with
+    op_type = Transaction.Standard;
   }
 
 let decode ~hash ~json:raw_json =
@@ -126,7 +145,7 @@ let decode ~hash ~json:raw_json =
             hash;
             raw_json;
             json;
-            tx = retain_proved_fields tx;
+            tx = retain_signed_fields tx;
             proof = Signed;
           }
         else

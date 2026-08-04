@@ -20,6 +20,12 @@ type result = {
 
 let pf fmt = Octra_log.info "recovery" fmt
 
+let chain_last_epoch chaindata =
+  match Store_chaindata.last_epoch_id chaindata with
+  | Ok (Some epoch) -> epoch
+  | Ok None -> -1
+  | Error reason -> failwith reason
+
 let schema_version = "v2_ascii64_int32be"
 let schema_meta_key = "index_schema_version"
 let repaired_upto_meta_key = "repaired_upto_epoch"
@@ -112,7 +118,40 @@ let verify_head_eic chaindata head =
       | None, Some _ -> eic_err "HEAD epoch_index_hash missing"
       | Some head_hash, Some head_root ->
           match Store_chaindata.get_epoch_header chaindata h.epoch_id with
-          | None -> eic_err (Printf.sprintf "epoch_meta missing for HEAD epoch=%d" h.epoch_id)
+          | None ->
+              begin
+                match Store_chaindata.history_floor chaindata with
+                | Error reason -> eic_err reason
+                | Ok None ->
+                    eic_err
+                      (Printf.sprintf
+                         "epoch_meta missing for HEAD epoch=%d"
+                         h.epoch_id)
+                | Ok (Some floor) ->
+                    let errors =
+                      (if History_floor.epoch floor = h.epoch_id then []
+                       else ["history floor epoch differs from HEAD"])
+                      @ (if History_floor.state_root floor = h.state_root then []
+                         else ["history floor state root differs from HEAD"])
+                      @ (if History_floor.ledger_state_root floor
+                              = Head_manifest.ledger_state_root h then []
+                         else ["history floor ledger root differs from HEAD"])
+                      @ (if History_floor.txid_hi floor = h.txid_hi then []
+                         else ["history floor transaction high-water differs from HEAD"])
+                      @ (if History_floor.epoch_index_hash floor = head_hash then []
+                         else ["history floor epoch hash differs from HEAD"])
+                      @ (if History_floor.epoch_index_root floor = head_root then []
+                         else ["history floor epoch root differs from HEAD"])
+                      @ (match Store_chaindata.validate_history_floor chaindata floor with
+                         | Ok () -> []
+                         | Error reason -> [reason])
+                    in
+                    {
+                      eic_checked = true;
+                      eic_ok = errors = [];
+                      eic_errors = errors;
+                    }
+              end
           | Some eh ->
               let prev_root = previous_eic_root chaindata h.epoch_id in
               let status = Store_chaindata.verify_epoch_index_commitment_raw chaindata
@@ -259,9 +298,7 @@ let recover ~data_dir ~chaindata ~store =
   let marker = Epoch_commit_marker.read_marker data_dir in
 
   let txlog_last_epoch =
-    match Store_chaindata.get_last_epoch chaindata with
-    | Some h -> h.Epochlog.id
-    | None -> -1
+    chain_last_epoch chaindata
   in
 
   let* irmin_last_str = Store_irmin.get_meta store "last_epoch" in
@@ -370,9 +407,7 @@ let recover ~data_dir ~chaindata ~store =
         Wal.delete data_dir e.epoch_id
       end else begin
         let chain_last =
-          match Store_chaindata.get_last_epoch chaindata with
-          | Some h -> h.Epochlog.id
-          | None -> -1
+          chain_last_epoch chaindata
         in
         let action = Wal.decide_action ~entry:e
           ~chaindata_last_epoch:chain_last
@@ -588,9 +623,7 @@ let recover ~data_dir ~chaindata ~store =
   in
 
   let chain_last_after =
-    match Store_chaindata.get_last_epoch chaindata with
-    | Some h -> h.Epochlog.id
-    | None -> -1
+    chain_last_epoch chaindata
   in
 
   let boundary_ok = (irmin_last_epoch_after = chain_last_after) in

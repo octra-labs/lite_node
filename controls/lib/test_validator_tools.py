@@ -712,6 +712,10 @@ class ValidatorToolsTest(unittest.TestCase):
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--concurrency") + 1], "4")
         self.assertEqual(command[command.index("--source-concurrency") + 1], "4")
+        self.assertEqual(
+            command[command.index("--migration-root") + 1],
+            "2" * 64,
+        )
 
     def test_sync_source_check_uses_each_published_source(self):
         sync_binary = WORK / "state_sync_client"

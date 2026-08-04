@@ -613,6 +613,9 @@ def sync_client_command(
     ]
     for source in sources:
         command.extend(["--source", source])
+    migration_root = values.get("OCTRA_PVAC_MIGRATION_ROOT", "")
+    if migration_root:
+        command.extend(["--migration-root", migration_root])
     for address, pubkey in validators:
         command.extend(["--validator", f"{address}:{pubkey}"])
     for address, pubkey in exporters:

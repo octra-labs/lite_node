@@ -10,6 +10,8 @@ type entry = {
 
 type t
 
+val state_relative_path : string
+
 val disabled :
   chain_id:string ->
   t
@@ -51,6 +53,13 @@ val state_root :
 val bind_snapshot :
   t ->
   (int -> (string, string) result) ->
+  (unit, string) result
+
+val bind_floor :
+  t ->
+  config_hash:string ->
+  floor_config_hash:string ->
+  floor_epoch:int ->
   (unit, string) result
 
 val entry_count :

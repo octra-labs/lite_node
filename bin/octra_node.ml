@@ -39,6 +39,7 @@ module Epoch_visibility = Octra_node_runtime.Epoch_visibility
 module Log = Octra_node_runtime.Log
 module Rest = Octra_node_runtime.Node_rest_facade
 module Rule_graph = Octra_core.Rule_graph
+module History_floor = Octra_core.History_floor
 module Preverify_cache = Octra_node_runtime.Preverify_cache
 module Preverify_submit = Octra_node_runtime.Preverify_submit
 module Startup_process_shell = Octra_node_runtime.Startup_process_shell
@@ -232,13 +233,58 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~exit_fatal:exit_error;
 
     let chaindata = Store_chaindata.open_chaindata (data_dir ^ "/chaindata") in
+    let history_floor =
+      match Store_chaindata.history_floor chaindata with
+      | Ok value -> value
+      | Error reason ->
+          Log.fatal "init" "event = history_floor status = rejected reason = %s" reason;
+          exit_error ()
+    in
+    let floor_config_hash =
+      match history_floor with
+      | None -> None
+      | Some floor when History_floor.chain_id floor <> startup_network.chain_id ->
+          Log.fatal "init"
+            "event = history_floor status = rejected reason = chain_id_mismatch";
+          exit_error ()
+      | Some floor ->
+          begin
+            match State_sync_http.configured_config_hash () with
+            | Ok expected when expected = History_floor.config_hash floor ->
+                Some expected
+            | Ok _ ->
+                Log.fatal "init"
+                  "event = history_floor status = rejected reason = config_hash_mismatch";
+                exit_error ()
+            | Error reason ->
+                Log.fatal "init"
+                  "event = history_floor status = rejected reason = %s"
+                  reason;
+                exit_error ()
+          end
+    in
     let rules =
       Rule_graph.create
         ~chain_id:startup_network.chain_id
         ~root_at:(fun epoch ->
           match Store_chaindata.get_bound_epoch_header chaindata epoch with
           | Ok header -> Rule_graph.Root header.Epochlog.state_root
-          | Error "epoch not found" -> Rule_graph.Missing
+          | Error "epoch not found" ->
+              begin
+                match history_floor with
+                | Some floor ->
+                    begin
+                      match
+                        Rule_graph.root_after_floor
+                          ~chain_id:startup_network.chain_id
+                          ~floor_epoch:(History_floor.epoch floor)
+                          ~epoch
+                      with
+                      | Some root -> Rule_graph.Root root
+                      | None -> Rule_graph.Missing
+                    end
+                | None -> Rule_graph.Missing
+              end
           | Error reason -> Rule_graph.Unreadable reason)
     in
     let (startup_txlog_seg, startup_txlog_off) =
@@ -254,13 +300,31 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Log.info "init"
           "event = migration_snapshot status = disabled"
       | Some root ->
-        match
-          Pvac_migration_entitlement.bind_snapshot
-            migration_entitlements
-            (fun epoch ->
-              match Store_chaindata.get_bound_epoch_header chaindata epoch with
-              | Ok header -> Ok header.Epochlog.state_root
-              | Error reason -> Error reason)
+        let binding =
+          match Pvac_migration_entitlement.snapshot_epoch migration_entitlements with
+          | None -> Error "migration snapshot epoch is missing"
+          | Some epoch ->
+              begin
+                match Store_chaindata.get_bound_epoch_header chaindata epoch with
+                | Ok header ->
+                    Pvac_migration_entitlement.bind_snapshot
+                      migration_entitlements
+                      (fun _ -> Ok header.Epochlog.state_root)
+                | Error "epoch not found" ->
+                    begin
+                      match history_floor, floor_config_hash with
+                      | Some floor, Some config_hash ->
+                          Pvac_migration_entitlement.bind_floor
+                            migration_entitlements
+                            ~config_hash
+                            ~floor_config_hash:(History_floor.config_hash floor)
+                            ~floor_epoch:(History_floor.epoch floor)
+                      | _ -> Error "migration snapshot unavailable: epoch not found"
+                    end
+                | Error reason -> Error ("migration snapshot unavailable: " ^ reason)
+              end
+        in
+        match binding
         with
         | Ok () ->
           Log.info "init"

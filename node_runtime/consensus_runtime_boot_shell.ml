@@ -47,8 +47,18 @@ let parent_commit_or_genesis = function
   | None -> "GENESIS"
 
 let last_commit chaindata =
-  Store_chaindata.get_last_epoch chaindata
-  |> parent_commit_or_genesis
+  match Store_chaindata.get_last_epoch chaindata with
+  | Some _ as header -> parent_commit_or_genesis header
+  | None ->
+      begin
+        match Store_chaindata.history_floor chaindata with
+        | Ok (Some floor) ->
+            Octra_core.History_floor.parent_commit floor
+            |> Octra_consensus.C_parent_commit.hash
+            |> Octra_bootstrap.State_sync_checkpoint.raw_to_hex
+        | Ok None -> "GENESIS"
+        | Error reason -> failwith reason
+      end
 
 let driver_round driver_ref =
   match !driver_ref with

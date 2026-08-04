@@ -6,6 +6,7 @@ type source
 val create :
   chain_id:string ->
   data_dir:string ->
+  chaindata:Octra_core.Store_chaindata.t ->
   (string -> string option) ->
   (source, string) result
 

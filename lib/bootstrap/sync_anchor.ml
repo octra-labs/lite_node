@@ -47,6 +47,9 @@ let steps t =
 let validator_set t =
   t.validator_set
 
+let finality t =
+  t.finalize
+
 let ( let* ) value f =
   match value with
   | Ok item -> f item

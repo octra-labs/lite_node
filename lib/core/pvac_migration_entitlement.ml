@@ -27,6 +27,7 @@ let schema = "octra_pvac_migration_entitlements_v2"
 let max_artifact_bytes = 64 * 1024 * 1024
 let max_entries = 1_000_000
 let state_name = "migration_state.json"
+let state_relative_path = Filename.concat "pvac" state_name
 
 let source_cipher_hash cipher =
   Digestif.SHA256.(digest_string cipher |> to_hex)
@@ -240,6 +241,15 @@ let bind_snapshot t lookup =
       | Ok _ ->
         Error "migration snapshot state root mismatch"
     end
+
+let bind_floor t ~config_hash ~floor_config_hash ~floor_epoch =
+  match t with
+  | Disabled _ -> Ok ()
+  | Enabled _ when config_hash <> floor_config_hash ->
+      Error "migration floor config hash mismatch"
+  | Enabled value when floor_epoch < value.activation_epoch ->
+      Error "migration floor precedes activation"
+  | Enabled _ -> Ok ()
 
 let entry_count = function
   | Disabled _ -> 0
@@ -472,7 +482,7 @@ let load_file ~chain_id ~expected_root path =
     (load_body ~chain_id ~expected_root)
 
 let state_path data_dir =
-  Filename.concat (Filename.concat data_dir "pvac") state_name
+  Filename.concat data_dir state_relative_path
 
 let load_env ~chain_id ~data_dir ~getenv =
   match configured getenv "OCTRA_PVAC_MIGRATION_ROOT" with

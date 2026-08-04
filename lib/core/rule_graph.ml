@@ -48,6 +48,14 @@ let create ~chain_id ~root_at =
 
 let circle_activation t = t.circle_activation
 
+let root_after_floor ~chain_id ~floor_epoch ~epoch =
+  if String.equal chain_id devnet_chain_id
+     && epoch = devnet_circle_activation.anchor_epoch
+     && floor_epoch >= devnet_circle_activation.activation_epoch then
+    Some devnet_circle_activation.anchor_state_root
+  else
+    None
+
 let verify_anchor t activation =
   match t.root_at activation.anchor_epoch with
   | Missing ->

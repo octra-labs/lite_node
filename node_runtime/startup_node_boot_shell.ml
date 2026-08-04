@@ -132,12 +132,15 @@ let check_supply deps =
         end
 
 let chain_last_epoch deps () =
-  Store_chaindata.get_last_epoch deps.chaindata
-  |> last_epoch_id
+  match Store_chaindata.last_epoch_id deps.chaindata with
+  | Ok value -> value
+  | Error reason -> failwith reason
 
 let chain_last_epoch_or deps ~default () =
-  Store_chaindata.get_last_epoch deps.chaindata
-  |> last_epoch_or ~default
+  match Store_chaindata.last_epoch_id deps.chaindata with
+  | Ok (Some value) -> value
+  | Ok None -> default
+  | Error reason -> failwith reason
 
 let irmin_stealth_counter deps () =
   get_meta deps "stealth_counter"

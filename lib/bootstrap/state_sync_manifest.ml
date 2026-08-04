@@ -487,20 +487,6 @@ let validate_body (body : body) =
           let root = chunks_root body.files in
           if root <> body.chunks_root then Error "chunk root mismatch" else Ok ()
 
-let decimal value =
-  value <> ""
-  && String.for_all (function '0'..'9' -> true | _ -> false) value
-
-let txlog_file path =
-  let prefix = "chaindata/txlog/seg" in
-  let suffix = ".dat" in
-  let first = String.length prefix in
-  let digits = String.length path - first - String.length suffix in
-  String.starts_with ~prefix path
-  && String.ends_with ~suffix path
-  && digits = 6
-  && decimal (String.sub path first digits)
-
 let pvac_file path =
   let prefix = "pvac/blobs/" in
   let suffix = ".pk" in
@@ -515,8 +501,7 @@ let reference_file path =
   path = "HEAD.json"
   || path = "state_root"
   || path = "ledger.dat"
-  || path = "chaindata/epochlog/epochs.dat"
-  || txlog_file path
+  || path = Octra_core.Pvac_migration_entitlement.state_relative_path
   || pvac_file path
 
 let validate_reference_body body =
@@ -528,10 +513,6 @@ let validate_reference_body body =
         Error "reference snapshot has no HEAD"
     | None when not (List.mem "state_root" paths) ->
         Error "reference snapshot has no state root"
-    | None when not (List.mem "chaindata/epochlog/epochs.dat" paths) ->
-        Error "reference snapshot has no epochlog"
-    | None when not (List.exists txlog_file paths) ->
-        Error "reference snapshot has no txlog"
     | None when not (List.mem "ledger.dat" paths) ->
         Error "reference snapshot has no ledger image"
     | None -> Ok ()
@@ -653,6 +634,11 @@ let verify_certificate ~validator_set ~exporter_set certificate =
           certificate.exporter_signatures
       in
       Ok certificate
+
+let verify_reference_certificate ~validator_set ~exporter_set certificate =
+  match certificate.authority with
+  | Checkpoint_quorum _ -> Error "reference checkpoint finality is required"
+  | Finalized _ -> verify_certificate ~validator_set ~exporter_set certificate
 
 let is_reference certificate =
   match certificate.authority with

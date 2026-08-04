@@ -4,6 +4,7 @@
 module Head = Octra_core.Head_manifest
 module Irmin = Octra_core.Store_irmin
 module Image = Octra_core.Ledger_image
+module Migration = Octra_core.Pvac_migration_entitlement
 module Txlog = Octra_core.Txlog
 module Epochlog = Octra_core.Epochlog
 
@@ -26,23 +27,21 @@ type report = {
 
 type bounds = {
   commit : string;
-  tx_seg : int;
-  tx_off : int;
-  epoch_off : int;
 }
 
 let bounds head =
-  match head.Head.irmin_commit, head.txlog_seg, head.txlog_off, head.epochlog_off with
-  | Some commit, Some tx_seg, Some tx_off, Some epoch_off
-    when commit <> ""
-         && tx_seg >= 0
-         && tx_off >= Txlog.header_size
-         && epoch_off >= Epochlog.header_size ->
-      Ok { commit; tx_seg; tx_off; epoch_off }
-  | _ -> Error "state sync head boundaries are incomplete"
+  match head.Head.irmin_commit with
+  | Some commit when commit <> "" -> Ok { commit }
+  | _ -> Error "state sync head commit is missing"
 
 let reference_head head =
-  Head.{ head with irmin_commit = None }
+  Head.{
+    head with
+    irmin_commit = None;
+    txlog_seg = Some 0;
+    txlog_off = Some Txlog.header_size;
+    epochlog_off = Some Epochlog.header_size;
+  }
 
 let rec mkdir_p path =
   if path = "" || path = "." || Sys.file_exists path then ()
@@ -128,29 +127,6 @@ let copy_whole source target =
   if before.st_size <> after.st_size then
     failwith "state sync source changed during copy"
 
-let copy_txlog source target bounds =
-  let source_dir = Filename.concat source "chaindata/txlog" in
-  let target_dir = Filename.concat target "chaindata/txlog" in
-  let rec loop segment =
-    if segment > bounds.tx_seg then ()
-    else begin
-      let source_path = Txlog.seg_path source_dir segment in
-      let target_path = Txlog.seg_path target_dir segment in
-      if segment = bounds.tx_seg then
-        copy_exact source_path target_path (Int64.of_int bounds.tx_off)
-      else
-        copy_whole source_path target_path;
-      loop (segment + 1)
-    end
-  in
-  loop 0
-
-let copy_epochlog source target bounds =
-  copy_exact
-    (Filename.concat source "chaindata/epochlog/epochs.dat")
-    (Filename.concat target "chaindata/epochlog/epochs.dat")
-    (Int64.of_int bounds.epoch_off)
-
 let file_hash path =
   let channel = open_in_bin path in
   let buffer = Bytes.create (1024 * 1024) in
@@ -172,6 +148,13 @@ let copy_pvac source target hashes =
     copy_whole source_path target_path;
     if file_hash target_path <> hash then
       failwith "state sync PVAC blob hash mismatch") hashes
+
+let copy_migration_state source target =
+  let source_path = Filename.concat source.data_dir Migration.state_relative_path in
+  if Sys.file_exists source_path then
+    copy_whole
+      source_path
+      (Filename.concat target Migration.state_relative_path)
 
 let snapshot_shape root =
   State_sync.list_files root
@@ -207,9 +190,8 @@ let build source ~target =
                   Lwt.fail_with "state sync ledger image root mismatch"
               | Ok image ->
                   Lwt_preemptive.detach (fun () ->
-                    copy_txlog source.data_dir stage bounds;
-                    copy_epochlog source.data_dir stage bounds;
                     copy_pvac source stage image.pvac_hashes;
+                    copy_migration_state source stage;
                     write_file
                       (Filename.concat stage "HEAD.json")
                       (Head.to_json reference);

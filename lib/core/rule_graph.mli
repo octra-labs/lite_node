@@ -32,6 +32,12 @@ val create :
 
 val circle_activation : t -> activation option
 
+val root_after_floor :
+  chain_id:string ->
+  floor_epoch:int ->
+  epoch:int ->
+  string option
+
 val circle :
   t ->
   epoch:int ->
