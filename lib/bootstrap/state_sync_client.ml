@@ -424,6 +424,79 @@ let finalize_files ~parallelism ~data_dir files =
   finalize_group ~parallelism ~data_dir regular >>= fun () ->
   Lwt_list.iter_s (finalize_one ~data_dir) head
 
+let retained_head root =
+  Filename.concat root "HEAD.source.json"
+
+let regular_file path =
+  try (Unix.lstat path).Unix.st_kind = Unix.S_REG with _ -> false
+
+let sync_dir path =
+  let descriptor = Unix.openfile path [Unix.O_RDONLY] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close descriptor)
+    (fun () -> Unix.fsync descriptor)
+
+let link_replace source target =
+  let temporary = target ^ ".source" in
+  if Sys.file_exists temporary then Unix.unlink temporary;
+  Unix.link source temporary;
+  Unix.rename temporary target;
+  sync_dir (Filename.dirname target)
+
+let head_file certificate =
+  List.find_opt
+    (fun file -> file.Manifest.path = "HEAD.json")
+    certificate.Manifest.manifest.files
+
+let retain_head ~root ~data_dir file =
+  let source = Filename.concat data_dir file.Manifest.path in
+  let retained = retained_head root in
+  if Sys.file_exists retained && not (regular_file retained) then
+    Error "retained HEAD is not a regular file"
+  else if not (regular_file source) then
+    Error "source HEAD is not a regular file"
+  else match Journal.hash_file retained with
+  | Ok hash when hash = file.sha256 -> Ok ()
+  | Ok _ -> Error "retained HEAD hash mismatch"
+  | Error _ when not (Sys.file_exists retained) ->
+      begin
+        match Journal.hash_file source with
+        | Ok hash when hash = file.sha256 ->
+            begin
+              try
+                Unix.link source retained;
+                sync_dir root;
+                Ok ()
+              with exn -> Error (Printexc.to_string exn)
+            end
+        | Ok _ -> Error "source HEAD hash mismatch"
+        | Error reason -> Error reason
+      end
+  | Error reason -> Error reason
+
+let restore_head ~root ~data_dir file =
+  let retained = retained_head root in
+  if not (Sys.file_exists retained) then Ok ()
+  else if not (regular_file retained) then
+    Error "retained HEAD is not a regular file"
+  else
+    match Journal.hash_file retained with
+    | Ok hash when hash = file.Manifest.sha256 ->
+        let target = Filename.concat data_dir file.path in
+        begin
+          match Journal.hash_file target with
+          | Ok current when current = hash -> Ok ()
+          | Ok _ | Error _ ->
+              begin
+                try
+                  link_replace retained target;
+                  Ok ()
+                with exn -> Error (Printexc.to_string exn)
+              end
+        end
+    | Ok _ -> Error "retained HEAD hash mismatch"
+    | Error reason -> Error reason
+
 let validate_rebuild checkpoint (report : Store.rebuild_report) =
   if Int64.compare checkpoint.Checkpoint.epoch (Int64.of_int max_int) >= 0 then
     Error "checkpoint epoch exceeds platform limit"
@@ -519,6 +592,16 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let certificate_file = Filename.concat root "certificate.json" in
   mkdir_p root;
   mkdir_p data_dir;
+  if Manifest.is_reference certificate then begin
+    match head_file certificate with
+    | Some file ->
+        begin
+          match restore_head ~root ~data_dir file with
+          | Ok () -> ()
+          | Error reason -> fail reason
+        end
+    | None -> fail "reference snapshot has no HEAD"
+  end;
   Manifest.write_json certificate_file (Manifest.certificate_json certificate);
   let journal =
     match Journal.open_journal ~path:journal_path ~manifest_hash:certificate.manifest_hash with
@@ -661,6 +744,16 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
     body.file_count;
   begin
     if Manifest.is_reference certificate then begin
+      begin
+        match head_file certificate with
+        | Some file ->
+            begin
+              match retain_head ~root ~data_dir file with
+              | Ok () -> ()
+              | Error reason -> fail reason
+            end
+        | None -> fail "reference snapshot has no HEAD"
+      end;
       Printf.printf
         "event = sync_ledger_start hash = %s epoch = %Ld\n%!"
         certificate.manifest_hash

@@ -277,6 +277,22 @@ let write_certificate path certificate =
     (fun () -> Manifest.write_json path (Manifest.certificate_json certificate))
     ()
 
+let snapshot_certificate_path deps certificate =
+  State_sync.snapshot_dir deps.data_dir certificate.Manifest.manifest.snapshot_id
+  |> State_sync.snapshot_certificate_path
+
+let archive_current deps =
+  match Manifest.load_certificate (deps.certificate_path ()) with
+  | Error _ -> Lwt.return_unit
+  | Ok certificate ->
+      let snapshot =
+        State_sync.snapshot_dir deps.data_dir certificate.manifest.snapshot_id
+      in
+      if Sys.file_exists snapshot then
+        write_certificate (State_sync.snapshot_certificate_path snapshot) certificate
+      else
+        Lwt.return_unit
+
 let published_manifest_hash deps checkpoint_hash =
   match Manifest.load_certificate (deps.certificate_path ()) with
   | Ok certificate when certificate.checkpoint_hash = checkpoint_hash ->
@@ -359,6 +375,10 @@ let publish deps exporter_set prepared =
                         certificate with
                       | Error reason -> Lwt.return_error reason
                       | Ok verified ->
+                          archive_current deps >>= fun () ->
+                          write_certificate
+                            (snapshot_certificate_path deps verified)
+                            verified >>= fun () ->
                           write_certificate (deps.certificate_path ()) verified
                           >>= fun () ->
                           deps.info

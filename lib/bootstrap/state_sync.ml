@@ -143,6 +143,9 @@ let anchor_path data_dir =
 let snapshot_ready_path dir =
   Filename.concat dir ".ready.json"
 
+let snapshot_certificate_path dir =
+  Filename.concat dir ".certificate.json"
+
 let write_ready dir head =
   let body =
     `Assoc [

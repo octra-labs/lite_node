@@ -4,6 +4,7 @@
 type proof =
   | Exact
   | Signed
+  | Signed_operation
 
 type t
 

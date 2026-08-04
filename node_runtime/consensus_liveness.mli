@@ -11,6 +11,7 @@ type sample = {
   now : float;
   source : string;
   stall_sec : float;
+  step_timeout_sec : float option;
   observer : bool;
   voting : bool;
   catchup_active : bool;
@@ -27,6 +28,7 @@ type reset = {
   expected : int64;
   source : string;
   stall_sec : float;
+  step_timeout_sec : float option;
   state_age : float;
   height_age : float;
   resets : int;
@@ -41,6 +43,7 @@ type driver_snapshot = {
   height : int64;
   round : int;
   step : string;
+  step_timeout_sec : float option;
 }
 
 val create : now:float -> state

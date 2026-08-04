@@ -329,13 +329,17 @@ let maybe_reset_liveness (deps : 'driver liveness_deps) driver ~source =
       ~round:reset.round
 
 let log_liveness_reset (reset : Consensus_liveness.reset) =
+  let step_timeout_sec =
+    Option.value reset.Consensus_liveness.step_timeout_sec ~default:0.0
+  in
   Octra_log.warn "consensus"
-    "liveness realign height = %Ld round = %d step = %s source = %s stall_sec = %.0f state_age = %.0f height_age = %.0f resets = %d"
+    "liveness realign height = %Ld round = %d step = %s source = %s stall_sec = %.0f step_timeout_sec = %.0f state_age = %.0f height_age = %.0f resets = %d"
     reset.Consensus_liveness.height
     reset.round
     reset.step
     reset.source
     reset.stall_sec
+    step_timeout_sec
     reset.state_age
     reset.height_age
     reset.resets

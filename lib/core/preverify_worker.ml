@@ -384,10 +384,14 @@ let snapshot_transition tx =
   | T.CircleRegisterCellPut -> true
   | _ -> false
 
-let first_snapshot_transition txs =
-  List.find_opt
-    snapshot_transition
-    txs
+let split_snapshot_transition txs =
+  let rec split prefix = function
+    | [] -> None
+    | tx :: suffix when snapshot_transition tx ->
+      Some (List.rev prefix, tx, suffix)
+    | tx :: suffix -> split (tx :: prefix) suffix
+  in
+  split [] txs
 
 let snapshot_isolation_reason tx =
   if tx.T.op_type = T.CircleCall then "circle_receipt_snapshot_isolation"
@@ -408,6 +412,15 @@ let isolate_snapshot selected txs =
         } :: skipped)
     txs
     ([], [])
+
+let defer_snapshot_suffix selected txs =
+  List.map
+    (fun tx -> {
+      tx;
+      reason = snapshot_isolation_reason selected;
+      kind = Deferred;
+    })
+    txs
 
 let without_snapshot_transitions txs =
   List.filter
@@ -503,15 +516,22 @@ let verify_checked_batch verify txs isolated =
 let run_checked verify txs =
   let open Lwt.Syntax in
   let txs, private_isolated = isolate_private_transitions txs in
-  match first_snapshot_transition txs with
+  match split_snapshot_transition txs with
   | None ->
     verify_checked_batch verify txs private_isolated
-  | Some selected ->
+  | Some (first :: rest, selected, suffix) ->
+    let prefix = first :: rest in
+    verify_checked_batch
+      verify
+      prefix
+      (private_isolated
+       @ defer_snapshot_suffix selected (selected :: suffix))
+  | Some ([], selected, suffix) ->
     let* selected_verdict = verify selected in
     begin
       match selected_verdict with
       | Checked_ready item ->
-        let _, isolated = isolate_snapshot selected txs in
+        let _, isolated = isolate_snapshot selected (selected :: suffix) in
         Lwt.return {
           ready = [item];
           skipped = private_isolated @ isolated;
@@ -519,9 +539,11 @@ let run_checked verify txs =
       | Checked_skip selected_skip ->
         verify_checked_batch
           verify
-          (without_snapshot_transitions txs)
+          (without_snapshot_transitions (selected :: suffix))
           (private_isolated
-           @ deferred_snapshot_transitions selected_skip txs)
+           @ deferred_snapshot_transitions
+               selected_skip
+               (selected :: suffix))
     end
 
 let checked_of_single_batch tx batch =

@@ -6,6 +6,7 @@ module String_set = Set.Make (String)
 type proof =
   | Exact
   | Signed
+  | Signed_operation
 
 type t = {
   hash : string;
@@ -35,6 +36,23 @@ let signed_hash tx =
   |> Digestif.SHA256.digest_string
   |> Digestif.SHA256.to_hex
 
+let operation_json (tx : Transaction.t) =
+  `Assoc [
+    "from", `String tx.from;
+    "to_", `String tx.to_;
+    "amount", `String (Z.to_string tx.amount);
+    "nonce", `Int tx.nonce;
+    "ou", `String (Z.to_string tx.ou);
+    "timestamp", `Float tx.timestamp;
+    "op_type", `String (Transaction.op_type_to_string tx.op_type);
+  ]
+
+let operation_hash tx =
+  operation_json tx
+  |> Yojson.Safe.to_string
+  |> Digestif.SHA256.digest_string
+  |> Digestif.SHA256.to_hex
+
 let allowed_keys =
   String_set.of_list [
     "from";
@@ -47,6 +65,8 @@ let allowed_keys =
     "public_key";
     "message";
   ]
+
+let operation_allowed_keys = String_set.add "op_type" allowed_keys
 
 let required_keys =
   ["from"; "to_"; "amount"; "nonce"; "ou"; "timestamp"; "signature"]
@@ -69,6 +89,27 @@ let signed_shape = function
       && optional_string fields "message"
   | _ -> false
 
+let operation_shape = function
+  | `Assoc fields ->
+      let keys = List.map fst fields in
+      let unique = String_set.of_list keys in
+      List.length keys = String_set.cardinal unique
+      && String_set.subset unique operation_allowed_keys
+      && List.for_all
+           (fun key -> String_set.mem key unique)
+           ("op_type" :: required_keys)
+      && optional_string fields "public_key"
+      && optional_string fields "message"
+  | _ -> false
+
+let retain_proved_fields tx =
+  Transaction.{
+    tx with
+    public_key = None;
+    message = None;
+    encrypted_data = None;
+  }
+
 let decode ~hash ~json:raw_json =
   try
     let json = Yojson.Safe.from_string raw_json in
@@ -81,9 +122,26 @@ let decode ~hash ~json:raw_json =
           Error "transaction encoding mismatch"
     | Ok tx when signed_hash tx = hash ->
         if signed_shape json then
-          Ok { hash; raw_json; json; tx; proof = Signed }
+          Ok {
+            hash;
+            raw_json;
+            json;
+            tx = retain_proved_fields tx;
+            proof = Signed;
+          }
         else
           Error "signed transaction shape is invalid"
+    | Ok tx when operation_hash tx = hash ->
+        if operation_shape json then
+          Ok {
+            hash;
+            raw_json;
+            json;
+            tx = retain_proved_fields tx;
+            proof = Signed_operation;
+          }
+        else
+          Error "signed operation shape is invalid"
     | Ok _ -> Error "transaction hash mismatch"
   with exn -> Error (Printexc.to_string exn)
 
@@ -100,11 +158,15 @@ let select_public_key ~public_key_of value =
   let trusted = public_key_of value.tx.from in
   let carried = carried_public_key value.json in
   match trusted, carried with
-  | Some expected, Some actual when not (String.equal expected actual) ->
-      Error "signed transaction public key conflicts with ledger"
   | Some value, _
   | None, Some value -> Ok value
   | None, None -> Error "signed transaction public key is unavailable"
+
+let proof_bytes value =
+  match value.proof with
+  | Exact -> value.raw_json
+  | Signed -> signed_bytes value.tx
+  | Signed_operation -> Yojson.Safe.to_string (operation_json value.tx)
 
 let verify_signature public_key value =
   if not (Crypto.Address.verify_address_pubkey value.tx.from public_key) then
@@ -118,7 +180,7 @@ let verify_signature public_key value =
       else if
         Octra_ed25519.verify
           ~pub:public_key
-          ~msg:(signed_bytes value.tx)
+          ~msg:(proof_bytes value)
           signature
       then
         Ok ()
@@ -129,7 +191,8 @@ let verify_signature public_key value =
 let verify ~public_key_of value =
   match value.proof with
   | Exact -> Ok ()
-  | Signed ->
+  | Signed
+  | Signed_operation ->
       begin
         match select_public_key ~public_key_of value with
         | Error _ as error -> error
@@ -139,9 +202,10 @@ let verify ~public_key_of value =
 let visible_json value =
   match value.proof with
   | Exact -> value.raw_json
-  | Signed ->
+  | Signed
+  | Signed_operation ->
       let tx = value.tx in
-      `Assoc [
+      let fields = [
         "from", `String tx.from;
         "to_", `String tx.to_;
         "amount", `String (Z.to_string tx.amount);
@@ -149,5 +213,14 @@ let visible_json value =
         "ou", `String (Z.to_string tx.ou);
         "timestamp", `Float tx.timestamp;
         "signature", `String tx.signature;
-      ]
+      ] in
+      let fields =
+        match value.proof with
+        | Signed_operation ->
+            fields
+            @ ["op_type", `String (Transaction.op_type_to_string tx.op_type)]
+        | Exact
+        | Signed -> fields
+      in
+      `Assoc fields
       |> Yojson.Safe.to_string

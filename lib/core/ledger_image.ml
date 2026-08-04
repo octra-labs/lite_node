@@ -38,7 +38,7 @@ let magic = "octra-ledger-image\n"
 let max_records = 16_777_216
 let max_path_parts = 1_024
 let max_part_bytes = 4_096
-let max_value_bytes = 16 * 1_024 * 1_024
+let max_value_bytes = Transaction.circle_asset_max_encrypted_data_len
 let drain_bytes = 4 * 1_024 * 1_024
 let import_batch = 4_096
 

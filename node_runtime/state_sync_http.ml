@@ -231,10 +231,10 @@ let warn_manifest_unavailable reason =
     Log.warn "state_sync" "event = manifest_unavailable reason = %s" reason
   end
 
-let load_certificate ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ =
-  match configured_certificate_path ~data_dir, configured_validator_set () with
-  | (Error _ as error), _ | _, (Error _ as error) -> error
-  | Ok path, Ok configured_validators ->
+let load_certificate_at ~path ~chain_id =
+  match configured_validator_set () with
+  | Error _ as error -> error
+  | Ok configured_validators ->
       try
         let stat = Unix.stat path in
         if stat.Unix.st_kind <> Unix.S_REG then Error "state sync certificate is not a file"
@@ -303,6 +303,31 @@ let load_certificate ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ =
                     outcome
               end
       with exn -> Error (Printexc.to_string exn)
+
+let load_certificate ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ =
+  match configured_certificate_path ~data_dir with
+  | Error _ as error -> error
+  | Ok path -> load_certificate_at ~path ~chain_id
+
+let load_snapshot_certificate ~data_dir ~chain_id ~snapshot_id =
+  let snapshot = State_sync.snapshot_dir data_dir snapshot_id in
+  let archived = State_sync.snapshot_certificate_path snapshot in
+  let matches loaded =
+    loaded.certificate.Manifest.manifest.snapshot_id = snapshot_id
+  in
+  match load_certificate_at ~path:archived ~chain_id with
+  | Ok loaded when matches loaded -> Ok loaded
+  | Ok _ -> Error "state sync snapshot certificate mismatch"
+  | Error archived_error ->
+      begin
+        match configured_certificate_path ~data_dir with
+        | Error _ -> Error archived_error
+        | Ok current ->
+            match load_certificate_at ~path:current ~chain_id with
+            | Ok loaded when matches loaded -> Ok loaded
+            | Ok _ -> Error "state sync snapshot is not retained"
+            | Error _ -> Error archived_error
+      end
 
 let respond_certificate cached =
   Server.respond_string
@@ -461,7 +486,7 @@ let int_query_param query name default_value =
   | Some s -> (try int_of_string s with _ -> default_value)
   | None -> default_value
 
-let handle_chunk ~data_dir ~chain_id ~config_hash ~validator_set query =
+let handle_chunk ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ query =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
@@ -483,11 +508,11 @@ let handle_chunk ~data_dir ~chain_id ~config_hash ~validator_set query =
         `Bad_request
         "invalid chunk request"
     else
-    match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
+    match load_snapshot_certificate ~data_dir ~chain_id ~snapshot_id with
     | Error reason ->
         respond_error
-          ~error_type:"state_sync_unavailable"
-          `Service_unavailable
+          ~error_type:"state_sync_snapshot_unavailable"
+          `Not_found
           reason
     | Ok cached ->
         let certificate = cached.certificate in

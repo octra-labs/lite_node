@@ -17,6 +17,7 @@ type sample = {
   now : float;
   source : string;
   stall_sec : float;
+  step_timeout_sec : float option;
   observer : bool;
   voting : bool;
   catchup_active : bool;
@@ -33,6 +34,7 @@ type reset = {
   expected : int64;
   source : string;
   stall_sec : float;
+  step_timeout_sec : float option;
   state_age : float;
   height_age : float;
   resets : int;
@@ -47,7 +49,20 @@ type driver_snapshot = {
   height : int64;
   round : int;
   step : string;
+  step_timeout_sec : float option;
 }
+
+let protocol_timeout_grace_sec = 30.0
+
+let protocol_realign_sec (sample : sample) =
+  Option.map
+    (fun timeout_sec -> timeout_sec +. protocol_timeout_grace_sec)
+    sample.step_timeout_sec
+
+let effective_stall_sec (sample : sample) =
+  match protocol_realign_sec sample with
+  | None -> sample.stall_sec
+  | Some protocol_sec -> max sample.stall_sec protocol_sec
 
 let create ~now = {
   key = "";
@@ -105,10 +120,19 @@ let record state (sample : sample) =
   in
   let state_age = sample.now -. state.key_started_at in
   let height_age = sample.now -. state.height_started_at in
-  let state_stalled = state_age >= sample.stall_sec in
+  let stall_sec = effective_stall_sec sample in
+  let state_stalled = state_age >= stall_sec in
   let height_stalled = height_age >= sample.stall_sec in
+  let protocol_realign_allowed =
+    match protocol_realign_sec sample with
+    | None -> true
+    | Some protocol_sec -> state_age >= protocol_sec
+  in
   let height_realign_allowed =
-    height_stalled && sample.step = "propose" && sample.round > 0
+    height_stalled
+    && protocol_realign_allowed
+    && sample.step = "propose"
+    && sample.round > 0
   in
   let stalled = state_stalled || height_realign_allowed in
   if blocked sample ~stalled then
@@ -129,7 +153,8 @@ let record state (sample : sample) =
         step = sample.step;
         expected = sample.expected;
         source = sample.source;
-        stall_sec = sample.stall_sec;
+        stall_sec;
+        step_timeout_sec = sample.step_timeout_sec;
         state_age;
         height_age;
         resets;
@@ -142,10 +167,16 @@ let step_label = function
   | Octra_consensus.C_types.PrecommitStep -> "precommit"
 
 let driver_snapshot driver =
+  let step = Octra_consensus.C_driver.current_step driver in
+  let round = Octra_consensus.C_driver.current_round driver in
   {
     height = Octra_consensus.C_driver.current_height driver;
-    round = Octra_consensus.C_driver.current_round driver;
-    step = step_label (Octra_consensus.C_driver.current_step driver);
+    round;
+    step = step_label step;
+    step_timeout_sec =
+      Some
+        (float_of_int (Octra_consensus.C_engine.timeout_ms ~round ~step)
+         /. 1000.0);
   }
 
 let record_snapshot state snapshot ~expected ~now ~source ~stall_sec ~observer
@@ -159,6 +190,7 @@ let record_snapshot state snapshot ~expected ~now ~source ~stall_sec ~observer
     now;
     source;
     stall_sec;
+    step_timeout_sec = snapshot.step_timeout_sec;
     observer;
     voting;
     catchup_active;
