@@ -173,6 +173,17 @@ let validate body =
   else
     Ok ()
 
+let same_finalized_state left right =
+  left.chain_id = right.chain_id
+  && left.epoch = right.epoch
+  && left.state_root = right.state_root
+  && left.ledger_state_root = right.ledger_state_root
+  && left.txid_hi = right.txid_hi
+  && left.config_hash = right.config_hash
+  && left.validator_set_hash = right.validator_set_hash
+  && left.epoch_index_hash = right.epoch_index_hash
+  && left.epoch_index_root = right.epoch_index_root
+
 let hash_raw body =
   let* () = validate body in
   Ok (Octra_net.Hash_domain.hash_encoded "octra:state_sync_checkpoint" (fun buffer ->

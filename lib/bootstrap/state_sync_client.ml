@@ -195,9 +195,14 @@ let select_manifests (results : (Source.t * Manifest.certificate) list) =
         let epoch = certificate.checkpoint.epoch in
         match Epoch_map.find_opt epoch epochs with
         | None ->
-            Epoch_map.add epoch certificate.checkpoint_hash epochs, conflicting
-        | Some checkpoint_hash ->
-            epochs, conflicting || checkpoint_hash <> certificate.checkpoint_hash)
+            Epoch_map.add epoch certificate.checkpoint epochs, conflicting
+        | Some checkpoint ->
+            epochs,
+            conflicting
+            || not
+                 (Checkpoint.same_finalized_state
+                    checkpoint
+                    certificate.checkpoint))
       (Epoch_map.empty, false)
       ordered
   in
