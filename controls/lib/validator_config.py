@@ -325,8 +325,8 @@ def bind_build_toolchains(environment, switch):
     environment_cache.unlink(missing_ok=True)
 
 def build_candidate():
-    if sys.platform != "linux" or os.uname().machine not in {"amd64", "x86_64"}:
-        raise ValidatorError("source build requires Linux x86_64")
+    if sys.platform != "linux" or os.uname().machine not in {"amd64", "x86_64", "aarch64", "arm64"}:
+        raise ValidatorError("source build requires a supported Linux architecture")
     locked = ROOT / "octra_node.opam.locked"
     if not locked.is_file():
         raise ValidatorError("source build lock is missing")
@@ -383,6 +383,8 @@ def build_candidate():
         "--require-checksums",
         "-y",
     ], env=environment)
+    (ROOT / "mcl" / "obj").mkdir(parents=True, exist_ok=True)
+    (ROOT / "mcl" / "lib").mkdir(parents=True, exist_ok=True)
     run([
         "make",
         "-C",

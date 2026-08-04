@@ -151,7 +151,7 @@ bind_build_toolchains() {
 PACKAGES='ca-certificates curl libev4 libgmp10 liblmdb0 libsqlite3-0 nodejs npm python3 python3-nacl'
 
 if [ "$SOURCE_BUILD" -eq 1 ]; then
-  PACKAGES="$PACKAGES build-essential git libev-dev libgmp-dev liblmdb-dev libsqlite3-dev m4 opam pkg-config"
+  PACKAGES="$PACKAGES build-essential clang git libev-dev libgmp-dev liblmdb-dev libsqlite3-dev m4 opam pkg-config"
 fi
 
 printf 'event = install phase = packages\n'
