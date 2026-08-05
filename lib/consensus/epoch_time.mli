@@ -3,6 +3,10 @@
 
 type t = int64
 
+type proposal_kind = Fresh | Reproposal
+
+type rule = Historical | Uniform
+
 val interval_ms : int64
 val interval_seconds : float
 val of_seconds : float -> (t, string) result
@@ -14,6 +18,13 @@ val check :
   candidate:float ->
   (t, string) result
 val check_reproposal :
+  previous:t option ->
+  candidate:float ->
+  (t, string) result
+val check_proposal :
+  rule:rule ->
+  kind:proposal_kind ->
+  now:float ->
   previous:t option ->
   candidate:float ->
   (t, string) result

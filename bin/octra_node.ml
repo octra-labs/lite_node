@@ -369,9 +369,21 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         evaluate =
       match activation with
       | None ->
-        Log.info "init"
-          "event = rule_graph rule = %s status = prior"
-          name
+        (match evaluate 0 with
+         | Ok Rule_graph.Active ->
+           Log.info "init"
+             "event = rule_graph rule = %s status = bound activation_epoch = 0"
+             name
+         | Ok Rule_graph.Prior ->
+           Log.info "init"
+             "event = rule_graph rule = %s status = prior"
+             name
+         | Error fault ->
+           Log.fatal "init"
+             "event = rule_graph rule = %s status = rejected reason = %s"
+             name
+             (Rule_graph.fault_message fault);
+           exit_error ())
       | Some activation ->
         if !current_epoch <= activation.anchor_epoch then
           Log.info "init"
@@ -407,6 +419,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "validator_quorum"
       (Rule_graph.validator_quorum_activation rules)
       (fun epoch -> Rule_graph.validator_quorum rules ~epoch);
+    bind_rule
+      "epoch_time"
+      (Rule_graph.epoch_time_activation rules)
+      (fun epoch -> Rule_graph.epoch_time rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)

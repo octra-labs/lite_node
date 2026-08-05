@@ -470,7 +470,14 @@ let run ?(stale_retries = 1) cfg deps =
                             ~lag
                             ~soft_lag:cfg.soft_catchup_max_lag with
                     | H.Lagging_soft lag ->
-                      begin
+                      let* () = deps.drain_pending_finalized () in
+                      let refreshed_head = deps.committed_head_epoch () in
+                      if refreshed_head > our_head_int then begin
+                        Log.info "catchup"
+                          "event = soft_catchup_local_finalize head_before = %d head_after = %d target = %Ld"
+                          our_head_int refreshed_head target_epoch;
+                        attempt stale_retries
+                      end else begin
                         match peer_root_quorum with
                         | H.Matching_quorum _ when lag = 1 && not already_attested ->
                           Log.info "catchup"

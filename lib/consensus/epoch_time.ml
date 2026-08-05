@@ -3,6 +3,10 @@
 
 type t = int64
 
+type proposal_kind = Fresh | Reproposal
+
+type rule = Historical | Uniform
+
 let interval_ms = 10_000L
 let interval_seconds = 10.0
 let initial_drift_ms = 300_000L
@@ -68,3 +72,10 @@ let check ~now ~previous ~candidate =
 
 let check_reproposal ~previous ~candidate =
   check_candidate ~previous ~candidate
+
+let check_proposal ~rule ~kind ~now ~previous ~candidate =
+  match rule, kind with
+  | Historical, Reproposal -> check_reproposal ~previous ~candidate
+  | Historical, Fresh
+  | Uniform, Fresh
+  | Uniform, Reproposal -> check ~now ~previous ~candidate

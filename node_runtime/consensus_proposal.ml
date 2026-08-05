@@ -1462,7 +1462,7 @@ let handle_proposal_admission ~start_height ~epoch_id ~current_epoch
   | Proceed ->
     Lwt.return Proposal_admit
 
-let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose) =
+let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
   match
@@ -1503,16 +1503,19 @@ let verify_proposal deps ~chain_id:_ (propose : Octra_consensus.C_types.propose)
       then
         Error "proposal valid round is invalid"
       else
-        match propose.valid_round with
-        | None ->
-          Octra_consensus.Epoch_time.check
-            ~now:(deps.now ())
-            ~previous
-            ~candidate:propose.header.ts
-        | Some _ ->
-          Octra_consensus.Epoch_time.check_reproposal
-            ~previous
-            ~candidate:propose.header.ts
+        let kind =
+          match propose.valid_round with
+          | None -> Octra_consensus.Epoch_time.Fresh
+          | Some _ -> Octra_consensus.Epoch_time.Reproposal
+        in
+        Octra_consensus.Epoch_time.check_proposal
+          ~rule:(Octra_consensus.C_epoch_time_policy.rule_for_epoch
+            ~chain_id
+            ~epoch_id:propose.epoch_id)
+          ~kind
+          ~now:(deps.now ())
+          ~previous
+          ~candidate:propose.header.ts
     in
     match epoch_time_check with
   | Error reason ->

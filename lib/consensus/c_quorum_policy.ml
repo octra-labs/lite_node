@@ -22,13 +22,16 @@ let activation_for_chain chain_id =
 
 let active ~chain_id ~epoch_id =
   match activation_for_chain chain_id with
-  | None -> false
+  | None -> Int64.compare epoch_id 0L >= 0
   | Some activation ->
     Int64.compare epoch_id (Int64.of_int activation.activation_epoch) >= 0
 
 let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
   match activation_for_chain chain_id with
-  | None -> true
+  | None ->
+    not
+      (Int64.compare from_epoch 0L >= 0
+       && Int64.compare to_epoch 0L < 0)
   | Some activation ->
     let boundary = Int64.of_int activation.activation_epoch in
     not

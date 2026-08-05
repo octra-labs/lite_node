@@ -24,8 +24,10 @@ type activation = {
 }
 
 type t = {
+  chain_id : string;
   circle_activation : activation option;
   validator_quorum_activation : activation option;
+  epoch_time_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -48,6 +50,16 @@ let validator_quorum_activation_for_chain chain_id : activation option =
       activation_epoch = source.activation_epoch;
     }
 
+let epoch_time_activation_for_chain chain_id : activation option =
+  match Octra_consensus.C_epoch_time_policy.activation_for_chain chain_id with
+  | None -> None
+  | Some source ->
+    Some {
+      anchor_epoch = source.anchor_epoch;
+      anchor_state_root = source.anchor_state_root;
+      activation_epoch = source.activation_epoch;
+    }
+
 let create ~chain_id ~root_at =
   let circle_activation =
     if String.equal chain_id devnet_chain_id then
@@ -56,14 +68,17 @@ let create ~chain_id ~root_at =
       None
   in
   {
+    chain_id;
     circle_activation;
     validator_quorum_activation =
       validator_quorum_activation_for_chain chain_id;
+    epoch_time_activation = epoch_time_activation_for_chain chain_id;
     root_at;
   }
 
 let circle_activation t = t.circle_activation
 let validator_quorum_activation t = t.validator_quorum_activation
+let epoch_time_activation t = t.epoch_time_activation
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
   if String.equal chain_id devnet_chain_id
@@ -71,12 +86,19 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
      && floor_epoch >= devnet_circle_activation.activation_epoch then
     Some devnet_circle_activation.anchor_state_root
   else
-    match validator_quorum_activation_for_chain chain_id with
-    | Some activation
-      when epoch = activation.anchor_epoch
-           && floor_epoch >= activation.anchor_epoch ->
-      Some activation.anchor_state_root
-    | _ -> None
+    let activations = [
+      validator_quorum_activation_for_chain chain_id;
+      epoch_time_activation_for_chain chain_id;
+    ] in
+    List.find_map
+      (function
+        | Some activation
+          when epoch = activation.anchor_epoch
+               && floor_epoch >= activation.anchor_epoch ->
+          Some activation.anchor_state_root
+        | Some _
+        | None -> None)
+      activations
 
 let verify_anchor t activation =
   match t.root_at activation.anchor_epoch with
@@ -108,7 +130,27 @@ let mode t activation ~epoch =
 let circle t ~epoch = mode t t.circle_activation ~epoch
 
 let validator_quorum t ~epoch =
-  mode t t.validator_quorum_activation ~epoch
+  match t.validator_quorum_activation with
+  | Some activation -> mode t (Some activation) ~epoch
+  | None ->
+    if
+      Octra_consensus.C_quorum_policy.active
+        ~chain_id:t.chain_id
+        ~epoch_id:(Int64.of_int epoch)
+    then Ok Active
+    else Ok Prior
+
+let epoch_time t ~epoch =
+  match t.epoch_time_activation with
+  | Some activation -> mode t (Some activation) ~epoch
+  | None ->
+    match
+      Octra_consensus.C_epoch_time_policy.rule_for_epoch
+        ~chain_id:t.chain_id
+        ~epoch_id:(Int64.of_int epoch)
+    with
+    | Octra_consensus.Epoch_time.Uniform -> Ok Active
+    | Octra_consensus.Epoch_time.Historical -> Ok Prior
 
 let fault_message = function
   | Anchor_missing epoch ->
