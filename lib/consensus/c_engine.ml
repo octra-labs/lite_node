@@ -96,7 +96,12 @@ let add_vote vs (v : vote) ~validator_set =
       if is_nil then begin
         vs.count_nil <- vs.count_nil + 1;
         vs.weight_nil <- Z.add vs.weight_nil weight;
-        if Z.geq vs.weight_total validator_set.quorum_weight then
+        if C_types.quorum_reached_at
+             ~chain_id:v.chain_id
+             ~epoch_id:v.epoch_id
+             validator_set
+             ~signer_count:vs.count_total
+             ~signed_weight:vs.weight_total then
           `QuorumAny
         else
           `Added
@@ -105,9 +110,19 @@ let add_vote vs (v : vote) ~validator_set =
         let proposal_weight = Z.add (weight_for_pid vs v.proposal_id) weight in
         Hashtbl.replace vs.by_pid v.proposal_id count;
         Hashtbl.replace vs.by_pid_weight v.proposal_id proposal_weight;
-        if Z.geq proposal_weight validator_set.quorum_weight then
+        if C_types.quorum_reached_at
+             ~chain_id:v.chain_id
+             ~epoch_id:v.epoch_id
+             validator_set
+             ~signer_count:count
+             ~signed_weight:proposal_weight then
           `QuorumOf v.proposal_id
-        else if Z.geq vs.weight_total validator_set.quorum_weight then
+        else if C_types.quorum_reached_at
+                  ~chain_id:v.chain_id
+                  ~epoch_id:v.epoch_id
+                  validator_set
+                  ~signer_count:vs.count_total
+                  ~signed_weight:vs.weight_total then
           `QuorumAny
         else
           `Added
@@ -421,7 +436,6 @@ let record_higher_round t ~round ~validator =
 let try_round_skip t =
   if Int64.compare t.state.height t.finalized_height <= 0 then ()
   else begin
-    let threshold = C_types.round_skip_weight t.vs in
     let best =
       Hashtbl.fold (fun round set acc ->
         if round <= t.state.round then acc
@@ -435,7 +449,14 @@ let try_round_skip t =
               set
               Z.zero
           in
-          if Z.lt weight threshold then acc
+          if not
+            (C_types.round_skip_reached_at
+               ~chain_id:t.chain_id
+               ~epoch_id:t.state.height
+               t.vs
+               ~signer_count:(Hashtbl.length set)
+               ~signed_weight:weight)
+          then acc
         else
           match acc with
           | None -> Some round
@@ -484,20 +505,32 @@ let lock_allows t (proposal_id : string) (valid_round : int option) : bool =
 let allow_valid_value_reuse t =
   t.vs.quorum >= 1
 
-let quorum_result votes ~validator_set =
+let quorum_result votes ~chain_id ~epoch_id ~validator_set =
   let proposal_id =
     Hashtbl.fold
       (fun pid weight found ->
         match found with
         | Some _ -> found
-        | None when Z.geq weight validator_set.quorum_weight -> Some pid
+        | None when
+            C_types.quorum_reached_at
+              ~chain_id
+              ~epoch_id
+              validator_set
+              ~signer_count:(count_for_pid votes pid)
+              ~signed_weight:weight -> Some pid
         | None -> None)
       votes.by_pid_weight
       None
   in
   match proposal_id with
   | Some pid -> `QuorumOf pid
-  | None when Z.geq votes.weight_total validator_set.quorum_weight ->
+  | None when
+      C_types.quorum_reached_at
+        ~chain_id
+        ~epoch_id
+        validator_set
+        ~signer_count:votes.count_total
+        ~signed_weight:votes.weight_total ->
     `QuorumAny
   | None -> `Added
 
@@ -553,7 +586,13 @@ let resume_voting t ~sign_fn =
      | Some _ ->
        t.pending_prevote <- None
      | None -> ());
-    (match quorum_result t.prevotes ~validator_set:t.vs with
+    (match
+       quorum_result
+         t.prevotes
+         ~chain_id:t.chain_id
+         ~epoch_id:t.state.height
+         ~validator_set:t.vs
+     with
      | `QuorumOf proposal_id
        when t.state.step <> PrecommitStep
          && not (Octra_net.Hash_domain.is_nil proposal_id) ->
@@ -583,7 +622,13 @@ let resume_voting t ~sign_fn =
            | LocalVoteConflict _ -> ()))
      | _ -> ());
     if Int64.compare t.state.height t.finalized_height > 0 then
-      match quorum_result t.precommits ~validator_set:t.vs with
+      match
+        quorum_result
+          t.precommits
+          ~chain_id:t.chain_id
+          ~epoch_id:t.state.height
+          ~validator_set:t.vs
+      with
       | `QuorumOf proposal_id
         when not (Octra_net.Hash_domain.is_nil proposal_id) ->
         finalize_quorum t proposal_id
@@ -777,7 +822,13 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
           ~proposal_id:vote_proposal_id
       in
       let proposal_quorum =
-        match quorum_result t.prevotes ~validator_set:t.vs with
+        match
+          quorum_result
+            t.prevotes
+            ~chain_id:t.chain_id
+            ~epoch_id:t.state.height
+            ~validator_set:t.vs
+        with
         | `QuorumOf pid -> pid = vote_proposal_id
         | `QuorumAny
         | `Added -> false

@@ -52,6 +52,7 @@ type deps = {
 
 type fork_repair_deps = {
   committed_head_epoch : unit -> int;
+  rewind_allowed : target:int -> head:int -> bool;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
   finality_target_ready : int -> (unit, string) result;

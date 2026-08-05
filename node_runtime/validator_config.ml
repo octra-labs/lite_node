@@ -241,16 +241,44 @@ let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
           match pending_config with
           | Error error -> Error error
           | Ok pending_config ->
-            let active_vs =
+            let active_vs_raw =
               match active_config with
               | None -> cfg.active_vs
               | Some active -> active.validator_set
             in
-            let scheduled_driver_config =
+            let active_vs =
+              Octra_consensus.C_types.validator_set_for_epoch
+                ~chain_id
+                ~epoch_id:current_height
+                active_vs_raw
+            in
+            let scheduled_driver_config_raw =
               match pending_config with
               | Some scheduled -> Some scheduled
               | None when Option.is_some active_config -> None
               | None -> cfg.scheduled_driver_config
+            in
+            let scheduled_driver_config =
+              if
+                Octra_consensus.C_quorum_policy.active
+                  ~chain_id
+                  ~epoch_id:current_height
+              then
+                Option.map
+                  (fun
+                    (scheduled :
+                      Octra_consensus.C_driver.scheduled_validator_set_config) ->
+                    {
+                      scheduled with
+                      validator_set =
+                        Octra_consensus.C_types.validator_set_for_epoch
+                          ~chain_id
+                          ~epoch_id:scheduled.activate_epoch
+                          scheduled.validator_set;
+                    })
+                  scheduled_driver_config_raw
+              else
+                scheduled_driver_config_raw
             in
             let light_scheduled_validator_set =
               light_scheduled_of_driver scheduled_driver_config
@@ -478,7 +506,34 @@ let build_bound ~chain_id ~consensus_mode ~current_height ~current_entries
         fingerprint;
       }
   in
-  let active_vs = Octra_consensus.C_engine.make_validator_set active_validator_list in
+  let active_vs =
+    Octra_consensus.C_engine.make_validator_set active_validator_list
+    |> Octra_consensus.C_types.validator_set_for_epoch
+         ~chain_id
+         ~epoch_id:current_height
+  in
+  let scheduled_driver_config =
+    if
+      Octra_consensus.C_quorum_policy.active
+        ~chain_id
+        ~epoch_id:current_height
+    then
+      Option.map
+        (fun
+          (scheduled :
+            Octra_consensus.C_driver.scheduled_validator_set_config) ->
+          {
+            scheduled with
+            validator_set =
+              Octra_consensus.C_types.validator_set_for_epoch
+                ~chain_id
+                ~epoch_id:scheduled.activate_epoch
+                scheduled.validator_set;
+          })
+        scheduled_driver_config
+    else
+      scheduled_driver_config
+  in
   let light_scheduled_validator_set =
     light_scheduled_of_driver scheduled_driver_config
   in

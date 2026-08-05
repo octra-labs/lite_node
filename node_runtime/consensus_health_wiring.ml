@@ -99,6 +99,7 @@ type driver_probe_deps = {
 
 type fork_repair_runtime = {
   committed_head_epoch : unit -> int;
+  rewind_allowed : target:int -> head:int -> bool;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
   finality_target_ready : int -> (unit, string) result;
@@ -408,6 +409,11 @@ let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
   in
   {
     committed_head_epoch = runtime.committed_head_epoch;
+    rewind_allowed = (fun ~target ~head ->
+      Octra_consensus.C_quorum_policy.rewind_allowed
+        ~chain_id:runtime.chain_id
+        ~from_epoch:(Int64.of_int head)
+        ~to_epoch:(Int64.of_int target));
     target_matches = (fun ~target ~root ->
       Octra_core.Fork_head_repair.target_matches
         runtime.chaindata
@@ -452,6 +458,7 @@ let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
 let fork_repair_deps (runtime : fork_repair_runtime) driver =
   Consensus_health_shell.{
     committed_head_epoch = runtime.committed_head_epoch;
+    rewind_allowed = runtime.rewind_allowed;
     target_matches = runtime.target_matches;
     empty_after = runtime.empty_after;
     run_empty = runtime.run_empty;

@@ -183,10 +183,44 @@ let catchup_response_key (rec_ : catchup_range_response_record) =
     | None -> "-" in
   rec_.status ^ "|" ^ next_epoch_s ^ "|" ^ records_root
 
-let catchup_agreement_weight t =
-  C_types.round_skip_weight t.engine.vs
+let catchup_agreement_validator_set t ~epoch_id =
+  C_types.validator_set_for_epoch
+    ~chain_id:t.config.chain_id
+    ~epoch_id
+    t.engine.vs
+
+let catchup_agreement_weight t ~epoch_id =
+  catchup_agreement_validator_set t ~epoch_id
+  |> C_types.round_skip_weight
+
+let catchup_agreement_reached t ~epoch_id ~count ~weight =
+  let validator_set = catchup_agreement_validator_set t ~epoch_id in
+  C_types.round_skip_reached_at
+    ~chain_id:t.config.chain_id
+    ~epoch_id
+    validator_set
+    ~signer_count:count
+    ~signed_weight:weight
+
+let catchup_responder_weight t ~epoch_id responder_addr =
+  catchup_agreement_validator_set t ~epoch_id
+  |> fun validator_set ->
+     match C_types.weight_of_addr validator_set responder_addr with
+     | Some weight -> weight
+     | None -> Z.zero
+
+let catchup_agreement_epoch ~from_epoch records =
+  match List.rev records with
+  | last :: _ -> last.C_codec.epoch_id
+  | [] -> from_epoch
 
 let create ~config ~validator_set ~swarm ~start_height =
+  let validator_set =
+    C_types.validator_set_for_epoch
+      ~chain_id:config.chain_id
+      ~epoch_id:start_height
+      validator_set
+  in
   let engine = C_engine.create
     ~chain_id:config.chain_id
     ~my_addr:config.my_addr
@@ -849,7 +883,7 @@ let record_vote_conflict ?conn t prior vote =
      | None -> ());
     if remembered then Some evidence else None
 
-let maybe_activate_scheduled_validator_set t ~target_epoch =
+let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
   let open Lwt.Syntax in
   let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
   let cfg_opt =
@@ -864,18 +898,24 @@ let maybe_activate_scheduled_validator_set t ~target_epoch =
        || Int64.compare target_epoch cfg.activate_epoch < 0 then
       Lwt.return_unit
     else begin
+      let validator_set =
+        C_types.validator_set_for_epoch
+          ~chain_id:t.config.chain_id
+          ~epoch_id:target_epoch
+          cfg.validator_set
+      in
       let* () =
         t.on_validator_set_activated
-          cfg.validator_set
+          validator_set
           cfg.fingerprint
       in
-      C_engine.replace_validator_set t.engine cfg.validator_set;
-      t.n_validators <- cfg.validator_set.C_types.n;
+      C_engine.replace_validator_set t.engine validator_set;
+      t.n_validators <- validator_set.C_types.n;
       Hashtbl.replace t.activated_validator_set_fingerprints cfg.fingerprint true;
       log_node t.config.my_addr
         "event = validator_set_activated target_epoch = %Ld n = %d quorum = %d fingerprint = %s"
-        target_epoch cfg.validator_set.n cfg.validator_set.quorum cfg.fingerprint;
-      if C_types.is_validator cfg.validator_set t.config.my_addr then
+        target_epoch validator_set.n validator_set.quorum cfg.fingerprint;
+      if C_types.is_validator validator_set t.config.my_addr then
         Lwt.return_unit
       else begin
         log_node t.config.my_addr
@@ -884,6 +924,43 @@ let maybe_activate_scheduled_validator_set t ~target_epoch =
         Lwt.return_unit
       end
     end
+
+let maybe_activate_quorum_policy t ~target_epoch =
+  let open Lwt.Syntax in
+  let current = t.engine.vs in
+  let effective =
+    C_types.validator_set_for_epoch
+      ~chain_id:t.config.chain_id
+      ~epoch_id:target_epoch
+      current
+  in
+  if String.equal
+       (C_config.validator_set_hash current)
+       (C_config.validator_set_hash effective)
+  then
+    Lwt.return_unit
+  else
+    let fingerprint =
+      C_config.validator_set_hash effective
+      |> raw_to_hex
+    in
+    let* () = t.on_validator_set_activated effective fingerprint in
+    C_engine.replace_validator_set t.engine effective;
+    t.n_validators <- effective.n;
+    log_node t.config.my_addr
+      "event = validator_quorum_policy_activated target_epoch = %Ld n = %d quorum = %d total_weight = %s quorum_weight = %s fingerprint = %s"
+      target_epoch
+      effective.n
+      effective.quorum
+      (Z.to_string effective.total_weight)
+      (Z.to_string effective.quorum_weight)
+      fingerprint;
+    Lwt.return_unit
+
+let maybe_activate_scheduled_validator_set t ~target_epoch =
+  let open Lwt.Syntax in
+  let* () = maybe_activate_scheduled_validator_set_raw t ~target_epoch in
+  maybe_activate_quorum_policy t ~target_epoch
 
 let resource_committee_snapshot t ~activation_delay ~committee_size ~target_epoch ~source_seed =
   Resource_attestation_flow.select_snapshot
@@ -2168,34 +2245,34 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
         t.config.my_addr from_epoch max_epochs request_nonce phase)
   in
   let pick_valid_with rejected responses =
-    let required_weight = catchup_agreement_weight t in
     let groups
-      : (string, Z.t * int * catchup_range_response_record) Hashtbl.t =
+      : (string, Z.t * int * int64 * catchup_range_response_record) Hashtbl.t =
       Hashtbl.create 8 in
     let prefix_groups
-      : (string, Z.t * int * int * catchup_range_response_record) Hashtbl.t =
+      : (string, Z.t * int * int * int64 * catchup_range_response_record) Hashtbl.t =
       Hashtbl.create 16
     in
     List.iter (fun (rec_ : catchup_range_response_record) ->
       if not (Hashtbl.mem rejected rec_.responder_addr) then begin
         if validate rec_ then begin
+          let agreement_epoch =
+            catchup_agreement_epoch ~from_epoch rec_.records
+          in
           let responder_weight =
-            match
-              C_types.weight_of_addr
-                t.engine.vs
-                rec_.responder_addr
-            with
-            | Some weight -> weight
-            | None -> Z.zero
+            catchup_responder_weight
+              t
+              ~epoch_id:agreement_epoch
+              rec_.responder_addr
           in
           let key = catchup_response_key rec_ in
-          let weight, count, repr =
+          let weight, count, agreement_epoch, repr =
             match Hashtbl.find_opt groups key with
-            | Some (weight, count, repr) ->
-              Z.add weight responder_weight, count + 1, repr
-            | None -> responder_weight, 1, rec_
+            | Some (weight, count, agreement_epoch, repr) ->
+              Z.add weight responder_weight, count + 1, agreement_epoch, repr
+            | None -> responder_weight, 1, agreement_epoch, rec_
           in
-          Hashtbl.replace groups key (weight, count, repr);
+          Hashtbl.replace groups key
+            (weight, count, agreement_epoch, repr);
           if rec_.status = "ok" then begin
             let len = List.length rec_.records in
             for prefix_len = 1 to len do
@@ -2209,23 +2286,39 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
                 records = prefix_records;
                 next_epoch = prefix_next_epoch prefix_records;
               } in
+              let prefix_epoch =
+                catchup_agreement_epoch ~from_epoch prefix_records
+              in
+              let prefix_responder_weight =
+                catchup_responder_weight
+                  t
+                  ~epoch_id:prefix_epoch
+                  rec_.responder_addr
+              in
               let
                 prefix_weight,
                 prefix_count,
                 _prefix_best_len,
+                prefix_epoch,
                 prefix_best_repr
               =
                 match Hashtbl.find_opt prefix_groups prefix_key with
-                | Some (weight, count, best_len, best_repr) ->
-                  Z.add weight responder_weight,
+                | Some (weight, count, best_len, prefix_epoch, best_repr) ->
+                  Z.add weight prefix_responder_weight,
                   count + 1,
                   best_len,
+                  prefix_epoch,
                   best_repr
                 | None ->
-                  responder_weight, 1, prefix_len, prefix_repr
+                  prefix_responder_weight,
+                  1,
+                  prefix_len,
+                  prefix_epoch,
+                  prefix_repr
               in
               Hashtbl.replace prefix_groups prefix_key
-                (prefix_weight, prefix_count, prefix_len, prefix_best_repr)
+                (prefix_weight, prefix_count, prefix_len, prefix_epoch,
+                 prefix_best_repr)
             done
           end
         end else begin
@@ -2237,29 +2330,30 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
       end
     ) responses;
     let best_full =
-      Hashtbl.fold (fun _ (weight, count, repr) acc ->
+      Hashtbl.fold (fun _ (weight, count, epoch_id, repr) acc ->
         match acc with
-        | None -> Some (weight, count, repr)
-        | Some (best_weight, _, _) when Z.gt weight best_weight ->
-          Some (weight, count, repr)
+        | None -> Some (weight, count, epoch_id, repr)
+        | Some (best_weight, _, _, _) when Z.gt weight best_weight ->
+          Some (weight, count, epoch_id, repr)
         | _ -> acc
       ) groups None
     in
     let best_prefix =
-      Hashtbl.fold (fun _ (weight, count, prefix_len, repr) acc ->
+      Hashtbl.fold (fun _ (weight, count, prefix_len, epoch_id, repr) acc ->
         match acc with
-        | None -> Some (weight, count, prefix_len, repr)
-        | Some (best_weight, _, best_prefix_len, _)
+        | None -> Some (weight, count, prefix_len, epoch_id, repr)
+        | Some (best_weight, _, best_prefix_len, _, _)
           when prefix_len > best_prefix_len
                || (prefix_len = best_prefix_len
                    && Z.gt weight best_weight) ->
-          Some (weight, count, prefix_len, repr)
+          Some (weight, count, prefix_len, epoch_id, repr)
         | _ -> acc
       ) prefix_groups None
     in
     match best_full, best_prefix with
-    | Some (weight, count, repr), _
-      when Z.geq weight required_weight ->
+    | Some (weight, count, epoch_id, repr), _
+      when catchup_agreement_reached t ~epoch_id ~count ~weight ->
+      let required_weight = catchup_agreement_weight t ~epoch_id in
       let records_root_hex =
         raw_to_hex (C_hash.catchup_records_root repr.records) in
       log_node t.config.my_addr
@@ -2271,8 +2365,9 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
         (String.sub records_root_hex 0 (min 16 (String.length records_root_hex)))
         (List.length repr.records);
       Some repr
-    | _, Some (weight, count, prefix_len, repr)
-      when Z.geq weight required_weight ->
+    | _, Some (weight, count, prefix_len, epoch_id, repr)
+      when catchup_agreement_reached t ~epoch_id ~count ~weight ->
+      let required_weight = catchup_agreement_weight t ~epoch_id in
       let records_root_hex =
         raw_to_hex (C_hash.catchup_records_root repr.records) in
       log_node t.config.my_addr
@@ -2349,24 +2444,21 @@ let query_epoch_root t ~epoch_id ~timeout_seconds =
   let open Lwt.Syntax in
   Hashtbl.replace t.epoch_root_responses epoch_id [];
   let has_root_quorum records =
-    let required_weight = catchup_agreement_weight t in
     let counts = Hashtbl.create 8 in
     List.exists (fun (r : epoch_root_response_record) ->
       match r.state_root with
       | None -> false
       | Some root ->
         let responder_weight =
-          match C_types.weight_of_addr t.engine.vs r.responder_addr with
-          | Some weight -> weight
-          | None -> Z.zero
+          catchup_responder_weight t ~epoch_id r.responder_addr
         in
-        let weight =
+        let weight, count =
           match Hashtbl.find_opt counts root with
-          | Some weight -> Z.add weight responder_weight
-          | None -> responder_weight
+          | Some (weight, count) -> Z.add weight responder_weight, count + 1
+          | None -> responder_weight, 1
         in
-        Hashtbl.replace counts root weight;
-        Z.geq weight required_weight
+        Hashtbl.replace counts root (weight, count);
+        catchup_agreement_reached t ~epoch_id ~count ~weight
     ) records
   in
   let q = C_codec.{

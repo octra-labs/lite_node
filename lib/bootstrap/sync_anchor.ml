@@ -260,6 +260,12 @@ let verify_step ~chain_id ~prior_epoch validator_set (step : step) =
           Error "validator transition state proof mismatch"
         else
           let* next = Update.validator_set update in
+          let next =
+            C_types.validator_set_for_epoch
+              ~chain_id
+              ~epoch_id:update.activate_epoch
+              next
+          in
           Ok (Some epoch, next)
 
 let derive ~validator_set:trusted value =

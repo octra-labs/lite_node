@@ -282,7 +282,20 @@ let persistent_update_deps_of_runtime runtime =
   }
 
 let load_runtime_persistent_update runtime =
-  load_persistent_update (persistent_update_deps_of_runtime runtime)
+  let open Lwt.Syntax in
+  let* config =
+    load_persistent_update (persistent_update_deps_of_runtime runtime)
+  in
+  match config with
+  | None -> Lwt.return_none
+  | Some config ->
+    let validator_set =
+      Octra_consensus.C_types.validator_set_for_epoch
+        ~chain_id:runtime.chain_id
+        ~epoch_id:config.activate_epoch
+        config.validator_set
+    in
+    Lwt.return_some { config with validator_set }
 
 let validator_pubkeys validator_set =
   validator_set.Octra_consensus.C_types.validators
@@ -369,7 +382,13 @@ let start_node runtime =
       activate_validator_set = (fun validator_set _ ->
         let next =
           match !scheduled with
-          | Some config when same_validator_set validator_set config.validator_set ->
+          | Some config when
+              same_validator_set
+                validator_set
+                (Octra_consensus.C_types.validator_set_for_epoch
+                   ~chain_id:runtime.chain_id
+                   ~epoch_id:config.activate_epoch
+                   config.validator_set) ->
             None
           | current -> current
         in

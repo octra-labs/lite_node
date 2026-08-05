@@ -77,13 +77,18 @@ let stored deps trusted =
   | first :: _ -> Some first
   | [] -> None
 
-let update raw =
+let update ~chain_id raw =
   let* update = Update.of_string raw in
   if Update.to_string update <> raw then
     Error "state sync validator update is not exact"
   else
     let* validator_set = Update.validator_set update in
-    Ok (update, validator_set)
+    Ok
+      ( update,
+        C_types.validator_set_for_epoch
+          ~chain_id
+          ~epoch_id:update.activate_epoch
+          validator_set )
 
 let transition_epoch update =
   let epoch = Int64.pred update.Update.activate_epoch in
@@ -278,7 +283,7 @@ let walk deps ~head_epoch ~base ~stop raw =
       if List.mem digest seen then
         Lwt.return_error "state sync validator transition chain has a cycle"
       else
-        match update raw with
+        match update ~chain_id:deps.chain_id raw with
         | Error reason -> Lwt.return_error reason
         | Ok (_, next_set) when same_set next_set stop.validator_set ->
             Lwt.return_ok stop
@@ -304,7 +309,7 @@ let walk deps ~head_epoch ~base ~stop raw =
                           "state sync stored validator chain does not join history"
                     | Some prior_raw ->
                         begin
-                          match update prior_raw with
+                          match update ~chain_id:deps.chain_id prior_raw with
                           | Error reason -> Lwt.return_error reason
                           | Ok (_, prior_set)
                             when same_set prior_set stop.validator_set ->

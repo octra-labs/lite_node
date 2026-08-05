@@ -55,7 +55,13 @@ let verify_root_quorum ~validator_set_proof roots =
         if not (List.for_all root_ok roots) then None
         else
           let signers = root_signers roots in
-          if not (C_types.has_quorum vs signers) then None
+          if not
+            (C_types.has_quorum_at
+               ~chain_id:root.chain_id
+               ~epoch_id:root.head_epoch
+               vs
+               signers)
+          then None
           else Some { root; signers }
 
 let rec verify_chain = function

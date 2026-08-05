@@ -363,35 +363,50 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           exit_fatal = exit_error;
         })
     in
-    begin
-      match Rule_graph.circle_activation rules with
+    let bind_rule
+        name
+        (activation : Rule_graph.activation option)
+        evaluate =
+      match activation with
       | None ->
-        Log.info "init" "event = rule_graph status = prior"
+        Log.info "init"
+          "event = rule_graph rule = %s status = prior"
+          name
       | Some activation ->
         if !current_epoch <= activation.anchor_epoch then
           Log.info "init"
-            "event = rule_graph status = awaiting_anchor anchor_epoch = %d activation_epoch = %d"
+            "event = rule_graph rule = %s status = awaiting_anchor anchor_epoch = %d activation_epoch = %d"
+            name
             activation.anchor_epoch
             activation.activation_epoch
         else
-          match
-            Rule_graph.circle rules ~epoch:activation.activation_epoch
-          with
+          match evaluate activation.activation_epoch with
           | Ok Rule_graph.Active ->
             Log.info "init"
-              "event = rule_graph status = bound anchor_epoch = %d activation_epoch = %d"
+              "event = rule_graph rule = %s status = bound anchor_epoch = %d activation_epoch = %d"
+              name
               activation.anchor_epoch
               activation.activation_epoch
           | Ok Rule_graph.Prior ->
             Log.fatal "init"
-              "event = rule_graph status = rejected reason = activation_unreachable";
+              "event = rule_graph rule = %s status = rejected reason = activation_unreachable"
+              name;
             exit_error ()
           | Error fault ->
             Log.fatal "init"
-              "event = rule_graph status = rejected reason = %s"
+              "event = rule_graph rule = %s status = rejected reason = %s"
+              name
               (Rule_graph.fault_message fault);
             exit_error ()
-    end;
+    in
+    bind_rule
+      "circle"
+      (Rule_graph.circle_activation rules)
+      (fun epoch -> Rule_graph.circle rules ~epoch);
+    bind_rule
+      "validator_quorum"
+      (Rule_graph.validator_quorum_activation rules)
+      (fun epoch -> Rule_graph.validator_quorum rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)

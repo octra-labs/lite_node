@@ -31,6 +31,7 @@ val create :
   t
 
 val circle_activation : t -> activation option
+val validator_quorum_activation : t -> activation option
 
 val root_after_floor :
   chain_id:string ->
@@ -39,6 +40,11 @@ val root_after_floor :
   string option
 
 val circle :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val validator_quorum :
   t ->
   epoch:int ->
   (mode, fault) result

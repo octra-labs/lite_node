@@ -269,7 +269,11 @@ let verify_quorum ~validator_set body signatures =
       ) (Ok ()) signatures
     in
     if not
-      (Octra_consensus.C_types.has_quorum validator_set signers) then
+      (Octra_consensus.C_types.has_quorum_at
+         ~chain_id:body.chain_id
+         ~epoch_id:body.epoch
+         validator_set
+         signers) then
       Error "checkpoint signature quorum missing"
     else
       Ok ()

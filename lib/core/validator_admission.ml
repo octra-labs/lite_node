@@ -237,7 +237,12 @@ let signed_weight snapshot signers =
 let has_quorum snapshot signers =
   match signed_weight snapshot signers with
   | Error _ as error -> error
-  | Ok weight -> Ok (Z.geq weight snapshot.quorum_weight)
+  | Ok weight ->
+    let n = List.length snapshot.validators in
+    let f = (n - 1) / 3 in
+    let quorum = if n < 4 then n else n - f in
+    let signer_count = List.length (List.sort_uniq String.compare signers) in
+    Ok (signer_count >= quorum && Z.geq weight snapshot.quorum_weight)
 
 let leader_hash ~seed ~epoch_id ~round =
   let buffer = Buffer.create 128 in

@@ -25,6 +25,7 @@ type activation = {
 
 type t = {
   circle_activation : activation option;
+  validator_quorum_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -37,6 +38,16 @@ let devnet_circle_activation = {
   activation_epoch = 1_299_000;
 }
 
+let validator_quorum_activation_for_chain chain_id : activation option =
+  match Octra_consensus.C_quorum_policy.activation_for_chain chain_id with
+  | None -> None
+  | Some source ->
+    Some {
+      anchor_epoch = source.anchor_epoch;
+      anchor_state_root = source.anchor_state_root;
+      activation_epoch = source.activation_epoch;
+    }
+
 let create ~chain_id ~root_at =
   let circle_activation =
     if String.equal chain_id devnet_chain_id then
@@ -44,9 +55,15 @@ let create ~chain_id ~root_at =
     else
       None
   in
-  { circle_activation; root_at }
+  {
+    circle_activation;
+    validator_quorum_activation =
+      validator_quorum_activation_for_chain chain_id;
+    root_at;
+  }
 
 let circle_activation t = t.circle_activation
+let validator_quorum_activation t = t.validator_quorum_activation
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
   if String.equal chain_id devnet_chain_id
@@ -54,7 +71,12 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
      && floor_epoch >= devnet_circle_activation.activation_epoch then
     Some devnet_circle_activation.anchor_state_root
   else
-    None
+    match validator_quorum_activation_for_chain chain_id with
+    | Some activation
+      when epoch = activation.anchor_epoch
+           && floor_epoch >= activation.anchor_epoch ->
+      Some activation.anchor_state_root
+    | _ -> None
 
 let verify_anchor t activation =
   match t.root_at activation.anchor_epoch with
@@ -76,12 +98,17 @@ let verify_anchor t activation =
          actual;
        })
 
-let circle t ~epoch =
-  match t.circle_activation with
+let mode t activation ~epoch =
+  match activation with
   | None -> Ok Prior
   | Some activation when epoch < activation.activation_epoch -> Ok Prior
   | Some activation ->
     Result.map (fun () -> Active) (verify_anchor t activation)
+
+let circle t ~epoch = mode t t.circle_activation ~epoch
+
+let validator_quorum t ~epoch =
+  mode t t.validator_quorum_activation ~epoch
 
 let fault_message = function
   | Anchor_missing epoch ->

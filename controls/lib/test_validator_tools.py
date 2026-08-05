@@ -880,6 +880,7 @@ class ValidatorToolsTest(unittest.TestCase):
         installer = install_path if install_path.is_file() else exported_install
         install_value = installer.read_text(encoding="utf-8")
         self.assertIn("build-essential", install_value)
+        self.assertIn("clang", install_value)
         self.assertIn("liblmdb-dev", install_value)
         self.assertIn("liblmdb0", install_value)
         self.assertIn("https://sh.rustup.rs", install_value)
@@ -929,7 +930,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with mock.patch("validator_config.sys.platform", "linux"):
                 with mock.patch(
                     "validator_config.os.uname",
-                    return_value=mock.Mock(machine="x86_64"),
+                    return_value=mock.Mock(machine="aarch64"),
                 ):
                     with mock.patch(
                         "validator_config.ensure_build_toolchain",
@@ -949,6 +950,8 @@ class ValidatorToolsTest(unittest.TestCase):
         build = next(command for command in command_values if "dune" in command)
         self.assertIn("--locked", install)
         self.assertIn("--require-checksums", install)
+        self.assertTrue((WORK / "mcl/obj").is_dir())
+        self.assertTrue((WORK / "mcl/lib").is_dir())
         for name in names:
             self.assertIn(f"bin/{name}", build)
             self.assertEqual(

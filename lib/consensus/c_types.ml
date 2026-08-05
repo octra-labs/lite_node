@@ -230,6 +230,84 @@ let make_weighted_validator_set entries =
   | Error _ as error -> error
   | Ok () -> Ok (build_validator_set ~weighted:true entries)
 
+let weights_of_set (vs : validator_set) =
+  List.map
+    (fun validator ->
+      match List.assoc_opt validator.address vs.weights with
+      | Some weight -> validator, weight
+      | None -> invalid_arg "validator weight missing")
+    vs.validators
+
+let sum_weights entries =
+  List.fold_left
+    (fun total (_, weight) -> Z.add total weight)
+    Z.zero
+    entries
+
+let cap_entries cap entries =
+  List.map
+    (fun (validator, weight) -> validator, Z.min weight cap)
+    entries
+
+let largest_weight_sum count entries =
+  entries
+  |> List.map snd
+  |> List.sort (fun left right -> Z.compare right left)
+  |> fun weights ->
+     let rec sum remaining total = function
+       | _ when remaining <= 0 -> total
+       | [] -> total
+       | weight :: rest -> sum (remaining - 1) (Z.add total weight) rest
+     in
+     sum count Z.zero weights
+
+let resilient_at_cap ~faults cap entries =
+  let effective = cap_entries cap entries in
+  let total = sum_weights effective in
+  let unavailable = largest_weight_sum faults effective in
+  let remaining = Z.sub total unavailable in
+  Z.geq remaining (quorum_weight total)
+
+let effective_weight_cap (vs : validator_set) =
+  let entries = weights_of_set vs in
+  match entries with
+  | [] -> Z.zero
+  | (_, first) :: rest ->
+    let maximum =
+      List.fold_left
+        (fun current (_, weight) -> Z.max current weight)
+        first
+        rest
+    in
+    if vs.f <= 0 || resilient_at_cap ~faults:vs.f maximum entries then
+      maximum
+    else
+      let rec search lower upper =
+        if Z.geq lower upper then lower
+        else
+          let middle =
+            Z.div (Z.add (Z.add lower upper) Z.one) (Z.of_int 2)
+          in
+          if resilient_at_cap ~faults:vs.f middle entries then
+            search middle upper
+          else
+            search lower (Z.sub middle Z.one)
+      in
+      search Z.one maximum
+
+let resilient_validator_set (vs : validator_set) =
+  if not vs.weighted || vs.n < 4 then vs
+  else
+    let entries = weights_of_set vs in
+    let cap = effective_weight_cap vs in
+    build_validator_set ~weighted:true (cap_entries cap entries)
+
+let validator_set_for_epoch ~chain_id ~epoch_id vs =
+  if C_quorum_policy.active ~chain_id ~epoch_id then
+    resilient_validator_set vs
+  else
+    vs
+
 let pubkey_of_addr (vs : validator_set) (addr : string) : string option =
   match List.find_opt (fun v -> v.address = addr) vs.validators with
   | Some v -> Some v.pubkey
@@ -258,13 +336,51 @@ let signed_weight (vs : validator_set) validators =
   in
   loop [] Z.zero validators
 
-let has_quorum vs validators =
+let unique_signer_count validators =
+  validators
+  |> List.sort_uniq String.compare
+  |> List.length
+
+let has_weight_quorum vs validators =
   match signed_weight vs validators with
   | None -> false
   | Some weight -> Z.geq weight vs.quorum_weight
 
+let has_quorum_values vs ~signer_count ~signed_weight =
+  signer_count >= vs.quorum
+  && Z.geq signed_weight vs.quorum_weight
+
+let has_quorum vs validators =
+  match signed_weight vs validators with
+  | None -> false
+  | Some weight ->
+    has_quorum_values
+      vs
+      ~signer_count:(unique_signer_count validators)
+      ~signed_weight:weight
+
+let has_quorum_at ~chain_id ~epoch_id vs validators =
+  if C_quorum_policy.active ~chain_id ~epoch_id then
+    has_quorum
+      (validator_set_for_epoch ~chain_id ~epoch_id vs)
+      validators
+  else
+    has_weight_quorum vs validators
+
+let quorum_reached_at ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
+  Z.geq signed_weight vs.quorum_weight
+  &&
+  (not (C_quorum_policy.active ~chain_id ~epoch_id)
+   || signer_count >= vs.quorum)
+
 let round_skip_weight vs =
   Z.(add (sub vs.total_weight vs.quorum_weight) one)
+
+let round_skip_reached_at ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
+  Z.geq signed_weight (round_skip_weight vs)
+  &&
+  (not (C_quorum_policy.active ~chain_id ~epoch_id)
+   || signer_count >= vs.f + 1)
 
 let weighted_leader (vs : validator_set) ~epoch_id ~round =
   let buffer = Buffer.create 256 in

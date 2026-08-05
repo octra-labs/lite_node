@@ -55,6 +55,7 @@ type deps = {
 
 type fork_repair_deps = {
   committed_head_epoch : unit -> int;
+  rewind_allowed : target:int -> head:int -> bool;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
   finality_target_ready : int -> (unit, string) result;
@@ -81,12 +82,18 @@ let repair_snapshot (deps : fork_repair_deps) reason =
   deps.mark_quarantine ("fork_snapshot_required:" ^ reason);
   Lwt.return false
 
+let await_rule_activation_quorum (deps : fork_repair_deps) =
+  deps.mark_quarantine "ahead_of_target_by_rule_activation_boundary";
+  Lwt.return false
+
 let repair_empty_fork (deps : fork_repair_deps) ~target_epoch ~target_root ~required
     ~current_root_quorum =
   let open Lwt.Syntax in
   let target = Int64.to_int target_epoch in
   let our_head = deps.committed_head_epoch () in
   if target < 0 then repair_snapshot deps "negative_target"
+  else if not (deps.rewind_allowed ~target ~head:our_head) then
+    await_rule_activation_quorum deps
   else
     let target_local_matches =
       deps.target_matches ~target ~root:target_root
