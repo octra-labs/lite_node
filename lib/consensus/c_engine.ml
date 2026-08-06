@@ -133,9 +133,23 @@ type output =
   | SendPropose of propose
   | SendVote of vote
   | SendFinalize of finalize
+  | RequestProposal of { round : int; proposal_id : string }
   | RequestRoundEvidence of int
   | ScheduleTimeout of { step : round_step; round : int; delay_ms : int; generation : int }
   | Finalized of { epoch_id : int64; finalize : finalize }
+
+let missing_proposal_request ~proposal_known (vote : vote) result =
+  match result with
+  | `Duplicate
+  | `Rejected ->
+    None
+  | `Added
+  | `QuorumAny
+  | `QuorumOf _ ->
+    if Octra_net.Hash_domain.is_nil vote.proposal_id || proposal_known then
+      None
+    else
+      Some (vote.round, vote.proposal_id)
 
 let int_env name ~fallback ~limit =
   match Sys.getenv_opt name with
@@ -1077,6 +1091,18 @@ let on_vote t (v : vote) ~sign_fn =
     match v.vote_type with
     | Prevote ->
       let result = add_vote t.prevotes v ~validator_set:t.vs in
+      Option.iter
+        (fun (round, proposal_id) ->
+          emit t (RequestProposal { round; proposal_id }))
+        (missing_proposal_request
+           ~proposal_known:
+             (Option.is_some
+                (find_proposal_message
+                   t
+                   ~proposal_id:v.proposal_id
+                   ~round:v.round))
+           v
+           result);
       (match result with
        | `QuorumOf proposal_id when t.state.step = PrevoteStep ->
          let nil = Octra_net.Hash_domain.is_nil proposal_id in
@@ -1132,6 +1158,18 @@ let on_vote t (v : vote) ~sign_fn =
 
     | Precommit ->
       let result = add_vote t.precommits v ~validator_set:t.vs in
+      Option.iter
+        (fun (round, proposal_id) ->
+          emit t (RequestProposal { round; proposal_id }))
+        (missing_proposal_request
+           ~proposal_known:
+             (Option.is_some
+                (find_proposal_message
+                   t
+                   ~proposal_id:v.proposal_id
+                   ~round:v.round))
+           v
+           result);
       (match result with
        | `QuorumOf proposal_id when local_voting_allowed t ->
          (match find_known_header t proposal_id with

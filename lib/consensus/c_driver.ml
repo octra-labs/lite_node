@@ -113,6 +113,24 @@ type proposal_frame_error =
   | Proposal_envelope
   | Proposal_parent_commit_hash
 
+type verified_proposal_route =
+  | Publish_verified_proposal
+  | Relay_verified_proposal of {
+      source_peer : string;
+      payload : string;
+    }
+
+type proposal_fetch = {
+  height : int64;
+  round : int;
+  proposal_id : string;
+  generation : int;
+}
+
+type proposal_fetch_decision =
+  | Stop_proposal_fetch
+  | Send_proposal_fetch
+
 type t = {
   mutable n_validators : int;
   config : config;
@@ -137,6 +155,7 @@ type t = {
   pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
   round_sync_replies : (string, int64) Hashtbl.t;
+  proposal_fetches : (string, unit) Hashtbl.t;
   catchup_query_from_epoch : (string, int64) Hashtbl.t;
   mutable proposal_build : proposal_build option;
   mutable proposal_retry : proposal_build option;
@@ -254,6 +273,7 @@ let create ~config ~validator_set ~swarm ~start_height =
     pending_proposals = Hashtbl.create 8;
     deferred_proposals = Hashtbl.create 16;
     round_sync_replies = Hashtbl.create 16;
+    proposal_fetches = Hashtbl.create 4;
     catchup_query_from_epoch = Hashtbl.create 8;
     proposal_build = None;
     proposal_retry = None;
@@ -426,6 +446,11 @@ let proposal_height_status ~current ~proposal =
 let proposal_local_status ~engine_head ~local_head ~proposal =
   if Int64.compare proposal local_head <= 0 then Proposal_stale
   else proposal_height_status ~current:engine_head ~proposal
+
+let vote_relay_relevant ~current_height ~current_round (vote : C_types.vote) =
+  vote.epoch_id = current_height
+  && vote.round >= current_round
+  && vote.round <= current_round + C_engine.max_round_ahead
 
 let proposal_frame_error_label = function
   | Proposal_signature_or_unknown -> "signature_or_unknown_validator"
@@ -667,6 +692,103 @@ let broadcast_round_sync_at t ~round =
             ~round
             ~step:C_types.PrevoteStep
             ~request:true))
+
+let proposal_fetch_attempts = 4
+let proposal_fetch_interval = 1.05
+
+let proposal_fetch_key fetch =
+  Printf.sprintf
+    "%d:%Ld:%d:%s"
+    fetch.generation
+    fetch.height
+    fetch.round
+    (raw_to_hex fetch.proposal_id)
+
+let decide_proposal_fetch
+    fetch
+    ~running
+    ~height
+    ~round
+    ~generation
+    ~proposal_known
+    ~attempts_left =
+  if not running
+     || attempts_left <= 0
+     || height <> fetch.height
+     || round <> fetch.round
+     || generation <> fetch.generation
+     || proposal_known
+  then
+    Stop_proposal_fetch
+  else
+    Send_proposal_fetch
+
+let start_proposal_fetch t ~round ~proposal_id =
+  if not (local_validator t) || not (t.config.can_vote ()) then
+    Lwt.return_unit
+  else
+    let fetch = {
+      height = t.engine.state.height;
+      round;
+      proposal_id;
+      generation = t.engine.generation;
+    } in
+    let key = proposal_fetch_key fetch in
+    if Hashtbl.mem t.proposal_fetches key then
+      Lwt.return_unit
+    else begin
+      Hashtbl.add t.proposal_fetches key ();
+      let open Lwt.Syntax in
+      let rec run attempts_left =
+        let proposal_known =
+          Option.is_some
+            (C_engine.find_proposal_message
+               t.engine
+               ~proposal_id:fetch.proposal_id
+               ~round:fetch.round)
+        in
+        match
+          decide_proposal_fetch
+            fetch
+            ~running:t.running
+            ~height:t.engine.state.height
+            ~round:t.engine.state.round
+            ~generation:t.engine.generation
+            ~proposal_known
+            ~attempts_left
+        with
+        | Stop_proposal_fetch ->
+          Lwt.return_unit
+        | Send_proposal_fetch ->
+          log_node t.config.my_addr
+            "event = request_proposal epoch = %Ld round = %d attempt = %d"
+            fetch.height
+            fetch.round
+            (proposal_fetch_attempts - attempts_left + 1);
+          let* () = broadcast_round_sync_at t ~round:fetch.round in
+          if attempts_left = 1 then
+            Lwt.return_unit
+          else
+            let* () = Lwt_unix.sleep proposal_fetch_interval in
+            run (attempts_left - 1)
+      in
+      Lwt.async (fun () ->
+        Lwt.catch
+          (fun () ->
+            Lwt.finalize
+              (fun () -> run proposal_fetch_attempts)
+              (fun () ->
+                Hashtbl.remove t.proposal_fetches key;
+                Lwt.return_unit))
+          (fun exn ->
+            warn_node t.config.my_addr
+              "event = request_proposal_failed epoch = %Ld round = %d error = %s"
+              fetch.height
+              fetch.round
+              (Printexc.to_string exn);
+            Lwt.return_unit));
+      Lwt.return_unit
+    end
 
 let local_round_votes t =
   let local_vote set =
@@ -1208,7 +1330,22 @@ let admit_resource_attestation t attestation =
             t.resource_admission
             attestation
 
-let admit_current_proposal t (p : C_types.propose) =
+let send_verified_proposal t route (p : C_types.propose) =
+  match route with
+  | Publish_verified_proposal ->
+    Octra_net.P2p_swarm.broadcast
+      t.swarm
+      {
+        msg_type = Frame.msg_cons_propose;
+        payload = C_codec.encode_propose p;
+      }
+  | Relay_verified_proposal { source_peer; payload } ->
+    Octra_net.P2p_swarm.broadcast_except
+      t.swarm
+      ~except:source_peer
+      { msg_type = Frame.msg_cons_propose; payload }
+
+let admit_current_proposal t ~route (p : C_types.propose) =
   let open Lwt.Syntax in
   let signature_valid =
     match C_types.pubkey_of_addr t.engine.vs p.proposer with
@@ -1260,9 +1397,7 @@ let admit_current_proposal t (p : C_types.propose) =
     | Some preview_ok ->
       let* () =
         if preview_ok then
-          let payload = C_codec.encode_propose p in
-          Octra_net.P2p_swarm.broadcast t.swarm
-            { msg_type = Frame.msg_cons_propose; payload }
+          send_verified_proposal t route p
         else
           Lwt.return_unit
       in
@@ -1293,7 +1428,7 @@ let replay_pending_proposal t =
       "event = replay_pending_proposal epoch = %Ld round = %d"
       height
       round;
-    admit_current_proposal t p
+    admit_current_proposal t ~route:Publish_verified_proposal p
 
 let vote_type_rank = function
   | C_types.Prevote -> 0
@@ -1393,6 +1528,7 @@ let rec process_outputs_once t =
       | C_engine.SendPropose _ -> "SendPropose"
       | C_engine.SendVote _ -> "SendVote"
       | C_engine.SendFinalize _ -> "SendFinalize"
+      | C_engine.RequestProposal _ -> "RequestProposal"
       | C_engine.RequestRoundEvidence _ -> "RequestRoundEvidence"
       | C_engine.ScheduleTimeout _ -> "ScheduleTimeout"
       | C_engine.Finalized _ -> "Finalized" in
@@ -1439,6 +1575,8 @@ let rec process_outputs_once t =
               proceed
                 (Octra_net.P2p_swarm.broadcast t.swarm
                   { msg_type = Frame.msg_cons_finalize; payload })
+            | C_engine.RequestProposal { round; proposal_id } ->
+              proceed (start_proposal_fetch t ~round ~proposal_id)
             | C_engine.RequestRoundEvidence round ->
               proceed (broadcast_round_sync_at t ~round)
             | C_engine.ScheduleTimeout { step; round; delay_ms; generation } ->
@@ -1778,7 +1916,13 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                ~reason:(proposal_frame_peer_reason error);
              Lwt.return_unit
            | Ok () ->
-             let* () = admit_current_proposal t p in
+             let route =
+               Relay_verified_proposal {
+                 source_peer = _conn.Octra_net.P2p_conn.peer_id;
+                 payload = frame.payload;
+               }
+             in
+             let* () = admit_current_proposal t ~route p in
              process_outputs t)
         )
       (fun exn ->
@@ -1826,6 +1970,16 @@ let on_p2p_message t _conn (frame : Frame.frame) =
              | Proposal_stale -> ());
             Lwt.return_unit
           end else
+            let relay_candidate =
+              match status with
+              | Proposal_current ->
+                vote_relay_relevant
+                  ~current_height:t.engine.state.height
+                  ~current_round:t.engine.state.round
+                  v
+              | Proposal_stale
+              | Proposal_future -> false
+            in
             let future =
               match status with
               | Proposal_future -> defer_future_vote t v
@@ -1864,6 +2018,15 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                 Octra_net.P2p_swarm.broadcast
                   t.swarm
                   (vote_evidence_frame value)
+            in
+            let* () =
+              if relay_candidate && Option.is_none evidence then
+                Octra_net.P2p_swarm.broadcast_except
+                  t.swarm
+                  ~except:_conn.Octra_net.P2p_conn.peer_id
+                  { msg_type = Frame.msg_cons_vote; payload = frame.payload }
+              else
+                Lwt.return_unit
             in
             Lwt.return_unit)
       (fun exn ->
