@@ -9,6 +9,7 @@ type validator_set = C_types.validator_set
 let make_validator_set = C_types.make_validator_set
 let leader_of = C_types.leader_of
 let max_round_ahead = 64
+let round_history_limit = 64
 let max_timeout_ms = 120_000
 let max_propose_timeout_ms = 300_000
 
@@ -132,6 +133,7 @@ type output =
   | SendPropose of propose
   | SendVote of vote
   | SendFinalize of finalize
+  | RequestRoundEvidence of int
   | ScheduleTimeout of { step : round_step; round : int; delay_ms : int; generation : int }
   | Finalized of { epoch_id : int64; finalize : finalize }
 
@@ -178,12 +180,14 @@ type t = {
   mutable vs : validator_set;
   mutable state : engine_state;
   mutable prevotes : vote_set;
+  mutable prevotes_by_round : (int, vote_set) Hashtbl.t;
   mutable precommits : vote_set;
   mutable current_proposal : propose option;
   mutable pending_prevote : (int64 * int * string) option;
   mutable proposal_cache : (string, proposal_cache_entry) Hashtbl.t;
   mutable proposal_messages : ((string * int), propose) Hashtbl.t;
   mutable polc_by_round : (int, string) Hashtbl.t;
+  mutable polc_requests : (int, int) Hashtbl.t;
   mutable higher_round_evidence : (int, (string, unit) Hashtbl.t) Hashtbl.t;
   mutable outputs : output list;
   mutable finalized_height : int64;
@@ -191,24 +195,30 @@ type t = {
   can_vote : unit -> bool;
 }
 
-let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote = {
-  chain_id;
-  my_addr;
-  vs = validator_set;
-  state = initial_engine_state start_height;
-  prevotes = create_vote_set ();
-  precommits = create_vote_set ();
-  current_proposal = None;
-  pending_prevote = None;
-  proposal_cache = Hashtbl.create 8;
-  proposal_messages = Hashtbl.create 8;
-  polc_by_round = Hashtbl.create 4;
-  higher_round_evidence = Hashtbl.create 4;
-  outputs = [];
-  finalized_height = Int64.pred start_height;
-  generation = 0;
-  can_vote;
-}
+let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
+  let prevotes = create_vote_set () in
+  let prevotes_by_round = Hashtbl.create 8 in
+  Hashtbl.add prevotes_by_round 0 prevotes;
+  {
+    chain_id;
+    my_addr;
+    vs = validator_set;
+    state = initial_engine_state start_height;
+    prevotes;
+    prevotes_by_round;
+    precommits = create_vote_set ();
+    current_proposal = None;
+    pending_prevote = None;
+    proposal_cache = Hashtbl.create 8;
+    proposal_messages = Hashtbl.create 8;
+    polc_by_round = Hashtbl.create 4;
+    polc_requests = Hashtbl.create 4;
+    higher_round_evidence = Hashtbl.create 4;
+    outputs = [];
+    finalized_height = Int64.pred start_height;
+    generation = 0;
+    can_vote;
+  }
 
 let replace_validator_set t validator_set =
   t.vs <- validator_set
@@ -239,10 +249,35 @@ let find_tx_hashes t pid =
   | Some e -> e.tx_hashes
   | None -> None
 
+let promote_known_header t round proposal_id =
+  if round > t.state.valid_round then
+    match find_header t proposal_id with
+    | None -> ()
+    | Some header ->
+      t.state <- {
+        t.state with
+        valid_round = round;
+        valid_value = Some header;
+      }
+
+let record_polc t round proposal_id =
+  if not (Octra_net.Hash_domain.is_nil proposal_id) then begin
+    Hashtbl.replace t.polc_by_round round proposal_id;
+    Hashtbl.remove t.polc_requests round;
+    promote_known_header t round proposal_id
+  end
+
+let promote_cached_polc t proposal_id =
+  Hashtbl.iter
+    (fun round pid ->
+      if pid = proposal_id then promote_known_header t round proposal_id)
+    t.polc_by_round
+
 let cache_proposal_message t (proposal : propose) =
   let pid = C_hash.proposal_id proposal.header in
   cache_proposal_bundle t pid proposal.header proposal.tx_hashes;
-  Hashtbl.replace t.proposal_messages (pid, proposal.round) proposal
+  Hashtbl.replace t.proposal_messages (pid, proposal.round) proposal;
+  promote_cached_polc t pid
 
 let find_proposal_message t ~proposal_id ~round =
   Hashtbl.find_opt t.proposal_messages (proposal_id, round)
@@ -267,13 +302,21 @@ let vote_set_for t = function
   | Prevote -> t.prevotes
   | Precommit -> t.precommits
 
+let vote_set_for_round t vote_type round =
+  match vote_type with
+  | Prevote -> Hashtbl.find_opt t.prevotes_by_round round
+  | Precommit when round = t.state.round -> Some t.precommits
+  | Precommit -> None
+
 let conflicting_vote t (vote : vote) =
-  if vote.epoch_id <> t.state.height || vote.round <> t.state.round then None
+  if vote.epoch_id <> t.state.height then None
   else
-    let votes = (vote_set_for t vote.vote_type).votes in
-    match Hashtbl.find_opt votes vote.validator with
-    | Some prior when prior.proposal_id <> vote.proposal_id -> Some prior
-    | _ -> None
+    match vote_set_for_round t vote.vote_type vote.round with
+    | None -> None
+    | Some vote_set ->
+      match Hashtbl.find_opt vote_set.votes vote.validator with
+      | Some prior when prior.proposal_id <> vote.proposal_id -> Some prior
+      | _ -> None
 
 let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
   let vs = vote_set_for t vote_type in
@@ -355,9 +398,87 @@ let can_prevote t =
   | ProposeStep | PrevoteStep -> true
   | PrecommitStep -> false
 
+let round_retained t round =
+  let recent_floor = max 0 (t.state.round - round_history_limit) in
+  round >= recent_floor
+  || round = t.state.locked_round
+  || round = t.state.valid_round
+  || Hashtbl.mem t.polc_requests round
+
+let oldest_polc_request t =
+  Hashtbl.fold
+    (fun round _ oldest ->
+      match oldest with
+      | None -> Some round
+      | Some value -> Some (min value round))
+    t.polc_requests
+    None
+
+let remember_polc_request t round =
+  if round < 0
+     || round >= t.state.round
+     || round <= t.state.locked_round
+     || Hashtbl.mem t.polc_by_round round
+  then
+    false
+  else if Hashtbl.mem t.polc_requests round then
+    true
+  else begin
+    if Hashtbl.length t.polc_requests >= round_history_limit then
+      Option.iter (Hashtbl.remove t.polc_requests) (oldest_polc_request t);
+    Hashtbl.replace t.polc_requests round (-1);
+    true
+  end
+
+let emit_polc_request t round =
+  Hashtbl.replace t.polc_requests round t.state.round;
+  emit t (RequestRoundEvidence round)
+
+let request_polc t round =
+  if remember_polc_request t round then
+    match Hashtbl.find_opt t.polc_requests round with
+    | Some last_sent when last_sent < t.state.round ->
+      emit_polc_request t round
+    | Some _
+    | None -> ()
+
+let least_recent_polc_request t ~except =
+  Hashtbl.fold
+    (fun round last_sent selected ->
+      if Some round = except || last_sent >= t.state.round then selected
+      else
+        match selected with
+        | None -> Some (round, last_sent)
+        | Some (best_round, best_sent)
+          when last_sent < best_sent
+               || (last_sent = best_sent && round > best_round) ->
+          Some (round, last_sent)
+        | Some _ -> selected)
+    t.polc_requests
+    None
+
+let retry_polc_request t ~except =
+  match least_recent_polc_request t ~except with
+  | None -> ()
+  | Some (round, _) ->
+    emit t (RequestRoundEvidence round);
+    Hashtbl.replace t.polc_requests round t.state.round
+
+let prune_round_history t =
+  Hashtbl.filter_map_inplace
+    (fun round vote_set ->
+      if round_retained t round then Some vote_set else None)
+    t.prevotes_by_round
+
 let start_round t round =
+  let prevotes = create_vote_set () in
   t.state <- { t.state with round; step = ProposeStep };
-  t.prevotes <- create_vote_set ();
+  let previous = if round > 0 then Some (round - 1) else None in
+  Option.iter (request_polc t) previous;
+  retry_polc_request t ~except:previous;
+  t.prevotes <- prevotes;
+  Hashtbl.replace t.prevotes_by_round round prevotes;
+  prune_round_history t;
   t.precommits <- create_vote_set ();
   t.current_proposal <- None;
   t.pending_prevote <- None;
@@ -380,12 +501,56 @@ let start_height t height =
   t.proposal_cache <- Hashtbl.create 8;
   t.proposal_messages <- Hashtbl.create 8;
   t.polc_by_round <- Hashtbl.create 4;
+  t.polc_requests <- Hashtbl.create 4;
+  t.prevotes_by_round <- Hashtbl.create 8;
   t.higher_round_evidence <- Hashtbl.create 4;
   start_round t 0
 
-let record_polc t round proposal_id =
-  if not (Octra_net.Hash_domain.is_nil proposal_id) then
-    Hashtbl.replace t.polc_by_round round proposal_id
+let polc_matches t ~round ~proposal_id =
+  match Hashtbl.find_opt t.polc_by_round round with
+  | Some known -> known = proposal_id
+  | None -> false
+
+let polc_request_pending t round =
+  Hashtbl.mem t.polc_requests round
+
+let historical_prevote_known t ~round ~validator =
+  match Hashtbl.find_opt t.prevotes_by_round round with
+  | None -> false
+  | Some vote_set -> Hashtbl.mem vote_set.votes validator
+
+let polc_votes_for_round t round =
+  match Hashtbl.find_opt t.polc_by_round round,
+        Hashtbl.find_opt t.prevotes_by_round round with
+  | Some proposal_id, Some vote_set ->
+    Hashtbl.fold
+      (fun _ (vote : vote) votes ->
+        if vote.proposal_id = proposal_id then vote :: votes else votes)
+      vote_set.votes
+      []
+    |> List.sort (fun (left : vote) (right : vote) ->
+      String.compare left.validator right.validator)
+  | _ -> []
+
+let record_historical_prevote t (vote : vote) =
+  if vote.round >= 0
+     && vote.round < t.state.round
+     && round_retained t vote.round then begin
+    let vote_set =
+      match Hashtbl.find_opt t.prevotes_by_round vote.round with
+      | Some value -> value
+      | None ->
+        let value = create_vote_set () in
+        Hashtbl.add t.prevotes_by_round vote.round value;
+        value
+    in
+    match add_vote vote_set vote ~validator_set:t.vs with
+    | `QuorumOf proposal_id -> record_polc t vote.round proposal_id
+    | `Duplicate
+    | `Rejected
+    | `Added
+    | `QuorumAny -> ()
+  end
 
 let restore_precommit_lock t (proposal : propose) =
   if not (is_pristine t) then
@@ -802,13 +967,13 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
          = p.header.parent_commit_hash
     in
     let root_valid = envelope_valid && execute_fn p in
-    let lock_ok = envelope_valid && lock_allows t proposal_id p.valid_round in
-    let accept =
-      proposer_valid && envelope_valid && root_valid && lock_ok
-    in
-    if accept then begin
+    let proposal_valid = proposer_valid && envelope_valid && root_valid in
+    let lock_ok = proposal_valid && lock_allows t proposal_id p.valid_round in
+    let accept = proposal_valid && lock_ok in
+    if proposal_valid then begin
       cache_proposal_message t p;
-      t.current_proposal <- Some p
+      if accept then t.current_proposal <- Some p;
+      if not lock_ok then Option.iter (request_polc t) p.valid_round
     end;
     let vote_proposal_id = if accept then proposal_id
       else Octra_net.Hash_domain.nil_hash in
@@ -879,7 +1044,7 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
   end
   end
 
-let find_header_or_fallback t proposal_id =
+let find_known_header t proposal_id =
   match find_header t proposal_id with
   | Some h -> Some h
   | None ->
@@ -896,7 +1061,12 @@ let find_header_or_fallback t proposal_id =
 let on_vote t (v : vote) ~sign_fn =
   if v.epoch_id <= t.finalized_height then ()
   else if v.epoch_id <> t.state.height then ()
+  else if v.round < 0 then ()
   else if v.round > t.state.round + max_round_ahead then ()
+  else if v.round < t.state.round then
+    match v.vote_type with
+    | Prevote -> record_historical_prevote t v
+    | Precommit -> ()
   else begin
     if v.round > t.state.round then begin
       record_higher_round t ~round:v.round ~validator:v.validator;
@@ -964,7 +1134,7 @@ let on_vote t (v : vote) ~sign_fn =
       let result = add_vote t.precommits v ~validator_set:t.vs in
       (match result with
        | `QuorumOf proposal_id when local_voting_allowed t ->
-         (match find_header_or_fallback t proposal_id with
+         (match find_known_header t proposal_id with
           | None ->
             if log_pending_header_quorum () then
               log_node t.my_addr

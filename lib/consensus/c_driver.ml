@@ -119,6 +119,7 @@ type t = {
   engine : C_engine.t;
   swarm : Octra_net.P2p_swarm.t;
   seen : C_seen.t;
+  historical_replays : C_seen.t;
   mutable running : bool;
   mutable epoch_start_mono : int64;
   epoch_root_responses : (int64, epoch_root_response_record list) Hashtbl.t;
@@ -236,6 +237,7 @@ let create ~config ~validator_set ~swarm ~start_height =
     ~can_vote:config.can_vote in
   { n_validators = validator_set.C_types.n; config; engine; swarm;
     seen = C_seen.create ~capacity:10_000; running = false;
+    historical_replays = C_seen.create ~capacity:4_096;
     epoch_start_mono = Mtime_clock.elapsed_ns ();
     epoch_root_responses = Hashtbl.create 16;
     bundle_responses = Hashtbl.create 16;
@@ -614,13 +616,13 @@ let broadcast_vote t (v : C_types.vote) =
     Lwt.return_true
   end
 
-let make_round_sync t ~request =
+let make_round_sync_at t ~round ~step ~request =
   let unsigned =
     C_codec.{
       chain_id = t.config.chain_id;
       epoch_id = t.engine.state.height;
-      round = t.engine.state.round;
-      step = t.engine.state.step;
+      round;
+      step;
       request;
       validator = t.config.my_addr;
       signature = String.make 64 '\x00';
@@ -630,6 +632,13 @@ let make_round_sync t ~request =
     unsigned with
     signature = t.config.sign_fn (C_hash.round_sync_sign_bytes unsigned);
   }
+
+let make_round_sync t ~request =
+  make_round_sync_at
+    t
+    ~round:t.engine.state.round
+    ~step:t.engine.state.step
+    ~request
 
 let round_sync_frame sync =
   {
@@ -645,6 +654,19 @@ let broadcast_round_sync t ~request =
     Octra_net.P2p_swarm.broadcast
       t.swarm
       (round_sync_frame (make_round_sync t ~request))
+
+let broadcast_round_sync_at t ~round =
+  if not (local_validator t) || not (t.config.can_vote ()) then
+    Lwt.return_unit
+  else
+    Octra_net.P2p_swarm.broadcast
+      t.swarm
+      (round_sync_frame
+         (make_round_sync_at
+            t
+            ~round
+            ~step:C_types.PrevoteStep
+            ~request:true))
 
 let local_round_votes t =
   let local_vote set =
@@ -679,7 +701,15 @@ let send_vote_to t conn vote =
         payload = C_codec.encode_vote vote;
       }
 
-let send_current_round t conn =
+let send_historical_prevote_to conn vote =
+  Octra_net.P2p_conn.send
+    conn
+    {
+      Frame.msg_type = Frame.msg_cons_vote;
+      payload = C_codec.encode_vote vote;
+    }
+
+let send_round_sync_response t conn ~requested_round =
   let open Lwt.Syntax in
   if not (local_validator t) || not (t.config.can_vote ()) then
     Lwt.return_unit
@@ -700,7 +730,15 @@ let send_current_round t conn =
             payload = C_codec.encode_propose proposal;
           }
     in
-    Lwt_list.iter_s (send_vote_to t conn) (local_round_votes t)
+    let* () =
+      Lwt_list.iter_s (send_vote_to t conn) (local_round_votes t)
+    in
+    if requested_round < t.engine.state.round then
+      Lwt_list.iter_s
+        (send_historical_prevote_to conn)
+        (C_engine.polc_votes_for_round t.engine requested_round)
+    else
+      Lwt.return_unit
   end
 
 let round_step_rank = function
@@ -842,6 +880,26 @@ let msg_id msg_type payload =
 let is_seen t msg_type payload =
   let id = msg_id msg_type payload in
   not (C_seen.remember t.seen id)
+
+let historical_replay_needed t msg_type payload =
+  if msg_type <> Frame.msg_cons_vote then false
+  else
+    try
+      let vote = C_codec.decode_vote payload in
+      vote.chain_id = t.config.chain_id
+      && vote.epoch_id = t.engine.state.height
+      && vote.vote_type = C_types.Prevote
+      && vote.round < t.engine.state.round
+      && C_engine.polc_request_pending t.engine vote.round
+      && not
+           (C_engine.historical_prevote_known
+              t.engine
+              ~round:vote.round
+              ~validator:vote.validator)
+      && C_seen.remember
+           t.historical_replays
+           (msg_id msg_type payload)
+    with _ -> false
 
 let resource_attestation_pool t =
   Hashtbl.fold (fun _ attestation acc -> attestation :: acc) t.resource_attestations []
@@ -1335,6 +1393,7 @@ let rec process_outputs_once t =
       | C_engine.SendPropose _ -> "SendPropose"
       | C_engine.SendVote _ -> "SendVote"
       | C_engine.SendFinalize _ -> "SendFinalize"
+      | C_engine.RequestRoundEvidence _ -> "RequestRoundEvidence"
       | C_engine.ScheduleTimeout _ -> "ScheduleTimeout"
       | C_engine.Finalized _ -> "Finalized" in
     trace_node t.config.my_addr "event = engine_output output = %s" name
@@ -1380,6 +1439,8 @@ let rec process_outputs_once t =
               proceed
                 (Octra_net.P2p_swarm.broadcast t.swarm
                   { msg_type = Frame.msg_cons_finalize; payload })
+            | C_engine.RequestRoundEvidence round ->
+              proceed (broadcast_round_sync_at t ~round)
             | C_engine.ScheduleTimeout { step; round; delay_ms; generation } ->
               let* () =
                 if step = C_types.ProposeStep then
@@ -1561,13 +1622,24 @@ and process_outputs t =
 let on_p2p_message t _conn (frame : Frame.frame) =
   let open Lwt.Syntax in
   let skip_dedup = query_frame frame.msg_type in
-  if not (frame_allowed ~running:t.running frame.msg_type) then begin
+  let allowed = frame_allowed ~running:t.running frame.msg_type in
+  let repeated =
+    allowed
+    && not skip_dedup
+    && is_seen t frame.msg_type frame.payload
+  in
+  if not allowed then begin
     trace_node t.config.my_addr
       "event = defer_consensus_frame reason = driver_not_started type = %d"
       frame.msg_type;
     Lwt.return_unit
   end
-  else if (not skip_dedup) && is_seen t frame.msg_type frame.payload then
+  else if repeated
+          && not
+               (historical_replay_needed
+                  t
+                  frame.msg_type
+                  frame.payload) then
     Lwt.return_unit
   else begin
     (match frame.msg_type with
@@ -1633,7 +1705,10 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                   let* () = process_outputs t in
                   if round_sync_reply_needed t sync
                      && round_sync_response_allowed t sync.validator then
-                    send_current_round t _conn
+                    send_round_sync_response
+                      t
+                      _conn
+                      ~requested_round:sync.round
                   else
                     Lwt.return_unit
                 end)
