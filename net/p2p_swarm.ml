@@ -424,19 +424,19 @@ let maybe_dial_record t r =
             Hashtbl.remove t.dialing endpoint;
             Lwt.return_unit))
 
+let accept_relayed_records t records =
+  records
+  |> List.iter (fun r ->
+    match accept_record t r with
+    | Ok true -> maybe_dial_record t r
+    | Ok false
+    | Error _ -> ())
+
 let handle_peers t conn payload =
   Lwt.catch
     (fun () ->
       let records = P2p_peer_record.decode_list payload in
-      records
-      |> List.iter (fun r ->
-        match accept_record t r with
-        | Ok true -> maybe_dial_record t r
-        | Ok false -> ()
-        | Error reason ->
-          report_bad_peer t conn ~reason:("peer_record_" ^ reason);
-          if reason = "binary_hash" || reason = "config_hash" || reason = "chain_id" then
-            Lwt.async (fun () -> P2p_conn.close conn));
+      accept_relayed_records t records;
       Lwt.return_unit)
     (fun _ ->
       report_bad_peer t conn ~reason:"invalid_frame_peers";
