@@ -83,13 +83,6 @@ type driver_probe_deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
-  repair_empty_fork :
-    Octra_consensus.C_driver.t ->
-    target_epoch:int64 ->
-    target_root:string ->
-    required:int ->
-    current_root_quorum:bool ->
-    bool Lwt.t;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->

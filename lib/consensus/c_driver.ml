@@ -790,12 +790,29 @@ let start_proposal_fetch t ~round ~proposal_id =
       Lwt.return_unit
     end
 
-let local_round_votes t =
-  let local_vote set =
-    Hashtbl.find_opt set.C_engine.votes t.config.my_addr
+let round_vote_rank (vote : C_types.vote) =
+  match vote.vote_type with
+  | C_types.Prevote -> 0
+  | C_types.Precommit -> 1
+
+let compare_round_vote (left : C_types.vote) (right : C_types.vote) =
+  let by_type = compare (round_vote_rank left) (round_vote_rank right) in
+  if by_type <> 0 then by_type
+  else String.compare left.validator right.validator
+
+let current_round_votes t =
+  let values set =
+    Hashtbl.fold
+      (fun _ (vote : C_types.vote) acc ->
+        if vote.epoch_id = t.engine.state.height
+           && vote.round = t.engine.state.round
+        then vote :: acc
+        else acc)
+      set.C_engine.votes
+      []
   in
-  [local_vote t.engine.prevotes; local_vote t.engine.precommits]
-  |> List.filter_map Fun.id
+  values t.engine.prevotes @ values t.engine.precommits
+  |> List.sort compare_round_vote
 
 let local_round_proposal t =
   match t.engine.current_proposal with
@@ -823,13 +840,19 @@ let send_vote_to t conn vote =
         payload = C_codec.encode_vote vote;
       }
 
-let send_historical_prevote_to conn vote =
+let send_verified_vote_to conn vote =
   Octra_net.P2p_conn.send
     conn
     {
       Frame.msg_type = Frame.msg_cons_vote;
       payload = C_codec.encode_vote vote;
     }
+
+let send_round_vote_to t conn (vote : C_types.vote) =
+  if String.equal vote.validator t.config.my_addr then
+    send_vote_to t conn vote
+  else
+    send_verified_vote_to conn vote
 
 let send_round_sync_response t conn ~requested_round =
   let open Lwt.Syntax in
@@ -853,11 +876,11 @@ let send_round_sync_response t conn ~requested_round =
           }
     in
     let* () =
-      Lwt_list.iter_s (send_vote_to t conn) (local_round_votes t)
+      Lwt_list.iter_s (send_round_vote_to t conn) (current_round_votes t)
     in
     if requested_round < t.engine.state.round then
       Lwt_list.iter_s
-        (send_historical_prevote_to conn)
+        (send_verified_vote_to conn)
         (C_engine.polc_votes_for_round t.engine requested_round)
     else
       Lwt.return_unit

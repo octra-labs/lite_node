@@ -34,12 +34,6 @@ type deps = {
   peer_snapshot : unit -> string;
   drain_pending_finalized : unit -> unit Lwt.t;
   wake_ready : unit -> unit Lwt.t;
-  repair_empty_fork :
-    target_epoch:int64 ->
-    target_root:string ->
-    required:int ->
-    current_root_quorum:bool ->
-    bool Lwt.t;
   run_catchup_to_target :
     target_epoch:int64 ->
     reason:string ->

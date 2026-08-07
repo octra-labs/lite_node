@@ -37,12 +37,6 @@ type deps = {
   peer_snapshot : unit -> string;
   drain_pending_finalized : unit -> unit Lwt.t;
   wake_ready : unit -> unit Lwt.t;
-  repair_empty_fork :
-    target_epoch:int64 ->
-    target_root:string ->
-    required:int ->
-    current_root_quorum:bool ->
-    bool Lwt.t;
   run_catchup_to_target :
     target_epoch:int64 ->
     reason:string ->
@@ -397,33 +391,13 @@ let run ?(stale_retries = 1) cfg deps =
                           "event = fresh_root_mismatch head = %d live = %s peer = %s count = %d"
                           our_head_int (short_hex8 live_root) (short_hex8 root) count;
                         Lwt.return_unit
-                      | H.Probe_target_root ->
-                        let* target_responses =
-                          deps.query_epoch_root
-                            ~epoch_id:target_epoch
-                            ~timeout_seconds:5.0
-                        in
-                        match
-                          H.peer_root_with_quorum
-                            ~required:state_attest_required
-                            target_responses
-                        with
-                        | Some { H.root = target_root; count = _ } ->
-                          let* repaired =
-                            deps.repair_empty_fork
-                              ~target_epoch
-                              ~target_root
-                              ~required:state_attest_required
-                              ~current_root_quorum:false
-                          in
-                          if repaired then Lwt.return_unit
-                          else begin
-                            clear_unattested_current_head deps our_head_int;
-                            Lwt.return_unit
-                          end
-                        | _ ->
-                          clear_unattested_current_head deps our_head_int;
-                          Lwt.return_unit
+                      | H.Wait_current_root_quorum ->
+                        Log.warn "catchup"
+                          "event = ahead_wait_current_root_quorum head = %d target = %Ld"
+                          our_head_int
+                          target_epoch;
+                        deps.set_catchup_in_progress false;
+                        Lwt.return_unit
                   end else begin
                     deps.set_state_attested ~head:our_head_int ~root:live_root;
                     match H.ahead_quorum_plan

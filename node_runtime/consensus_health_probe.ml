@@ -31,7 +31,7 @@ type ahead_no_quorum_plan =
 type ahead_current_root_plan =
   | Current_root_matches
   | Current_root_mismatch of majority
-  | Probe_target_root
+  | Wait_current_root_quorum
 
 type ahead_quorum_plan =
   | Stay_active of {
@@ -143,7 +143,7 @@ let ahead_current_root_plan = function
   | Matching_quorum _ -> Current_root_matches
   | Mismatching_quorum m -> Current_root_mismatch m
   | No_root
-  | Missing_quorum _ -> Probe_target_root
+  | Missing_quorum _ -> Wait_current_root_quorum
 
 let ahead_quorum_plan ~head ~ahead_by ~streak ~grace_epochs
     ~drift_tolerance ~streak_threshold ~quarantine_active =

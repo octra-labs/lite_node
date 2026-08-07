@@ -83,13 +83,6 @@ type driver_probe_deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
-  repair_empty_fork :
-    Octra_consensus.C_driver.t ->
-    target_epoch:int64 ->
-    target_root:string ->
-    required:int ->
-    current_root_quorum:bool ->
-    bool Lwt.t;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
@@ -521,15 +514,6 @@ let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
       Consensus_runtime_state.ahead_streak runtime.runtime_state);
     incr_ahead_streak = (fun () ->
       Consensus_runtime_state.incr_ahead_streak runtime.runtime_state);
-    repair_empty_fork = (fun driver ~target_epoch ~target_root ~required
-        ~current_root_quorum ->
-      repair_empty_fork_with_driver
-        runtime.fork_repair
-        driver
-        ~target_epoch
-        ~target_root
-        ~required
-        ~current_root_quorum);
     run_catchup_to_target = (fun driver ~target_epoch ~reason ->
       runtime.run_catchup_to_target driver ~target_epoch ~reason);
   }
@@ -624,14 +608,6 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
     drain_pending_finalized = deps.drain_pending_finalized;
     wake_ready = (fun () ->
       Octra_consensus.C_driver.wake_ready driver);
-    repair_empty_fork = (fun ~target_epoch ~target_root ~required
-        ~current_root_quorum ->
-      deps.repair_empty_fork
-        driver
-        ~target_epoch
-        ~target_root
-        ~required
-        ~current_root_quorum);
     run_catchup_to_target = (fun ~target_epoch ~reason ->
       deps.run_catchup_to_target driver ~target_epoch ~reason);
     quarantine_active = deps.quarantine_active;
