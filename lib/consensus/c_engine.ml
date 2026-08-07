@@ -186,6 +186,7 @@ let timeout_ms ~round ~step =
 type proposal_cache_entry = {
   header : epoch_header;
   tx_hashes : string list option;
+  parent_commit : parent_commit option;
 }
 
 type t = {
@@ -246,12 +247,20 @@ let is_pristine t =
   && Hashtbl.length t.precommits.votes = 0
   && t.outputs = []
 
-let cache_proposal_bundle t pid header tx_hashes =
-  Hashtbl.replace t.proposal_cache pid { header; tx_hashes = Some tx_hashes }
+let cache_proposal_bundle t pid header tx_hashes ~parent_commit =
+  Hashtbl.replace t.proposal_cache pid {
+    header;
+    tx_hashes = Some tx_hashes;
+    parent_commit;
+  }
 
 let cache_proposal_header_only t pid header =
   if not (Hashtbl.mem t.proposal_cache pid) then
-    Hashtbl.replace t.proposal_cache pid { header; tx_hashes = None }
+    Hashtbl.replace t.proposal_cache pid {
+      header;
+      tx_hashes = None;
+      parent_commit = None;
+    }
 
 let find_header t pid =
   match Hashtbl.find_opt t.proposal_cache pid with
@@ -261,6 +270,11 @@ let find_header t pid =
 let find_tx_hashes t pid =
   match Hashtbl.find_opt t.proposal_cache pid with
   | Some e -> e.tx_hashes
+  | None -> None
+
+let find_parent_commit t pid =
+  match Hashtbl.find_opt t.proposal_cache pid with
+  | Some entry -> entry.parent_commit
   | None -> None
 
 let promote_known_header t round proposal_id =
@@ -289,7 +303,12 @@ let promote_cached_polc t proposal_id =
 
 let cache_proposal_message t (proposal : propose) =
   let pid = C_hash.proposal_id proposal.header in
-  cache_proposal_bundle t pid proposal.header proposal.tx_hashes;
+  cache_proposal_bundle
+    t
+    pid
+    proposal.header
+    proposal.tx_hashes
+    ~parent_commit:proposal.parent_commit;
   Hashtbl.replace t.proposal_messages (pid, proposal.round) proposal;
   promote_cached_polc t pid
 
@@ -369,33 +388,56 @@ let precommits_for_pid t pid =
     t.precommits.votes []
   |> List.sort (fun (a : vote) (b : vote) -> String.compare a.validator b.validator)
 
+type finalize_block =
+  | Parent_commit_missing
+  | Parent_commit_mismatch
+
+let parent_commit_for_finalize t ~header ~proposal_id =
+  let parent_commit = find_parent_commit t proposal_id in
+  let got = C_hash.parent_commit_hash_opt parent_commit in
+  if got = header.parent_commit_hash then
+    Ok parent_commit
+  else if Option.is_none parent_commit then
+    Error Parent_commit_missing
+  else
+    Error Parent_commit_mismatch
+
 let make_finalize t ~header ~proposal_id ~round =
-  let parent_commit =
-    match find_proposal_message t ~proposal_id ~round with
-    | Some proposal -> proposal.parent_commit
-    | None ->
-      Option.bind
-        t.current_proposal
-        (fun proposal ->
-          if C_hash.proposal_id proposal.header = proposal_id then
-            proposal.parent_commit
-          else
-            None)
-  in
-  {
-    chain_id = t.chain_id;
-    epoch_id = t.state.height;
-    commit_round = round;
-    header;
-    proposal_id;
-    precommits = precommits_for_pid t proposal_id;
-    parent_commit;
-  }
+  Result.map
+    (fun parent_commit -> {
+      chain_id = t.chain_id;
+      epoch_id = t.state.height;
+      commit_round = round;
+      header;
+      proposal_id;
+      precommits = precommits_for_pid t proposal_id;
+      parent_commit;
+    })
+    (parent_commit_for_finalize t ~header ~proposal_id)
 
 let emit_finalized ?(send = true) t finalize =
   t.finalized_height <- finalize.epoch_id;
   if send then emit t (SendFinalize finalize);
   emit t (Finalized { epoch_id = finalize.epoch_id; finalize })
+
+let finalize_block_name = function
+  | Parent_commit_missing -> "parent_commit_missing"
+  | Parent_commit_mismatch -> "parent_commit_mismatch"
+
+let emit_local_finalize t ~header ~proposal_id ~round =
+  match make_finalize t ~header ~proposal_id ~round with
+  | Ok finalize ->
+    emit_finalized t finalize;
+    true
+  | Error reason ->
+    err_node t.my_addr
+      "event = defer_local_finalize reason = %s height = %Ld round = %d pid = %s"
+      (finalize_block_name reason)
+      t.state.height
+      round
+      (short_hex_raw proposal_id);
+    emit t (RequestProposal { round; proposal_id });
+    false
 
 let am_i_leader t =
   let l = leader_of t.vs ~epoch_id:t.state.height ~round:t.state.round in
@@ -732,7 +774,7 @@ let schedule_step_timeout t step =
 
 let finalize_quorum t proposal_id =
   match find_header t proposal_id with
-  | None -> ()
+  | None -> false
   | Some header ->
     log_node t.my_addr
       "event = local_finalize_ready height = %Ld round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
@@ -740,10 +782,11 @@ let finalize_quorum t proposal_id =
       (short_hex_raw proposal_id)
       (short_addr header.creator_addr)
       t.state.locked_round t.state.valid_round;
-    let finalize =
-      make_finalize t ~header ~proposal_id ~round:t.state.round
-    in
-    emit_finalized t finalize
+    emit_local_finalize
+      t
+      ~header
+      ~proposal_id
+      ~round:t.state.round
 
 let resume_voting t ~sign_fn =
   if not (local_voting_allowed t) then ()
@@ -810,7 +853,7 @@ let resume_voting t ~sign_fn =
       with
       | `QuorumOf proposal_id
         when not (Octra_net.Hash_domain.is_nil proposal_id) ->
-        finalize_quorum t proposal_id
+        ignore (finalize_quorum t proposal_id)
       | _ -> ()
   end
 
@@ -867,14 +910,7 @@ let do_propose ?parent_commit t (header : epoch_header)
                log_node t.my_addr
                  "event = repropose_valid_value valid_round = %d locked_round = %d"
                  t.state.valid_round t.state.locked_round;
-               let cached_parent_commit =
-                 Option.bind
-                   (find_proposal_message
-                      t
-                      ~proposal_id:v_pid
-                      ~round:t.state.valid_round)
-                   (fun proposal -> proposal.parent_commit)
-               in
+               let cached_parent_commit = find_parent_commit t v_pid in
                Some
                  (v,
                   cached_hashes,
@@ -897,7 +933,12 @@ let do_propose ?parent_commit t (header : epoch_header)
         t.state.round
     | Some (header, tx_hashes, valid_round, parent_commit) ->
     let proposal_id = C_hash.proposal_id header in
-    cache_proposal_bundle t proposal_id header tx_hashes;
+    cache_proposal_bundle
+      t
+      proposal_id
+      header
+      tx_hashes
+      ~parent_commit;
     let propose = {
       chain_id = t.chain_id;
       epoch_id = t.state.height;
@@ -940,8 +981,12 @@ let do_propose ?parent_commit t (header : epoch_header)
             (short_hex_raw proposal_id)
             (short_addr header.creator_addr)
             t.state.locked_round t.state.valid_round;
-          let finalize = make_finalize t ~header ~proposal_id ~round:t.state.round in
-          emit_finalized t finalize
+          ignore
+            (emit_local_finalize
+               t
+               ~header
+               ~proposal_id
+               ~round:t.state.round)
         | _ ->
           emit t (ScheduleTimeout {
             step = PrecommitStep; round = t.state.round;
@@ -989,9 +1034,28 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
       if accept then t.current_proposal <- Some p;
       if not lock_ok then Option.iter (request_polc t) p.valid_round
     end;
+    let finalized_from_cache =
+      proposal_valid
+      && local_voting_allowed t
+      &&
+      match
+        quorum_result
+          t.precommits
+          ~chain_id:t.chain_id
+          ~epoch_id:t.state.height
+          ~validator_set:t.vs
+      with
+      | `QuorumOf pid when pid = proposal_id ->
+        finalize_quorum t proposal_id
+      | `QuorumOf _
+      | `QuorumAny
+      | `Added ->
+        false
+    in
     let vote_proposal_id = if accept then proposal_id
       else Octra_net.Hash_domain.nil_hash in
-    if not (can_prevote t) then ()
+    if finalized_from_cache then ()
+    else if not (can_prevote t) then ()
     else if not (local_voting_allowed t) then
       remember_pending_prevote t vote_proposal_id
     else begin
@@ -1034,10 +1098,12 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
             (short_hex_raw vote_proposal_id)
             (short_addr hdr.creator_addr)
             t.state.locked_round t.state.valid_round;
-          let finalize =
-            make_finalize t ~header:hdr ~proposal_id:vote_proposal_id
-              ~round:t.state.round in
-          emit_finalized t finalize
+          ignore
+            (emit_local_finalize
+               t
+               ~header:hdr
+               ~proposal_id:vote_proposal_id
+               ~round:t.state.round)
         | _ ->
           emit t (ScheduleTimeout {
             step = PrecommitStep; round = t.state.round;
@@ -1185,8 +1251,12 @@ let on_vote t (v : vote) ~sign_fn =
               (short_hex_raw proposal_id)
               (short_addr header.creator_addr)
               t.state.locked_round t.state.valid_round;
-            let finalize = make_finalize t ~header ~proposal_id ~round:t.state.round in
-            emit_finalized t finalize)
+            ignore
+              (emit_local_finalize
+                 t
+                 ~header
+                 ~proposal_id
+                 ~round:t.state.round))
        | _ -> ())
   end
 

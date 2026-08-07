@@ -38,6 +38,10 @@ val read_validated :
   string ->
   read_result
 
+val read_pending_epoch :
+  string ->
+  (int64 option, string) result
+
 val read_committed_validated :
   chain_id:string ->
   entry:Octra_consensus.Finality_log.entry ->
@@ -98,6 +102,11 @@ val restore_committed_from_history :
 val remove :
   string ->
   unit
+
+val drop_invalid_unapplied :
+  string ->
+  head:int ->
+  (int, string) result
 
 val pending :
   string ->

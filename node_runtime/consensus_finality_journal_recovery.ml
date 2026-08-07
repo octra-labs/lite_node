@@ -11,8 +11,14 @@ type outcome =
   | Armed
   | Blocked
 
+type invalid_plan =
+  | Drop_unapplied
+  | Block_invalid
+
 type deps = {
   read_journal : unit -> Journal.read_result;
+  read_pending_epoch : unit -> (int64 option, string) result;
+  drop_invalid_unapplied : head_epoch:int -> (int, string) result;
   head_epoch : unit -> int;
   root_at_epoch : int -> string option;
   current_root : unit -> string option;
@@ -48,6 +54,42 @@ let block deps reason =
     "event = finality_journal_recovery action = block reason = %s"
     reason;
   Blocked
+
+let classify_invalid ~head_epoch = function
+  | Ok (Some epoch)
+    when Int64.compare epoch (Int64.of_int head_epoch) > 0 ->
+    Drop_unapplied
+  | Ok (Some _)
+  | Ok None
+  | Error _ ->
+    Block_invalid
+
+let invalid deps reason =
+  try
+    let head_epoch = deps.head_epoch () in
+    let plan =
+      try classify_invalid ~head_epoch (deps.read_pending_epoch ())
+      with _ -> Block_invalid
+    in
+    match plan with
+    | Drop_unapplied ->
+      begin
+        match deps.drop_invalid_unapplied ~head_epoch with
+        | Ok finality_entries ->
+          Log.warn "finality"
+            "event = finality_journal_recovery action = drop_unapplied finality_entries = %d reason = %s"
+            finality_entries
+            reason;
+          Continue
+        | Error drop_reason ->
+          block deps
+            ("finality_journal_drop_unapplied_failed:" ^ drop_reason)
+      end
+    | Block_invalid ->
+      block deps ("finality_journal_invalid:" ^ reason)
+  with exn ->
+    block deps
+      ("finality_journal_invalid_recovery_failed:" ^ Printexc.to_string exn)
 
 let applied deps record target =
   try
@@ -137,6 +179,6 @@ let run deps =
   match deps.read_journal () with
   | Journal.Missing -> Continue
   | Journal.Invalid reason ->
-    block deps ("finality_journal_invalid:" ^ reason)
+    invalid deps reason
   | Journal.Valid record ->
     recover deps record

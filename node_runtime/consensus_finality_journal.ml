@@ -363,6 +363,15 @@ let read_validated ~chain_id ~validator_set base =
     ~validator_set
     (path base)
 
+let read_pending_epoch base =
+  try
+    Ok
+      (Option.map
+         (fun record -> record.finalize.C_types.epoch_id)
+         (read_record (path base)))
+  with exn ->
+    Error (Printexc.to_string exn)
+
 let committed_matches entry record =
   Finality_log.same_commitment
     entry
@@ -527,6 +536,30 @@ let remove base =
     Unix.unlink target;
     fsync_dir base
   end
+
+let drop_invalid_unapplied base ~head =
+  try
+    match read_record (path base) with
+    | None -> Error "pending finality journal is missing"
+    | Some record ->
+      let expected = Finality_log.of_finalize record.finalize in
+      if expected.Finality_log.height <> head + 1 then
+        Error "pending finality journal is not next after durable head"
+      else
+        begin
+          match
+            Finality_log.drop_matching_uncommitted
+              base
+              ~head
+              expected
+          with
+          | Error _ as error -> error
+          | Ok dropped ->
+            remove base;
+            Ok dropped
+        end
+  with exn ->
+    Error (Printexc.to_string exn)
 
 let pending base =
   Sys.file_exists (path base)

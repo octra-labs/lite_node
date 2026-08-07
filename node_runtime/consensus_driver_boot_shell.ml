@@ -193,10 +193,27 @@ let startup_pending (deps : deps) validator_set =
         end
     end
 
-let startup_journal (deps : deps) pending =
+let startup_journal (deps : deps) validator_set pending =
   Consensus_finality_journal_recovery.run
     Consensus_finality_journal_recovery.{
       read_journal = (fun () -> pending);
+      read_pending_epoch = (fun () ->
+        Consensus_finality_journal.read_pending_epoch deps.data_dir);
+      drop_invalid_unapplied = (fun ~head_epoch ->
+        match
+          Consensus_finality_journal.read_validated
+            ~chain_id:deps.chain_id
+            ~validator_set
+            deps.data_dir
+        with
+        | Consensus_finality_journal.Invalid _ ->
+          Consensus_finality_journal.drop_invalid_unapplied
+            deps.data_dir
+            ~head:head_epoch
+        | Consensus_finality_journal.Missing ->
+          Error "pending finality journal disappeared"
+        | Consensus_finality_journal.Valid _ ->
+          Error "pending finality journal became valid");
       head_epoch = deps.committed_head_epoch;
       root_at_epoch = committed_root_at_epoch deps;
       current_root = (fun () -> current_committed_root deps);
@@ -270,7 +287,7 @@ let startup_backlog (deps : deps) validator_set pending =
 
 let startup_recovery (deps : deps) validator_set =
   let pending = startup_pending deps validator_set in
-  match startup_journal deps pending with
+  match startup_journal deps validator_set pending with
   | Consensus_finality_journal_recovery.Blocked ->
     Consensus_finality_journal_recovery.Blocked
   | pending_outcome ->

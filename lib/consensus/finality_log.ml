@@ -306,6 +306,26 @@ let drop_uncommitted_after base head =
       Ok (List.length entries - List.length kept)
     end
 
+let drop_matching_uncommitted base ~head expected =
+  if expected.height <> head + 1 then
+    Error "unapplied finality height is not next"
+  else
+    let entries = read base in
+    let tail = List.filter (fun entry -> entry.height > head) entries in
+    match tail with
+    | [] -> Ok 0
+    | [entry]
+      when entry.height = expected.height
+           && entry.round = expected.round
+           && same_commitment entry expected
+           && entry.qc_hash = expected.qc_hash ->
+      replace base (List.filter (fun value -> value.height <= head) entries);
+      Ok 1
+    | [_] ->
+      Error "unapplied finality certificate does not match pending journal"
+    | _ ->
+      Error "multiple finality certificates exist above durable head"
+
 let last base =
   match List.rev (read base) with
   | x :: _ -> Some x

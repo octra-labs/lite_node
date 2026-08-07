@@ -6,8 +6,14 @@ type outcome =
   | Armed
   | Blocked
 
+type invalid_plan =
+  | Drop_unapplied
+  | Block_invalid
+
 type deps = {
   read_journal : unit -> Consensus_finality_journal.read_result;
+  read_pending_epoch : unit -> (int64 option, string) result;
+  drop_invalid_unapplied : head_epoch:int -> (int, string) result;
   head_epoch : unit -> int;
   root_at_epoch : int -> string option;
   current_root : unit -> string option;
@@ -38,3 +44,8 @@ type deps = {
 val run :
   deps ->
   outcome
+
+val classify_invalid :
+  head_epoch:int ->
+  (int64 option, string) result ->
+  invalid_plan
