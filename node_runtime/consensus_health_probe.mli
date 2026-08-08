@@ -92,6 +92,8 @@ val peer_root_with_quorum :
   majority option
 
 val in_sync_plan :
+  required:int ->
+  has_committed_root:bool ->
   genesis_attested:bool ->
   root_quorum ->
   in_sync_plan

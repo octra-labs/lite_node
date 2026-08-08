@@ -109,10 +109,11 @@ let peer_root_with_quorum ~required responses =
   |> peer_root_majority
   |> root_with_quorum ~required
 
-let in_sync_plan ~genesis_attested root_quorum =
+let in_sync_plan ~required ~has_committed_root ~genesis_attested root_quorum =
   match root_quorum with
   | Mismatching_quorum m -> Peer_root_mismatch m
   | _ when genesis_attested -> Accept_genesis
+  | _ when required = 0 && has_committed_root -> Accept_current_root
   | No_root -> Missing_peer_root_quorum 0
   | Missing_quorum m -> Missing_peer_root_quorum m.count
   | Matching_quorum _ -> Accept_current_root

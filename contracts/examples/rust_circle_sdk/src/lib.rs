@@ -1152,6 +1152,257 @@ impl Host {
         Ok((code as i64, score[0]))
     }
 
+    pub fn tensor_session_has_q24(
+        key: &str,
+        n_layers: usize,
+        max_t: usize,
+        kv_dim: usize,
+    ) -> Result<bool, i32> {
+        let code = unsafe {
+            host_tensor_session_has_q24(
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                n_layers as i32,
+                max_t as i32,
+                kv_dim as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(code == 1)
+    }
+
+    pub fn tensor_session_reset_q24(
+        key: &str,
+        n_layers: usize,
+        max_t: usize,
+        kv_dim: usize,
+    ) -> Result<(), i32> {
+        let code = unsafe {
+            host_tensor_session_reset_q24(
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                n_layers as i32,
+                max_t as i32,
+                kv_dim as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_session_append_kv_q24(
+        key: &str,
+        layer_idx: usize,
+        position: usize,
+        key_values: &[i64],
+        values: &[i64],
+    ) -> Result<(), i32> {
+        if key_values.len() != values.len() {
+            return Err(-1);
+        }
+        let code = unsafe {
+            host_tensor_session_append_kv_q24(
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                layer_idx as i32,
+                position as i32,
+                key_values.as_ptr() as i32,
+                values.as_ptr() as i32,
+                key_values.len() as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_session_attention_kv_q24(
+        key: &str,
+        query: &[i64],
+        output: &mut [i64],
+        sequence_len: usize,
+        layer_idx: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        scale: i64,
+    ) -> Result<(), i32> {
+        let code = unsafe {
+            host_tensor_session_attention_kv_q24(
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                query.as_ptr() as i32,
+                output.as_mut_ptr() as i32,
+                sequence_len as i32,
+                layer_idx as i32,
+                query_heads as i32,
+                kv_heads as i32,
+                head_dim as i32,
+                scale,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_load_i8_kv_q24(
+        dst: &mut [i64],
+        key: &str,
+        off: usize,
+        n: usize,
+        scale_bits: i64,
+    ) -> Result<(), i32> {
+        let code = unsafe {
+            host_tensor_load_i8_kv_q24(
+                dst.as_mut_ptr() as i32,
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                off as i32,
+                n as i32,
+                scale_bits,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_rmsnorm_q24(dst: &mut [i64], gamma: &[i64]) -> Result<(), i32> {
+        if dst.len() != gamma.len() {
+            return Err(-1);
+        }
+        let code = unsafe {
+            host_tensor_rmsnorm_q24(
+                dst.as_mut_ptr() as i32,
+                dst.len() as i32,
+                gamma.as_ptr() as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_silu_q24(dst: &mut [i64]) -> Result<(), i32> {
+        let code = unsafe { host_tensor_silu_q24(dst.as_mut_ptr() as i32, dst.len() as i32) };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_elemwise_mul_q24(dst: &mut [i64], src: &[i64]) -> Result<(), i32> {
+        if dst.len() != src.len() {
+            return Err(-1);
+        }
+        let code = unsafe {
+            host_tensor_elemwise_mul_q24(
+                dst.as_mut_ptr() as i32,
+                src.as_ptr() as i32,
+                dst.len() as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_residual_add_q24(dst: &mut [i64], src: &[i64]) -> Result<(), i32> {
+        if dst.len() != src.len() {
+            return Err(-1);
+        }
+        let code = unsafe {
+            host_tensor_residual_add_q24(
+                dst.as_mut_ptr() as i32,
+                src.as_ptr() as i32,
+                dst.len() as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_rope_apply_q24(
+        dst: &mut [i64],
+        position: usize,
+        frequencies: &[i64],
+    ) -> Result<(), i32> {
+        if dst.len() != frequencies.len().saturating_mul(2) {
+            return Err(-1);
+        }
+        let code = unsafe {
+            host_tensor_rope_apply_q24(
+                dst.as_mut_ptr() as i32,
+                dst.len() as i32,
+                position as i32,
+                frequencies.as_ptr() as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_linear_i8_kv_q24(
+        out: &mut [i64],
+        input: &[i64],
+        key: &str,
+        scale_bits: i64,
+    ) -> Result<(), i32> {
+        let code = unsafe {
+            host_tensor_linear_i8_kv_q24(
+                out.as_mut_ptr() as i32,
+                input.as_ptr() as i32,
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                input.len() as i32,
+                out.len() as i32,
+                scale_bits,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(())
+    }
+
+    pub fn tensor_top1_i8_kv_q24(
+        input: &[i64],
+        key: &str,
+        rows: usize,
+        scale_bits: i64,
+    ) -> Result<(i64, i64), i32> {
+        let mut score = [0_i64; 1];
+        let code = unsafe {
+            host_tensor_top1_i8_kv_q24(
+                input.as_ptr() as i32,
+                key.as_bytes().as_ptr(),
+                key.len() as i32,
+                rows as i32,
+                input.len() as i32,
+                scale_bits,
+                score.as_mut_ptr() as i32,
+            )
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok((code as i64, score[0]))
+    }
+
     pub fn emit_event(topic: &str, data: &[u8]) -> Result<(), i32> {
         let code = unsafe {
             host_emit_event(
@@ -2046,7 +2297,7 @@ fn decode_bytes<'a>(raw: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a
     Ok(value)
 }
 
-fn sha256_hex(input: &[u8]) -> String {
+pub fn sha256_hex(input: &[u8]) -> String {
     const H0: [u32; 8] = [
         0x6a09e667,
         0xbb67ae85,
@@ -2281,6 +2532,77 @@ extern "C" {
         scale_bits: i64,
     ) -> i32;
     fn host_tensor_top1_i8_kv(
+        in_ptr: i32,
+        key_ptr: *const u8,
+        key_len: i32,
+        rows: i32,
+        cols: i32,
+        scale_bits: i64,
+        score_out_ptr: i32,
+    ) -> i32;
+    fn host_tensor_session_has_q24(
+        key_ptr: *const u8,
+        key_len: i32,
+        n_layers: i32,
+        max_t: i32,
+        kv_dim: i32,
+    ) -> i32;
+    fn host_tensor_session_reset_q24(
+        key_ptr: *const u8,
+        key_len: i32,
+        n_layers: i32,
+        max_t: i32,
+        kv_dim: i32,
+    ) -> i32;
+    fn host_tensor_session_append_kv_q24(
+        key_ptr: *const u8,
+        key_len: i32,
+        layer_idx: i32,
+        position: i32,
+        key_values_ptr: i32,
+        values_ptr: i32,
+        n: i32,
+    ) -> i32;
+    fn host_tensor_session_attention_kv_q24(
+        key_ptr: *const u8,
+        key_len: i32,
+        query_ptr: i32,
+        output_ptr: i32,
+        sequence_len: i32,
+        layer_idx: i32,
+        query_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        scale: i64,
+    ) -> i32;
+    fn host_tensor_load_i8_kv_q24(
+        dst_ptr: i32,
+        key_ptr: *const u8,
+        key_len: i32,
+        off: i32,
+        n: i32,
+        scale_bits: i64,
+    ) -> i32;
+    fn host_tensor_rmsnorm_q24(addr_ptr: i32, n: i32, gamma_ptr: i32) -> i32;
+    fn host_tensor_silu_q24(addr_ptr: i32, n: i32) -> i32;
+    fn host_tensor_elemwise_mul_q24(dst_ptr: i32, src_ptr: i32, n: i32) -> i32;
+    fn host_tensor_residual_add_q24(dst_ptr: i32, src_ptr: i32, n: i32) -> i32;
+    fn host_tensor_rope_apply_q24(
+        addr_ptr: i32,
+        n_dim: i32,
+        position: i32,
+        frequencies_ptr: i32,
+    ) -> i32;
+    fn host_tensor_linear_i8_kv_q24(
+        out_ptr: i32,
+        in_ptr: i32,
+        key_ptr: *const u8,
+        key_len: i32,
+        in_dim: i32,
+        out_dim: i32,
+        scale_bits: i64,
+    ) -> i32;
+    fn host_tensor_top1_i8_kv_q24(
         in_ptr: i32,
         key_ptr: *const u8,
         key_len: i32,

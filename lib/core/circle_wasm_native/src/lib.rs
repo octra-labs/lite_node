@@ -9,7 +9,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::slice;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use wasmi::{AsContext, AsContextMut, Caller, Config, Engine, Error as WasmiError, Extern, ExternType, Func, Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmi::{
+    AsContext, AsContextMut, Caller, Config, Engine, Error as WasmiError, Extern, ExternType, Func,
+    Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
+};
+
+mod deterministic_tensor;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SPAWN_PAYLOAD_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -27,19 +32,31 @@ const MAX_HFHE_VERIFIER_ENTRIES: usize = 2;
 const MAX_TENSOR_SESSION_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_FUEL_LIMIT: u64 = 20_000_000;
 const MAX_FUEL_LIMIT: u64 = 20_000_000;
+const COMPUTE_MAX_GUEST_BYTES: usize = 64 * 1024 * 1024;
+const COMPUTE_MAX_TENSOR_SESSION_BYTES: usize = 128 * 1024 * 1024;
+const COMPUTE_DEFAULT_FUEL_LIMIT: u64 = 1_000_000_000;
+const COMPUTE_MAX_FUEL_LIMIT: u64 = 2_000_000_000;
 const CIRCLE_INVOKE_FUEL: u64 = 100_000;
 const HFHE_INVOKE_FUEL: u64 = 2_000_000;
 const PAGE_BYTES: usize = 65536;
 const MAX_INITIAL_PAGES: usize = 512;
+const COMPUTE_MAX_INITIAL_PAGES: usize = 1024;
 const SESSION_CACHE_LIMIT: usize = 128;
 const SESSION_CACHE_TTL_SECS: f64 = 300.0;
 const TENSOR_SESSION_CACHE_LIMIT: usize = 8;
+const FIXED_TENSOR_SESSION_CACHE_LIMIT: usize = 2;
 const TENSOR_SESSION_CACHE_TTL_SECS: f64 = 300.0;
 const MODULE_CACHE_LIMIT: usize = 32;
 const MODULE_CACHE_TTL_SECS: f64 = 300.0;
 const STORAGE_CACHE_LIMIT: usize = 16;
 const STORAGE_CACHE_TTL_SECS: f64 = 300.0;
 const STORAGE_CACHE_BYTE_LIMIT: usize = 48 * 1024 * 1024;
+const COMPUTE_STORAGE_CACHE_LIMIT: usize = 2;
+const COMPUTE_STORAGE_BUILDER_LIMIT: usize = 2;
+const COMPUTE_STORAGE_ENTRY_LIMIT: usize = 1024;
+const COMPUTE_STORAGE_VALUE_LIMIT: usize = 8 * 1024 * 1024;
+const COMPUTE_STORAGE_BYTE_LIMIT: usize = 512 * 1024 * 1024;
+const COMPUTE_TRACE_DOMAIN: &[u8] = b"octra:resource-compute-trace:v1\0";
 const REQUEST_MAGIC: &[u8; 5] = b"OCWR1";
 const RESPONSE_MAGIC: &[u8; 5] = b"OCWS1";
 const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -84,6 +101,18 @@ const ALLOWED_IMPORTS: &[&str] = &[
     "host_tensor_linear_i8_kv",
     "host_tensor_argmax_i8_kv",
     "host_tensor_top1_i8_kv",
+    "host_tensor_session_has_q24",
+    "host_tensor_session_reset_q24",
+    "host_tensor_session_append_kv_q24",
+    "host_tensor_session_attention_kv_q24",
+    "host_tensor_load_i8_kv_q24",
+    "host_tensor_rmsnorm_q24",
+    "host_tensor_silu_q24",
+    "host_tensor_elemwise_mul_q24",
+    "host_tensor_residual_add_q24",
+    "host_tensor_rope_apply_q24",
+    "host_tensor_linear_i8_kv_q24",
+    "host_tensor_top1_i8_kv_q24",
 ];
 
 const UPDATE_DISABLED_IMPORTS: &[&str] = &[
@@ -109,6 +138,67 @@ const UPDATE_DISABLED_IMPORTS: &[&str] = &[
     "host_tensor_session_attention_kv_fp",
 ];
 
+const COMPUTE_IMPORTS: &[&str] = &[
+    "host_tensor_session_has_q24",
+    "host_tensor_session_reset_q24",
+    "host_tensor_session_append_kv_q24",
+    "host_tensor_session_attention_kv_q24",
+    "host_tensor_load_i8_kv_q24",
+    "host_tensor_rmsnorm_q24",
+    "host_tensor_silu_q24",
+    "host_tensor_elemwise_mul_q24",
+    "host_tensor_residual_add_q24",
+    "host_tensor_rope_apply_q24",
+    "host_tensor_linear_i8_kv_q24",
+    "host_tensor_top1_i8_kv_q24",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionProfile {
+    Standard,
+    Compute,
+}
+
+impl ExecutionProfile {
+    fn of_payload(payload: &Payload) -> Result<Self, String> {
+        match payload.execution_profile.as_deref().unwrap_or("standard") {
+            "standard" => Ok(Self::Standard),
+            "compute" => Ok(Self::Compute),
+            _ => Err("invalid wasm execution profile".to_owned()),
+        }
+    }
+
+    fn max_guest_bytes(self) -> usize {
+        match self {
+            Self::Standard => MAX_GUEST_READ_BYTES.min(MAX_GUEST_WRITE_BYTES),
+            Self::Compute => COMPUTE_MAX_GUEST_BYTES,
+        }
+    }
+
+    fn max_tensor_session_bytes(self) -> usize {
+        match self {
+            Self::Standard => MAX_TENSOR_SESSION_BYTES,
+            Self::Compute => COMPUTE_MAX_TENSOR_SESSION_BYTES,
+        }
+    }
+
+    fn max_initial_pages(self) -> usize {
+        match self {
+            Self::Standard => MAX_INITIAL_PAGES,
+            Self::Compute => COMPUTE_MAX_INITIAL_PAGES,
+        }
+    }
+
+    fn fuel(self, requested: Option<u64>) -> u64 {
+        match self {
+            Self::Standard => requested.unwrap_or(DEFAULT_FUEL_LIMIT).min(MAX_FUEL_LIMIT),
+            Self::Compute => requested
+                .unwrap_or(COMPUTE_DEFAULT_FUEL_LIMIT)
+                .min(COMPUTE_MAX_FUEL_LIMIT),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Payload {
     action: Option<String>,
@@ -131,6 +221,14 @@ struct Payload {
     is_view: Option<bool>,
     update_policy: Option<bool>,
     fuel_limit: Option<u64>,
+    execution_profile: Option<String>,
+    compute_storage_cache_key: Option<String>,
+    compute_storage_key: Option<String>,
+    compute_storage_value_b64: Option<String>,
+    compute_storage_root: Option<String>,
+    compute_storage_entries: Option<usize>,
+    compute_storage_bytes: Option<usize>,
+    compute_session_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +325,9 @@ struct EncryptedAssetPutJson {
 #[derive(Debug)]
 struct HostState {
     limits: StoreLimits,
+    execution_profile: ExecutionProfile,
+    max_guest_bytes: usize,
+    max_tensor_session_bytes: usize,
     storage: Arc<BTreeMap<String, Vec<u8>>>,
     hfhe_caps: BTreeSet<String>,
     hfhe_pubkeys: HashMap<String, String>,
@@ -252,6 +353,71 @@ struct HostState {
     circle_invoke_cache: Option<(Vec<u8>, Vec<u8>)>,
     hfhe_invoke_cache: Option<(Vec<u8>, Vec<u8>)>,
     unavailable: Option<String>,
+    compute_trace: Option<ComputeTrace>,
+    compute_session_scope: Option<String>,
+}
+
+#[derive(Debug)]
+struct ComputeTrace {
+    hasher: Sha256,
+    operations: u64,
+}
+
+impl ComputeTrace {
+    fn new(program_root: &str, storage_root: Option<&str>, session_scope: Option<&str>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(COMPUTE_TRACE_DOMAIN);
+        trace_put(&mut hasher, program_root.as_bytes());
+        trace_put(&mut hasher, storage_root.unwrap_or("").as_bytes());
+        trace_put(&mut hasher, session_scope.unwrap_or("").as_bytes());
+        Self {
+            hasher,
+            operations: 0,
+        }
+    }
+
+    fn begin(&mut self, export_name: &str, request_bytes: &[u8]) {
+        trace_put(&mut self.hasher, b"request");
+        trace_put(&mut self.hasher, export_name.as_bytes());
+        trace_put(&mut self.hasher, &Sha256::digest(request_bytes));
+    }
+
+    fn record(&mut self, operation: &str, fields: &[&[u8]]) {
+        self.operations = self.operations.saturating_add(1);
+        trace_put(&mut self.hasher, operation.as_bytes());
+        for field in fields {
+            trace_put(&mut self.hasher, field);
+        }
+    }
+
+    fn finish(&self, code: i32, response_bytes: &[u8], effort_used: u64) -> String {
+        let mut hasher = self.hasher.clone();
+        trace_put(&mut hasher, b"result");
+        trace_put(&mut hasher, &code.to_le_bytes());
+        trace_put(&mut hasher, &Sha256::digest(response_bytes));
+        trace_put(&mut hasher, &effort_used.to_le_bytes());
+        trace_put(&mut hasher, &self.operations.to_le_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+fn trace_put(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn trace_i64_digest(values: &[i64]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn record_compute_trace(caller: &mut Caller<'_, HostState>, operation: &str, fields: &[&[u8]]) {
+    if let Some(trace) = caller.data_mut().compute_trace.as_mut() {
+        trace.record(operation, fields);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -271,10 +437,21 @@ struct TensorSessionEntry {
 }
 
 #[derive(Debug, Clone)]
+struct FixedTensorSessionEntry {
+    n_layers: usize,
+    max_t: usize,
+    kv_dim: usize,
+    k_cache: Vec<i64>,
+    v_cache: Vec<i64>,
+    updated_at: f64,
+}
+
+#[derive(Debug, Clone)]
 struct ModuleCacheEntry {
     module: Arc<Module>,
     exports: Vec<ExportInfoJson>,
     has_update_disabled_imports: bool,
+    has_compute_imports: bool,
     updated_at: f64,
 }
 
@@ -285,9 +462,23 @@ struct StorageCacheEntry {
     updated_at: f64,
 }
 
+#[derive(Debug)]
+struct ComputeStorageBuilder {
+    storage: BTreeMap<String, Vec<u8>>,
+    weight: usize,
+    updated_at: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ComputeStorageEntry {
+    storage: Arc<BTreeMap<String, Vec<u8>>>,
+    root: String,
+    weight: usize,
+    updated_at: f64,
+}
+
 fn storage_cache() -> &'static Mutex<HashMap<String, StorageCacheEntry>> {
-    static STORAGE_CACHE: OnceLock<Mutex<HashMap<String, StorageCacheEntry>>> =
-        OnceLock::new();
+    static STORAGE_CACHE: OnceLock<Mutex<HashMap<String, StorageCacheEntry>>> = OnceLock::new();
     STORAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -303,9 +494,20 @@ fn cache_guard<T: Default>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-fn session_cache() -> &'static Mutex<HashMap<String, SessionCacheEntry>> {
-    static SESSION_CACHE: OnceLock<Mutex<HashMap<String, SessionCacheEntry>>> =
+fn compute_storage_builders() -> &'static Mutex<HashMap<String, ComputeStorageBuilder>> {
+    static COMPUTE_STORAGE_BUILDERS: OnceLock<Mutex<HashMap<String, ComputeStorageBuilder>>> =
         OnceLock::new();
+    COMPUTE_STORAGE_BUILDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn compute_storage_cache() -> &'static Mutex<HashMap<String, ComputeStorageEntry>> {
+    static COMPUTE_STORAGE_CACHE: OnceLock<Mutex<HashMap<String, ComputeStorageEntry>>> =
+        OnceLock::new();
+    COMPUTE_STORAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_cache() -> &'static Mutex<HashMap<String, SessionCacheEntry>> {
+    static SESSION_CACHE: OnceLock<Mutex<HashMap<String, SessionCacheEntry>>> = OnceLock::new();
     SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -313,6 +515,12 @@ fn tensor_session_cache() -> &'static Mutex<HashMap<String, TensorSessionEntry>>
     static TENSOR_SESSION_CACHE: OnceLock<Mutex<HashMap<String, TensorSessionEntry>>> =
         OnceLock::new();
     TENSOR_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fixed_tensor_session_cache() -> &'static Mutex<HashMap<String, FixedTensorSessionEntry>> {
+    static FIXED_TENSOR_SESSION_CACHE: OnceLock<Mutex<HashMap<String, FixedTensorSessionEntry>>> =
+        OnceLock::new();
+    FIXED_TENSOR_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn shared_engine() -> &'static Engine {
@@ -344,6 +552,7 @@ struct Runtime {
     fuel_limit: u64,
     has_update_disabled_imports: bool,
     update_policy: bool,
+    has_compute_imports: bool,
 }
 
 #[derive(Debug)]
@@ -423,11 +632,7 @@ pub extern "C" fn octra_circle_wasm_host_run_json(
             1
         },
         Err(_) => unsafe {
-            write_owned_bytes(
-                b"octra_circle_wasm_host: panic".to_vec(),
-                err_ptr,
-                err_len,
-            );
+            write_owned_bytes(b"octra_circle_wasm_host: panic".to_vec(), err_ptr, err_len);
             if !out_ptr.is_null() {
                 *out_ptr = std::ptr::null_mut();
             }
@@ -463,6 +668,12 @@ fn run_json(input_ptr: *const u8, input_len: usize) -> Result<String, String> {
         "validate" => run_validate(&payload)?,
         "describe" => run_describe(&payload)?,
         "execute" => run_execute(&payload)?,
+        "compute_storage_begin" => run_compute_storage_begin(&payload)?,
+        "compute_storage_put" => run_compute_storage_put(&payload)?,
+        "compute_storage_seal" => run_compute_storage_seal(&payload)?,
+        "compute_storage_status" => run_compute_storage_status(&payload)?,
+        "compute_storage_drop" => run_compute_storage_drop(&payload)?,
+        "compute_self_test" => run_compute_self_test()?,
         _ => {
             return Err(format!(
                 "octra_circle_wasm_host: unsupported action: {}",
@@ -472,6 +683,254 @@ fn run_json(input_ptr: *const u8, input_len: usize) -> Result<String, String> {
     };
     serde_json::to_string(&output)
         .map_err(|e| format!("octra_circle_wasm_host: json encode failed: {e}"))
+}
+
+fn self_test_i64(hasher: &mut Sha256, values: &[i64]) {
+    hasher.update((values.len() as u64).to_be_bytes());
+    for value in values {
+        hasher.update(value.to_be_bytes());
+    }
+}
+
+fn run_compute_self_test() -> Result<JsonValue, String> {
+    let one = deterministic_tensor::ONE;
+    let half = deterministic_tensor::HALF;
+    let loaded = deterministic_tensor::load_i8(&[1, 2, 3, 4], half).map_err(str::to_owned)?;
+    let linear = deterministic_tensor::linear_i8(&[one, 2 * one], &[1, 2, 3, 4], 2, half)
+        .map_err(str::to_owned)?;
+    let top1 = deterministic_tensor::top1_i8(&[one, 2 * one], &[1, 2, 3, 4], 2, half)
+        .map_err(str::to_owned)?;
+    let normalized =
+        deterministic_tensor::rmsnorm(&[one, -one], &[one, one]).map_err(str::to_owned)?;
+    let activated = deterministic_tensor::silu(&[-one, 0, one]).map_err(str::to_owned)?;
+    let multiplied = deterministic_tensor::elementwise_mul(&[one, 2 * one], &[2 * one, half])
+        .map_err(str::to_owned)?;
+    let residual =
+        deterministic_tensor::residual_add(&[one, 2 * one], &[one, -one]).map_err(str::to_owned)?;
+    let rotated = deterministic_tensor::rope(&[one, 2 * one, 3 * one, 4 * one], &[one, half], 3)
+        .map_err(str::to_owned)?;
+    let attended = deterministic_tensor::attention_kv(
+        &[one, 0],
+        &[one, 0, 0, one],
+        &[one, 2 * one, 3 * one, 4 * one],
+        2,
+        1,
+        1,
+        2,
+        one,
+    )
+    .map_err(str::to_owned)?;
+    let executor_root = Sha256::digest(b"octra:resource-compute-executor:q24-v1\0");
+    let mut evidence = Sha256::new();
+    evidence.update(b"octra:resource-compute-evidence:q24-v1\0");
+    self_test_i64(&mut evidence, &loaded);
+    self_test_i64(&mut evidence, &linear);
+    self_test_i64(&mut evidence, &[top1.0 as i64, top1.1]);
+    self_test_i64(&mut evidence, &normalized);
+    self_test_i64(&mut evidence, &activated);
+    self_test_i64(&mut evidence, &multiplied);
+    self_test_i64(&mut evidence, &residual);
+    self_test_i64(&mut evidence, &rotated);
+    self_test_i64(&mut evidence, &attended);
+    Ok(json!({
+        "evidence_root": hex::encode(evidence.finalize()),
+        "executor_root": hex::encode(executor_root),
+        "profile": "q24-v1"
+    }))
+}
+
+fn compute_storage_key(payload: &Payload) -> Result<&str, String> {
+    let key = payload
+        .compute_storage_cache_key
+        .as_deref()
+        .ok_or_else(|| "missing compute storage cache key".to_owned())?;
+    normalize_hex64(key, "compute storage cache key")?;
+    Ok(key)
+}
+
+fn remove_oldest_compute_builder(builders: &mut HashMap<String, ComputeStorageBuilder>) {
+    let oldest = builders
+        .iter()
+        .min_by(|left, right| left.1.updated_at.total_cmp(&right.1.updated_at))
+        .map(|(key, _)| key.clone());
+    if let Some(key) = oldest {
+        builders.remove(&key);
+    }
+}
+
+fn remove_oldest_compute_storage(cache: &mut HashMap<String, ComputeStorageEntry>) {
+    let oldest = cache
+        .iter()
+        .min_by(|left, right| left.1.updated_at.total_cmp(&right.1.updated_at))
+        .map(|(key, _)| key.clone());
+    if let Some(key) = oldest {
+        cache.remove(&key);
+    }
+}
+
+fn compute_storage_root(storage: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"octra:compute_storage_cache:v1\0");
+    for (key, value) in storage {
+        hasher.update((key.len() as u32).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(Sha256::digest(value));
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn run_compute_storage_begin(payload: &Payload) -> Result<JsonValue, String> {
+    let key = compute_storage_key(payload)?.to_owned();
+    let mut builders = compute_storage_builders()
+        .lock()
+        .map_err(|_| "compute storage builder poisoned".to_owned())?;
+    if !builders.contains_key(&key) && builders.len() >= COMPUTE_STORAGE_BUILDER_LIMIT {
+        remove_oldest_compute_builder(&mut builders);
+    }
+    builders.insert(
+        key.clone(),
+        ComputeStorageBuilder {
+            storage: BTreeMap::new(),
+            weight: 0,
+            updated_at: now_secs(),
+        },
+    );
+    Ok(json!({"cache_key": key, "status": "building"}))
+}
+
+fn run_compute_storage_put(payload: &Payload) -> Result<JsonValue, String> {
+    let cache_key = compute_storage_key(payload)?.to_owned();
+    let key = payload
+        .compute_storage_key
+        .as_deref()
+        .ok_or_else(|| "missing compute storage key".to_owned())?;
+    if key.is_empty() || key.len() > 256 || key.as_bytes().contains(&0) {
+        return Err("invalid compute storage key".to_owned());
+    }
+    let value = decode_b64(
+        "compute storage value",
+        payload
+            .compute_storage_value_b64
+            .as_deref()
+            .ok_or_else(|| "missing compute storage value".to_owned())?,
+    )?;
+    if value.len() > COMPUTE_STORAGE_VALUE_LIMIT {
+        return Err("compute storage value exceeds limit".to_owned());
+    }
+    let mut builders = compute_storage_builders()
+        .lock()
+        .map_err(|_| "compute storage builder poisoned".to_owned())?;
+    let builder = builders
+        .get_mut(&cache_key)
+        .ok_or_else(|| format!("missing compute storage builder: {cache_key}"))?;
+    match builder.storage.get(key) {
+        Some(current) if current == &value => {}
+        Some(_) => return Err("compute storage key differs".to_owned()),
+        None => {
+            if builder.storage.len() >= COMPUTE_STORAGE_ENTRY_LIMIT {
+                return Err("compute storage entry count exceeds limit".to_owned());
+            }
+            let next_weight = builder
+                .weight
+                .checked_add(value.len())
+                .ok_or_else(|| "compute storage bytes overflow".to_owned())?;
+            if next_weight > COMPUTE_STORAGE_BYTE_LIMIT {
+                return Err("compute storage bytes exceed limit".to_owned());
+            }
+            builder.storage.insert(key.to_owned(), value);
+            builder.weight = next_weight;
+        }
+    }
+    builder.updated_at = now_secs();
+    Ok(json!({
+        "bytes": builder.weight,
+        "cache_key": cache_key,
+        "entries": builder.storage.len(),
+        "status": "building",
+    }))
+}
+
+fn run_compute_storage_seal(payload: &Payload) -> Result<JsonValue, String> {
+    let cache_key = compute_storage_key(payload)?.to_owned();
+    let expected_root = payload
+        .compute_storage_root
+        .as_deref()
+        .ok_or_else(|| "missing compute storage root".to_owned())?;
+    normalize_hex64(expected_root, "compute storage root")?;
+    let expected_entries = payload
+        .compute_storage_entries
+        .ok_or_else(|| "missing compute storage entries".to_owned())?;
+    let expected_bytes = payload
+        .compute_storage_bytes
+        .ok_or_else(|| "missing compute storage bytes".to_owned())?;
+    let builder = compute_storage_builders()
+        .lock()
+        .map_err(|_| "compute storage builder poisoned".to_owned())?
+        .remove(&cache_key)
+        .ok_or_else(|| format!("missing compute storage builder: {cache_key}"))?;
+    let actual_root = compute_storage_root(&builder.storage);
+    if builder.storage.len() != expected_entries
+        || builder.weight != expected_bytes
+        || actual_root != expected_root
+    {
+        return Err("compute storage seal differs".to_owned());
+    }
+    let mut cache = compute_storage_cache()
+        .lock()
+        .map_err(|_| "compute storage cache poisoned".to_owned())?;
+    if !cache.contains_key(&cache_key) && cache.len() >= COMPUTE_STORAGE_CACHE_LIMIT {
+        remove_oldest_compute_storage(&mut cache);
+    }
+    cache.insert(
+        cache_key.clone(),
+        ComputeStorageEntry {
+            storage: Arc::new(builder.storage),
+            root: actual_root.clone(),
+            weight: builder.weight,
+            updated_at: now_secs(),
+        },
+    );
+    Ok(json!({
+        "bytes": expected_bytes,
+        "cache_key": cache_key,
+        "entries": expected_entries,
+        "root": actual_root,
+        "status": "ready",
+    }))
+}
+
+fn run_compute_storage_status(payload: &Payload) -> Result<JsonValue, String> {
+    let cache_key = compute_storage_key(payload)?.to_owned();
+    let mut cache = compute_storage_cache()
+        .lock()
+        .map_err(|_| "compute storage cache poisoned".to_owned())?;
+    match cache.get_mut(&cache_key) {
+        Some(entry) => {
+            entry.updated_at = now_secs();
+            Ok(json!({
+                "bytes": entry.weight,
+                "cache_key": cache_key,
+                "entries": entry.storage.len(),
+                "root": entry.root,
+                "status": "ready",
+            }))
+        }
+        None => Ok(json!({"cache_key": cache_key, "status": "missing"})),
+    }
+}
+
+fn run_compute_storage_drop(payload: &Payload) -> Result<JsonValue, String> {
+    let cache_key = compute_storage_key(payload)?.to_owned();
+    compute_storage_builders()
+        .lock()
+        .map_err(|_| "compute storage builder poisoned".to_owned())?
+        .remove(&cache_key);
+    compute_storage_cache()
+        .lock()
+        .map_err(|_| "compute storage cache poisoned".to_owned())?
+        .remove(&cache_key);
+    Ok(json!({"cache_key": cache_key, "status": "missing"}))
 }
 
 fn run_validate(payload: &Payload) -> Result<JsonValue, String> {
@@ -484,17 +943,20 @@ fn run_validate(payload: &Payload) -> Result<JsonValue, String> {
 
 fn run_describe(payload: &Payload) -> Result<JsonValue, String> {
     let mut runtime = Runtime::instantiate(payload, true)?;
-    let manifest =
-        if runtime.instance.get_func(&runtime.store, "octra_manifest").is_some() {
-            match runtime.call_export("octra_manifest", &[]) {
-                Ok((_code, response_bytes, _effort_used)) => {
-                    serde_json::from_slice::<JsonValue>(&response_bytes).ok()
-                }
-                Err(_) => None,
+    let manifest = if runtime
+        .instance
+        .get_func(&runtime.store, "octra_manifest")
+        .is_some()
+    {
+        match runtime.call_export("octra_manifest", &[]) {
+            Ok((_code, response_bytes, _effort_used)) => {
+                serde_json::from_slice::<JsonValue>(&response_bytes).ok()
             }
-        } else {
-            None
-        };
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     Ok(json!({
         "exports": runtime.exports,
         "manifest": manifest,
@@ -517,29 +979,35 @@ fn run_execute(payload: &Payload) -> Result<JsonValue, String> {
 
 fn execute_output(
     runtime: &Runtime,
+    code: i32,
     success: bool,
     response_bytes: &[u8],
     effort_used: u64,
     error: Option<String>,
 ) -> JsonValue {
     let state = runtime.store.data();
-    let storage_pairs =
-        if state.is_view {
-            JsonValue::Null
-        } else {
-            JsonValue::Array(
-                state
-                    .storage
-                    .iter()
-                    .map(|(key, value)| {
-                        json!({
-                            "key_b64": encode_b64(key.as_bytes()),
-                            "value_b64": encode_b64(value),
-                        })
+    let compute_trace_root = state
+        .compute_trace
+        .as_ref()
+        .map(|trace| trace.finish(code, &response_bytes, effort_used));
+    let compute_operations = state.compute_trace.as_ref().map(|trace| trace.operations);
+    let compute_steps = state.compute_trace.as_ref().map(|_| effort_used);
+    let storage_pairs = if state.is_view {
+        JsonValue::Null
+    } else {
+        JsonValue::Array(
+            state
+                .storage
+                .iter()
+                .map(|(key, value)| {
+                    json!({
+                        "key_b64": encode_b64(key.as_bytes()),
+                        "value_b64": encode_b64(value),
                     })
-                    .collect(),
-            )
-        };
+                })
+                .collect(),
+        )
+    };
     json!({
         "success": success,
         "status_code": state.response_status,
@@ -551,21 +1019,39 @@ fn execute_output(
         "encrypted_assets": state.encrypted_assets,
         "hfhe_receipt_entries": state.hfhe_receipt_entries,
         "effort_used": effort_used,
+        "compute_trace_root": compute_trace_root,
+        "compute_steps": compute_steps,
+        "compute_operations": compute_operations,
         "error": error,
         "unavailable": state.unavailable,
     })
 }
 
-fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]) -> Result<JsonValue, String> {
-    if runtime.update_policy
-        && !runtime.store.data().is_view
-        && runtime.has_update_disabled_imports
+fn finish_execute(
+    runtime: &mut Runtime,
+    export_name: &str,
+    request_bytes: &[u8],
+) -> Result<JsonValue, String> {
+    if runtime.update_policy && !runtime.store.data().is_view && runtime.has_update_disabled_imports
     {
         return Err("wasm_v1 nonpersistent host imports are disabled for updates".to_owned());
     }
-    let (success, response_bytes, effort_used, error) =
+    if !runtime.store.data().is_view && runtime.has_compute_imports {
+        return Err("wasm_v1 compute host imports are disabled for updates".to_owned());
+    }
+    if runtime.has_compute_imports
+        && runtime.store.data().execution_profile != ExecutionProfile::Compute
+    {
+        return Err("wasm_v1 compute host imports require compute execution profile".to_owned());
+    }
+    maintain_compute_session_caches();
+    if let Some(trace) = runtime.store.data_mut().compute_trace.as_mut() {
+        trace.begin(export_name, request_bytes);
+    }
+    let (code, success, response_bytes, effort_used, error) =
         match runtime.call_export(export_name, request_bytes) {
             Ok((code, response_bytes, effort_used)) => (
+                code,
                 code == 0,
                 response_bytes,
                 effort_used,
@@ -581,6 +1067,7 @@ fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]
                     .get_fuel()
                     .map_err(|e| format!("wasm fuel read failed: {e}"))?;
                 (
+                    -1,
                     false,
                     Vec::new(),
                     runtime.fuel_limit.saturating_sub(remaining),
@@ -588,14 +1075,18 @@ fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]
                 )
             }
         };
-    if runtime.store.data().hfhe_receipt_mode == "consume"
-        && runtime.store.data().hfhe_receipt_index
-            != runtime.store.data().hfhe_receipt_expected.len()
-    {
+    let receipt_complete = runtime.store.data().hfhe_receipt_mode != "consume"
+        || runtime.store.data().hfhe_receipt_index
+            == runtime.store.data().hfhe_receipt_expected.len();
+    if !success || !receipt_complete {
+        clear_compute_session_scope(runtime.store.data())?;
+    }
+    if !receipt_complete {
         return Err("hfhe receipt was not fully consumed".to_owned());
     }
     Ok(execute_output(
         runtime,
+        code,
         success,
         &response_bytes,
         effort_used,
@@ -605,6 +1096,10 @@ fn finish_execute(runtime: &mut Runtime, export_name: &str, request_bytes: &[u8]
 
 impl Runtime {
     fn instantiate(payload: &Payload, description_only: bool) -> Result<Self, String> {
+        let profile = ExecutionProfile::of_payload(payload)?;
+        if payload.compute_session_scope.is_some() && profile != ExecutionProfile::Compute {
+            return Err("compute session scope requires compute execution profile".to_owned());
+        }
         let code_b64_opt = payload.code_b64.as_deref();
         let module_key = match payload.code_cache_key.as_deref() {
             Some(key) if !key.is_empty() => key.to_owned(),
@@ -615,7 +1110,7 @@ impl Runtime {
                 format!("{:x}", hasher.finalize())
             }
         };
-        let (module, exports, has_update_disabled_imports) = {
+        let (module, exports, has_update_disabled_imports, has_compute_imports) = {
             let mut guard = cache_guard(module_cache());
             prune_module_cache_locked(&mut guard);
             if let Some(entry) = guard.get_mut(&module_key) {
@@ -624,10 +1119,11 @@ impl Runtime {
                     entry.module.clone(),
                     entry.exports.clone(),
                     entry.has_update_disabled_imports,
+                    entry.has_compute_imports,
                 )
             } else {
-                let code_b64 =
-                    code_b64_opt.ok_or_else(|| format!("missing wasm module cache: {module_key}"))?;
+                let code_b64 = code_b64_opt
+                    .ok_or_else(|| format!("missing wasm module cache: {module_key}"))?;
                 let wasm_bytes = decode_b64("code_b64", code_b64)?;
                 let module = Arc::new(
                     Module::new(shared_engine(), &mut &wasm_bytes[..])
@@ -639,25 +1135,41 @@ impl Runtime {
                 let has_update_disabled_imports = module
                     .imports()
                     .any(|entry| UPDATE_DISABLED_IMPORTS.contains(&entry.name()));
+                let has_compute_imports = module
+                    .imports()
+                    .any(|entry| COMPUTE_IMPORTS.contains(&entry.name()));
                 guard.insert(
-                    module_key,
+                    module_key.clone(),
                     ModuleCacheEntry {
                         module: module.clone(),
                         exports: exports.clone(),
                         has_update_disabled_imports,
+                        has_compute_imports,
                         updated_at: now_secs(),
                     },
                 );
-                (module, exports, has_update_disabled_imports)
+                (
+                    module,
+                    exports,
+                    has_update_disabled_imports,
+                    has_compute_imports,
+                )
             }
         };
 
         let mut store = Store::new(shared_engine(), HostState::from_payload(payload)?);
+        if profile == ExecutionProfile::Compute {
+            if let Some(scope) = payload.compute_session_scope.as_deref() {
+                normalize_hex64(scope, "compute session scope")?;
+            }
+            store.data_mut().compute_trace = Some(ComputeTrace::new(
+                &module_key,
+                payload.compute_storage_cache_key.as_deref(),
+                payload.compute_session_scope.as_deref(),
+            ));
+        }
         store.limiter(|state| &mut state.limits);
-        let fuel_limit = payload
-            .fuel_limit
-            .unwrap_or(DEFAULT_FUEL_LIMIT)
-            .min(MAX_FUEL_LIMIT);
+        let fuel_limit = profile.fuel(payload.fuel_limit);
         store
             .set_fuel(fuel_limit)
             .map_err(|e| format!("wasm fuel setup failed: {e}"))?;
@@ -681,10 +1193,10 @@ impl Runtime {
             .get_memory(&store, "memory")
             .ok_or_else(|| "wasm_v1 memory export missing".to_owned())?;
         let initial_pages = memory.data_size(&store) / PAGE_BYTES;
-        if initial_pages > MAX_INITIAL_PAGES {
+        if initial_pages > profile.max_initial_pages() {
             return Err(format!(
                 "wasm_v1 memory exceeds {} pages",
-                MAX_INITIAL_PAGES
+                profile.max_initial_pages()
             ));
         }
         Ok(Self {
@@ -694,6 +1206,7 @@ impl Runtime {
             fuel_limit,
             has_update_disabled_imports,
             update_policy: payload.update_policy.unwrap_or(false),
+            has_compute_imports,
         })
     }
 
@@ -736,7 +1249,6 @@ impl Runtime {
             .map_err(|e| format!("wasm fuel read failed: {e}"))?;
         Ok((code, response_bytes, self.fuel_limit - remaining))
     }
-
 }
 
 fn is_lower_hex64(value: &str) -> bool {
@@ -753,10 +1265,7 @@ fn is_hfhe_verify_method(method: &str) -> bool {
     )
 }
 
-fn validate_hfhe_receipt_input(
-    mode: &str,
-    entries: &[HfheReceiptEntryJson],
-) -> Result<(), String> {
+fn validate_hfhe_receipt_input(mode: &str, entries: &[HfheReceiptEntryJson]) -> Result<(), String> {
     if !matches!(mode, "direct" | "capture" | "consume") {
         return Err("invalid hfhe receipt mode".to_owned());
     }
@@ -789,7 +1298,8 @@ fn validate_hfhe_receipt_input(
 
 impl HostState {
     fn from_payload(payload: &Payload) -> Result<Self, String> {
-        let storage = build_storage_from_payload(payload)?;
+        let execution_profile = ExecutionProfile::of_payload(payload)?;
+        let storage = build_storage_from_payload(payload, execution_profile)?;
         let hfhe_caps = payload
             .hfhe_caps
             .clone()
@@ -807,19 +1317,19 @@ impl HostState {
             .hfhe_receipt_mode
             .clone()
             .unwrap_or_else(|| "direct".to_owned());
-        let hfhe_receipt_expected = payload
-            .hfhe_receipt_entries
-            .clone()
-            .unwrap_or_default();
+        let hfhe_receipt_expected = payload.hfhe_receipt_entries.clone().unwrap_or_default();
         validate_hfhe_receipt_input(&hfhe_receipt_mode, &hfhe_receipt_expected)?;
         Ok(Self {
             limits: StoreLimitsBuilder::new()
-                .memory_size(MAX_INITIAL_PAGES * PAGE_BYTES)
+                .memory_size(execution_profile.max_initial_pages() * PAGE_BYTES)
                 .memories(1)
                 .tables(1)
                 .instances(1)
                 .trap_on_grow_failure(true)
                 .build(),
+            execution_profile,
+            max_guest_bytes: execution_profile.max_guest_bytes(),
+            max_tensor_session_bytes: execution_profile.max_tensor_session_bytes(),
             storage,
             hfhe_caps,
             hfhe_pubkeys,
@@ -845,11 +1355,18 @@ impl HostState {
             circle_invoke_cache: None,
             hfhe_invoke_cache: None,
             unavailable: None,
+            compute_trace: None,
+            compute_session_scope: payload.compute_session_scope.clone(),
         })
     }
 }
 
-fn public_read_key(circle_id: &str, canonical_path: &str, offset: usize, max_bytes: usize) -> String {
+fn public_read_key(
+    circle_id: &str,
+    canonical_path: &str,
+    offset: usize,
+    max_bytes: usize,
+) -> String {
     format!("{circle_id}\0{canonical_path}\0{offset}\0{max_bytes}")
 }
 
@@ -913,7 +1430,29 @@ fn build_public_reads(payload: &Payload) -> Result<BTreeMap<String, PublicRead>,
     Ok(result)
 }
 
-fn build_storage_from_payload(payload: &Payload) -> Result<Arc<BTreeMap<String, Vec<u8>>>, String> {
+fn build_storage_from_payload(
+    payload: &Payload,
+    execution_profile: ExecutionProfile,
+) -> Result<Arc<BTreeMap<String, Vec<u8>>>, String> {
+    if let Some(key) = payload.compute_storage_cache_key.as_deref() {
+        if execution_profile != ExecutionProfile::Compute {
+            return Err("compute storage requires compute execution profile".to_owned());
+        }
+        if payload.storage_cache_key.is_some() || payload.storage_pairs.is_some() {
+            return Err("compute storage cannot mix storage sources".to_owned());
+        }
+        normalize_hex64(key, "compute storage cache key")?;
+        let mut cache = compute_storage_cache()
+            .lock()
+            .map_err(|_| "compute storage cache poisoned".to_owned())?;
+        match cache.get_mut(key) {
+            Some(entry) => {
+                entry.updated_at = now_secs();
+                return Ok(entry.storage.clone());
+            }
+            None => return Err(format!("missing compute storage cache: {key}")),
+        }
+    }
     let cache_key = payload.storage_cache_key.clone();
     let pairs_opt = payload.storage_pairs.clone();
 
@@ -969,15 +1508,9 @@ fn validate_imports(module: &Module) -> Result<(), String> {
         }
         match import.ty() {
             ExternType::Func(_) => {}
-            ExternType::Table(_) => {
-                return Err("unsupported wasm import kind: table".to_owned())
-            }
-            ExternType::Memory(_) => {
-                return Err("unsupported wasm import kind: memory".to_owned())
-            }
-            ExternType::Global(_) => {
-                return Err("unsupported wasm import kind: global".to_owned())
-            }
+            ExternType::Table(_) => return Err("unsupported wasm import kind: table".to_owned()),
+            ExternType::Memory(_) => return Err("unsupported wasm import kind: memory".to_owned()),
+            ExternType::Global(_) => return Err("unsupported wasm import kind: global".to_owned()),
         }
         if !ALLOWED_IMPORTS.iter().any(|name| *name == import.name()) {
             return Err(format!("unsupported wasm import: {}", import.name()));
@@ -1045,17 +1578,23 @@ fn manifest_from_exports(exports: &[ExportInfoJson]) -> JsonValue {
     json!({ "methods": methods })
 }
 
-fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> Result<(), String> {
+fn define_imports(
+    store: &mut Store<HostState>,
+    linker: &mut Linker<HostState>,
+) -> Result<(), String> {
     linker
         .define(
             "octra",
             "host_response_reset",
-            Func::wrap(&mut *store, |mut caller: Caller<'_, HostState>| -> Result<i32, WasmiError> {
-                let data = caller.data_mut();
-                data.response_bytes.clear();
-                data.response_status = 0;
-                Ok(0)
-            }),
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>| -> Result<i32, WasmiError> {
+                    let data = caller.data_mut();
+                    data.response_bytes.clear();
+                    data.response_status = 0;
+                    Ok(0)
+                },
+            ),
         )
         .map_err(|e| format!("link host_response_reset failed: {e}"))?;
     linker
@@ -1064,7 +1603,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_response_write",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 ptr: i32,
+                 len: i32|
+                 -> Result<i32, WasmiError> {
                     if len < 0 {
                         return Ok(-1);
                     }
@@ -1099,7 +1641,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_circle_invoke_len",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 req_ptr: i32,
+                 req_len: i32|
+                 -> Result<i32, WasmiError> {
                     let request_bytes = read_guest_bytes(&mut caller, req_ptr, req_len)?;
                     charge_host_fuel(&mut caller, CIRCLE_INVOKE_FUEL)?;
                     let response_bytes = execute_circle_invoke(&mut caller, &request_bytes)
@@ -1149,7 +1694,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_hfhe_invoke_len",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, req_ptr: i32, req_len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 req_ptr: i32,
+                 req_len: i32|
+                 -> Result<i32, WasmiError> {
                     let request_bytes = read_guest_bytes(&mut caller, req_ptr, req_len)?;
                     charge_host_fuel(&mut caller, HFHE_INVOKE_FUEL)?;
                     let response_bytes = match execute_hfhe_invoke(&mut caller, &request_bytes) {
@@ -1203,7 +1751,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_kv_get_len",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32|
+                 -> Result<i32, WasmiError> {
                     let key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
                     Ok(caller
                         .data()
@@ -1269,7 +1820,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_kv_del",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32|
+                 -> Result<i32, WasmiError> {
                     if caller.data().is_view {
                         return Ok(-1);
                     }
@@ -1286,7 +1840,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_session_get_len",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, key_ptr: i32, key_len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32|
+                 -> Result<i32, WasmiError> {
                     let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
                     let cache_key = session_namespaced_key(caller.data(), &raw_key);
                     let mut guard = cache_guard(session_cache());
@@ -1507,18 +2064,24 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
         .define(
             "octra",
             "host_epoch",
-            Func::wrap(&mut *store, |caller: Caller<'_, HostState>| -> Result<i64, WasmiError> {
-                Ok(caller.data().current_epoch)
-            }),
+            Func::wrap(
+                &mut *store,
+                |caller: Caller<'_, HostState>| -> Result<i64, WasmiError> {
+                    Ok(caller.data().current_epoch)
+                },
+            ),
         )
         .map_err(|e| format!("link host_epoch failed: {e}"))?;
     linker
         .define(
             "octra",
             "host_caller_len",
-            Func::wrap(&mut *store, |caller: Caller<'_, HostState>| -> Result<i32, WasmiError> {
-                Ok(caller.data().caller_bytes.len() as i32)
-            }),
+            Func::wrap(
+                &mut *store,
+                |caller: Caller<'_, HostState>| -> Result<i32, WasmiError> {
+                    Ok(caller.data().caller_bytes.len() as i32)
+                },
+            ),
         )
         .map_err(|e| format!("link host_caller_len failed: {e}"))?;
     linker
@@ -1527,7 +2090,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_caller_read",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 out_ptr: i32,
+                 out_cap: i32|
+                 -> Result<i32, WasmiError> {
                     let bytes = caller.data().caller_bytes.clone();
                     if out_cap < 0 || (out_cap as usize) < bytes.len() {
                         return Ok(-2);
@@ -1541,9 +2107,12 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
         .define(
             "octra",
             "host_self_len",
-            Func::wrap(&mut *store, |caller: Caller<'_, HostState>| -> Result<i32, WasmiError> {
-                Ok(caller.data().self_bytes.len() as i32)
-            }),
+            Func::wrap(
+                &mut *store,
+                |caller: Caller<'_, HostState>| -> Result<i32, WasmiError> {
+                    Ok(caller.data().self_bytes.len() as i32)
+                },
+            ),
         )
         .map_err(|e| format!("link host_self_len failed: {e}"))?;
     linker
@@ -1552,7 +2121,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_self_read",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 out_ptr: i32,
+                 out_cap: i32|
+                 -> Result<i32, WasmiError> {
                     let bytes = caller.data().self_bytes.clone();
                     if out_cap < 0 || (out_cap as usize) < bytes.len() {
                         return Ok(-2);
@@ -1568,10 +2140,12 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_state_path_key_len",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 ptr: i32,
+                 len: i32|
+                 -> Result<i32, WasmiError> {
                     let state_ref = read_guest_utf8(&mut caller, ptr, len)?;
-                    let encoded = state_path_key(&state_ref)
-                        .into_bytes();
+                    let encoded = state_path_key(&state_ref).into_bytes();
                     Ok(encoded.len() as i32)
                 },
             ),
@@ -1625,8 +2199,7 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
                         .checked_add(data_len as usize)
                         .ok_or_else(|| WasmiError::new("wasm event size overflow"))?;
                     if caller.data().events.len() >= MAX_EVENT_COUNT
-                        || caller.data().event_bytes.saturating_add(event_bytes)
-                            > MAX_EVENT_BYTES
+                        || caller.data().event_bytes.saturating_add(event_bytes) > MAX_EVENT_BYTES
                     {
                         return Err(WasmiError::new("wasm event cap exceeded"));
                     }
@@ -1711,7 +2284,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_tensor_silu_fp",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, addr_ptr: i32, n: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 addr_ptr: i32,
+                 n: i32|
+                 -> Result<i32, WasmiError> {
                     host_tensor_silu_fp(&mut caller, addr_ptr, n)
                 },
             ),
@@ -1820,7 +2396,10 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             "host_tensor_argmax_fp",
             Func::wrap(
                 &mut *store,
-                |mut caller: Caller<'_, HostState>, addr_ptr: i32, n: i32| -> Result<i32, WasmiError> {
+                |mut caller: Caller<'_, HostState>,
+                 addr_ptr: i32,
+                 n: i32|
+                 -> Result<i32, WasmiError> {
                     host_tensor_argmax_fp(&mut caller, addr_ptr, n)
                 },
             ),
@@ -1911,13 +2490,347 @@ fn define_imports(store: &mut Store<HostState>, linker: &mut Linker<HostState>) 
             ),
         )
         .map_err(|e| format!("link host_tensor_top1_i8_kv failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_session_has_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 n_layers: i32,
+                 max_t: i32,
+                 kv_dim: i32|
+                 -> Result<i32, WasmiError> {
+                    require_compute_profile(&caller)?;
+                    if n_layers <= 0 || max_t <= 0 || kv_dim <= 0 {
+                        return Ok(-1);
+                    }
+                    let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
+                    let cache_key = fixed_tensor_session_namespaced_key(caller.data(), &raw_key);
+                    let mut guard = fixed_tensor_session_cache()
+                        .lock()
+                        .map_err(|_| WasmiError::new("fixed tensor session cache poisoned"))?;
+                    prune_fixed_tensor_session_cache_locked(&mut guard);
+                    let result: i32 = match guard.get(&cache_key) {
+                        Some(entry)
+                            if entry.n_layers == n_layers as usize
+                                && entry.max_t == max_t as usize
+                                && entry.kv_dim == kv_dim as usize =>
+                        {
+                            1
+                        }
+                        Some(_) => {
+                            guard.remove(&cache_key);
+                            0
+                        }
+                        None => 0,
+                    };
+                    drop(guard);
+                    let key_digest: [u8; 32] = Sha256::digest(raw_key.as_bytes()).into();
+                    let layers_bytes = n_layers.to_le_bytes();
+                    let tokens_bytes = max_t.to_le_bytes();
+                    let dimension_bytes = kv_dim.to_le_bytes();
+                    let result_bytes = result.to_le_bytes();
+                    record_compute_trace(
+                        &mut caller,
+                        "tensor_session_has_q24",
+                        &[
+                            &key_digest,
+                            &layers_bytes,
+                            &tokens_bytes,
+                            &dimension_bytes,
+                            &result_bytes,
+                        ],
+                    );
+                    Ok(result)
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_session_has_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_session_reset_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 n_layers: i32,
+                 max_t: i32,
+                 kv_dim: i32|
+                 -> Result<i32, WasmiError> {
+                    require_compute_profile(&caller)?;
+                    if n_layers <= 0 || max_t <= 0 || kv_dim <= 0 {
+                        return Ok(-1);
+                    }
+                    let raw_key = read_guest_utf8(&mut caller, key_ptr, key_len)?;
+                    let cache_key = fixed_tensor_session_namespaced_key(caller.data(), &raw_key);
+                    let (n_layers, max_t, kv_dim) =
+                        (n_layers as usize, max_t as usize, kv_dim as usize);
+                    let total = n_layers
+                        .checked_mul(max_t)
+                        .and_then(|value| value.checked_mul(kv_dim))
+                        .ok_or_else(|| WasmiError::new("fixed tensor session size overflow"))?;
+                    let total_bytes = total
+                        .checked_mul(16)
+                        .filter(|value| *value <= caller.data().max_tensor_session_bytes)
+                        .ok_or_else(|| WasmiError::new("fixed tensor session exceeds cap"))?;
+                    charge_host_work(&mut caller, total_bytes)?;
+                    let mut guard = fixed_tensor_session_cache()
+                        .lock()
+                        .map_err(|_| WasmiError::new("fixed tensor session cache poisoned"))?;
+                    prune_fixed_tensor_session_cache_locked(&mut guard);
+                    guard.insert(
+                        cache_key,
+                        FixedTensorSessionEntry {
+                            n_layers,
+                            max_t,
+                            kv_dim,
+                            k_cache: vec![0_i64; total],
+                            v_cache: vec![0_i64; total],
+                            updated_at: now_secs(),
+                        },
+                    );
+                    prune_fixed_tensor_session_cache_locked(&mut guard);
+                    drop(guard);
+                    let key_digest: [u8; 32] = Sha256::digest(raw_key.as_bytes()).into();
+                    let layers_bytes = (n_layers as u64).to_le_bytes();
+                    let tokens_bytes = (max_t as u64).to_le_bytes();
+                    let dimension_bytes = (kv_dim as u64).to_le_bytes();
+                    record_compute_trace(
+                        &mut caller,
+                        "tensor_session_reset_q24",
+                        &[&key_digest, &layers_bytes, &tokens_bytes, &dimension_bytes],
+                    );
+                    Ok(0)
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_session_reset_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_session_append_kv_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 layer_idx: i32,
+                 position: i32,
+                 key_values_ptr: i32,
+                 values_ptr: i32,
+                 n: i32|
+                 -> Result<i32, WasmiError> {
+                    host_tensor_session_append_kv_q24(
+                        &mut caller,
+                        key_ptr,
+                        key_len,
+                        layer_idx,
+                        position,
+                        key_values_ptr,
+                        values_ptr,
+                        n,
+                    )
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_session_append_kv_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_session_attention_kv_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 query_ptr: i32,
+                 output_ptr: i32,
+                 sequence_len: i32,
+                 layer_idx: i32,
+                 query_heads: i32,
+                 kv_heads: i32,
+                 head_dim: i32,
+                 scale: i64|
+                 -> Result<i32, WasmiError> {
+                    host_tensor_session_attention_kv_q24(
+                        &mut caller,
+                        key_ptr,
+                        key_len,
+                        query_ptr,
+                        output_ptr,
+                        sequence_len,
+                        layer_idx,
+                        query_heads,
+                        kv_heads,
+                        head_dim,
+                        scale,
+                    )
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_session_attention_kv_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_load_i8_kv_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 dst_ptr: i32,
+                 key_ptr: i32,
+                 key_len: i32,
+                 off: i32,
+                 n: i32,
+                 scale_bits: i64|
+                 -> Result<i32, WasmiError> {
+                    host_tensor_load_i8_kv_q24(
+                        &mut caller,
+                        dst_ptr,
+                        key_ptr,
+                        key_len,
+                        off,
+                        n,
+                        scale_bits,
+                    )
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_load_i8_kv_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_rmsnorm_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>, addr_ptr: i32, n: i32, gamma_ptr: i32| {
+                    host_tensor_rmsnorm_q24(&mut caller, addr_ptr, n, gamma_ptr)
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_rmsnorm_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_silu_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>, addr_ptr: i32, n: i32| {
+                    host_tensor_silu_q24(&mut caller, addr_ptr, n)
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_silu_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_elemwise_mul_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>, dst_ptr: i32, src_ptr: i32, n: i32| {
+                    host_tensor_elemwise_mul_q24(&mut caller, dst_ptr, src_ptr, n)
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_elemwise_mul_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_residual_add_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>, dst_ptr: i32, src_ptr: i32, n: i32| {
+                    host_tensor_residual_add_q24(&mut caller, dst_ptr, src_ptr, n)
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_residual_add_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_rope_apply_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 addr_ptr: i32,
+                 n_dim: i32,
+                 position: i32,
+                 frequencies_ptr: i32| {
+                    host_tensor_rope_apply_q24(
+                        &mut caller,
+                        addr_ptr,
+                        n_dim,
+                        position,
+                        frequencies_ptr,
+                    )
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_rope_apply_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_linear_i8_kv_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 out_ptr: i32,
+                 in_ptr: i32,
+                 key_ptr: i32,
+                 key_len: i32,
+                 in_dim: i32,
+                 out_dim: i32,
+                 scale_bits: i64| {
+                    host_tensor_linear_i8_kv_q24(
+                        &mut caller,
+                        out_ptr,
+                        in_ptr,
+                        key_ptr,
+                        key_len,
+                        in_dim,
+                        out_dim,
+                        scale_bits,
+                    )
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_linear_i8_kv_q24 failed: {e}"))?;
+    linker
+        .define(
+            "octra",
+            "host_tensor_top1_i8_kv_q24",
+            Func::wrap(
+                &mut *store,
+                |mut caller: Caller<'_, HostState>,
+                 in_ptr: i32,
+                 key_ptr: i32,
+                 key_len: i32,
+                 rows: i32,
+                 cols: i32,
+                 scale_bits: i64,
+                 score_out_ptr: i32| {
+                    host_tensor_top1_i8_kv_q24(
+                        &mut caller,
+                        in_ptr,
+                        key_ptr,
+                        key_len,
+                        rows,
+                        cols,
+                        scale_bits,
+                        score_out_ptr,
+                    )
+                },
+            ),
+        )
+        .map_err(|e| format!("link host_tensor_top1_i8_kv_q24 failed: {e}"))?;
     Ok(())
 }
 
-fn charge_host_fuel(
-    caller: &mut Caller<'_, HostState>,
-    cost: u64,
-) -> Result<(), WasmiError> {
+fn charge_host_fuel(caller: &mut Caller<'_, HostState>, cost: u64) -> Result<(), WasmiError> {
     let remaining = caller
         .get_fuel()
         .map_err(|e| WasmiError::new(format!("wasm fuel read failed: {e}")))?;
@@ -1932,10 +2845,7 @@ fn charge_host_fuel(
         .map_err(|e| WasmiError::new(format!("wasm fuel update failed: {e}")))
 }
 
-fn charge_host_work(
-    caller: &mut Caller<'_, HostState>,
-    units: usize,
-) -> Result<(), WasmiError> {
+fn charge_host_work(caller: &mut Caller<'_, HostState>, units: usize) -> Result<(), WasmiError> {
     charge_host_fuel(caller, u64::try_from(units).unwrap_or(u64::MAX))
 }
 
@@ -1955,7 +2865,7 @@ fn read_guest_bytes(
         return Err(WasmiError::new("negative pointer"));
     }
     let len = len as usize;
-    if len > MAX_GUEST_READ_BYTES {
+    if len > caller.data().max_guest_bytes {
         return Err(WasmiError::new("guest read exceeds cap"));
     }
     charge_host_work(caller, len.saturating_add(64))?;
@@ -1987,7 +2897,7 @@ fn write_guest_bytes(
     if ptr < 0 {
         return Ok(-2);
     }
-    if bytes.len() > MAX_GUEST_WRITE_BYTES {
+    if bytes.len() > caller.data().max_guest_bytes {
         return Err(WasmiError::new("guest write exceeds cap"));
     }
     let memory = caller
@@ -2004,16 +2914,71 @@ fn write_guest_bytes(
 }
 
 fn session_namespaced_key(data: &HostState, raw_key: &str) -> String {
-    format!(
-        "{}|{}|{}",
-        String::from_utf8_lossy(&data.self_bytes),
-        String::from_utf8_lossy(&data.caller_bytes),
-        raw_key
-    )
+    match data.compute_session_scope.as_deref() {
+        Some(scope) => format!(
+            "{}|{}|{}|{}",
+            String::from_utf8_lossy(&data.self_bytes),
+            String::from_utf8_lossy(&data.caller_bytes),
+            scope,
+            raw_key
+        ),
+        None => format!(
+            "{}|{}|{}",
+            String::from_utf8_lossy(&data.self_bytes),
+            String::from_utf8_lossy(&data.caller_bytes),
+            raw_key
+        ),
+    }
+}
+
+fn maintain_compute_session_caches() {
+    prune_session_cache_locked(&mut cache_guard(session_cache()));
+    prune_tensor_session_cache_locked(&mut cache_guard(tensor_session_cache()));
+    prune_fixed_tensor_session_cache_locked(&mut cache_guard(fixed_tensor_session_cache()));
+}
+
+fn compute_session_prefix(data: &HostState) -> Option<String> {
+    data.compute_session_scope.as_deref().map(|scope| {
+        format!(
+            "{}|{}|{}|",
+            String::from_utf8_lossy(&data.self_bytes),
+            String::from_utf8_lossy(&data.caller_bytes),
+            scope
+        )
+    })
+}
+
+fn clear_compute_session_prefix(prefix: &str) -> Result<(), String> {
+    session_cache()
+        .lock()
+        .map_err(|_| "session cache poisoned".to_owned())?
+        .retain(|key, _| !key.starts_with(prefix));
+    let tensor_prefix = format!("tensor|{prefix}");
+    tensor_session_cache()
+        .lock()
+        .map_err(|_| "tensor session cache poisoned".to_owned())?
+        .retain(|key, _| !key.starts_with(&tensor_prefix));
+    let fixed_prefix = format!("tensor_q24|{prefix}");
+    fixed_tensor_session_cache()
+        .lock()
+        .map_err(|_| "fixed tensor session cache poisoned".to_owned())?
+        .retain(|key, _| !key.starts_with(&fixed_prefix));
+    Ok(())
+}
+
+fn clear_compute_session_scope(data: &HostState) -> Result<(), String> {
+    match compute_session_prefix(data) {
+        Some(prefix) => clear_compute_session_prefix(&prefix),
+        None => Ok(()),
+    }
 }
 
 fn tensor_session_namespaced_key(data: &HostState, raw_key: &str) -> String {
     format!("tensor|{}", session_namespaced_key(data, raw_key))
+}
+
+fn fixed_tensor_session_namespaced_key(data: &HostState, raw_key: &str) -> String {
+    format!("tensor_q24|{}", session_namespaced_key(data, raw_key))
 }
 
 fn prune_session_cache_locked(cache: &mut HashMap<String, SessionCacheEntry>) {
@@ -2029,6 +2994,22 @@ fn prune_tensor_session_cache_locked(cache: &mut HashMap<String, TensorSessionEn
     cache.retain(|_, entry| now - entry.updated_at <= TENSOR_SESSION_CACHE_TTL_SECS);
     if cache.len() > TENSOR_SESSION_CACHE_LIMIT {
         cache.clear();
+    }
+}
+
+fn prune_fixed_tensor_session_cache_locked(cache: &mut HashMap<String, FixedTensorSessionEntry>) {
+    let now = now_secs();
+    cache.retain(|_, entry| now - entry.updated_at <= TENSOR_SESSION_CACHE_TTL_SECS);
+    while cache.len() > FIXED_TENSOR_SESSION_CACHE_LIMIT {
+        if let Some(key) = cache
+            .iter()
+            .min_by(|(_, left), (_, right)| left.updated_at.total_cmp(&right.updated_at))
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&key);
+        } else {
+            break;
+        }
     }
 }
 
@@ -2064,9 +3045,8 @@ fn remove_oldest_storage_cache_entry(cache: &mut HashMap<String, StorageCacheEnt
 fn prune_storage_cache_locked(cache: &mut HashMap<String, StorageCacheEntry>) {
     let now = now_secs();
     cache.retain(|_, entry| now - entry.updated_at <= STORAGE_CACHE_TTL_SECS);
-    while
-        cache.len() > STORAGE_CACHE_LIMIT
-            || storage_cache_weight(cache) > STORAGE_CACHE_BYTE_LIMIT
+    while cache.len() > STORAGE_CACHE_LIMIT
+        || storage_cache_weight(cache) > STORAGE_CACHE_BYTE_LIMIT
     {
         remove_oldest_storage_cache_entry(cache);
     }
@@ -2083,10 +3063,9 @@ fn prepare_storage_cache_insert(
         cache.retain(|cached_key, _| cached_key == key || !cached_key.starts_with(&prefix));
     }
     cache.remove(key);
-    while
-        !cache.is_empty()
-            && (cache.len() >= STORAGE_CACHE_LIMIT
-                || storage_cache_weight(cache) + incoming_weight > STORAGE_CACHE_BYTE_LIMIT)
+    while !cache.is_empty()
+        && (cache.len() >= STORAGE_CACHE_LIMIT
+            || storage_cache_weight(cache) + incoming_weight > STORAGE_CACHE_BYTE_LIMIT)
     {
         remove_oldest_storage_cache_entry(cache);
     }
@@ -2099,7 +3078,7 @@ fn read_guest_f64_vec(
 ) -> Result<Vec<f64>, WasmiError> {
     let byte_len = len
         .checked_mul(8)
-        .filter(|value| *value <= MAX_GUEST_READ_BYTES)
+        .filter(|value| *value <= caller.data().max_guest_bytes)
         .ok_or_else(|| WasmiError::new("tensor input exceeds cap"))?;
     let raw = read_guest_bytes(caller, ptr, byte_len as i32)?;
     let mut out = Vec::with_capacity(len);
@@ -2119,13 +3098,66 @@ fn write_guest_f64_vec(
     let byte_len = values
         .len()
         .checked_mul(8)
-        .filter(|value| *value <= MAX_GUEST_READ_BYTES)
+        .filter(|value| *value <= caller.data().max_guest_bytes)
         .ok_or_else(|| WasmiError::new("tensor output exceeds cap"))?;
     let mut raw = Vec::with_capacity(byte_len);
     for value in values {
         raw.extend_from_slice(&value.to_le_bytes());
     }
     write_guest_bytes(caller, ptr, &raw)
+}
+
+fn require_compute_profile(caller: &Caller<'_, HostState>) -> Result<(), WasmiError> {
+    if caller.data().execution_profile == ExecutionProfile::Compute && caller.data().is_view {
+        Ok(())
+    } else {
+        Err(WasmiError::new(
+            "compute tensor import requires compute view",
+        ))
+    }
+}
+
+fn read_guest_i64_vec(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: usize,
+) -> Result<Vec<i64>, WasmiError> {
+    require_compute_profile(caller)?;
+    let byte_len = len
+        .checked_mul(8)
+        .filter(|value| *value <= caller.data().max_guest_bytes)
+        .ok_or_else(|| WasmiError::new("tensor input exceeds cap"))?;
+    let raw = read_guest_bytes(caller, ptr, byte_len as i32)?;
+    Ok(raw
+        .chunks_exact(8)
+        .map(|chunk| {
+            i64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        })
+        .collect())
+}
+
+fn write_guest_i64_vec(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    values: &[i64],
+) -> Result<i32, WasmiError> {
+    require_compute_profile(caller)?;
+    let byte_len = values
+        .len()
+        .checked_mul(8)
+        .filter(|value| *value <= caller.data().max_guest_bytes)
+        .ok_or_else(|| WasmiError::new("tensor output exceeds cap"))?;
+    let mut raw = Vec::with_capacity(byte_len);
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    write_guest_bytes(caller, ptr, &raw)
+}
+
+fn compute_error(error: &'static str) -> WasmiError {
+    WasmiError::new(error)
 }
 
 fn bits_to_fp64(bits: i64) -> f64 {
@@ -2212,7 +3244,9 @@ fn host_tensor_rmsnorm_fp(
     charge_host_work(caller, n.saturating_mul(3))?;
     let mut values = read_guest_f64_vec(caller, addr_ptr, n)?;
     let gamma = read_guest_f64_vec(caller, gamma_ptr, n)?;
-    let sum_sq = values.iter().fold(0.0_f64, |acc, value| acc + (value * value));
+    let sum_sq = values
+        .iter()
+        .fold(0.0_f64, |acc, value| acc + (value * value));
     let inv_rms = 1.0_f64 / ((sum_sq / n as f64) + 1e-5_f64).sqrt();
     for idx in 0..n {
         values[idx] = gamma[idx] * values[idx] * inv_rms;
@@ -2369,11 +3403,20 @@ fn host_tensor_attention_kv_fp(
     n_kv_heads: i32,
     head_dim: i32,
 ) -> Result<i32, WasmiError> {
-    if t_total <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || n_q_heads % n_kv_heads != 0 {
+    if t_total <= 0
+        || n_q_heads <= 0
+        || n_kv_heads <= 0
+        || head_dim <= 0
+        || n_q_heads % n_kv_heads != 0
+    {
         return Ok(-1);
     }
-    let (t_total, n_q_heads, n_kv_heads, head_dim) =
-        (t_total as usize, n_q_heads as usize, n_kv_heads as usize, head_dim as usize);
+    let (t_total, n_q_heads, n_kv_heads, head_dim) = (
+        t_total as usize,
+        n_q_heads as usize,
+        n_kv_heads as usize,
+        head_dim as usize,
+    );
     charge_host_work(
         caller,
         host_work_product(&[t_total, n_q_heads, head_dim, 2])?,
@@ -2567,7 +3610,9 @@ fn host_tensor_linear_i8_kv(
                 out[o] += input_v * signed * scale;
             }
         }
-        out.into_iter().map(|value| value as f64).collect::<Vec<_>>()
+        out.into_iter()
+            .map(|value| value as f64)
+            .collect::<Vec<_>>()
     };
     write_guest_f64_vec(caller, out_ptr, &out)
 }
@@ -2666,6 +3711,449 @@ fn host_tensor_top1_i8_kv(
     Ok(best_idx as i32)
 }
 
+fn host_tensor_load_i8_kv_q24(
+    caller: &mut Caller<'_, HostState>,
+    dst_ptr: i32,
+    key_ptr: i32,
+    key_len: i32,
+    off: i32,
+    n: i32,
+    scale_bits: i64,
+) -> Result<i32, WasmiError> {
+    require_compute_profile(caller)?;
+    if off < 0 || n <= 0 {
+        return Ok(-1);
+    }
+    let key = read_guest_utf8(caller, key_ptr, key_len)?;
+    charge_host_work(caller, n as usize)?;
+    let scale = deterministic_tensor::scale_bits_to_q24(scale_bits).map_err(compute_error)?;
+    let output = {
+        let data = caller.data();
+        let value = match data.storage.get(&key) {
+            Some(value) => value,
+            None => return Ok(-3),
+        };
+        let start = off as usize;
+        let count = n as usize;
+        if start
+            .checked_add(count)
+            .filter(|end| *end <= value.len())
+            .is_none()
+        {
+            return Ok(-1);
+        }
+        deterministic_tensor::load_i8(&value[start..start + count], scale).map_err(compute_error)?
+    };
+    let key_digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    let output_digest = trace_i64_digest(&output);
+    let offset_bytes = off.to_le_bytes();
+    let count_bytes = n.to_le_bytes();
+    let scale_bytes = scale.to_le_bytes();
+    let status = write_guest_i64_vec(caller, dst_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_load_i8_q24",
+        &[
+            &key_digest,
+            &offset_bytes,
+            &count_bytes,
+            &scale_bytes,
+            &output_digest,
+        ],
+    );
+    Ok(status)
+}
+
+fn host_tensor_rmsnorm_q24(
+    caller: &mut Caller<'_, HostState>,
+    addr_ptr: i32,
+    n: i32,
+    gamma_ptr: i32,
+) -> Result<i32, WasmiError> {
+    if n <= 0 {
+        return Ok(-1);
+    }
+    let n = n as usize;
+    charge_host_work(caller, n.saturating_mul(4))?;
+    let values = read_guest_i64_vec(caller, addr_ptr, n)?;
+    let gamma = read_guest_i64_vec(caller, gamma_ptr, n)?;
+    let output = deterministic_tensor::rmsnorm(&values, &gamma).map_err(compute_error)?;
+    let values_digest = trace_i64_digest(&values);
+    let gamma_digest = trace_i64_digest(&gamma);
+    let output_digest = trace_i64_digest(&output);
+    let count_bytes = (n as u64).to_le_bytes();
+    let status = write_guest_i64_vec(caller, addr_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_rmsnorm_q24",
+        &[&count_bytes, &values_digest, &gamma_digest, &output_digest],
+    );
+    Ok(status)
+}
+
+fn host_tensor_silu_q24(
+    caller: &mut Caller<'_, HostState>,
+    addr_ptr: i32,
+    n: i32,
+) -> Result<i32, WasmiError> {
+    if n <= 0 {
+        return Ok(-1);
+    }
+    let n = n as usize;
+    charge_host_work(caller, n.saturating_mul(12))?;
+    let values = read_guest_i64_vec(caller, addr_ptr, n)?;
+    let output = deterministic_tensor::silu(&values).map_err(compute_error)?;
+    let values_digest = trace_i64_digest(&values);
+    let output_digest = trace_i64_digest(&output);
+    let count_bytes = (n as u64).to_le_bytes();
+    let status = write_guest_i64_vec(caller, addr_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_silu_q24",
+        &[&count_bytes, &values_digest, &output_digest],
+    );
+    Ok(status)
+}
+
+fn host_tensor_elemwise_mul_q24(
+    caller: &mut Caller<'_, HostState>,
+    dst_ptr: i32,
+    src_ptr: i32,
+    n: i32,
+) -> Result<i32, WasmiError> {
+    if n <= 0 {
+        return Ok(-1);
+    }
+    let n = n as usize;
+    charge_host_work(caller, n)?;
+    let left = read_guest_i64_vec(caller, dst_ptr, n)?;
+    let right = read_guest_i64_vec(caller, src_ptr, n)?;
+    let output = deterministic_tensor::elementwise_mul(&left, &right).map_err(compute_error)?;
+    let left_digest = trace_i64_digest(&left);
+    let right_digest = trace_i64_digest(&right);
+    let output_digest = trace_i64_digest(&output);
+    let count_bytes = (n as u64).to_le_bytes();
+    let status = write_guest_i64_vec(caller, dst_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_elementwise_mul_q24",
+        &[&count_bytes, &left_digest, &right_digest, &output_digest],
+    );
+    Ok(status)
+}
+
+fn host_tensor_residual_add_q24(
+    caller: &mut Caller<'_, HostState>,
+    dst_ptr: i32,
+    src_ptr: i32,
+    n: i32,
+) -> Result<i32, WasmiError> {
+    if n <= 0 {
+        return Ok(-1);
+    }
+    let n = n as usize;
+    charge_host_work(caller, n)?;
+    let left = read_guest_i64_vec(caller, dst_ptr, n)?;
+    let right = read_guest_i64_vec(caller, src_ptr, n)?;
+    let output = deterministic_tensor::residual_add(&left, &right).map_err(compute_error)?;
+    let left_digest = trace_i64_digest(&left);
+    let right_digest = trace_i64_digest(&right);
+    let output_digest = trace_i64_digest(&output);
+    let count_bytes = (n as u64).to_le_bytes();
+    let status = write_guest_i64_vec(caller, dst_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_residual_add_q24",
+        &[&count_bytes, &left_digest, &right_digest, &output_digest],
+    );
+    Ok(status)
+}
+
+fn host_tensor_rope_apply_q24(
+    caller: &mut Caller<'_, HostState>,
+    addr_ptr: i32,
+    n_dim: i32,
+    position: i32,
+    frequencies_ptr: i32,
+) -> Result<i32, WasmiError> {
+    if n_dim <= 0 || n_dim & 1 != 0 || position < 0 {
+        return Ok(-1);
+    }
+    let n_dim = n_dim as usize;
+    charge_host_work(caller, n_dim.saturating_mul(20))?;
+    let values = read_guest_i64_vec(caller, addr_ptr, n_dim)?;
+    let frequencies = read_guest_i64_vec(caller, frequencies_ptr, n_dim / 2)?;
+    let output = deterministic_tensor::rope(&values, &frequencies, position as i64)
+        .map_err(compute_error)?;
+    let values_digest = trace_i64_digest(&values);
+    let frequencies_digest = trace_i64_digest(&frequencies);
+    let output_digest = trace_i64_digest(&output);
+    let dimension_bytes = (n_dim as u64).to_le_bytes();
+    let position_bytes = position.to_le_bytes();
+    let status = write_guest_i64_vec(caller, addr_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_rope_q24",
+        &[
+            &dimension_bytes,
+            &position_bytes,
+            &values_digest,
+            &frequencies_digest,
+            &output_digest,
+        ],
+    );
+    Ok(status)
+}
+
+fn host_tensor_linear_i8_kv_q24(
+    caller: &mut Caller<'_, HostState>,
+    out_ptr: i32,
+    in_ptr: i32,
+    key_ptr: i32,
+    key_len: i32,
+    in_dim: i32,
+    out_dim: i32,
+    scale_bits: i64,
+) -> Result<i32, WasmiError> {
+    if in_dim <= 0 || out_dim <= 0 {
+        return Ok(-1);
+    }
+    let (in_dim, out_dim) = (in_dim as usize, out_dim as usize);
+    charge_host_work(caller, host_work_product(&[in_dim, out_dim])?)?;
+    let input = read_guest_i64_vec(caller, in_ptr, in_dim)?;
+    let key = read_guest_utf8(caller, key_ptr, key_len)?;
+    let scale = deterministic_tensor::scale_bits_to_q24(scale_bits).map_err(compute_error)?;
+    let output = {
+        let data = caller.data();
+        let weights = match data.storage.get(&key) {
+            Some(value) => value,
+            None => return Ok(-3),
+        };
+        deterministic_tensor::linear_i8(&input, weights, out_dim, scale).map_err(compute_error)?
+    };
+    let key_digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    let input_digest = trace_i64_digest(&input);
+    let output_digest = trace_i64_digest(&output);
+    let input_dimension_bytes = (in_dim as u64).to_le_bytes();
+    let output_dimension_bytes = (out_dim as u64).to_le_bytes();
+    let scale_bytes = scale.to_le_bytes();
+    let status = write_guest_i64_vec(caller, out_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_linear_i8_q24",
+        &[
+            &key_digest,
+            &input_dimension_bytes,
+            &output_dimension_bytes,
+            &scale_bytes,
+            &input_digest,
+            &output_digest,
+        ],
+    );
+    Ok(status)
+}
+
+fn host_tensor_top1_i8_kv_q24(
+    caller: &mut Caller<'_, HostState>,
+    in_ptr: i32,
+    key_ptr: i32,
+    key_len: i32,
+    rows: i32,
+    cols: i32,
+    scale_bits: i64,
+    score_out_ptr: i32,
+) -> Result<i32, WasmiError> {
+    if rows <= 0 || cols <= 0 {
+        return Ok(-1);
+    }
+    let (rows, cols) = (rows as usize, cols as usize);
+    charge_host_work(caller, host_work_product(&[rows, cols])?)?;
+    let input = read_guest_i64_vec(caller, in_ptr, cols)?;
+    let key = read_guest_utf8(caller, key_ptr, key_len)?;
+    let scale = deterministic_tensor::scale_bits_to_q24(scale_bits).map_err(compute_error)?;
+    let (index, score) = {
+        let data = caller.data();
+        let weights = match data.storage.get(&key) {
+            Some(value) => value,
+            None => return Ok(-3),
+        };
+        deterministic_tensor::top1_i8(&input, weights, rows, scale).map_err(compute_error)?
+    };
+    let index = i32::try_from(index).map_err(|_| WasmiError::new("top1 index overflow"))?;
+    write_guest_i64_vec(caller, score_out_ptr, &[score])?;
+    let key_digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    let input_digest = trace_i64_digest(&input);
+    let rows_bytes = (rows as u64).to_le_bytes();
+    let columns_bytes = (cols as u64).to_le_bytes();
+    let scale_bytes = scale.to_le_bytes();
+    let index_bytes = index.to_le_bytes();
+    let score_bytes = score.to_le_bytes();
+    record_compute_trace(
+        caller,
+        "tensor_top1_i8_q24",
+        &[
+            &key_digest,
+            &rows_bytes,
+            &columns_bytes,
+            &scale_bytes,
+            &input_digest,
+            &index_bytes,
+            &score_bytes,
+        ],
+    );
+    Ok(index)
+}
+
+fn host_tensor_session_append_kv_q24(
+    caller: &mut Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    layer_idx: i32,
+    position: i32,
+    key_values_ptr: i32,
+    values_ptr: i32,
+    n: i32,
+) -> Result<i32, WasmiError> {
+    if layer_idx < 0 || position < 0 || n <= 0 {
+        return Ok(-1);
+    }
+    let raw_key = read_guest_utf8(caller, key_ptr, key_len)?;
+    let cache_key = fixed_tensor_session_namespaced_key(caller.data(), &raw_key);
+    charge_host_work(caller, (n as usize).saturating_mul(2))?;
+    let key_values = read_guest_i64_vec(caller, key_values_ptr, n as usize)?;
+    let values = read_guest_i64_vec(caller, values_ptr, n as usize)?;
+    let mut cache = fixed_tensor_session_cache()
+        .lock()
+        .map_err(|_| WasmiError::new("fixed tensor session cache poisoned"))?;
+    prune_fixed_tensor_session_cache_locked(&mut cache);
+    let entry = match cache.get_mut(&cache_key) {
+        Some(entry) => entry,
+        None => return Ok(-3),
+    };
+    let (layer_idx, position, n) = (layer_idx as usize, position as usize, n as usize);
+    if layer_idx >= entry.n_layers || position >= entry.max_t || n != entry.kv_dim {
+        return Ok(-1);
+    }
+    let layer_span = entry.max_t * entry.kv_dim;
+    let offset = layer_idx * layer_span + position * entry.kv_dim;
+    entry.k_cache[offset..offset + entry.kv_dim].copy_from_slice(&key_values);
+    entry.v_cache[offset..offset + entry.kv_dim].copy_from_slice(&values);
+    entry.updated_at = now_secs();
+    drop(cache);
+    let key_digest: [u8; 32] = Sha256::digest(raw_key.as_bytes()).into();
+    let key_values_digest = trace_i64_digest(&key_values);
+    let values_digest = trace_i64_digest(&values);
+    let layer_bytes = (layer_idx as u64).to_le_bytes();
+    let position_bytes = (position as u64).to_le_bytes();
+    let count_bytes = (n as u64).to_le_bytes();
+    record_compute_trace(
+        caller,
+        "tensor_session_append_q24",
+        &[
+            &key_digest,
+            &layer_bytes,
+            &position_bytes,
+            &count_bytes,
+            &key_values_digest,
+            &values_digest,
+        ],
+    );
+    Ok(0)
+}
+
+fn host_tensor_session_attention_kv_q24(
+    caller: &mut Caller<'_, HostState>,
+    key_ptr: i32,
+    key_len: i32,
+    query_ptr: i32,
+    output_ptr: i32,
+    sequence_len: i32,
+    layer_idx: i32,
+    query_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    scale: i64,
+) -> Result<i32, WasmiError> {
+    if sequence_len <= 0
+        || layer_idx < 0
+        || query_heads <= 0
+        || kv_heads <= 0
+        || head_dim <= 0
+        || query_heads % kv_heads != 0
+    {
+        return Ok(-1);
+    }
+    let raw_key = read_guest_utf8(caller, key_ptr, key_len)?;
+    let cache_key = fixed_tensor_session_namespaced_key(caller.data(), &raw_key);
+    let (sequence_len, layer_idx, query_heads, kv_heads, head_dim) = (
+        sequence_len as usize,
+        layer_idx as usize,
+        query_heads as usize,
+        kv_heads as usize,
+        head_dim as usize,
+    );
+    charge_host_work(
+        caller,
+        host_work_product(&[sequence_len, query_heads, head_dim, 3])?,
+    )?;
+    let query = read_guest_i64_vec(caller, query_ptr, query_heads * head_dim)?;
+    let kv_dim = kv_heads * head_dim;
+    let output = {
+        let mut cache = fixed_tensor_session_cache()
+            .lock()
+            .map_err(|_| WasmiError::new("fixed tensor session cache poisoned"))?;
+        prune_fixed_tensor_session_cache_locked(&mut cache);
+        let entry = match cache.get_mut(&cache_key) {
+            Some(entry) => entry,
+            None => return Ok(-3),
+        };
+        if layer_idx >= entry.n_layers || sequence_len > entry.max_t || entry.kv_dim != kv_dim {
+            return Ok(-1);
+        }
+        let layer_span = entry.max_t * entry.kv_dim;
+        let layer_offset = layer_idx * layer_span;
+        let used = sequence_len * entry.kv_dim;
+        entry.updated_at = now_secs();
+        deterministic_tensor::attention_kv(
+            &query,
+            &entry.k_cache[layer_offset..layer_offset + used],
+            &entry.v_cache[layer_offset..layer_offset + used],
+            sequence_len,
+            query_heads,
+            kv_heads,
+            head_dim,
+            scale,
+        )
+        .map_err(compute_error)?
+    };
+    let key_digest: [u8; 32] = Sha256::digest(raw_key.as_bytes()).into();
+    let query_digest = trace_i64_digest(&query);
+    let output_digest = trace_i64_digest(&output);
+    let sequence_bytes = (sequence_len as u64).to_le_bytes();
+    let layer_bytes = (layer_idx as u64).to_le_bytes();
+    let query_heads_bytes = (query_heads as u64).to_le_bytes();
+    let kv_heads_bytes = (kv_heads as u64).to_le_bytes();
+    let head_dimension_bytes = (head_dim as u64).to_le_bytes();
+    let scale_bytes = scale.to_le_bytes();
+    let status = write_guest_i64_vec(caller, output_ptr, &output)?;
+    record_compute_trace(
+        caller,
+        "tensor_session_attention_q24",
+        &[
+            &key_digest,
+            &sequence_bytes,
+            &layer_bytes,
+            &query_heads_bytes,
+            &kv_heads_bytes,
+            &head_dimension_bytes,
+            &scale_bytes,
+            &query_digest,
+            &output_digest,
+        ],
+    );
+    Ok(status)
+}
+
 fn decode_b64(name: &str, value: &str) -> Result<Vec<u8>, String> {
     BASE64
         .decode(value)
@@ -2716,12 +4204,21 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 }
 
 fn normalize_bool_literal(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
+    if value {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 fn validate_int_string(raw: &str, field: &str) -> Result<String, String> {
     let value = raw.trim();
-    if value.is_empty() || !value.chars().enumerate().all(|(idx, ch)| ch.is_ascii_digit() || (idx == 0 && ch == '-')) {
+    if value.is_empty()
+        || !value
+            .chars()
+            .enumerate()
+            .all(|(idx, ch)| ch.is_ascii_digit() || (idx == 0 && ch == '-'))
+    {
         Err(format!("{field} must be an integer string"))
     } else {
         Ok(value.to_owned())
@@ -2735,7 +4232,10 @@ fn parse_string_param(params: &[FrameValue], idx: usize, field: &str) -> Result<
     }
 }
 
-fn parse_optional_string_param(params: &[FrameValue], idx: usize) -> Result<Option<String>, String> {
+fn parse_optional_string_param(
+    params: &[FrameValue],
+    idx: usize,
+) -> Result<Option<String>, String> {
     match params.get(idx) {
         Some(FrameValue::Null) | None => Ok(None),
         Some(FrameValue::String(value)) | Some(FrameValue::Int(value)) => Ok(Some(value.clone())),
@@ -2775,8 +4275,14 @@ fn parse_request_frame(raw: &[u8]) -> Result<RequestFrame, String> {
             0 => FrameValue::Null,
             1 => FrameValue::Bool(false),
             2 => FrameValue::Bool(true),
-            3 => FrameValue::Int(String::from_utf8(payload.to_vec()).map_err(|_| "invalid request utf8".to_owned())?),
-            4 => FrameValue::String(String::from_utf8(payload.to_vec()).map_err(|_| "invalid request utf8".to_owned())?),
+            3 => FrameValue::Int(
+                String::from_utf8(payload.to_vec())
+                    .map_err(|_| "invalid request utf8".to_owned())?,
+            ),
+            4 => FrameValue::String(
+                String::from_utf8(payload.to_vec())
+                    .map_err(|_| "invalid request utf8".to_owned())?,
+            ),
             _ => return Err(format!("unsupported request param tag: {tag}")),
         };
         params.push(value);
@@ -2793,7 +4299,11 @@ fn encode_response_value(value: FrameValue) -> Vec<u8> {
         FrameValue::Bool(false) => (1_u8, Vec::new()),
         FrameValue::Bool(true) => (2_u8, Vec::new()),
         FrameValue::Int(value) | FrameValue::String(value) => {
-            let tag = if matches!(value.parse::<i64>(), Ok(_)) { 3_u8 } else { 4_u8 };
+            let tag = if matches!(value.parse::<i64>(), Ok(_)) {
+                3_u8
+            } else {
+                4_u8
+            };
             (tag, value.into_bytes())
         }
     };
@@ -2899,7 +4409,12 @@ fn storage_get_bool(storage: &BTreeMap<String, Vec<u8>>, key: &str) -> Option<bo
 fn storage_get_int(storage: &BTreeMap<String, Vec<u8>>, key: &str) -> Option<String> {
     let raw = storage_get_utf8(storage, key)?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() || !trimmed.chars().enumerate().all(|(idx, ch)| ch.is_ascii_digit() || (idx == 0 && ch == '-')) {
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .enumerate()
+            .all(|(idx, ch)| ch.is_ascii_digit() || (idx == 0 && ch == '-'))
+    {
         None
     } else {
         Some(trimmed.to_owned())
@@ -3016,68 +4531,118 @@ fn parse_object_member_bundle(bundle: &str) -> Result<Vec<ObjectMemberDelta>, St
         .collect()
 }
 
-fn read_state_descriptor_field(storage: &BTreeMap<String, Vec<u8>>, state_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_state_descriptor_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    state_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
         "state_class" | "codec" | "schema_hash" | "subject_addr" | "hfhe_profile" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &state_descriptor_key(state_ref, field))))
+            Ok(frame_from_option_string(storage_get_utf8(
+                storage,
+                &state_descriptor_key(state_ref, field),
+            )))
         }
-        "mutable_state" => Ok(frame_from_option_bool(storage_get_bool(storage, &state_descriptor_key(state_ref, field)))),
+        "mutable_state" => Ok(frame_from_option_bool(storage_get_bool(
+            storage,
+            &state_descriptor_key(state_ref, field),
+        ))),
         _ => Err(format!("unsupported state descriptor field: {field}")),
     }
 }
 
-fn read_state_policy_field(storage: &BTreeMap<String, Vec<u8>>, state_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_state_policy_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    state_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
-        "delivery_key_id" => Ok(frame_from_option_string(storage_get_utf8(storage, &state_policy_key(state_ref, field)))),
-        "activate_after_epoch" | "expire_after_epoch" => {
-            Ok(frame_from_option_int_string(storage_get_int(storage, &state_policy_key(state_ref, field))))
-        }
-        "tombstone" | "revoked" => {
-            Ok(frame_from_option_bool(storage_get_bool(storage, &state_policy_key(state_ref, field))))
-        }
+        "delivery_key_id" => Ok(frame_from_option_string(storage_get_utf8(
+            storage,
+            &state_policy_key(state_ref, field),
+        ))),
+        "activate_after_epoch" | "expire_after_epoch" => Ok(frame_from_option_int_string(
+            storage_get_int(storage, &state_policy_key(state_ref, field)),
+        )),
+        "tombstone" | "revoked" => Ok(frame_from_option_bool(storage_get_bool(
+            storage,
+            &state_policy_key(state_ref, field),
+        ))),
         _ => Err(format!("unsupported state policy field: {field}")),
     }
 }
 
-fn read_balance_cell_field(storage: &BTreeMap<String, Vec<u8>>, state_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_balance_cell_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    state_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
         "ciphertext_commitment" | "amount_commitment" | "proof_kind" | "proof_receipt_hash" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &balance_cell_key(state_ref, field))))
+            Ok(frame_from_option_string(storage_get_utf8(
+                storage,
+                &balance_cell_key(state_ref, field),
+            )))
         }
         _ => Err(format!("unsupported balance cell field: {field}")),
     }
 }
 
-fn read_register_cell_field(storage: &BTreeMap<String, Vec<u8>>, state_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_register_cell_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    state_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
         "ciphertext_commitment" | "proof_kind" | "proof_receipt_hash" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &register_cell_key(state_ref, field))))
+            Ok(frame_from_option_string(storage_get_utf8(
+                storage,
+                &register_cell_key(state_ref, field),
+            )))
         }
         _ => Err(format!("unsupported register cell field: {field}")),
     }
 }
 
-fn read_balance_binding_field(storage: &BTreeMap<String, Vec<u8>>, subject_addr: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_balance_binding_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    subject_addr: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
-        "current_state_ref" | "status" | "last_workflow_ref" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &balance_binding_key(subject_addr, field))))
-        }
-        "version" => Ok(frame_from_option_int_string(storage_get_int(storage, &balance_binding_key(subject_addr, field)))),
+        "current_state_ref" | "status" | "last_workflow_ref" => Ok(frame_from_option_string(
+            storage_get_utf8(storage, &balance_binding_key(subject_addr, field)),
+        )),
+        "version" => Ok(frame_from_option_int_string(storage_get_int(
+            storage,
+            &balance_binding_key(subject_addr, field),
+        ))),
         _ => Err(format!("unsupported balance binding field: {field}")),
     }
 }
 
-fn read_register_binding_field(storage: &BTreeMap<String, Vec<u8>>, register_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_register_binding_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    register_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
-        "current_state_ref" | "status" | "last_workflow_ref" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &register_binding_key(register_ref, field))))
-        }
-        "version" => Ok(frame_from_option_int_string(storage_get_int(storage, &register_binding_key(register_ref, field)))),
+        "current_state_ref" | "status" | "last_workflow_ref" => Ok(frame_from_option_string(
+            storage_get_utf8(storage, &register_binding_key(register_ref, field)),
+        )),
+        "version" => Ok(frame_from_option_int_string(storage_get_int(
+            storage,
+            &register_binding_key(register_ref, field),
+        ))),
         _ => Err(format!("unsupported register binding field: {field}")),
     }
 }
 
-fn read_balance_workflow_field(storage: &BTreeMap<String, Vec<u8>>, workflow_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_balance_workflow_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    workflow_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
         "flow_kind"
         | "debit_subject_addr"
@@ -3088,79 +4653,126 @@ fn read_balance_workflow_field(storage: &BTreeMap<String, Vec<u8>>, workflow_ref
         | "proof_kind"
         | "proof_receipt_hash"
         | "status"
-        | "intent_id" => Ok(frame_from_option_string(storage_get_utf8(storage, &balance_workflow_key(workflow_ref, field)))),
+        | "intent_id" => Ok(frame_from_option_string(storage_get_utf8(
+            storage,
+            &balance_workflow_key(workflow_ref, field),
+        ))),
         _ => Err(format!("unsupported balance workflow field: {field}")),
     }
 }
 
-fn read_register_workflow_field(storage: &BTreeMap<String, Vec<u8>>, workflow_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_register_workflow_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    workflow_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
-        "register_ref"
-        | "previous_state_ref"
-        | "next_state_ref"
-        | "workflow_kind"
-        | "proof_kind"
-        | "proof_receipt_hash"
-        | "status"
-        | "intent_id" => Ok(frame_from_option_string(storage_get_utf8(storage, &register_workflow_key(workflow_ref, field)))),
+        "register_ref" | "previous_state_ref" | "next_state_ref" | "workflow_kind"
+        | "proof_kind" | "proof_receipt_hash" | "status" | "intent_id" => {
+            Ok(frame_from_option_string(storage_get_utf8(
+                storage,
+                &register_workflow_key(workflow_ref, field),
+            )))
+        }
         _ => Err(format!("unsupported register workflow field: {field}")),
     }
 }
 
-fn read_object_binding_field(storage: &BTreeMap<String, Vec<u8>>, object_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_object_binding_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    object_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
-        "current_state_ref" | "status" | "last_transition_ref" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &object_binding_key(object_ref, field))))
-        }
-        "version" => Ok(frame_from_option_int_string(storage_get_int(storage, &object_binding_key(object_ref, field)))),
+        "current_state_ref" | "status" | "last_transition_ref" => Ok(frame_from_option_string(
+            storage_get_utf8(storage, &object_binding_key(object_ref, field)),
+        )),
+        "version" => Ok(frame_from_option_int_string(storage_get_int(
+            storage,
+            &object_binding_key(object_ref, field),
+        ))),
         _ => Err(format!("unsupported object binding field: {field}")),
     }
 }
 
-fn read_object_member_field(storage: &BTreeMap<String, Vec<u8>>, object_ref: &str, member_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_object_member_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    object_ref: &str,
+    member_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
         "state_ref" | "member_kind" | "state_class" | "codec" | "status" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &object_member_key(object_ref, member_ref, field))))
+            Ok(frame_from_option_string(storage_get_utf8(
+                storage,
+                &object_member_key(object_ref, member_ref, field),
+            )))
         }
         _ => Err(format!("unsupported object member field: {field}")),
     }
 }
 
-fn read_object_policy_field(storage: &BTreeMap<String, Vec<u8>>, object_ref: &str, field: &str) -> Result<Vec<u8>, String> {
+fn read_object_policy_field(
+    storage: &BTreeMap<String, Vec<u8>>,
+    object_ref: &str,
+    field: &str,
+) -> Result<Vec<u8>, String> {
     match field {
         "delivery_key_id" | "transition_mode" | "required_proof_kind" => {
-            Ok(frame_from_option_string(storage_get_utf8(storage, &object_policy_key(object_ref, field))))
+            Ok(frame_from_option_string(storage_get_utf8(
+                storage,
+                &object_policy_key(object_ref, field),
+            )))
         }
         "activate_after_epoch" | "expire_after_epoch" | "member_quorum" => {
-            Ok(frame_from_option_int_string(storage_get_int(storage, &object_policy_key(object_ref, field))))
+            Ok(frame_from_option_int_string(storage_get_int(
+                storage,
+                &object_policy_key(object_ref, field),
+            )))
         }
         "tombstone" | "revoked" | "allow_detach" | "allow_root_state_rotation" => {
-            Ok(frame_from_option_bool(storage_get_bool(storage, &object_policy_key(object_ref, field))))
+            Ok(frame_from_option_bool(storage_get_bool(
+                storage,
+                &object_policy_key(object_ref, field),
+            )))
         }
         _ => Err(format!("unsupported object policy field: {field}")),
     }
 }
 
-fn encrypted_asset_locator(kind: &str, value: &str) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+fn encrypted_asset_locator(
+    kind: &str,
+    value: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>), String> {
     let locator_kind = normalize_non_empty(kind, "locator_kind")?;
     let locator_value = normalize_non_empty(value, "locator_value")?;
     if locator_kind == "path" {
         return Ok((Some(locator_value), None, None));
     }
     if locator_kind == "slot" {
-        return Ok((None, Some(normalize_hex64(&locator_value, "slot_ref")?), None));
+        return Ok((
+            None,
+            Some(normalize_hex64(&locator_value, "slot_ref")?),
+            None,
+        ));
     }
     if locator_kind == "state" {
-        return Ok((None, None, Some(normalize_hex64(&locator_value, "state_ref")?)));
+        return Ok((
+            None,
+            None,
+            Some(normalize_hex64(&locator_value, "state_ref")?),
+        ));
     }
     Err("locator_kind must be path, slot, or state".to_owned())
 }
 
-fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn execute_circle_invoke(
+    caller: &mut Caller<'_, HostState>,
+    req_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
     let request = parse_request_frame(req_bytes)?;
     let params = request.params;
-    if request.method == "circle_public_asset_meta"
-        || request.method == "circle_public_asset_read"
+    if request.method == "circle_public_asset_meta" || request.method == "circle_public_asset_read"
     {
         let circle_id = parse_string_param(&params, 0, "circle_id")?;
         let canonical_path = parse_string_param(&params, 1, "canonical_path")?;
@@ -3198,13 +4810,17 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
         if caller.data().spawns.len() >= 4 {
             return Err("circle spawn cap exceeded".to_owned());
         }
-        let payload_json = normalize_non_empty(&parse_string_param(&params, 0, "payload_json")?, "payload_json")?;
+        let payload_json = normalize_non_empty(
+            &parse_string_param(&params, 0, "payload_json")?,
+            "payload_json",
+        )?;
         if payload_json.len() > MAX_SPAWN_PAYLOAD_JSON_BYTES {
             return Err("circle spawn payload exceeds max size".to_owned());
         }
         serde_json::from_str::<JsonValue>(&payload_json)
             .map_err(|e| format!("invalid circle spawn payload json: {e}"))?;
-        let owner_mode = normalize_non_empty(&parse_string_param(&params, 1, "owner_mode")?, "owner_mode")?;
+        let owner_mode =
+            normalize_non_empty(&parse_string_param(&params, 1, "owner_mode")?, "owner_mode")?;
         if owner_mode != "caller" && owner_mode != "parent" {
             return Err("owner_mode must be caller or parent".to_owned());
         }
@@ -3225,10 +4841,15 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
         if caller.data().assets.len() + caller.data().encrypted_assets.len() >= 4 {
             return Err("circle asset effect cap exceeded".to_owned());
         }
-        let circle_id = normalize_non_empty(&parse_string_param(&params, 0, "circle_id")?, "circle_id")?;
+        let circle_id =
+            normalize_non_empty(&parse_string_param(&params, 0, "circle_id")?, "circle_id")?;
         let path = normalize_non_empty(&parse_string_param(&params, 1, "path")?, "path")?;
-        let content_type = normalize_non_empty(&parse_string_param(&params, 2, "content_type")?, "content_type")?;
-        let body_b64 = normalize_non_empty(&parse_string_param(&params, 3, "body_b64")?, "body_b64")?;
+        let content_type = normalize_non_empty(
+            &parse_string_param(&params, 2, "content_type")?,
+            "content_type",
+        )?;
+        let body_b64 =
+            normalize_non_empty(&parse_string_param(&params, 3, "body_b64")?, "body_b64")?;
         let encoding = normalize_optional_string(parse_optional_string_param(&params, 4)?);
         if body_b64.len() > MAX_ASSET_EFFECT_BODY_B64_BYTES {
             return Err("circle asset effect body exceeds max encoded size".to_owned());
@@ -3249,12 +4870,22 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
         if caller.data().assets.len() + caller.data().encrypted_assets.len() >= 4 {
             return Err("circle asset effect cap exceeded".to_owned());
         }
-        let circle_id = normalize_non_empty(&parse_string_param(&params, 0, "circle_id")?, "circle_id")?;
+        let circle_id =
+            normalize_non_empty(&parse_string_param(&params, 0, "circle_id")?, "circle_id")?;
         let path = normalize_non_empty(&parse_string_param(&params, 1, "path")?, "path")?;
-        let content_type = normalize_non_empty(&parse_string_param(&params, 2, "content_type")?, "content_type")?;
-        let ciphertext_b64 = normalize_non_empty(&parse_string_param(&params, 3, "ciphertext_b64")?, "ciphertext_b64")?;
+        let content_type = normalize_non_empty(
+            &parse_string_param(&params, 2, "content_type")?,
+            "content_type",
+        )?;
+        let ciphertext_b64 = normalize_non_empty(
+            &parse_string_param(&params, 3, "ciphertext_b64")?,
+            "ciphertext_b64",
+        )?;
         let key_id = normalize_non_empty(&parse_string_param(&params, 4, "key_id")?, "key_id")?;
-        let plaintext_hash = normalize_hex64(&parse_string_param(&params, 5, "plaintext_hash")?, "plaintext_hash")?;
+        let plaintext_hash = normalize_hex64(
+            &parse_string_param(&params, 5, "plaintext_hash")?,
+            "plaintext_hash",
+        )?;
         let encoding = normalize_optional_string(parse_optional_string_param(&params, 6)?);
         let padding_class = normalize_optional_string(parse_optional_string_param(&params, 7)?);
         let activate_after_epoch =
@@ -3278,21 +4909,24 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
         {
             return Err("metadata_mode must be reveal or opaque".to_owned());
         }
-        caller.data_mut().encrypted_assets.push(EncryptedAssetPutJson {
-            circle_id,
-            path: Some(path),
-            slot_ref: None,
-            state_ref: None,
-            content_type,
-            encoding,
-            key_id,
-            plaintext_hash,
-            padding_class,
-            activate_after_epoch,
-            expire_after_epoch,
-            metadata_mode,
-            ciphertext_b64,
-        });
+        caller
+            .data_mut()
+            .encrypted_assets
+            .push(EncryptedAssetPutJson {
+                circle_id,
+                path: Some(path),
+                slot_ref: None,
+                state_ref: None,
+                content_type,
+                encoding,
+                key_id,
+                plaintext_hash,
+                padding_class,
+                activate_after_epoch,
+                expire_after_epoch,
+                metadata_mode,
+                ciphertext_b64,
+            });
         return Ok(frame_bool(true));
     }
     if request.method == "circle_asset_put_encrypted_at" {
@@ -3302,13 +4936,25 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
         if caller.data().assets.len() + caller.data().encrypted_assets.len() >= 4 {
             return Err("circle asset effect cap exceeded".to_owned());
         }
-        let circle_id = normalize_non_empty(&parse_string_param(&params, 0, "circle_id")?, "circle_id")?;
-        let (path, slot_ref, state_ref) =
-            encrypted_asset_locator(&parse_string_param(&params, 1, "locator_kind")?, &parse_string_param(&params, 2, "locator_value")?)?;
-        let content_type = normalize_non_empty(&parse_string_param(&params, 3, "content_type")?, "content_type")?;
-        let ciphertext_b64 = normalize_non_empty(&parse_string_param(&params, 4, "ciphertext_b64")?, "ciphertext_b64")?;
+        let circle_id =
+            normalize_non_empty(&parse_string_param(&params, 0, "circle_id")?, "circle_id")?;
+        let (path, slot_ref, state_ref) = encrypted_asset_locator(
+            &parse_string_param(&params, 1, "locator_kind")?,
+            &parse_string_param(&params, 2, "locator_value")?,
+        )?;
+        let content_type = normalize_non_empty(
+            &parse_string_param(&params, 3, "content_type")?,
+            "content_type",
+        )?;
+        let ciphertext_b64 = normalize_non_empty(
+            &parse_string_param(&params, 4, "ciphertext_b64")?,
+            "ciphertext_b64",
+        )?;
         let key_id = normalize_non_empty(&parse_string_param(&params, 5, "key_id")?, "key_id")?;
-        let plaintext_hash = normalize_hex64(&parse_string_param(&params, 6, "plaintext_hash")?, "plaintext_hash")?;
+        let plaintext_hash = normalize_hex64(
+            &parse_string_param(&params, 6, "plaintext_hash")?,
+            "plaintext_hash",
+        )?;
         let encoding = normalize_optional_string(parse_optional_string_param(&params, 7)?);
         let padding_class = normalize_optional_string(parse_optional_string_param(&params, 8)?);
         let activate_after_epoch =
@@ -3332,55 +4978,100 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
         {
             return Err("metadata_mode must be reveal or opaque".to_owned());
         }
-        caller.data_mut().encrypted_assets.push(EncryptedAssetPutJson {
-            circle_id,
-            path,
-            slot_ref,
-            state_ref,
-            content_type,
-            encoding,
-            key_id,
-            plaintext_hash,
-            padding_class,
-            activate_after_epoch,
-            expire_after_epoch,
-            metadata_mode,
-            ciphertext_b64,
-        });
+        caller
+            .data_mut()
+            .encrypted_assets
+            .push(EncryptedAssetPutJson {
+                circle_id,
+                path,
+                slot_ref,
+                state_ref,
+                content_type,
+                encoding,
+                key_id,
+                plaintext_hash,
+                padding_class,
+                activate_after_epoch,
+                expire_after_epoch,
+                metadata_mode,
+                ciphertext_b64,
+            });
         return Ok(frame_bool(true));
     }
     let storage = Arc::make_mut(&mut caller.data_mut().storage);
     match request.method.as_str() {
         "state_describe" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
-            let state_class = normalize_non_empty(&parse_string_param(&params, 1, "state_class")?, "state_class")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_class = normalize_non_empty(
+                &parse_string_param(&params, 1, "state_class")?,
+                "state_class",
+            )?;
             let codec = normalize_non_empty(&parse_string_param(&params, 2, "codec")?, "codec")?;
             let schema_hash = normalize_optional_string(parse_optional_string_param(&params, 3)?);
             let subject_addr = normalize_optional_string(parse_optional_string_param(&params, 4)?);
-            let hfhe_profile = normalize_non_empty(&parse_string_param(&params, 5, "hfhe_profile")?, "hfhe_profile")?;
+            let hfhe_profile = normalize_non_empty(
+                &parse_string_param(&params, 5, "hfhe_profile")?,
+                "hfhe_profile",
+            )?;
             let mutable_state = parse_bool_param(&params, 6, "mutable_state")?;
-            storage_set_utf8(storage, state_descriptor_key(&state_ref, "state_class"), state_class);
+            storage_set_utf8(
+                storage,
+                state_descriptor_key(&state_ref, "state_class"),
+                state_class,
+            );
             storage_set_utf8(storage, state_descriptor_key(&state_ref, "codec"), codec);
-            storage_set_optional_utf8(storage, state_descriptor_key(&state_ref, "schema_hash"), schema_hash);
-            storage_set_optional_utf8(storage, state_descriptor_key(&state_ref, "subject_addr"), subject_addr);
-            storage_set_utf8(storage, state_descriptor_key(&state_ref, "hfhe_profile"), hfhe_profile);
-            storage_set_bool(storage, state_descriptor_key(&state_ref, "mutable_state"), mutable_state);
+            storage_set_optional_utf8(
+                storage,
+                state_descriptor_key(&state_ref, "schema_hash"),
+                schema_hash,
+            );
+            storage_set_optional_utf8(
+                storage,
+                state_descriptor_key(&state_ref, "subject_addr"),
+                subject_addr,
+            );
+            storage_set_utf8(
+                storage,
+                state_descriptor_key(&state_ref, "hfhe_profile"),
+                hfhe_profile,
+            );
+            storage_set_bool(
+                storage,
+                state_descriptor_key(&state_ref, "mutable_state"),
+                mutable_state,
+            );
             Ok(frame_bool(true))
         }
         "state_publish" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
-            let delivery_key_id = normalize_optional_string(parse_optional_string_param(&params, 1)?);
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let delivery_key_id =
+                normalize_optional_string(parse_optional_string_param(&params, 1)?);
             let activate_after = parse_int_param(&params, 2, "activate_after_epoch")?;
             let expire_after = parse_int_param(&params, 3, "expire_after_epoch")?;
-            storage_set_optional_utf8(storage, state_policy_key(&state_ref, "delivery_key_id"), delivery_key_id);
-            storage_set_int(storage, state_policy_key(&state_ref, "activate_after_epoch"), activate_after);
-            storage_set_int(storage, state_policy_key(&state_ref, "expire_after_epoch"), expire_after);
+            storage_set_optional_utf8(
+                storage,
+                state_policy_key(&state_ref, "delivery_key_id"),
+                delivery_key_id,
+            );
+            storage_set_int(
+                storage,
+                state_policy_key(&state_ref, "activate_after_epoch"),
+                activate_after,
+            );
+            storage_set_int(
+                storage,
+                state_policy_key(&state_ref, "expire_after_epoch"),
+                expire_after,
+            );
             storage_set_bool(storage, state_policy_key(&state_ref, "tombstone"), false);
             storage_set_bool(storage, state_policy_key(&state_ref, "revoked"), false);
             Ok(frame_bool(true))
         }
         "state_release" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             storage.remove(&state_policy_key(&state_ref, "activate_after_epoch"));
             storage.remove(&state_policy_key(&state_ref, "expire_after_epoch"));
             storage_set_bool(storage, state_policy_key(&state_ref, "tombstone"), false);
@@ -3388,178 +5079,381 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
             Ok(frame_bool(true))
         }
         "state_retire" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             let expire_after = parse_int_param(&params, 1, "expire_after_epoch")?;
-            storage_set_int(storage, state_policy_key(&state_ref, "expire_after_epoch"), expire_after);
+            storage_set_int(
+                storage,
+                state_policy_key(&state_ref, "expire_after_epoch"),
+                expire_after,
+            );
             Ok(frame_bool(true))
         }
         "state_tombstone_apply" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             storage_set_bool(storage, state_policy_key(&state_ref, "tombstone"), true);
             Ok(frame_bool(true))
         }
         "state_restore" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             storage_set_bool(storage, state_policy_key(&state_ref, "tombstone"), false);
             Ok(frame_bool(true))
         }
         "state_revoke_apply" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             storage_set_bool(storage, state_policy_key(&state_ref, "revoked"), true);
             Ok(frame_bool(true))
         }
         "state_reinstate" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             storage_set_bool(storage, state_policy_key(&state_ref, "revoked"), false);
             Ok(frame_bool(true))
         }
         "state_descriptor_get" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_state_descriptor_field(storage, &state_ref, &field)
         }
         "state_policy_get" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_state_policy_field(storage, &state_ref, &field)
         }
         "balance_cell_materialize" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
-            storage_set_utf8(storage, balance_cell_key(&state_ref, "ciphertext_commitment"), normalize_non_empty(&parse_string_param(&params, 1, "ciphertext_commitment")?, "ciphertext_commitment")?);
-            storage_set_utf8(storage, balance_cell_key(&state_ref, "amount_commitment"), normalize_non_empty(&parse_string_param(&params, 2, "amount_commitment")?, "amount_commitment")?);
-            storage_set_utf8(storage, balance_cell_key(&state_ref, "proof_kind"), normalize_non_empty(&parse_string_param(&params, 3, "proof_kind")?, "proof_kind")?);
-            storage_set_optional_utf8(storage, balance_cell_key(&state_ref, "proof_receipt_hash"), normalize_optional_hex64(parse_optional_string_param(&params, 4)?, "proof_receipt_hash")?);
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            storage_set_utf8(
+                storage,
+                balance_cell_key(&state_ref, "ciphertext_commitment"),
+                normalize_non_empty(
+                    &parse_string_param(&params, 1, "ciphertext_commitment")?,
+                    "ciphertext_commitment",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                balance_cell_key(&state_ref, "amount_commitment"),
+                normalize_non_empty(
+                    &parse_string_param(&params, 2, "amount_commitment")?,
+                    "amount_commitment",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                balance_cell_key(&state_ref, "proof_kind"),
+                normalize_non_empty(&parse_string_param(&params, 3, "proof_kind")?, "proof_kind")?,
+            );
+            storage_set_optional_utf8(
+                storage,
+                balance_cell_key(&state_ref, "proof_receipt_hash"),
+                normalize_optional_hex64(
+                    parse_optional_string_param(&params, 4)?,
+                    "proof_receipt_hash",
+                )?,
+            );
             Ok(frame_bool(true))
         }
         "balance_cell_get" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_balance_cell_field(storage, &state_ref, &field)
         }
         "register_cell_materialize" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
-            storage_set_utf8(storage, register_cell_key(&state_ref, "ciphertext_commitment"), normalize_non_empty(&parse_string_param(&params, 1, "ciphertext_commitment")?, "ciphertext_commitment")?);
-            storage_set_utf8(storage, register_cell_key(&state_ref, "proof_kind"), normalize_non_empty(&parse_string_param(&params, 2, "proof_kind")?, "proof_kind")?);
-            storage_set_optional_utf8(storage, register_cell_key(&state_ref, "proof_receipt_hash"), normalize_optional_hex64(parse_optional_string_param(&params, 3)?, "proof_receipt_hash")?);
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            storage_set_utf8(
+                storage,
+                register_cell_key(&state_ref, "ciphertext_commitment"),
+                normalize_non_empty(
+                    &parse_string_param(&params, 1, "ciphertext_commitment")?,
+                    "ciphertext_commitment",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                register_cell_key(&state_ref, "proof_kind"),
+                normalize_non_empty(&parse_string_param(&params, 2, "proof_kind")?, "proof_kind")?,
+            );
+            storage_set_optional_utf8(
+                storage,
+                register_cell_key(&state_ref, "proof_receipt_hash"),
+                normalize_optional_hex64(
+                    parse_optional_string_param(&params, 3)?,
+                    "proof_receipt_hash",
+                )?,
+            );
             Ok(frame_bool(true))
         }
         "register_cell_get" => {
-            let state_ref = normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "state_ref")?, "state_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_register_cell_field(storage, &state_ref, &field)
         }
         "balance_binding_bind" => {
-            let subject_addr = normalize_non_empty(&parse_string_param(&params, 0, "subject_addr")?, "subject_addr")?;
-            let state_ref = normalize_hex64(&parse_string_param(&params, 1, "state_ref")?, "state_ref")?;
-            let workflow_ref = normalize_hex64(&parse_string_param(&params, 2, "workflow_ref")?, "workflow_ref")?;
+            let subject_addr = normalize_non_empty(
+                &parse_string_param(&params, 0, "subject_addr")?,
+                "subject_addr",
+            )?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 1, "state_ref")?, "state_ref")?;
+            let workflow_ref = normalize_hex64(
+                &parse_string_param(&params, 2, "workflow_ref")?,
+                "workflow_ref",
+            )?;
             let status = normalize_non_empty(&parse_string_param(&params, 3, "status")?, "status")?;
-            storage_set_utf8(storage, balance_binding_key(&subject_addr, "current_state_ref"), state_ref);
-            let version = increment_stored_version(storage, &balance_binding_key(&subject_addr, "version"));
-            storage_set_utf8(storage, balance_binding_key(&subject_addr, "status"), status);
-            storage_set_utf8(storage, balance_binding_key(&subject_addr, "last_workflow_ref"), workflow_ref);
+            storage_set_utf8(
+                storage,
+                balance_binding_key(&subject_addr, "current_state_ref"),
+                state_ref,
+            );
+            let version =
+                increment_stored_version(storage, &balance_binding_key(&subject_addr, "version"));
+            storage_set_utf8(
+                storage,
+                balance_binding_key(&subject_addr, "status"),
+                status,
+            );
+            storage_set_utf8(
+                storage,
+                balance_binding_key(&subject_addr, "last_workflow_ref"),
+                workflow_ref,
+            );
             Ok(frame_int(version))
         }
         "balance_binding_get" => {
-            let subject_addr = normalize_non_empty(&parse_string_param(&params, 0, "subject_addr")?, "subject_addr")?;
+            let subject_addr = normalize_non_empty(
+                &parse_string_param(&params, 0, "subject_addr")?,
+                "subject_addr",
+            )?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_balance_binding_field(storage, &subject_addr, &field)
         }
         "register_binding_bind" => {
-            let register_ref = normalize_hex64(&parse_string_param(&params, 0, "register_ref")?, "register_ref")?;
-            let state_ref = normalize_hex64(&parse_string_param(&params, 1, "state_ref")?, "state_ref")?;
-            let workflow_ref = normalize_hex64(&parse_string_param(&params, 2, "workflow_ref")?, "workflow_ref")?;
+            let register_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "register_ref")?,
+                "register_ref",
+            )?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 1, "state_ref")?, "state_ref")?;
+            let workflow_ref = normalize_hex64(
+                &parse_string_param(&params, 2, "workflow_ref")?,
+                "workflow_ref",
+            )?;
             let status = normalize_non_empty(&parse_string_param(&params, 3, "status")?, "status")?;
-            storage_set_utf8(storage, register_binding_key(&register_ref, "current_state_ref"), state_ref);
-            let version = increment_stored_version(storage, &register_binding_key(&register_ref, "version"));
-            storage_set_utf8(storage, register_binding_key(&register_ref, "status"), status);
-            storage_set_utf8(storage, register_binding_key(&register_ref, "last_workflow_ref"), workflow_ref);
+            storage_set_utf8(
+                storage,
+                register_binding_key(&register_ref, "current_state_ref"),
+                state_ref,
+            );
+            let version =
+                increment_stored_version(storage, &register_binding_key(&register_ref, "version"));
+            storage_set_utf8(
+                storage,
+                register_binding_key(&register_ref, "status"),
+                status,
+            );
+            storage_set_utf8(
+                storage,
+                register_binding_key(&register_ref, "last_workflow_ref"),
+                workflow_ref,
+            );
             Ok(frame_int(version))
         }
         "register_binding_get" => {
-            let register_ref = normalize_hex64(&parse_string_param(&params, 0, "register_ref")?, "register_ref")?;
+            let register_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "register_ref")?,
+                "register_ref",
+            )?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_register_binding_field(storage, &register_ref, &field)
         }
         "balance_workflow_record" => {
-            let workflow_ref = normalize_hex64(&parse_string_param(&params, 0, "workflow_ref")?, "workflow_ref")?;
+            let workflow_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "workflow_ref")?,
+                "workflow_ref",
+            )?;
             let fields = [
                 ("flow_kind", parse_string_param(&params, 1, "flow_kind")?),
-                ("debit_subject_addr", parse_string_param(&params, 2, "debit_subject_addr")?),
-                ("credit_subject_addr", parse_string_param(&params, 3, "credit_subject_addr")?),
-                ("debit_state_ref", parse_string_param(&params, 4, "debit_state_ref")?),
-                ("credit_state_ref", parse_string_param(&params, 5, "credit_state_ref")?),
-                ("amount_commitment", parse_string_param(&params, 6, "amount_commitment")?),
+                (
+                    "debit_subject_addr",
+                    parse_string_param(&params, 2, "debit_subject_addr")?,
+                ),
+                (
+                    "credit_subject_addr",
+                    parse_string_param(&params, 3, "credit_subject_addr")?,
+                ),
+                (
+                    "debit_state_ref",
+                    parse_string_param(&params, 4, "debit_state_ref")?,
+                ),
+                (
+                    "credit_state_ref",
+                    parse_string_param(&params, 5, "credit_state_ref")?,
+                ),
+                (
+                    "amount_commitment",
+                    parse_string_param(&params, 6, "amount_commitment")?,
+                ),
                 ("proof_kind", parse_string_param(&params, 7, "proof_kind")?),
-                ("proof_receipt_hash", parse_string_param(&params, 8, "proof_receipt_hash")?),
+                (
+                    "proof_receipt_hash",
+                    parse_string_param(&params, 8, "proof_receipt_hash")?,
+                ),
                 ("status", parse_string_param(&params, 9, "status")?),
                 ("intent_id", parse_string_param(&params, 10, "intent_id")?),
             ];
             for (suffix, value) in fields {
-                storage_set_utf8(storage, balance_workflow_key(&workflow_ref, suffix), normalize_non_empty(&value, suffix)?);
+                storage_set_utf8(
+                    storage,
+                    balance_workflow_key(&workflow_ref, suffix),
+                    normalize_non_empty(&value, suffix)?,
+                );
             }
             Ok(frame_bool(true))
         }
         "balance_workflow_get" => {
-            let workflow_ref = normalize_hex64(&parse_string_param(&params, 0, "workflow_ref")?, "workflow_ref")?;
+            let workflow_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "workflow_ref")?,
+                "workflow_ref",
+            )?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_balance_workflow_field(storage, &workflow_ref, &field)
         }
         "register_workflow_record" => {
-            let workflow_ref = normalize_hex64(&parse_string_param(&params, 0, "workflow_ref")?, "workflow_ref")?;
+            let workflow_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "workflow_ref")?,
+                "workflow_ref",
+            )?;
             let fields = [
-                ("register_ref", parse_string_param(&params, 1, "register_ref")?),
-                ("previous_state_ref", parse_string_param(&params, 2, "previous_state_ref")?),
-                ("next_state_ref", parse_string_param(&params, 3, "next_state_ref")?),
-                ("workflow_kind", parse_string_param(&params, 4, "workflow_kind")?),
+                (
+                    "register_ref",
+                    parse_string_param(&params, 1, "register_ref")?,
+                ),
+                (
+                    "previous_state_ref",
+                    parse_string_param(&params, 2, "previous_state_ref")?,
+                ),
+                (
+                    "next_state_ref",
+                    parse_string_param(&params, 3, "next_state_ref")?,
+                ),
+                (
+                    "workflow_kind",
+                    parse_string_param(&params, 4, "workflow_kind")?,
+                ),
                 ("proof_kind", parse_string_param(&params, 5, "proof_kind")?),
-                ("proof_receipt_hash", parse_string_param(&params, 6, "proof_receipt_hash")?),
+                (
+                    "proof_receipt_hash",
+                    parse_string_param(&params, 6, "proof_receipt_hash")?,
+                ),
                 ("status", parse_string_param(&params, 7, "status")?),
                 ("intent_id", parse_string_param(&params, 8, "intent_id")?),
             ];
             for (suffix, value) in fields {
-                storage_set_utf8(storage, register_workflow_key(&workflow_ref, suffix), normalize_non_empty(&value, suffix)?);
+                storage_set_utf8(
+                    storage,
+                    register_workflow_key(&workflow_ref, suffix),
+                    normalize_non_empty(&value, suffix)?,
+                );
             }
             Ok(frame_bool(true))
         }
         "register_workflow_get" => {
-            let workflow_ref = normalize_hex64(&parse_string_param(&params, 0, "workflow_ref")?, "workflow_ref")?;
+            let workflow_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "workflow_ref")?,
+                "workflow_ref",
+            )?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_register_workflow_field(storage, &workflow_ref, &field)
         }
         "object_bind" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
-            let state_ref = normalize_hex64(&parse_string_param(&params, 1, "state_ref")?, "state_ref")?;
-            let transition_ref = normalize_hex64(&parse_string_param(&params, 2, "transition_ref")?, "transition_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 1, "state_ref")?, "state_ref")?;
+            let transition_ref = normalize_hex64(
+                &parse_string_param(&params, 2, "transition_ref")?,
+                "transition_ref",
+            )?;
             let status = normalize_non_empty(&parse_string_param(&params, 3, "status")?, "status")?;
-            storage_set_utf8(storage, object_binding_key(&object_ref, "current_state_ref"), state_ref);
-            let version = increment_stored_version(storage, &object_binding_key(&object_ref, "version"));
-            storage_set_utf8(storage, object_binding_key(&object_ref, "last_transition_ref"), transition_ref);
+            storage_set_utf8(
+                storage,
+                object_binding_key(&object_ref, "current_state_ref"),
+                state_ref,
+            );
+            let version =
+                increment_stored_version(storage, &object_binding_key(&object_ref, "version"));
+            storage_set_utf8(
+                storage,
+                object_binding_key(&object_ref, "last_transition_ref"),
+                transition_ref,
+            );
             storage_set_utf8(storage, object_binding_key(&object_ref, "status"), status);
             Ok(frame_int(version))
         }
         "object_binding_get" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_object_binding_field(storage, &object_ref, &field)
         }
         "object_member_attach" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
-            let member_ref = normalize_non_empty(&parse_string_param(&params, 1, "member_ref")?, "member_ref")?;
-            let state_ref = normalize_hex64(&parse_string_param(&params, 2, "state_ref")?, "state_ref")?;
-            let member_kind = normalize_non_empty(&parse_string_param(&params, 3, "member_kind")?, "member_kind")?;
-            let state_class = normalize_non_empty(&parse_string_param(&params, 4, "state_class")?, "state_class")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let member_ref =
+                normalize_non_empty(&parse_string_param(&params, 1, "member_ref")?, "member_ref")?;
+            let state_ref =
+                normalize_hex64(&parse_string_param(&params, 2, "state_ref")?, "state_ref")?;
+            let member_kind = normalize_non_empty(
+                &parse_string_param(&params, 3, "member_kind")?,
+                "member_kind",
+            )?;
+            let state_class = normalize_non_empty(
+                &parse_string_param(&params, 4, "state_class")?,
+                "state_class",
+            )?;
             let codec = normalize_non_empty(&parse_string_param(&params, 5, "codec")?, "codec")?;
             let status = normalize_non_empty(&parse_string_param(&params, 6, "status")?, "status")?;
-            storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "state_ref"), state_ref);
-            storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "member_kind"), member_kind);
-            storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "state_class"), state_class);
-            storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "codec"), codec);
-            storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "status"), status);
+            storage_set_utf8(
+                storage,
+                object_member_key(&object_ref, &member_ref, "state_ref"),
+                state_ref,
+            );
+            storage_set_utf8(
+                storage,
+                object_member_key(&object_ref, &member_ref, "member_kind"),
+                member_kind,
+            );
+            storage_set_utf8(
+                storage,
+                object_member_key(&object_ref, &member_ref, "state_class"),
+                state_class,
+            );
+            storage_set_utf8(
+                storage,
+                object_member_key(&object_ref, &member_ref, "codec"),
+                codec,
+            );
+            storage_set_utf8(
+                storage,
+                object_member_key(&object_ref, &member_ref, "status"),
+                status,
+            );
             Ok(frame_bool(true))
         }
         "object_member_detach" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
-            let member_ref = normalize_non_empty(&parse_string_param(&params, 1, "member_ref")?, "member_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let member_ref =
+                normalize_non_empty(&parse_string_param(&params, 1, "member_ref")?, "member_ref")?;
             storage.remove(&object_member_key(&object_ref, &member_ref, "state_ref"));
             storage.remove(&object_member_key(&object_ref, &member_ref, "member_kind"));
             storage.remove(&object_member_key(&object_ref, &member_ref, "state_class"));
@@ -3568,27 +5462,69 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
             Ok(frame_bool(true))
         }
         "object_member_get" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
-            let member_ref = normalize_non_empty(&parse_string_param(&params, 1, "member_ref")?, "member_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let member_ref =
+                normalize_non_empty(&parse_string_param(&params, 1, "member_ref")?, "member_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 2, "field")?, "field")?;
             read_object_member_field(storage, &object_ref, &member_ref, &field)
         }
         "object_policy_define" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
-            storage_set_optional_utf8(storage, object_policy_key(&object_ref, "delivery_key_id"), normalize_optional_string(parse_optional_string_param(&params, 1)?));
-            storage_set_int(storage, object_policy_key(&object_ref, "activate_after_epoch"), parse_int_param(&params, 2, "activate_after_epoch")?);
-            storage_set_int(storage, object_policy_key(&object_ref, "expire_after_epoch"), parse_int_param(&params, 3, "expire_after_epoch")?);
-            storage_set_utf8(storage, object_policy_key(&object_ref, "transition_mode"), normalize_non_empty(&parse_string_param(&params, 4, "transition_mode")?, "transition_mode")?);
-            storage_set_utf8(storage, object_policy_key(&object_ref, "required_proof_kind"), normalize_non_empty(&parse_string_param(&params, 5, "required_proof_kind")?, "required_proof_kind")?);
-            storage_set_int(storage, object_policy_key(&object_ref, "member_quorum"), parse_int_param(&params, 6, "member_quorum")?);
-            storage_set_bool(storage, object_policy_key(&object_ref, "allow_detach"), parse_bool_param(&params, 7, "allow_detach")?);
-            storage_set_bool(storage, object_policy_key(&object_ref, "allow_root_state_rotation"), parse_bool_param(&params, 8, "allow_root_state_rotation")?);
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            storage_set_optional_utf8(
+                storage,
+                object_policy_key(&object_ref, "delivery_key_id"),
+                normalize_optional_string(parse_optional_string_param(&params, 1)?),
+            );
+            storage_set_int(
+                storage,
+                object_policy_key(&object_ref, "activate_after_epoch"),
+                parse_int_param(&params, 2, "activate_after_epoch")?,
+            );
+            storage_set_int(
+                storage,
+                object_policy_key(&object_ref, "expire_after_epoch"),
+                parse_int_param(&params, 3, "expire_after_epoch")?,
+            );
+            storage_set_utf8(
+                storage,
+                object_policy_key(&object_ref, "transition_mode"),
+                normalize_non_empty(
+                    &parse_string_param(&params, 4, "transition_mode")?,
+                    "transition_mode",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                object_policy_key(&object_ref, "required_proof_kind"),
+                normalize_non_empty(
+                    &parse_string_param(&params, 5, "required_proof_kind")?,
+                    "required_proof_kind",
+                )?,
+            );
+            storage_set_int(
+                storage,
+                object_policy_key(&object_ref, "member_quorum"),
+                parse_int_param(&params, 6, "member_quorum")?,
+            );
+            storage_set_bool(
+                storage,
+                object_policy_key(&object_ref, "allow_detach"),
+                parse_bool_param(&params, 7, "allow_detach")?,
+            );
+            storage_set_bool(
+                storage,
+                object_policy_key(&object_ref, "allow_root_state_rotation"),
+                parse_bool_param(&params, 8, "allow_root_state_rotation")?,
+            );
             storage_set_bool(storage, object_policy_key(&object_ref, "tombstone"), false);
             storage_set_bool(storage, object_policy_key(&object_ref, "revoked"), false);
             Ok(frame_bool(true))
         }
         "object_policy_release" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             storage.remove(&object_policy_key(&object_ref, "delivery_key_id"));
             storage.remove(&object_policy_key(&object_ref, "activate_after_epoch"));
             storage.remove(&object_policy_key(&object_ref, "expire_after_epoch"));
@@ -3597,80 +5533,221 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
             Ok(frame_bool(true))
         }
         "object_policy_retire" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
-            storage_set_int(storage, object_policy_key(&object_ref, "expire_after_epoch"), parse_int_param(&params, 1, "expire_after_epoch")?);
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            storage_set_int(
+                storage,
+                object_policy_key(&object_ref, "expire_after_epoch"),
+                parse_int_param(&params, 1, "expire_after_epoch")?,
+            );
             Ok(frame_bool(true))
         }
         "object_policy_tombstone" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             storage_set_bool(storage, object_policy_key(&object_ref, "tombstone"), true);
             Ok(frame_bool(true))
         }
         "object_policy_restore" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             storage_set_bool(storage, object_policy_key(&object_ref, "tombstone"), false);
             Ok(frame_bool(true))
         }
         "object_policy_revoke" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             storage_set_bool(storage, object_policy_key(&object_ref, "revoked"), true);
             Ok(frame_bool(true))
         }
         "object_policy_reinstate" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             storage_set_bool(storage, object_policy_key(&object_ref, "revoked"), false);
             Ok(frame_bool(true))
         }
         "object_policy_get" => {
-            let object_ref = normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 0, "object_ref")?, "object_ref")?;
             let field = normalize_non_empty(&parse_string_param(&params, 1, "field")?, "field")?;
             read_object_policy_field(storage, &object_ref, &field)
         }
         "object_transition_record" => {
-            let transition_ref = normalize_hex64(&parse_string_param(&params, 0, "transition_ref")?, "transition_ref")?;
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "object_ref"), normalize_hex64(&parse_string_param(&params, 1, "object_ref")?, "object_ref")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "previous_state_ref"), normalize_hex64(&parse_string_param(&params, 2, "previous_state_ref")?, "previous_state_ref")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "next_state_ref"), normalize_hex64(&parse_string_param(&params, 3, "next_state_ref")?, "next_state_ref")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "touched_members_hash"), normalize_hex64(&parse_string_param(&params, 4, "touched_members_hash")?, "touched_members_hash")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "proof_kind"), normalize_non_empty(&parse_string_param(&params, 5, "proof_kind")?, "proof_kind")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "proof_receipt_hash"), normalize_hex64(&parse_string_param(&params, 6, "proof_receipt_hash")?, "proof_receipt_hash")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "status"), normalize_non_empty(&parse_string_param(&params, 7, "status")?, "status")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "intent_id"), normalize_hex64(&parse_string_param(&params, 8, "intent_id")?, "intent_id")?);
+            let transition_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "transition_ref")?,
+                "transition_ref",
+            )?;
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "object_ref"),
+                normalize_hex64(&parse_string_param(&params, 1, "object_ref")?, "object_ref")?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "previous_state_ref"),
+                normalize_hex64(
+                    &parse_string_param(&params, 2, "previous_state_ref")?,
+                    "previous_state_ref",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "next_state_ref"),
+                normalize_hex64(
+                    &parse_string_param(&params, 3, "next_state_ref")?,
+                    "next_state_ref",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "touched_members_hash"),
+                normalize_hex64(
+                    &parse_string_param(&params, 4, "touched_members_hash")?,
+                    "touched_members_hash",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "proof_kind"),
+                normalize_non_empty(&parse_string_param(&params, 5, "proof_kind")?, "proof_kind")?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "proof_receipt_hash"),
+                normalize_hex64(
+                    &parse_string_param(&params, 6, "proof_receipt_hash")?,
+                    "proof_receipt_hash",
+                )?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "status"),
+                normalize_non_empty(&parse_string_param(&params, 7, "status")?, "status")?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "intent_id"),
+                normalize_hex64(&parse_string_param(&params, 8, "intent_id")?, "intent_id")?,
+            );
             Ok(frame_bool(true))
         }
         "object_transition_apply" => {
-            let transition_ref = normalize_hex64(&parse_string_param(&params, 0, "transition_ref")?, "transition_ref")?;
-            let object_ref = normalize_hex64(&parse_string_param(&params, 1, "object_ref")?, "object_ref")?;
-            let previous_state_ref = normalize_hex64(&parse_string_param(&params, 2, "previous_state_ref")?, "previous_state_ref")?;
-            let next_state_ref = normalize_hex64(&parse_string_param(&params, 3, "next_state_ref")?, "next_state_ref")?;
+            let transition_ref = normalize_hex64(
+                &parse_string_param(&params, 0, "transition_ref")?,
+                "transition_ref",
+            )?;
+            let object_ref =
+                normalize_hex64(&parse_string_param(&params, 1, "object_ref")?, "object_ref")?;
+            let previous_state_ref = normalize_hex64(
+                &parse_string_param(&params, 2, "previous_state_ref")?,
+                "previous_state_ref",
+            )?;
+            let next_state_ref = normalize_hex64(
+                &parse_string_param(&params, 3, "next_state_ref")?,
+                "next_state_ref",
+            )?;
             let member_bundle = parse_string_param(&params, 4, "member_bundle")?;
             let deltas = parse_object_member_bundle(&member_bundle)?;
-            let touched_members_hash = normalize_hex64(&parse_string_param(&params, 5, "touched_members_hash")?, "touched_members_hash")?;
+            let touched_members_hash = normalize_hex64(
+                &parse_string_param(&params, 5, "touched_members_hash")?,
+                "touched_members_hash",
+            )?;
             let computed_hash = hex::encode(Sha256::digest(member_bundle.as_bytes()));
             if computed_hash != touched_members_hash {
                 return Err("object transition touched_members_hash mismatch".to_owned());
             }
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "object_ref"), object_ref.clone());
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "previous_state_ref"), previous_state_ref);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "next_state_ref"), next_state_ref.clone());
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "touched_members_hash"), touched_members_hash);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "proof_kind"), normalize_non_empty(&parse_string_param(&params, 6, "proof_kind")?, "proof_kind")?);
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "proof_receipt_hash"), normalize_hex64(&parse_string_param(&params, 7, "proof_receipt_hash")?, "proof_receipt_hash")?);
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "object_ref"),
+                object_ref.clone(),
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "previous_state_ref"),
+                previous_state_ref,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "next_state_ref"),
+                next_state_ref.clone(),
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "touched_members_hash"),
+                touched_members_hash,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "proof_kind"),
+                normalize_non_empty(&parse_string_param(&params, 6, "proof_kind")?, "proof_kind")?,
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "proof_receipt_hash"),
+                normalize_hex64(
+                    &parse_string_param(&params, 7, "proof_receipt_hash")?,
+                    "proof_receipt_hash",
+                )?,
+            );
             let status = normalize_non_empty(&parse_string_param(&params, 8, "status")?, "status")?;
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "status"), status.clone());
-            storage_set_utf8(storage, object_transition_key(&transition_ref, "intent_id"), normalize_hex64(&parse_string_param(&params, 9, "intent_id")?, "intent_id")?);
-            storage_set_utf8(storage, object_binding_key(&object_ref, "current_state_ref"), next_state_ref);
-            let version = increment_stored_version(storage, &object_binding_key(&object_ref, "version"));
-            storage_set_utf8(storage, object_binding_key(&object_ref, "last_transition_ref"), transition_ref);
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "status"),
+                status.clone(),
+            );
+            storage_set_utf8(
+                storage,
+                object_transition_key(&transition_ref, "intent_id"),
+                normalize_hex64(&parse_string_param(&params, 9, "intent_id")?, "intent_id")?,
+            );
+            storage_set_utf8(
+                storage,
+                object_binding_key(&object_ref, "current_state_ref"),
+                next_state_ref,
+            );
+            let version =
+                increment_stored_version(storage, &object_binding_key(&object_ref, "version"));
+            storage_set_utf8(
+                storage,
+                object_binding_key(&object_ref, "last_transition_ref"),
+                transition_ref,
+            );
             storage_set_utf8(storage, object_binding_key(&object_ref, "status"), status);
             for delta in deltas {
                 match delta {
-                    ObjectMemberDelta::Attach { member_ref, state_ref, member_kind, state_class, codec, status } => {
-                        storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "state_ref"), state_ref);
-                        storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "member_kind"), member_kind);
-                        storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "state_class"), state_class);
-                        storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "codec"), codec);
-                        storage_set_utf8(storage, object_member_key(&object_ref, &member_ref, "status"), status);
+                    ObjectMemberDelta::Attach {
+                        member_ref,
+                        state_ref,
+                        member_kind,
+                        state_class,
+                        codec,
+                        status,
+                    } => {
+                        storage_set_utf8(
+                            storage,
+                            object_member_key(&object_ref, &member_ref, "state_ref"),
+                            state_ref,
+                        );
+                        storage_set_utf8(
+                            storage,
+                            object_member_key(&object_ref, &member_ref, "member_kind"),
+                            member_kind,
+                        );
+                        storage_set_utf8(
+                            storage,
+                            object_member_key(&object_ref, &member_ref, "state_class"),
+                            state_class,
+                        );
+                        storage_set_utf8(
+                            storage,
+                            object_member_key(&object_ref, &member_ref, "codec"),
+                            codec,
+                        );
+                        storage_set_utf8(
+                            storage,
+                            object_member_key(&object_ref, &member_ref, "status"),
+                            status,
+                        );
                     }
                     ObjectMemberDelta::Detach { member_ref } => {
                         storage.remove(&object_member_key(&object_ref, &member_ref, "state_ref"));
@@ -3683,7 +5760,10 @@ fn execute_circle_invoke(caller: &mut Caller<'_, HostState>, req_bytes: &[u8]) -
             }
             Ok(frame_int(version))
         }
-        _ => Err(format!("unsupported circle host method: {}", request.method)),
+        _ => Err(format!(
+            "unsupported circle host method: {}",
+            request.method
+        )),
     }
 }
 
@@ -3692,7 +5772,9 @@ fn hfhe_capability_name(method: &str) -> Option<&'static str> {
         "fhe_load_pk" => Some("fhe_load_pk"),
         "fhe_encrypt" | "fhe_encrypt_zero" => Some("fhe_encrypt"),
         "fhe_decrypt" => Some("fhe_decrypt"),
-        "fhe_add" | "fhe_sub" | "fhe_scale" | "fhe_add_const" | "fhe_sub_const" => Some("fhe_cipher_arithmetic"),
+        "fhe_add" | "fhe_sub" | "fhe_scale" | "fhe_add_const" | "fhe_sub_const" => {
+            Some("fhe_cipher_arithmetic")
+        }
         "fhe_commit" | "fhe_bound_commitment" => Some("fhe_commit"),
         "fhe_pedersen" => Some("fhe_pedersen"),
         "fhe_verify_zero" => Some("fhe_verify_zero"),
@@ -3725,15 +5807,14 @@ fn hfhe_receipt_entry(
     request: &[u8],
     response: &[u8],
 ) -> Result<HfheReceiptEntryJson, String> {
-    let result =
-        if is_hfhe_verify_method(method) {
-            Some(
-                hfhe_response_bool(response)
-                    .ok_or_else(|| "invalid hfhe verifier response".to_owned())?,
-            )
-        } else {
-            None
-        };
+    let result = if is_hfhe_verify_method(method) {
+        Some(
+            hfhe_response_bool(response)
+                .ok_or_else(|| "invalid hfhe verifier response".to_owned())?,
+        )
+    } else {
+        None
+    };
     Ok(HfheReceiptEntryJson {
         method: method.to_owned(),
         request_hash: hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", request),
@@ -3828,7 +5909,11 @@ fn execute_hfhe_invoke(
     if mode == "consume" {
         let expected = rejected(expected_hfhe_receipt_entry(caller))?;
         let request_hash = hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", req_bytes);
-        rejected(match_hfhe_receipt_request(&expected, &method, &request_hash))?;
+        rejected(match_hfhe_receipt_request(
+            &expected,
+            &method,
+            &request_hash,
+        ))?;
         if is_verify {
             let result = rejected(
                 expected
@@ -4051,8 +6136,7 @@ fn execute_hfhe_direct(
             let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
             let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
             let proof = rejected(parse_string_param(&params, 2, "proof"))?;
-            let amount_commitment =
-                rejected(parse_string_param(&params, 3, "amount_commitment"))?;
+            let amount_commitment = rejected(parse_string_param(&params, 3, "amount_commitment"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_range",
                 "pubkey_b64": pubkey_b64,
@@ -4066,8 +6150,7 @@ fn execute_hfhe_direct(
             let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
             let ciphertext = rejected(parse_string_param(&params, 1, "ciphertext"))?;
             let proof = rejected(parse_string_param(&params, 2, "proof"))?;
-            let amount_commitment =
-                rejected(parse_string_param(&params, 3, "amount_commitment"))?;
+            let amount_commitment = rejected(parse_string_param(&params, 3, "amount_commitment"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_bound",
                 "pubkey_b64": pubkey_b64,
@@ -4110,8 +6193,9 @@ fn call_hfhe_backend(payload: JsonValue) -> Result<JsonValue, HostFailure> {
         }));
     }
     let output = unsafe { copy_and_free_malloc_string(out_ptr, out_len) };
-    let response: JsonValue = serde_json::from_str(&output)
-        .map_err(|e| HostFailure::Unavailable(format!("hfhe backend returned invalid json: {e}")))?;
+    let response: JsonValue = serde_json::from_str(&output).map_err(|e| {
+        HostFailure::Unavailable(format!("hfhe backend returned invalid json: {e}"))
+    })?;
     match response.get("ok").and_then(|value| value.as_bool()) {
         Some(true) => Ok(response.get("value").cloned().unwrap_or(JsonValue::Null)),
         _ => {
@@ -4154,9 +6238,7 @@ fn expect_backend_string(value: JsonValue) -> Result<String, HostFailure> {
 fn expect_backend_bool(value: JsonValue) -> Result<bool, HostFailure> {
     value
         .as_bool()
-        .ok_or_else(|| {
-            HostFailure::Unavailable("hfhe backend returned non-bool value".to_owned())
-        })
+        .ok_or_else(|| HostFailure::Unavailable("hfhe backend returned non-bool value".to_owned()))
 }
 
 fn state_path_key(raw_state_ref: &str) -> String {
@@ -4230,7 +6312,12 @@ fn base58_part(value: &str) -> String {
     }
 }
 
-fn circle_id_of_spawn(state: &HostState, owner_mode: &str, spawn_nonce: i32, payload_json: &str) -> String {
+fn circle_id_of_spawn(
+    state: &HostState,
+    owner_mode: &str,
+    spawn_nonce: i32,
+    payload_json: &str,
+) -> String {
     let nonce = encode_u64(spawn_nonce);
     let seed = h256_raw(
         "octra:circle_spawn_id:v1",
@@ -4412,5 +6499,72 @@ mod tests {
             .filter(|key| key.starts_with(&circle_prefix))
             .count();
         assert_eq!(circle_roots, 1);
+    }
+
+    #[test]
+    fn compute_invocation_preserves_live_sessions_and_prunes_expired_sessions() {
+        let live_key = "compute-session-regression-live".to_owned();
+        let expired_key = "compute-session-regression-expired".to_owned();
+        {
+            let mut cache = cache_guard(session_cache());
+            cache.insert(
+                live_key.clone(),
+                SessionCacheEntry {
+                    value: vec![1],
+                    updated_at: now_secs(),
+                },
+            );
+            cache.insert(
+                expired_key.clone(),
+                SessionCacheEntry {
+                    value: vec![2],
+                    updated_at: now_secs() - SESSION_CACHE_TTL_SECS - 1.0,
+                },
+            );
+        }
+
+        maintain_compute_session_caches();
+
+        let mut cache = cache_guard(session_cache());
+        assert_eq!(
+            cache.get(&live_key).map(|entry| entry.value.as_slice()),
+            Some(&[1][..])
+        );
+        assert!(!cache.contains_key(&expired_key));
+        cache.remove(&live_key);
+    }
+
+    #[test]
+    fn failed_compute_cleanup_is_scoped_to_one_session() {
+        let prefix = "circle|caller|session-a|";
+        let scoped_key = format!("{prefix}meta");
+        let other_key = "circle|caller|session-b|meta".to_owned();
+        {
+            let mut cache = cache_guard(session_cache());
+            cache.insert(
+                scoped_key.clone(),
+                SessionCacheEntry {
+                    value: vec![1],
+                    updated_at: now_secs(),
+                },
+            );
+            cache.insert(
+                other_key.clone(),
+                SessionCacheEntry {
+                    value: vec![2],
+                    updated_at: now_secs(),
+                },
+            );
+        }
+
+        clear_compute_session_prefix(prefix).expect("session cleanup");
+
+        let mut cache = cache_guard(session_cache());
+        assert!(!cache.contains_key(&scoped_key));
+        assert_eq!(
+            cache.get(&other_key).map(|entry| entry.value.as_slice()),
+            Some(&[2][..])
+        );
+        cache.remove(&other_key);
     }
 }

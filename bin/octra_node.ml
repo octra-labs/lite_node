@@ -42,6 +42,9 @@ module Rule_graph = Octra_core.Rule_graph
 module History_floor = Octra_core.History_floor
 module Preverify_cache = Octra_node_runtime.Preverify_cache
 module Preverify_submit = Octra_node_runtime.Preverify_submit
+module Resource_compute_config = Octra_node_runtime.Resource_compute_provider_config
+module Resource_compute_engine = Octra_node_runtime.Resource_compute_provider_engine
+module Resource_compute_service = Octra_node_runtime.Resource_compute_service
 module Startup_process_shell = Octra_node_runtime.Startup_process_shell
 module Startup_network_boot_shell = Octra_node_runtime.Startup_network_boot_shell
 module Startup_node_boot_shell = Octra_node_runtime.Startup_node_boot_shell
@@ -648,9 +651,14 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let deferred_stealth_txs = shared_result.deferred_stealth_txs in
     let epoch_ts =
-      match epoch_env.Consensus_epoch_apply_env.epoch_ts !current_epoch with
-      | Some value -> value
-      | None -> failwith "finalized epoch timestamp missing"
+      match
+        Consensus_epoch_apply_env.resolve_epoch_ts
+          ~consensus_mode
+          epoch_env
+          !current_epoch
+      with
+      | Ok value -> value
+      | Error error -> failwith error
     in
     begin
       match
@@ -1123,6 +1131,87 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           warn = Log.warn "state_sync" "%s";
         }
     in
+    let compute_identity =
+      Octra_node_runtime.P2p_config.identity
+        ~priv_b64:wallet.Wallet.priv
+        ~pub_b64:wallet.pub in
+    let compute_raw_root value =
+      if Octra_node_runtime.Text.is_hex_len 64 value then
+        Some (Octra_node_runtime.Text.hex_to_string value)
+      else
+        None in
+    let compute_state_root_at epoch_id =
+      if epoch_id < 0L || epoch_id > Int64.of_int max_int then None
+      else
+        match Store_chaindata.get_epoch_header chaindata (Int64.to_int epoch_id) with
+        | None -> None
+        | Some header -> compute_raw_root header.Octra_core.Epochlog.state_root in
+    let compute_provider =
+      match
+        Resource_compute_config.of_inputs
+          ~cli_enabled:(cli_has_flag "--compute-provider")
+          ~getenv:env_opt
+      with
+      | Error reason ->
+        Log.fatal "compute"
+          "event = provider_config status = rejected reason = %s"
+          reason;
+        exit_error ()
+      | Ok Resource_compute_config.Disabled ->
+        Log.info "compute" "event = provider status = disabled";
+        None
+      | Ok (Resource_compute_config.Enabled limits) ->
+        let deps =
+          Resource_compute_engine.native_deps
+            ~limits
+            ~store
+            ~state_root_at:compute_state_root_at in
+        let engine = Resource_compute_engine.create ~limits ~deps in
+        Log.info "compute"
+          "event = provider status = enabled accelerator = %s lanes = %d memory_bytes = %Ld"
+          (Resource_compute_config.accelerator_name limits.accelerator)
+          limits.lanes
+          limits.memory_bytes;
+        Some Resource_compute_service.{ limits; engine }
+    in
+    let compute_head () =
+      match Octra_core.Head_manifest.get_cached () with
+      | None -> None
+      | Some head ->
+        Option.map
+          (fun state_root -> Resource_compute_service.{
+             epoch_id = Int64.of_int head.Octra_core.Head_manifest.epoch_id;
+             state_root;
+           })
+          (compute_raw_root head.state_root) in
+    let compute_frame payload =
+      Octra_net.P2p_frame.{ msg_type = msg_resource_compute; payload } in
+    let resource_compute =
+      Resource_compute_service.create
+        ~deps:Resource_compute_service.{
+          chain_id;
+          node_id = wallet.address;
+          sign = compute_identity.sign_fn;
+          validator_set = (fun () -> !consensus_validator_set_ref);
+          head = compute_head;
+          state_root_at = compute_state_root_at;
+          self_test = Resource_compute_engine.native_self_test;
+          nonce = (fun () -> Mirage_crypto_rng.generate 32);
+          broadcast = (fun payload ->
+            match !swarm_opt with
+            | Some swarm -> Octra_net.P2p_swarm.broadcast swarm (compute_frame payload)
+            | None -> Lwt.return_unit);
+          relay = (fun ~source payload ->
+            match !swarm_opt with
+            | Some swarm ->
+              Octra_net.P2p_swarm.broadcast_except
+                swarm
+                ~except:source
+                (compute_frame payload)
+            | None -> Lwt.return_unit);
+          sleep = Lwt_unix.sleep;
+        }
+        ~provider:compute_provider in
 
     let rpc_task =
       Rest.start_task rest_runtime
@@ -1133,6 +1222,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~migration_entitlements
         ~consensus_driver_ref:driver_ref
         ~epoch_visibility
+        ~resource_compute
     in
     Startup_node_launch_shell.run
       Startup_node_launch_shell.{
@@ -1155,6 +1245,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         now = Unix.gettimeofday;
         max_drift = Rest.max_timestamp_drift;
         driver_ref;
+        resource_compute = Some resource_compute;
         close_chaindata = (fun () -> Store_chaindata.close chaindata);
         exit_fatal = exit_error;
       }

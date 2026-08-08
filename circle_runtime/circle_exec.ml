@@ -968,7 +968,65 @@ let prepare_octb_call ~ctx ~depth ~limit ~caller ~address ~value ~method_name ~p
 let wasm_fuel_limit limit =
   max 0 (min limit 20_000_000)
 
-let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+let wasm_compute_fuel_limit limit =
+  max 0 (min limit 2_000_000_000)
+
+let execute_wasm_view
+    execution
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit =
+  match execution with
+  | Circle_program.Standard ->
+    Octra_core.Circle_wasm_host.execute
+      ~code_b64
+      ~export_name
+      ~request_bytes
+      ~storage_tbl
+      ~storage_cache_key
+      ~caller
+      ~address
+      ~tx_hash
+      ~current_epoch
+      ~hfhe_caps
+      ~hfhe_pubkeys
+      ~hfhe_active_key
+      ~hfhe_mode
+      ~public_reads
+      ~fuel_limit:(wasm_fuel_limit fuel_limit)
+      ~is_view:true
+      ~update_policy:false
+  | Circle_program.Compute ->
+    Octra_core.Circle_wasm_host.execute_compute
+      ~code_b64
+      ~export_name
+      ~request_bytes
+      ~storage_tbl
+      ~storage_cache_key
+      ~caller
+      ~address
+      ~tx_hash
+      ~current_epoch
+      ~hfhe_caps
+      ~hfhe_pubkeys
+      ~hfhe_active_key
+      ~hfhe_mode
+      ~public_reads
+      ~fuel_limit:(wasm_compute_fuel_limit fuel_limit)
+
+let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
     store circle_id method_name params caller =
   let timing_enabled = wasm_view_method_timing_enabled method_name in
   let timing_started_at = if timing_enabled then Some (Unix.gettimeofday ()) else None in
@@ -1014,6 +1072,19 @@ let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(d
     finish
       (failed_receipt (Octra_core.Circle_wasm_host.error_message e))
   | Ok loaded ->
+    let declared_execution =
+      match loaded.code with
+      | Circle_program.Octb _ -> Circle_program.Standard
+      | Circle_program.Wasm_v1 wasm ->
+        Circle_program.execution_for_method wasm.methods method_name
+    in
+    begin
+      match execution, declared_execution with
+      | Circle_program.Standard, Circle_program.Compute ->
+        finish (failed_receipt "circle compute method requires compute executor")
+      | Circle_program.Compute, Circle_program.Standard ->
+        finish (failed_receipt "circle method is not declared for compute execution")
+      | _ ->
     begin
       match loaded.code with
       | Circle_program.Octb { bytecode; profile } ->
@@ -1115,7 +1186,8 @@ let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(d
                         finish (failed_receipt "wasm public read effort exceeds limit")
                       else
                         let* wasm_result =
-                          Octra_core.Circle_wasm_host.execute
+                          execute_wasm_view
+                            execution
                             ~code_b64:wasm.code_b64
                             ~export_name:"octra_query"
                             ~request_bytes
@@ -1130,9 +1202,7 @@ let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(d
                             ~hfhe_active_key
                             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
                             ~public_reads:public_reads.snapshots
-                            ~fuel_limit:(wasm_fuel_limit wasm_limit)
-                            ~is_view:true
-                            ~update_policy:false in
+                            ~fuel_limit:wasm_limit in
                         timing_mark "native_execute";
                         begin
                           match wasm_result with
@@ -1165,6 +1235,7 @@ let rec execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(d
             end
         end
     end
+    end
 
 and maybe_prefetch_preview ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
     store circle_id caller prompt_csv prompt_tokens delivered_csv =
@@ -1189,7 +1260,8 @@ and maybe_prefetch_preview ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_00
         Lwt.async (fun () ->
           let params = [`String next_prompt_csv; `Int prefetch_n] in
           let* receipt =
-            execute_view_call_direct
+            execute_view_call_with_execution
+              Circle_program.Standard
               ~ctx
               ~depth
               ~limit
@@ -1213,7 +1285,17 @@ and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(l
     store circle_id method_name params caller =
   match preview_request_of_call method_name params with
   | None ->
-    execute_view_call_direct ~trusted ~ctx ~depth ~limit store circle_id method_name params caller
+    execute_view_call_with_execution
+      Circle_program.Standard
+      ~trusted
+      ~ctx
+      ~depth
+      ~limit
+      store
+      circle_id
+      method_name
+      params
+      caller
   | Some (prompt_csv, prompt_tokens, n_tokens) ->
     let cache_key = preview_cache_key circle_id caller prompt_csv in
     begin
@@ -1232,7 +1314,8 @@ and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(l
         Lwt.return (preview_receipt result_csv)
       | None ->
         let* receipt =
-          execute_view_call_direct
+          execute_view_call_with_execution
+            Circle_program.Standard
             ~ctx
             ~depth
             ~limit
@@ -1261,6 +1344,34 @@ and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(l
         Lwt.return receipt
     end
 
+let execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+    store circle_id method_name params caller =
+  execute_view_call_with_execution
+    Circle_program.Standard
+    ~trusted
+    ~ctx
+    ~depth
+    ~limit
+    store
+    circle_id
+    method_name
+    params
+    caller
+
+let execute_compute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+    store circle_id method_name params caller =
+  execute_view_call_with_execution
+    Circle_program.Compute
+    ~trusted
+    ~ctx
+    ~depth
+    ~limit
+    store
+    circle_id
+    method_name
+    params
+    caller
+
 let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
     ?(limit=1_000_000)
     ?(hfhe_mode=Octra_core.Circle_hfhe_transcript.Direct)
@@ -1273,6 +1384,15 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
   | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
     Lwt.fail (Execution_unavailable e)
   | Ok loaded ->
+    let declared_execution =
+      match loaded.code with
+      | Circle_program.Octb _ -> Circle_program.Standard
+      | Circle_program.Wasm_v1 wasm ->
+        Circle_program.execution_for_method wasm.methods method_name
+    in
+    if declared_execution = Circle_program.Compute then
+      Lwt.return (failed_call_result "circle compute method cannot execute as update")
+    else
     let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
     begin
       match storage_result with

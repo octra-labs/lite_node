@@ -36,6 +36,12 @@ val current_validator_pubkeys :
   node_env ->
   (string * string) list
 
+val resolve_epoch_ts :
+  consensus_mode:bool ->
+  node_env ->
+  int ->
+  (float, string) result
+
 val standard :
   chain_id:string ->
   epoch_id:int ->

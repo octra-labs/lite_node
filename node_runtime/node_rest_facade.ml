@@ -196,7 +196,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     ~scheduled_validator_set_ref
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
     ~program_trust ~migration_entitlements ~chaindata ~consensus_driver_ref
-    ~epoch_visibility =
+    ~epoch_visibility ~resource_compute =
   let deps = Node_rpc_server.{
     validate = validate_and_submit_tx runtime ledger;
     encrypted_supply = encrypted_supply_aggregate store ledger;
@@ -227,6 +227,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     chaindata;
     consensus_driver_ref;
     epoch_visibility;
+    resource_compute;
     deps;
   }
 
@@ -235,7 +236,7 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
     ~validator_view_sk ~validator_view_pub ~program_trust
     ~migration_entitlements ~chaindata
-    ~consensus_driver_ref ~epoch_visibility () =
+    ~consensus_driver_ref ~epoch_visibility ~resource_compute () =
   start
     runtime
     ~port
@@ -257,3 +258,4 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~chaindata
     ~consensus_driver_ref
     ~epoch_visibility
+    ~resource_compute

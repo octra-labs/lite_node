@@ -29,6 +29,7 @@ let msg_resource_attestation = 0x3c
 let msg_vote_evidence = 0x3d
 let msg_cons_round_sync = 0x3e
 let msg_epoch_broadcast = 0x40
+let msg_resource_compute = 0x41
 
 let control_payload_max = 4 * 1024
 let handshake_payload_max = 64 * 1024
@@ -41,6 +42,7 @@ let bundle_payload_max = 8 * 1024 * 1024
 let catchup_payload_max = 8 * 1024 * 1024
 let attestation_payload_max = 256 * 1024
 let epoch_payload_max = 8 * 1024 * 1024
+let resource_compute_payload_max = 384 * 1024
 
 let known_msg_types = [
   msg_hello;
@@ -68,6 +70,7 @@ let known_msg_types = [
   msg_resource_attestation;
   msg_vote_evidence;
   msg_epoch_broadcast;
+  msg_resource_compute;
 ]
 
 let known_msg_type n =
@@ -100,6 +103,8 @@ let max_payload_size msg_type =
     consensus_control_payload_max
   else if msg_type = msg_epoch_broadcast then
     epoch_payload_max
+  else if msg_type = msg_resource_compute then
+    resource_compute_payload_max
   else if known_msg_type msg_type then
     consensus_control_payload_max
   else
@@ -139,6 +144,7 @@ let msg_type_name = function
   | 0x3d -> "VOTE_EVIDENCE"
   | 0x3e -> "CONS_ROUND_SYNC"
   | 0x40 -> "EPOCH_BROADCAST"
+  | 0x41 -> "RESOURCE_COMPUTE"
   | n -> Printf.sprintf "UNKNOWN(0x%02x)" n
 
 type frame = {

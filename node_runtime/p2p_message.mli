@@ -5,6 +5,7 @@ type domain =
   | Legacy_epoch
   | Tx_gossip
   | Consensus
+  | Resource_compute
   | Unknown of int
 
 val legacy_epoch_broadcast : int

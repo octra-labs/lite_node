@@ -331,7 +331,11 @@ let run ?(stale_retries = 1) cfg deps =
                         ~max_lag:cfg.snapshot_policy_threshold with
                 | C_catchup.In_sync ->
                   begin
-                    match H.in_sync_plan ~genesis_attested peer_root_quorum with
+                    match H.in_sync_plan
+                            ~required:state_attest_required
+                            ~has_committed_root:(committed_root_opt <> None)
+                            ~genesis_attested
+                            peer_root_quorum with
                     | H.Peer_root_mismatch { count; _ } ->
                       quarantine_peer_root_mismatch deps ~head:our_head_int count;
                       Lwt.return_unit

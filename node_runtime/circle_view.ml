@@ -48,6 +48,10 @@ type object_member_request = {
 
 module Rpc = Octra_core.Rpc
 
+let max_circle_id_bytes = 128
+let max_view_method_bytes = 64
+let max_view_params_bytes = 65_536
+
 let policy ~delivery_key_id ~activate_after_epoch ~expire_after_epoch ~tombstone ~revoked =
   {
     delivery_key_id;
@@ -72,11 +76,22 @@ let view_call_params params =
         Rpc.require_string params 1 "method" with
   | Error e, _ | _, Error e -> Error e
   | Ok circle_id, Ok method_name ->
-    Ok {
-      circle_id;
-      method_name;
-      call_params = params_json (Rpc.param_json params 2);
-    }
+    let call_params = params_json (Rpc.param_json params 2) in
+    if String.length circle_id > max_circle_id_bytes then
+      Error (Rpc.invalid_params "circle id exceeds limit")
+    else if String.length method_name > max_view_method_bytes then
+      Error (Rpc.invalid_params "circle view method exceeds limit")
+    else if
+      String.length (Yojson.Safe.to_string (`List call_params))
+      > max_view_params_bytes
+    then
+      Error (Rpc.invalid_params "circle view params exceed limit")
+    else
+      Ok {
+        circle_id;
+        method_name;
+        call_params;
+      }
 
 let asset_path_params params =
   match Rpc.require_string params 0 "circle_id", Rpc.require_string params 1 "path" with

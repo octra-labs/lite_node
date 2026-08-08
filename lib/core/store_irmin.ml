@@ -28,6 +28,22 @@ type batch_savepoint = {
   stealth_counter : int64;
 }
 
+type read_snapshot = {
+  tree : Store.tree;
+  state_root : string;
+  commit_hash : string;
+  epoch_id : int64;
+}
+
+type circle_public_asset = {
+  canonical_path : string;
+  path_key : string;
+  browser_mode : string;
+  resource_mode : string;
+  meta : Circles.asset_meta;
+  body_b64 : string;
+}
+
 let rec strip_trailing_slash path =
   let n = String.length path in
   if n > 1 && path.[n - 1] = Filename.dir_sep.[0] then
@@ -186,7 +202,7 @@ let save_batch t =
     }
   | None -> Error "store batch is not active"
 
-let restore_batch t savepoint =
+let restore_batch t (savepoint : batch_savepoint) =
   match t.batch_tree with
   | Some _ ->
     t.batch_tree <- Some savepoint.tree;
@@ -244,6 +260,82 @@ let head_tree_key t =
     let tree = Store.Commit.tree commit in
     let* key = tree_key t tree in
     Lwt.return (Option.map (fun key -> tree, key) key)
+
+let capture_read_snapshot t =
+  let* head = Store.Head.find t.store in
+  match head with
+  | None -> Lwt.return (Error "store head missing")
+  | Some commit ->
+    let tree = Store.Commit.tree commit in
+    let* epoch_raw = Store.Tree.find tree ["meta"; "last_epoch"] in
+    begin
+      match Option.bind epoch_raw Int64.of_string_opt with
+      | Some epoch_id when epoch_id >= 0L ->
+        Lwt.return
+          (Ok {
+             tree;
+             state_root =
+               Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree);
+             commit_hash =
+               Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit);
+             epoch_id;
+           })
+      | _ -> Lwt.return (Error "store epoch missing")
+    end
+
+let capture_read_snapshot_at t ~epoch_id ~state_root =
+  if epoch_id < 0L || epoch_id > Int64.of_int max_int then
+    Lwt.return (Error "store snapshot epoch refused")
+  else
+    let branch = Printf.sprintf "epoch_%Ld" epoch_id in
+    let* commit_opt = Store.Branch.find t.repo branch in
+    match commit_opt with
+    | None -> Lwt.return (Error "store snapshot branch missing")
+    | Some commit ->
+      let tree = Store.Commit.tree commit in
+      let actual_root =
+        Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree) in
+      let* stored_epoch = Store.Tree.find tree ["meta"; "last_epoch"] in
+      if stored_epoch <> Some (Int64.to_string epoch_id) then
+        Lwt.return (Error "store snapshot epoch differs")
+      else if actual_root <> state_root then
+        Lwt.return (Error "store snapshot root differs")
+      else
+        Lwt.return
+          (Ok {
+             tree;
+             state_root = actual_root;
+             commit_hash =
+               Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit);
+             epoch_id;
+           })
+
+let capture_read_snapshot_epoch t ~epoch_id =
+  if epoch_id < 0L || epoch_id > Int64.of_int max_int then
+    Lwt.return (Error "store snapshot epoch refused")
+  else
+    let branch = Printf.sprintf "epoch_%Ld" epoch_id in
+    let* commit_opt = Store.Branch.find t.repo branch in
+    match commit_opt with
+    | None -> Lwt.return (Error "store snapshot branch missing")
+    | Some commit ->
+      let tree = Store.Commit.tree commit in
+      let* stored_epoch = Store.Tree.find tree ["meta"; "last_epoch"] in
+      if stored_epoch <> Some (Int64.to_string epoch_id) then
+        Lwt.return (Error "store snapshot epoch differs")
+      else
+        Lwt.return
+          (Ok {
+             tree;
+             state_root =
+               Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree);
+             commit_hash =
+               Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit);
+             epoch_id;
+           })
+
+let read_snapshot (snapshot : read_snapshot) path =
+  Store.Tree.find snapshot.tree path
 
 let prove_tree t tree path =
   let* key = tree_key t tree in
@@ -1089,6 +1181,42 @@ let list_circle_stable_entries t circle_id =
     ) entries in
     Lwt.return pairs
 
+let list_circle_stable_entries_at snapshot circle_id =
+  let path = ["circles"; circle_id; "stable"; "by_hash"] in
+  let* tree_opt = Store.Tree.find_tree snapshot.tree path in
+  match tree_opt with
+  | None -> Lwt.return []
+  | Some tree ->
+    let* entries = Store.Tree.list tree [] in
+    let entries = List.sort (fun (a, _) (b, _) -> String.compare a b) entries in
+    Lwt_list.filter_map_s
+      (fun (key_hash, _) ->
+        let* value_opt = Store.Tree.find tree [key_hash] in
+        match value_opt with
+        | None -> Lwt.return_none
+        | Some value ->
+          begin
+            match Circles.stable_entry_of_yojson (Yojson.Safe.from_string value) with
+            | Ok entry -> Lwt.return_some entry
+            | Error _ -> Lwt.return_none
+            | exception _ -> Lwt.return_none
+          end)
+      entries
+
+let load_circle_stable_storage_at snapshot circle_id =
+  let* entries = list_circle_stable_entries_at snapshot circle_id in
+  let rec inline_pairs values = function
+    | [] -> Ok (List.rev values)
+    | entry :: rest ->
+      begin
+        match entry.Circles.value with
+        | Circles.Inline value ->
+          inline_pairs ((entry.raw_key, value) :: values) rest
+        | Circles.Blob_ref _ ->
+          Error "circle stable storage contains non-inline values"
+      end in
+  Lwt.return (inline_pairs [] entries)
+
 type circle_stable_page = {
   entries : Circles.stable_entry list;
   total : int;
@@ -1204,6 +1332,61 @@ let save_circle_asset_body_b64 t circle_id path_key body_b64 =
 
 let get_circle_asset_body_b64 t circle_id path_key =
   read t ["circles"; circle_id; "assets"; "by_hash"; path_key; "body_b64"]
+
+let get_circle_public_asset_at snapshot circle_id raw_path =
+  match Circles.path_key_of_raw_path raw_path with
+  | Error message -> Lwt.return (Error message)
+  | Ok (canonical_path, path_key) ->
+    let root = ["circles"; circle_id] in
+    let asset_root = root @ ["assets"; "by_hash"; path_key] in
+    let* browser_mode = read_snapshot snapshot (root @ ["browser"; "mode"]) in
+    let* resource_mode = read_snapshot snapshot (root @ ["resources"; "mode"]) in
+    let* meta_raw = read_snapshot snapshot (asset_root @ ["meta"]) in
+    let* body_b64 = read_snapshot snapshot (asset_root @ ["body_b64"]) in
+    begin
+      match browser_mode, resource_mode, meta_raw, body_b64 with
+      | Some browser_mode, Some resource_mode, Some meta_raw, Some body_b64 ->
+        begin
+          match Circles.asset_meta_of_yojson (Yojson.Safe.from_string meta_raw) with
+          | Ok meta
+            when meta.Circles.path_key = path_key
+                 && meta.canonical_path = canonical_path ->
+            Lwt.return
+              (Ok {
+                 canonical_path;
+                 path_key;
+                 browser_mode;
+                 resource_mode;
+                 meta;
+                 body_b64;
+               })
+          | Ok _ -> Lwt.return (Error "circle asset metadata differs")
+          | Error message -> Lwt.return (Error message)
+        end
+      | _ -> Lwt.return (Error "circle asset missing")
+    end
+
+type circle_program_snapshot = {
+  runtime : string;
+  code_hash : string;
+  privacy_class : string;
+  resource_mode : string;
+  code_b64 : string;
+}
+
+let get_circle_program_at snapshot circle_id =
+  let root = ["circles"; circle_id] in
+  let* runtime = read_snapshot snapshot (root @ ["runtime"]) in
+  let* code_hash = read_snapshot snapshot (root @ ["code_hash"]) in
+  let* privacy_class = read_snapshot snapshot (root @ ["privacy"; "class"]) in
+  let* resource_mode = read_snapshot snapshot (root @ ["resources"; "mode"]) in
+  let* code_b64 = read_snapshot snapshot (root @ ["program"; "code_b64"]) in
+  match runtime, code_hash, privacy_class, resource_mode, code_b64 with
+  | Some runtime, Some code_hash, Some privacy_class, Some resource_mode,
+    Some code_b64 ->
+    Lwt.return
+      (Ok { runtime; code_hash; privacy_class; resource_mode; code_b64 })
+  | _ -> Lwt.return (Error "circle program snapshot missing")
 
 let save_circle_asset_ciphertext_b64 t circle_id path_key ciphertext_b64 =
   write t ["circles"; circle_id; "assets"; "by_hash"; path_key; "ciphertext_b64"] ciphertext_b64

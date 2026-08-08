@@ -223,7 +223,7 @@ let run_account deps =
     add_account = (fun ~addr ~pub ~amount ->
       Ledger.add_account_with_pubkey deps.ledger addr amount pub);
     set_meta = (fun ~key ~value -> set_meta deps ~key ~value);
-    flush_dirty = (fun () -> run_s (Ledger.flush_dirty_lwt deps.ledger));
+    flush_dirty = (fun () -> Lwt_main.run (Ledger.flush_dirty_lwt deps.ledger));
   }
 
 let run_epoch deps =

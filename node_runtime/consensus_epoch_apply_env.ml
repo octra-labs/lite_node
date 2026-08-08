@@ -49,6 +49,12 @@ let current_validator_pubkeys env =
     ~driver:(env.driver ())
     ~fallback:(fun () -> env.validator_fallback (env.current_epoch ()))
 
+let resolve_epoch_ts ~consensus_mode env epoch_id =
+  match env.epoch_ts epoch_id with
+  | Some epoch_ts -> Ok epoch_ts
+  | None when consensus_mode -> Error "missing finalized epoch timestamp"
+  | None -> Ok 0.
+
 let standard
     ~chain_id
     ~epoch_id

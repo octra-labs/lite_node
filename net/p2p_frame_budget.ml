@@ -57,7 +57,8 @@ let lane msg_type =
        || msg_type = P2p_frame.msg_bundle_response
        || msg_type = P2p_frame.msg_catchup_range_response
        || msg_type = P2p_frame.msg_catchup_range_response_v2
-       || msg_type = P2p_frame.msg_epoch_broadcast then Data
+       || msg_type = P2p_frame.msg_epoch_broadcast
+       || msg_type = P2p_frame.msg_resource_compute then Data
   else Control
 
 let select t = function

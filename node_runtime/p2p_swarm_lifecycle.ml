@@ -22,6 +22,7 @@ type deps = {
   observer : bool;
   tx : tx_callbacks;
   on_consensus : Octra_net.P2p_conn.t -> Octra_net.P2p_frame.frame -> unit;
+  on_resource_compute : Octra_net.P2p_conn.t -> Octra_net.P2p_frame.frame -> unit;
 }
 
 type node_deps = {
@@ -33,6 +34,7 @@ type node_deps = {
   now : unit -> float;
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  resource_compute : Resource_compute_service.t option;
 }
 
 let frame_tx_gossip payload =
@@ -80,6 +82,7 @@ let handle_frame_with_transport
     ~(tx : tx_callbacks)
     ~(transport : transport)
     ~on_consensus
+    ~on_resource_compute
     frame =
   P2p_swarm_dispatch.handle_frame
     {
@@ -87,6 +90,7 @@ let handle_frame_with_transport
       peer_id;
       tx = dispatch_tx_deps tx transport;
       on_consensus;
+      on_resource_compute;
     }
     frame
 
@@ -97,6 +101,7 @@ let handle_frame (deps : deps) swarm conn frame =
     ~tx:deps.tx
     ~transport:(transport_of_peer swarm conn)
     ~on_consensus:(fun () -> deps.on_consensus conn frame)
+    ~on_resource_compute:(fun () -> deps.on_resource_compute conn frame)
     frame;
   Lwt.return_unit
 
@@ -124,11 +129,22 @@ let forward_consensus driver_ref conn frame =
       Octra_consensus.C_driver.on_p2p_message driver conn frame)
   | None -> ()
 
+let forward_resource_compute service conn frame =
+  match service with
+  | Some actor ->
+    Lwt.async (fun () ->
+      Resource_compute_service.on_message
+        actor
+        ~source:conn.Octra_net.P2p_conn.peer_id
+        frame.Octra_net.P2p_frame.payload)
+  | None -> ()
+
 let node_lifecycle_deps (deps : node_deps) =
   {
     observer = deps.observer;
     tx = node_tx_callbacks deps;
     on_consensus = forward_consensus deps.driver_ref;
+    on_resource_compute = forward_resource_compute deps.resource_compute;
   }
 
 let node_task ~swarm deps =

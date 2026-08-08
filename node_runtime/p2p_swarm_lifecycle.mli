@@ -22,6 +22,7 @@ type deps = {
   observer : bool;
   tx : tx_callbacks;
   on_consensus : Octra_net.P2p_conn.t -> Octra_net.P2p_frame.frame -> unit;
+  on_resource_compute : Octra_net.P2p_conn.t -> Octra_net.P2p_frame.frame -> unit;
 }
 
 type node_deps = {
@@ -33,6 +34,7 @@ type node_deps = {
   now : unit -> float;
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  resource_compute : Resource_compute_service.t option;
 }
 
 val node_tx_callbacks :
@@ -49,6 +51,7 @@ val handle_frame_with_transport :
   tx:tx_callbacks ->
   transport:transport ->
   on_consensus:(unit -> unit) ->
+  on_resource_compute:(unit -> unit) ->
   Octra_net.P2p_frame.frame ->
   unit
 

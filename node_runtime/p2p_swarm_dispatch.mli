@@ -20,6 +20,7 @@ type deps = {
   peer_id : string;
   tx : tx_deps;
   on_consensus : unit -> unit;
+  on_resource_compute : unit -> unit;
 }
 
 val handle_frame :

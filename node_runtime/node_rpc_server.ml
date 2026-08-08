@@ -44,6 +44,7 @@ type config = {
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   epoch_visibility : Epoch_visibility.t;
+  resource_compute : Resource_compute_service.t;
   deps : deps;
 }
 
@@ -64,6 +65,7 @@ type ctx = {
   program_trust : Octra_vm.Program_trust.t;
   migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
+  resource_compute : Resource_compute_service.t;
   deps : deps;
 } [@@warning "-69"]
 
@@ -401,6 +403,13 @@ let effect_dispatch =
     private_transfer = octra_private_transfer;
   }
 
+let compute_dispatch = [
+  "octra_circleComputeSubmit",
+  (fun params ctx -> Resource_compute_rpc.submit ctx.resource_compute params);
+  "octra_circleComputeStatus",
+  (fun params ctx -> Resource_compute_rpc.status ctx.resource_compute params);
+]
+
 let read_error =
   Rpc.err
     (-32012)
@@ -439,6 +448,7 @@ let dispatch visibility :
     effect_dispatch.submission
     @ effect_dispatch.staging
     @ effect_dispatch.mutation
+    @ compute_dispatch
   in
   reads @ effects
 
@@ -482,6 +492,7 @@ let start (cfg : config) =
     program_trust = cfg.program_trust;
     migration_entitlements = cfg.migration_entitlements;
     consensus_driver_ref = cfg.consensus_driver_ref;
+    resource_compute = cfg.resource_compute;
     deps = cfg.deps;
   } in
   let routes = dispatch cfg.epoch_visibility in

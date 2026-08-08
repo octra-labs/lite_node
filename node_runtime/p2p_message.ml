@@ -5,6 +5,7 @@ type domain =
   | Legacy_epoch
   | Tx_gossip
   | Consensus
+  | Resource_compute
   | Unknown of int
 
 let consensus_types = [
@@ -33,4 +34,5 @@ let classify = function
   | t when t = legacy_epoch_broadcast -> Legacy_epoch
   | t when t = Octra_net.P2p_frame.msg_tx_gossip -> Tx_gossip
   | t when is_consensus t -> Consensus
+  | t when t = Octra_net.P2p_frame.msg_resource_compute -> Resource_compute
   | t -> Unknown t

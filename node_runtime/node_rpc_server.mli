@@ -42,6 +42,7 @@ type config = {
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   epoch_visibility : Epoch_visibility.t;
+  resource_compute : Resource_compute_service.t;
   deps : deps;
 }
 

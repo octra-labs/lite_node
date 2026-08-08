@@ -3,6 +3,8 @@
 
 module Rpc = Octra_core.Rpc
 
+let view_capacity = Circle_view_capacity.create ~limit:2
+
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
 type 'handler dispatch_adapters = {
@@ -393,32 +395,38 @@ let view_call
     ~call_params
     ~caller_addr
     ~include_storage =
-  let open Lwt.Syntax in
-  let* result =
-    Octra_circle_runtime.Circle_exec.execute_view_call
-      ~trusted
-      ~ctx:view_ctx
-      store
-      circle_id
-      method_name
-      call_params
-      caller_addr in
-  match Octra_vm.Receipt_view.view_call_outcome result with
-  | Octra_vm.Receipt_view.View_call_ok return_value ->
-    if include_storage then
-      let* storage_result =
-        Octra_circle_runtime.Circle_exec.list_storage_pairs store circle_id in
-      begin
-        match storage_result with
-        | Ok storage_pairs ->
-          ok (Circle_view.view_result ~storage_pairs return_value)
-        | Error e ->
-          Lwt.return (Error (rpc_error e))
-      end
-    else
-      ok (Circle_view.view_result return_value)
-  | Octra_vm.Receipt_view.View_call_failed error ->
-    Lwt.return (Error (rpc_error error))
+  Circle_view_capacity.with_slot
+    view_capacity
+    ~busy:(fun () ->
+      Lwt.return
+        (Error (Rpc.err (-32005) "circle view busy" None)))
+    (fun () ->
+      let open Lwt.Syntax in
+      let* result =
+        Octra_circle_runtime.Circle_exec.execute_view_call
+          ~trusted
+          ~ctx:view_ctx
+          store
+          circle_id
+          method_name
+          call_params
+          caller_addr in
+      match Octra_vm.Receipt_view.view_call_outcome result with
+      | Octra_vm.Receipt_view.View_call_ok return_value ->
+        if include_storage then
+          let* storage_result =
+            Octra_circle_runtime.Circle_exec.list_storage_pairs store circle_id in
+          begin
+            match storage_result with
+            | Ok storage_pairs ->
+              ok (Circle_view.view_result ~storage_pairs return_value)
+            | Error e ->
+              Lwt.return (Error (rpc_error e))
+          end
+        else
+          ok (Circle_view.view_result return_value)
+      | Octra_vm.Receipt_view.View_call_failed error ->
+        Lwt.return (Error (rpc_error error)))
 
 let view_call_public
     ?(trusted=[])

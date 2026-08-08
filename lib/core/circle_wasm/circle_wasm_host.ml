@@ -13,6 +13,10 @@ type descriptor = {
   manifest : Yojson.Safe.t option;
 }
 
+type execution_profile =
+  | Standard
+  | Compute
+
 type wasm_event = {
   topic : string;
   data : string;
@@ -52,6 +56,9 @@ type encrypted_asset_put = {
 type exec_result = {
   success : bool;
   effort_used : int;
+  compute_trace_root : string option;
+  compute_steps : int64 option;
+  compute_operations : int64 option;
   response_value : Circle_wasm_codec.response option;
   response_status : int;
   storage_tbl : (string, string) Hashtbl.t;
@@ -443,6 +450,26 @@ let decode_optional_i64_field name fields =
   | Some `Null | None -> Ok None
   | _ -> Error ("invalid wasm encrypted asset effect")
 
+let lower_hex64 value =
+  String.length value = 64
+  && String.for_all
+       (function
+        | '0' .. '9' | 'a' .. 'f' -> true
+        | _ -> false)
+       value
+
+let decode_compute_trace fields =
+  match
+    List.assoc_opt "compute_trace_root" fields,
+    decode_optional_i64_field "compute_steps" fields,
+    decode_optional_i64_field "compute_operations" fields
+  with
+  | (None | Some `Null), Ok None, Ok None -> Ok (None, None, None)
+  | Some (`String root), Ok (Some steps), Ok (Some operations)
+    when lower_hex64 root && steps > 0L && operations > 0L ->
+    Ok (Some root, Some steps, Some operations)
+  | _ -> Error "invalid wasm compute trace"
+
 let decode_encrypted_asset_put = function
   | `Assoc fields ->
     begin
@@ -530,6 +557,49 @@ let decode_encrypted_assets = function
   | _ ->
     Error "invalid wasm encrypted asset effects"
 
+let compute_storage_payload action cache_key fields =
+  `Assoc
+    ([
+      "action", `String action;
+      "compute_storage_cache_key", `String cache_key;
+    ] @ fields)
+
+let compute_storage_begin cache_key =
+  read_process_json
+    (compute_storage_payload "compute_storage_begin" cache_key [])
+
+let compute_storage_put ~cache_key ~key ~value =
+  read_process_json
+    (compute_storage_payload
+       "compute_storage_put"
+       cache_key
+       [
+         "compute_storage_key", `String key;
+         "compute_storage_value_b64", `String (Base64.encode_exn value);
+       ])
+
+let compute_storage_seal ~cache_key ~root ~entries ~bytes =
+  read_process_json
+    (compute_storage_payload
+       "compute_storage_seal"
+       cache_key
+       [
+         "compute_storage_root", `String root;
+         "compute_storage_entries", `Int entries;
+         "compute_storage_bytes", `Int bytes;
+       ])
+
+let compute_storage_status cache_key =
+  read_process_json
+    (compute_storage_payload "compute_storage_status" cache_key [])
+
+let compute_storage_drop cache_key =
+  read_process_json
+    (compute_storage_payload "compute_storage_drop" cache_key [])
+
+let compute_self_test () =
+  read_process_json (`Assoc ["action", `String "compute_self_test"])
+
 let validate code_b64 =
   let payload =
     `Assoc [
@@ -556,7 +626,11 @@ let describe code_b64 =
   | Ok json ->
     Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
-let execute
+let execution_profile_name = function
+  | Standard -> "standard"
+  | Compute -> "compute"
+
+let execute_with_profile
     ~code_b64
     ~export_name
     ~request_bytes
@@ -572,6 +646,9 @@ let execute
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
+    ~compute_storage_cache_key
+    ~compute_session_scope
+    ~execution_profile
     ~is_view
     ~update_policy =
   let code_key = code_cache_key code_b64 in
@@ -586,8 +663,10 @@ let execute
       end
     | None -> false in
   let rec dispatch ~allow_cache_only ~allow_code_cache_only =
+    let use_compute_storage = Option.is_some compute_storage_cache_key in
     let storage_entry =
-      Option.map (fun key -> cached_storage_entry key storage_tbl) storage_cache_key in
+      if use_compute_storage then None
+      else Option.map (fun key -> cached_storage_entry key storage_tbl) storage_cache_key in
     let use_cache_only =
       allow_cache_only
       && Option.value
@@ -597,14 +676,16 @@ let execute
       allow_code_cache_only
       && code_seeded code_key in
     let storage_json =
-      if use_cache_only then
+      if use_compute_storage || use_cache_only then
         `Null
       else
         match storage_entry with
         | Some entry -> `List entry.storage_json
         | None -> `List (make_storage_pairs_json storage_tbl) in
     let storage_cache_key_json =
-      if use_cache_only then
+      if use_compute_storage then
+        `Null
+      else if use_cache_only then
         match storage_cache_key with
         | Some key -> `String key
         | None -> `Null
@@ -662,6 +743,19 @@ let execute
              Circle_wasm_public_read.yojson_of_snapshot
              public_reads);
         "fuel_limit", `Int fuel_limit;
+        "compute_storage_cache_key",
+        begin
+          match compute_storage_cache_key with
+          | Some key -> `String key
+          | None -> `Null
+        end;
+        "compute_session_scope",
+        begin
+          match compute_session_scope with
+          | Some scope -> `String scope
+          | None -> `Null
+        end;
+        "execution_profile", `String (execution_profile_name execution_profile);
         "is_view", `Bool is_view;
         "update_policy", `Bool update_policy;
       ] in
@@ -748,6 +842,7 @@ let execute
                 decode_assets assets_json,
                 decode_encrypted_assets encrypted_assets_json,
                 Circle_hfhe_transcript.entries_of_json hfhe_transcript_json,
+                decode_compute_trace fields,
                 (match response_json with
                  | `Null -> Ok None
                  | _ ->
@@ -763,7 +858,9 @@ let execute
                    end)
               with
               | Ok storage_tbl, Ok events, Ok spawns, Ok assets,
-                Ok encrypted_assets, Ok hfhe_transcript, Ok response_value ->
+                Ok encrypted_assets, Ok hfhe_transcript,
+                Ok (compute_trace_root, compute_steps, compute_operations),
+                Ok response_value ->
                 let error =
                   match List.assoc_opt "error" fields with
                   | Some (`String msg) -> Some msg
@@ -772,6 +869,9 @@ let execute
                   (Ok {
                      success;
                      effort_used;
+                     compute_trace_root;
+                     compute_steps;
+                     compute_operations;
                      response_value;
                      response_status = status_code;
                      storage_tbl;
@@ -782,13 +882,14 @@ let execute
                      hfhe_transcript;
                      error;
                    })
-              | Error e, _, _, _, _, _, _
-              | _, Error e, _, _, _, _, _
-              | _, _, Error e, _, _, _, _
-              | _, _, _, Error e, _, _, _
-              | _, _, _, _, Error e, _, _
-              | _, _, _, _, _, Error e, _
-              | _, _, _, _, _, _, Error e ->
+              | Error e, _, _, _, _, _, _, _
+              | _, Error e, _, _, _, _, _, _
+              | _, _, Error e, _, _, _, _, _
+              | _, _, _, Error e, _, _, _, _
+              | _, _, _, _, Error e, _, _, _
+              | _, _, _, _, _, Error e, _, _
+              | _, _, _, _, _, _, Error e, _
+              | _, _, _, _, _, _, _, Error e ->
                 Lwt.return (Error (Rejected e))
             end
           | _ ->
@@ -797,3 +898,190 @@ let execute
     end
   | Ok _ ->
     Lwt.return (Error (Rejected "invalid wasm execution response"))
+
+let execute
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+    ~is_view
+    ~update_policy =
+  execute_with_profile
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+    ~compute_storage_cache_key:None
+    ~compute_session_scope:None
+    ~execution_profile:Standard
+    ~is_view
+    ~update_policy
+
+let execute_compute_with_storage_inner
+    ~compute_session_scope
+    ~compute_storage_cache_key
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit =
+  execute_with_profile
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+    ~compute_storage_cache_key
+    ~compute_session_scope
+    ~execution_profile:Compute
+    ~is_view:true
+    ~update_policy:false
+
+let execute_compute_with_storage
+    ~compute_storage_cache_key
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit =
+  execute_compute_with_storage_inner
+    ~compute_session_scope:None
+    ~compute_storage_cache_key
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+
+let execute_compute_isolated_with_storage
+    ~compute_session_scope
+    ~compute_storage_cache_key
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit =
+  execute_compute_with_storage_inner
+    ~compute_session_scope:(Some compute_session_scope)
+    ~compute_storage_cache_key
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+
+let execute_compute
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit =
+  execute_compute_with_storage
+    ~compute_storage_cache_key:None
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit

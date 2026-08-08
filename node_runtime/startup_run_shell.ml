@@ -62,6 +62,7 @@ type node_launch_runtime = {
   now : unit -> float;
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  resource_compute : Resource_compute_service.t option;
   close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
@@ -72,7 +73,7 @@ type join_log = {
 }
 
 let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
-    ~now ~max_drift ~driver_ref =
+    ~now ~max_drift ~driver_ref ~resource_compute =
   P2p_swarm_lifecycle.{
     observer;
     guard;
@@ -82,6 +83,7 @@ let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
     now;
     max_drift;
     driver_ref;
+    resource_compute;
   }
 
 let make_node_launch_deps ~p2p ~rpc ~services ~observer ~tick_loop ~swarm
@@ -89,7 +91,8 @@ let make_node_launch_deps ~p2p ~rpc ~services ~observer ~tick_loop ~swarm
   { p2p; rpc; services; observer; tick_loop; swarm; swarm_deps }
 
 let make_node_launch_deps_with_swarm ~p2p ~rpc ~services ~observer ~tick_loop
-    ~swarm ~guard ~find_tx ~find_account ~add_tx ~now ~max_drift ~driver_ref =
+    ~swarm ~guard ~find_tx ~find_account ~add_tx ~now ~max_drift ~driver_ref
+    ~resource_compute =
   make_node_launch_deps
     ~p2p
     ~rpc
@@ -106,7 +109,8 @@ let make_node_launch_deps_with_swarm ~p2p ~rpc ~services ~observer ~tick_loop
          ~add_tx
          ~now
          ~max_drift
-         ~driver_ref)
+         ~driver_ref
+         ~resource_compute)
 
 let launch_tasks (deps : 'a launch_tasks) =
   node_tasks
@@ -202,6 +206,7 @@ let run_node_runtime (runtime : node_launch_runtime) =
        ~add_tx:runtime.add_tx
        ~now:runtime.now
        ~max_drift:runtime.max_drift
-       ~driver_ref:runtime.driver_ref)
+       ~driver_ref:runtime.driver_ref
+       ~resource_compute:runtime.resource_compute)
     ~close_chaindata:runtime.close_chaindata
     ~exit_fatal:runtime.exit_fatal

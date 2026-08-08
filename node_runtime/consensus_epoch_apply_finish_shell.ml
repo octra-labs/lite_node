@@ -136,11 +136,14 @@ let run (deps : deps) (request : request) =
     ~validators_sha;
   let confirmed_txs = List.rev_map fst !(request.pending_tx_saves) in
   let epoch_ts =
-    match request.epoch_env.epoch_ts epoch_id with
-    | Some value -> value
-    | None when request.consensus_mode ->
-      invalid_arg "missing finalized epoch timestamp"
-    | None -> 0.
+    match
+      Env.resolve_epoch_ts
+        ~consensus_mode:request.consensus_mode
+        request.epoch_env
+        epoch_id
+    with
+    | Ok value -> value
+    | Error error -> invalid_arg error
   in
   let* finalized =
     deps.finalize

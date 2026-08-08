@@ -15,6 +15,7 @@ type deps = {
   now : unit -> float;
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  resource_compute : Resource_compute_service.t option;
   close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
@@ -46,6 +47,7 @@ let run deps =
         now = deps.now;
         max_drift = deps.max_drift;
         driver_ref = deps.driver_ref;
+        resource_compute = deps.resource_compute;
         close_chaindata = deps.close_chaindata;
         exit_fatal = deps.exit_fatal;
       })

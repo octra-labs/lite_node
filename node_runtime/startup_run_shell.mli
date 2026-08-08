@@ -67,6 +67,7 @@ type node_launch_runtime = {
   now : unit -> float;
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  resource_compute : Resource_compute_service.t option;
   close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
@@ -85,6 +86,7 @@ val make_node_swarm_deps :
   now:(unit -> float) ->
   max_drift:float ->
   driver_ref:Octra_consensus.C_driver.t option ref ->
+  resource_compute:Resource_compute_service.t option ->
   P2p_swarm_lifecycle.node_deps
 
 val make_node_launch_deps :
@@ -111,6 +113,7 @@ val make_node_launch_deps_with_swarm :
   now:(unit -> float) ->
   max_drift:float ->
   driver_ref:Octra_consensus.C_driver.t option ref ->
+  resource_compute:Resource_compute_service.t option ->
   node_launch_deps
 
 val launch_tasks :

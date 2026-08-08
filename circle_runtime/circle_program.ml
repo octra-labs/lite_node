@@ -3,9 +3,14 @@
 
 open Lwt.Syntax
 
+type execution =
+  | Standard
+  | Compute
+
 type method_info = {
   name : string;
   view : bool;
+  execution : execution;
 }
 
 type descriptor = {
@@ -95,54 +100,102 @@ let decode_descriptor_bytecode code_b64 =
 
 let methods_of_bytecode bytecode =
   Octra_vm.Contract.extract_methods bytecode
-  |> List.map (fun (name, view) -> { name; view })
+  |> List.map (fun (name, view) -> { name; view; execution = Standard })
+
+let execution_name = function
+  | Standard -> "standard"
+  | Compute -> "compute"
+
+let execution_of_manifest ~view fields =
+  match List.assoc_opt "execution" fields with
+  | None
+  | Some (`String "standard") ->
+    Ok Standard
+  | Some (`String "compute") when view ->
+    Ok Compute
+  | Some (`String "compute") ->
+    Error "compute method must be view-only"
+  | Some (`String _) ->
+    Error "invalid wasm method execution"
+  | Some _ ->
+    Error "invalid wasm method execution encoding"
+
+let method_of_manifest = function
+  | `Assoc fields ->
+    begin
+      match List.assoc_opt "name" fields, List.assoc_opt "view" fields with
+      | Some (`String name), Some (`Bool view) ->
+        begin
+          match execution_of_manifest ~view fields with
+          | Ok execution -> Ok { name; view; execution }
+          | Error _ as error -> error
+        end
+      | _ ->
+        Error "invalid wasm method descriptor"
+    end
+  | _ ->
+    Error "invalid wasm method descriptor"
+
+let parse_manifest_methods entries =
+  let rec loop methods = function
+    | [] -> Ok (List.rev methods)
+    | entry :: rest ->
+      begin
+        match method_of_manifest entry with
+        | Ok method_info -> loop (method_info :: methods) rest
+        | Error _ as error -> error
+      end
+  in
+  loop [] entries
+
+let exported_wasm_methods descriptor =
+  let names =
+    (descriptor : Octra_core.Circle_wasm_host.descriptor).exports
+    |> List.filter (fun (export : Octra_core.Circle_wasm_host.export_info) ->
+      String.equal export.kind "function")
+    |> List.map (fun (export : Octra_core.Circle_wasm_host.export_info) -> export.name)
+  in
+  let methods = ref [] in
+  if List.mem "octra_query" names then
+    methods := { name = "octra_query"; view = true; execution = Standard } :: !methods;
+  if List.mem "octra_update" names then
+    methods := { name = "octra_update"; view = false; execution = Standard } :: !methods;
+  if List.mem "octra_http_request" names then
+    methods := { name = "octra_http_request"; view = true; execution = Standard } :: !methods;
+  List.rev !methods
 
 let methods_of_wasm_descriptor descriptor =
-  let manifest_methods =
-    match (descriptor : Octra_core.Circle_wasm_host.descriptor).manifest with
-    | Some (`Assoc fields) ->
-      begin
-        match List.assoc_opt "methods" fields with
-        | Some (`List entries) ->
-          let parse_entry = function
-            | `Assoc entry_fields ->
-              begin
-                match List.assoc_opt "name" entry_fields, List.assoc_opt "view" entry_fields with
-                | Some (`String name), Some (`Bool view) ->
-                  Some { name; view }
-                | _ ->
-                  None
-              end
-            | _ ->
-              None
-          in
-          List.filter_map parse_entry entries
-        | _ ->
-          []
-      end
-    | _ ->
-      []
-  in
-  if manifest_methods <> [] then
-    manifest_methods
-  else
-    let names =
-      (descriptor : Octra_core.Circle_wasm_host.descriptor).exports
-      |> List.filter (fun (export : Octra_core.Circle_wasm_host.export_info) -> String.equal export.kind "function")
-      |> List.map (fun (export : Octra_core.Circle_wasm_host.export_info) -> export.name) in
-    let methods = ref [] in
-    if List.mem "octra_query" names then
-      methods := { name = "octra_query"; view = true } :: !methods;
-    if List.mem "octra_update" names then
-      methods := { name = "octra_update"; view = false } :: !methods;
-    if List.mem "octra_http_request" names then
-      methods := { name = "octra_http_request"; view = true } :: !methods;
-    List.rev !methods
+  match (descriptor : Octra_core.Circle_wasm_host.descriptor).manifest with
+  | None ->
+    Ok (exported_wasm_methods descriptor)
+  | Some (`Assoc fields) ->
+    begin
+      match List.assoc_opt "methods" fields with
+      | None
+      | Some (`List []) ->
+        Ok (exported_wasm_methods descriptor)
+      | Some (`List entries) ->
+        parse_manifest_methods entries
+      | Some _ ->
+        Error "invalid wasm methods manifest"
+    end
+  | Some _ ->
+    Error "invalid wasm manifest"
+
+let execution_for_method methods method_name =
+  match
+    List.find_opt
+      (fun method_info -> String.equal method_info.name method_name)
+      methods
+  with
+  | Some method_info -> method_info.execution
+  | None -> Standard
 
 let yojson_of_method_info t =
   `Assoc [
     "name", `String t.name;
     "view", `Bool t.view;
+    "execution", `String (execution_name t.execution);
   ]
 
 let yojson_of_descriptor (t : descriptor) =
@@ -218,15 +271,21 @@ let describe store circle_id =
                          ("invalid circle wasm: "
                           ^ Octra_core.Circle_wasm_host.error_message e))
                   | Ok wasm_descriptor ->
-                    Lwt.return (Ok {
-                      circle_id;
-                      info;
-                      has_code = true;
-                      code_hash = info.code_hash;
-                      code_b64 = None;
-                      code_bytes = String.length raw_code;
-                      methods = methods_of_wasm_descriptor wasm_descriptor;
-                    })
+                    begin
+                      match methods_of_wasm_descriptor wasm_descriptor with
+                      | Error e ->
+                        Lwt.return (Error ("invalid circle wasm manifest: " ^ e))
+                      | Ok methods ->
+                        Lwt.return (Ok {
+                          circle_id;
+                          info;
+                          has_code = true;
+                          code_hash = info.code_hash;
+                          code_b64 = None;
+                          code_bytes = String.length raw_code;
+                          methods;
+                        })
+                    end
                 end
           with e ->
             Lwt.return (Error ("invalid circle code: " ^ Printexc.to_string e))
@@ -291,33 +350,42 @@ let load ?(trusted = []) store circle_id =
                     Lwt.return (Error e)
                   | Ok wasm_descriptor ->
                     begin
-                      match
-                        Octra_core.Circle_wasm_public_read.declarations_of_manifest
-                          wasm_descriptor.manifest
-                      with
+                      match methods_of_wasm_descriptor wasm_descriptor with
                       | Error e ->
                         Lwt.return
                           (Error
                              (Octra_core.Circle_wasm_host.Rejected
                                 ("invalid circle wasm manifest: " ^ e)))
-                      | Ok public_reads ->
-                        let loaded = {
-                          circle_id;
-                          info;
-                          code =
-                            Wasm_v1 {
-                              code_b64;
-                              code_raw = raw_code;
-                              exports = wasm_descriptor.exports;
-                              methods = methods_of_wasm_descriptor wasm_descriptor;
-                              public_reads;
-                            };
-                        } in
-                        Hashtbl.replace
-                          loaded_cache
-                          cache_key
-                          { loaded; updated_at = Unix.gettimeofday () };
-                        Lwt.return (Ok loaded)
+                      | Ok methods ->
+                        begin
+                          match
+                            Octra_core.Circle_wasm_public_read.declarations_of_manifest
+                              wasm_descriptor.manifest
+                          with
+                          | Error e ->
+                            Lwt.return
+                              (Error
+                                 (Octra_core.Circle_wasm_host.Rejected
+                                    ("invalid circle wasm manifest: " ^ e)))
+                          | Ok public_reads ->
+                            let loaded = {
+                              circle_id;
+                              info;
+                              code =
+                                Wasm_v1 {
+                                  code_b64;
+                                  code_raw = raw_code;
+                                  exports = wasm_descriptor.exports;
+                                  methods;
+                                  public_reads;
+                                };
+                            } in
+                            Hashtbl.replace
+                              loaded_cache
+                              cache_key
+                              { loaded; updated_at = Unix.gettimeofday () };
+                            Lwt.return (Ok loaded)
+                        end
                     end
                 end
           with e ->

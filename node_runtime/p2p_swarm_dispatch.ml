@@ -20,6 +20,7 @@ type deps = {
   peer_id : string;
   tx : tx_deps;
   on_consensus : unit -> unit;
+  on_resource_compute : unit -> unit;
 }
 
 let log_recv frame =
@@ -71,4 +72,5 @@ let handle_frame deps frame =
   | P2p_message.Legacy_epoch -> handle_legacy deps frame
   | P2p_message.Tx_gossip -> handle_tx deps frame
   | P2p_message.Consensus -> deps.on_consensus ()
+  | P2p_message.Resource_compute -> deps.on_resource_compute ()
   | P2p_message.Unknown t -> handle_unknown frame t
