@@ -65,8 +65,17 @@ type job_status =
   | Finished of response
   | Refused of string
 
+type cancellation = {
+  caller : string;
+  caller_public_key : string;
+  caller_signature : string;
+  session_id : string;
+}
+
 type job = {
   caller : string;
+  session_id : string;
+  mutable lease_active : bool;
   result : (response, string) result Lwt.t;
 }
 
@@ -93,6 +102,26 @@ type offer_snapshot = {
   reveals : Selection.reveal list;
 }
 
+type committee_lease = {
+  caller : string;
+  caller_public_key : string;
+  session_id : string;
+  circle_id : string;
+  model_epoch : int64;
+  model_state_root : string;
+  graph_root : string;
+  model_root : string;
+  program_root : string;
+  executor_root : string;
+  validator_set_root : string;
+  request_epoch : int64;
+  request_state_root : string;
+  expires_epoch : int64;
+  max_request_bytes : int;
+  max_response_bytes : int;
+  selection : Selection.selection;
+}
+
 type certificate_progress =
   | Certificate_pending
   | Certificate_finished of response
@@ -114,6 +143,9 @@ type _ actor_message =
       job_id : string;
       caller : string;
     } -> unit actor_message
+  | Cancel_session : cancellation -> (int, string) result actor_message
+  | Complete_background : int -> unit actor_message
+  | Remember_committee : committee_lease -> unit actor_message
   | Query_status : {
       caller : string;
       job_id : string;
@@ -142,11 +174,15 @@ type t = {
   jobs : (string, job) Hashtbl.t;
   job_order : string Queue.t;
   caller_jobs : (string, int) Hashtbl.t;
-  mailbox : actor_command Queue.t;
-  control_mailbox : actor_command Queue.t;
-  mailbox_ready : unit Lwt_condition.t;
-  mailbox_space : unit Lwt_condition.t;
-  mutable mailbox_open : bool;
+  cancelled_sessions : (string, int64) Hashtbl.t;
+  committee_leases : (string, committee_lease) Hashtbl.t;
+  background_tasks : (int, unit Lwt.t) Hashtbl.t;
+  mutable next_background_id : int;
+  data_channel : actor_command Queue.t;
+  control_channel : actor_command Queue.t;
+  channel_ready : unit Lwt_condition.t;
+  channel_space : unit Lwt_condition.t;
+  mutable channel_open : bool;
   mutable actor_generation : int64;
   mutable self_test : self_test option;
 }
@@ -159,10 +195,12 @@ let capability_ttl = 16L
 let max_offers = 64
 let max_requests = 128
 let max_jobs = 32
+let max_cancelled_sessions = 256
+let max_committee_leases = 256
 let max_offer_records = 256
 let max_pending_reveals_per_node = 4
-let mailbox_capacity = 512
-let control_mailbox_capacity = 64
+let data_channel_limit = 512
+let control_channel_limit = 64
 let zero32 = String.make 32 '\000'
 let zero64 = String.make 64 '\000'
 
@@ -173,6 +211,9 @@ let actor_message_name : type reply. reply actor_message -> string = function
   | Apply_protocol _ -> "apply_protocol"
   | Admit_request _ -> "admit_request"
   | Complete_job _ -> "complete_job"
+  | Cancel_session _ -> "cancel_session"
+  | Complete_background _ -> "complete_background"
+  | Remember_committee _ -> "remember_committee"
   | Query_status _ -> "query_status"
   | Query_active_jobs -> "query_active_jobs"
   | Query_offer _ -> "query_offer"
@@ -181,7 +222,11 @@ let actor_message_name : type reply. reply actor_message -> string = function
   | Stop -> "stop"
 
 let actor_message_is_control : type reply. reply actor_message -> bool = function
-  | Complete_job _ | Stop -> true
+  | Complete_job _
+  | Cancel_session _
+  | Complete_background _
+  | Remember_committee _
+  | Stop -> true
   | Apply_protocol _
   | Admit_request _
   | Query_status _
@@ -191,23 +236,23 @@ let actor_message_is_control : type reply. reply actor_message -> bool = functio
   | Ensure_self_test -> false
 
 let enqueue_now t (Command command as envelope) =
-  let queue, capacity =
+  let channel, limit =
     if actor_message_is_control command.message then
-      t.control_mailbox, control_mailbox_capacity
+      t.control_channel, control_channel_limit
     else
-      t.mailbox, mailbox_capacity in
-  if not t.mailbox_open || Queue.length queue >= capacity then false
+      t.data_channel, data_channel_limit in
+  if not t.channel_open || Queue.length channel >= limit then false
   else begin
-    Queue.push envelope queue;
-    Lwt_condition.signal t.mailbox_ready ();
+    Queue.push envelope channel;
+    Lwt_condition.signal t.channel_ready ();
     true
   end
 
 let rec enqueue_wait t command =
   if enqueue_now t command then Lwt.return_true
-  else if not t.mailbox_open then Lwt.return_false
+  else if not t.channel_open then Lwt.return_false
   else
-    let* () = Lwt_condition.wait t.mailbox_space in
+    let* () = Lwt_condition.wait t.channel_space in
     enqueue_wait t command
 
 let actor_call_with enqueue t message =
@@ -223,6 +268,32 @@ let actor_call_with enqueue t message =
 
 let actor_call t message =
   actor_call_with enqueue_wait t message
+
+let spawn_background t kind run =
+  let task_id = t.next_background_id in
+  t.next_background_id <- t.next_background_id + 1;
+  let task =
+    Lwt.finalize
+      (fun () ->
+        Lwt.catch
+          run
+          (function
+           | Lwt.Canceled -> Lwt.return_unit
+           | Failure message
+             when message = "resource compute actor is stopping"
+               || message = "resource compute actor stopped" ->
+             Lwt.return_unit
+           | error ->
+             Log.warn "compute"
+               "event = background status = failed kind = %s reason = %s"
+               kind
+               (Printexc.to_string error);
+             Lwt.return_unit))
+      (fun () ->
+        Lwt.catch
+          (fun () -> actor_call t (Complete_background task_id))
+          (fun _ -> Lwt.return_unit)) in
+  Hashtbl.add t.background_tasks task_id task
 
 let actor_try_call t message =
   actor_call_with
@@ -599,9 +670,32 @@ let weight_floor validator_set selected =
       selected in
   Z.(add (div (mul total (of_int 2)) (of_int 3)) one)
 
-let find_offer_for_request t request =
+let capability_supports_request
+    (state : offer_state)
+    request
+    current_epoch
+    (member : Selection.member) =
+  table_values state.capabilities
+  |> List.exists (fun capability ->
+    capability.Capability.node_id = member.node_id
+    && capability.evidence_root = member.evidence_root
+    && capability.validator_set_root = request.Certificate.validator_set_root
+    && capability.observed_epoch <= request.epoch_id
+    && current_epoch <= capability.valid_until
+    && capability.max_request_bytes >= request.input_bytes
+    && capability.max_response_bytes >= request.max_output_bytes)
+
+let selection_supports_request state request current_epoch selection =
+  List.for_all
+    (capability_supports_request state request current_epoch)
+    selection.Selection.members
+
+let find_offer_for_request t request current_epoch =
   matching_offers t (fun offer ->
     offer.Protocol.validator_set_root = request.Certificate.validator_set_root
+    && offer.offered_epoch <= request.epoch_id
+    && request.epoch_id <= offer.expires_epoch
+    && current_epoch <= offer.expires_epoch
     && offer_model_matches
          offer
          ~circle_id:request.circle_id
@@ -611,9 +705,19 @@ let find_offer_for_request t request =
          ~model_root:request.model_root
          ~program_root:request.program_root
          ~executor_root:request.executor_root)
+  |> List.filter_map (fun state ->
+    try
+      let selection = selection_for t state request in
+      if
+        selection.Selection.root = request.selection_root
+        && selection_supports_request state request current_epoch selection
+      then Some (offer_id state.offer, state, selection)
+      else None
+    with Invalid_argument _ -> None)
+  |> List.sort (fun (left, _, _) (right, _, _) -> String.compare left right)
   |> function
-  | [state] -> Some state
-  | _ -> None
+  | (_, state, selection) :: _ -> Some (state, selection)
+  | [] -> None
 
 let verify_call t call =
   if not (Protocol.call_shape call) then Error "resource compute call shape refused"
@@ -647,10 +751,9 @@ let verify_call t call =
       else if not (verify_caller call) then
         Error "resource compute caller signature refused"
       else
-        match find_offer_for_request t request with
+        match find_offer_for_request t request head.epoch_id with
         | None -> Error "resource compute offer unavailable"
-        | Some state ->
-          let selection = selection_for t state request in
+        | Some (state, selection) ->
           if
             List.length selection.Selection.members
             <> committee_members validator_set
@@ -926,7 +1029,7 @@ and apply_message_direct t message =
             | None -> ()
             | Some _ ->
               state.local_started <- true;
-              Lwt.async (fun () -> local_provider_flow t offer)
+              spawn_background t "provider_flow" (fun () -> local_provider_flow t offer)
           end;
           Lwt.return_true
       end
@@ -957,7 +1060,7 @@ and apply_message_direct t message =
           selected
           executable;
         if executable then
-          Lwt.async (fun () -> execute_selected_call t call);
+          spawn_background t "provider_execution" (fun () -> execute_selected_call t call);
         Lwt.return_true
     end
   | Protocol.Result result ->
@@ -1209,6 +1312,9 @@ let rec wait_for_certificate t request_key =
     let* () = t.deps.sleep 0.1 in
     wait_for_certificate t request_key
 
+let request_input_bytes (request : request) =
+  String.length request.method_name + String.length request.params_json
+
 let unsigned_offer t (request : request) (head : head) validator_set_root =
   Protocol.{
     chain_id = t.deps.chain_id;
@@ -1224,7 +1330,7 @@ let unsigned_offer t (request : request) (head : head) validator_set_root =
     program_root = request.program_root;
     executor_root = request.executor_root;
     min_memory_bytes = 1_073_741_824L;
-    request_bytes = String.length request.method_name + String.length request.params_json;
+    request_bytes = request_input_bytes request;
     response_bytes = request.max_output_bytes;
     signature = zero64;
   }
@@ -1232,15 +1338,22 @@ let unsigned_offer t (request : request) (head : head) validator_set_root =
 let sign_offer t (offer : Protocol.offer) =
   { offer with Protocol.signature = t.deps.sign (Protocol.offer_sign_bytes offer) }
 
-let unsigned_request t (request : request) (head : head) validator_set_root selection_root =
+let unsigned_request_at
+    t
+    (request : request)
+    ~epoch_id
+    ~state_root
+    ~expires_epoch
+    validator_set_root
+    selection_root =
   Certificate.{
     chain_id = t.deps.chain_id;
-    epoch_id = head.epoch_id;
-    expires_epoch = Int64.add head.epoch_id call_ttl;
+    epoch_id;
+    expires_epoch;
     validator_set_root;
     selection_root;
     circle_id = request.circle_id;
-    state_root = head.state_root;
+    state_root;
     model_epoch = request.model_epoch;
     model_state_root = request.model_state_root;
     graph_root = request.graph_root;
@@ -1254,9 +1367,19 @@ let unsigned_request t (request : request) (head : head) validator_set_root sele
       Protocol.input_hash
         ~method_name:request.method_name
         ~params_json:request.params_json;
-    input_bytes = String.length request.method_name + String.length request.params_json;
+    input_bytes = request_input_bytes request;
     max_output_bytes = request.max_output_bytes;
   }
+
+let unsigned_request t request (head : head) validator_set_root selection_root =
+  unsigned_request_at
+    t
+    request
+    ~epoch_id:head.epoch_id
+    ~state_root:head.state_root
+    ~expires_epoch:(Int64.add head.epoch_id call_ttl)
+    validator_set_root
+    selection_root
 
 let unsigned_call t request head validator_set_root selection_root =
   Protocol.{
@@ -1269,10 +1392,29 @@ let unsigned_call t request head validator_set_root selection_root =
     signature = zero64;
   }
 
+let unsigned_call_for_lease t request lease =
+  Protocol.{
+    request =
+      unsigned_request_at
+        t
+        request
+        ~epoch_id:lease.request_epoch
+        ~state_root:lease.request_state_root
+        ~expires_epoch:lease.expires_epoch
+        lease.validator_set_root
+        lease.selection.Selection.root;
+    method_name = request.method_name;
+    params_json = request.params_json;
+    caller_public_key = request.caller_public_key;
+    caller_signature = request.caller_signature;
+    coordinator = t.deps.node_id;
+    signature = zero64;
+  }
+
 let sign_call t call =
   { call with Protocol.signature = t.deps.sign (Protocol.call_sign_bytes call) }
 
-let request_shape request =
+let request_shape (request : request) =
   request.model_epoch >= 0L
   && hash32 request.model_state_root
   && Octra_core.Crypto.Address.is_valid_address request.circle_id
@@ -1300,6 +1442,162 @@ let intent_id call =
     Octra_net.Oce1.put_hash32 buffer (Protocol.intent_sign_bytes call);
     Octra_net.Oce1.put_sig64 buffer call.Protocol.caller_signature)
 
+let cancellation_sign_bytes
+    ~chain_id
+    ~caller
+    ~caller_public_key
+    ~session_id =
+  Octra_net.Hash_domain.hash_encoded "octra:resource_compute_cancel" (fun buffer ->
+    Octra_net.Oce1.put_string buffer chain_id;
+    Octra_net.Oce1.put_string buffer caller;
+    Octra_net.Oce1.put_hash32 buffer caller_public_key;
+    Octra_net.Oce1.put_hash32 buffer session_id)
+
+let cancellation_key caller session_id =
+  Octra_net.Hash_domain.hash_encoded "octra:resource_compute_cancel_key" (fun buffer ->
+    Octra_net.Oce1.put_string buffer caller;
+    Octra_net.Oce1.put_hash32 buffer session_id)
+
+let committee_lease_matches_request
+    t
+    (request : request)
+    (head : head)
+    validator_set_root
+    (lease : committee_lease) =
+  lease.caller = request.caller
+  && lease.caller_public_key = request.caller_public_key
+  && lease.session_id = request.session_id
+  && lease.circle_id = request.circle_id
+  && lease.model_epoch = request.model_epoch
+  && lease.model_state_root = request.model_state_root
+  && lease.graph_root = request.graph_root
+  && lease.model_root = request.model_root
+  && lease.program_root = request.program_root
+  && lease.executor_root = request.executor_root
+  && lease.validator_set_root = validator_set_root
+  && head.epoch_id <= lease.expires_epoch
+  && t.deps.state_root_at lease.request_epoch = Some lease.request_state_root
+  && request_input_bytes request <= lease.max_request_bytes
+  && request.max_output_bytes <= lease.max_response_bytes
+
+let prune_committee_leases t epoch_id =
+  Hashtbl.filter_map_inplace
+    (fun _ lease ->
+      if Int64.compare lease.expires_epoch epoch_id < 0 then None
+      else Some lease)
+    t.committee_leases
+
+let evict_committee_lease t key =
+  if
+    Hashtbl.length t.committee_leases >= max_committee_leases
+    && not (Hashtbl.mem t.committee_leases key)
+  then begin
+    let oldest =
+      Hashtbl.fold
+        (fun current_key lease current ->
+          match current with
+          | None -> Some (current_key, lease.expires_epoch)
+          | Some (oldest_key, oldest_epoch) ->
+            if
+              Int64.compare lease.expires_epoch oldest_epoch < 0
+              || (Int64.equal lease.expires_epoch oldest_epoch
+                  && String.compare current_key oldest_key < 0)
+            then Some (current_key, lease.expires_epoch)
+            else current)
+        t.committee_leases
+        None in
+    Option.iter (fun (oldest_key, _) -> Hashtbl.remove t.committee_leases oldest_key) oldest
+  end
+
+let remember_committee_direct t (lease : committee_lease) =
+  match current_head t with
+  | Error _ -> ()
+  | Ok head when head.epoch_id > lease.expires_epoch -> ()
+  | Ok head ->
+    prune_committee_leases t head.epoch_id;
+    let key = cancellation_key lease.caller lease.session_id in
+    evict_committee_lease t key;
+    Hashtbl.replace t.committee_leases key lease
+
+let committee_lease_for_request
+    t
+    (request : request)
+    (head : head)
+    validator_set_root =
+  prune_committee_leases t head.epoch_id;
+  let key = cancellation_key request.caller request.session_id in
+  match Hashtbl.find_opt t.committee_leases key with
+  | Some lease
+    when committee_lease_matches_request t request head validator_set_root lease ->
+    Some lease
+  | Some _ ->
+    Hashtbl.remove t.committee_leases key;
+    None
+  | None -> None
+
+let capability_for_member snapshot (member : Selection.member) =
+  let capabilities =
+    snapshot.capabilities
+    |> List.filter (fun capability ->
+      capability.Capability.node_id = member.node_id
+      && capability.evidence_root = member.evidence_root)
+    |> List.sort (fun left right ->
+      String.compare (Capability.id left) (Capability.id right)) in
+  match capabilities with
+  | capability :: _ -> Some capability
+  | [] -> None
+
+let committee_lease_of_response
+    (request : request)
+    (snapshot : offer_snapshot)
+    (response : response) =
+  let capabilities =
+    List.map (capability_for_member snapshot) response.selection.Selection.members in
+  if List.exists Option.is_none capabilities then None
+  else
+    let capabilities = List.filter_map Fun.id capabilities in
+    let expires_epoch =
+      List.fold_left
+        (fun epoch capability -> Int64.min epoch capability.Capability.valid_until)
+        snapshot.offer.Protocol.expires_epoch
+        capabilities in
+    let max_request_bytes =
+      List.fold_left
+        (fun limit capability -> min limit capability.Capability.max_request_bytes)
+        max_int
+        capabilities in
+    let max_response_bytes =
+      List.fold_left
+        (fun limit capability -> min limit capability.Capability.max_response_bytes)
+        max_int
+        capabilities in
+    if
+      capabilities = []
+      || expires_epoch < response.request.Certificate.epoch_id
+      || request_input_bytes request > max_request_bytes
+      || request.max_output_bytes > max_response_bytes
+    then None
+    else
+      Some {
+        caller = request.caller;
+        caller_public_key = request.caller_public_key;
+        session_id = request.session_id;
+        circle_id = request.circle_id;
+        model_epoch = request.model_epoch;
+        model_state_root = request.model_state_root;
+        graph_root = request.graph_root;
+        model_root = request.model_root;
+        program_root = request.program_root;
+        executor_root = request.executor_root;
+        validator_set_root = response.request.validator_set_root;
+        request_epoch = response.request.epoch_id;
+        request_state_root = response.request.state_root;
+        expires_epoch;
+        max_request_bytes;
+        max_response_bytes;
+        selection = response.selection;
+      }
+
 let caller_admitted t caller =
   Option.value ~default:0 (Hashtbl.find_opt t.caller_jobs caller) = 0
 
@@ -1307,6 +1605,55 @@ let set_caller_active t caller delta =
   let count = Option.value ~default:0 (Hashtbl.find_opt t.caller_jobs caller) + delta in
   if count <= 0 then Hashtbl.remove t.caller_jobs caller
   else Hashtbl.replace t.caller_jobs caller count
+
+let release_job_lease t (job : job) =
+  if job.lease_active then begin
+    job.lease_active <- false;
+    set_caller_active t job.caller (-1)
+  end
+
+let prune_cancelled_sessions t epoch_id =
+  Hashtbl.filter_map_inplace
+    (fun _ expires_epoch ->
+      if Int64.compare expires_epoch epoch_id < 0 then None
+      else Some expires_epoch)
+    t.cancelled_sessions
+
+let evict_cancelled_session t =
+  if Hashtbl.length t.cancelled_sessions >= max_cancelled_sessions then begin
+    let oldest =
+      Hashtbl.fold
+        (fun key expires_epoch current ->
+          match current with
+          | None -> Some (key, expires_epoch)
+          | Some (current_key, current_epoch) ->
+            if
+              Int64.compare expires_epoch current_epoch < 0
+              || (Int64.equal expires_epoch current_epoch
+                  && String.compare key current_key < 0)
+            then Some (key, expires_epoch)
+            else current)
+        t.cancelled_sessions
+        None in
+    Option.iter (fun (key, _) -> Hashtbl.remove t.cancelled_sessions key) oldest
+  end
+
+let session_cancelled t caller session_id =
+  Hashtbl.mem t.cancelled_sessions (cancellation_key caller session_id)
+
+let verify_cancellation t (cancellation : cancellation) =
+  let public_key_b64 = Base64.encode_exn cancellation.caller_public_key in
+  Octra_core.Crypto.Address.verify_address_pubkey cancellation.caller public_key_b64
+  && Octra_ed25519.safe cancellation.caller_public_key
+  && Octra_ed25519.verify
+       ~pub:cancellation.caller_public_key
+       ~msg:
+         (cancellation_sign_bytes
+            ~chain_id:t.deps.chain_id
+            ~caller:cancellation.caller
+            ~caller_public_key:cancellation.caller_public_key
+            ~session_id:cancellation.session_id)
+       cancellation.caller_signature
 
 let prune_finished_jobs t =
   let count = Queue.length t.job_order in
@@ -1334,6 +1681,44 @@ let prune_finished_jobs t =
 
 let complete_job t ~job_id ~caller =
   actor_call t (Complete_job { job_id; caller })
+
+let cancel_session_direct t (cancellation : cancellation) =
+  if
+    not (Octra_core.Crypto.Address.is_valid_address cancellation.caller)
+    || not (hash32 cancellation.caller_public_key)
+    || not (signature64 cancellation.caller_signature)
+    || not (hash32 cancellation.session_id)
+  then Error "resource compute cancellation refused"
+  else if not (verify_cancellation t cancellation) then
+    Error "resource compute cancellation signature refused"
+  else
+    match current_head t with
+    | Error message -> Error message
+    | Ok head ->
+      prune_cancelled_sessions t head.epoch_id;
+      evict_cancelled_session t;
+      Hashtbl.replace
+        t.cancelled_sessions
+        (cancellation_key cancellation.caller cancellation.session_id)
+        (Int64.add head.epoch_id call_ttl);
+      Hashtbl.remove
+        t.committee_leases
+        (cancellation_key cancellation.caller cancellation.session_id);
+      let cancelled =
+        Hashtbl.fold
+          (fun _ (job : job) count ->
+            if
+              job.caller = cancellation.caller
+              && job.session_id = cancellation.session_id
+              && Lwt.is_sleeping job.result
+            then begin
+              release_job_lease t job;
+              Lwt.cancel job.result;
+              count + 1
+            end else count)
+          t.jobs
+          0 in
+      Ok cancelled
 
 let compute_new t request validator_set_root offer =
   Log.info "compute" "event = committee status = offered";
@@ -1363,7 +1748,33 @@ let compute_new t request validator_set_root offer =
           "event = committee status = selected members = %d"
           (List.length selection.Selection.members);
         let* () = publish t (Protocol.Call call) in
-        wait_for_certificate t request_key
+        let* result = wait_for_certificate t request_key in
+        begin
+          match result with
+          | Error _ -> Lwt.return result
+          | Ok response ->
+            begin
+              match committee_lease_of_response request snapshot response with
+              | None -> Lwt.return result
+              | Some lease ->
+                let* () = actor_call t (Remember_committee lease) in
+                Log.info "compute"
+                  "event = committee status = leased until_epoch = %Ld capacity = %d"
+                  lease.expires_epoch
+                  lease.max_request_bytes;
+                Lwt.return result
+            end
+        end
+
+let compute_reused t request lease =
+  let call = unsigned_call_for_lease t request lease |> sign_call t in
+  let request_key = request_id call in
+  Log.info "compute"
+    "event = committee status = reused members = %d until_epoch = %Ld"
+    (List.length lease.selection.Selection.members)
+    lease.expires_epoch;
+  let* () = publish t (Protocol.Call call) in
+  wait_for_certificate t request_key
 
 let start_job_direct t request =
   if not (request_shape request) then
@@ -1372,6 +1783,7 @@ let start_job_direct t request =
     match current_head t with
     | Error message -> Error message
     | Ok head ->
+      prune_cancelled_sessions t head.epoch_id;
       let validator_set, validator_set_root = current_validator_set t in
       if
         request.model_epoch > head.epoch_id
@@ -1380,6 +1792,8 @@ let start_job_direct t request =
         Error "resource compute model snapshot unavailable"
       else if not (Octra_consensus.C_types.is_validator validator_set t.deps.node_id) then
         Error "resource compute coordinator is not a validator"
+      else if session_cancelled t request.caller request.session_id then
+        Error "resource compute session cancelled"
       else
         let preview_call =
           unsigned_call t request head validator_set_root zero32 in
@@ -1395,21 +1809,34 @@ let start_job_direct t request =
           | None when not (caller_admitted t request.caller) ->
             Error "resource compute caller already active"
           | None ->
-            let offer = unsigned_offer t request head validator_set_root |> sign_offer t in
+            let computation =
+              match committee_lease_for_request t request head validator_set_root with
+              | Some lease -> fun () -> compute_reused t request lease
+              | None ->
+                let offer =
+                  unsigned_offer t request head validator_set_root |> sign_offer t in
+                fun () -> compute_new t request validator_set_root offer in
             set_caller_active t request.caller 1;
             let job =
               Lwt.finalize
                 (fun () ->
                   Lwt.catch
-                    (fun () -> compute_new t request validator_set_root offer)
+                    computation
                     (fun error ->
                       Lwt.return
                         (Error
                            ("resource compute actor failed: "
                             ^ Printexc.to_string error))))
                 (fun () ->
-                  complete_job t ~job_id:id ~caller:request.caller) in
-            let entry = { caller = request.caller; result = job } in
+                  Lwt.catch
+                    (fun () -> complete_job t ~job_id:id ~caller:request.caller)
+                    (fun _ -> Lwt.return_unit)) in
+            let entry = {
+              caller = request.caller;
+              session_id = request.session_id;
+              lease_active = true;
+              result = job;
+            } in
             Hashtbl.add t.jobs id entry;
             Queue.push id t.job_order;
             Ok (id, entry)
@@ -1439,6 +1866,9 @@ let status_direct t ~caller ~job_id =
 let status t ~caller ~job_id =
   actor_call t (Query_status { caller; job_id })
 
+let cancel t cancellation =
+  actor_call t (Cancel_session cancellation)
+
 let compute t request =
   let* started = actor_call t (Admit_request request) in
   match started with
@@ -1458,13 +1888,20 @@ let drain_commands queue error =
   loop ()
 
 let stop_direct t =
-  t.mailbox_open <- false;
+  Hashtbl.iter
+    (fun _ (job : job) ->
+      release_job_lease t job;
+      if Lwt.is_sleeping job.result then Lwt.cancel job.result)
+    t.jobs;
+  Hashtbl.iter (fun _ task -> Lwt.cancel task) t.background_tasks;
+  Hashtbl.clear t.background_tasks;
+  t.channel_open <- false;
   t.actor_generation <- Int64.succ t.actor_generation;
   let error = Failure "resource compute actor stopped" in
-  drain_commands t.control_mailbox error;
-  drain_commands t.mailbox error;
-  Lwt_condition.broadcast t.mailbox_ready ();
-  Lwt_condition.broadcast t.mailbox_space ()
+  drain_commands t.control_channel error;
+  drain_commands t.data_channel error;
+  Lwt_condition.broadcast t.channel_ready ();
+  Lwt_condition.broadcast t.channel_space ()
 
 let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
   fun t message ->
@@ -1479,9 +1916,17 @@ let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
     | Complete_job { job_id; caller } ->
       begin
         match Hashtbl.find_opt t.jobs job_id with
-        | Some job when job.caller = caller -> set_caller_active t caller (-1)
+        | Some job when job.caller = caller -> release_job_lease t job
         | _ -> ()
       end;
+      Lwt.return_unit
+    | Cancel_session cancellation ->
+      Lwt.return (cancel_session_direct t cancellation)
+    | Complete_background task_id ->
+      Hashtbl.remove t.background_tasks task_id;
+      Lwt.return_unit
+    | Remember_committee lease ->
+      remember_committee_direct t lease;
       Lwt.return_unit
     | Query_status { caller; job_id } ->
       Lwt.return (status_direct t ~caller ~job_id)
@@ -1502,14 +1947,14 @@ let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
       Lwt.return_unit
 
 let take_actor_command t =
-  match Queue.take_opt t.control_mailbox with
+  match Queue.take_opt t.control_channel with
   | Some _ as command -> command
-  | None -> Queue.take_opt t.mailbox
+  | None -> Queue.take_opt t.data_channel
 
 let rec actor_loop t =
   match take_actor_command t with
   | Some (Command command) ->
-    Lwt_condition.broadcast t.mailbox_space ();
+    Lwt_condition.broadcast t.channel_space ();
     if command.generation <> t.actor_generation then begin
       Lwt.wakeup_later_exn command.reply
         (Failure "resource compute actor generation changed");
@@ -1527,9 +1972,9 @@ let rec actor_loop t =
             (Printexc.to_string error);
           Lwt.wakeup_later_exn command.reply error;
           actor_loop t)
-  | None when not t.mailbox_open -> Lwt.return_unit
+  | None when not t.channel_open -> Lwt.return_unit
   | None ->
-    let* () = Lwt_condition.wait t.mailbox_ready in
+    let* () = Lwt_condition.wait t.channel_ready in
     actor_loop t
 
 let create ~deps ~provider =
@@ -1544,11 +1989,15 @@ let create ~deps ~provider =
     jobs = Hashtbl.create 32;
     job_order = Queue.create ();
     caller_jobs = Hashtbl.create 32;
-    mailbox = Queue.create ();
-    control_mailbox = Queue.create ();
-    mailbox_ready = Lwt_condition.create ();
-    mailbox_space = Lwt_condition.create ();
-    mailbox_open = true;
+    cancelled_sessions = Hashtbl.create 64;
+    committee_leases = Hashtbl.create 64;
+    background_tasks = Hashtbl.create 32;
+    next_background_id = 0;
+    data_channel = Queue.create ();
+    control_channel = Queue.create ();
+    channel_ready = Lwt_condition.create ();
+    channel_space = Lwt_condition.create ();
+    channel_open = true;
     actor_generation = 0L;
     self_test = None;
   } in

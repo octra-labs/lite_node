@@ -38,57 +38,75 @@ let node_backend
       | Error fault ->
         Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
       | Ok circle_mode ->
-      Octra_core.State_preview.with_preview
-        ~base_store:store
-        ~base_ledger:ledger
-        ~epoch_id
-        ~proposal_id
-        ?expected_prev_root
-        (fun backend ->
-          let private_transition =
-            Octra_core.Private_transition.create
-              ~preverify:(Some preverify)
-              ~ledger:backend.Octra_core.Epoch_exec.ledger
+        begin
+          match
+            Octra_core.Rule_graph.wasm_compute rules ~epoch:epoch_id
+          with
+          | Error fault ->
+            Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
+          | Ok wasm_compute_mode ->
+            begin
+              match
+                Octra_core.Rule_graph.owner_migration rules ~epoch:epoch_id
+              with
+              | Error fault ->
+                Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
+              | Ok owner_migration_mode ->
+            Octra_core.State_preview.with_preview
+              ~base_store:store
+              ~base_ledger:ledger
               ~epoch_id
-              ~result_policy:(private_result_policy epoch_id)
-              ~legacy_replay
-              ~limits:Octra_core.Private_transition.{
-                max_fhe;
-                max_stealth;
-              }
-          in
-          let process_tx ~backend ~env
-              (tx : Octra_core.Transaction.t) =
-            if Octra_core.Transaction.bft_crypto_active ()
-              && Octra_core.Transaction.bft_crypto_op tx.op_type
-            then
-              let open Lwt.Syntax in
-              let* result =
-                Octra_core.Private_transition.process
-                  private_transition
+              ~proposal_id
+              ?expected_prev_root
+              (fun backend ->
+                let private_transition =
+                  Octra_core.Private_transition.create
+                    ~preverify:(Some preverify)
+                    ~ledger:backend.Octra_core.Epoch_exec.ledger
+                    ~epoch_id
+                    ~owner_migration_mode
+                    ~result_policy:(private_result_policy epoch_id)
+                    ~legacy_replay
+                    ~limits:Octra_core.Private_transition.{
+                      max_fhe;
+                      max_stealth;
+                    }
+                in
+                let process_tx ~backend ~env
+                    (tx : Octra_core.Transaction.t) =
+                  if Octra_core.Transaction.bft_crypto_active ()
+                    && Octra_core.Transaction.bft_crypto_op tx.op_type
+                  then
+                    let open Lwt.Syntax in
+                    let* result =
+                      Octra_core.Private_transition.process
+                        private_transition
+                        ~backend
+                        ~env
+                        tx in
+                    Lwt.return
+                      (Result.map
+                         (fun fee -> Octra_core.Epoch_exec.Confirmed fee)
+                         result)
+                  else
+                    Consensus_vm_transition.process_tx
+                      ~preverify
+                      ~circle_mode
+                      ~wasm_compute_mode
+                      ~program_trust
+                      ~backend
+                      ~env
+                      tx
+                in
+                Octra_core.Epoch_exec.run_transition_rewarded
+                  ~reward
+                  ~preverify
                   ~backend
                   ~env
-                  tx in
-              Lwt.return
-                (Result.map
-                   (fun fee -> Octra_core.Epoch_exec.Confirmed fee)
-                   result)
-            else
-              Consensus_vm_transition.process_tx
-                ~preverify
-                ~circle_mode
-                ~program_trust
-                ~backend
-                ~env
-                tx
-          in
-          Octra_core.Epoch_exec.run_transition_rewarded
-            ~reward
-            ~preverify
-            ~backend
-            ~env
-            ~txs
-            ~process_tx));
+                  ~txs
+                  ~process_tx)
+            end
+        end);
   }
 
 let run (deps : deps) =

@@ -46,6 +46,8 @@ type runtime = {
   notify_rejected : Transaction.t -> string -> unit;
   program_trust : Octra_vm.Program_trust.t;
   circle_mode : Octra_core.Rule_graph.mode;
+  wasm_compute_mode : Octra_core.Rule_graph.mode;
+  owner_migration_mode : Octra_core.Rule_graph.mode;
   legacy_replay :
     epoch:int ->
     address:string ->
@@ -163,6 +165,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
         ~preverify
         ~ledger:(Lazy.force backend).Epoch_exec.ledger
         ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id
+        ~owner_migration_mode:runtime.owner_migration_mode
         ~result_policy:
           (runtime.private_result_policy
              (Lazy.force env).Epoch_exec.epoch_id)
@@ -201,6 +204,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
                   ~backend:(Lazy.force backend)
                   ~env:(Lazy.force env)
                   ~circle_mode:runtime.circle_mode
+                  ~wasm_compute_mode:runtime.wasm_compute_mode
                   ~program_trust:runtime.program_trust
                   tx
             in
@@ -333,6 +337,26 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
+    let owner_migration_mode =
+      match
+        Octra_core.Rule_graph.owner_migration
+          runtime.rules
+          ~epoch:(runtime.current_epoch ())
+      with
+      | Ok mode -> mode
+      | Error fault ->
+        failwith (Octra_core.Rule_graph.fault_message fault)
+    in
+    let wasm_compute_mode =
+      match
+        Octra_core.Rule_graph.wasm_compute
+          runtime.rules
+          ~epoch:(runtime.current_epoch ())
+      with
+      | Ok mode -> mode
+      | Error fault ->
+        failwith (Octra_core.Rule_graph.fault_message fault)
+    in
     let* () =
       run_runtime
         ?preverify
@@ -360,6 +384,8 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         notify_rejected = runtime.notify_rejected;
         program_trust = runtime.program_trust;
         circle_mode;
+        wasm_compute_mode;
+        owner_migration_mode;
         legacy_replay = runtime.legacy_replay;
         private_result_policy = runtime.private_result_policy;
         add_rejected_fee = (fun fee ->

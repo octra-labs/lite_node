@@ -44,6 +44,8 @@ type runtime = {
   notify_rejected : Transaction.t -> string -> unit;
   program_trust : Octra_vm.Program_trust.t;
   circle_mode : Octra_core.Rule_graph.mode;
+  wasm_compute_mode : Octra_core.Rule_graph.mode;
+  owner_migration_mode : Octra_core.Rule_graph.mode;
   legacy_replay :
     epoch:int ->
     address:string ->

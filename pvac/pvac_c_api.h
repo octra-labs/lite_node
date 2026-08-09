@@ -63,6 +63,17 @@ int pvac_verify_zero_bound_key_switch(
     pvac_cipher ct,
     pvac_zero_proof proof,
     const uint8_t amount_commitment[32]);
+pvac_zero_proof pvac_make_zero_proof_bound_historical_migration(
+    pvac_pubkey pk,
+    pvac_seckey sk,
+    pvac_cipher ct,
+    uint64_t amount,
+    const uint8_t blinding[32]);
+int pvac_verify_zero_bound_historical_migration(
+    pvac_pubkey pk,
+    pvac_cipher ct,
+    pvac_zero_proof proof,
+    const uint8_t amount_commitment[32]);
 
 void pvac_pedersen_commit(uint64_t amount, const uint8_t blinding[32], uint8_t out[32]);
 int pvac_pedersen_commit_v2(uint64_t amount, const uint8_t blinding[32],

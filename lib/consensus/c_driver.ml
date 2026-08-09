@@ -66,6 +66,10 @@ type epoch_root_response_record = {
   state_root : string option;
 }
 
+type epoch_root_wait =
+  | Source_agreement
+  | Consensus_quorum
+
 type bundle_response_record = {
   responder_addr : string;
   tx_hashes : string list;
@@ -334,16 +338,19 @@ let same_proposal_build b ~gen ~height ~round ~step =
 let local_validator t =
   C_types.is_validator t.engine.vs t.config.my_addr
 
-let query_frame msg_type =
-  msg_type = Frame.msg_cons_round_sync
-  || msg_type = Frame.msg_query_epoch_root
-  || msg_type = Frame.msg_epoch_root_response
-  || msg_type = Frame.msg_query_bundle
-  || msg_type = Frame.msg_bundle_response
-  || msg_type = Frame.msg_query_catchup_range
-  || msg_type = Frame.msg_catchup_range_response
-  || msg_type = Frame.msg_query_catchup_range_v2
-  || msg_type = Frame.msg_catchup_range_response_v2
+let repeatable_query_frame (frame : Frame.frame) =
+  (frame.msg_type = Frame.msg_cons_round_sync
+   &&
+   try (C_codec.decode_round_sync frame.payload).request
+   with _ -> false)
+  || frame.msg_type = Frame.msg_query_epoch_root
+  || frame.msg_type = Frame.msg_epoch_root_response
+  || frame.msg_type = Frame.msg_query_bundle
+  || frame.msg_type = Frame.msg_bundle_response
+  || frame.msg_type = Frame.msg_query_catchup_range
+  || frame.msg_type = Frame.msg_catchup_range_response
+  || frame.msg_type = Frame.msg_query_catchup_range_v2
+  || frame.msg_type = Frame.msg_catchup_range_response_v2
 
 let engine_output_frame msg_type =
   msg_type = Frame.msg_cons_propose
@@ -451,6 +458,15 @@ let vote_relay_relevant ~current_height ~current_round (vote : C_types.vote) =
   vote.epoch_id = current_height
   && vote.round >= current_round
   && vote.round <= current_round + C_engine.max_round_ahead
+
+let round_sync_relay_relevant
+    ~current_height
+    ~current_round
+    (sync : C_codec.round_sync) =
+  not sync.request
+  && sync.epoch_id = current_height
+  && sync.round > current_round
+  && sync.round <= current_round + C_engine.max_round_ahead
 
 let proposal_frame_error_label = function
   | Proposal_signature_or_unknown -> "signature_or_unknown_validator"
@@ -1782,7 +1798,7 @@ and process_outputs t =
 
 let on_p2p_message t _conn (frame : Frame.frame) =
   let open Lwt.Syntax in
-  let skip_dedup = query_frame frame.msg_type in
+  let skip_dedup = repeatable_query_frame frame in
   let allowed = frame_allowed ~running:t.running frame.msg_type in
   let repeated =
     allowed
@@ -1842,23 +1858,27 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                   _conn
                   ~reason:"bad_signature_round_sync";
                 Lwt.return_unit
-              | Some pubkey
-                when Octra_net.P2p_handshake.node_id_of_pubkey pubkey
-                     <> _conn.Octra_net.P2p_conn.peer_id ->
-                warn_node t.config.my_addr
-                  "event = reject_round_sync reason = peer_identity_mismatch from = %s"
-                  (String.sub sync.validator 0
-                    (min 12 (String.length sync.validator)));
-                Octra_net.P2p_swarm.report_bad_peer
-                  t.swarm
-                  _conn
-                  ~reason:"round_sync_peer_identity_mismatch";
-                Lwt.return_unit
               | Some _ ->
                 let current_round = t.engine.state.round in
+                let relay_candidate =
+                  round_sync_relay_relevant
+                    ~current_height:t.engine.state.height
+                    ~current_round
+                    sync
+                in
                 if sync.round > current_round + C_engine.max_round_ahead then
                   Lwt.return_unit
                 else begin
+                  let* () =
+                    if relay_candidate then
+                      Octra_net.P2p_swarm.broadcast_except
+                        t.swarm
+                        ~except:_conn.Octra_net.P2p_conn.peer_id
+                        { msg_type = Frame.msg_cons_round_sync;
+                          payload = frame.payload }
+                    else
+                      Lwt.return_unit
+                  in
                   C_engine.on_round_sync
                     t.engine
                     ~round:sync.round
@@ -2765,10 +2785,26 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
       ~msg_type:Frame.msg_query_catchup_range_v2
       ~budget:(total_budget -. first_budget)
 
-let query_epoch_root t ~epoch_id ~timeout_seconds =
-  let open Lwt.Syntax in
-  Hashtbl.replace t.epoch_root_responses epoch_id [];
-  let has_root_quorum records =
+let epoch_root_consensus_quorum t ~epoch_id ~root records =
+  let validators =
+    records
+    |> List.filter_map (fun (record : epoch_root_response_record) ->
+      match record.state_root with
+      | Some candidate when String.equal candidate root ->
+        Some record.responder_addr
+      | Some _
+      | None -> None)
+    |> List.sort_uniq String.compare
+  in
+  C_types.has_quorum_at
+    ~chain_id:t.config.chain_id
+    ~epoch_id
+    t.engine.vs
+    validators
+
+let epoch_root_wait_reached t ~epoch_id ~wait_for records =
+  match wait_for with
+  | Source_agreement ->
     let counts = Hashtbl.create 8 in
     List.exists (fun (r : epoch_root_response_record) ->
       match r.state_root with
@@ -2785,6 +2821,23 @@ let query_epoch_root t ~epoch_id ~timeout_seconds =
         Hashtbl.replace counts root (weight, count);
         catchup_agreement_reached t ~epoch_id ~count ~weight
     ) records
+  | Consensus_quorum ->
+    records
+    |> List.filter_map (fun (record : epoch_root_response_record) ->
+      record.state_root)
+    |> List.sort_uniq String.compare
+    |> List.exists (fun root ->
+      epoch_root_consensus_quorum t ~epoch_id ~root records)
+
+let query_epoch_root
+    ?(wait_for = Source_agreement)
+    t
+    ~epoch_id
+    ~timeout_seconds =
+  let open Lwt.Syntax in
+  Hashtbl.replace t.epoch_root_responses epoch_id [];
+  let has_root_quorum records =
+    epoch_root_wait_reached t ~epoch_id ~wait_for records
   in
   let q = C_codec.{
     chain_id = t.config.chain_id;
@@ -2858,24 +2911,29 @@ let restore_precommit_lock t proposal =
   else C_engine.restore_precommit_lock t.engine proposal
 
 let realign_progress t ~height ~round =
+  let open Lwt.Syntax in
   let current_height = t.engine.state.height in
   if height < current_height then
     Lwt.return_unit
-  else if height > current_height then begin
-    log_node t.config.my_addr
-      "event = realign_progress old_height = %Ld new_height = %Ld"
-      current_height height;
-    start_height t height
-  end else begin
-    let current_round = t.engine.state.round in
-    let target_round = max (current_round + 1) (round + 1) in
-    log_node t.config.my_addr
-      "event = realign_progress height = %Ld old_round = %d new_round = %d"
-      height current_round target_round;
-    clear_round_local_state t ~height ~round:target_round;
-    C_engine.realign_round t.engine target_round;
-    process_outputs t
-  end
+  else
+    let* () =
+      if height > current_height then begin
+        log_node t.config.my_addr
+          "event = realign_progress old_height = %Ld new_height = %Ld"
+          current_height height;
+        start_height t height
+      end else begin
+        let current_round = t.engine.state.round in
+        let target_round = max (current_round + 1) (round + 1) in
+        log_node t.config.my_addr
+          "event = realign_progress height = %Ld old_round = %d new_round = %d"
+          height current_round target_round;
+        clear_round_local_state t ~height ~round:target_round;
+        C_engine.realign_round t.engine target_round;
+        process_outputs t
+      end
+    in
+    wake_ready t
 
 let start t =
   t.running <- true;

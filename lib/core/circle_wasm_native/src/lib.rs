@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::slice;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wasmi::{
     AsContext, AsContextMut, Caller, Config, Engine, Error as WasmiError, Extern, ExternType, Func,
     Instance, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
@@ -46,6 +46,9 @@ const SESSION_CACHE_TTL_SECS: f64 = 300.0;
 const TENSOR_SESSION_CACHE_LIMIT: usize = 8;
 const FIXED_TENSOR_SESSION_CACHE_LIMIT: usize = 2;
 const TENSOR_SESSION_CACHE_TTL_SECS: f64 = 300.0;
+const Q24_FUEL_SCALE: usize = 64;
+const Q24_CALL_LIMIT: usize = 250_000;
+const Q24_WALL_LIMIT_SECS: u64 = 30;
 const MODULE_CACHE_LIMIT: usize = 32;
 const MODULE_CACHE_TTL_SECS: f64 = 300.0;
 const STORAGE_CACHE_LIMIT: usize = 16;
@@ -355,6 +358,8 @@ struct HostState {
     unavailable: Option<String>,
     compute_trace: Option<ComputeTrace>,
     compute_session_scope: Option<String>,
+    compute_started_at: Instant,
+    q24_calls: usize,
 }
 
 #[derive(Debug)]
@@ -720,7 +725,6 @@ fn run_compute_self_test() -> Result<JsonValue, String> {
         one,
     )
     .map_err(str::to_owned)?;
-    let executor_root = Sha256::digest(b"octra:resource-compute-executor:q24-v1\0");
     let mut evidence = Sha256::new();
     evidence.update(b"octra:resource-compute-evidence:q24-v1\0");
     self_test_i64(&mut evidence, &loaded);
@@ -732,8 +736,18 @@ fn run_compute_self_test() -> Result<JsonValue, String> {
     self_test_i64(&mut evidence, &residual);
     self_test_i64(&mut evidence, &rotated);
     self_test_i64(&mut evidence, &attended);
+    let evidence_root: [u8; 32] = evidence.finalize().into();
+    let mut executor = Sha256::new();
+    executor.update(b"octra:resource-compute-executor\0");
+    executor.update(evidence_root);
+    executor.update((Q24_FUEL_SCALE as u64).to_be_bytes());
+    executor.update((Q24_CALL_LIMIT as u64).to_be_bytes());
+    executor.update(Q24_WALL_LIMIT_SECS.to_be_bytes());
+    executor.update(COMPUTE_MAX_FUEL_LIMIT.to_be_bytes());
+    executor.update((COMPUTE_MAX_TENSOR_SESSION_BYTES as u64).to_be_bytes());
+    let executor_root = executor.finalize();
     Ok(json!({
-        "evidence_root": hex::encode(evidence.finalize()),
+        "evidence_root": hex::encode(evidence_root),
         "executor_root": hex::encode(executor_root),
         "profile": "q24-v1"
     }))
@@ -1157,6 +1171,15 @@ impl Runtime {
             }
         };
 
+        if profile == ExecutionProfile::Standard && has_compute_imports {
+            let name = module
+                .imports()
+                .find(|entry| COMPUTE_IMPORTS.contains(&entry.name()))
+                .map(|entry| entry.name().to_owned())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            return Err(format!("unsupported wasm import: {name}"));
+        }
+
         let mut store = Store::new(shared_engine(), HostState::from_payload(payload)?);
         if profile == ExecutionProfile::Compute {
             if let Some(scope) = payload.compute_session_scope.as_deref() {
@@ -1357,6 +1380,8 @@ impl HostState {
             unavailable: None,
             compute_trace: None,
             compute_session_scope: payload.compute_session_scope.clone(),
+            compute_started_at: Instant::now(),
+            q24_calls: 0,
         })
     }
 }
@@ -2578,7 +2603,7 @@ fn define_imports(
                         .checked_mul(16)
                         .filter(|value| *value <= caller.data().max_tensor_session_bytes)
                         .ok_or_else(|| WasmiError::new("fixed tensor session exceeds cap"))?;
-                    charge_host_work(&mut caller, total_bytes)?;
+                    charge_q24_work(&mut caller, total_bytes)?;
                     let mut guard = fixed_tensor_session_cache()
                         .lock()
                         .map_err(|_| WasmiError::new("fixed tensor session cache poisoned"))?;
@@ -2847,6 +2872,19 @@ fn charge_host_fuel(caller: &mut Caller<'_, HostState>, cost: u64) -> Result<(),
 
 fn charge_host_work(caller: &mut Caller<'_, HostState>, units: usize) -> Result<(), WasmiError> {
     charge_host_fuel(caller, u64::try_from(units).unwrap_or(u64::MAX))
+}
+
+fn charge_q24_work(caller: &mut Caller<'_, HostState>, units: usize) -> Result<(), WasmiError> {
+    {
+        let data = caller.data_mut();
+        if data.q24_calls >= Q24_CALL_LIMIT
+            || data.compute_started_at.elapsed() > Duration::from_secs(Q24_WALL_LIMIT_SECS)
+        {
+            return Err(WasmiError::new("q24 execution limit reached"));
+        }
+        data.q24_calls += 1;
+    }
+    charge_host_work(caller, units.div_ceil(Q24_FUEL_SCALE).max(1))
 }
 
 fn host_work_product(factors: &[usize]) -> Result<usize, WasmiError> {
@@ -3725,7 +3763,7 @@ fn host_tensor_load_i8_kv_q24(
         return Ok(-1);
     }
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
-    charge_host_work(caller, n as usize)?;
+    charge_q24_work(caller, n as usize)?;
     let scale = deterministic_tensor::scale_bits_to_q24(scale_bits).map_err(compute_error)?;
     let output = {
         let data = caller.data();
@@ -3774,7 +3812,7 @@ fn host_tensor_rmsnorm_q24(
         return Ok(-1);
     }
     let n = n as usize;
-    charge_host_work(caller, n.saturating_mul(4))?;
+    charge_q24_work(caller, n.saturating_mul(4))?;
     let values = read_guest_i64_vec(caller, addr_ptr, n)?;
     let gamma = read_guest_i64_vec(caller, gamma_ptr, n)?;
     let output = deterministic_tensor::rmsnorm(&values, &gamma).map_err(compute_error)?;
@@ -3800,7 +3838,7 @@ fn host_tensor_silu_q24(
         return Ok(-1);
     }
     let n = n as usize;
-    charge_host_work(caller, n.saturating_mul(12))?;
+    charge_q24_work(caller, n.saturating_mul(12))?;
     let values = read_guest_i64_vec(caller, addr_ptr, n)?;
     let output = deterministic_tensor::silu(&values).map_err(compute_error)?;
     let values_digest = trace_i64_digest(&values);
@@ -3825,7 +3863,7 @@ fn host_tensor_elemwise_mul_q24(
         return Ok(-1);
     }
     let n = n as usize;
-    charge_host_work(caller, n)?;
+    charge_q24_work(caller, n)?;
     let left = read_guest_i64_vec(caller, dst_ptr, n)?;
     let right = read_guest_i64_vec(caller, src_ptr, n)?;
     let output = deterministic_tensor::elementwise_mul(&left, &right).map_err(compute_error)?;
@@ -3852,7 +3890,7 @@ fn host_tensor_residual_add_q24(
         return Ok(-1);
     }
     let n = n as usize;
-    charge_host_work(caller, n)?;
+    charge_q24_work(caller, n)?;
     let left = read_guest_i64_vec(caller, dst_ptr, n)?;
     let right = read_guest_i64_vec(caller, src_ptr, n)?;
     let output = deterministic_tensor::residual_add(&left, &right).map_err(compute_error)?;
@@ -3880,7 +3918,7 @@ fn host_tensor_rope_apply_q24(
         return Ok(-1);
     }
     let n_dim = n_dim as usize;
-    charge_host_work(caller, n_dim.saturating_mul(20))?;
+    charge_q24_work(caller, n_dim.saturating_mul(20))?;
     let values = read_guest_i64_vec(caller, addr_ptr, n_dim)?;
     let frequencies = read_guest_i64_vec(caller, frequencies_ptr, n_dim / 2)?;
     let output = deterministic_tensor::rope(&values, &frequencies, position as i64)
@@ -3919,7 +3957,7 @@ fn host_tensor_linear_i8_kv_q24(
         return Ok(-1);
     }
     let (in_dim, out_dim) = (in_dim as usize, out_dim as usize);
-    charge_host_work(caller, host_work_product(&[in_dim, out_dim])?)?;
+    charge_q24_work(caller, host_work_product(&[in_dim, out_dim])?)?;
     let input = read_guest_i64_vec(caller, in_ptr, in_dim)?;
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
     let scale = deterministic_tensor::scale_bits_to_q24(scale_bits).map_err(compute_error)?;
@@ -3967,7 +4005,7 @@ fn host_tensor_top1_i8_kv_q24(
         return Ok(-1);
     }
     let (rows, cols) = (rows as usize, cols as usize);
-    charge_host_work(caller, host_work_product(&[rows, cols])?)?;
+    charge_q24_work(caller, host_work_product(&[rows, cols])?)?;
     let input = read_guest_i64_vec(caller, in_ptr, cols)?;
     let key = read_guest_utf8(caller, key_ptr, key_len)?;
     let scale = deterministic_tensor::scale_bits_to_q24(scale_bits).map_err(compute_error)?;
@@ -4019,7 +4057,7 @@ fn host_tensor_session_append_kv_q24(
     }
     let raw_key = read_guest_utf8(caller, key_ptr, key_len)?;
     let cache_key = fixed_tensor_session_namespaced_key(caller.data(), &raw_key);
-    charge_host_work(caller, (n as usize).saturating_mul(2))?;
+    charge_q24_work(caller, (n as usize).saturating_mul(2))?;
     let key_values = read_guest_i64_vec(caller, key_values_ptr, n as usize)?;
     let values = read_guest_i64_vec(caller, values_ptr, n as usize)?;
     let mut cache = fixed_tensor_session_cache()
@@ -4092,7 +4130,7 @@ fn host_tensor_session_attention_kv_q24(
         kv_heads as usize,
         head_dim as usize,
     );
-    charge_host_work(
+    charge_q24_work(
         caller,
         host_work_product(&[sequence_len, query_heads, head_dim, 3])?,
     )?;

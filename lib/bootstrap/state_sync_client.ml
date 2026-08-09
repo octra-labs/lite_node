@@ -70,6 +70,7 @@ let options = [
 ]
 
 exception Sync_error of string
+exception Snapshot_expired of string
 
 let fail message =
   raise (Sync_error message)
@@ -112,13 +113,24 @@ let read_body_limited body limit =
   in
   loop 0
 
+let snapshot_expired_reason payload =
+  try
+    Yojson.Safe.from_string payload
+    |> Yojson.Safe.Util.member "error"
+    |> Yojson.Safe.Util.member "reason"
+    |> Yojson.Safe.Util.to_string
+  with _ ->
+    "state sync snapshot expired"
+
 let get_limited ~timeout ~limit url =
   Lwt_unix.with_timeout timeout (fun () ->
     Cohttp_lwt_unix.Client.get (Uri.of_string url) >>= fun (response, body) ->
     let code = Cohttp.Response.status response |> Cohttp.Code.code_of_status in
     let body_limit = if code >= 200 && code < 300 then limit else 65_536 in
     read_body_limited body body_limit >>= fun payload ->
-    if code < 200 || code >= 300 then
+    if code = 410 then
+      Lwt.fail (Snapshot_expired (snapshot_expired_reason payload))
+    else if code < 200 || code >= 300 then
       Lwt.fail_with (Printf.sprintf "HTTP %d" code)
     else
       Lwt.return (response, payload))
@@ -687,6 +699,19 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let downloaded = ref !completed_bytes in
   let last_log = ref 0.0 in
   let salt = random_salt (Filename.concat root "source_salt.json") in
+  let expired_sources = Hashtbl.create (List.length sources) in
+  let expired_urls () =
+    Hashtbl.to_seq_keys expired_sources
+    |> List.of_seq
+    |> List.sort_uniq String.compare
+  in
+  let expired_reason () =
+    expired_urls ()
+    |> List.filter_map (Hashtbl.find_opt expired_sources)
+    |> function
+    | reason :: _ -> reason
+    | [] -> "state sync snapshot expired"
+  in
   let report_progress task source =
     Lwt_mutex.with_lock progress_lock (fun () ->
       downloaded := Int64.add !downloaded (Int64.of_int task.chunk.size);
@@ -711,18 +736,28 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let rec choose_source task attempted =
     let now = Unix.gettimeofday () in
     let key = Journal.chunk_key task.file.path task.chunk in
-    match Source.rank ~salt ~chunk_key:key ~now ~attempted sources with
+    let expired = expired_urls () in
+    let excluded = List.sort_uniq String.compare (attempted @ expired) in
+    match Source.rank ~salt ~chunk_key:key ~now ~attempted:excluded sources with
     | source :: _ -> Lwt.return (source, attempted)
     | [] ->
-        let attempted =
-          if List.length attempted >= List.length sources then [] else attempted in
-        let wake =
-          match Source.earliest_cooldown ~attempted sources with
-          | Some value -> max 0.05 (value -. now)
-          | None -> 0.05
-        in
-        Lwt_unix.sleep (min 5.0 wake) >>= fun () ->
-        choose_source task attempted
+        let available = List.length sources - List.length expired in
+        if available <= 0 then
+          Lwt.fail (Snapshot_expired (expired_reason ()))
+        else
+          let attempted =
+            if List.length (List.sort_uniq String.compare attempted) >= available
+            then []
+            else attempted
+          in
+          let excluded = List.sort_uniq String.compare (attempted @ expired) in
+          let wake =
+            match Source.earliest_cooldown ~attempted:excluded sources with
+            | Some value -> max 0.05 (value -. now)
+            | None -> 0.05
+          in
+          Lwt_unix.sleep (min 5.0 wake) >>= fun () ->
+          choose_source task attempted
   in
   let rec download_task task attempt attempted =
     if attempt >= !retries then
@@ -746,16 +781,28 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
                 Lwt.return_unit) >>= fun () ->
               Source.record_success source ((Unix.gettimeofday () -. started) *. 1000.0);
               report_progress task source)
-        (fun exn ->
-          Source.record_failure source (Unix.gettimeofday ());
-          Printf.eprintf
-            "event = chunk_retry source = %s path = %s index = %d attempt = %d error = %s\n%!"
-            source.url
-            task.file.path
-            task.chunk.index
-            (attempt + 1)
-            (Printexc.to_string exn);
-          download_task task (attempt + 1) (source.url :: attempted))
+        (function
+          | Snapshot_expired reason as exn ->
+              Hashtbl.replace expired_sources source.url reason;
+              Printf.eprintf
+                "event = sync_source_snapshot_expired source = %s path = %s index = %d\n%!"
+                source.url
+                task.file.path
+                task.chunk.index;
+              if Hashtbl.length expired_sources >= List.length sources then
+                Lwt.fail exn
+              else
+                download_task task attempt attempted
+          | exn ->
+              Source.record_failure source (Unix.gettimeofday ());
+              Printf.eprintf
+                "event = chunk_retry source = %s path = %s index = %d attempt = %d error = %s\n%!"
+                source.url
+                task.file.path
+                task.chunk.index
+                (attempt + 1)
+                (Printexc.to_string exn);
+              download_task task (attempt + 1) (source.url :: attempted))
   in
   let rec worker () =
     if Queue.is_empty pending then Lwt.return_unit
@@ -937,6 +984,11 @@ let run () =
 
 let main () =
   try Lwt_main.run (run ()) with
+  | Snapshot_expired message ->
+      Printf.eprintf
+        "error = state sync snapshot expired reason = %s action = restart_with_current_manifest\n%!"
+        message;
+      exit 1
   | Sync_error message ->
       Printf.eprintf "error = %s\n%!" message;
       exit 1

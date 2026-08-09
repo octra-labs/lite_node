@@ -1285,6 +1285,19 @@ CAMLprim value caml_pvac_serialize_pubkey_legacy_v2(value v_pk) {
     CAMLreturn(v_bytes);
 }
 
+CAMLprim value caml_pvac_test_set_historical_profile(value v_pk, value v_sk) {
+    CAMLparam2(v_pk, v_sk);
+
+    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    pvac::SecKey& sk = *Handle_val(pvac::SecKey, v_sk);
+    pvac::set_circuit_prf_profile(
+        pk,
+        sk,
+        pvac::CircuitPrfProfile::MIMC_X3_V6);
+
+    CAMLreturn(Val_unit);
+}
+
 static pvac::PubKey* deserialize_pubkey_safe(
     const std::vector<uint8_t>& input,
     char* error,
@@ -1526,6 +1539,71 @@ CAMLprim value caml_pvac_verify_zero_bound_key_switch(
     caml_acquire_runtime_system();
 
     DBG_EXIT("verify_zero_bound_key_switch");
+    CAMLreturn(Val_bool(ok));
+}
+
+CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration(
+    value v_pk,
+    value v_sk,
+    value v_ct,
+    value v_amount,
+    value v_blinding
+) {
+    CAMLparam5(v_pk, v_sk, v_ct, v_amount, v_blinding);
+    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    pvac::SecKey& sk = *Handle_val(pvac::SecKey, v_sk);
+    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    uint64_t amount = nonnegative_u64(
+        v_amount,
+        "make_zero_proof_bound_historical_migration: negative amount");
+    if (bytes_len(v_blinding) != 32)
+        caml_failwith(
+            "make_zero_proof_bound_historical_migration: blinding must be 32 bytes");
+    pvac::Scalar blind = pvac::sc_reduce256(bytes_data(v_blinding));
+    pvac::ZeroProof* proof = new pvac::ZeroProof();
+    try {
+        *proof = pvac::make_zero_proof_bound_historical_migration(
+            pk,
+            sk,
+            ct,
+            amount,
+            blind);
+    } catch (const std::exception& error) {
+        delete proof;
+        caml_failwith(error.what());
+    }
+    CAMLreturn(wrap_zero_proof(proof));
+}
+
+CAMLprim value caml_pvac_verify_zero_bound_historical_migration(
+    value v_pk,
+    value v_ct,
+    value v_proof,
+    value v_commitment
+) {
+    CAMLparam4(v_pk, v_ct, v_proof, v_commitment);
+    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    pvac::ZeroProof& proof = *Handle_val(pvac::ZeroProof, v_proof);
+    if (bytes_len(v_commitment) != 32)
+        CAMLreturn(Val_bool(false));
+    pvac::RistrettoPoint commitment;
+    std::memcpy(commitment.data(), bytes_data(v_commitment), 32);
+    pvac::ExtPoint decoded_commitment;
+    if (!pvac::rist_decode(decoded_commitment, commitment))
+        CAMLreturn(Val_bool(false));
+    bool ok = false;
+    caml_release_runtime_system();
+    try {
+        ok = pvac::verify_zero_bound_historical_migration(
+            pk,
+            ct,
+            proof,
+            commitment);
+    } catch (...) {
+        ok = false;
+    }
+    caml_acquire_runtime_system();
     CAMLreturn(Val_bool(ok));
 }
 

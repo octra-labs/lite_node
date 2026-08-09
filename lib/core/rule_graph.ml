@@ -26,8 +26,10 @@ type activation = {
 type t = {
   chain_id : string;
   circle_activation : activation option;
+  wasm_compute_activation : activation option;
   validator_quorum_activation : activation option;
   epoch_time_activation : activation option;
+  owner_migration_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -39,6 +41,32 @@ let devnet_circle_activation = {
     "564797e4554eece839e606a431c3f1251679949c48dea039270dd8c6e706aab9";
   activation_epoch = 1_299_000;
 }
+
+let devnet_owner_migration_activation = {
+  anchor_epoch = 1_325_398;
+  anchor_state_root =
+    "257254d363a6864cb28461d80b0d40885e561ee3d17a97bfccb3af906a010229";
+  activation_epoch = 1_330_000;
+}
+
+let devnet_wasm_compute_activation = {
+  anchor_epoch = 1_325_398;
+  anchor_state_root =
+    "257254d363a6864cb28461d80b0d40885e561ee3d17a97bfccb3af906a010229";
+  activation_epoch = 1_330_000;
+}
+
+let owner_migration_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_owner_migration_activation
+  else
+    None
+
+let wasm_compute_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_wasm_compute_activation
+  else
+    None
 
 let validator_quorum_activation_for_chain chain_id : activation option =
   match Octra_consensus.C_quorum_policy.activation_for_chain chain_id with
@@ -70,15 +98,19 @@ let create ~chain_id ~root_at =
   {
     chain_id;
     circle_activation;
+    wasm_compute_activation = wasm_compute_activation_for_chain chain_id;
     validator_quorum_activation =
       validator_quorum_activation_for_chain chain_id;
     epoch_time_activation = epoch_time_activation_for_chain chain_id;
+    owner_migration_activation = owner_migration_activation_for_chain chain_id;
     root_at;
   }
 
 let circle_activation t = t.circle_activation
+let wasm_compute_activation t = t.wasm_compute_activation
 let validator_quorum_activation t = t.validator_quorum_activation
 let epoch_time_activation t = t.epoch_time_activation
+let owner_migration_activation t = t.owner_migration_activation
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
   if String.equal chain_id devnet_chain_id
@@ -89,6 +121,8 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
     let activations = [
       validator_quorum_activation_for_chain chain_id;
       epoch_time_activation_for_chain chain_id;
+      owner_migration_activation_for_chain chain_id;
+      wasm_compute_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -129,6 +163,11 @@ let mode t activation ~epoch =
 
 let circle t ~epoch = mode t t.circle_activation ~epoch
 
+let wasm_compute t ~epoch =
+  match t.wasm_compute_activation with
+  | Some activation -> mode t (Some activation) ~epoch
+  | None -> Ok Active
+
 let validator_quorum t ~epoch =
   match t.validator_quorum_activation with
   | Some activation -> mode t (Some activation) ~epoch
@@ -151,6 +190,11 @@ let epoch_time t ~epoch =
     with
     | Octra_consensus.Epoch_time.Uniform -> Ok Active
     | Octra_consensus.Epoch_time.Historical -> Ok Prior
+
+let owner_migration t ~epoch =
+  match t.owner_migration_activation with
+  | Some activation -> mode t (Some activation) ~epoch
+  | None -> Ok Prior
 
 let fault_message = function
   | Anchor_missing epoch ->

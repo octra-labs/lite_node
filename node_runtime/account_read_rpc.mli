@@ -75,8 +75,10 @@ val pvac_status :
   rpc_result Lwt.t
 
 val pvac_migration_status :
+  Octra_core.Store_irmin.t ->
   Octra_core.Pvac_migration_entitlement.t ->
   epoch:int ->
+  owner_migration_mode:Octra_core.Rule_graph.mode ->
   addr:string ->
   account:Octra_core.Ledger.account ->
   rpc_result Lwt.t

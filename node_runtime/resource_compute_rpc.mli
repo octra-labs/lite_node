@@ -10,3 +10,8 @@ val status :
   Resource_compute_service.t ->
   Yojson.Safe.t ->
   (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
+
+val cancel :
+  Resource_compute_service.t ->
+  Yojson.Safe.t ->
+  (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t

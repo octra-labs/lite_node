@@ -919,7 +919,10 @@ let debit_fee ~(backend : backend) (tx : Transaction.t) =
   | Ok () -> Stdlib.Ok ()
   | Error err -> Stdlib.Error ("insufficient_balance", err)
 
-let process_circle_deploy_tx ~(backend : backend) (tx : Transaction.t) =
+let process_circle_deploy_tx
+    ?(wasm_profile=Circle_wasm_host.Standard)
+    ~(backend : backend)
+    (tx : Transaction.t) =
   let open Lwt.Syntax in
   match parse_circle_deploy_payload tx with
   | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
@@ -929,7 +932,12 @@ let process_circle_deploy_tx ~(backend : backend) (tx : Transaction.t) =
     if tx.to_ <> circle_id then
       Lwt.return (Stdlib.Error ("circle_id_mismatch", "recipient does not match derived circle id"))
     else
-      let* checked = Circle_deploy.check_available backend.store src payload in
+      let* checked =
+        Circle_deploy.check_available
+          ~execution_profile:wasm_profile
+          backend.store
+          src
+          payload in
       match checked with
       | Stdlib.Error e ->
         Lwt.return (Stdlib.Error e)
@@ -943,7 +951,10 @@ let process_circle_deploy_tx ~(backend : backend) (tx : Transaction.t) =
           | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
           | Stdlib.Ok _ -> Lwt.return (Stdlib.Ok tx.ou)
 
-let process_circle_program_update_tx ~(backend : backend) (tx : Transaction.t) =
+let process_circle_program_update_tx
+    ?(wasm_profile=Circle_wasm_host.Standard)
+    ~(backend : backend)
+    (tx : Transaction.t) =
   let open Lwt.Syntax in
   match parse_circle_program_update_payload tx with
   | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
@@ -970,7 +981,9 @@ let process_circle_program_update_tx ~(backend : backend) (tx : Transaction.t) =
                     Lwt.return (Stdlib.Ok ())
                   | Circles.Wasm_v1 ->
                     let* validate_result =
-                      Circle_wasm_host.validate payload.code_b64 in
+                      Circle_wasm_host.validate
+                        ~execution_profile:wasm_profile
+                        payload.code_b64 in
                     begin
                       match validate_result with
                       | Ok _ ->
@@ -2794,14 +2807,16 @@ let process_validator_ready_tx ~backend ~env tx =
     | _ ->
       process_legacy_validator_ready_tx ~backend ~env tx
 
-let process_circle_operation_tx ?expected_transition_hash
+let process_circle_operation_tx
+    ?(wasm_profile=Circle_wasm_host.Standard)
+    ?expected_transition_hash
     ~(backend : backend) ~(current_epoch : int) (tx : Transaction.t) =
   let open Transaction in
   match tx.op_type with
   | CircleDeploy ->
-    process_circle_deploy_tx ~backend tx
+    process_circle_deploy_tx ~wasm_profile ~backend tx
   | CircleProgramUpdate ->
-    process_circle_program_update_tx ~backend tx
+    process_circle_program_update_tx ~wasm_profile ~backend tx
   | CircleAssetPut ->
     process_circle_asset_put_tx ~backend tx
   | CircleAssetPutEncrypted ->
@@ -2849,7 +2864,11 @@ let process_circle_operation_tx ?expected_transition_hash
   | _ ->
     Lwt.return (Stdlib.Error ("malformed_transaction", "unsupported circle operation"))
 
-let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
+let process_standard_tx_with_wasm_profile
+    ~wasm_profile
+    ~(backend : backend)
+    ~(env : env)
+    (tx : Transaction.t) =
   let open Transaction in
   match tx.op_type with
   | Standard ->
@@ -2878,7 +2897,11 @@ let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
   | CircleHfhePolicyPut | CircleKeyPolicyPut | CircleKeyGrant | CircleKeyExtend
   | CircleKeyRevoke | CircleKeyErase | CircleOutboxOpen | CircleRelayClaim
   | CircleRelayCancel | CircleIngressCommit ->
-    process_circle_operation_tx ~backend ~current_epoch:env.epoch_id tx
+    process_circle_operation_tx
+      ~wasm_profile
+      ~backend
+      ~current_epoch:env.epoch_id
+      tx
   | ValidatorSetUpdate ->
     process_validator_set_update_tx ~backend ~env tx
   | ValidatorReady ->
@@ -2905,6 +2928,13 @@ let process_standard_tx ~(backend : backend) ~(env : env) (tx : Transaction.t) =
     (match backend.ops.apply_op01_burn ~from:tx.from ~to_:tx.to_ tx.amount tx.nonce with
      | Error err -> Lwt.return (Stdlib.Error ("op01_burn_rejected", err))
      | Ok () -> Lwt.return (Stdlib.Ok tx.ou))
+
+let process_standard_tx ~(backend : backend) ~(env : env) tx =
+  process_standard_tx_with_wasm_profile
+    ~wasm_profile:Circle_wasm_host.Standard
+    ~backend
+    ~env
+    tx
 
 let schedule_validator_snapshot ~backend ~env =
   let open Lwt.Syntax in

@@ -262,7 +262,9 @@ let describe store circle_id =
                 end
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
-                  Octra_core.Circle_wasm_host.describe code_b64 in
+                  Octra_core.Circle_wasm_host.describe
+                    ~execution_profile:Octra_core.Circle_wasm_host.Compute
+                    code_b64 in
                 begin
                   match wasm_descriptor_result with
                   | Error e ->
@@ -343,7 +345,9 @@ let load ?(trusted = []) store circle_id =
                 end
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
-                  Octra_core.Circle_wasm_host.describe code_b64 in
+                  Octra_core.Circle_wasm_host.describe
+                    ~execution_profile:Octra_core.Circle_wasm_host.Compute
+                    code_b64 in
                 begin
                   match wasm_descriptor_result with
                   | Error e ->

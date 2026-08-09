@@ -275,3 +275,52 @@ let status service params =
             Lwt.return (Ok (response_json response))
         end
     end
+
+let cancel service params =
+  match
+    object_fields
+      ["caller"; "caller_public_key"; "caller_signature"; "session_id"]
+      params
+  with
+  | Error error -> Lwt.return (Error error)
+  | Ok fields ->
+    begin
+      match
+        address_field fields "caller",
+        base64_field fields "caller_public_key" 32,
+        base64_field fields "caller_signature" 64,
+        raw_hash_field fields "session_id"
+      with
+      | Error error, _, _, _
+      | _, Error error, _, _
+      | _, _, Error error, _
+      | _, _, _, Error error -> Lwt.return (Error error)
+      | Ok caller, Ok caller_public_key, Ok caller_signature, Ok session_id ->
+        let open Lwt.Syntax in
+        let* result =
+          Service.cancel
+            service
+            Service.{
+              caller;
+              caller_public_key;
+              caller_signature;
+              session_id;
+            } in
+        begin
+          match result with
+          | Error message ->
+            Lwt.return
+              (Error
+                 (Rpc.err
+                    (-32041)
+                    "resource compute cancellation refused"
+                    (Some (`String message))))
+          | Ok cancelled ->
+            Lwt.return
+              (Ok
+                 (`Assoc [
+                    "cancelled_jobs", `Int cancelled;
+                    "status", `String "cancelled";
+                  ]))
+        end
+    end

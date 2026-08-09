@@ -44,9 +44,14 @@ let context ~program_trust backend env (tx : Transaction.t) effects tx_hash =
       tx_hash;
     }
 
+let wasm_profile = function
+  | Rule_graph.Prior -> Octra_core.Circle_wasm_host.Standard
+  | Rule_graph.Active -> Octra_core.Circle_wasm_host.Compute
+
 let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
     ?(save_receipt_raw=(fun ~tx_hash:_ ~json:_ -> ()))
-    ~circle_mode ~program_trust backend env (tx : Transaction.t) =
+    ~circle_mode ~wasm_compute_mode ~program_trust backend env
+    (tx : Transaction.t) =
   let effects =
     Tx_effects.create
       ~ledger:backend.Epoch_exec.ledger
@@ -232,7 +237,11 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
           ~method_name:call.Call_plan.method_name
           result.Circle_exec.receipt);
       circle_commit = (fun current result ->
-        Circle_exec.commit_call_result backend.store current.to_ result);
+        Circle_exec.commit_call_result
+          ~deployment_profile:(wasm_profile wasm_compute_mode)
+          backend.store
+          current.to_
+          result);
       circle_log_ok = (fun _ _ _ _ -> ());
       program_exec = (fun current ~ctx call ->
         Lwt.return
@@ -348,7 +357,13 @@ let circle_cell_transition_hash preverify tx =
         end
     end
 
-let preverify_circle ~circle_mode ~backend ~env ~program_trust tx =
+let preverify_circle
+    ~circle_mode
+    ~wasm_compute_mode
+    ~backend
+    ~env
+    ~program_trust
+    tx =
   let open Lwt.Syntax in
   let capture = ref None in
   let* result =
@@ -356,6 +371,7 @@ let preverify_circle ~circle_mode ~backend ~env ~program_trust tx =
       ~hfhe_mode:Transcript.Capture
       ~circle_capture:capture
       ~circle_mode
+      ~wasm_compute_mode
       ~program_trust
       backend
       env
@@ -380,7 +396,7 @@ let preverify_circle ~circle_mode ~backend ~env ~program_trust tx =
     Lwt.return_error "circle_receipt_capture_missing"
 
 let process_tx ?preverify ?save_receipt_raw ~backend
-    ~(env : Epoch_exec.env) ~circle_mode ~program_trust tx =
+    ~(env : Epoch_exec.env) ~circle_mode ~wasm_compute_mode ~program_trust tx =
   match tx.Transaction.op_type with
   | Transaction.CircleBalanceCellPut
   | Transaction.CircleRegisterCellPut ->
@@ -406,13 +422,21 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Error e ->
         Lwt.return_error ("circle_preverify_receipt", e)
       | Ok None ->
-        run ?save_receipt_raw ~circle_mode ~program_trust backend env tx
+        run
+          ?save_receipt_raw
+          ~circle_mode
+          ~wasm_compute_mode
+          ~program_trust
+          backend
+          env
+          tx
       | Ok (Some circle) ->
         run
           ~hfhe_mode:(Transcript.Consume circle.transcript)
           ~expected_circle:circle
           ?save_receipt_raw
           ~circle_mode
+          ~wasm_compute_mode
           ~program_trust
           backend
           env
@@ -424,8 +448,34 @@ let process_tx ?preverify ?save_receipt_raw ~backend
   | Transaction.ProgramExec
   | Transaction.MultiExec
   | Transaction.ContractUpgrade ->
-    run ?save_receipt_raw ~circle_mode ~program_trust backend env tx
-  | Transaction.CircleDeploy
+    run
+      ?save_receipt_raw
+      ~circle_mode
+      ~wasm_compute_mode
+      ~program_trust
+      backend
+      env
+      tx
+  | Transaction.CircleDeploy ->
+    let open Lwt.Syntax in
+    let* admitted =
+      Consensus_circle_code_admission.admit
+        ~store:backend.Epoch_exec.store
+        ~program_trust
+        tx
+    in
+    begin
+      match admitted with
+      | Error error -> Lwt.return_error error
+      | Ok () ->
+        let* result =
+          Epoch_exec.process_circle_deploy_tx
+            ~wasm_profile:(wasm_profile wasm_compute_mode)
+            ~backend
+            tx in
+        Lwt.return
+          (Result.map (fun fee -> Epoch_exec.Confirmed fee) result)
+    end
   | Transaction.CircleProgramUpdate ->
     let open Lwt.Syntax in
     let* admitted =
@@ -438,11 +488,20 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       match admitted with
       | Error error -> Lwt.return_error error
       | Ok () ->
-        let* result = Epoch_exec.process_standard_tx ~backend ~env tx in
+        let* result =
+          Epoch_exec.process_circle_program_update_tx
+            ~wasm_profile:(wasm_profile wasm_compute_mode)
+            ~backend
+            tx in
         Lwt.return
           (Result.map (fun fee -> Epoch_exec.Confirmed fee) result)
     end
   | _ ->
     let open Lwt.Syntax in
-    let* result = Epoch_exec.process_standard_tx ~backend ~env tx in
+    let* result =
+      Epoch_exec.process_standard_tx_with_wasm_profile
+        ~wasm_profile:(wasm_profile wasm_compute_mode)
+        ~backend
+        ~env
+        tx in
     Lwt.return (Result.map (fun fee -> Epoch_exec.Confirmed fee) result)

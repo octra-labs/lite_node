@@ -218,6 +218,7 @@ val pvac_migration_status :
   addr:string ->
   cipher:string ->
   epoch:int ->
+  owner_migration_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Pvac_migration.status ->
   Octra_core.Pvac_migration_entitlement.t ->
   Yojson.Safe.t

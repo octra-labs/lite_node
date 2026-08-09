@@ -508,6 +508,13 @@ let handle_chunk ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ query =
         `Bad_request
         "invalid chunk request"
     else
+    let snapshot = State_sync.snapshot_dir data_dir snapshot_id in
+    if not (Sys.file_exists snapshot) then
+      respond_error
+        ~error_type:"state_sync_snapshot_expired"
+        `Gone
+        "state sync snapshot expired; restart with the current manifest"
+    else
     match load_snapshot_certificate ~data_dir ~chain_id ~snapshot_id with
     | Error reason ->
         respond_error
@@ -565,6 +572,15 @@ let handle_chunk ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ query =
                       `Internal_server_error
                       "snapshot chunk failed local integrity check"
                 | Ok payload ->
+                    begin
+                      match Sync_lease.renew ~now:(Unix.gettimeofday ()) snapshot with
+                      | Ok () -> ()
+                      | Error reason ->
+                        Log.warn "state_sync"
+                          "event = lease_renew_failed snapshot = %s reason = %s"
+                          body.snapshot_id
+                          reason
+                    end;
                     Server.respond_string
                       ~status:`OK
                       ~headers:(octet_stream_headers [

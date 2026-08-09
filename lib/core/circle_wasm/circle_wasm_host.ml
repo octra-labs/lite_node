@@ -600,11 +600,16 @@ let compute_storage_drop cache_key =
 let compute_self_test () =
   read_process_json (`Assoc ["action", `String "compute_self_test"])
 
-let validate code_b64 =
+let profile_name = function
+  | Standard -> "standard"
+  | Compute -> "compute"
+
+let validate ?(execution_profile=Standard) code_b64 =
   let payload =
     `Assoc [
       "action", `String "validate";
       "code_b64", `String code_b64;
+      "execution_profile", `String (profile_name execution_profile);
     ] in
   let* json_result = read_process_json payload in
   match json_result with
@@ -613,11 +618,12 @@ let validate code_b64 =
   | Ok json ->
     Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
-let describe code_b64 =
+let describe ?(execution_profile=Standard) code_b64 =
   let payload =
     `Assoc [
       "action", `String "describe";
       "code_b64", `String code_b64;
+      "execution_profile", `String (profile_name execution_profile);
     ] in
   let* json_result = read_process_json payload in
   match json_result with
@@ -626,9 +632,7 @@ let describe code_b64 =
   | Ok json ->
     Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
-let execution_profile_name = function
-  | Standard -> "standard"
-  | Compute -> "compute"
+let execution_profile_name = profile_name
 
 let execute_with_profile
     ~code_b64

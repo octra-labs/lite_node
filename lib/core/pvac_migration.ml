@@ -8,11 +8,22 @@ type cipher_class =
   | Foreign
   | Malformed of string
 
+type key_class =
+  | Current
+  | Historical
+  | Missing
+  | Malformed_key of string
+
+type route =
+  | Direct_key_switch
+  | Bound_migration
+  | History_migration
+  | Blocked
+
 type status = {
   cipher_class : cipher_class;
-  can_key_switch : bool;
-  can_v3_migrate : bool;
-  needs_legacy_public_replay : bool;
+  key_class : key_class;
+  route : route;
   reason : string;
 }
 
@@ -23,6 +34,27 @@ let cipher_class_to_string = function
   | Foreign -> "foreign"
   | Malformed _ -> "malformed"
 
+let key_class_to_string = function
+  | Current -> "current"
+  | Historical -> "historical"
+  | Missing -> "missing"
+  | Malformed_key _ -> "malformed"
+
+let route_to_string = function
+  | Direct_key_switch -> "direct_key_switch"
+  | Bound_migration -> "bound_migration"
+  | History_migration -> "history_migration"
+  | Blocked -> "blocked"
+
+let can_key_switch status =
+  status.route = Direct_key_switch
+
+let can_bound_migrate status =
+  status.route = Bound_migration
+
+let needs_history_migration status =
+  status.route = History_migration
+
 let classify_cipher = function
   | "" | "0" -> Empty
   | cipher when not (Crypto.FheBalance.is_fhe_cipher cipher) -> Foreign
@@ -32,47 +64,74 @@ let classify_cipher = function
     | Ok false -> Legacy_hfhe
     | Error e -> Malformed e
 
-let status_of_class = function
-  | Empty ->
+let classify_key = function
+  | None -> Missing
+  | Some blob ->
+    begin
+      match Crypto.FheBalance.blob_supports_alias_rejection blob with
+      | Ok true -> Current
+      | Ok false -> Historical
+      | Error error -> Malformed_key error
+    end
+
+let status_of_classes cipher_class key_class =
+  match cipher_class, key_class with
+  | Empty, _ ->
     {
       cipher_class = Empty;
-      can_key_switch = true;
-      can_v3_migrate = false;
-      needs_legacy_public_replay = false;
+      key_class;
+      route = Direct_key_switch;
       reason = "encrypted balance is empty";
     }
-  | V3 ->
+  | V3, Current ->
     {
       cipher_class = V3;
-      can_key_switch = false;
-      can_v3_migrate = true;
-      needs_legacy_public_replay = false;
-      reason = "v3 encrypted balance can migrate with bound equality proofs";
+      key_class;
+      route = Bound_migration;
+      reason = "key-bound encrypted balance can migrate with equality proofs";
     }
-  | Legacy_hfhe ->
+  | V3, Historical ->
+    {
+      cipher_class = V3;
+      key_class;
+      route = History_migration;
+      reason = "pvac pubkey proof circuit requires public or commitment history migration";
+    }
+  | V3, Missing ->
+    {
+      cipher_class = V3;
+      key_class;
+      route = Blocked;
+      reason = "encrypted balance has no pvac pubkey";
+    }
+  | V3, Malformed_key error ->
+    {
+      cipher_class = V3;
+      key_class;
+      route = Blocked;
+      reason = error;
+    }
+  | Legacy_hfhe, _ ->
     {
       cipher_class = Legacy_hfhe;
-      can_key_switch = false;
-      can_v3_migrate = false;
-      needs_legacy_public_replay = true;
+      key_class;
+      route = History_migration;
       reason = "legacy hfhe balance needs public-history replay or ciphertext migration proof";
     }
-  | Foreign ->
+  | Foreign, _ ->
     {
       cipher_class = Foreign;
-      can_key_switch = false;
-      can_v3_migrate = false;
-      needs_legacy_public_replay = false;
+      key_class;
+      route = Blocked;
       reason = "encrypted balance is not hfhe";
     }
-  | Malformed e ->
+  | Malformed error, _ ->
     {
-      cipher_class = Malformed e;
-      can_key_switch = false;
-      can_v3_migrate = false;
-      needs_legacy_public_replay = false;
-      reason = "encrypted balance is malformed: " ^ e;
+      cipher_class = Malformed error;
+      key_class;
+      route = Blocked;
+      reason = "encrypted balance is malformed: " ^ error;
     }
 
-let status_of_cipher cipher =
-  status_of_class (classify_cipher cipher)
+let status_of_state ~cipher ~pubkey =
+  status_of_classes (classify_cipher cipher) (classify_key pubkey)

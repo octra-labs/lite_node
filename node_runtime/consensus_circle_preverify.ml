@@ -43,6 +43,10 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok circle_mode ->
+    match Rule_graph.wasm_compute runtime.rules ~epoch:env.epoch_id with
+    | Error fault ->
+      Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
+    | Ok wasm_compute_mode ->
     let proposal_id = "circle-" ^ Transaction.hash tx in
     let open Lwt.Syntax in
     let* result = Lwt.catch
@@ -61,6 +65,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
                   let* result =
                     Consensus_vm_transition.preverify_circle
                       ~circle_mode
+                      ~wasm_compute_mode
                       ~backend
                       ~env
                       ~program_trust:runtime.program_trust

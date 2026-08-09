@@ -41,6 +41,7 @@ type config = {
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
   migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
+  rules : Octra_core.Rule_graph.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   epoch_visibility : Epoch_visibility.t;
@@ -64,6 +65,7 @@ type ctx = {
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
   migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
+  rules : Octra_core.Rule_graph.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t;
   deps : deps;
@@ -321,12 +323,26 @@ let octra_register_public_key params ctx =
     params
 
 let octra_pvac_migration_status params ctx =
-  with_account params ctx (fun addr account ->
-    Account_read_rpc.pvac_migration_status
-      ctx.migration_entitlements
+  match
+    Octra_core.Rule_graph.owner_migration
+      ctx.rules
       ~epoch:!(ctx.current_epoch)
-      ~addr
-      ~account)
+  with
+  | Error fault ->
+    Lwt.return_error
+      (Rpc.err
+         (-32005)
+         (Octra_core.Rule_graph.fault_message fault)
+         None)
+  | Ok owner_migration_mode ->
+    with_account params ctx (fun addr account ->
+      Account_read_rpc.pvac_migration_status
+        ctx.store
+        ctx.migration_entitlements
+        ~epoch:!(ctx.current_epoch)
+        ~owner_migration_mode
+        ~addr
+        ~account)
 
 let status_dispatch_adapters =
   Status_read_rpc.{ status_read }
@@ -408,6 +424,8 @@ let compute_dispatch = [
   (fun params ctx -> Resource_compute_rpc.submit ctx.resource_compute params);
   "octra_circleComputeStatus",
   (fun params ctx -> Resource_compute_rpc.status ctx.resource_compute params);
+  "octra_circleComputeCancel",
+  (fun params ctx -> Resource_compute_rpc.cancel ctx.resource_compute params);
 ]
 
 let read_error =
@@ -491,6 +509,7 @@ let start (cfg : config) =
     validator_view_pub = cfg.validator_view_pub;
     program_trust = cfg.program_trust;
     migration_entitlements = cfg.migration_entitlements;
+    rules = cfg.rules;
     consensus_driver_ref = cfg.consensus_driver_ref;
     resource_compute = cfg.resource_compute;
     deps = cfg.deps;

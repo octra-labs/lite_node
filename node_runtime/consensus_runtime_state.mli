@@ -24,5 +24,10 @@ val clear_state_attested : t -> unit
 val set_state_attested : t -> head:int -> root:string -> unit
 val attested_head : t -> int -> bool
 val root_attestation_recovers : string -> bool
+val root_recovery_evidence :
+  reason:string ->
+  evidence:string ->
+  consensus_proved:bool ->
+  string option
 val enter_quarantine : t -> epoch:int -> reason:string -> bool
 val clear_quarantine : t -> evidence:string -> clear_result

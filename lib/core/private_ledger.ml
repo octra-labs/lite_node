@@ -189,6 +189,14 @@ type decrypt_payload = {
   range_proof_balance : string option;
 }
 
+type key_switch_migration =
+  | Standard
+  | Rejected_rebinding
+  | Public_history
+  | Commitment_history
+  | Verified_zero_reset
+  | Historical_owner_proof
+
 type key_switch_payload = {
   new_pubkey_b64 : string;
   aes_kat : string;
@@ -200,20 +208,48 @@ type key_switch_payload = {
   new_zero_proof : string option;
   amount_commitment : string option;
   amount_blinding : string option;
-  legacy_ct_migration : bool;
-  legacy_public_migration : bool;
-  legacy_commitment_migration : bool;
-  legacy_zero_reset : bool;
+  migration : key_switch_migration;
 }
 
-let key_switch_migration_count payload =
-  [
-    payload.legacy_ct_migration;
-    payload.legacy_public_migration;
-    payload.legacy_commitment_migration;
-    payload.legacy_zero_reset;
-  ]
-  |> List.fold_left (fun count enabled -> if enabled then count + 1 else count) 0
+let key_switch_migration_of_name = function
+  | "standard" -> Ok Standard
+  | "rejected_rebinding" -> Ok Rejected_rebinding
+  | "public_history" -> Ok Public_history
+  | "commitment_history" -> Ok Commitment_history
+  | "verified_zero_reset" -> Ok Verified_zero_reset
+  | "historical_owner_proof" -> Ok Historical_owner_proof
+  | value -> Error ("unknown key_switch migration_mode = " ^ value)
+
+let compatibility_migration json =
+  let legacy_fields = [
+    "legacy_ct_migration", Rejected_rebinding;
+    "legacy_public_migration", Public_history;
+    "legacy_commitment_migration", Commitment_history;
+    "legacy_zero_reset", Verified_zero_reset;
+  ] in
+  let requested =
+    List.filter_map
+      (fun (name, migration) ->
+        if Yojson.Safe.Util.(member name json |> to_bool_option) = Some true
+        then Some migration
+        else None)
+      legacy_fields
+  in
+  match requested with
+  | [] -> Ok Standard
+  | [migration] -> Ok migration
+  | _ -> Error "key_switch migration modes are mutually exclusive"
+
+let parse_key_switch_migration json =
+  let requested =
+    Yojson.Safe.Util.(member "migration_mode" json |> to_string_option)
+  in
+  match requested, compatibility_migration json with
+  | _, Error reason -> Error reason
+  | None, Ok migration -> Ok migration
+  | Some name, Ok Standard -> key_switch_migration_of_name name
+  | Some _, Ok _ ->
+    Error "migration_mode cannot be mixed with legacy migration fields"
 
 let error ?user_reason tag reason =
   let user_reason = match user_reason with
@@ -401,30 +437,24 @@ let parse_key_switch raw =
   | Ok json ->
     match field json "new_pubkey", field json "aes_kat" with
     | Ok new_pubkey_b64, Ok aes_kat ->
-      let payload = {
-        new_pubkey_b64;
-        aes_kat;
-        old_bound_pubkey_b64 = Yojson.Safe.Util.(member "old_bound_pubkey" json |> to_string_option);
-        old_bound_cipher = Yojson.Safe.Util.(member "old_bound_cipher" json |> to_string_option);
-        source_cipher_hash = Yojson.Safe.Util.(member "source_cipher_hash" json |> to_string_option);
-        new_cipher = Yojson.Safe.Util.(member "new_cipher" json |> to_string_option);
-        old_zero_proof = Yojson.Safe.Util.(member "old_zero_proof" json |> to_string_option);
-        new_zero_proof = Yojson.Safe.Util.(member "new_zero_proof" json |> to_string_option);
-        amount_commitment = Yojson.Safe.Util.(member "amount_commitment" json |> to_string_option);
-        amount_blinding = Yojson.Safe.Util.(member "amount_blinding" json |> to_string_option);
-        legacy_ct_migration =
-          Yojson.Safe.Util.(member "legacy_ct_migration" json |> to_bool_option) = Some true;
-        legacy_public_migration =
-          Yojson.Safe.Util.(member "legacy_public_migration" json |> to_bool_option) = Some true;
-        legacy_commitment_migration =
-          Yojson.Safe.Util.(member "legacy_commitment_migration" json |> to_bool_option) = Some true;
-        legacy_zero_reset =
-          Yojson.Safe.Util.(member "legacy_zero_reset" json |> to_bool_option) = Some true;
-      } in
-      if key_switch_migration_count payload > 1 then
-        error "key_switch_rejected" "key_switch migration modes are mutually exclusive"
-      else
-        Ok payload
+      begin
+        match parse_key_switch_migration json with
+        | Error reason -> error "key_switch_rejected" reason
+        | Ok migration ->
+          Ok {
+            new_pubkey_b64;
+            aes_kat;
+            old_bound_pubkey_b64 = Yojson.Safe.Util.(member "old_bound_pubkey" json |> to_string_option);
+            old_bound_cipher = Yojson.Safe.Util.(member "old_bound_cipher" json |> to_string_option);
+            source_cipher_hash = Yojson.Safe.Util.(member "source_cipher_hash" json |> to_string_option);
+            new_cipher = Yojson.Safe.Util.(member "new_cipher" json |> to_string_option);
+            old_zero_proof = Yojson.Safe.Util.(member "old_zero_proof" json |> to_string_option);
+            new_zero_proof = Yojson.Safe.Util.(member "new_zero_proof" json |> to_string_option);
+            amount_commitment = Yojson.Safe.Util.(member "amount_commitment" json |> to_string_option);
+            amount_blinding = Yojson.Safe.Util.(member "amount_blinding" json |> to_string_option);
+            migration;
+          }
+      end
     | Error e, _
     | _, Error e ->
       error "key_switch_rejected"
@@ -433,15 +463,26 @@ let parse_key_switch raw =
 
 let key_switch_requests_legacy_public_migration tx =
   match parse_key_switch tx.T.encrypted_data with
-  | Ok payload -> payload.legacy_public_migration
+  | Ok payload -> payload.migration = Public_history
+  | Error _ -> false
+
+let key_switch_requests_historical_owner_proof tx =
+  match parse_key_switch tx.T.encrypted_data with
+  | Ok payload -> payload.migration = Historical_owner_proof
   | Error _ -> false
 
 let key_switch_requests_legacy_audit tx =
   match parse_key_switch tx.T.encrypted_data with
   | Ok payload ->
-    payload.legacy_public_migration ||
-    payload.legacy_ct_migration ||
-    payload.legacy_commitment_migration
+    begin
+      match payload.migration with
+      | Public_history
+      | Rejected_rebinding
+      | Commitment_history -> true
+      | Standard
+      | Historical_owner_proof
+      | Verified_zero_reset -> false
+    end
   | Error _ -> false
 
 let version json =
@@ -955,26 +996,6 @@ let legacy_audit_commitment = function
     | _, None -> Error "legacy commitment migration requires reconstructable commitment history")
   | None -> Error "legacy commitment migration requires node history audit"
 
-let history_migration_required status old_pubkey =
-  match status.PM.cipher_class with
-  | PM.Legacy_hfhe -> Ok true
-  | PM.V3 ->
-    begin
-      match old_pubkey with
-      | None -> Error "encrypted balance has no pvac pubkey"
-      | Some blob ->
-        Result.map not (FB.blob_supports_alias_rejection blob)
-    end
-  | PM.Empty
-  | PM.Foreign
-  | PM.Malformed _ -> Ok false
-
-let history_migration_reason status =
-  if status.PM.needs_legacy_public_replay then
-    status.reason
-  else
-    "pvac pubkey proof circuit requires public or commitment history migration"
-
 let verify_legacy_public_migration new_pubkey amount payload =
   match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
   | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
@@ -1168,6 +1189,99 @@ let prepared_bound_migration old_pk current_cipher payload =
             "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"
     end
 
+let prepared_historical_owner old_pk current_cipher payload =
+  match payload.old_bound_pubkey_b64, payload.old_bound_cipher with
+  | Some _, _
+  | _, Some _ ->
+    error
+      "key_switch_rejected"
+      "historical owner migration reads its source key and ciphertext from finalized state"
+  | None, None ->
+    begin
+      match payload.amount_blinding with
+      | Some _ ->
+        error
+          "key_switch_rejected"
+          "historical owner migration must not disclose amount blinding"
+      | None ->
+        match payload.source_cipher_hash with
+        | None ->
+          error
+            "key_switch_rejected"
+            "historical owner migration requires source_cipher_hash"
+        | Some source when not (String.equal source (digest current_cipher)) ->
+          error
+            "key_switch_rejected"
+            "encrypted balance changed before historical owner verification"
+        | Some _ ->
+          begin
+            match guard_refresh_source current_cipher with
+            | Error _ as result -> result
+            | Ok () ->
+              match
+                old_pk,
+                payload.new_cipher,
+                payload.old_zero_proof,
+                payload.new_zero_proof,
+                payload.amount_commitment
+              with
+              | Some old_blob, Some new_cipher, Some old_proof, Some new_proof,
+                Some commitment when FB.cipher_is_wrapped_scalar new_cipher ->
+                Ok (old_blob, new_cipher, old_proof, new_proof, commitment)
+              | Some _, Some _, Some _, Some _, Some _ ->
+                error
+                  "key_switch_rejected"
+                  "historical owner migration requires a wrapped scalar new cipher"
+              | _ ->
+                error
+                  "key_switch_rejected"
+                  "historical owner migration requires source proof, new cipher, new proof and amount commitment"
+          end
+    end
+
+let verify_historical_owner
+    ~worker_priority
+    ~old_pk
+    ~current_cipher
+    ~new_pubkey
+    payload =
+  let open Lwt.Syntax in
+  match prepared_historical_owner old_pk current_cipher payload with
+  | Error failure -> Lwt.return (Error failure)
+  | Ok (old_blob, new_cipher, old_proof, new_proof, commitment) ->
+    let* old_checked =
+      VW.verify_historical_migration_claim_classified_with_priority
+        worker_priority
+        ~pubkey:old_blob
+        ~cipher:current_cipher
+        ~proof:old_proof
+        ~commitment
+    in
+    begin
+      match old_checked with
+      | Error worker_failure ->
+        Lwt.return
+          (key_switch_worker_error
+             "historical encrypted balance proof failed: "
+             worker_failure)
+      | Ok () ->
+        let* new_checked =
+          VW.verify_claim_classified_with_priority
+            worker_priority
+            ~pubkey:new_pubkey
+            ~cipher:new_cipher
+            ~proof:new_proof
+            ~commitment
+        in
+        match new_checked with
+        | Error worker_failure ->
+          Lwt.return
+            (key_switch_worker_error
+               "new encrypted balance proof failed: "
+               worker_failure)
+        | Ok () -> Lwt.return_ok new_cipher
+    end
+
 let verify_key_switch_plan
     ?legacy_public_replay
     ?snapshot
@@ -1209,26 +1323,21 @@ let verify_key_switch_plan
             let* migration_status =
               Proof_pool.run
                 ~priority:worker_priority
-                (fun () -> PM.status_of_cipher current_cipher)
-            in
-            let* history_required_result =
-              Proof_pool.run
-                ~priority:worker_priority
                 (fun () ->
-                  history_migration_required migration_status old_pk)
+                  PM.status_of_state
+                    ~cipher:current_cipher
+                    ~pubkey:old_pk)
             in
-            match history_required_result with
-            | Error reason ->
-              Lwt.return (error "key_switch_rejected" reason)
-            | Ok history_required ->
-            if payload.legacy_zero_reset && not history_required then
+            if payload.migration = Verified_zero_reset
+              && not (PM.needs_history_migration migration_status)
+            then
               Lwt.return (error "key_switch_rejected" "legacy zero reset requires a legacy hfhe balance")
-            else if migration_status.can_key_switch then
+            else if PM.can_key_switch migration_status then
               Lwt.return
                 (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
                   ~new_cipher:None ~source_cipher:current_cipher)
-            else if history_required then
-              if payload.legacy_zero_reset then
+            else if PM.needs_history_migration migration_status then
+              if payload.migration = Verified_zero_reset then
                   let* checked =
                     verify_new_key new_pubkey "legacy zero reset failed: "
                     (fun pubkey -> verify_legacy_zero_reset pubkey payload)
@@ -1241,7 +1350,37 @@ let verify_key_switch_plan
                       ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
                 | Ok (), None ->
                   Lwt.return (error "key_switch_rejected" "legacy zero reset lost new cipher"))
-              else if payload.legacy_commitment_migration then
+              else if payload.migration = Historical_owner_proof then
+                if
+                  migration_status.cipher_class <> PM.V3
+                  || migration_status.key_class <> PM.Historical
+                then
+                  Lwt.return
+                    (error
+                       "key_switch_rejected"
+                       "historical owner proof requires a key-bound balance and historical registered key")
+                else
+                  let* checked =
+                    verify_historical_owner
+                      ~worker_priority
+                      ~old_pk
+                      ~current_cipher
+                      ~new_pubkey
+                      payload
+                  in
+                  begin
+                    match checked with
+                    | Error failure -> Lwt.return (Error failure)
+                    | Ok new_cipher ->
+                      Lwt.return
+                        (key_switch_value
+                           ~old_key_hash
+                           ~new_key_hash
+                           ~new_pubkey
+                           ~new_cipher:(Some new_cipher)
+                           ~source_cipher:current_cipher)
+                  end
+              else if payload.migration = Commitment_history then
                 (match legacy_audit_commitment legacy_public_replay with
                 | Error e -> Lwt.return (error "key_switch_rejected" e)
                 | Ok commitment ->
@@ -1261,11 +1400,11 @@ let verify_key_switch_plan
                         ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
                   | Ok (), None ->
                     Lwt.return (error "key_switch_rejected" "legacy commitment migration lost new cipher")))
-              else if payload.legacy_ct_migration then
+              else if payload.migration = Rejected_rebinding then
                 Lwt.return
                   (error "key_switch_rejected"
                     "legacy ciphertext rebinding is not statement preserving; use public or commitment history migration")
-              else if payload.legacy_public_migration then
+              else if payload.migration = Public_history then
                 match legacy_public_replay_amount legacy_public_replay with
                 | Error e -> Lwt.return (error "key_switch_rejected" e)
                 | Ok amount ->
@@ -1286,8 +1425,8 @@ let verify_key_switch_plan
                 Lwt.return
                   (error
                     "key_switch_rejected"
-                    (history_migration_reason migration_status))
-            else if not migration_status.can_v3_migrate then
+                    migration_status.reason)
+            else if not (PM.can_bound_migrate migration_status) then
               Lwt.return (error "key_switch_rejected" migration_status.reason)
             else
               (match payload.source_cipher_hash with
@@ -1388,42 +1527,49 @@ let prepare_key_switch_plan_uncached ledger tx =
         | Error e -> Lwt.return (Error e)
         | Ok current_cipher ->
           let* status =
-            Proof_pool.run (fun () -> PM.status_of_cipher current_cipher)
-          in
-          let* history_required_result =
             Proof_pool.run
-              (fun () -> history_migration_required status old_pk)
+              (fun () ->
+                PM.status_of_state
+                  ~cipher:current_cipher
+                  ~pubkey:old_pk)
           in
-          begin
-            match history_required_result with
-            | Error reason ->
-              Lwt.return (error "key_switch_rejected" reason)
-            | Ok history_required ->
           let prepared =
-            if payload.legacy_zero_reset
-              && not history_required
+            if payload.migration = Verified_zero_reset
+              && not (PM.needs_history_migration status)
             then
               error
                 "key_switch_rejected"
                 "legacy zero reset requires a legacy hfhe balance"
-            else if status.can_key_switch then
+            else if PM.can_key_switch status then
               Ok None
-            else if history_required then
-              if payload.legacy_zero_reset then
+            else if PM.needs_history_migration status then
+              if payload.migration = Verified_zero_reset then
                 Result.map Option.some (prepared_legacy_zero_reset payload)
-              else if payload.legacy_commitment_migration then
+              else if payload.migration = Historical_owner_proof then
+                if
+                  status.cipher_class <> PM.V3
+                  || status.key_class <> PM.Historical
+                then
+                  error
+                    "key_switch_rejected"
+                    "historical owner proof requires a key-bound balance and historical registered key"
+                else
+                  Result.map
+                    (fun (_, new_cipher, _, _, _) -> Some new_cipher)
+                    (prepared_historical_owner old_pk current_cipher payload)
+              else if payload.migration = Commitment_history then
                 Result.map Option.some (prepared_legacy_commitment payload)
-              else if payload.legacy_ct_migration then
+              else if payload.migration = Rejected_rebinding then
                 error
                   "key_switch_rejected"
                   "legacy ciphertext rebinding is not statement preserving; use public or commitment history migration"
-              else if payload.legacy_public_migration then
+              else if payload.migration = Public_history then
                 Result.map Option.some (prepared_legacy_public payload)
               else
                 error
                   "key_switch_rejected"
-                  (history_migration_reason status)
-            else if not status.can_v3_migrate then
+                  status.reason
+            else if not (PM.can_bound_migrate status) then
               error "key_switch_rejected" status.reason
             else
               Result.map Option.some
@@ -1440,7 +1586,6 @@ let prepare_key_switch_plan_uncached ledger tx =
                    source_cipher = current_cipher;
                  })
                prepared)
-          end
     end
 
 let prepare_key_switch_plan ledger tx =

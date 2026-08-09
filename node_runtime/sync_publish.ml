@@ -226,12 +226,27 @@ let staged_snapshot name =
   else
     false
 
+let active_lease ~now root (id, _) =
+  let snapshot = Filename.concat root id in
+  let certificate = State_sync.snapshot_certificate_path snapshot in
+  try
+    let published_at = (Unix.stat certificate).Unix.st_mtime in
+    Sync_lease.read ~now ~published_at ~snapshot_id:id snapshot
+  with Unix.Unix_error _ -> None
+
 let retain data_dir ~retain ~current =
   let root = State_sync.snapshot_root data_dir in
   if Sys.file_exists root then begin
+    let snapshots = snapshot_entries root in
+    let leased =
+      snapshots
+      |> List.filter_map (active_lease ~now:(Unix.gettimeofday ()) root)
+      |> Sync_lease.retained
+    in
     let removed =
-      snapshot_entries root
+      snapshots
       |> retention_plan ~retain ~current
+      |> List.filter (fun id -> not (List.mem id leased))
     in
     List.iter (fun id -> remove_tree (Filename.concat root id)) removed;
     Sys.readdir root
@@ -585,7 +600,7 @@ let run deps =
             load_published deps exporter_set >>= fun published ->
             deps.info
               (Printf.sprintf
-                 "event = sync_cycle_started published = %s interval_epochs = 360 retain = 3"
+                 "event = sync_cycle_started published = %s interval_epochs = 360 retain = 10"
                  (Option.fold
                     ~none:"none"
                     ~some:Int64.to_string

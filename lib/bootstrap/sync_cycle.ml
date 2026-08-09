@@ -36,7 +36,7 @@ let policy ~interval ~retain =
     Ok { interval; retain }
 
 let default =
-  match policy ~interval:360L ~retain:3 with
+  match policy ~interval:360L ~retain:10 with
   | Ok value -> value
   | Error reason -> invalid_arg reason
 

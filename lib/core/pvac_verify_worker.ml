@@ -2,9 +2,9 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module P = Pvac_verify_protocol
-module Scheduler = Compute_pool
+module Channel = Compute_pool
 
-type priority = Scheduler.priority =
+type priority = Channel.priority =
   | Required
   | Speculative
 
@@ -44,8 +44,8 @@ let capacity_of_getenv getenv =
 
 let capacity = capacity_of_getenv Sys.getenv_opt
 
-let scheduler =
-  Scheduler.create
+let proof_channel =
+  Channel.create
     ~capacity
     ~required_limit:Resource_lanes.preverify_required_queue_limit
     ~speculative_limit:Resource_lanes.preverify_speculative_queue_limit
@@ -397,14 +397,14 @@ let run_unmanaged request =
 
 let run_sync ?(priority = Required) request =
   match
-    Scheduler.run_sync scheduler priority (fun () -> run_unmanaged request)
+    Channel.run_sync proof_channel priority (fun () -> run_unmanaged request)
   with
   | Some outcome -> outcome
   | None -> Busy
 
 let try_run_sync ?(priority = Speculative) request =
   match
-    Scheduler.try_run_sync scheduler priority (fun () -> run_unmanaged request)
+    Channel.try_run_sync proof_channel priority (fun () -> run_unmanaged request)
   with
   | Some outcome -> outcome
   | None -> Busy
@@ -412,14 +412,14 @@ let try_run_sync ?(priority = Speculative) request =
 let run ?(priority = Required) request =
   let open Lwt.Syntax in
   let* outcome =
-    Scheduler.run_threaded scheduler priority run_unmanaged request
+    Channel.run_threaded proof_channel priority run_unmanaged request
   in
   match outcome with
   | Some value -> Lwt.return value
   | None -> Lwt.return Busy
 
-let scheduler_stats () =
-  Scheduler.stats scheduler
+let channel_stats () =
+  Channel.stats proof_channel
 
 let verification_failure_message = function
   | Proof_rejected reason -> reason
@@ -566,6 +566,44 @@ let verify_key_switch_claim_classified_with_priority
 
 let verify_key_switch_claim_classified ~pubkey ~cipher ~proof ~commitment =
   verify_key_switch_claim_classified_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
+let verify_historical_migration_claim_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  result ~priority
+    (P.Historical_migration_claim { pubkey; cipher; proof; commitment })
+
+let verify_historical_migration_claim ~pubkey ~cipher ~proof ~commitment =
+  verify_historical_migration_claim_with_priority
+    Required
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
+let verify_historical_migration_claim_classified_with_priority
+    priority
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  classified_result ~priority
+    (P.Historical_migration_claim { pubkey; cipher; proof; commitment })
+
+let verify_historical_migration_claim_classified
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  verify_historical_migration_claim_classified_with_priority
     Required
     ~pubkey
     ~cipher

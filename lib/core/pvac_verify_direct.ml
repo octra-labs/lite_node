@@ -11,6 +11,13 @@ let proof_pubkey blob =
     Error "pvac pubkey proof circuit lacks alias rejection"
   | Ok pubkey -> Ok pubkey
 
+let historical_pubkey blob =
+  match FB.load_pubkey_result blob with
+  | Error error -> Error error
+  | Ok pubkey when FB.pubkey_supports_alias_rejection pubkey ->
+    Error "historical migration requires a historical proof profile"
+  | Ok pubkey -> Ok pubkey
+
 let decode_commitment encoded =
   try
     let value = Base64.decode_exn encoded |> Bytes.of_string in
@@ -139,6 +146,28 @@ let execute request =
           value.cipher
           value.proof
           value.commitment
+    end
+  | P.Historical_migration_claim value ->
+    begin
+      match
+        historical_pubkey value.pubkey,
+        FB.decode_cipher value.cipher,
+        FB.decode_zero_proof value.proof,
+        decode_commitment value.commitment
+      with
+      | Error error, _, _, _ -> Error error
+      | _, Error error, _, _ -> Error error
+      | _, _, Error error, _ -> Error error
+      | _, _, _, Error error -> Error error
+      | Ok pubkey, Ok cipher, Ok proof, Ok commitment ->
+        if
+          Pvac_ffi.verify_zero_bound_historical_migration
+            pubkey
+            cipher
+            proof
+            commitment
+        then Ok ()
+        else Error "historical migration proof verification failed"
     end
   | P.Range value ->
     begin

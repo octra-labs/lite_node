@@ -3,8 +3,9 @@
 (library
  (name octra_core)
  (foreign_stubs
-  (language c)
+ (language c)
   (names circle_wasm_native_stubs lmdb_handle_stubs))
+ (foreign_archives octra_circle_wasm_host)
  (c_library_flags (:include circle_wasm_native_clib_flags.sexp))
  (libraries
   lwt lwt.unix unix
@@ -36,4 +37,4 @@
   (with-stdout-to circle_wasm_native_clib_flags.sexp
    (run env -u BASH_ENV -u ENV
     bash --noprofile --norc -c
-    "set -euo pipefail; ROOT=$(cd %{workspace_root} && pwd); TARGET_DIR=\"$ROOT/_cargo_target/circle_wasm_native\"; LOG=\"$TARGET_DIR/native-static-libs.log\"; mkdir -p \"$TARGET_DIR\"; cargo rustc --manifest-path \"$ROOT/lib/core/circle_wasm_native/Cargo.toml\" --target-dir \"$TARGET_DIR\" --release -- --print=native-static-libs >/dev/null 2> \"$LOG\"; cp \"$TARGET_DIR/release/liboctra_circle_wasm_host.a\" liboctra_circle_wasm_host.a; LIBS=$(grep 'native-static-libs:' \"$LOG\" | tail -1 | sed -E 's/.*native-static-libs: //'); echo \"(-L $(pwd) -loctra_circle_wasm_host $LIBS)\""))))
+    "set -euo pipefail; ROOT=$(cd %{workspace_root} && pwd); TARGET_DIR=\"$ROOT/_cargo_target/circle_wasm_native\"; LOG=\"$TARGET_DIR/native-static-libs.log\"; mkdir -p \"$TARGET_DIR\"; cargo rustc --manifest-path \"$ROOT/lib/core/circle_wasm_native/Cargo.toml\" --target-dir \"$TARGET_DIR\" --release -- --print=native-static-libs >/dev/null 2> \"$LOG\"; cp \"$TARGET_DIR/release/liboctra_circle_wasm_host.a\" liboctra_circle_wasm_host.a; LIBS=$(grep 'native-static-libs:' \"$LOG\" | tail -1 | sed -E 's/.*native-static-libs: //'); echo \"($LIBS)\""))))

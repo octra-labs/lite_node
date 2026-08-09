@@ -3,6 +3,7 @@
 
 val preverify_circle :
   circle_mode:Octra_core.Rule_graph.mode ->
+  wasm_compute_mode:Octra_core.Rule_graph.mode ->
   backend:Octra_core.Epoch_exec.backend ->
   env:Octra_core.Epoch_exec.env ->
   program_trust:Octra_vm.Program_trust.t ->
@@ -15,6 +16,7 @@ val process_tx :
   backend:Octra_core.Epoch_exec.backend ->
   env:Octra_core.Epoch_exec.env ->
   circle_mode:Octra_core.Rule_graph.mode ->
+  wasm_compute_mode:Octra_core.Rule_graph.mode ->
   program_trust:Octra_vm.Program_trust.t ->
   Octra_core.Transaction.t ->
   (Octra_core.Epoch_exec.tx_effect, string * string) result Lwt.t

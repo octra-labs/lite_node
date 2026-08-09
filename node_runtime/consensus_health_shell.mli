@@ -29,6 +29,11 @@ type deps = {
     epoch_id:int64 ->
     timeout_seconds:float ->
     C_driver.epoch_root_response_record list Lwt.t;
+  root_consensus_quorum :
+    epoch_id:int64 ->
+    root:string ->
+    C_driver.epoch_root_response_record list ->
+    bool;
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   peer_snapshot : unit -> string;

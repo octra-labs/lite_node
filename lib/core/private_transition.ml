@@ -12,6 +12,7 @@ type limits = {
 type t = {
   ledger : Ledger.t;
   epoch_id : int;
+  owner_migration_mode : Rule_graph.mode;
   result_policy : Private_result_policy.t;
   limits : limits;
   preverify : Preverify_commit.t option;
@@ -34,11 +35,13 @@ let create
     ~legacy_replay
     ~ledger
     ~epoch_id
+    ~owner_migration_mode
     ~result_policy
     ~limits =
   {
     ledger;
     epoch_id;
+    owner_migration_mode;
     result_policy;
     limits;
     preverify;
@@ -218,10 +221,19 @@ let decrypt t tx =
 
 let key_switch t tx =
   let open Lwt.Syntax in
-  match self tx, cap "fhe_epoch_cap" t.fhe t.limits.max_fhe with
-  | Error e, _
-  | _, Error e -> Lwt.return_error e
-  | Ok (), Ok () ->
+  match
+    t.owner_migration_mode,
+    P.key_switch_requests_historical_owner_proof tx,
+    self tx,
+    cap "fhe_epoch_cap" t.fhe t.limits.max_fhe
+  with
+  | Rule_graph.Prior, true, _, _ ->
+    Lwt.return_error
+      ("pvac_migration_inactive",
+       "historical owner migration is not active at this epoch")
+  | _, _, Error e, _
+  | _, _, _, Error e -> Lwt.return_error e
+  | _, _, Ok (), Ok () ->
     let replay =
       if P.key_switch_requests_legacy_audit tx then
         let cipher =

@@ -32,6 +32,11 @@ type deps = {
     epoch_id:int64 ->
     timeout_seconds:float ->
     C_driver.epoch_root_response_record list Lwt.t;
+  root_consensus_quorum :
+    epoch_id:int64 ->
+    root:string ->
+    C_driver.epoch_root_response_record list ->
+    bool;
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   peer_snapshot : unit -> string;
@@ -164,27 +169,39 @@ let quarantine_peer_root_mismatch (deps : deps) ~head count =
   deps.mark_quarantine
     (Printf.sprintf "peer_root_mismatch_at_head count = %d epoch = %d" count head)
 
-let accept_current_root (deps : deps) ~head ~root reason =
+let accept_current_root
+    (deps : deps)
+    ~head
+    ~root
+    ~matching
+    ~consensus_proved
+    reason =
   let open Lwt.Syntax in
   let quarantine_active = deps.quarantine_active () in
   let quarantine_reason = deps.quarantine_reason () in
-  if
-    quarantine_active
-    && not (Consensus_runtime_state.root_attestation_recovers quarantine_reason)
-  then begin
+  let clear_evidence =
+    if not quarantine_active then
+      Some reason
+    else
+      Consensus_runtime_state.root_recovery_evidence
+        ~reason:quarantine_reason
+        ~evidence:reason
+        ~consensus_proved
+  in
+  match clear_evidence with
+  | None ->
     deps.clear_state_attested ();
     deps.set_catchup_in_progress false;
     Log.warn "catchup"
-      "event = quarantine_preserved reason = %s evidence = %s head = %d"
-      quarantine_reason reason head;
+      "event = quarantine_preserved reason = %s evidence = %s head = %d matching = %d consensus_proved = %b"
+      quarantine_reason reason head matching consensus_proved;
     Lwt.return_unit
-  end else begin
+  | Some clear_evidence ->
     deps.set_state_attested ~head ~root;
     deps.set_catchup_in_progress false;
-    deps.clear_quarantine reason;
+    deps.clear_quarantine clear_evidence;
     let* () = deps.drain_pending_finalized () in
     deps.wake_ready ()
-  end
 
 let wake_if_ready (deps : deps) wake_ready =
   let open Lwt.Syntax in
@@ -300,6 +317,12 @@ let run ?(stale_retries = 1) cfg deps =
                 let peer_root_quorum_count =
                   H.root_quorum_count peer_root_quorum
                 in
+                let root_consensus_proved =
+                  deps.root_consensus_quorum
+                    ~epoch_id:our_head
+                    ~root:live_root
+                    responses
+                in
                 let genesis_attested =
                   C_catchup.genesis_state_attested
                     ~head:our_head_int
@@ -341,6 +364,8 @@ let run ?(stale_retries = 1) cfg deps =
                       Lwt.return_unit
                     | H.Accept_genesis ->
                       accept_current_root deps ~head:our_head_int ~root:live_root
+                        ~matching:peer_root_quorum_count
+                        ~consensus_proved:root_consensus_proved
                         "genesis_in_sync"
                     | H.Missing_peer_root_quorum count ->
                       Log.warn "catchup"
@@ -351,6 +376,8 @@ let run ?(stale_retries = 1) cfg deps =
                       Lwt.return_unit
                     | H.Accept_current_root ->
                       accept_current_root deps ~head:our_head_int ~root:live_root
+                        ~matching:peer_root_quorum_count
+                        ~consensus_proved:root_consensus_proved
                         "in_sync"
                   end
                 | C_catchup.Ahead_of_target n ->
@@ -372,6 +399,8 @@ let run ?(stale_retries = 1) cfg deps =
                         n our_head_int cfg.quarantine_ahead_grace_epochs
                         cfg.quarantine_ahead_drift_tolerance;
                       accept_current_root deps ~head:our_head_int ~root:live_root
+                        ~matching:peer_root_quorum_count
+                        ~consensus_proved:root_consensus_proved
                         "ahead_wait_current_head"
                     | H.Probe_current_head ->
                       let* head_responses =
@@ -379,15 +408,23 @@ let run ?(stale_retries = 1) cfg deps =
                           ~epoch_id:our_head
                           ~timeout_seconds:2.0
                       in
-                      match
+                      let head_root_quorum =
                         H.peer_root_quorum
                           ~required:state_attest_required
                           ~local_root:live_root
                           head_responses
-                        |> H.ahead_current_root_plan
-                      with
+                      in
+                      let head_root_consensus_proved =
+                        deps.root_consensus_quorum
+                          ~epoch_id:our_head
+                          ~root:live_root
+                          head_responses
+                      in
+                      match H.ahead_current_root_plan head_root_quorum with
                       | H.Current_root_matches ->
                         accept_current_root deps ~head:our_head_int ~root:live_root
+                          ~matching:(H.root_quorum_count head_root_quorum)
+                          ~consensus_proved:head_root_consensus_proved
                           "ahead_current_root_quorum"
                       | H.Current_root_mismatch { root; count } ->
                         quarantine_peer_root_mismatch deps ~head:our_head_int count;
@@ -462,6 +499,8 @@ let run ?(stale_retries = 1) cfg deps =
                             "event = soft_lag_current_root lag = %d target = %Ld head = %Ld"
                             lag target_epoch our_head;
                           accept_current_root deps ~head:our_head_int ~root:live_root
+                            ~matching:peer_root_quorum_count
+                            ~consensus_proved:root_consensus_proved
                             "soft_lag_current_root"
                         | _ ->
                           Log.info "catchup"

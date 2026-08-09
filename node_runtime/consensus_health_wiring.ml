@@ -597,9 +597,16 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
     mark_quarantine = deps.mark_quarantine;
     query_epoch_root = (fun ~epoch_id ~timeout_seconds ->
       Octra_consensus.C_driver.query_epoch_root
+        ~wait_for:Octra_consensus.C_driver.Consensus_quorum
         driver
         ~epoch_id
         ~timeout_seconds);
+    root_consensus_quorum = (fun ~epoch_id ~root responses ->
+      Octra_consensus.C_driver.epoch_root_consensus_quorum
+        driver
+        ~epoch_id
+        ~root
+        responses);
     read_local_root_raw = deps.read_local_root_raw;
     committed_epoch_root_raw = deps.committed_epoch_root_raw;
     peer_snapshot = (fun () ->

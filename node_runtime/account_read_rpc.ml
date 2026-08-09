@@ -134,16 +134,37 @@ let pvac_status store ~addr =
           ~canonical_binding
           pk_opt))
 
-let pvac_migration_status entitlements ~epoch ~addr ~account =
+let pvac_migration_status
+    store
+    entitlements
+    ~epoch
+    ~owner_migration_mode
+    ~addr
+    ~account =
+  let open Lwt.Syntax in
   let cipher = account_cipher account in
-  let status = Octra_core.Pvac_migration.status_of_cipher cipher in
-  ok
-    (Rpc_view.pvac_migration_status
-       ~addr
-       ~cipher
-       ~epoch
-       status
-       entitlements)
+  let* pubkey = Octra_core.Store_irmin.get_pvac_pubkey store addr in
+  let* status =
+    Octra_core.Proof_pool.try_run
+      ~priority:Octra_core.Proof_pool.Speculative
+      (fun () ->
+        Octra_core.Pvac_migration.status_of_state
+          ~cipher
+          ~pubkey)
+  in
+  match status with
+  | None ->
+    Lwt.return_error
+      (Rpc.err (-32005) "pvac migration status busy" None)
+  | Some status ->
+    ok
+      (Rpc_view.pvac_migration_status
+         ~addr
+         ~cipher
+         ~epoch
+         ~owner_migration_mode
+         status
+         entitlements)
 
 let encrypted_cipher ~addr ~account =
   ok (Rpc_view.encrypted_cipher ~addr ~cipher:(public_cipher (account_cipher account)))

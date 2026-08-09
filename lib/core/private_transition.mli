@@ -17,6 +17,7 @@ val create :
      Pvac_legacy_public_replay.decision) ->
   ledger:Ledger.t ->
   epoch_id:int ->
+  owner_migration_mode:Rule_graph.mode ->
   result_policy:Private_result_policy.t ->
   limits:limits ->
   t

@@ -209,6 +209,10 @@ val key_switch_requests_legacy_public_migration :
   Transaction.t ->
   bool
 
+val key_switch_requests_historical_owner_proof :
+  Transaction.t ->
+  bool
+
 val key_switch_requests_legacy_audit :
   Transaction.t ->
   bool

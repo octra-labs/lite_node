@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
+use std::sync::OnceLock;
+
 pub const FRAC_BITS: u32 = 24;
 pub const ONE: i64 = 1_i64 << FRAC_BITS;
 pub const HALF: i64 = ONE / 2;
@@ -11,6 +13,23 @@ const RMS_EPSILON_Q48: u128 = ((1_u128 << 48) + 50_000) / 100_000;
 const PI: i64 = 52_707_179;
 const TWO_PI: i64 = 105_414_357;
 const HALF_PI: i64 = 26_353_589;
+const MAX_COMPUTE_THREADS: usize = 6;
+const WORK_PER_THREAD: usize = 500_000;
+
+fn compute_threads(work: usize, partitions: usize) -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    let available = *THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1)
+            .saturating_sub(2)
+            .clamp(1, MAX_COMPUTE_THREADS)
+    });
+    work.checked_add(WORK_PER_THREAD - 1)
+        .map(|value| value / WORK_PER_THREAD)
+        .unwrap_or(available)
+        .clamp(1, available.min(partitions.max(1)))
+}
 
 fn checked_i64(value: i128) -> Result<i64, &'static str> {
     i64::try_from(value).map_err(|_| "fixed point overflow")
@@ -99,6 +118,38 @@ pub fn load_i8(values: &[u8], scale: i64) -> Result<Vec<i64>, &'static str> {
         .collect()
 }
 
+fn i64_accumulator_safe(input: &[i64], terms: usize) -> bool {
+    let maximum = input
+        .iter()
+        .map(|value| u128::from(value.unsigned_abs()))
+        .max()
+        .unwrap_or(0);
+    maximum
+        .checked_mul(128)
+        .and_then(|value| value.checked_mul(terms as u128))
+        .map(|value| value <= i64::MAX as u128)
+        .unwrap_or(false)
+}
+
+fn i128_accumulator_safe(input: &[i64], terms: usize) -> bool {
+    let maximum = input
+        .iter()
+        .map(|value| u128::from(value.unsigned_abs()))
+        .max()
+        .unwrap_or(0);
+    maximum
+        .checked_mul(128)
+        .and_then(|value| value.checked_mul(terms as u128))
+        .map(|value| value <= i128::MAX as u128)
+        .unwrap_or(false)
+}
+
+fn scaled_sum(sum: i128, scale: i64, message: &'static str) -> Result<i64, &'static str> {
+    sum.checked_mul(i128::from(scale))
+        .ok_or(message)
+        .and_then(|value| rounded_shift(value, FRAC_BITS))
+}
+
 pub fn linear_i8(
     input: &[i64],
     weights: &[u8],
@@ -116,23 +167,137 @@ pub fn linear_i8(
     {
         return Err("invalid linear tensor shape");
     }
-    let mut accumulators = vec![0_i128; out_dim];
-    for (input_index, value) in input.iter().enumerate() {
-        let offset = input_index * out_dim;
-        for output_index in 0..out_dim {
-            let product = i128::from(weights[offset + output_index] as i8)
-                .checked_mul(i128::from(scale))
-                .and_then(|scaled| scaled.checked_mul(i128::from(*value)))
-                .ok_or("linear accumulator overflow")?;
-            accumulators[output_index] = accumulators[output_index]
-                .checked_add(product)
-                .ok_or("linear accumulator overflow")?;
-        }
+    if i64_accumulator_safe(input, input.len()) {
+        let mut accumulators = vec![0_i64; out_dim];
+        let threads = compute_threads(input.len() * out_dim, out_dim);
+        let chunk_size = out_dim.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (chunk_index, chunk) in accumulators.chunks_mut(chunk_size).enumerate() {
+                let output_start = chunk_index * chunk_size;
+                scope.spawn(move || {
+                    let chunk_len = chunk.len();
+                    for (input_index, value) in input.iter().copied().enumerate() {
+                        let offset = input_index * out_dim + output_start;
+                        for (accumulator, weight) in
+                            chunk.iter_mut().zip(&weights[offset..offset + chunk_len])
+                        {
+                            *accumulator += i64::from(*weight as i8) * value;
+                        }
+                    }
+                });
+            }
+        });
+        return accumulators
+            .into_iter()
+            .map(|sum| scaled_sum(i128::from(sum), scale, "linear accumulator overflow"))
+            .collect();
     }
+    if !i128_accumulator_safe(input, input.len()) {
+        return Err("linear accumulator overflow");
+    }
+    let mut accumulators = vec![0_i128; out_dim];
+    let threads = compute_threads(input.len() * out_dim, out_dim);
+    let chunk_size = out_dim.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (chunk_index, chunk) in accumulators.chunks_mut(chunk_size).enumerate() {
+            let output_start = chunk_index * chunk_size;
+            scope.spawn(move || {
+                let chunk_len = chunk.len();
+                for (input_index, value) in input.iter().copied().enumerate() {
+                    let offset = input_index * out_dim + output_start;
+                    for (accumulator, weight) in
+                        chunk.iter_mut().zip(&weights[offset..offset + chunk_len])
+                    {
+                        *accumulator += i128::from(*weight as i8) * i128::from(value);
+                    }
+                }
+            });
+        }
+    });
     accumulators
         .into_iter()
-        .map(|sum| rounded_shift(sum, FRAC_BITS))
+        .map(|sum| scaled_sum(sum, scale, "linear accumulator overflow"))
         .collect()
+}
+
+fn top1_i64(
+    input: &[i64],
+    weights: &[u8],
+    row_start: usize,
+    scale: i64,
+) -> Result<(usize, i64), &'static str> {
+    weights
+        .chunks_exact(input.len())
+        .enumerate()
+        .try_fold(None, |best, (local_index, row)| {
+            let sum = row.iter().zip(input).fold(0_i64, |sum, (weight, value)| {
+                sum + i64::from(*weight as i8) * *value
+            });
+            let score = scaled_sum(i128::from(sum), scale, "top1 accumulator overflow")?;
+            let candidate = (row_start + local_index, score);
+            Ok::<_, &'static str>(match best {
+                Some((_, best_score)) if best_score >= score => best,
+                _ => Some(candidate),
+            })
+        })?
+        .ok_or("empty top1 tensor")
+}
+
+fn top1_i128(
+    input: &[i64],
+    weights: &[u8],
+    row_start: usize,
+    scale: i64,
+) -> Result<(usize, i64), &'static str> {
+    weights
+        .chunks_exact(input.len())
+        .enumerate()
+        .try_fold(None, |best, (local_index, row)| {
+            let sum = row.iter().zip(input).fold(0_i128, |sum, (weight, value)| {
+                sum + i128::from(*weight as i8) * i128::from(*value)
+            });
+            let score = scaled_sum(sum, scale, "top1 accumulator overflow")?;
+            let candidate = (row_start + local_index, score);
+            Ok::<_, &'static str>(match best {
+                Some((_, best_score)) if best_score >= score => best,
+                _ => Some(candidate),
+            })
+        })?
+        .ok_or("empty top1 tensor")
+}
+
+fn parallel_top1(
+    input: &[i64],
+    weights: &[u8],
+    rows: usize,
+    scale: i64,
+    worker: fn(&[i64], &[u8], usize, i64) -> Result<(usize, i64), &'static str>,
+) -> Result<(usize, i64), &'static str> {
+    let threads = compute_threads(input.len() * rows, rows);
+    let rows_per_thread = rows.div_ceil(threads);
+    let bytes_per_thread = rows_per_thread * input.len();
+    let results = std::thread::scope(|scope| {
+        weights
+            .chunks(bytes_per_thread)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                scope.spawn(move || worker(input, chunk, chunk_index * rows_per_thread, scale))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().map_err(|_| "top1 worker failed")?)
+            .collect::<Result<Vec<_>, &'static str>>()
+    })?;
+    results
+        .into_iter()
+        .reduce(|best, candidate| {
+            if candidate.1 > best.1 {
+                candidate
+            } else {
+                best
+            }
+        })
+        .ok_or("empty top1 tensor")
 }
 
 pub fn top1_i8(
@@ -152,34 +317,13 @@ pub fn top1_i8(
     {
         return Err("invalid top1 tensor shape");
     }
-    let scores = weights
-        .chunks_exact(input.len())
-        .map(|row| {
-            row.iter()
-                .zip(input)
-                .try_fold(0_i128, |sum, (weight, value)| {
-                    sum.checked_add(
-                        i128::from(*weight as i8)
-                            .checked_mul(i128::from(scale))
-                            .and_then(|scaled| scaled.checked_mul(i128::from(*value)))
-                            .ok_or("top1 accumulator overflow")?,
-                    )
-                    .ok_or("top1 accumulator overflow")
-                })
-                .and_then(|sum| rounded_shift(sum, FRAC_BITS))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    scores
-        .into_iter()
-        .enumerate()
-        .reduce(|best, candidate| {
-            if candidate.1 > best.1 {
-                candidate
-            } else {
-                best
-            }
-        })
-        .ok_or("empty top1 tensor")
+    if i64_accumulator_safe(input, input.len()) {
+        return parallel_top1(input, weights, rows, scale, top1_i64);
+    }
+    if !i128_accumulator_safe(input, input.len()) {
+        return Err("top1 accumulator overflow");
+    }
+    parallel_top1(input, weights, rows, scale, top1_i128)
 }
 
 fn integer_sqrt(value: u128) -> u128 {
@@ -444,6 +588,62 @@ pub fn attention_kv(
 mod tests {
     use super::*;
 
+    fn reference_linear(
+        input: &[i64],
+        weights: &[u8],
+        out_dim: usize,
+        scale: i64,
+    ) -> Result<Vec<i64>, &'static str> {
+        let mut sums = vec![0_i128; out_dim];
+        for (input_index, value) in input.iter().enumerate() {
+            let offset = input_index * out_dim;
+            for output_index in 0..out_dim {
+                sums[output_index] = sums[output_index]
+                    .checked_add(
+                        i128::from(weights[offset + output_index] as i8) * i128::from(*value),
+                    )
+                    .ok_or("linear accumulator overflow")?;
+            }
+        }
+        sums.into_iter()
+            .map(|sum| scaled_sum(sum, scale, "linear accumulator overflow"))
+            .collect()
+    }
+
+    fn reference_top1(
+        input: &[i64],
+        weights: &[u8],
+        rows: usize,
+        scale: i64,
+    ) -> Result<(usize, i64), &'static str> {
+        if weights.len() != rows * input.len() {
+            return Err("invalid top1 tensor shape");
+        }
+        weights
+            .chunks_exact(input.len())
+            .enumerate()
+            .map(|(index, row)| {
+                let sum = row
+                    .iter()
+                    .zip(input)
+                    .try_fold(0_i128, |sum, (weight, value)| {
+                        sum.checked_add(i128::from(*weight as i8) * i128::from(*value))
+                            .ok_or("top1 accumulator overflow")
+                    })?;
+                Ok((index, scaled_sum(sum, scale, "top1 accumulator overflow")?))
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?
+            .into_iter()
+            .reduce(|best, candidate| {
+                if candidate.1 > best.1 {
+                    candidate
+                } else {
+                    best
+                }
+            })
+            .ok_or("empty top1 tensor")
+    }
+
     #[test]
     fn scale_decoding_is_exact() {
         assert_eq!(scale_bits_to_q24(0.5_f64.to_bits() as i64), Ok(HALF));
@@ -468,6 +668,27 @@ mod tests {
             Ok(vec![2 * ONE, ONE])
         );
         assert_eq!(residual_add(&input, &[ONE, -ONE]), Ok(vec![2 * ONE, ONE]));
+    }
+
+    #[test]
+    fn parallel_linear_and_top1_match_reference() {
+        let input_len = 1024;
+        let rows = 1024;
+        let input = (0..input_len)
+            .map(|index| ((index as i64 * 104_729) % (8 * ONE)) - 4 * ONE)
+            .collect::<Vec<_>>();
+        let weights = (0..input_len * rows)
+            .map(|index| ((index * 73 + index / 17 + 19) & 255) as u8)
+            .collect::<Vec<_>>();
+        let scale = HALF + 1_337;
+        assert_eq!(
+            linear_i8(&input, &weights, rows, scale),
+            reference_linear(&input, &weights, rows, scale)
+        );
+        assert_eq!(
+            top1_i8(&input, &weights, rows, scale),
+            reference_top1(&input, &weights, rows, scale)
+        );
     }
 
     #[test]

@@ -38,6 +38,12 @@ type request =
       proof : string;
       commitment : string;
     }
+  | Historical_migration_claim of {
+      pubkey : string;
+      cipher : string;
+      proof : string;
+      commitment : string;
+    }
   | Range of {
       pubkey : string;
       cipher : string;
@@ -165,6 +171,12 @@ let request_fields request =
       "proof", `String value.proof;
       "commitment", `String value.commitment;
     ]
+  | Historical_migration_claim value ->
+    common "historical_migration_claim" value.pubkey @ [
+      "cipher", `String value.cipher;
+      "proof", `String value.proof;
+      "commitment", `String value.commitment;
+    ]
   | Range value ->
     common "range" value.pubkey @ [
       "cipher", `String value.cipher;
@@ -251,6 +263,19 @@ let request_of_json = function
           bind (parse_value "commitment" fields) (fun commitment ->
             Ok
               (Key_switch_claim {
+                 pubkey;
+                 cipher;
+                 proof;
+                 commitment;
+               }))))))
+        | "historical_migration_claim" ->
+          bind (string_field "pubkey" fields) (fun encoded_pubkey ->
+          bind (decode_pubkey encoded_pubkey) (fun pubkey ->
+          bind (parse_value "cipher" fields) (fun cipher ->
+          bind (parse_value "proof" fields) (fun proof ->
+          bind (parse_value "commitment" fields) (fun commitment ->
+            Ok
+              (Historical_migration_claim {
                  pubkey;
                  cipher;
                  proof;

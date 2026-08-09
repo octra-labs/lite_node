@@ -31,8 +31,10 @@ val create :
   t
 
 val circle_activation : t -> activation option
+val wasm_compute_activation : t -> activation option
 val validator_quorum_activation : t -> activation option
 val epoch_time_activation : t -> activation option
+val owner_migration_activation : t -> activation option
 
 val root_after_floor :
   chain_id:string ->
@@ -45,12 +47,22 @@ val circle :
   epoch:int ->
   (mode, fault) result
 
+val wasm_compute :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
 val validator_quorum :
   t ->
   epoch:int ->
   (mode, fault) result
 
 val epoch_time :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val owner_migration :
   t ->
   epoch:int ->
   (mode, fault) result

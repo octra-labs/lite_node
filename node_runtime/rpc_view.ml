@@ -8,6 +8,7 @@ module Pvac_registry = Octra_core.Pvac_registry
 module Pvac_migration = Octra_core.Pvac_migration
 module Pvac_legacy_public_replay = Octra_core.Pvac_legacy_public_replay
 module FheBalance = Octra_core.Crypto.FheBalance
+module Rule_graph = Octra_core.Rule_graph
 
 let opt_hex = function
   | None -> `Null
@@ -446,19 +447,29 @@ let pvac_status ~addr (status : Pvac_registry.status) =
     "pubkey_format", opt_string status.pubkey_format;
   ]
 
-let pvac_migration_status ~addr ~cipher ~epoch
+let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
     (status : Pvac_migration.status) entitlements =
-  let replay_json =
-    if not status.needs_legacy_public_replay then
-      `Null
+  let entitlement =
+    if Pvac_migration.needs_history_migration status then
+      Some
+        (Octra_core.Pvac_migration_entitlement.find
+           entitlements
+           ~epoch
+           ~address:addr
+           ~cipher)
     else
-      match
-        Octra_core.Pvac_migration_entitlement.find
-          entitlements
-          ~epoch
-          ~address:addr
-          ~cipher
-      with
+      None
+  in
+  let can_owner_proof_migrate =
+    match owner_migration_mode, status.cipher_class, status.key_class with
+    | Rule_graph.Active, Pvac_migration.V3, Pvac_migration.Historical -> true
+    | _ -> false
+  in
+  let replay_json =
+    match entitlement with
+    | None -> `Null
+    | Some result ->
+      match result with
       | Error reason ->
         `Assoc [
           "total", `Int 0;
@@ -498,9 +509,18 @@ let pvac_migration_status ~addr ~cipher ~epoch
   `Assoc [
     "address", `String addr;
     "cipher_class", `String (Pvac_migration.cipher_class_to_string status.cipher_class);
-    "can_key_switch", `Bool status.can_key_switch;
-    "can_v3_migrate", `Bool status.can_v3_migrate;
-    "needs_legacy_public_replay", `Bool status.needs_legacy_public_replay;
+    "key_class", `String (Pvac_migration.key_class_to_string status.key_class);
+    "target_key_class", `String "current";
+    "migration_route", `String (Pvac_migration.route_to_string status.route);
+    "can_key_switch", `Bool (Pvac_migration.can_key_switch status);
+    "can_v3_migrate", `Bool (Pvac_migration.can_bound_migrate status);
+    "can_owner_proof_migrate", `Bool can_owner_proof_migrate;
+    "owner_proof_rule",
+      `String
+        (match owner_migration_mode with
+         | Rule_graph.Active -> "active"
+         | Rule_graph.Prior -> "prior");
+    "needs_legacy_public_replay", `Bool (Pvac_migration.needs_history_migration status);
     "reason", `String status.reason;
     "entitlement_root",
       (match Octra_core.Pvac_migration_entitlement.root entitlements with

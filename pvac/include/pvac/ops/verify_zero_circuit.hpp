@@ -208,12 +208,15 @@ inline KeyBoundCircuitWiring build_key_bound_circuit(
     const std::vector<size_t>& bases,
     const std::vector<std::vector<Fp>>* r_ptr,
     const std::vector<std::vector<Fp>>* rinv_ptr,
-    const AmountBinding* amount_bind = nullptr
+    const AmountBinding* amount_bind = nullptr,
+    bool force_alias_rejection = false
 ) {
     size_t nL = ct.L.size();
     size_t S = ct.slots;
     size_t nB = bases.size();
-    const bool canonical = pk.circuit_prf_profile == CircuitPrfProfile::MIMC_X5_V7;
+    const bool canonical =
+        force_alias_rejection ||
+        pk.circuit_prf_profile == CircuitPrfProfile::MIMC_X5_V7;
 
     if (A.size() != nL)
         throw std::runtime_error("pvac: coefficient/layer size mismatch");
@@ -583,7 +586,10 @@ inline bool verify_zero(
 inline ZeroProof make_zero_proof_bound_checked(
     const PubKey& pk, const SecKey& sk, const Cipher& ct,
     uint64_t amount, const Scalar& amount_blinding,
-    size_t base_layer_limit, bp::R1CSLimitProfile limit_profile
+    size_t base_layer_limit, bp::R1CSLimitProfile limit_profile,
+    bool force_alias_rejection = false,
+    const char* transcript_label = "pvac.verify_zero_bound.key_bound",
+    const char* proof_kind = "bound"
 ) {
     if (!key_bound_verify_shape_ok_with_limit(pk, ct, base_layer_limit))
         throw std::runtime_error("pvac: key-bound proof shape rejected");
@@ -611,14 +617,29 @@ inline ZeroProof make_zero_proof_bound_checked(
     bind.blinding = amount_blinding;
 
     bp::R1CSProver prover;
-    auto wiring = detail::build_key_bound_circuit(prover, pk, &sk, ct, A, bases, &cache, &rinv, &bind);
+    auto wiring = detail::build_key_bound_circuit(
+        prover,
+        pk,
+        &sk,
+        ct,
+        A,
+        bases,
+        &cache,
+        &rinv,
+        &bind,
+        force_alias_rejection);
 
     RistrettoPoint amount_commitment = pedersen_commit(bp::sc_from_u64(amount), amount_blinding);
-    bp::Transcript transcript("pvac.verify_zero_bound.key_bound");
+    bp::Transcript transcript(transcript_label);
     transcript.append_u64("nL", nL);
     transcript.append_u64("S", S);
     transcript.append_u64("nB", nB);
-    detail::append_key_bound_transcript_context(transcript, pk, ct, "bound", &amount_commitment);
+    detail::append_key_bound_transcript_context(
+        transcript,
+        pk,
+        ct,
+        proof_kind,
+        &amount_commitment);
 
     ZeroProof result;
     result.proof = prover.prove(transcript, limit_profile);
@@ -657,7 +678,10 @@ inline ZeroProof make_zero_proof_bound_key_switch(
 inline bool verify_zero_bound_checked(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof, const RistrettoPoint& amount_commitment,
-    size_t base_layer_limit, bp::R1CSLimitProfile limit_profile
+    size_t base_layer_limit, bp::R1CSLimitProfile limit_profile,
+    bool force_alias_rejection = false,
+    const char* transcript_label = "pvac.verify_zero_bound.key_bound",
+    const char* proof_kind = "bound"
 ) {
     if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     if (!key_bound_verify_shape_ok_with_limit(pk, ct, base_layer_limit)) return false;
@@ -690,18 +714,33 @@ inline bool verify_zero_bound_checked(
     auto A = compute_layer_coeffs(pk, ct);
     detail::AmountBinding dummy_bind;
     bp::R1CSProver dummy;
-    detail::build_key_bound_circuit(dummy, pk, nullptr, ct, A, bases, nullptr, nullptr, &dummy_bind);
+    detail::build_key_bound_circuit(
+        dummy,
+        pk,
+        nullptr,
+        ct,
+        A,
+        bases,
+        nullptr,
+        nullptr,
+        &dummy_bind,
+        force_alias_rejection);
 
     bp::ConstraintSystem cs;
     cs.num_gates = dummy.num_gates();
     cs.num_committed = dummy.num_committed();
     cs.constraints = dummy.get_constraints();
 
-    bp::Transcript transcript("pvac.verify_zero_bound.key_bound");
+    bp::Transcript transcript(transcript_label);
     transcript.append_u64("nL", nL);
     transcript.append_u64("S", S);
     transcript.append_u64("nB", nB);
-    detail::append_key_bound_transcript_context(transcript, pk, ct, "bound", &amount_commitment);
+    detail::append_key_bound_transcript_context(
+        transcript,
+        pk,
+        ct,
+        proof_kind,
+        &amount_commitment);
 
     return bp::r1cs_verify(transcript, cs, proof.proof, limit_profile);
 }
@@ -732,6 +771,44 @@ inline bool verify_zero_bound_key_switch(
         amount_commitment,
         key_bound_key_switch_base_layer_limit(pk.circuit_prf_profile),
         bp::R1CSLimitProfile::KeySwitchRefresh);
+}
+
+inline ZeroProof make_zero_proof_bound_historical_migration(
+    const PubKey& pk, const SecKey& sk, const Cipher& ct,
+    uint64_t amount, const Scalar& amount_blinding
+) {
+    if (pk.circuit_prf_profile != CircuitPrfProfile::MIMC_X3_V6)
+        throw std::runtime_error("pvac: historical migration requires historical proof profile");
+    return make_zero_proof_bound_checked(
+        pk,
+        sk,
+        ct,
+        amount,
+        amount_blinding,
+        key_bound_key_switch_base_layer_limit(pk.circuit_prf_profile),
+        bp::R1CSLimitProfile::KeySwitchRefresh,
+        true,
+        "pvac.historical_migration.bound",
+        "historical_migration");
+}
+
+inline bool verify_zero_bound_historical_migration(
+    const PubKey& pk, const Cipher& ct,
+    const ZeroProof& proof,
+    const RistrettoPoint& amount_commitment
+) {
+    if (pk.circuit_prf_profile != CircuitPrfProfile::MIMC_X3_V6)
+        return false;
+    return verify_zero_bound_checked(
+        pk,
+        ct,
+        proof,
+        amount_commitment,
+        key_bound_key_switch_base_layer_limit(pk.circuit_prf_profile),
+        bp::R1CSLimitProfile::KeySwitchRefresh,
+        true,
+        "pvac.historical_migration.bound",
+        "historical_migration");
 }
 
 inline ZeroProof make_zero_proof_bound_range(

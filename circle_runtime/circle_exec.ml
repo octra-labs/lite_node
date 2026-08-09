@@ -1630,7 +1630,11 @@ let list_storage_pairs store circle_id =
 let list_storage_page store circle_id ~limit =
   Octra_core.Store_irmin.load_circle_stable_storage_page store circle_id ~limit
 
-let commit_call_result store circle_id t =
+let commit_call_result
+    ?(deployment_profile=Octra_core.Circle_wasm_host.Standard)
+    store
+    circle_id
+    t =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
   | None -> Lwt.return (Error "circle not found")
@@ -1682,7 +1686,11 @@ let commit_call_result store circle_id t =
                 Lwt.return (Error "circle spawn id mismatch")
               else
                 let* checked =
-                  Octra_core.Circle_deploy.check_available store src payload in
+                  Octra_core.Circle_deploy.check_available
+                    ~execution_profile:deployment_profile
+                    store
+                    src
+                    payload in
                 begin
                   match checked with
                   | Error (_code, reason) ->

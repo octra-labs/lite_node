@@ -58,6 +58,12 @@ external verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
 external verify_zero_bound_key_switch :
   pubkey -> cipher -> zero_proof -> bytes -> bool
   = "caml_pvac_verify_zero_bound_key_switch"
+external make_zero_proof_bound_historical_migration :
+  pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+  = "caml_pvac_make_zero_proof_bound_historical_migration"
+external verify_zero_bound_historical_migration :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_bound_historical_migration"
 external make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
   = "caml_pvac_make_zero_proof_bound_range"
 

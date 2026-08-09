@@ -426,6 +426,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "epoch_time"
       (Rule_graph.epoch_time_activation rules)
       (fun epoch -> Rule_graph.epoch_time rules ~epoch);
+    bind_rule
+      "owner_migration"
+      (Rule_graph.owner_migration_activation rules)
+      (fun epoch -> Rule_graph.owner_migration rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -1220,6 +1224,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
         ~validator_view_sk ~validator_view_pub ~program_trust ~chaindata
         ~migration_entitlements
+        ~rules
         ~consensus_driver_ref:driver_ref
         ~epoch_visibility
         ~resource_compute

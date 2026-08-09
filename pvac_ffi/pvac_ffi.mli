@@ -59,6 +59,12 @@ val verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
 val verify_zero_bound_key_switch :
   pubkey -> cipher -> zero_proof -> bytes -> bool
 
+val make_zero_proof_bound_historical_migration :
+  pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+
+val verify_zero_bound_historical_migration :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
+
 val make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
 
 val pedersen_commit_amount : int64 -> bytes -> bytes

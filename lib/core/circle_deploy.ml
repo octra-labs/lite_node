@@ -106,7 +106,9 @@ let prepare source (payload : Circles.deploy_payload) =
   with _ ->
     Error ("malformed_transaction", "circle deploy input is invalid")
 
-let validate_runtime (payload : Circles.deploy_payload) =
+let validate_runtime
+    ?(execution_profile=Circle_wasm_host.Standard)
+    (payload : Circles.deploy_payload) =
   match payload.Circles.runtime with
   | Circles.Octb ->
     Lwt.return (Ok ())
@@ -119,7 +121,7 @@ let validate_runtime (payload : Circles.deploy_payload) =
              ("circle_program_missing", "wasm_v1 circles require program code"))
       | Some code_b64 ->
         let* validate_result =
-          Circle_wasm_host.describe code_b64 in
+          Circle_wasm_host.describe ~execution_profile code_b64 in
         begin
           match validate_result with
           | Ok descriptor ->
@@ -138,7 +140,11 @@ let validate_runtime (payload : Circles.deploy_payload) =
         end
     end
 
-let check_available store source (payload : Circles.deploy_payload) =
+let check_available
+    ?(execution_profile=Circle_wasm_host.Standard)
+    store
+    source
+    (payload : Circles.deploy_payload) =
   match prepare source payload with
   | Error e ->
     Lwt.return (Error e)
@@ -147,7 +153,7 @@ let check_available store source (payload : Circles.deploy_payload) =
     if exists then
       Lwt.return (Error ("circle_exists", "circle already exists"))
     else
-      let* runtime_ok = validate_runtime payload in
+      let* runtime_ok = validate_runtime ~execution_profile payload in
       begin
         match runtime_ok with
         | Error e -> Lwt.return (Error e)
@@ -178,8 +184,12 @@ let write_prepared store source prepared (payload : Circles.deploy_payload) =
   let* () = save_origin store source prepared.circle_id in
   Lwt.return (Ok prepared.circle_id)
 
-let apply store source (payload : Circles.deploy_payload) =
-  let* checked = check_available store source payload in
+let apply
+    ?(execution_profile=Circle_wasm_host.Standard)
+    store
+    source
+    (payload : Circles.deploy_payload) =
+  let* checked = check_available ~execution_profile store source payload in
   match checked with
   | Error e ->
     Lwt.return (Error e)

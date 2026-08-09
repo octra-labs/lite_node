@@ -57,6 +57,13 @@ type job_status =
   | Finished of response
   | Refused of string
 
+type cancellation = {
+  caller : string;
+  caller_public_key : string;
+  caller_signature : string;
+  session_id : string;
+}
+
 type t
 
 val create :
@@ -85,6 +92,18 @@ val status :
   caller:string ->
   job_id:string ->
   job_status option Lwt.t
+
+val cancellation_sign_bytes :
+  chain_id:string ->
+  caller:string ->
+  caller_public_key:string ->
+  session_id:string ->
+  string
+
+val cancel :
+  t ->
+  cancellation ->
+  (int, string) result Lwt.t
 
 val active_jobs :
   t ->

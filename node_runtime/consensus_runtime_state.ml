@@ -95,6 +95,25 @@ let root_attestation_recovers reason =
       "state_root_mismatch_streak = ";
     ]
 
+let consensus_root_attestation_recovers reason =
+  starts_with "catchup_failed:" reason
+  || starts_with "catchup_apply_failed:" reason
+
+let root_recovery_evidence
+    ~reason
+    ~evidence
+    ~consensus_proved =
+  if root_attestation_recovers reason then
+    Some evidence
+  else if
+    consensus_root_attestation_recovers reason
+    && String.equal evidence "in_sync"
+    && consensus_proved
+  then
+    Some "in_sync_consensus_quorum"
+  else
+    None
+
 let catchup_recovers reason =
   root_attestation_recovers reason
   || starts_with "lag_" reason
@@ -124,6 +143,8 @@ let clear_allowed ~reason ~evidence =
   || (root_attestation_recovers reason && root_evidence evidence)
   || (root_attestation_recovers reason
       && starts_with "direct_finalized_apply:" evidence)
+  || (consensus_root_attestation_recovers reason
+      && String.equal evidence "in_sync_consensus_quorum")
 
 let enter_quarantine t ~epoch ~reason =
   let entered = not (quarantine_active t) in
