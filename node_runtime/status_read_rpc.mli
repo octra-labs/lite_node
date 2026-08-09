@@ -40,6 +40,15 @@ val node_version :
   unit ->
   rpc_result
 
+val runtime_version :
+  chain_id:string ->
+  validator_address:string ->
+  program_trust_hash:string option ->
+  runtime_profile_hash:string option ->
+  validator_set_ref:Octra_consensus.C_types.validator_set ref ->
+  scheduled_validator_set_ref:Octra_consensus.C_config.scheduled option ref ->
+  rpc_result
+
 val validator_view_pubkey :
   validator_view_pub:string ->
   validator_address:string ->
@@ -81,6 +90,11 @@ val node_stats :
   rpc_result
 
 val node_version_params :
+  Yojson.Safe.t ->
+  read_ctx ->
+  rpc_result
+
+val runtime_version_params :
   Yojson.Safe.t ->
   read_ctx ->
   rpc_result

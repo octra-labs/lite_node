@@ -1376,8 +1376,10 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
     ?(limit=1_000_000)
     ?(hfhe_mode=Octra_core.Circle_hfhe_transcript.Direct)
     ?(update_policy=false)
+    ?(manifest_profile=Octra_core.Circle_wasm_host.Manifest)
     store circle_id method_name params caller value =
-  let* loaded_result = Circle_program.load ~trusted store circle_id in
+  let* loaded_result =
+    Circle_program.load ~trusted ~manifest_profile store circle_id in
   match loaded_result with
   | Error (Octra_core.Circle_wasm_host.Rejected e) ->
     Lwt.return (failed_call_result e)

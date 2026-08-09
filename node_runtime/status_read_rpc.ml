@@ -51,6 +51,20 @@ let signer ~chain_id ~validator_addr ~validator_pubkey ~validator_priv_b64
 let node_version () =
   ok (Status_rpc.node_version ())
 
+let release_hash name length =
+  match Sys.getenv_opt name with
+  | None -> None
+  | Some raw ->
+    let value = String.trim raw in
+    if String.length value = length
+       && String.for_all
+            (function
+              | '0' .. '9' | 'a' .. 'f' -> true
+              | _ -> false)
+            value
+    then Some value
+    else None
+
 let validator_view_pubkey ~validator_view_pub ~validator_address =
   ok (Status_rpc.validator_view_pubkey ~validator_view_pub ~validator_address)
 
@@ -103,6 +117,27 @@ let validator_set_proof ~chain_id ~program_trust_hash
        ?runtime_profile_hash
        ?scheduled
        validator_set)
+
+let runtime_version ~chain_id ~validator_address ~program_trust_hash
+    ~runtime_profile_hash ~validator_set_ref ~scheduled_validator_set_ref =
+  let _, _, config_hash =
+    current_validator_config
+      ~chain_id
+      ~program_trust_hash
+      ~runtime_profile_hash
+      ~validator_set_ref
+      ~scheduled_validator_set_ref
+  in
+  ok
+    (Status_rpc.runtime_version
+       ~source_commit:(release_hash "OCTRA_SOURCE_COMMIT" 40)
+       ~binary_hash:(release_hash "OCTRA_BINARY_HASH" 64)
+       ~consensus_profile:Consensus_profile.version
+       ~consensus_rules_id:Consensus_profile.rules_id
+       ~runtime_profile_hash
+       ~config_hash
+       ~chain_id
+       ~validator:validator_address)
 
 let consensus_peer_states ~swarm ~driver_ref =
   let now = Unix.gettimeofday () in
@@ -178,6 +213,15 @@ let signer_of_ctx ctx =
 let node_version_params _params _ctx =
   node_version ()
 
+let runtime_version_params _params ctx =
+  runtime_version
+    ~chain_id:ctx.chain_id
+    ~validator_address:ctx.validator_address
+    ~program_trust_hash:ctx.program_trust_hash
+    ~runtime_profile_hash:ctx.runtime_profile_hash
+    ~validator_set_ref:ctx.validator_set_ref
+    ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
+
 let validator_view_pubkey_params _params ctx =
   validator_view_pubkey
     ~validator_view_pub:ctx.validator_view_pub
@@ -236,6 +280,7 @@ let node_metrics_params _params _ctx =
 let core_dispatch adapters =
   [
     "node_version", adapters.status_read node_version_params;
+    "octra_runtimeVersion", adapters.status_read runtime_version_params;
     "node_status", adapters.status_read node_status_params;
     "node_stats", adapters.status_read node_stats_params;
     "node_metrics", adapters.status_read node_metrics_params;

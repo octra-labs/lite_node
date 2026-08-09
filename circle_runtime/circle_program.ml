@@ -56,7 +56,7 @@ let loaded_cache_ttl_secs = 300.0
 let loaded_cache_limit = 64
 
 let loaded_cache_key circle_id (info : Octra_core.Circles.circle_info) =
-  circle_id ^ ":" ^ Int64.to_string info.version ^ ":" ^ info.code_hash ^ ":" ^ info.stable_root
+  circle_id ^ ":" ^ Int64.to_string info.version ^ ":" ^ info.code_hash
 
 let prune_loaded_cache () =
   let now = Unix.gettimeofday () in
@@ -217,7 +217,10 @@ let yojson_of_descriptor (t : descriptor) =
     "limits", Octra_core.Circles.yojson_of_limits t.info.limits;
   ]
 
-let describe store circle_id =
+let describe
+    ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
+    store
+    circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
   | None -> Lwt.return (Error "circle not found")
@@ -263,7 +266,7 @@ let describe store circle_id =
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
                   Octra_core.Circle_wasm_host.describe
-                    ~execution_profile:Octra_core.Circle_wasm_host.Compute
+                    ~execution_profile:manifest_profile
                     code_b64 in
                 begin
                   match wasm_descriptor_result with
@@ -294,7 +297,11 @@ let describe store circle_id =
         end
     end
 
-let load ?(trusted = []) store circle_id =
+let load
+    ?(trusted = [])
+    ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
+    store
+    circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
   | None ->
@@ -306,7 +313,12 @@ let load ?(trusted = []) store circle_id =
     begin
       match Hashtbl.find_opt loaded_cache cache_key with
       | Some entry ->
-        Lwt.return (Ok entry.loaded)
+        let loaded = { entry.loaded with info } in
+        Hashtbl.replace
+          loaded_cache
+          cache_key
+          { loaded; updated_at = Unix.gettimeofday () };
+        Lwt.return (Ok loaded)
       | None ->
     let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 store circle_id in
     begin
@@ -346,7 +358,7 @@ let load ?(trusted = []) store circle_id =
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
                   Octra_core.Circle_wasm_host.describe
-                    ~execution_profile:Octra_core.Circle_wasm_host.Compute
+                    ~execution_profile:manifest_profile
                     code_b64 in
                 begin
                   match wasm_descriptor_result with

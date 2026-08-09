@@ -15,6 +15,7 @@ type descriptor = {
 
 type execution_profile =
   | Standard
+  | Manifest
   | Compute
 
 type wasm_event = {
@@ -602,6 +603,7 @@ let compute_self_test () =
 
 let profile_name = function
   | Standard -> "standard"
+  | Manifest -> "manifest"
   | Compute -> "compute"
 
 let validate ?(execution_profile=Standard) code_b64 =

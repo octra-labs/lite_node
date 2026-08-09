@@ -16,15 +16,19 @@ const HALF_PI: i64 = 26_353_589;
 const MAX_COMPUTE_THREADS: usize = 6;
 const WORK_PER_THREAD: usize = 500_000;
 
-fn compute_threads(work: usize, partitions: usize) -> usize {
+fn available_compute_threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
-    let available = *THREADS.get_or_init(|| {
+    *THREADS.get_or_init(|| {
         std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1)
             .saturating_sub(2)
             .clamp(1, MAX_COMPUTE_THREADS)
-    });
+    })
+}
+
+fn compute_threads(work: usize, partitions: usize, thread_limit: usize) -> usize {
+    let available = thread_limit.clamp(1, MAX_COMPUTE_THREADS);
     work.checked_add(WORK_PER_THREAD - 1)
         .map(|value| value / WORK_PER_THREAD)
         .unwrap_or(available)
@@ -156,6 +160,16 @@ pub fn linear_i8(
     out_dim: usize,
     scale: i64,
 ) -> Result<Vec<i64>, &'static str> {
+    linear_i8_with_thread_limit(input, weights, out_dim, scale, available_compute_threads())
+}
+
+fn linear_i8_with_thread_limit(
+    input: &[i64],
+    weights: &[u8],
+    out_dim: usize,
+    scale: i64,
+    thread_limit: usize,
+) -> Result<Vec<i64>, &'static str> {
     if input.is_empty()
         || out_dim == 0
         || weights.len()
@@ -169,7 +183,7 @@ pub fn linear_i8(
     }
     if i64_accumulator_safe(input, input.len()) {
         let mut accumulators = vec![0_i64; out_dim];
-        let threads = compute_threads(input.len() * out_dim, out_dim);
+        let threads = compute_threads(input.len() * out_dim, out_dim, thread_limit);
         let chunk_size = out_dim.div_ceil(threads);
         std::thread::scope(|scope| {
             for (chunk_index, chunk) in accumulators.chunks_mut(chunk_size).enumerate() {
@@ -196,7 +210,7 @@ pub fn linear_i8(
         return Err("linear accumulator overflow");
     }
     let mut accumulators = vec![0_i128; out_dim];
-    let threads = compute_threads(input.len() * out_dim, out_dim);
+    let threads = compute_threads(input.len() * out_dim, out_dim, thread_limit);
     let chunk_size = out_dim.div_ceil(threads);
     std::thread::scope(|scope| {
         for (chunk_index, chunk) in accumulators.chunks_mut(chunk_size).enumerate() {
@@ -271,9 +285,10 @@ fn parallel_top1(
     weights: &[u8],
     rows: usize,
     scale: i64,
+    thread_limit: usize,
     worker: fn(&[i64], &[u8], usize, i64) -> Result<(usize, i64), &'static str>,
 ) -> Result<(usize, i64), &'static str> {
-    let threads = compute_threads(input.len() * rows, rows);
+    let threads = compute_threads(input.len() * rows, rows, thread_limit);
     let rows_per_thread = rows.div_ceil(threads);
     let bytes_per_thread = rows_per_thread * input.len();
     let results = std::thread::scope(|scope| {
@@ -306,6 +321,16 @@ pub fn top1_i8(
     rows: usize,
     scale: i64,
 ) -> Result<(usize, i64), &'static str> {
+    top1_i8_with_thread_limit(input, weights, rows, scale, available_compute_threads())
+}
+
+fn top1_i8_with_thread_limit(
+    input: &[i64],
+    weights: &[u8],
+    rows: usize,
+    scale: i64,
+    thread_limit: usize,
+) -> Result<(usize, i64), &'static str> {
     if input.is_empty()
         || rows == 0
         || weights.len()
@@ -318,12 +343,43 @@ pub fn top1_i8(
         return Err("invalid top1 tensor shape");
     }
     if i64_accumulator_safe(input, input.len()) {
-        return parallel_top1(input, weights, rows, scale, top1_i64);
+        return parallel_top1(input, weights, rows, scale, thread_limit, top1_i64);
     }
     if !i128_accumulator_safe(input, input.len()) {
         return Err("top1 accumulator overflow");
     }
-    parallel_top1(input, weights, rows, scale, top1_i128)
+    parallel_top1(input, weights, rows, scale, thread_limit, top1_i128)
+}
+
+pub(crate) fn verify_thread_invariance() -> Result<(), &'static str> {
+    let input_len = 768;
+    let rows = 4096;
+    let input = (0..input_len)
+        .map(|index| ((index as i64 * 104_729) % (8 * ONE)) - 4 * ONE)
+        .collect::<Vec<_>>();
+    let linear_weights = (0..input_len * rows)
+        .map(|index| ((index * 73 + index / 17 + 19) & 255) as u8)
+        .collect::<Vec<_>>();
+    let row = (0..input_len)
+        .map(|index| ((index * 29 + index / 11 + 7) & 255) as u8)
+        .collect::<Vec<_>>();
+    let top1_weights = row.repeat(rows);
+    let scale = HALF + 1_337;
+    let expected_linear = linear_i8_with_thread_limit(&input, &linear_weights, rows, scale, 1)?;
+    let expected_top1 = top1_i8_with_thread_limit(&input, &top1_weights, rows, scale, 1)?;
+    if expected_top1.0 != 0 {
+        return Err("top1 tie rule differs");
+    }
+    for thread_limit in [2, MAX_COMPUTE_THREADS] {
+        if linear_i8_with_thread_limit(&input, &linear_weights, rows, scale, thread_limit)?
+            != expected_linear
+            || top1_i8_with_thread_limit(&input, &top1_weights, rows, scale, thread_limit)?
+                != expected_top1
+        {
+            return Err("tensor thread partition differs");
+        }
+    }
+    Ok(())
 }
 
 fn integer_sqrt(value: u128) -> u128 {
@@ -689,6 +745,11 @@ mod tests {
             top1_i8(&input, &weights, rows, scale),
             reference_top1(&input, &weights, rows, scale)
         );
+    }
+
+    #[test]
+    fn thread_partitions_are_identical() {
+        assert_eq!(verify_thread_invariance(), Ok(()));
     }
 
     #[test]

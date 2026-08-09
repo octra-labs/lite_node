@@ -70,10 +70,20 @@ OPAM_SWITCH = TOOLCHAIN_ROOT / "ocaml"
 def operator_pm2_name(name):
     return name if name.startswith("octra-") else f"octra-{name}"
 
+def source_commit():
+    path = ROOT / "SOURCE_COMMIT"
+    if not path.is_file():
+        return None
+    value = path.read_text(encoding="utf-8").strip()
+    if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+        raise ValidatorError("SOURCE_COMMIT is invalid")
+    return value
+
 def runtime_binding(config):
     key_dir = ROOT / ".keys/validator"
-    return {
+    binding = {
         "OCTRA_BINARY_HASH": sha256_file(DEFAULT_BINARY),
+        "OCTRA_SOURCE_COMMIT": source_commit() or "",
         "OCTRA_OPERATOR_BINARY": str(DEFAULT_BINARY.resolve()),
         "OCTRA_OPERATOR_CONFIG": str(Path(config).resolve()),
         "OCTRA_OPERATOR_CONTROL_BINARY": str(DEFAULT_CONTROL_BINARY.resolve()),
@@ -85,6 +95,7 @@ def runtime_binding(config):
         "OCTRA_PVAC_VERIFY_WORKER": str(DEFAULT_WORKER.resolve()),
         "OCTRA_PVAC_VERIFY_WORKER_HASH": sha256_file(DEFAULT_WORKER),
     }
+    return binding
 
 def require_runtime_files():
     files = [

@@ -378,7 +378,7 @@ let start_node runtime =
               Some config
           in
           let* () = install next in
-          Lwt.return (Some config));
+          Lwt.return next);
       activate_validator_set = (fun validator_set _ ->
         let next =
           match !scheduled with

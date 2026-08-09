@@ -11,6 +11,7 @@ let max_committee_size = 64
 
 type commitment = {
   chain_id : string;
+  offer_id : string;
   commit_epoch : int64;
   node_id : string;
   graph_root : string;
@@ -23,6 +24,7 @@ type commitment = {
 
 type reveal = {
   chain_id : string;
+  offer_id : string;
   commit_epoch : int64;
   reveal_epoch : int64;
   node_id : string;
@@ -38,6 +40,7 @@ type reveal = {
 type reject =
   | Malformed
   | Chain_mismatch
+  | Offer_mismatch
   | Epoch_mismatch
   | Identity_mismatch
   | Model_mismatch
@@ -58,6 +61,7 @@ type member = {
 }
 
 type selection = {
+  offer_id : string;
   target_epoch : int64;
   challenge : string;
   members : member list;
@@ -76,6 +80,7 @@ let bounded_non_empty limit value =
 
 let commitment_is_well_formed (commitment : commitment) =
   bounded_non_empty max_chain_id_bytes commitment.chain_id
+  && hash32 commitment.offer_id
   && commitment.commit_epoch >= 0L
   && bounded_non_empty max_node_id_bytes commitment.node_id
   && hash32 commitment.graph_root
@@ -87,6 +92,7 @@ let commitment_is_well_formed (commitment : commitment) =
 
 let reveal_is_well_formed (reveal : reveal) =
   bounded_non_empty max_chain_id_bytes reveal.chain_id
+  && hash32 reveal.offer_id
   && reveal.commit_epoch >= 0L
   && reveal.reveal_epoch >= 0L
   && bounded_non_empty max_node_id_bytes reveal.node_id
@@ -104,6 +110,7 @@ let nonce_hash nonce =
 let commitment_sign_bytes (commitment : commitment) =
   Octra_net.Hash_domain.hash_encoded "octra:resource_compute_commitment" (fun buf ->
     Octra_net.Oce1.put_string buf commitment.chain_id;
+    Octra_net.Oce1.put_hash32 buf commitment.offer_id;
     Octra_net.Oce1.put_u64 buf commitment.commit_epoch;
     Octra_net.Oce1.put_string buf commitment.node_id;
     Octra_net.Oce1.put_hash32 buf commitment.graph_root;
@@ -162,6 +169,8 @@ let validate_after_commitment
     Error Malformed
   else if reveal.chain_id <> chain_id then
     Error Chain_mismatch
+  else if reveal.offer_id <> commitment.offer_id then
+    Error Offer_mismatch
   else if
     reveal.commit_epoch <> commitment.commit_epoch
     || not (epoch_window ~target_epoch ~minimum_delay commitment reveal)
@@ -199,6 +208,8 @@ let validate
     Error Malformed
   else if commitment.chain_id <> chain_id || reveal.chain_id <> chain_id then
     Error Chain_mismatch
+  else if reveal.offer_id <> commitment.offer_id then
+    Error Offer_mismatch
   else if
     reveal.commit_epoch <> commitment.commit_epoch
     || not (epoch_window ~target_epoch ~minimum_delay commitment reveal)
@@ -278,6 +289,7 @@ let unique_by id_of values =
 
 let valid_pairs
     ~chain_id
+    ~offer_id
     ~target_epoch
     ~minimum_delay
     ~verify_commitment_signature
@@ -290,6 +302,7 @@ let valid_pairs
     |> List.filter (fun commitment ->
       commitment_is_well_formed commitment
       && commitment.chain_id = chain_id
+      && commitment.offer_id = offer_id
       && commitment.commit_epoch < target_epoch
       && protected_bool (fun () -> verify_commitment_signature commitment))
     |> unique_by commitment_id
@@ -327,8 +340,9 @@ let valid_pairs
     valid_commitments
     []
 
-let selection_root ~target_epoch ~challenge members =
+let selection_root ~offer_id ~target_epoch ~challenge members =
   Octra_net.Hash_domain.hash_encoded "octra:resource_compute_selection" (fun buf ->
+    Octra_net.Oce1.put_hash32 buf offer_id;
     Octra_net.Oce1.put_u64 buf target_epoch;
     Octra_net.Oce1.put_hash32 buf challenge;
     Octra_net.Oce1.put_list
@@ -345,6 +359,7 @@ let selection_root ~target_epoch ~challenge members =
 
 let select
     ~chain_id
+    ~offer_id
     ~target_epoch
     ~challenge
     ~minimum_delay
@@ -360,6 +375,7 @@ let select
     || minimum_delay <= 0L
     || target_epoch <= 0L
     || not (bounded_non_empty max_chain_id_bytes chain_id)
+    || not (hash32 offer_id)
     || not (hash32 challenge)
     || List.length commitments > max_candidates
     || List.length reveals > max_candidates
@@ -368,6 +384,7 @@ let select
   let members =
     valid_pairs
       ~chain_id
+      ~offer_id
       ~target_epoch
       ~minimum_delay
       ~verify_commitment_signature
@@ -379,8 +396,9 @@ let select
     |> List.sort compare_member
     |> take committee_size in
   {
+    offer_id;
     target_epoch;
     challenge;
     members;
-    root = selection_root ~target_epoch ~challenge members;
+    root = selection_root ~offer_id ~target_epoch ~challenge members;
   }

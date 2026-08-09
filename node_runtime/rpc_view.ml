@@ -271,6 +271,30 @@ let node_version () =
     "protocol", `String "json-rpc-2.0";
   ]
 
+let runtime_version ~source_commit ~binary_hash ~consensus_profile
+    ~consensus_rules_id ~runtime_profile_hash ~config_hash ~chain_id
+    ~validator =
+  let runtime_profile_hash =
+    match runtime_profile_hash with
+    | None -> `Null
+    | Some value -> `String (raw_to_hex value)
+  in
+  `Assoc [
+    "schema", `String "octra-runtime-release-v1";
+    "schema_version", `Int 1;
+    "node", `String "octra";
+    "node_version", `String "3.0.0";
+    "source_commit", opt_string source_commit;
+    "binary_hash", opt_string binary_hash;
+    "consensus_profile", `Int consensus_profile;
+    "consensus_rules_id", `String consensus_rules_id;
+    "runtime_profile_hash", runtime_profile_hash;
+    "config_hash", `String (raw_to_hex config_hash);
+    "chain_id", `String chain_id;
+    "validator", `String validator;
+    "self_reported", `Bool true;
+  ]
+
 let validator_view_pubkey ~validator_view_pub ~validator_address =
   `Assoc [
     "validator_view_pubkey", `String (Base64.encode_exn validator_view_pub);
@@ -461,8 +485,14 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
       None
   in
   let can_owner_proof_migrate =
-    match owner_migration_mode, status.cipher_class, status.key_class with
-    | Rule_graph.Active, Pvac_migration.V3, Pvac_migration.Historical -> true
+    match owner_migration_mode, status.cipher_class, status.key_class, entitlement with
+    | Rule_graph.Active, Pvac_migration.V3, Pvac_migration.Historical,
+      Some (Ok entry)
+      when
+        entry.Octra_core.Pvac_migration_entitlement.decision.audit_class
+        <> Pvac_legacy_public_replay.Poisoned
+        && Option.is_some entry.decision.commitment_net ->
+      true
     | _ -> false
   in
   let replay_json =
@@ -515,6 +545,12 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
     "can_key_switch", `Bool (Pvac_migration.can_key_switch status);
     "can_v3_migrate", `Bool (Pvac_migration.can_bound_migrate status);
     "can_owner_proof_migrate", `Bool can_owner_proof_migrate;
+    "owner_migration_authority",
+      `String
+        (if can_owner_proof_migrate then
+           "finalized_history_commitment"
+         else
+           "unavailable");
     "owner_proof_rule",
       `String
         (match owner_migration_mode with

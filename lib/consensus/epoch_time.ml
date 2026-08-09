@@ -11,6 +11,7 @@ let interval_ms = 10_000L
 let interval_seconds = 10.0
 let initial_drift_ms = 300_000L
 let max_future_ms = 5_000L
+let proposal_wait_budget_ms = Int64.add interval_ms max_future_ms
 let max_seconds = 9.22e15
 
 let of_seconds seconds =

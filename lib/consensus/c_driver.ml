@@ -135,6 +135,13 @@ type proposal_fetch_decision =
   | Stop_proposal_fetch
   | Send_proposal_fetch
 
+type round_sync_reply = {
+  epoch_id : int64;
+  round : int;
+  step : C_types.round_step;
+  sent_at : int64;
+}
+
 type t = {
   mutable n_validators : int;
   config : config;
@@ -158,7 +165,7 @@ type t = {
   pending_finalizes : (int64, pending_finalize) Hashtbl.t;
   pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
-  round_sync_replies : (string, int64) Hashtbl.t;
+  round_sync_replies : (string, round_sync_reply) Hashtbl.t;
   proposal_fetches : (string, unit) Hashtbl.t;
   catchup_query_from_epoch : (string, int64) Hashtbl.t;
   mutable proposal_build : proposal_build option;
@@ -696,6 +703,11 @@ let broadcast_round_sync t ~request =
       t.swarm
       (round_sync_frame (make_round_sync t ~request))
 
+let round_sync_request_for_step = function
+  | C_types.ProposeStep -> false
+  | C_types.PrevoteStep
+  | C_types.PrecommitStep -> true
+
 let broadcast_round_sync_at t ~round =
   if not (local_validator t) || not (t.config.can_vote ()) then
     Lwt.return_unit
@@ -920,11 +932,34 @@ let round_sync_response_due ~last ~now =
     Int64.compare now prior >= 0
     && Int64.compare (Int64.sub now prior) 1_000_000_000L >= 0
 
-let round_sync_response_allowed t validator =
+let round_sync_reply_progresses prior (sync : C_codec.round_sync) =
+  Int64.compare sync.epoch_id prior.epoch_id > 0
+  || (Int64.equal sync.epoch_id prior.epoch_id
+      && sync.round = prior.round
+      && round_step_rank sync.step > round_step_rank prior.step)
+
+let round_sync_response_allowed t (sync : C_codec.round_sync) =
   let now = Mtime_clock.elapsed_ns () in
-  let last = Hashtbl.find_opt t.round_sync_replies validator in
-  if round_sync_response_due ~last ~now then begin
-    Hashtbl.replace t.round_sync_replies validator now;
+  let prior = Hashtbl.find_opt t.round_sync_replies sync.validator in
+  let due =
+    round_sync_response_due
+      ~last:(Option.map (fun reply -> reply.sent_at) prior)
+      ~now
+  in
+  let progresses =
+    Option.fold ~none:false ~some:(fun reply ->
+      round_sync_reply_progresses reply sync) prior
+  in
+  if due || progresses then begin
+    Hashtbl.replace
+      t.round_sync_replies
+      sync.validator
+      {
+        epoch_id = sync.epoch_id;
+        round = sync.round;
+        step = sync.step;
+        sent_at = now;
+      };
     true
   end else
     false
@@ -1620,10 +1655,9 @@ let rec process_outputs_once t =
               proceed (broadcast_round_sync_at t ~round)
             | C_engine.ScheduleTimeout { step; round; delay_ms; generation } ->
               let* () =
-                if step = C_types.ProposeStep then
-                  broadcast_round_sync t ~request:false
-                else
-                  Lwt.return_unit
+                broadcast_round_sync
+                  t
+                  ~request:(round_sync_request_for_step step)
               in
               Lwt.async (fun () ->
                 let* () =
@@ -1885,7 +1919,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                     ~validator:sync.validator;
                   let* () = process_outputs t in
                   if round_sync_reply_needed t sync
-                     && round_sync_response_allowed t sync.validator then
+                     && round_sync_response_allowed t sync then
                     send_round_sync_response
                       t
                       _conn

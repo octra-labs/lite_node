@@ -162,7 +162,9 @@ let int_env name ~fallback ~limit =
 
 let timeout_ms_with ~round ~step ~base ~propose ~per_round =
   let step_base, cap = match step with
-    | ProposeStep -> propose, max_propose_timeout_ms
+    | ProposeStep ->
+      max propose (Int64.to_int Epoch_time.proposal_wait_budget_ms),
+      max_propose_timeout_ms
     | PrevoteStep
     | PrecommitStep -> base, max_timeout_ms
   in

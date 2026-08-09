@@ -374,6 +374,7 @@ let offer_matches_capability offer (capability : Capability.t) =
 
 let offer_matches_commitment offer (commitment : Selection.commitment) =
   commitment.chain_id = offer.Protocol.chain_id
+  && commitment.offer_id = offer_id offer
   && commitment.commit_epoch >= offer.offered_epoch
   && commitment.commit_epoch <= offer.expires_epoch
   && commitment.graph_root = offer.graph_root
@@ -519,7 +520,8 @@ let validate_pending_reveal t state (reveal : Selection.reveal) =
   let matching_commitments =
     List.filter
       (fun (commitment : Selection.commitment) ->
-        commitment.commit_epoch = reveal.commit_epoch
+        commitment.offer_id = reveal.offer_id
+        && commitment.commit_epoch = reveal.commit_epoch
         && commitment.graph_root = reveal.graph_root
         && commitment.model_root = reveal.model_root
         && commitment.program_root = reveal.program_root
@@ -604,6 +606,7 @@ let selection_for t (state : offer_state) request =
       ~finality_hash:request.state_root in
   Selection.select
     ~chain_id:t.deps.chain_id
+    ~offer_id:(offer_id state.offer)
     ~target_epoch:request.epoch_id
     ~challenge
     ~minimum_delay:reveal_delay
@@ -635,6 +638,7 @@ let selection_for_snapshot t validator_set (snapshot : offer_snapshot) request =
       ~finality_hash:request.state_root in
   Selection.select
     ~chain_id:t.deps.chain_id
+    ~offer_id:(offer_id snapshot.offer)
     ~target_epoch:request.epoch_id
     ~challenge
     ~minimum_delay:reveal_delay
@@ -807,34 +811,32 @@ let record_commitment t commitment =
   let validator_set, _ = current_validator_set t in
   if not (verify_commitment validator_set commitment) then false
   else
-    let states = matching_offers t (fun offer -> offer_matches_commitment offer commitment) in
-    List.fold_left
-      (fun accepted (state : offer_state) ->
+    match Hashtbl.find_opt t.offers commitment.Selection.offer_id with
+    | Some state when offer_matches_commitment state.offer commitment ->
         let added =
           add_limited
             state.commitments
             (Selection.commitment_id commitment)
             commitment in
         if added then promote_pending_reveals t state commitment.node_id;
-        added || accepted)
-      false
-      states
+        added
+    | Some _
+    | None -> false
 
 let record_reveal t reveal =
   let validator_set, _ = current_validator_set t in
-  let states = matching_offers t (fun offer ->
-    offer.Protocol.chain_id = reveal.Selection.chain_id
-    && offer.graph_root = reveal.graph_root
-    && offer.model_root = reveal.model_root
-    && offer.program_root = reveal.program_root
-    && offer.executor_root = reveal.executor_root) in
   if
     not (Selection.reveal_is_well_formed reveal)
     || not (Octra_consensus.C_types.is_validator validator_set reveal.node_id)
   then false
   else
-    List.fold_left
-      (fun accepted (state : offer_state) ->
+    match Hashtbl.find_opt t.offers reveal.Selection.offer_id with
+    | Some state
+      when state.offer.Protocol.chain_id = reveal.chain_id
+           && state.offer.graph_root = reveal.graph_root
+           && state.offer.model_root = reveal.model_root
+           && state.offer.program_root = reveal.program_root
+           && state.offer.executor_root = reveal.executor_root ->
         let key = pending_reveal_key reveal in
         let existing = Hashtbl.find_opt state.pending_reveals key in
         let admitted =
@@ -849,9 +851,9 @@ let record_reveal t reveal =
             Hashtbl.add state.pending_reveals key reveal;
             true in
         if admitted then promote_pending_reveals t state reveal.node_id;
-        admitted || accepted)
-      false
-      states
+        admitted
+    | Some _
+    | None -> false
 
 let record_result t result =
   if not (Protocol.result_shape result) then false
@@ -909,6 +911,7 @@ let signed_capability
 let signed_commitment t offer epoch nonce =
   let unsigned = Selection.{
     chain_id = offer.Protocol.chain_id;
+    offer_id = offer_id offer;
     commit_epoch = epoch;
     node_id = t.deps.node_id;
     graph_root = offer.graph_root;
@@ -923,6 +926,7 @@ let signed_commitment t offer epoch nonce =
 let signed_reveal t (commitment : Selection.commitment) nonce evidence_root reveal_epoch =
   let unsigned : Selection.reveal = Selection.{
     chain_id = commitment.chain_id;
+    offer_id = commitment.offer_id;
     commit_epoch = commitment.commit_epoch;
     reveal_epoch;
     node_id = commitment.node_id;

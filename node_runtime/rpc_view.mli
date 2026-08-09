@@ -112,6 +112,17 @@ val node_version :
   unit ->
   Yojson.Safe.t
 
+val runtime_version :
+  source_commit:string option ->
+  binary_hash:string option ->
+  consensus_profile:int ->
+  consensus_rules_id:string ->
+  runtime_profile_hash:string option ->
+  config_hash:string ->
+  chain_id:string ->
+  validator:string ->
+  Yojson.Safe.t
+
 val validator_view_pubkey :
   validator_view_pub:string ->
   validator_address:string ->

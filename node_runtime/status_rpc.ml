@@ -6,6 +6,19 @@ module Rpc = Octra_core.Rpc
 let node_version () =
   Rpc_view.node_version ()
 
+let runtime_version ~source_commit ~binary_hash ~consensus_profile
+    ~consensus_rules_id ~runtime_profile_hash ~config_hash ~chain_id
+    ~validator =
+  Rpc_view.runtime_version
+    ~source_commit
+    ~binary_hash
+    ~consensus_profile
+    ~consensus_rules_id
+    ~runtime_profile_hash
+    ~config_hash
+    ~chain_id
+    ~validator
+
 let validator_view_pubkey ~validator_view_pub ~validator_address =
   Rpc_view.validator_view_pubkey
     ~validator_view_pub

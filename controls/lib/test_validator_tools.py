@@ -45,6 +45,7 @@ from validator_config import resource_report
 from validator_config import require_validator_membership
 from validator_config import require_runtime_binding
 from validator_config import rebind_runtime
+from validator_config import source_commit
 from validator_config import validate_advertise
 from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
@@ -513,6 +514,14 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(values["OCTRA_CHAIN_ID"], f"$(touch {marker})")
 
+    def test_source_commit_rejects_invalid_value(self):
+        root = WORK / "candidate-source"
+        root.mkdir()
+        (root / "SOURCE_COMMIT").write_text("invalid\n", encoding="utf-8")
+        with mock.patch("validator_config.ROOT", root):
+            with self.assertRaisesRegex(ValidatorError, "SOURCE_COMMIT is invalid"):
+                source_commit()
+
     def test_run_requires_explicit_candidate_binding(self):
         source_path = Path(__file__).resolve().parent / "run.sh"
         exported_path = Path(__file__).resolve().parent.parent / "run.sh"
@@ -543,6 +552,7 @@ class ValidatorToolsTest(unittest.TestCase):
         sync_binary = root / "artifacts/octra_state_sync_client.exe"
         control_binary = root / "artifacts/bft_control_tx.exe"
         for path, body in (
+            (root / "SOURCE_COMMIT", b"a" * 40 + b"\n"),
             (packaged_network, b"network\n"),
             (installed_network, b"network\n"),
             (binary, b"node"),
@@ -578,6 +588,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(values["OCTRA_STATE_SYNC_ENABLE"], "1")
         self.assertEqual(values["OCTRA_OPERATOR_BINARY"], str(binary.resolve()))
         self.assertEqual(values["OCTRA_BINARY_HASH"], hashlib.sha256(b"node").hexdigest())
+        self.assertEqual(values["OCTRA_SOURCE_COMMIT"], "a" * 40)
 
     def test_install_prepares_operator_data_root(self):
         source_path = Path(__file__).resolve().parent / "install.sh"

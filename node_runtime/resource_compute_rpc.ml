@@ -200,6 +200,7 @@ let selection_json (selection : Selection.selection) =
   `Assoc [
     "challenge", hex selection.challenge;
     "members", `List (List.map member_json selection.members);
+    "offer_id", hex selection.offer_id;
     "root", hex selection.root;
     "target_epoch", int64 selection.target_epoch;
   ]

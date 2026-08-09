@@ -379,6 +379,7 @@ let get_capability cursor =
 
 let put_commitment buf (commitment : Selection.commitment) =
   Octra_net.Oce1.put_string buf commitment.Selection.chain_id;
+  Octra_net.Oce1.put_hash32 buf commitment.offer_id;
   Octra_net.Oce1.put_u64 buf commitment.commit_epoch;
   Octra_net.Oce1.put_string buf commitment.node_id;
   Octra_net.Oce1.put_hash32 buf commitment.graph_root;
@@ -390,6 +391,7 @@ let put_commitment buf (commitment : Selection.commitment) =
 
 let get_commitment cursor =
   let chain_id = Octra_net.Oce1.get_string_bounded ~max:max_chain_id_bytes cursor in
+  let offer_id = Octra_net.Oce1.get_hash32 cursor in
   let commit_epoch = Octra_net.Oce1.get_u64 cursor in
   let node_id = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
   let graph_root = Octra_net.Oce1.get_hash32 cursor in
@@ -400,6 +402,7 @@ let get_commitment cursor =
   let signature = Octra_net.Oce1.get_sig64 cursor in
   ({
     chain_id = chain_id;
+    offer_id = offer_id;
     commit_epoch = commit_epoch;
     node_id = node_id;
     graph_root = graph_root;
@@ -412,6 +415,7 @@ let get_commitment cursor =
 
 let put_reveal buf (reveal : Selection.reveal) =
   Octra_net.Oce1.put_string buf reveal.Selection.chain_id;
+  Octra_net.Oce1.put_hash32 buf reveal.offer_id;
   Octra_net.Oce1.put_u64 buf reveal.commit_epoch;
   Octra_net.Oce1.put_u64 buf reveal.reveal_epoch;
   Octra_net.Oce1.put_string buf reveal.node_id;
@@ -425,6 +429,7 @@ let put_reveal buf (reveal : Selection.reveal) =
 
 let get_reveal cursor =
   let chain_id = Octra_net.Oce1.get_string_bounded ~max:max_chain_id_bytes cursor in
+  let offer_id = Octra_net.Oce1.get_hash32 cursor in
   let commit_epoch = Octra_net.Oce1.get_u64 cursor in
   let reveal_epoch = Octra_net.Oce1.get_u64 cursor in
   let node_id = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
@@ -437,6 +442,7 @@ let get_reveal cursor =
   let signature = Octra_net.Oce1.get_sig64 cursor in
   ({
     chain_id = chain_id;
+    offer_id = offer_id;
     commit_epoch = commit_epoch;
     reveal_epoch = reveal_epoch;
     node_id = node_id;

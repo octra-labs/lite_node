@@ -44,9 +44,13 @@ let context ~program_trust backend env (tx : Transaction.t) effects tx_hash =
       tx_hash;
     }
 
-let wasm_profile = function
+let wasm_admission_profile = function
   | Rule_graph.Prior -> Octra_core.Circle_wasm_host.Standard
-  | Rule_graph.Active -> Octra_core.Circle_wasm_host.Compute
+  | Rule_graph.Active -> Octra_core.Circle_wasm_host.Manifest
+
+let wasm_load_profile = function
+  | Rule_graph.Prior -> Octra_core.Circle_wasm_host.Compute
+  | Rule_graph.Active -> Octra_core.Circle_wasm_host.Manifest
 
 let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
     ?(save_receipt_raw=(fun ~tx_hash:_ ~json:_ -> ()))
@@ -196,6 +200,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
             ~limit:call.Call_plan.effort_limit
             ~hfhe_mode
             ~update_policy:(circle_mode = Rule_graph.Active)
+            ~manifest_profile:(wasm_load_profile wasm_compute_mode)
             backend.store
             current.to_
             call.method_name
@@ -238,7 +243,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
           result.Circle_exec.receipt);
       circle_commit = (fun current result ->
         Circle_exec.commit_call_result
-          ~deployment_profile:(wasm_profile wasm_compute_mode)
+          ~deployment_profile:(wasm_admission_profile wasm_compute_mode)
           backend.store
           current.to_
           result);
@@ -470,7 +475,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Ok () ->
         let* result =
           Epoch_exec.process_circle_deploy_tx
-            ~wasm_profile:(wasm_profile wasm_compute_mode)
+            ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
             ~backend
             tx in
         Lwt.return
@@ -490,7 +495,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Ok () ->
         let* result =
           Epoch_exec.process_circle_program_update_tx
-            ~wasm_profile:(wasm_profile wasm_compute_mode)
+            ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
             ~backend
             tx in
         Lwt.return
@@ -500,7 +505,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
     let open Lwt.Syntax in
     let* result =
       Epoch_exec.process_standard_tx_with_wasm_profile
-        ~wasm_profile:(wasm_profile wasm_compute_mode)
+        ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
         ~backend
         ~env
         tx in

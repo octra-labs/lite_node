@@ -198,7 +198,7 @@ let verify_finalize ~chain_id ~validator_set finalize =
     Error "finality epoch mismatch"
   else
     match
-      C_qc.validate_persisted_finalize
+      C_qc.validate_persisted_finalize_hardened
         ~chain_id
         ~validator_set
         ~verify_vote:(verify_vote validator_set)

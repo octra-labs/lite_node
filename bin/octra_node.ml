@@ -430,6 +430,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "owner_migration"
       (Rule_graph.owner_migration_activation rules)
       (fun epoch -> Rule_graph.owner_migration rules ~epoch);
+    bind_rule
+      "wasm_compute"
+      (Rule_graph.wasm_compute_activation rules)
+      (fun epoch -> Rule_graph.wasm_compute rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)

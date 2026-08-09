@@ -159,6 +159,7 @@ const COMPUTE_IMPORTS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionProfile {
     Standard,
+    Manifest,
     Compute,
 }
 
@@ -166,6 +167,7 @@ impl ExecutionProfile {
     fn of_payload(payload: &Payload) -> Result<Self, String> {
         match payload.execution_profile.as_deref().unwrap_or("standard") {
             "standard" => Ok(Self::Standard),
+            "manifest" => Ok(Self::Manifest),
             "compute" => Ok(Self::Compute),
             _ => Err("invalid wasm execution profile".to_owned()),
         }
@@ -174,6 +176,7 @@ impl ExecutionProfile {
     fn max_guest_bytes(self) -> usize {
         match self {
             Self::Standard => MAX_GUEST_READ_BYTES.min(MAX_GUEST_WRITE_BYTES),
+            Self::Manifest => MAX_GUEST_READ_BYTES.min(MAX_GUEST_WRITE_BYTES),
             Self::Compute => COMPUTE_MAX_GUEST_BYTES,
         }
     }
@@ -181,6 +184,7 @@ impl ExecutionProfile {
     fn max_tensor_session_bytes(self) -> usize {
         match self {
             Self::Standard => MAX_TENSOR_SESSION_BYTES,
+            Self::Manifest => MAX_TENSOR_SESSION_BYTES,
             Self::Compute => COMPUTE_MAX_TENSOR_SESSION_BYTES,
         }
     }
@@ -188,6 +192,7 @@ impl ExecutionProfile {
     fn max_initial_pages(self) -> usize {
         match self {
             Self::Standard => MAX_INITIAL_PAGES,
+            Self::Manifest => COMPUTE_MAX_INITIAL_PAGES,
             Self::Compute => COMPUTE_MAX_INITIAL_PAGES,
         }
     }
@@ -195,6 +200,7 @@ impl ExecutionProfile {
     fn fuel(self, requested: Option<u64>) -> u64 {
         match self {
             Self::Standard => requested.unwrap_or(DEFAULT_FUEL_LIMIT).min(MAX_FUEL_LIMIT),
+            Self::Manifest => requested.unwrap_or(DEFAULT_FUEL_LIMIT).min(MAX_FUEL_LIMIT),
             Self::Compute => requested
                 .unwrap_or(COMPUTE_DEFAULT_FUEL_LIMIT)
                 .min(COMPUTE_MAX_FUEL_LIMIT),
@@ -594,6 +600,7 @@ enum FrameValue {
     String(String),
 }
 
+#[cfg(not(test))]
 extern "C" {
     fn octra_circle_wasm_host_hfhe_call_json(
         input_ptr: *const u8,
@@ -603,6 +610,30 @@ extern "C" {
         err_ptr: *mut *mut u8,
         err_len: *mut usize,
     ) -> i32;
+}
+
+#[cfg(test)]
+unsafe fn octra_circle_wasm_host_hfhe_call_json(
+    _input_ptr: *const u8,
+    _input_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    err_ptr: *mut *mut u8,
+    err_len: *mut usize,
+) -> i32 {
+    if !out_ptr.is_null() {
+        *out_ptr = std::ptr::null_mut();
+    }
+    if !out_len.is_null() {
+        *out_len = 0;
+    }
+    if !err_ptr.is_null() {
+        *err_ptr = std::ptr::null_mut();
+    }
+    if !err_len.is_null() {
+        *err_len = 0;
+    }
+    1
 }
 
 #[no_mangle]
@@ -698,6 +729,7 @@ fn self_test_i64(hasher: &mut Sha256, values: &[i64]) {
 }
 
 fn run_compute_self_test() -> Result<JsonValue, String> {
+    deterministic_tensor::verify_thread_invariance().map_err(str::to_owned)?;
     let one = deterministic_tensor::ONE;
     let half = deterministic_tensor::HALF;
     let loaded = deterministic_tensor::load_i8(&[1, 2, 3, 4], half).map_err(str::to_owned)?;
@@ -962,12 +994,18 @@ fn run_describe(payload: &Payload) -> Result<JsonValue, String> {
         .get_func(&runtime.store, "octra_manifest")
         .is_some()
     {
-        match runtime.call_export("octra_manifest", &[]) {
-            Ok((_code, response_bytes, _effort_used)) => {
-                serde_json::from_slice::<JsonValue>(&response_bytes).ok()
-            }
-            Err(_) => None,
+        let (code, response_bytes, _effort_used) = runtime
+            .call_export("octra_manifest", &[])
+            .map_err(|error| format!("wasm manifest execution failed: {error}"))?;
+        if code != 0 {
+            return Err(format!("wasm manifest returned {code}"));
         }
+        let value = serde_json::from_slice::<JsonValue>(&response_bytes)
+            .map_err(|error| format!("invalid wasm manifest json: {error}"))?;
+        if !value.is_object() {
+            return Err("wasm manifest must be an object".to_owned());
+        }
+        Some(value)
     } else {
         None
     };
@@ -1517,6 +1555,7 @@ fn build_storage_from_payload(
                 },
             );
         }
+
         return Ok(shared);
     }
 
@@ -6440,6 +6479,42 @@ mod tests {
             response_hash: format!("{response:064x}"),
             result,
         }
+    }
+
+    #[test]
+    fn manifest_profile_has_deterministic_standard_budget() {
+        assert_eq!(
+            ExecutionProfile::Manifest.fuel(Some(COMPUTE_MAX_FUEL_LIMIT)),
+            MAX_FUEL_LIMIT
+        );
+        assert_eq!(
+            ExecutionProfile::Manifest.max_tensor_session_bytes(),
+            MAX_TENSOR_SESSION_BYTES
+        );
+        assert_ne!(ExecutionProfile::Manifest, ExecutionProfile::Compute);
+    }
+
+    #[test]
+    fn trapped_manifest_is_rejected_instead_of_falling_back() {
+        let wasm = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x02, 0x60, 0x01, 0x7f,
+            0x01, 0x7f, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x03, 0x02, 0x00, 0x01, 0x05,
+            0x03, 0x01, 0x00, 0x01, 0x07, 0x37, 0x04, 0x06, b'm', b'e', b'm', b'o', b'r', b'y',
+            0x02, 0x00, 0x0b, b'o', b'c', b't', b'r', b'a', b'_', b'a', b'l', b'l', b'o', b'c',
+            0x00, 0x00, 0x0e, b'o', b'c', b't', b'r', b'a', b'_', b'm', b'a', b'n', b'i', b'f',
+            b'e', b's', b't', 0x00, 0x01, 0x0b, b'o', b'c', b't', b'r', b'a', b'_', b'q', b'u',
+            b'e', b'r', b'y', 0x00, 0x01, 0x0a, 0x0a, 0x02, 0x04, 0x00, 0x41, 0x00, 0x0b, 0x03,
+            0x00, 0x00, 0x0b,
+        ];
+        let input = serde_json::json!({
+            "action": "describe",
+            "code_b64": BASE64.encode(wasm),
+            "execution_profile": "manifest",
+            "is_view": true
+        })
+        .to_string();
+        let error = run_json(input.as_ptr(), input.len()).expect_err("trapped manifest accepted");
+        assert!(error.contains("wasm manifest execution failed"), "{error}");
     }
 
     #[test]

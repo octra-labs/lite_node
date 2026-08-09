@@ -478,9 +478,9 @@ let key_switch_requests_legacy_audit tx =
       match payload.migration with
       | Public_history
       | Rejected_rebinding
-      | Commitment_history -> true
+      | Commitment_history
+      | Historical_owner_proof -> true
       | Standard
-      | Historical_owner_proof
       | Verified_zero_reset -> false
     end
   | Error _ -> false
@@ -1189,14 +1189,19 @@ let prepared_bound_migration old_pk current_cipher payload =
             "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"
     end
 
-let prepared_historical_owner old_pk current_cipher payload =
-  match payload.old_bound_pubkey_b64, payload.old_bound_cipher with
-  | Some _, _
-  | _, Some _ ->
+let prepared_historical_owner current_cipher payload =
+  match
+    payload.old_bound_pubkey_b64,
+    payload.old_bound_cipher,
+    payload.old_zero_proof
+  with
+  | Some _, _, _
+  | _, Some _, _
+  | _, _, Some _ ->
     error
       "key_switch_rejected"
-      "historical owner migration reads its source key and ciphertext from finalized state"
-  | None, None ->
+      "historical owner migration reads its authorization from finalized history"
+  | None, None, None ->
     begin
       match payload.amount_blinding with
       | Some _ ->
@@ -1219,52 +1224,43 @@ let prepared_historical_owner old_pk current_cipher payload =
             | Error _ as result -> result
             | Ok () ->
               match
-                old_pk,
                 payload.new_cipher,
-                payload.old_zero_proof,
                 payload.new_zero_proof,
                 payload.amount_commitment
               with
-              | Some old_blob, Some new_cipher, Some old_proof, Some new_proof,
+              | Some new_cipher, Some new_proof,
                 Some commitment when FB.cipher_is_wrapped_scalar new_cipher ->
-                Ok (old_blob, new_cipher, old_proof, new_proof, commitment)
-              | Some _, Some _, Some _, Some _, Some _ ->
+                Ok (new_cipher, new_proof, commitment)
+              | Some _, Some _, Some _ ->
                 error
                   "key_switch_rejected"
                   "historical owner migration requires a wrapped scalar new cipher"
               | _ ->
                 error
                   "key_switch_rejected"
-                  "historical owner migration requires source proof, new cipher, new proof and amount commitment"
+                  "historical owner migration requires new cipher, new proof and history-bound amount commitment"
           end
     end
 
 let verify_historical_owner
     ~worker_priority
-    ~old_pk
+    ~legacy_public_replay
     ~current_cipher
     ~new_pubkey
     payload =
   let open Lwt.Syntax in
-  match prepared_historical_owner old_pk current_cipher payload with
+  match prepared_historical_owner current_cipher payload with
   | Error failure -> Lwt.return (Error failure)
-  | Ok (old_blob, new_cipher, old_proof, new_proof, commitment) ->
-    let* old_checked =
-      VW.verify_historical_migration_claim_classified_with_priority
-        worker_priority
-        ~pubkey:old_blob
-        ~cipher:current_cipher
-        ~proof:old_proof
-        ~commitment
-    in
+  | Ok (new_cipher, new_proof, commitment) ->
     begin
-      match old_checked with
-      | Error worker_failure ->
+      match legacy_audit_commitment legacy_public_replay with
+      | Error reason -> Lwt.return (error "key_switch_rejected" reason)
+      | Ok trusted_commitment when not (String.equal commitment trusted_commitment) ->
         Lwt.return
-          (key_switch_worker_error
-             "historical encrypted balance proof failed: "
-             worker_failure)
-      | Ok () ->
+          (error
+             "key_switch_rejected"
+             "historical owner commitment differs from finalized history")
+      | Ok _ ->
         let* new_checked =
           VW.verify_claim_classified_with_priority
             worker_priority
@@ -1363,7 +1359,7 @@ let verify_key_switch_plan
                   let* checked =
                     verify_historical_owner
                       ~worker_priority
-                      ~old_pk
+                      ~legacy_public_replay
                       ~current_cipher
                       ~new_pubkey
                       payload
@@ -1555,8 +1551,8 @@ let prepare_key_switch_plan_uncached ledger tx =
                     "historical owner proof requires a key-bound balance and historical registered key"
                 else
                   Result.map
-                    (fun (_, new_cipher, _, _, _) -> Some new_cipher)
-                    (prepared_historical_owner old_pk current_cipher payload)
+                    (fun (new_cipher, _, _) -> Some new_cipher)
+                    (prepared_historical_owner current_cipher payload)
               else if payload.migration = Commitment_history then
                 Result.map Option.some (prepared_legacy_commitment payload)
               else if payload.migration = Rejected_rebinding then

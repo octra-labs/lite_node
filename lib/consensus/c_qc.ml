@@ -25,15 +25,21 @@ let vote_ok ~chain_id ~epoch_id ~round ~proposal_id (vote : vote) =
   && vote.vote_type = Precommit
   && vote.proposal_id = proposal_id
 
-let validate_certificate ~chain_id ~validator_set ~verify_vote
+let validate_certificate_with_policy
+    ~harden_quorum
+    ~chain_id
+    ~validator_set
+    ~verify_vote
     (certificate : commit_certificate) =
   if certificate.chain_id <> chain_id then invalid "chain_id"
   else
     let validator_set =
-      validator_set_for_epoch
-        ~chain_id
-        ~epoch_id:certificate.epoch_id
-        validator_set
+      if harden_quorum then resilient_validator_set validator_set
+      else
+        validator_set_for_epoch
+          ~chain_id
+          ~epoch_id:certificate.epoch_id
+          validator_set
     in
     if certificate.header.chain_id <> certificate.chain_id then
       invalid "header_chain_id"
@@ -60,11 +66,13 @@ let validate_certificate ~chain_id ~validator_set ~verify_vote
       in
       if not (unique addrs) then invalid "duplicate_validator"
       else if not
-        (C_types.has_quorum_at
-           ~chain_id
-           ~epoch_id:certificate.epoch_id
-           validator_set
-           addrs)
+        (if harden_quorum then C_types.has_quorum validator_set addrs
+         else
+           C_types.has_quorum_at
+             ~chain_id
+             ~epoch_id:certificate.epoch_id
+             validator_set
+             addrs)
       then invalid "quorum"
       else begin
         let bad_vote =
@@ -100,7 +108,15 @@ let validate_certificate ~chain_id ~validator_set ~verify_vote
       end
     end
 
-let validate_finalize_with ~version_valid ~chain_id ~validator_set
+let validate_certificate ~chain_id ~validator_set ~verify_vote certificate =
+  validate_certificate_with_policy
+    ~harden_quorum:false
+    ~chain_id
+    ~validator_set
+    ~verify_vote
+    certificate
+
+let validate_finalize_with ~version_valid ~harden_quorum ~chain_id ~validator_set
     ~verify_vote (finalize : finalize) =
   if not (version_valid finalize) then
     invalid "header_proto_version"
@@ -110,7 +126,8 @@ let validate_finalize_with ~version_valid ~chain_id ~validator_set
   then
     invalid "parent_commit_hash"
   else
-    validate_certificate
+    validate_certificate_with_policy
+      ~harden_quorum
       ~chain_id
       ~validator_set
       ~verify_vote
@@ -118,6 +135,7 @@ let validate_finalize_with ~version_valid ~chain_id ~validator_set
 
 let validate_finalize ~chain_id ~validator_set ~verify_vote finalize =
   validate_finalize_with
+    ~harden_quorum:false
     ~version_valid:(fun finalize ->
       finalize.header.proto_version
       = C_protocol.version_for_epoch finalize.epoch_id)
@@ -128,6 +146,21 @@ let validate_finalize ~chain_id ~validator_set ~verify_vote finalize =
 
 let validate_persisted_finalize ~chain_id ~validator_set ~verify_vote finalize =
   validate_finalize_with
+    ~harden_quorum:false
+    ~version_valid:(fun finalize ->
+      C_protocol.supported_version finalize.header.proto_version)
+    ~chain_id
+    ~validator_set
+    ~verify_vote
+    finalize
+
+let validate_persisted_finalize_hardened
+    ~chain_id
+    ~validator_set
+    ~verify_vote
+    finalize =
+  validate_finalize_with
+    ~harden_quorum:true
     ~version_valid:(fun finalize ->
       C_protocol.supported_version finalize.header.proto_version)
     ~chain_id
