@@ -13,7 +13,7 @@ type t =
 
 type plan =
   | Wait
-  | Exhausted
+  | Rest
   | Send of t
 
 type response_route =
@@ -24,6 +24,7 @@ type response_route =
 
 let max_attempts = 3
 let retry_ns = 5_000_000_000L
+let rest_ns = 60_000_000_000L
 let idle = Idle
 
 let response_route ~finality_request ~complete_valid ~legacy_valid =
@@ -37,8 +38,11 @@ let plan ~now ~epoch = function
     Send (Sent { epoch; attempts = 1; sent_at = now })
   | Sent prior when prior.epoch <> epoch ->
     Send (Sent { epoch; attempts = 1; sent_at = now })
+  | Sent prior when prior.attempts >= max_attempts
+                    && Int64.sub now prior.sent_at < rest_ns ->
+    Rest
   | Sent prior when prior.attempts >= max_attempts ->
-    Exhausted
+    Send (Sent { epoch; attempts = 1; sent_at = now })
   | Sent prior when Int64.sub now prior.sent_at < retry_ns ->
     Wait
   | Sent prior ->

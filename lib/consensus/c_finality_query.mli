@@ -13,7 +13,7 @@ type t =
 
 type plan =
   | Wait
-  | Exhausted
+  | Rest
   | Send of t
 
 type response_route =
@@ -24,6 +24,7 @@ type response_route =
 
 val max_attempts : int
 val retry_ns : int64
+val rest_ns : int64
 val idle : t
 val response_route :
   finality_request:bool ->

@@ -2683,6 +2683,16 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               | [] -> from_epoch
             in
             let* validator_set = validator_set_for_frame t response_epoch in
+            if not (C_types.is_validator validator_set r.responder_addr) then begin
+              log_node t.config.my_addr
+                "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
+                is_v2
+                (String.sub
+                   r.responder_addr
+                   0
+                   (min 12 (String.length r.responder_addr)));
+              Lwt.return_unit
+            end else
             let records_root =
               if is_v2 then C_hash.catchup_records_root r.records
               else C_hash.catchup_records_root_v1_wire r.records in
@@ -2726,12 +2736,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               else
                 C_finality_query.Reject_response
             in
-            if not (C_types.is_validator validator_set r.responder_addr) then begin
-              log_node t.config.my_addr
-                "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
-                is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
-              Lwt.return_unit
-            end else if response_route = C_finality_query.Ignore_legacy_response then begin
+            if response_route = C_finality_query.Ignore_legacy_response then begin
               log_node t.config.my_addr
                 "event = ignore_catchup_range_response v2 = %b reason = legacy_signature from = %s"
                 is_v2
@@ -3401,6 +3406,13 @@ let finality_query_peer_ids validator_set ~epoch_id records =
   |> List.sort_uniq String.compare
   |> List.filteri (fun index _ -> index < limit)
 
+let close_finality_query_windows t =
+  Hashtbl.iter
+    (fun request_id _ ->
+      Hashtbl.remove t.catchup_query_windows request_id)
+    t.finality_query_requests;
+  Hashtbl.clear t.finality_query_requests
+
 let request_missing_finalize t ~epoch_id records =
   let open Lwt.Syntax in
   let* validator_set = validator_set_for_frame t epoch_id in
@@ -3411,7 +3423,7 @@ let request_missing_finalize t ~epoch_id records =
     let now = Mtime_clock.elapsed_ns () in
     match C_finality_query.plan ~now ~epoch:epoch_id t.finality_query with
     | C_finality_query.Wait
-    | C_finality_query.Exhausted -> Lwt.return_unit
+    | C_finality_query.Rest -> Lwt.return_unit
     | C_finality_query.Send next ->
       t.finality_query <- next;
       let attempts =
@@ -3419,10 +3431,7 @@ let request_missing_finalize t ~epoch_id records =
         | C_finality_query.Idle -> 0
         | C_finality_query.Sent sent -> sent.attempts
       in
-      Hashtbl.filter_map_inplace
-        (fun _ target ->
-          if target = epoch_id then Some target else None)
-        t.finality_query_requests;
+      close_finality_query_windows t;
       let request_id =
         Octra_net.Hash_domain.hash
           "octra:finality_query_request"
