@@ -13,6 +13,7 @@ type t = {
   ledger : Ledger.t;
   epoch_id : int;
   owner_migration_mode : Rule_graph.mode;
+  field_policy : P.field_policy;
   result_policy : Private_result_policy.t;
   limits : limits;
   preverify : Preverify_commit.t option;
@@ -36,12 +37,14 @@ let create
     ~ledger
     ~epoch_id
     ~owner_migration_mode
+    ~field_policy
     ~result_policy
     ~limits =
   {
     ledger;
     epoch_id;
     owner_migration_mode;
+    field_policy;
     result_policy;
     limits;
     preverify;
@@ -135,12 +138,20 @@ let encrypt t tx =
           | Error e -> Lwt.return_error e
           | Ok Verify_proof ->
             let* result =
-              P.encrypt_plan ~result_policy:t.result_policy t.ledger tx
+              P.encrypt_plan
+                ~field_policy:t.field_policy
+                ~result_policy:t.result_policy
+                t.ledger
+                tx
             in
             Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
           | Ok (Apply_receipt expected) ->
             let* result =
-              P.prepare_encrypt_plan ~result_policy:t.result_policy t.ledger tx
+              P.prepare_encrypt_plan
+                ~field_policy:t.field_policy
+                ~result_policy:t.result_policy
+                t.ledger
+                tx
             in
             begin
               match result with
@@ -186,12 +197,20 @@ let decrypt t tx =
           | Error e -> Lwt.return_error e
           | Ok Verify_proof ->
             let* result =
-              P.decrypt_plan ~result_policy:t.result_policy t.ledger tx
+              P.decrypt_plan
+                ~field_policy:t.field_policy
+                ~result_policy:t.result_policy
+                t.ledger
+                tx
             in
             Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
           | Ok (Apply_receipt expected) ->
             let* result =
-              P.prepare_decrypt_plan ~result_policy:t.result_policy t.ledger tx
+              P.prepare_decrypt_plan
+                ~field_policy:t.field_policy
+                ~result_policy:t.result_policy
+                t.ledger
+                tx
             in
             begin
               match result with
@@ -223,7 +242,9 @@ let key_switch t tx =
   let open Lwt.Syntax in
   match
     t.owner_migration_mode,
-    P.key_switch_requests_historical_owner_proof tx,
+    P.key_switch_requests_historical_owner_proof
+      ~field_policy:t.field_policy
+      tx,
     self tx,
     cap "fhe_epoch_cap" t.fhe t.limits.max_fhe
   with
@@ -235,7 +256,7 @@ let key_switch t tx =
   | _, _, _, Error e -> Lwt.return_error e
   | _, _, Ok (), Ok () ->
     let replay =
-      if P.key_switch_requests_legacy_audit tx then
+      if P.key_switch_requests_legacy_audit ~field_policy:t.field_policy tx then
         let cipher =
           match Ledger.find_opt t.ledger tx.T.from with
           | Some account ->
@@ -255,11 +276,17 @@ let key_switch t tx =
       | Error e -> Lwt.return_error e
       | Ok Verify_proof ->
         let* result =
-          P.key_switch_plan ?legacy_public_replay:replay t.ledger tx
+          P.key_switch_plan
+            ~field_policy:t.field_policy
+            ?legacy_public_replay:replay
+            t.ledger
+            tx
         in
         Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
       | Ok (Apply_receipt expected) ->
-        let* result = P.prepare_key_switch_plan t.ledger tx in
+        let* result =
+          P.prepare_key_switch_plan ~field_policy:t.field_policy t.ledger tx
+        in
         begin
           match result with
           | Error e -> Lwt.return_error (e.P.tag, e.reason)
@@ -294,7 +321,11 @@ let verified_stealth_plan t tx =
   | Error e -> Lwt.return_error e
   | Ok (Apply_receipt expected) ->
     let* result =
-      P.prepare_stealth_plan ~result_policy:t.result_policy t.ledger tx
+      P.prepare_stealth_plan
+        ~field_policy:t.field_policy
+        ~result_policy:t.result_policy
+        t.ledger
+        tx
     in
     begin
       match result with
@@ -308,7 +339,11 @@ let verified_stealth_plan t tx =
     end
   | Ok Verify_proof ->
     let* result =
-      P.stealth_plan ~result_policy:t.result_policy t.ledger tx
+      P.stealth_plan
+        ~field_policy:t.field_policy
+        ~result_policy:t.result_policy
+        t.ledger
+        tx
     in
     begin
       match result with
@@ -323,7 +358,13 @@ let verified_stealth_plan t tx =
               match P.stealth_accept_range range with
               | Error e -> Lwt.return_error (e.P.tag, e.reason)
               | Ok () ->
-                let* binding = P.stealth_binding t.ledger tx plan in
+                let* binding =
+                  P.stealth_binding
+                    ~field_policy:t.field_policy
+                    t.ledger
+                    tx
+                    plan
+                in
                 Lwt.return
                   (Result.map_error
                      (fun e -> e.P.tag, e.reason)
@@ -407,7 +448,9 @@ let verified_claim_plan t tx =
   match verification t tx with
   | Error e -> Lwt.return_error e
   | Ok (Apply_receipt expected) ->
-    let* claim = P.prepare_claim_plan t.ledger tx in
+    let* claim =
+      P.prepare_claim_plan ~field_policy:t.field_policy t.ledger tx
+    in
     begin
       match claim with
       | Error e -> Lwt.return_error (e.P.tag, e.reason)
@@ -429,7 +472,7 @@ let verified_claim_plan t tx =
         end
     end
   | Ok Verify_proof ->
-    let* claim = P.claim_plan t.ledger tx in
+    let* claim = P.claim_plan ~field_policy:t.field_policy t.ledger tx in
     begin
       match claim with
       | Error e -> Lwt.return_error (e.P.tag, e.reason)

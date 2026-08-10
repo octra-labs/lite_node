@@ -52,6 +52,16 @@ let node_backend
               | Error fault ->
                 Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
               | Ok owner_migration_mode ->
+                begin
+                  match
+                    Octra_core.Rule_graph.private_payload
+                      rules
+                      ~epoch:epoch_id
+                  with
+                  | Error fault ->
+                    Lwt.return_error
+                      (Octra_core.Rule_graph.fault_message fault)
+                  | Ok private_payload_mode ->
             Octra_core.State_preview.with_preview
               ~base_store:store
               ~base_ledger:ledger
@@ -65,6 +75,9 @@ let node_backend
                     ~ledger:backend.Octra_core.Epoch_exec.ledger
                     ~epoch_id
                     ~owner_migration_mode
+                    ~field_policy:
+                      (Octra_core.Private_ledger.field_policy_of_mode
+                         private_payload_mode)
                     ~result_policy:(private_result_policy epoch_id)
                     ~legacy_replay
                     ~limits:Octra_core.Private_transition.{
@@ -105,6 +118,7 @@ let node_backend
                   ~env
                   ~txs
                   ~process_tx)
+                end
             end
         end);
   }

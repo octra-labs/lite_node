@@ -196,18 +196,22 @@ let source_binding ledger pre_state_hash tx =
         transition_hash = None;
       }
 
-let verify_private result_policy ledger tx =
+let verify_private field_policy result_policy ledger tx =
   let open Lwt.Syntax in
-  let* result = Private_ledger.verify_private ~result_policy ledger tx in
+  let* result =
+    Private_ledger.verify_private ~field_policy ~result_policy ledger tx
+  in
   Lwt.return
     (Result.map_error
        (fun rejection -> rejection.Private_ledger.private_preverify_reason)
        result)
 
-let verify_key_switch ?legacy_replay ledger tx =
+let verify_key_switch field_policy ?legacy_replay ledger tx =
   let open Lwt.Syntax in
   let replay =
-    if Private_ledger.key_switch_requests_legacy_audit tx then
+    if
+      Private_ledger.key_switch_requests_legacy_audit ~field_policy tx
+    then
       match legacy_replay, sender_enc ledger tx.T.from with
       | Some lookup, Ok cipher ->
         Some (lookup ~address:tx.T.from ~cipher)
@@ -218,6 +222,7 @@ let verify_key_switch ?legacy_replay ledger tx =
   in
   let* plan =
     Private_ledger.key_switch_plan
+      ~field_policy
       ?legacy_public_replay:replay
       ledger
       tx
@@ -260,6 +265,7 @@ let prepared_operation verify prepared tx =
     end
 
 let run_heavy
+    ~field_policy
     ?ledger
     ?legacy_replay
     ?prepared
@@ -268,17 +274,24 @@ let run_heavy
   let open Lwt.Syntax in
   match tx.T.op_type, ledger with
   | T.KeySwitch, Some ledger ->
-    if Private_ledger.key_switch_requests_legacy_audit tx then
-      let* result = verify_key_switch ?legacy_replay ledger tx in
+    if
+      Private_ledger.key_switch_requests_legacy_audit ~field_policy tx
+    then
+      let* result =
+        verify_key_switch field_policy ?legacy_replay ledger tx
+      in
       Lwt.return
         (Result.fold
            ~ok:(fun value -> A.Ready value)
            ~error:(fun reason -> A.Invalid reason)
            result)
     else
-      prepared_operation (verify_key_switch ledger) prepared tx
+      prepared_operation (verify_key_switch field_policy ledger) prepared tx
   | (T.EncryptOp | T.DecryptOp | T.StealthOp | T.ClaimOp), Some ledger ->
-    prepared_operation (verify_private result_policy ledger) prepared tx
+    prepared_operation
+      (verify_private field_policy result_policy ledger)
+      prepared
+      tx
   | T.PrivateOp, _ -> Lwt.return (A.Invalid "private_disabled")
   | T.RecryptOp, _ -> Lwt.return (A.Invalid "recrypt_disabled")
   | T.CircleBalanceCellPut, _ ->
@@ -289,6 +302,7 @@ let run_heavy
   | _ -> Lwt.return (A.Invalid "lane_not_heavy")
 
 let run
+    ~field_policy
     ?ledger
     ?circle_preverify
     ?circle_cell_preverify
@@ -359,7 +373,15 @@ let run
         | _, _, _, None -> Lwt.return (Skip "state_binding_required")
       end
     else
-      let* v = run_heavy ?ledger ?legacy_replay ?prepared ~result_policy tx in
+      let* v =
+        run_heavy
+          ~field_policy
+          ?ledger
+          ?legacy_replay
+          ?prepared
+          ~result_policy
+          tx
+      in
       match v with
       | A.Unmanaged -> Lwt.return (Skip "preverify operation is unmanaged")
       | A.Pending -> Lwt.return (Defer "private_preverify_pending")
@@ -559,6 +581,7 @@ let checked_of_single_batch tx batch =
     Error "invalid_single_preverify_batch"
 
 let run_many
+    ~field_policy
     ?ledger
     ?circle_preverify
     ?circle_cell_preverify
@@ -580,6 +603,7 @@ let run_many
     else
       let* verdict =
         run
+          ~field_policy
           ?ledger
           ?circle_preverify
           ?circle_cell_preverify

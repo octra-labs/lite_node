@@ -48,6 +48,7 @@ type runtime = {
   circle_mode : Octra_core.Rule_graph.mode;
   wasm_compute_mode : Octra_core.Rule_graph.mode;
   owner_migration_mode : Octra_core.Rule_graph.mode;
+  private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :
     epoch:int ->
     address:string ->
@@ -166,6 +167,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
         ~ledger:(Lazy.force backend).Epoch_exec.ledger
         ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id
         ~owner_migration_mode:runtime.owner_migration_mode
+        ~field_policy:runtime.private_field_policy
         ~result_policy:
           (runtime.private_result_policy
              (Lazy.force env).Epoch_exec.epoch_id)
@@ -357,6 +359,16 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
+    let private_field_policy =
+      match
+        Octra_core.Rule_graph.private_payload
+          runtime.rules
+          ~epoch:(runtime.current_epoch ())
+      with
+      | Ok mode -> Octra_core.Private_ledger.field_policy_of_mode mode
+      | Error fault ->
+        failwith (Octra_core.Rule_graph.fault_message fault)
+    in
     let* () =
       run_runtime
         ?preverify
@@ -386,6 +398,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         circle_mode;
         wasm_compute_mode;
         owner_migration_mode;
+        private_field_policy;
         legacy_replay = runtime.legacy_replay;
         private_result_policy = runtime.private_result_policy;
         add_rejected_fee = (fun fee ->

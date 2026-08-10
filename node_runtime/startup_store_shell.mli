@@ -3,12 +3,26 @@
 
 type integrity_plan =
   | Fresh_store
-  | Integrity_ok of Octra_core.Store_irmin.integrity_result
-  | Recover_state_root of Octra_core.Store_irmin.integrity_result
-  | Integrity_fatal of Octra_core.Store_irmin.integrity_result
+  | Verify_store
+  | Restore_epoch of {
+      epoch : int;
+      root : string;
+    }
+  | Integrity_fatal of string
+
+type head_state =
+  | Head_missing
+  | Head_corrupt of string
+  | Head_ready of {
+      epoch : int;
+      root : string;
+    }
 
 type integrity_deps = {
-  is_fresh_store : unit -> bool;
+  head_state : unit -> head_state;
+  store_root : unit -> string option;
+  epoch_root : int -> string option;
+  rollback_epoch : int -> (unit, string) result;
   verify_integrity : unit -> Octra_core.Store_irmin.integrity_result;
   save_state_root : unit -> unit;
   exit_fatal : unit -> unit;
@@ -30,8 +44,9 @@ type epoch_tag_deps = {
 }
 
 val integrity_plan :
-  is_fresh_store:bool ->
-  Octra_core.Store_irmin.integrity_result option ->
+  head_state:head_state ->
+  store_root:string option ->
+  epoch_root:string option ->
   integrity_plan
 
 val epoch_tag_plan :

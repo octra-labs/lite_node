@@ -18,6 +18,7 @@ val create :
   ledger:Ledger.t ->
   epoch_id:int ->
   owner_migration_mode:Rule_graph.mode ->
+  field_policy:Private_ledger.field_policy ->
   result_policy:Private_result_policy.t ->
   limits:limits ->
   t

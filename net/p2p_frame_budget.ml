@@ -106,12 +106,23 @@ let peer_class (state : t) =
 let lane msg_type =
   if msg_type = P2p_frame.msg_tx_gossip then Tx
   else if msg_type = P2p_frame.msg_cons_propose
-       || msg_type = P2p_frame.msg_cons_finalize then Consensus
-  else if msg_type = P2p_frame.msg_bundle_response
+       || msg_type = P2p_frame.msg_cons_vote
+       || msg_type = P2p_frame.msg_cons_finalize
+       || msg_type = P2p_frame.msg_cons_timeout
+       || msg_type = P2p_frame.msg_cons_round_sync
+       || msg_type = P2p_frame.msg_query_epoch_root
+       || msg_type = P2p_frame.msg_epoch_root_response
+       || msg_type = P2p_frame.msg_vote_evidence then Consensus
+  else if msg_type = P2p_frame.msg_proofcert_gossip
+       || msg_type = P2p_frame.msg_query_bundle
+       || msg_type = P2p_frame.msg_bundle_response
+       || msg_type = P2p_frame.msg_query_catchup_range
        || msg_type = P2p_frame.msg_catchup_range_response
+       || msg_type = P2p_frame.msg_query_catchup_range_v2
        || msg_type = P2p_frame.msg_catchup_range_response_v2
        || msg_type = P2p_frame.msg_epoch_broadcast then Artifact
   else if msg_type = P2p_frame.msg_peers
+       || msg_type = P2p_frame.msg_resource_attestation
        || msg_type = P2p_frame.msg_resource_compute then Data
   else Control
 

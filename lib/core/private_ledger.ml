@@ -21,6 +21,18 @@ type failure = {
   user_reason : string;
 }
 
+type field_policy =
+  | First_field
+  | Unique_fields
+
+let field_policy_of_mode = function
+  | Rule_graph.Prior -> First_field
+  | Rule_graph.Active -> Unique_fields
+
+let field_policy_key = function
+  | First_field -> "first"
+  | Unique_fields -> "unique"
+
 type balance_plan = {
   current_cipher : string;
   next_cipher : string;
@@ -37,6 +49,7 @@ type key_switch_plan = {
 type key_switch_source = {
   source_cipher : string;
   source_key_hash : string;
+  source_fields : field_policy;
 }
 
 type key_switch_snapshot = {
@@ -47,6 +60,7 @@ type key_switch_snapshot = {
 type key_switch_artifact =
   | Verified_key_switch of {
       artifact_tx_hash : string;
+      artifact_fields : field_policy;
       artifact_plan : key_switch_plan;
     }
   | Rejected_key_switch of {
@@ -78,6 +92,7 @@ type private_source = {
   source_key_hash : string option;
   source_claim : private_claim;
   source_policy : Private_result_policy.t;
+  source_fields : field_policy;
   source_verifier : string;
 }
 
@@ -86,10 +101,10 @@ let key_switch_cache_cap = 32
 let key_switch_cache : (string, key_switch_plan) Hashtbl.t =
   Hashtbl.create key_switch_cache_cap
 
-let key_switch_cache_key ledger tx =
+let key_switch_cache_key field_policy ledger tx =
   let open Lwt.Syntax in
   let* root = Ledger.hash ledger in
-  Lwt.return (T.hash tx ^ ":" ^ root)
+  Lwt.return (T.hash tx ^ ":" ^ root ^ ":" ^ field_policy_key field_policy)
 
 let remember_key_switch_plan key plan =
   if
@@ -220,47 +235,52 @@ let key_switch_migration_of_name = function
   | "historical_owner_proof" -> Ok Historical_owner_proof
   | value -> Error ("unknown key_switch migration_mode = " ^ value)
 
-let json_member json name =
+let json_member field_policy json name =
   match json with
   | `Assoc fields ->
     begin
-      match
-        List.filter_map
-          (fun (field_name, value) ->
-            if String.equal field_name name then Some value else None)
-          fields
-      with
-      | [] -> Ok None
-      | [value] -> Ok (Some value)
-      | _ -> Error ("duplicate " ^ name)
+      match field_policy with
+      | First_field -> Ok (List.assoc_opt name fields)
+      | Unique_fields ->
+        begin
+          match
+            List.filter_map
+              (fun (field_name, value) ->
+                if String.equal field_name name then Some value else None)
+              fields
+          with
+          | [] -> Ok None
+          | [value] -> Ok (Some value)
+          | _ -> Error ("duplicate " ^ name)
+        end
     end
   | _ -> Error "encrypted_data must be a JSON object"
 
-let required_string_field json name =
-  match json_member json name with
+let required_string_field field_policy json name =
+  match json_member field_policy json name with
   | Ok (Some (`String value)) -> Ok value
   | Ok None
   | Ok (Some `Null) -> Error ("missing " ^ name)
   | Ok (Some _) -> Error (name ^ " must be a string")
   | Error reason -> Error reason
 
-let optional_string_field json name =
-  match json_member json name with
+let optional_string_field field_policy json name =
+  match json_member field_policy json name with
   | Ok None
   | Ok (Some `Null) -> Ok None
   | Ok (Some (`String value)) -> Ok (Some value)
   | Ok (Some _) -> Error (name ^ " must be a string")
   | Error reason -> Error reason
 
-let optional_bool_field json name =
-  match json_member json name with
+let optional_bool_field field_policy json name =
+  match json_member field_policy json name with
   | Ok None
   | Ok (Some `Null) -> Ok None
   | Ok (Some (`Bool value)) -> Ok (Some value)
   | Ok (Some _) -> Error (name ^ " must be a boolean")
   | Error reason -> Error reason
 
-let compatibility_migration json =
+let compatibility_migration field_policy json =
   let legacy_fields = [
     "legacy_ct_migration", Rejected_rebinding;
     "legacy_public_migration", Public_history;
@@ -271,7 +291,7 @@ let compatibility_migration json =
     | [] -> Ok (List.rev requested)
     | (name, migration) :: rest ->
       begin
-        match optional_bool_field json name with
+        match optional_bool_field field_policy json name with
         | Error reason -> Error reason
         | Ok (Some true) -> collect (migration :: requested) rest
         | Ok (Some false)
@@ -284,12 +304,12 @@ let compatibility_migration json =
   | Ok [migration] -> Ok migration
   | Ok _ -> Error "key_switch migration modes are mutually exclusive"
 
-let parse_key_switch_migration json =
-  match optional_string_field json "migration_mode" with
+let parse_key_switch_migration field_policy json =
+  match optional_string_field field_policy json "migration_mode" with
   | Error reason -> Error reason
   | Ok requested ->
     begin
-      match requested, compatibility_migration json with
+      match requested, compatibility_migration field_policy json with
       | _, Error reason -> Error reason
       | None, Ok migration -> Ok migration
       | Some name, Ok Standard -> key_switch_migration_of_name name
@@ -434,14 +454,14 @@ let safe_json raw =
     try Ok (Yojson.Safe.from_string s)
     with _ -> Error "parse"
 
-let parse_encrypt raw =
+let parse_encrypt field_policy raw =
   match json_payload "encrypt" raw with
   | Error e -> Error e
   | Ok json ->
-    match field json "cipher",
-      field json "amount_commitment",
-      field json "zero_proof",
-      field json "blinding" with
+    match field field_policy json "cipher",
+      field field_policy json "amount_commitment",
+      field field_policy json "zero_proof",
+      field field_policy json "blinding" with
     | Ok cipher, Ok amount_commitment, Ok zero_proof, Ok blinding ->
       Ok { cipher; amount_commitment; zero_proof; blinding }
     | Error e, _, _, _
@@ -452,17 +472,17 @@ let parse_encrypt raw =
         ("encrypt: cannot parse encrypted_data: " ^ e)
         ~user_reason:"encrypt: malformed encrypted_data"
 
-let parse_decrypt raw =
+let parse_decrypt field_policy raw =
   match json_payload "decrypt" raw with
   | Error e -> Error e
   | Ok json ->
-    match field json "cipher",
-      field json "amount_commitment",
-      field json "zero_proof",
-      field json "blinding" with
+    match field field_policy json "cipher",
+      field field_policy json "amount_commitment",
+      field field_policy json "zero_proof",
+      field field_policy json "blinding" with
     | Ok cipher, Ok amount_commitment, Ok zero_proof, Ok blinding ->
       begin
-        match optional_string_field json "range_proof_balance" with
+        match optional_string_field field_policy json "range_proof_balance" with
         | Ok range_proof_balance ->
           Ok { cipher; amount_commitment; zero_proof; blinding; range_proof_balance }
         | Error e ->
@@ -478,26 +498,26 @@ let parse_decrypt raw =
         ("decrypt: cannot parse encrypted_data: " ^ e)
         ~user_reason:"decrypt: malformed encrypted_data"
 
-let parse_key_switch raw =
+let parse_key_switch field_policy raw =
   match json_payload "key_switch" raw with
   | Error e ->
     error "key_switch_rejected" e.reason ~user_reason:"encrypted_data must be JSON with new_pubkey and aes_kat"
   | Ok json ->
     let ( let* ) value next = Result.bind value next in
     let decoded =
-      let* new_pubkey_b64 = required_string_field json "new_pubkey" in
-      let* aes_kat = required_string_field json "aes_kat" in
-      let* migration = parse_key_switch_migration json in
+      let* new_pubkey_b64 = required_string_field field_policy json "new_pubkey" in
+      let* aes_kat = required_string_field field_policy json "aes_kat" in
+      let* migration = parse_key_switch_migration field_policy json in
       let* old_bound_pubkey_b64 =
-        optional_string_field json "old_bound_pubkey"
+        optional_string_field field_policy json "old_bound_pubkey"
       in
-      let* old_bound_cipher = optional_string_field json "old_bound_cipher" in
-      let* source_cipher_hash = optional_string_field json "source_cipher_hash" in
-      let* new_cipher = optional_string_field json "new_cipher" in
-      let* old_zero_proof = optional_string_field json "old_zero_proof" in
-      let* new_zero_proof = optional_string_field json "new_zero_proof" in
-      let* amount_commitment = optional_string_field json "amount_commitment" in
-      let* amount_blinding = optional_string_field json "amount_blinding" in
+      let* old_bound_cipher = optional_string_field field_policy json "old_bound_cipher" in
+      let* source_cipher_hash = optional_string_field field_policy json "source_cipher_hash" in
+      let* new_cipher = optional_string_field field_policy json "new_cipher" in
+      let* old_zero_proof = optional_string_field field_policy json "old_zero_proof" in
+      let* new_zero_proof = optional_string_field field_policy json "new_zero_proof" in
+      let* amount_commitment = optional_string_field field_policy json "amount_commitment" in
+      let* amount_blinding = optional_string_field field_policy json "amount_blinding" in
       Ok {
         new_pubkey_b64;
         aes_kat;
@@ -520,18 +540,24 @@ let parse_key_switch raw =
           ~user_reason:"encrypted_data must be JSON with new_pubkey and aes_kat"
     end
 
-let key_switch_requests_legacy_public_migration tx =
-  match parse_key_switch tx.T.encrypted_data with
+let key_switch_requests_legacy_public_migration
+    ?(field_policy = Unique_fields)
+    tx =
+  match parse_key_switch field_policy tx.T.encrypted_data with
   | Ok payload -> payload.migration = Public_history
   | Error _ -> false
 
-let key_switch_requests_historical_owner_proof tx =
-  match parse_key_switch tx.T.encrypted_data with
+let key_switch_requests_historical_owner_proof
+    ?(field_policy = Unique_fields)
+    tx =
+  match parse_key_switch field_policy tx.T.encrypted_data with
   | Ok payload -> payload.migration = Historical_owner_proof
   | Error _ -> false
 
-let key_switch_requests_legacy_audit tx =
-  match parse_key_switch tx.T.encrypted_data with
+let key_switch_requests_legacy_audit
+    ?(field_policy = Unique_fields)
+    tx =
+  match parse_key_switch field_policy tx.T.encrypted_data with
   | Ok payload ->
     begin
       match payload.migration with
@@ -544,21 +570,21 @@ let key_switch_requests_legacy_audit tx =
     end
   | Error _ -> false
 
-let version json =
-  match json_member json "version" with
+let version field_policy json =
+  match json_member field_policy json "version" with
   | Ok (Some (`Int value)) -> Ok value
   | Ok None
   | Ok (Some `Null) -> Ok 0
   | Ok (Some _) -> Error "version must be an integer"
   | Error reason -> Error reason
 
-let parse_stealth raw =
+let parse_stealth field_policy raw =
   match safe_json raw with
   | Error "missing" -> error "missing_encrypted_data" "encrypted_data required for stealth transfer"
   | Error _ -> error "version_rejected" "only version 5 stealth transfers are accepted"
   | Ok json ->
     begin
-      match version json with
+      match version field_policy json with
       | Error _ ->
         error "version_rejected" "only version 5 stealth transfers are accepted"
       | Ok value when value <> 5 ->
@@ -573,13 +599,13 @@ let parse_stealth raw =
             Ok ptd
     end
 
-let parse_claim raw =
+let parse_claim field_policy raw =
   match safe_json raw with
   | Error "missing" -> error "missing_encrypted_data" "encrypted_data required for claim"
   | Error _ -> error "version_rejected" "only version 5 (private) claim operations are accepted"
   | Ok json ->
     begin
-      match version json with
+      match version field_policy json with
       | Error _ ->
         error "version_rejected" "only version 5 (private) claim operations are accepted"
       | Ok value when value <> 5 ->
@@ -609,12 +635,12 @@ let private_account ledger address =
     |> digest
     |> fun encrypted_hash -> Private_account encrypted_hash
 
-let private_claim_source ledger tx =
+let private_claim_source field_policy ledger tx =
   let open Lwt.Syntax in
   match tx.T.op_type with
   | T.ClaimOp ->
     begin
-      match parse_claim tx.T.encrypted_data with
+      match parse_claim field_policy tx.T.encrypted_data with
       | Error _ -> Lwt.return Private_claim_invalid
       | Ok claim ->
         let output_id = claim.SC.output_id in
@@ -633,7 +659,7 @@ let private_claim_source ledger tx =
     end
   | _ -> Lwt.return Private_claim_none
 
-let private_source ~result_policy ledger tx =
+let private_source ~field_policy ~result_policy ledger tx =
   let open Lwt.Syntax in
   match private_op tx with
   | None ->
@@ -645,7 +671,7 @@ let private_source ~result_policy ledger tx =
     let source_account = private_account ledger tx.T.from in
     let* source_key = Ledger.get_pvac_pubkey ledger tx.T.from in
     let source_key_hash = Option.map PR.key_hash source_key in
-    let* source_claim = private_claim_source ledger tx in
+    let* source_claim = private_claim_source field_policy ledger tx in
     Lwt.return_ok {
       source_tx_hash = T.hash tx;
       source_op;
@@ -653,6 +679,7 @@ let private_source ~result_policy ledger tx =
       source_key_hash;
       source_claim;
       source_policy = result_policy;
+      source_fields = field_policy;
       source_verifier = private_verifier;
     }
 
@@ -663,6 +690,7 @@ let private_source_equal left right =
   && left.source_key_hash = right.source_key_hash
   && left.source_claim = right.source_claim
   && left.source_policy = right.source_policy
+  && left.source_fields = right.source_fields
   && String.equal left.source_verifier right.source_verifier
 
 let kat_state ledger addr =
@@ -791,11 +819,12 @@ let verify_encrypt
     end
 
 let prepare_encrypt_plan
+    ?(field_policy = Unique_fields)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  match parse_encrypt tx.T.encrypted_data with
+  match parse_encrypt field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok payload ->
     let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "encrypt" in
@@ -810,12 +839,13 @@ let prepare_encrypt_plan
         | Ok () -> encrypt_balance_plan result_policy blob current payload
 
 let encrypt_plan
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  match parse_encrypt tx.T.encrypted_data with
+  match parse_encrypt field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok payload ->
     let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "encrypt" in
@@ -943,6 +973,7 @@ let verify_decrypt
     end
 
 let prepare_decrypt_plan
+    ?(field_policy = Unique_fields)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -954,7 +985,7 @@ let prepare_decrypt_plan
     Lwt.return
       (error "invalid_amount" "decrypt amount must be positive")
   else
-    match parse_decrypt tx.T.encrypted_data with
+    match parse_decrypt field_policy tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok payload ->
       let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "decrypt" in
@@ -969,6 +1000,7 @@ let prepare_decrypt_plan
           | Ok () -> decrypt_balance_plan result_policy blob current payload
 
 let decrypt_plan
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -981,7 +1013,7 @@ let decrypt_plan
     Lwt.return
       (error "invalid_amount" "decrypt amount must be positive")
   else
-    match parse_decrypt tx.T.encrypted_data with
+    match parse_decrypt field_policy tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok payload ->
       let* blob_result = load_pk_blob ledger tx.T.from "bad_zero_proof" "decrypt" in
@@ -1018,11 +1050,12 @@ let apply_encrypt_plan ledger tx plan =
         | Error e -> failwith (Printf.sprintf "encrypt update_enc_balance: %s" e))
 
 let apply_encrypt
+    ?(field_policy = Unique_fields)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = encrypt_plan ~result_policy ledger tx in
+  let* plan = encrypt_plan ~field_policy ~result_policy ledger tx in
   match plan with
   | Error e -> Lwt.return (Error e)
   | Ok plan -> apply_encrypt_plan ledger tx plan
@@ -1042,11 +1075,12 @@ let apply_decrypt_plan ledger tx plan =
           | Error e -> failwith (Printf.sprintf "decrypt update_enc_balance: %s" e))
 
 let apply_decrypt
+    ?(field_policy = Unique_fields)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = decrypt_plan ~result_policy ledger tx in
+  let* plan = decrypt_plan ~field_policy ~result_policy ledger tx in
   match plan with
   | Error e -> Lwt.return (Error e)
   | Ok plan -> apply_decrypt_plan ledger tx plan
@@ -1351,13 +1385,14 @@ let verify_historical_owner
     end
 
 let verify_key_switch_plan
+    ?(field_policy = Unique_fields)
     ?legacy_public_replay
     ?snapshot
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx =
   let open Lwt.Syntax in
-  match parse_key_switch tx.T.encrypted_data with
+  match parse_key_switch field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok payload ->
     if payload.aes_kat <> PR.expected_kat () then
@@ -1566,9 +1601,9 @@ let verify_key_switch_plan
                       "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"))
     end
 
-let prepare_key_switch_plan_uncached ledger tx =
+let prepare_key_switch_plan_uncached field_policy ledger tx =
   let open Lwt.Syntax in
-  match parse_key_switch tx.T.encrypted_data with
+  match parse_key_switch field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok payload when payload.aes_kat <> PR.expected_kat () ->
     Lwt.return
@@ -1656,33 +1691,48 @@ let prepare_key_switch_plan_uncached ledger tx =
                prepared)
     end
 
-let prepare_key_switch_plan ledger tx =
+let prepare_key_switch_plan
+    ?(field_policy = Unique_fields)
+    ledger
+    tx =
   let open Lwt.Syntax in
-  if key_switch_requests_legacy_audit tx then
-    prepare_key_switch_plan_uncached ledger tx
+  if key_switch_requests_legacy_audit ~field_policy tx then
+    prepare_key_switch_plan_uncached field_policy ledger tx
   else
-    let* key = key_switch_cache_key ledger tx in
+    let* key = key_switch_cache_key field_policy ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some plan -> Lwt.return_ok plan
-    | None -> prepare_key_switch_plan_uncached ledger tx
+    | None -> prepare_key_switch_plan_uncached field_policy ledger tx
 
-let key_switch_plan ?legacy_public_replay ledger tx =
+let key_switch_plan
+    ?(field_policy = Unique_fields)
+    ?legacy_public_replay
+    ledger
+    tx =
   let open Lwt.Syntax in
-  let* result = verify_key_switch_plan ?legacy_public_replay ledger tx in
+  let* result =
+    verify_key_switch_plan
+      ~field_policy
+      ?legacy_public_replay
+      ledger
+      tx
+  in
   match result with
   | Error _ -> Lwt.return result
-  | Ok _ when key_switch_requests_legacy_audit tx -> Lwt.return result
+  | Ok _ when key_switch_requests_legacy_audit ~field_policy tx ->
+    Lwt.return result
   | Ok plan ->
-    let* key = key_switch_cache_key ledger tx in
+    let* key = key_switch_cache_key field_policy ledger tx in
     remember_key_switch_plan key plan;
     Lwt.return result
 
 let preverify_key_switch_artifact
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Speculative)
     ledger
     tx =
   let open Lwt.Syntax in
-  if key_switch_requests_legacy_audit tx then
+  if key_switch_requests_legacy_audit ~field_policy tx then
     Lwt.return
       (error
          "key_switch_artifact_rejected"
@@ -1695,16 +1745,26 @@ let preverify_key_switch_artifact
       let artifact_source = {
         source_cipher = snapshot.snapshot_cipher;
         source_key_hash = key_hash_of_pubkey snapshot.snapshot_pubkey;
+        source_fields = field_policy;
       } in
       let artifact_tx_hash = T.hash tx in
       let* result =
-        verify_key_switch_plan ~snapshot ~worker_priority ledger tx
+        verify_key_switch_plan
+          ~field_policy
+          ~snapshot
+          ~worker_priority
+          ledger
+          tx
       in
       begin
         match result with
         | Ok artifact_plan ->
           Lwt.return_ok
-            (Verified_key_switch { artifact_tx_hash; artifact_plan })
+            (Verified_key_switch {
+               artifact_tx_hash;
+               artifact_fields = field_policy;
+               artifact_plan;
+             })
         | Error artifact_failure when
             key_switch_failure_retryable artifact_failure ->
           Lwt.return_error artifact_failure
@@ -1717,7 +1777,11 @@ let preverify_key_switch_artifact
              })
       end
 
-let bind_key_switch_artifact ledger tx artifact =
+let bind_key_switch_artifact
+    ?(field_policy = Unique_fields)
+    ledger
+    tx
+    artifact =
   let open Lwt.Syntax in
   let artifact_tx_hash =
     match artifact with
@@ -1743,10 +1807,11 @@ let bind_key_switch_artifact ledger tx artifact =
         | Verified_key_switch verified ->
           let plan = verified.artifact_plan in
           if
-            String.equal current_cipher plan.source_cipher
+            verified.artifact_fields = field_policy
+            && String.equal current_cipher plan.source_cipher
             && String.equal current_key_hash plan.old_key_hash
           then begin
-            let* cache_key = key_switch_cache_key ledger tx in
+            let* cache_key = key_switch_cache_key field_policy ledger tx in
             remember_key_switch_plan cache_key plan;
             Lwt.return (Key_switch_bound (Prepared_key_switch plan))
           end
@@ -1754,7 +1819,8 @@ let bind_key_switch_artifact ledger tx artifact =
             Lwt.return Key_switch_source_changed
         | Rejected_key_switch rejected ->
           if
-            String.equal current_cipher rejected.artifact_source.source_cipher
+            rejected.artifact_source.source_fields = field_policy
+            && String.equal current_cipher rejected.artifact_source.source_cipher
             && String.equal
                  current_key_hash
                  rejected.artifact_source.source_key_hash
@@ -1765,15 +1831,19 @@ let bind_key_switch_artifact ledger tx artifact =
             Lwt.return Key_switch_source_changed
       end
 
-let key_switch_plan_for_apply ?legacy_public_replay ledger tx =
+let key_switch_plan_for_apply
+    ?(field_policy = Unique_fields)
+    ?legacy_public_replay
+    ledger
+    tx =
   let open Lwt.Syntax in
-  if key_switch_requests_legacy_audit tx then
-    key_switch_plan ?legacy_public_replay ledger tx
+  if key_switch_requests_legacy_audit ~field_policy tx then
+    key_switch_plan ~field_policy ?legacy_public_replay ledger tx
   else
-    let* key = key_switch_cache_key ledger tx in
+    let* key = key_switch_cache_key field_policy ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some plan -> Lwt.return_ok plan
-    | None -> key_switch_plan ?legacy_public_replay ledger tx
+    | None -> key_switch_plan ~field_policy ?legacy_public_replay ledger tx
 
 let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
   let open Lwt.Syntax in
@@ -1810,21 +1880,32 @@ let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
             migrated_cipher;
           })
 
-let apply_key_switch ?legacy_public_replay ledger tx =
+let apply_key_switch
+    ?(field_policy = Unique_fields)
+    ?legacy_public_replay
+    ledger
+    tx =
   let open Lwt.Syntax in
-  let* plan = key_switch_plan_for_apply ?legacy_public_replay ledger tx in
+  let* plan =
+    key_switch_plan_for_apply
+      ~field_policy
+      ?legacy_public_replay
+      ledger
+      tx
+  in
   match plan with
   | Error failure ->
     Lwt.return (Key_switch_rejected { failure; consume_nonce = false })
   | Ok plan -> apply_key_switch_plan ledger tx plan
 
 let prepare_stealth_plan
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  match parse_stealth tx.T.encrypted_data with
+  match parse_stealth field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok ptd ->
     let* blob_result =
@@ -1877,18 +1958,24 @@ let prepare_stealth_plan
                   }))
 
 let stealth_plan
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
   let* plan =
-    prepare_stealth_plan ~worker_priority ~result_policy ledger tx
+    prepare_stealth_plan
+      ~field_policy
+      ~worker_priority
+      ~result_policy
+      ledger
+      tx
   in
   match plan with
   | Error _ as result -> Lwt.return result
   | Ok plan ->
-    match parse_stealth tx.T.encrypted_data with
+    match parse_stealth field_policy tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok ptd ->
       let* blob_result =
@@ -1980,12 +2067,13 @@ let stealth_accept_range range =
     Ok ()
 
 let stealth_binding
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx
     plan =
   let open Lwt.Syntax in
-  match parse_stealth tx.T.encrypted_data with
+  match parse_stealth field_policy tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok ptd ->
       if String.length ptd.PT.send_zero_proof = 0 then
@@ -2025,12 +2113,15 @@ let stealth_binding
                    worker_failure)
           end
 
-let prepare_claim_plan ledger tx =
+let prepare_claim_plan
+    ?(field_policy = Unique_fields)
+    ledger
+    tx =
   let open Lwt.Syntax in
   if not (String.equal tx.T.from tx.T.to_) then
     Lwt.return (error "claim_not_self" "claim operation must target sender (from == to)")
   else
-    match parse_claim tx.T.encrypted_data with
+    match parse_claim field_policy tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok claim ->
       let* so_opt = Ledger.get_stealth_output_by_id ledger claim.SC.output_id in
@@ -2053,15 +2144,16 @@ let prepare_claim_plan ledger tx =
           }
 
 let claim_plan
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = prepare_claim_plan ledger tx in
+  let* plan = prepare_claim_plan ~field_policy ledger tx in
   match plan with
   | Error _ as result -> Lwt.return result
   | Ok plan ->
-    match parse_claim tx.T.encrypted_data with
+    match parse_claim field_policy tx.T.encrypted_data with
     | Error e -> Lwt.return (Error e)
     | Ok claim ->
       let* so_opt = Ledger.get_stealth_output_by_id ledger claim.SC.output_id in
@@ -2168,6 +2260,7 @@ let claim_balance_plan
                 Ok { current_cipher = current; next_cipher }))
 
 let verify_private
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -2176,7 +2269,7 @@ let verify_private
   match tx.T.op_type with
   | T.EncryptOp ->
     let* result =
-      encrypt_plan ~worker_priority ~result_policy ledger tx
+      encrypt_plan ~field_policy ~worker_priority ~result_policy ledger tx
     in
     Lwt.return
       (result
@@ -2184,7 +2277,7 @@ let verify_private
        |> Result.map_error private_reject)
   | T.DecryptOp ->
     let* result =
-      decrypt_plan ~worker_priority ~result_policy ledger tx
+      decrypt_plan ~field_policy ~worker_priority ~result_policy ledger tx
     in
     Lwt.return
       (result
@@ -2192,7 +2285,7 @@ let verify_private
        |> Result.map_error private_reject)
   | T.StealthOp ->
     let* plan =
-      stealth_plan ~worker_priority ~result_policy ledger tx
+      stealth_plan ~field_policy ~worker_priority ~result_policy ledger tx
     in
     begin
       match plan with
@@ -2210,7 +2303,7 @@ let verify_private
               | Error failure -> Lwt.return_error (private_reject failure)
               | Ok () ->
                 let* binding =
-                  stealth_binding ~worker_priority ledger tx plan
+                  stealth_binding ~field_policy ~worker_priority ledger tx plan
                 in
                 Lwt.return
                   (binding
@@ -2220,7 +2313,7 @@ let verify_private
         end
     end
   | T.ClaimOp ->
-    let* claim = claim_plan ~worker_priority ledger tx in
+    let* claim = claim_plan ~field_policy ~worker_priority ledger tx in
     begin
       match claim with
       | Error failure ->
@@ -2249,17 +2342,23 @@ let verify_private
     Lwt.return_error (private_reject private_error)
 
 let preverify_private_artifact
+    ?(field_policy = Unique_fields)
     ?(worker_priority = Compute_pool.Speculative)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* source = private_source ~result_policy ledger tx in
+  let* source = private_source ~field_policy ~result_policy ledger tx in
   match source with
   | Error failure -> Lwt.return_error failure
   | Ok private_source ->
     let* result =
-      verify_private ~worker_priority ~result_policy ledger tx
+      verify_private
+        ~field_policy
+        ~worker_priority
+        ~result_policy
+        ledger
+        tx
     in
     begin
       match result with
@@ -2275,6 +2374,7 @@ let preverify_private_artifact
     end
 
 let bind_private_artifact
+    ?(field_policy = Unique_fields)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx
@@ -2285,7 +2385,7 @@ let bind_private_artifact
     | Verified_private verified -> verified.private_source
     | Rejected_private rejected -> rejected.private_source
   in
-  let* current = private_source ~result_policy ledger tx in
+  let* current = private_source ~field_policy ~result_policy ledger tx in
   match current with
   | Error private_error ->
     Lwt.return

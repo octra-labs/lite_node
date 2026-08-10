@@ -1681,7 +1681,10 @@ let verify_integrity t =
     Lwt.return { ok = false; head_hash = ""; accounts_sampled = 0;
                  accounts_ok = 0; errors = ["no head commit — store empty or corrupted"] }
   | Some commit ->
-    let head_hash = Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit) in
+    let head_hash =
+      Irmin.Type.to_string Store.Hash.t
+        (Store.Tree.hash (Store.Commit.tree commit))
+    in
     let* tree_exists = read_tree t ["accounts"] in
     (if tree_exists = None then err "accounts subtree missing");
     let sampled = ref 0 in

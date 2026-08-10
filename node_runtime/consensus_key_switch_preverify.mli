@@ -4,6 +4,7 @@
 type t
 
 val create :
+  field_policy:(unit -> Octra_core.Private_ledger.field_policy) ->
   Octra_core.Ledger.t ->
   t
 

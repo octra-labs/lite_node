@@ -8,22 +8,27 @@ module Transaction = Octra_core.Transaction
 type t =
   (Private_ledger.key_switch_artifact, Private_ledger.prepared) Pool.t
 
-let eligible tx =
+let eligible_with field_policy tx =
   tx.Transaction.op_type = Transaction.KeySwitch
-  && not (Private_ledger.key_switch_requests_legacy_audit tx)
+  && not
+       (Private_ledger.key_switch_requests_legacy_audit
+          ~field_policy
+          tx)
 
-let create ledger =
+let create ~field_policy ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
       (Octra_core.Resource_lanes.preverify_queue_limit
          Octra_core.Resource_lanes.Fhe)
     {
-      eligible;
+      eligible = (fun tx -> eligible_with (field_policy ()) tx);
       verify = (fun priority tx ->
         let open Lwt.Syntax in
+        let fields = field_policy () in
         let* result =
           Private_ledger.preverify_key_switch_artifact
+            ~field_policy:fields
             ~worker_priority:priority
             ledger
             tx
@@ -34,7 +39,11 @@ let create ledger =
             Lwt.return_error failure.Private_ledger.reason
           | Ok artifact ->
             let* binding =
-              Private_ledger.bind_key_switch_artifact ledger tx artifact
+              Private_ledger.bind_key_switch_artifact
+                ~field_policy:(field_policy ())
+                ledger
+                tx
+                artifact
             in
             Lwt.return_ok
               (match binding with
@@ -49,7 +58,11 @@ let create ledger =
       bind = (fun tx artifact ->
         let open Lwt.Syntax in
         let* binding =
-          Private_ledger.bind_key_switch_artifact ledger tx artifact
+          Private_ledger.bind_key_switch_artifact
+            ~field_policy:(field_policy ())
+            ledger
+            tx
+            artifact
         in
         Lwt.return
           (match binding with

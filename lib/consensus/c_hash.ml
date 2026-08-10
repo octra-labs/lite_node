@@ -151,6 +151,47 @@ let catchup_range_response_sign_bytes
     Octra_net.Oce1.put_u64 buf from_epoch;
     Octra_net.Oce1.put_hash32 buf records_root)
 
+let catchup_complete_tag = "OCRFULL2"
+
+let mark_complete_catchup_request request_id =
+  if String.length request_id <> 32 then
+    invalid_arg "catchup request id must be 32 bytes"
+  else
+    catchup_complete_tag
+    ^ String.sub
+        request_id
+        (String.length catchup_complete_tag)
+        (32 - String.length catchup_complete_tag)
+
+let catchup_request_is_complete request_id =
+  String.length request_id = 32
+  && String.sub request_id 0 (String.length catchup_complete_tag)
+     = catchup_complete_tag
+
+let catchup_range_response_complete_sign_bytes
+    ~from_epoch
+    (response : C_codec.catchup_range_response) =
+  Octra_net.Hash_domain.hash_encoded
+    "octra:catchup_range_response:complete"
+    (fun buf ->
+      Octra_net.Oce1.put_string buf response.chain_id;
+      Octra_net.Oce1.put_hash32 buf response.request_id;
+      Octra_net.Oce1.put_addr buf response.responder_addr;
+      Octra_net.Oce1.put_u64 buf from_epoch;
+      Octra_net.Oce1.put_string buf response.status;
+      Octra_net.Oce1.put_option
+        Octra_net.Oce1.put_string
+        buf
+        response.error_code;
+      Octra_net.Oce1.put_list
+        C_codec.encode_catchup_epoch_record_v2
+        buf
+        response.records;
+      Octra_net.Oce1.put_option
+        Octra_net.Oce1.put_u64
+        buf
+        response.next_epoch)
+
 let catchup_records_root (records : C_codec.catchup_epoch_record list) =
   Octra_net.Hash_domain.hash_encoded "octra:catchup_records_root:v5" (fun buf ->
     Octra_net.Oce1.put_list (fun b r ->

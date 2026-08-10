@@ -12,6 +12,7 @@ module Store_irmin = Octra_core.Store_irmin
 module Tx_drop = Octra_core.Tx_drop
 module Pvac_migration_entitlement = Octra_core.Pvac_migration_entitlement
 module Pvac_verify_worker = Octra_core.Pvac_verify_worker
+module Private_ledger = Octra_core.Private_ledger
 module Consensus_catchup_shell = Octra_node_runtime.Consensus_catchup_shell
 module Consensus_circle_preverify = Octra_node_runtime.Consensus_circle_preverify
 module Consensus_circle_cell_preverify = Octra_node_runtime.Consensus_circle_cell_preverify
@@ -366,6 +367,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           exit_fatal = exit_error;
         })
     in
+    let private_field_policy epoch =
+      match Rule_graph.private_payload rules ~epoch with
+      | Ok mode -> Private_ledger.field_policy_of_mode mode
+      | Error fault -> failwith (Rule_graph.fault_message fault)
+    in
     let bind_rule
         name
         (activation : Rule_graph.activation option)
@@ -434,6 +440,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "wasm_compute"
       (Rule_graph.wasm_compute_activation rules)
       (fun epoch -> Rule_graph.wasm_compute rules ~epoch);
+    bind_rule
+      "private_payload"
+      (Rule_graph.private_payload_activation rules)
+      (fun epoch -> Rule_graph.private_payload rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -918,10 +928,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       }
     in
     let key_switch_preverify =
-      Consensus_key_switch_preverify.create ledger
+      Consensus_key_switch_preverify.create
+        ~field_policy:(fun () -> private_field_policy !current_epoch)
+        ledger
     in
     let private_preverify =
       Consensus_private_preverify.create
+        ~field_policy:(fun () -> private_field_policy !current_epoch)
         ~result_policy:(fun () -> private_result_policy !current_epoch)
         ledger
     in
@@ -990,6 +1003,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let run_preverify prepared txs =
       Octra_core.Preverify_worker.run_many
+        ~field_policy:(private_field_policy !current_epoch)
         ~ledger
         ~result_policy:(private_result_policy !current_epoch)
         ~circle_preverify:

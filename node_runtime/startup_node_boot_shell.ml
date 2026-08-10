@@ -5,6 +5,7 @@ module Ledger = Octra_core.Ledger
 module Store_chaindata = Octra_core.Store_chaindata
 module Store_irmin = Octra_core.Store_irmin
 module Epochlog = Octra_core.Epochlog
+module Head_manifest = Octra_core.Head_manifest
 module Emission_policy = Octra_core.Emission_policy
 module Emission_schedule = Octra_core.Emission_schedule
 module Denomination = Octra_core.Denomination
@@ -149,8 +150,23 @@ let irmin_stealth_counter deps () =
 
 let run_store_integrity (deps : store_deps) =
   Startup_store_shell.run_integrity {
-    is_fresh_store = (fun () ->
-      not (Sys.file_exists (Startup_store_shell.irmin_path deps.data_dir ^ "/store.pack")));
+    head_state = (fun () ->
+      match Head_manifest.load_result deps.data_dir with
+      | Head_manifest.Missing -> Startup_store_shell.Head_missing
+      | Head_manifest.Corrupt reason ->
+        Startup_store_shell.Head_corrupt reason
+      | Head_manifest.Present head ->
+        Startup_store_shell.Head_ready {
+          epoch = head.Head_manifest.epoch_id;
+          root = Head_manifest.ledger_state_root head;
+        });
+    store_root = (fun () -> run_s (Store_irmin.get_head_hash deps.store));
+    epoch_root = (fun epoch ->
+      match run_s (Store_irmin.epoch_binding deps.store epoch) with
+      | Ok binding -> Some binding.Store_irmin.root
+      | Error _ -> None);
+    rollback_epoch = (fun epoch ->
+      run_s (Store_irmin.rollback_to_epoch deps.store epoch));
     verify_integrity = (fun () ->
       run_s (Store_irmin.verify_integrity deps.store));
     save_state_root = (fun () ->

@@ -85,6 +85,11 @@ type catchup_range_response_record = {
   next_epoch : int64 option;
 }
 
+type catchup_query_window = {
+  from_epoch : int64;
+  max_epochs : int;
+}
+
 type peer_state_record = {
   responder_addr : string;
   mutable head_epoch : int64;
@@ -116,7 +121,13 @@ type proposal_frame_error =
   | Proposal_unknown_validator
   | Proposal_bad_signature
   | Proposal_envelope
+  | Proposal_tx_list_hash
   | Proposal_parent_commit_hash
+
+type proposal_fault_source =
+  | Proposal_fault_unresolved
+  | Proposal_fault_sender
+  | Proposal_fault_signer
 
 type vote_evidence_validation =
   | Evidence_valid
@@ -172,16 +183,17 @@ type t = {
   pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
   round_sync_replies : (string, round_sync_reply) Hashtbl.t;
+  finality_query_requests : (string, int64) Hashtbl.t;
+  mutable finality_query : C_finality_query.t;
   proposal_fetches : (string, unit) Hashtbl.t;
-  catchup_query_from_epoch : (string, int64) Hashtbl.t;
+  catchup_query_windows : (string, catchup_query_window) Hashtbl.t;
   mutable proposal_build : proposal_build option;
   mutable proposal_retry : proposal_build option;
   mutable proposal_verify : proposal_build option;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable on_validator_set_activated :
     C_types.validator_set -> string -> unit Lwt.t;
-  mutable output_loop_active : bool;
-  mutable output_loop_requested : bool;
+  mutable output_actor : C_output_actor.t;
 }
 
 let raw_to_hex s =
@@ -258,6 +270,22 @@ let catchup_agreement_epoch ~from_epoch records =
   | last :: _ -> last.C_codec.epoch_id
   | [] -> from_epoch
 
+let catchup_epoch_in_window window epoch =
+  window.max_epochs > 0
+  && Int64.compare epoch window.from_epoch >= 0
+  && Int64.compare
+       (Int64.sub epoch window.from_epoch)
+       (Int64.of_int window.max_epochs)
+     < 0
+
+let catchup_response_in_window window records =
+  window.max_epochs >= 0
+  && List.length records <= window.max_epochs
+  && List.for_all
+       (fun (record : C_codec.catchup_epoch_record) ->
+         catchup_epoch_in_window window record.epoch_id)
+       records
+
 let create ~config ~validator_set ~swarm ~start_height =
   let validator_set =
     C_types.validator_set_for_epoch
@@ -290,16 +318,17 @@ let create ~config ~validator_set ~swarm ~start_height =
     pending_proposals = Hashtbl.create 8;
     deferred_proposals = Hashtbl.create 16;
     round_sync_replies = Hashtbl.create 16;
+    finality_query_requests = Hashtbl.create 4;
+    finality_query = C_finality_query.idle;
     proposal_fetches = Hashtbl.create 4;
-    catchup_query_from_epoch = Hashtbl.create 8;
+    catchup_query_windows = Hashtbl.create 8;
     proposal_build = None;
     proposal_retry = None;
     proposal_verify = None;
     proposal_work_gate = C_proposal_work_gate.create ();
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
-    output_loop_active = false;
-    output_loop_requested = false }
+    output_actor = C_output_actor.idle }
 
 let set_validator_set_activation_handler t handler =
   t.on_validator_set_activated <- handler
@@ -490,20 +519,33 @@ let round_sync_relay_relevant
     (sync : C_codec.round_sync) =
   not sync.request
   && sync.epoch_id = current_height
-  && sync.round > current_round
+  && sync.round >= current_round
   && sync.round <= current_round + C_engine.max_round_ahead
 
 let proposal_frame_error_label = function
   | Proposal_unknown_validator -> "unknown_validator"
   | Proposal_bad_signature -> "bad_signature"
   | Proposal_envelope -> "envelope"
+  | Proposal_tx_list_hash -> "tx_list_hash"
   | Proposal_parent_commit_hash -> "parent_commit_hash"
 
 let proposal_frame_peer_reason = function
   | Proposal_unknown_validator -> "unknown_validator_propose"
   | Proposal_bad_signature -> "bad_signature_propose"
   | Proposal_envelope -> "invalid_frame_propose_envelope"
+  | Proposal_tx_list_hash -> "invalid_frame_propose_tx_list_hash"
   | Proposal_parent_commit_hash -> "invalid_frame_propose_parent_commit"
+
+let proposal_fault_source = function
+  | Proposal_unknown_validator -> Proposal_fault_unresolved
+  | Proposal_bad_signature
+  | Proposal_tx_list_hash
+  | Proposal_parent_commit_hash -> Proposal_fault_sender
+  | Proposal_envelope -> Proposal_fault_signer
+
+let proposal_tx_list_is_bound (proposal : C_types.propose) =
+  C_engine.tx_list_hash_for_header proposal.tx_hashes
+  = proposal.header.tx_list_hash
 
 let validate_proposal_frame ~chain_id ~validator_set (p : C_types.propose) =
   match C_types.pubkey_of_addr validator_set p.proposer with
@@ -517,6 +559,8 @@ let validate_proposal_frame ~chain_id ~validator_set (p : C_types.propose) =
          ~validator_set
          p) ->
     Error Proposal_envelope
+  | Some _ when not (proposal_tx_list_is_bound p) ->
+    Error Proposal_tx_list_hash
   | Some _
     when C_hash.parent_commit_hash_opt p.parent_commit
          <> p.header.parent_commit_hash ->
@@ -1023,10 +1067,13 @@ let flush_pending_votes t =
         votes
   end
 
-let verify_engine_signature t addr msg signature =
-  match C_types.pubkey_of_addr t.engine.vs addr with
+let verify_set_signature validator_set addr msg signature =
+  match C_types.pubkey_of_addr validator_set addr with
   | Some pk -> C_hash.verify_ed25519 ~pubkey_raw:pk ~msg ~signature
   | None -> false
+
+let verify_engine_signature t addr msg signature =
+  verify_set_signature t.engine.vs addr msg signature
 
 let proposal_round_key epoch round =
   Printf.sprintf "%Ld|%d" epoch round
@@ -1112,25 +1159,42 @@ let frame_known t msg_type payload =
 let remember_frame t msg_type payload =
   ignore (C_seen.remember t.seen (msg_id msg_type payload))
 
+let historical_vote_replay_needed t payload =
+  try
+    let vote = C_codec.decode_vote payload in
+    vote.chain_id = t.config.chain_id
+    && vote.epoch_id = t.engine.state.height
+    && vote.vote_type = C_types.Prevote
+    && vote.round < t.engine.state.round
+    && C_engine.polc_request_pending t.engine vote.round
+    && not
+         (C_engine.historical_prevote_known
+            t.engine
+            ~round:vote.round
+            ~validator:vote.validator)
+    && C_seen.remember
+         t.historical_replays
+         (msg_id Frame.msg_cons_vote payload)
+  with _ -> false
+
+let finalize_replay_needed t payload =
+  try
+    let finalize = C_codec.decode_finalize payload in
+    finalize.chain_id = t.config.chain_id
+    && finalize.epoch_id = t.engine.state.height
+    && Int64.compare finalize.epoch_id t.engine.finalized_height > 0
+    && C_seen.remember
+         t.historical_replays
+         (msg_id Frame.msg_cons_finalize payload)
+  with _ -> false
+
 let historical_replay_needed t msg_type payload =
-  if msg_type <> Frame.msg_cons_vote then false
+  if msg_type = Frame.msg_cons_vote then
+    historical_vote_replay_needed t payload
+  else if msg_type = Frame.msg_cons_finalize then
+    finalize_replay_needed t payload
   else
-    try
-      let vote = C_codec.decode_vote payload in
-      vote.chain_id = t.config.chain_id
-      && vote.epoch_id = t.engine.state.height
-      && vote.vote_type = C_types.Prevote
-      && vote.round < t.engine.state.round
-      && C_engine.polc_request_pending t.engine vote.round
-      && not
-           (C_engine.historical_prevote_known
-              t.engine
-              ~round:vote.round
-              ~validator:vote.validator)
-      && C_seen.remember
-           t.historical_replays
-           (msg_id msg_type payload)
-    with _ -> false
+    false
 
 let resource_attestation_pool t =
   Hashtbl.fold (fun _ attestation acc -> attestation :: acc) t.resource_attestations []
@@ -1203,15 +1267,14 @@ let report_validator_identity t validator_set validator ~reason =
       ~reason
 
 let report_proposal_error t conn validator_set proposer error =
-  match error with
-  | Proposal_unknown_validator -> ()
-  | Proposal_bad_signature ->
+  match proposal_fault_source error with
+  | Proposal_fault_unresolved -> ()
+  | Proposal_fault_sender ->
     Octra_net.P2p_swarm.report_bad_peer
       t.swarm
       conn
       ~reason:(proposal_frame_peer_reason error)
-  | Proposal_envelope
-  | Proposal_parent_commit_hash ->
+  | Proposal_fault_signer ->
     report_validator_identity
       t
       validator_set
@@ -1524,6 +1587,7 @@ let admit_current_proposal t ~route (p : C_types.propose) =
       ~chain_id:t.config.chain_id
       ~validator_set:t.engine.vs
       p
+    && proposal_tx_list_is_bound p
     && C_hash.parent_commit_hash_opt p.parent_commit
        = p.header.parent_commit_hash
   in
@@ -1917,22 +1981,27 @@ let rec process_outputs_once t =
     if proposed then process_outputs t else Lwt.return_unit
 and process_outputs t =
   let open Lwt.Syntax in
-  if t.output_loop_active then begin
-    t.output_loop_requested <- true;
-    Lwt.return_unit
-  end else begin
-    t.output_loop_active <- true;
-    let rec loop () =
-      t.output_loop_requested <- false;
-      let* () = process_outputs_once t in
-      if t.output_loop_requested then loop () else Lwt.return_unit
+  let actor, request = C_output_actor.request t.output_actor in
+  t.output_actor <- actor;
+  match request with
+  | C_output_actor.Join -> Lwt.return_unit
+  | C_output_actor.Start ->
+    let rec run () =
+      Lwt.catch
+        (fun () ->
+          let* () = process_outputs_once t in
+          let actor, completion = C_output_actor.complete t.output_actor in
+          t.output_actor <- actor;
+          match completion with
+          | C_output_actor.Continue -> run ()
+          | C_output_actor.Stop -> Lwt.return_unit)
+        (fun exn ->
+          t.output_actor <- C_output_actor.fail t.output_actor;
+          Lwt.fail exn)
     in
-    Lwt.finalize loop (fun () ->
-      t.output_loop_active <- false;
-      Lwt.return_unit)
-  end
+    run ()
 
-let on_p2p_message t _conn (frame : Frame.frame) =
+let rec on_p2p_message t _conn (frame : Frame.frame) =
   let open Lwt.Syntax in
   let skip_dedup = repeatable_query_frame frame in
   let allowed = frame_allowed ~running:t.running frame.msg_type in
@@ -2387,7 +2456,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             signature;
           } in
           let payload = C_codec.encode_epoch_root_response response in
-          Octra_net.P2p_swarm.broadcast t.swarm
+          Octra_net.P2p_conn.send _conn
             { msg_type = Frame.msg_epoch_root_response; payload }
         end)
         (fun exn ->
@@ -2464,7 +2533,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               signature = t.config.sign_fn (C_hash.bundle_response_sign_bytes r);
             } in
             let payload = C_codec.encode_bundle_response r in
-            Octra_net.P2p_swarm.broadcast t.swarm
+            Octra_net.P2p_conn.send _conn
               { msg_type = Frame.msg_bundle_response; payload }
         end)
         (fun exn ->
@@ -2524,17 +2593,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           let outcome = t.config.lookup_catchup_range
             ~from_epoch:q.from_epoch ~max_epochs:q.max_epochs in
           let make_response status error_code records next_epoch =
-            let records_root =
-              if is_v2 then C_hash.catchup_records_root records
-              else C_hash.catchup_records_root_v1_wire records in
-            let sign_bytes = C_hash.catchup_range_response_sign_bytes
-              ~chain_id:t.config.chain_id
-              ~request_id:q.request_id
-              ~responder_addr:t.config.my_addr
-              ~from_epoch:q.from_epoch
-              ~records_root in
-            let signature = t.config.sign_fn sign_bytes in
-            C_codec.{
+            let unsigned = C_codec.{
               chain_id = t.config.chain_id;
               request_id = q.request_id;
               status;
@@ -2542,8 +2601,28 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               records;
               next_epoch;
               responder_addr = t.config.my_addr;
-              signature;
+              signature = "";
             }
+            in
+            let sign_bytes =
+              if is_v2
+                 && C_hash.catchup_request_is_complete q.request_id then
+                C_hash.catchup_range_response_complete_sign_bytes
+                  ~from_epoch:q.from_epoch
+                  unsigned
+              else
+                let records_root =
+                  if is_v2 then C_hash.catchup_records_root records
+                  else C_hash.catchup_records_root_v1_wire records
+                in
+                C_hash.catchup_range_response_sign_bytes
+                  ~chain_id:t.config.chain_id
+                  ~request_id:q.request_id
+                  ~responder_addr:t.config.my_addr
+                  ~from_epoch:q.from_epoch
+                  ~records_root
+            in
+            { unsigned with signature = t.config.sign_fn sign_bytes }
           in
           let response = match outcome with
             | `Ok (records, next_epoch) -> make_response "ok" None records next_epoch
@@ -2558,7 +2637,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               (C_codec.encode_catchup_range_response_v1 response,
                Frame.msg_catchup_range_response)
           in
-          Octra_net.P2p_swarm.broadcast t.swarm
+          Octra_net.P2p_conn.send _conn
             { msg_type = response_msg_type; payload }
         end)
         (fun exn ->
@@ -2575,45 +2654,121 @@ let on_p2p_message t _conn (frame : Frame.frame) =
           else C_codec.decode_catchup_range_response_v1 frame.payload
         in
         if r.chain_id <> t.config.chain_id then Lwt.return_unit
-        else if not (Hashtbl.mem t.catchup_query_from_epoch r.request_id) then
+        else if not (Hashtbl.mem t.catchup_query_windows r.request_id) then
           Lwt.return_unit
-        else if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
-          log_node t.config.my_addr
-            "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
-            is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
-          Lwt.return_unit
-        end else begin
-
-          let from_epoch_opt =
-            Hashtbl.find_opt t.catchup_query_from_epoch r.request_id
+        else begin
+          let window_opt =
+            Hashtbl.find_opt t.catchup_query_windows r.request_id
           in
-          match from_epoch_opt with
+          match window_opt with
           | None ->
             log_node t.config.my_addr
               "event = ignore_catchup_range_response v2 = %b reason = unknown_request_empty_records"
               is_v2;
             Lwt.return_unit
-          | Some from_epoch ->
+          | Some window when not (catchup_response_in_window window r.records) ->
+            log_node t.config.my_addr
+              "event = ignore_catchup_range_response v2 = %b reason = epoch_outside_request from = %s"
+              is_v2
+              (String.sub
+                 r.responder_addr
+                 0
+                 (min 12 (String.length r.responder_addr)));
+            Lwt.return_unit
+          | Some window ->
+            let from_epoch = window.from_epoch in
+            let response_epoch =
+              match List.rev r.records with
+              | last :: _ -> last.C_codec.epoch_id
+              | [] -> from_epoch
+            in
+            let* validator_set = validator_set_for_frame t response_epoch in
             let records_root =
               if is_v2 then C_hash.catchup_records_root r.records
               else C_hash.catchup_records_root_v1_wire r.records in
-            let sign_bytes = C_hash.catchup_range_response_sign_bytes
+            let legacy_sign_bytes = C_hash.catchup_range_response_sign_bytes
               ~chain_id:r.chain_id
               ~request_id:r.request_id
               ~responder_addr:r.responder_addr
               ~from_epoch
               ~records_root in
-            if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
+            let complete_request =
+              is_v2 && C_hash.catchup_request_is_complete r.request_id
+            in
+            let complete_valid =
+              complete_request
+              && verify_set_signature
+                   validator_set
+                   r.responder_addr
+                   (C_hash.catchup_range_response_complete_sign_bytes
+                      ~from_epoch
+                      r)
+                   r.signature
+            in
+            let legacy_valid =
+              verify_set_signature
+                validator_set
+                r.responder_addr
+                legacy_sign_bytes
+                r.signature
+            in
+            let finality_request =
+              Hashtbl.mem t.finality_query_requests r.request_id
+            in
+            let response_route =
+              if complete_request then
+                C_finality_query.response_route
+                  ~finality_request
+                  ~complete_valid
+                  ~legacy_valid
+              else if legacy_valid then
+                C_finality_query.Complete_response
+              else
+                C_finality_query.Reject_response
+            in
+            if not (C_types.is_validator validator_set r.responder_addr) then begin
               log_node t.config.my_addr
                 "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
                 is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
               Lwt.return_unit
-            end else if not (verify_engine_signature t r.responder_addr sign_bytes r.signature) then begin
+            end else if response_route = C_finality_query.Ignore_legacy_response then begin
+              log_node t.config.my_addr
+                "event = ignore_catchup_range_response v2 = %b reason = legacy_signature from = %s"
+                is_v2
+                (String.sub
+                   r.responder_addr
+                   0
+                   (min 12 (String.length r.responder_addr)));
+              Lwt.return_unit
+            end else if response_route = C_finality_query.Reject_response then begin
               log_node t.config.my_addr
                 "event = ignore_catchup_range_response v2 = %b reason = bad_signature from = %s"
                 is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
               Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"bad_signature_catchup_range";
               Lwt.return_unit
+            end else if response_route = C_finality_query.Finality_response then begin
+              match Hashtbl.find_opt t.finality_query_requests r.request_id with
+              | Some expected_epoch ->
+                let finalize =
+                  match r.records with
+                  | [ record ] when record.C_codec.epoch_id = expected_epoch ->
+                    Option.map
+                      (fun finality -> finality.C_codec.finalize)
+                      record.finality
+                  | _ -> None
+                in
+                (match finalize with
+                 | Some value when value.C_types.epoch_id = expected_epoch ->
+                   on_p2p_message
+                     t
+                     _conn
+                     {
+                       msg_type = Frame.msg_cons_finalize;
+                       payload = C_codec.encode_finalize value;
+                     }
+                 | Some _
+                 | None -> Lwt.return_unit)
+              | None -> Lwt.return_unit
             end else begin
               let checked_epoch, state_root =
                 match List.rev r.records with
@@ -2629,19 +2784,53 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                 ~head_epoch
                 ~checked_epoch
                 ~state_root;
-              let record = {
-                responder_addr = r.responder_addr;
-                request_id = r.request_id;
-                status = r.status;
-                records = r.records;
-                next_epoch = r.next_epoch;
-              } in
-              let prior = try Hashtbl.find t.catchup_responses r.request_id with Not_found -> [] in
-              let already_seen = List.exists (fun (rec_ : catchup_range_response_record) ->
-                rec_.responder_addr = r.responder_addr) prior in
-              if not already_seen then
-                Hashtbl.replace t.catchup_responses r.request_id (record :: prior);
-              Lwt.return_unit
+              match
+                Hashtbl.find_opt t.finality_query_requests r.request_id
+              with
+              | Some expected_epoch ->
+                let finalize =
+                  match r.records with
+                  | [ record ] when record.C_codec.epoch_id = expected_epoch ->
+                    Option.map
+                      (fun finality -> finality.C_codec.finalize)
+                      record.finality
+                  | _ -> None
+                in
+                (match finalize with
+                 | Some value when value.C_types.epoch_id = expected_epoch ->
+                   on_p2p_message
+                     t
+                     _conn
+                     {
+                       msg_type = Frame.msg_cons_finalize;
+                       payload = C_codec.encode_finalize value;
+                     }
+                 | Some _
+                 | None -> Lwt.return_unit)
+              | None ->
+                let record = {
+                  responder_addr = r.responder_addr;
+                  request_id = r.request_id;
+                  status = r.status;
+                  records = r.records;
+                  next_epoch = r.next_epoch;
+                } in
+                let prior =
+                  try Hashtbl.find t.catchup_responses r.request_id
+                  with Not_found -> []
+                in
+                let already_seen =
+                  List.exists
+                    (fun (rec_ : catchup_range_response_record) ->
+                      rec_.responder_addr = r.responder_addr)
+                    prior
+                in
+                if not already_seen then
+                  Hashtbl.replace
+                    t.catchup_responses
+                    r.request_id
+                    (record :: prior);
+                Lwt.return_unit
             end
         end)
         (fun exn ->
@@ -2753,6 +2942,80 @@ let broadcast_resource_attestation t attestation =
   | Resource_attestation_admission.Quarantine _ ->
       Lwt.return_unit
 
+let split_prefix n values =
+  let rec take selected remaining count =
+    if count <= 0 then List.rev selected, remaining
+    else
+      match remaining with
+      | [] -> List.rev selected, []
+      | value :: rest -> take (value :: selected) rest (count - 1)
+  in
+  take [] values n
+
+let rotate_values offset values =
+  let before, after = split_prefix offset values in
+  after @ before
+
+let bundle_query_offset proposal_id count =
+  if count <= 0 then 0
+  else
+    let width = min 16 (String.length proposal_id) in
+    let rec fold index value =
+      if index >= width then value
+      else
+        fold
+          (index + 1)
+          (((value * 257) + Char.code proposal_id.[index]) mod count)
+    in
+    fold 0 0
+
+let ordered_query_peer_ids t seed =
+  let active_ids = Hashtbl.create t.engine.vs.C_types.n in
+  List.iter
+    (fun (validator : C_types.validator_info) ->
+      Hashtbl.replace
+        active_ids
+        (Octra_net.P2p_handshake.node_id_of_pubkey validator.pubkey)
+        ())
+    t.engine.vs.validators;
+  let connected =
+    Octra_net.P2p_swarm.connected_peers t.swarm
+    |> List.map (fun conn -> conn.Octra_net.P2p_conn.peer_id)
+    |> List.sort_uniq String.compare
+  in
+  let validators, others =
+    List.partition (fun peer_id -> Hashtbl.mem active_ids peer_id) connected
+  in
+  let rotate values =
+    rotate_values (bundle_query_offset seed (List.length values)) values
+  in
+  rotate validators @ rotate others
+
+let bundle_query_peer_ids t proposal_id =
+  ordered_query_peer_ids t proposal_id
+
+let bundle_query_waves peer_ids =
+  let first, rest = split_prefix 2 peer_ids in
+  let second, rest = split_prefix 4 rest in
+  [first; second; rest] |> List.filter (fun wave -> wave <> [])
+
+let catchup_query_waves validator_set peer_ids =
+  let width = max 1 (validator_set.C_types.f + 2) in
+  let first, rest = split_prefix width peer_ids in
+  let second, rest = split_prefix width rest in
+  [first; second; rest] |> List.filter (fun wave -> wave <> [])
+
+let catchup_query_limit ~from_epoch ~max_epochs = function
+  | Some cfg when from_epoch < cfg.activate_epoch ->
+    let until_activation = Int64.sub cfg.activate_epoch from_epoch in
+    if max_epochs <= 0
+       || Int64.compare until_activation (Int64.of_int max_epochs) >= 0 then
+      max_epochs
+    else
+      Int64.to_int until_activation
+  | Some _
+  | None -> max_epochs
+
 let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
     ~(validate : bundle_response_record -> bool) =
   let open Lwt.Syntax in
@@ -2763,8 +3026,7 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
     proposal_id;
   } in
   let payload = C_codec.encode_bundle_query q in
-  let* () = Octra_net.P2p_swarm.broadcast t.swarm
-    { msg_type = Frame.msg_query_bundle; payload } in
+  let query_frame = { Frame.msg_type = Frame.msg_query_bundle; payload } in
   let rejected : (string, unit) Hashtbl.t = Hashtbl.create 4 in
   let pick_valid responses =
     List.find_opt (fun (rec_ : bundle_response_record) ->
@@ -2792,13 +3054,74 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
         wait_valid deadline
   in
   let deadline = deadline_after timeout_seconds in
-  let* result = wait_valid deadline in
+  let send_wave peer_ids =
+    Lwt_list.iter_p
+      (fun peer_id ->
+        Octra_net.P2p_swarm.send_to t.swarm ~peer_id query_frame)
+      peer_ids
+  in
+  let rec query_waves = function
+    | [] -> wait_valid deadline
+    | _ when deadline_reached deadline -> Lwt.return_none
+    | wave :: rest ->
+      let* () = send_wave wave in
+      let wave_deadline =
+        if rest = [] then deadline
+        else min deadline (deadline_after 0.25)
+      in
+      let* result = wait_valid wave_deadline in
+      (match result with
+       | Some _ -> Lwt.return result
+       | None -> query_waves rest)
+  in
+  let peer_ids = bundle_query_peer_ids t proposal_id in
+  let* result =
+    match bundle_query_waves peer_ids with
+    | [] ->
+      let* () = Octra_net.P2p_swarm.broadcast t.swarm query_frame in
+      wait_valid deadline
+    | waves -> query_waves waves
+  in
   Hashtbl.remove t.bundle_responses proposal_id;
   Lwt.return result
 
 let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     ~(validate : catchup_range_response_record -> bool) =
   let open Lwt.Syntax in
+  let* validator_set_plan = load_validator_set_plan t in
+  let max_epochs =
+    catchup_query_limit
+      ~from_epoch
+      ~max_epochs
+      validator_set_plan
+  in
+  let agreement_validator_set epoch_id =
+    validator_set_at
+      ~chain_id:t.config.chain_id
+      ~current:t.engine.vs
+      ~epoch:epoch_id
+      validator_set_plan
+    |> catchup_source_validator_set
+  in
+  let agreement_weight epoch_id =
+    agreement_validator_set epoch_id
+    |> C_types.round_skip_weight
+  in
+  let weight_of_responder epoch_id responder_addr =
+    match
+      C_types.weight_of_addr
+        (agreement_validator_set epoch_id)
+        responder_addr
+    with
+    | Some weight -> weight
+    | None -> Z.zero
+  in
+  let agreement_reached epoch_id count weight =
+    catchup_source_agreement_reached
+      (agreement_validator_set epoch_id)
+      ~signer_count:count
+      ~signed_weight:weight
+  in
   let take_prefix n xs =
     let rec loop acc i = function
       | _ when i <= 0 -> List.rev acc
@@ -2817,6 +3140,7 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     Octra_net.Hash_domain.hash "octra:catchup_range_request_id:v1"
       (Printf.sprintf "%s:%Ld:%d:%f:%s"
         t.config.my_addr from_epoch max_epochs request_nonce phase)
+    |> C_hash.mark_complete_catchup_request
   in
   let pick_valid_with rejected responses =
     let groups
@@ -2833,10 +3157,7 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
             catchup_agreement_epoch ~from_epoch rec_.records
           in
           let responder_weight =
-            catchup_responder_weight
-              t
-              ~epoch_id:agreement_epoch
-              rec_.responder_addr
+            weight_of_responder agreement_epoch rec_.responder_addr
           in
           let key = catchup_response_key rec_ in
           let weight, count, agreement_epoch, repr =
@@ -2864,10 +3185,7 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
                 catchup_agreement_epoch ~from_epoch prefix_records
               in
               let prefix_responder_weight =
-                catchup_responder_weight
-                  t
-                  ~epoch_id:prefix_epoch
-                  rec_.responder_addr
+                weight_of_responder prefix_epoch rec_.responder_addr
               in
               let
                 prefix_weight,
@@ -2926,8 +3244,8 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     in
     match best_full, best_prefix with
     | Some (weight, count, epoch_id, repr), _
-      when catchup_agreement_reached t ~epoch_id ~count ~weight ->
-      let required_weight = catchup_agreement_weight t ~epoch_id in
+      when agreement_reached epoch_id count weight ->
+      let required_weight = agreement_weight epoch_id in
       let records_root_hex =
         raw_to_hex (C_hash.catchup_records_root repr.records) in
       log_node t.config.my_addr
@@ -2940,8 +3258,8 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
         (List.length repr.records);
       Some repr
     | _, Some (weight, count, prefix_len, epoch_id, repr)
-      when catchup_agreement_reached t ~epoch_id ~count ~weight ->
-      let required_weight = catchup_agreement_weight t ~epoch_id in
+      when agreement_reached epoch_id count weight ->
+      let required_weight = agreement_weight epoch_id in
       let records_root_hex =
         raw_to_hex (C_hash.catchup_records_root repr.records) in
       log_node t.config.my_addr
@@ -2968,10 +3286,10 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
   in
   let cleanup request_id =
     Hashtbl.remove t.catchup_responses request_id;
-    Hashtbl.remove t.catchup_query_from_epoch request_id
+    Hashtbl.remove t.catchup_query_windows request_id
   in
-  let run_phase ~phase ~msg_type ~budget =
-    let request_id = request_id phase in
+  let run_query ~msg_type ~budget =
+    let request_id = request_id "range" in
     let query = C_codec.{
       chain_id = t.config.chain_id;
       request_id;
@@ -2980,39 +3298,51 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     } in
     let payload = C_codec.encode_catchup_query_range query in
     Hashtbl.remove t.catchup_responses request_id;
-    Hashtbl.replace t.catchup_query_from_epoch request_id from_epoch;
+    Hashtbl.replace
+      t.catchup_query_windows
+      request_id
+      { from_epoch; max_epochs };
     let rejected : (string, unit) Hashtbl.t = Hashtbl.create 4 in
-    Lwt.finalize
-      (fun () ->
+    let frame = { Frame.msg_type; payload } in
+    let peer_ids = ordered_query_peer_ids t request_id in
+    let waves =
+      catchup_query_waves
+        (agreement_validator_set from_epoch)
+        peer_ids
+    in
+    let deadline = deadline_after budget in
+    let wave_budget =
+      budget /. float_of_int (max 1 (List.length waves))
+    in
+    let rec send = function
+      | [] -> wait_valid_with request_id rejected deadline
+      | _ when deadline_reached deadline -> Lwt.return_none
+      | wave :: rest ->
         let* () =
-          Octra_net.P2p_swarm.broadcast t.swarm { msg_type; payload }
+          Lwt_list.iter_p
+            (fun peer_id ->
+              Octra_net.P2p_swarm.send_to t.swarm ~peer_id frame)
+            wave
         in
-        wait_valid_with request_id rejected (deadline_after budget))
+        let wave_deadline =
+          if rest = [] then deadline
+          else min deadline (deadline_after wave_budget)
+        in
+        let* result = wait_valid_with request_id rejected wave_deadline in
+        (match result with
+         | Some _ -> Lwt.return result
+         | None -> send rest)
+    in
+    Lwt.finalize
+      (fun () -> send waves)
       (fun () ->
         cleanup request_id;
         Lwt.return_unit)
   in
   let total_budget = bounded_timeout timeout_seconds in
-  let first_budget =
-    min total_budget (max 1.5 (total_budget /. 2.0))
-  in
-  let* first =
-    run_phase
-      ~phase:"canonical"
-      ~msg_type:Frame.msg_query_catchup_range_v2
-      ~budget:first_budget
-  in
-  match first with
-  | Some _ as result ->
-    Lwt.return result
-  | None ->
-    log_node t.config.my_addr
-      "event = catchup_canonical_retry timeout_s = %.1f"
-      first_budget;
-    run_phase
-      ~phase:"canonical_retry"
-      ~msg_type:Frame.msg_query_catchup_range_v2
-      ~budget:(total_budget -. first_budget)
+  run_query
+    ~msg_type:Frame.msg_query_catchup_range_v2
+    ~budget:total_budget
 
 let epoch_root_consensus_quorum t ~epoch_id ~root records =
   let validators =
@@ -3058,6 +3388,77 @@ let epoch_root_wait_reached t ~epoch_id ~wait_for records =
     |> List.exists (fun root ->
       epoch_root_consensus_quorum t ~epoch_id ~root records)
 
+let finality_query_peer_ids validator_set ~epoch_id records =
+  let limit = max 1 (validator_set.C_types.f + 2) in
+  records
+  |> List.filter (fun (record : epoch_root_response_record) ->
+    Int64.compare record.responder_head_epoch epoch_id >= 0)
+  |> List.filter_map (fun (record : epoch_root_response_record) ->
+    match C_types.pubkey_of_addr validator_set record.responder_addr with
+    | Some pubkey ->
+      Some (Octra_net.P2p_handshake.node_id_of_pubkey pubkey)
+    | None -> None)
+  |> List.sort_uniq String.compare
+  |> List.filteri (fun index _ -> index < limit)
+
+let request_missing_finalize t ~epoch_id records =
+  let open Lwt.Syntax in
+  let* validator_set = validator_set_for_frame t epoch_id in
+  let peer_ids = finality_query_peer_ids validator_set ~epoch_id records in
+  match peer_ids with
+  | [] -> Lwt.return_unit
+  | _ ->
+    let now = Mtime_clock.elapsed_ns () in
+    match C_finality_query.plan ~now ~epoch:epoch_id t.finality_query with
+    | C_finality_query.Wait
+    | C_finality_query.Exhausted -> Lwt.return_unit
+    | C_finality_query.Send next ->
+      t.finality_query <- next;
+      let attempts =
+        match next with
+        | C_finality_query.Idle -> 0
+        | C_finality_query.Sent sent -> sent.attempts
+      in
+      Hashtbl.filter_map_inplace
+        (fun _ target ->
+          if target = epoch_id then Some target else None)
+        t.finality_query_requests;
+      let request_id =
+        Octra_net.Hash_domain.hash
+          "octra:finality_query_request"
+          (Printf.sprintf
+             "%s:%Ld:%d:%Ld"
+             t.config.my_addr
+             epoch_id
+             attempts
+             now)
+        |> C_hash.mark_complete_catchup_request
+      in
+      let query = C_codec.{
+        chain_id = t.config.chain_id;
+        request_id;
+        from_epoch = epoch_id;
+        max_epochs = 1;
+      } in
+      let frame = {
+        Frame.msg_type = Frame.msg_query_catchup_range_v2;
+        payload = C_codec.encode_catchup_query_range query;
+      } in
+      Hashtbl.replace
+        t.catchup_query_windows
+        request_id
+        { from_epoch = epoch_id; max_epochs = 1 };
+      Hashtbl.replace t.finality_query_requests request_id epoch_id;
+      log_node t.config.my_addr
+        "event = request_missing_finalize epoch = %Ld peers = %d attempt = %d"
+        epoch_id
+        (List.length peer_ids)
+        attempts;
+      Lwt_list.iter_p
+        (fun peer_id ->
+          Octra_net.P2p_swarm.send_to t.swarm ~peer_id frame)
+        peer_ids
+
 let query_epoch_root
     ?(wait_for = Source_agreement)
     t
@@ -3088,6 +3489,17 @@ let query_epoch_root
       wait ()
   in
   let* collected = wait () in
+  let local_head = t.config.local_head_epoch () in
+  let* () =
+    if epoch_id = local_head
+       && Int64.sub t.engine.state.height local_head = 1L then
+      request_missing_finalize
+        t
+        ~epoch_id:t.engine.state.height
+        collected
+    else
+      Lwt.return_unit
+  in
   Hashtbl.remove t.epoch_root_responses epoch_id;
   Lwt.return collected
 
@@ -3110,7 +3522,6 @@ let clear_local_transients t =
   t.proposal_build <- None;
   t.proposal_verify <- None;
   Hashtbl.clear t.pending_votes;
-  t.output_loop_requested <- false;
   t.epoch_start_mono <- Mtime_clock.elapsed_ns ()
 
 let clear_height_local_state t =
