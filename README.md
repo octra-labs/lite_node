@@ -5,6 +5,8 @@ This repository provides a complete, lightweight Node implementation for the Oct
 For the lite node, you might also consider using a Raspberry Pi, as shown in this post:
 https://x.com/lambda0xE/status/2060325624426705227?s=20
 
+Among the good providers for infra there are also Contabo and several others.
+
 ## Toolchain
 - OCaml 4.14.2
 - Dune 3.0 or newer (tested on 3.23.0)
@@ -93,4 +95,32 @@ sh controls/enroll.sh withdraw
 
 ```bash
 sh controls/stop.sh
+```
+
+## How to update (if you are already a validator)
+> **MUST be taken into account before everything else:**
+> Don't run `--sync` again, don't change `config/network.env`, and don't re-enroll the node. Consider the conditions of your config and your data paths as needed.
+
+```bash
+sudo -iu octra
+cd /opt/octra/libv_litecore
+
+git pull --ff-only
+cat SOURCE_COMMIT
+sh controls/check.sh
+
+SWITCH="$PWD/runtime_data/toolchains/ocaml"
+
+make -C mcl MCL_FP_BIT=256 MCL_FR_BIT=256 lib/libmcl.a
+
+opam exec --switch "$SWITCH" -- dune build --profile release \
+  bin/octra_node.exe \
+  bin/octra_pvac_worker.exe \
+  bin/octra_state_sync_client.exe \
+  bin/octra_state_sync_manifest.exe \
+  bin/bft_control_tx.exe
+
+sh controls/stop.sh
+sh controls/run.sh --rebind-runtime
+sh controls/stat.sh
 ```
