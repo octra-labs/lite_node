@@ -33,6 +33,7 @@ type deps = {
     address:string ->
     cipher:string ->
     Octra_core.Pvac_legacy_public_replay.decision;
+  private_field_policy : Octra_core.Private_ledger.field_policy;
   private_result_policy :
     int ->
     Octra_core.Private_result_policy.t;
@@ -222,6 +223,7 @@ let run deps sender_txs =
                    ~gate:fhe_gate
                    ~plan:(fun () ->
                      Octra_core.Private_ledger.apply_encrypt
+                       ~field_policy:deps.private_field_policy
                        ~result_policy:
                          (deps.private_result_policy (deps.current_epoch ()))
                        deps.ledger
@@ -247,6 +249,7 @@ let run deps sender_txs =
                      ])
                    ~plan:(fun () ->
                      Octra_core.Private_ledger.apply_decrypt
+                       ~field_policy:deps.private_field_policy
                        ~result_policy:
                          (deps.private_result_policy (deps.current_epoch ()))
                        deps.ledger
@@ -257,6 +260,7 @@ let run deps sender_txs =
               Consensus_epoch_key_switch_shell.run_live_ledger_tx
                 {
                   ledger = deps.ledger;
+                  field_policy = deps.private_field_policy;
                   legacy_replay = (fun address ->
                     let cipher =
                       match Octra_core.Ledger.find_opt deps.ledger address with
@@ -287,6 +291,7 @@ let run deps sender_txs =
                 (Consensus_epoch_stealth_shell.live_ledger_tx_deps
                 {
                   ledger = deps.ledger;
+                  field_policy = deps.private_field_policy;
                   stealth_count = !(deps.stealth_in_epoch_counter);
                   max_stealth_per_epoch = deps.max_stealth_per_epoch;
                   max_stealth_defer = deps.max_stealth_defer;
@@ -319,6 +324,7 @@ let run deps sender_txs =
                 (Consensus_epoch_claim_shell.live_ledger_tx_deps
                 {
                   ledger = deps.ledger;
+                  field_policy = deps.private_field_policy;
                   private_result_policy = deps.private_result_policy;
                   current_epoch = deps.current_epoch;
                   trace_cipher = trace_enc_balance ~short:deps.short_addr;

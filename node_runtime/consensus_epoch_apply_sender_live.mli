@@ -32,6 +32,7 @@ type deps = {
     address:string ->
     cipher:string ->
     Octra_core.Pvac_legacy_public_replay.decision;
+  private_field_policy : Octra_core.Private_ledger.field_policy;
   private_result_policy :
     int ->
     Octra_core.Private_result_policy.t;

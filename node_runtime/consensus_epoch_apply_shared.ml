@@ -118,6 +118,10 @@ let first_disabled_bft_tx txs =
 let consensus_order txs =
   Transaction.consensus_order txs
 
+let private_field_policy_at rules epoch =
+  Octra_core.Rule_graph.private_payload rules ~epoch
+  |> Result.map Octra_core.Private_ledger.field_policy_of_mode
+
 let process_standard ~backend ~env tx =
   let open Lwt.Syntax in
   let* result = Epoch_exec.process_standard_tx ~backend ~env tx in
@@ -285,7 +289,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
     tx_sink.confirm tx
   in
   let deferred_stealth_txs = ref [] in
-  let process_sender sender_txs =
+  let process_sender private_field_policy sender_txs =
     Sender_live.run
       {
         ledger = runtime.ledger;
@@ -312,6 +316,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         notify_confirmed = runtime.notify_confirmed;
         notify_rejected = runtime.notify_rejected;
         legacy_replay = runtime.legacy_replay;
+        private_field_policy;
         private_result_policy = runtime.private_result_policy;
       }
       sender_txs
@@ -329,11 +334,12 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
   | Error e ->
     Lwt.fail_with ("finalized preverify gate failed: " ^ e)
   | Ok () ->
+    let epoch_id = runtime.current_epoch () in
     let circle_mode =
       match
         Octra_core.Rule_graph.circle
           runtime.rules
-          ~epoch:(runtime.current_epoch ())
+          ~epoch:epoch_id
       with
       | Ok mode -> mode
       | Error fault ->
@@ -343,7 +349,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
       match
         Octra_core.Rule_graph.owner_migration
           runtime.rules
-          ~epoch:(runtime.current_epoch ())
+          ~epoch:epoch_id
       with
       | Ok mode -> mode
       | Error fault ->
@@ -353,19 +359,15 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
       match
         Octra_core.Rule_graph.wasm_compute
           runtime.rules
-          ~epoch:(runtime.current_epoch ())
+          ~epoch:epoch_id
       with
       | Ok mode -> mode
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
     let private_field_policy =
-      match
-        Octra_core.Rule_graph.private_payload
-          runtime.rules
-          ~epoch:(runtime.current_epoch ())
-      with
-      | Ok mode -> Octra_core.Private_ledger.field_policy_of_mode mode
+      match private_field_policy_at runtime.rules epoch_id with
+      | Ok policy -> policy
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
@@ -389,7 +391,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         env = runtime.standard_env;
         max_fhe_per_epoch = runtime.max_fhe_per_epoch;
         max_stealth_per_epoch = runtime.max_stealth_per_epoch;
-        process_sender;
+        process_sender = process_sender private_field_policy;
         confirm_tx;
         reject_tx = log_rejected;
         notify_confirmed = runtime.notify_confirmed;

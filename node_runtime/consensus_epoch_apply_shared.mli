@@ -108,6 +108,11 @@ val all_shared_bft : Transaction.t list -> bool
 
 val consensus_order : Transaction.t list -> Transaction.t list
 
+val private_field_policy_at :
+  Octra_core.Rule_graph.t ->
+  int ->
+  (Octra_core.Private_ledger.field_policy, Octra_core.Rule_graph.fault) result
+
 val process_standard :
   backend:Epoch_exec.backend ->
   env:Epoch_exec.env ->

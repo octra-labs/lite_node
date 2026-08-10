@@ -541,21 +541,21 @@ let parse_key_switch field_policy raw =
     end
 
 let key_switch_requests_legacy_public_migration
-    ?(field_policy = Unique_fields)
+    ~field_policy
     tx =
   match parse_key_switch field_policy tx.T.encrypted_data with
   | Ok payload -> payload.migration = Public_history
   | Error _ -> false
 
 let key_switch_requests_historical_owner_proof
-    ?(field_policy = Unique_fields)
+    ~field_policy
     tx =
   match parse_key_switch field_policy tx.T.encrypted_data with
   | Ok payload -> payload.migration = Historical_owner_proof
   | Error _ -> false
 
 let key_switch_requests_legacy_audit
-    ?(field_policy = Unique_fields)
+    ~field_policy
     tx =
   match parse_key_switch field_policy tx.T.encrypted_data with
   | Ok payload ->
@@ -819,7 +819,7 @@ let verify_encrypt
     end
 
 let prepare_encrypt_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -839,7 +839,7 @@ let prepare_encrypt_plan
         | Ok () -> encrypt_balance_plan result_policy blob current payload
 
 let encrypt_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -973,7 +973,7 @@ let verify_decrypt
     end
 
 let prepare_decrypt_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -1000,7 +1000,7 @@ let prepare_decrypt_plan
           | Ok () -> decrypt_balance_plan result_policy blob current payload
 
 let decrypt_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -1050,7 +1050,7 @@ let apply_encrypt_plan ledger tx plan =
         | Error e -> failwith (Printf.sprintf "encrypt update_enc_balance: %s" e))
 
 let apply_encrypt
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -1075,7 +1075,7 @@ let apply_decrypt_plan ledger tx plan =
           | Error e -> failwith (Printf.sprintf "decrypt update_enc_balance: %s" e))
 
 let apply_decrypt
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -1385,7 +1385,7 @@ let verify_historical_owner
     end
 
 let verify_key_switch_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?legacy_public_replay
     ?snapshot
     ?(worker_priority = Compute_pool.Required)
@@ -1692,7 +1692,7 @@ let prepare_key_switch_plan_uncached field_policy ledger tx =
     end
 
 let prepare_key_switch_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ledger
     tx =
   let open Lwt.Syntax in
@@ -1705,7 +1705,7 @@ let prepare_key_switch_plan
     | None -> prepare_key_switch_plan_uncached field_policy ledger tx
 
 let key_switch_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?legacy_public_replay
     ledger
     tx =
@@ -1727,7 +1727,7 @@ let key_switch_plan
     Lwt.return result
 
 let preverify_key_switch_artifact
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Speculative)
     ledger
     tx =
@@ -1778,7 +1778,7 @@ let preverify_key_switch_artifact
       end
 
 let bind_key_switch_artifact
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ledger
     tx
     artifact =
@@ -1832,7 +1832,7 @@ let bind_key_switch_artifact
       end
 
 let key_switch_plan_for_apply
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?legacy_public_replay
     ledger
     tx =
@@ -1881,7 +1881,7 @@ let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
           })
 
 let apply_key_switch
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?legacy_public_replay
     ledger
     tx =
@@ -1899,7 +1899,7 @@ let apply_key_switch
   | Ok plan -> apply_key_switch_plan ledger tx plan
 
 let prepare_stealth_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -1958,7 +1958,7 @@ let prepare_stealth_plan
                   }))
 
 let stealth_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -2067,7 +2067,7 @@ let stealth_accept_range range =
     Ok ()
 
 let stealth_binding
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx
@@ -2114,7 +2114,7 @@ let stealth_binding
           end
 
 let prepare_claim_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ledger
     tx =
   let open Lwt.Syntax in
@@ -2144,7 +2144,7 @@ let prepare_claim_plan
           }
 
 let claim_plan
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx =
@@ -2260,7 +2260,7 @@ let claim_balance_plan
                 Ok { current_cipher = current; next_cipher }))
 
 let verify_private
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -2342,7 +2342,7 @@ let verify_private
     Lwt.return_error (private_reject private_error)
 
 let preverify_private_artifact
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(worker_priority = Compute_pool.Speculative)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -2374,7 +2374,7 @@ let preverify_private_artifact
     end
 
 let bind_private_artifact
-    ?(field_policy = Unique_fields)
+    ~field_policy
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx

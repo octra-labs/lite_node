@@ -153,6 +153,7 @@ type live_tx_args = {
 
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
+  field_policy : Private_ledger.field_policy;
   current_epoch : unit -> int;
   private_result_policy :
     int ->
