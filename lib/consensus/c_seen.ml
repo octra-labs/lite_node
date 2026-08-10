@@ -28,4 +28,6 @@ let remember t id =
     true
   end
 
+let known t id = Hashtbl.mem t.ids id
+
 let length t = Hashtbl.length t.ids

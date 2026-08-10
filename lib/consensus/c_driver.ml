@@ -113,9 +113,15 @@ type proposal_height_status =
   | Proposal_future
 
 type proposal_frame_error =
-  | Proposal_signature_or_unknown
+  | Proposal_unknown_validator
+  | Proposal_bad_signature
   | Proposal_envelope
   | Proposal_parent_commit_hash
+
+type vote_evidence_validation =
+  | Evidence_valid
+  | Evidence_unknown_validator
+  | Evidence_invalid
 
 type verified_proposal_route =
   | Publish_verified_proposal
@@ -466,6 +472,18 @@ let vote_relay_relevant ~current_height ~current_round (vote : C_types.vote) =
   && vote.round >= current_round
   && vote.round <= current_round + C_engine.max_round_ahead
 
+let next_height_relay_relevant ~current_height ~epoch_id ~round =
+  current_height <> Int64.max_int
+  && epoch_id = Int64.succ current_height
+  && round >= 0
+  && round <= C_engine.max_round_ahead
+
+let future_vote_relay_relevant ~current_height (vote : C_types.vote) =
+  next_height_relay_relevant
+    ~current_height
+    ~epoch_id:vote.epoch_id
+    ~round:vote.round
+
 let round_sync_relay_relevant
     ~current_height
     ~current_round
@@ -476,20 +494,22 @@ let round_sync_relay_relevant
   && sync.round <= current_round + C_engine.max_round_ahead
 
 let proposal_frame_error_label = function
-  | Proposal_signature_or_unknown -> "signature_or_unknown_validator"
+  | Proposal_unknown_validator -> "unknown_validator"
+  | Proposal_bad_signature -> "bad_signature"
   | Proposal_envelope -> "envelope"
   | Proposal_parent_commit_hash -> "parent_commit_hash"
 
 let proposal_frame_peer_reason = function
-  | Proposal_signature_or_unknown -> "bad_signature_propose"
+  | Proposal_unknown_validator -> "unknown_validator_propose"
+  | Proposal_bad_signature -> "bad_signature_propose"
   | Proposal_envelope -> "invalid_frame_propose_envelope"
   | Proposal_parent_commit_hash -> "invalid_frame_propose_parent_commit"
 
 let validate_proposal_frame ~chain_id ~validator_set (p : C_types.propose) =
   match C_types.pubkey_of_addr validator_set p.proposer with
-  | None -> Error Proposal_signature_or_unknown
+  | None -> Error Proposal_unknown_validator
   | Some pubkey when not (C_hash.verify_propose ~pubkey_raw:pubkey p) ->
-    Error Proposal_signature_or_unknown
+    Error Proposal_bad_signature
   | Some _
     when not
       (C_types.proposal_is_well_formed
@@ -884,35 +904,34 @@ let send_round_vote_to t conn (vote : C_types.vote) =
 
 let send_round_sync_response t conn ~requested_round =
   let open Lwt.Syntax in
-  if not (local_validator t) || not (t.config.can_vote ()) then
-    Lwt.return_unit
-  else begin
-    let* () =
+  let* () =
+    if local_validator t && t.config.can_vote () then
       Octra_net.P2p_conn.send
         conn
         (round_sync_frame (make_round_sync t ~request:false))
-    in
-    let* () =
-      match local_round_proposal t with
-      | None -> Lwt.return_unit
-      | Some proposal ->
-        Octra_net.P2p_conn.send
-          conn
-          {
-            Frame.msg_type = Frame.msg_cons_propose;
-            payload = C_codec.encode_propose proposal;
-          }
-    in
-    let* () =
-      Lwt_list.iter_s (send_round_vote_to t conn) (current_round_votes t)
-    in
-    if requested_round < t.engine.state.round then
-      Lwt_list.iter_s
-        (send_verified_vote_to conn)
-        (C_engine.polc_votes_for_round t.engine requested_round)
     else
       Lwt.return_unit
-  end
+  in
+  let* () =
+    match local_round_proposal t with
+    | None -> Lwt.return_unit
+    | Some proposal ->
+      Octra_net.P2p_conn.send
+        conn
+        {
+          Frame.msg_type = Frame.msg_cons_propose;
+          payload = C_codec.encode_propose proposal;
+        }
+  in
+  let* () =
+    Lwt_list.iter_s (send_round_vote_to t conn) (current_round_votes t)
+  in
+  if requested_round < t.engine.state.round then
+    Lwt_list.iter_s
+      (send_verified_vote_to conn)
+      (C_engine.polc_votes_for_round t.engine requested_round)
+  else
+    Lwt.return_unit
 
 let round_step_rank = function
   | C_types.ProposeStep -> 1
@@ -938,8 +957,7 @@ let round_sync_reply_progresses prior (sync : C_codec.round_sync) =
       && sync.round = prior.round
       && round_step_rank sync.step > round_step_rank prior.step)
 
-let round_sync_response_allowed t (sync : C_codec.round_sync) =
-  let now = Mtime_clock.elapsed_ns () in
+let round_sync_response_allowed_at t (sync : C_codec.round_sync) now =
   let prior = Hashtbl.find_opt t.round_sync_replies sync.validator in
   let due =
     round_sync_response_due
@@ -951,18 +969,29 @@ let round_sync_response_allowed t (sync : C_codec.round_sync) =
       round_sync_reply_progresses reply sync) prior
   in
   if due || progresses then begin
+    let reply =
+      match prior with
+      | Some reply when not progresses ->
+        { reply with sent_at = now }
+      | None
+      | Some _ ->
+        {
+          epoch_id = sync.epoch_id;
+          round = sync.round;
+          step = sync.step;
+          sent_at = now;
+        }
+    in
     Hashtbl.replace
       t.round_sync_replies
       sync.validator
-      {
-        epoch_id = sync.epoch_id;
-        round = sync.round;
-        step = sync.step;
-        sent_at = now;
-      };
+      reply;
     true
   end else
     false
+
+let round_sync_response_allowed t sync =
+  round_sync_response_allowed_at t sync (Mtime_clock.elapsed_ns ())
 
 let flush_pending_votes t =
   if not (t.config.can_vote ()) then Lwt.return_true
@@ -1077,6 +1106,12 @@ let is_seen t msg_type payload =
   let id = msg_id msg_type payload in
   not (C_seen.remember t.seen id)
 
+let frame_known t msg_type payload =
+  C_seen.known t.seen (msg_id msg_type payload)
+
+let remember_frame t msg_type payload =
+  ignore (C_seen.remember t.seen (msg_id msg_type payload))
+
 let historical_replay_needed t msg_type payload =
   if msg_type <> Frame.msg_cons_vote then false
   else
@@ -1131,18 +1166,26 @@ let vote_evidence t =
 let vote_evidence_root t =
   C_evidence.vote_conflict_root (vote_evidence t)
 
-let vote_evidence_in_window t evidence =
+let vote_evidence_in_window ~current evidence =
   let epoch = evidence.C_evidence.second.epoch_id in
-  let current = t.engine.state.height in
-  epoch <= current && epoch >= Int64.sub current vote_evidence_window
+  let newest =
+    if current = Int64.max_int then current else Int64.succ current
+  in
+  epoch <= newest && epoch >= Int64.sub current vote_evidence_window
 
-let verify_vote_evidence t evidence =
+let validate_vote_evidence ~chain_id ~validator_set ~current evidence =
   let vote = evidence.C_evidence.second in
-  vote.chain_id = t.config.chain_id
-  && vote_evidence_in_window t evidence
-  && match C_types.pubkey_of_addr t.engine.vs vote.validator with
-     | None -> false
-     | Some pubkey -> C_evidence.verify_vote_conflict ~pubkey_raw:pubkey evidence
+  if
+    vote.chain_id <> chain_id
+    || not (vote_evidence_in_window ~current evidence)
+  then Evidence_invalid
+  else
+    match C_types.pubkey_of_addr validator_set vote.validator with
+    | None -> Evidence_unknown_validator
+    | Some pubkey when
+        C_evidence.verify_vote_conflict ~pubkey_raw:pubkey evidence ->
+      Evidence_valid
+    | Some _ -> Evidence_invalid
 
 let vote_evidence_frame evidence =
   {
@@ -1150,7 +1193,32 @@ let vote_evidence_frame evidence =
     payload = C_evidence.encode_vote_conflict evidence;
   }
 
-let record_vote_conflict ?conn t prior vote =
+let report_validator_identity t validator_set validator ~reason =
+  match C_types.pubkey_of_addr validator_set validator with
+  | None -> ()
+  | Some pubkey ->
+    Octra_net.P2p_swarm.report_bad_identity
+      t.swarm
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey pubkey)
+      ~reason
+
+let report_proposal_error t conn validator_set proposer error =
+  match error with
+  | Proposal_unknown_validator -> ()
+  | Proposal_bad_signature ->
+    Octra_net.P2p_swarm.report_bad_peer
+      t.swarm
+      conn
+      ~reason:(proposal_frame_peer_reason error)
+  | Proposal_envelope
+  | Proposal_parent_commit_hash ->
+    report_validator_identity
+      t
+      validator_set
+      proposer
+      ~reason:(proposal_frame_peer_reason error)
+
+let record_vote_conflict ~validator_set t prior vote =
   match C_evidence.vote_conflict prior vote with
   | None -> None
   | Some evidence ->
@@ -1165,21 +1233,46 @@ let record_vote_conflict ?conn t prior vote =
         (Digestif.SHA256.of_raw_string evidence_id)
        |> fun hex -> String.sub hex 0 16)
       remembered;
-    (match conn with
-     | Some value ->
-       Octra_net.P2p_swarm.report_bad_peer t.swarm value
-         ~reason:"vote_equivocation"
-     | None -> ());
+    report_validator_identity
+      t
+      validator_set
+      vote.validator
+      ~reason:"vote_equivocation";
     if remembered then Some evidence else None
+
+let load_validator_set_plan t =
+  let open Lwt.Syntax in
+  let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
+  Lwt.return
+    (match dynamic_cfg with
+     | Some cfg -> Some cfg
+     | None -> t.config.scheduled_validator_set_config)
+
+let validator_set_at ~chain_id ~current ~epoch plan =
+  let source =
+    match plan with
+    | Some cfg when epoch >= cfg.activate_epoch -> cfg.validator_set
+    | Some _
+    | None -> current
+  in
+  C_types.validator_set_for_epoch ~chain_id ~epoch_id:epoch source
+
+let validator_set_for_frame t epoch =
+  let open Lwt.Syntax in
+  if epoch <= t.engine.state.height then
+    Lwt.return t.engine.vs
+  else
+    let* plan = load_validator_set_plan t in
+    Lwt.return
+      (validator_set_at
+         ~chain_id:t.config.chain_id
+         ~current:t.engine.vs
+         ~epoch
+         plan)
 
 let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
   let open Lwt.Syntax in
-  let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
-  let cfg_opt =
-    match dynamic_cfg with
-    | Some cfg -> Some cfg
-    | None -> t.config.scheduled_validator_set_config
-  in
+  let* cfg_opt = load_validator_set_plan t in
   match cfg_opt with
   | None -> Lwt.return_unit
   | Some cfg ->
@@ -1540,7 +1633,8 @@ let replay_future_votes t =
     match C_types.pubkey_of_addr t.engine.vs vote.validator with
     | Some pubkey when C_hash.verify_vote ~pubkey_raw:pubkey vote ->
       (match C_engine.conflicting_vote t.engine vote with
-       | Some prior -> record_vote_conflict t prior vote
+       | Some prior ->
+         record_vote_conflict ~validator_set:t.engine.vs t prior vote
        | None ->
          C_engine.on_vote t.engine vote ~sign_fn:t.config.sign_fn;
          None)
@@ -1700,7 +1794,15 @@ let rec process_outputs_once t =
                 fire ());
               Lwt.return_true
             | C_engine.SendVote v ->
-              if not (t.config.can_vote ()) then begin
+              if not (vote_still_relevant t v) then begin
+                log_node t.config.my_addr
+                  "event = drop_stale_vote_output type = %s epoch = %Ld round = %d height = %Ld"
+                  (vote_step_label v.vote_type)
+                  v.epoch_id
+                  v.round
+                  t.engine.state.height;
+                Lwt.return_true
+              end else if not (t.config.can_vote ()) then begin
                 let* durable = vote_durable t v in
                 if not durable then begin
                   error_node t.config.my_addr
@@ -1834,10 +1936,17 @@ let on_p2p_message t _conn (frame : Frame.frame) =
   let open Lwt.Syntax in
   let skip_dedup = repeatable_query_frame frame in
   let allowed = frame_allowed ~running:t.running frame.msg_type in
+  let verify_before_dedup =
+    engine_output_frame frame.msg_type
+    || frame.msg_type = Frame.msg_vote_evidence
+  in
   let repeated =
     allowed
     && not skip_dedup
-    && is_seen t frame.msg_type frame.payload
+    && if verify_before_dedup then
+         frame_known t frame.msg_type frame.payload
+       else
+         is_seen t frame.msg_type frame.payload
   in
   if not allowed then begin
     trace_node t.config.my_addr
@@ -1858,31 +1967,32 @@ let on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch
         (fun () ->
           let sync = C_codec.decode_round_sync frame.payload in
-          if sync.chain_id <> t.config.chain_id then
+          if sync.chain_id <> t.config.chain_id then begin
+            remember_frame t frame.msg_type frame.payload;
             Lwt.return_unit
-          else
+          end else
             match
               proposal_height_status
                 ~current:t.engine.state.height
                 ~proposal:sync.epoch_id
             with
-            | Proposal_stale
+            | Proposal_stale ->
+              remember_frame t frame.msg_type frame.payload;
+              Lwt.return_unit
             | Proposal_future ->
               Lwt.return_unit
             | Proposal_current ->
               match C_types.pubkey_of_addr t.engine.vs sync.validator with
               | None ->
+                remember_frame t frame.msg_type frame.payload;
                 warn_node t.config.my_addr
                   "event = reject_round_sync reason = unknown_validator from = %s"
                   (String.sub sync.validator 0
                     (min 12 (String.length sync.validator)));
-                Octra_net.P2p_swarm.report_bad_peer
-                  t.swarm
-                  _conn
-                  ~reason:"unknown_round_sync_validator";
                 Lwt.return_unit
               | Some pubkey
                 when not (C_hash.verify_round_sync ~pubkey_raw:pubkey sync) ->
+                remember_frame t frame.msg_type frame.payload;
                 warn_node t.config.my_addr
                   "event = reject_round_sync reason = bad_signature from = %s"
                   (String.sub sync.validator 0
@@ -1893,6 +2003,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                   ~reason:"bad_signature_round_sync";
                 Lwt.return_unit
               | Some _ ->
+                remember_frame t frame.msg_type frame.payload;
                 let current_round = t.engine.state.round in
                 let relay_candidate =
                   round_sync_relay_relevant
@@ -1928,6 +2039,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                     Lwt.return_unit
                 end)
         (fun exn ->
+          remember_frame t frame.msg_type frame.payload;
           warn_node t.config.my_addr
             "event = bad_round_sync error = %s"
             (Printexc.to_string exn);
@@ -1940,6 +2052,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch (fun () ->
         let p = C_codec.decode_propose frame.payload in
         if p.chain_id <> t.config.chain_id then begin
+          remember_frame t frame.msg_type frame.payload;
           warn_node t.config.my_addr
             "event = reject_propose reason = chain_id_mismatch got = %s ours = %s"
             p.chain_id t.config.chain_id;
@@ -1950,12 +2063,14 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                 ~local_head:(t.config.local_head_epoch ())
                 ~proposal:p.epoch_id with
         | Proposal_stale ->
+          remember_frame t frame.msg_type frame.payload;
           Lwt.return_unit
         | Proposal_future ->
+          let* validator_set = validator_set_for_frame t p.epoch_id in
           (match
              validate_proposal_frame
                ~chain_id:t.config.chain_id
-               ~validator_set:t.engine.vs
+               ~validator_set
                p
            with
            | Error error ->
@@ -1963,20 +2078,41 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                "event = ignore_future_propose reason = unresolved_validator_set predicate = %s epoch = %Ld local_height = %Ld"
                (proposal_frame_error_label error)
                p.epoch_id
-               t.engine.state.height
+               t.engine.state.height;
+             (match error with
+              | Proposal_unknown_validator -> ()
+              | _ ->
+                remember_frame t frame.msg_type frame.payload;
+                report_proposal_error
+                  t
+                  _conn
+                  validator_set
+                  p.proposer
+                  error);
+             Lwt.return_unit
            | Ok () ->
-             if defer_pending_proposal t p then
+             let deferred = defer_pending_proposal t p in
+             if deferred then begin
+               remember_frame t frame.msg_type frame.payload;
                log_node t.config.my_addr
                  "event = defer_pending_proposal epoch = %Ld round = %d local_height = %Ld"
                  p.epoch_id
                  p.round
-                 t.engine.state.height);
-          Lwt.return_unit
+                 t.engine.state.height
+             end;
+             if deferred then
+               Octra_net.P2p_swarm.broadcast_except
+                 t.swarm
+                 ~except:_conn.Octra_net.P2p_conn.peer_id
+                 { msg_type = Frame.msg_cons_propose; payload = frame.payload }
+             else
+               Lwt.return_unit)
         | Proposal_current ->
+          let* validator_set = validator_set_for_frame t p.epoch_id in
           (match
              validate_proposal_frame
                ~chain_id:t.config.chain_id
-               ~validator_set:t.engine.vs
+               ~validator_set
                p
            with
            | Error error ->
@@ -1987,12 +2123,20 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                p.round
                (String.sub p.proposer 0
                   (min 12 (String.length p.proposer)));
-             Octra_net.P2p_swarm.report_bad_peer
-               t.swarm
-               _conn
-               ~reason:(proposal_frame_peer_reason error);
+             (match error with
+              | Proposal_unknown_validator ->
+                remember_frame t frame.msg_type frame.payload
+              | _ ->
+                remember_frame t frame.msg_type frame.payload;
+                report_proposal_error
+                  t
+                  _conn
+                  validator_set
+                  p.proposer
+                  error);
              Lwt.return_unit
            | Ok () ->
+             remember_frame t frame.msg_type frame.payload;
              let route =
                Relay_verified_proposal {
                  source_peer = _conn.Octra_net.P2p_conn.peer_id;
@@ -2003,6 +2147,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
              process_outputs t)
         )
       (fun exn ->
+        remember_frame t frame.msg_type frame.payload;
         warn_node t.config.my_addr "event = bad_propose error = %s"
           (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"invalid_frame_propose";
@@ -2011,6 +2156,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch (fun () ->
         let v = C_codec.decode_vote frame.payload in
         if v.chain_id <> t.config.chain_id then begin
+          remember_frame t frame.msg_type frame.payload;
           warn_node t.config.my_addr
             "event = reject_vote reason = chain_id_mismatch got = %s ours = %s"
             v.chain_id t.config.chain_id;
@@ -2021,47 +2167,61 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                 ~local_head:(t.config.local_head_epoch ())
                 ~proposal:v.epoch_id with
         | Proposal_stale ->
+          remember_frame t frame.msg_type frame.payload;
           Lwt.return_unit
         | status ->
-          let valid =
-            match C_types.pubkey_of_addr t.engine.vs v.validator with
-            | Some pk -> C_hash.verify_vote ~pubkey_raw:pk v
-            | None -> false
+          let* validator_set = validator_set_for_frame t v.epoch_id in
+          let validation =
+            match C_types.pubkey_of_addr validator_set v.validator with
+            | None -> `Unknown_validator
+            | Some pubkey when C_hash.verify_vote ~pubkey_raw:pubkey v ->
+              `Valid
+            | Some _ -> `Bad_signature
           in
-          if not valid then begin
+          if validation = `Unknown_validator then begin
             (match status with
              | Proposal_current ->
-               warn_node t.config.my_addr
-                 "event = reject_vote reason = bad_signature_or_unknown_validator from = %s"
-                 (String.sub v.validator 0
-                    (min 12 (String.length v.validator)));
-               Octra_net.P2p_swarm.report_bad_peer
-                 t.swarm
-                 _conn
-                 ~reason:"bad_signature_vote"
-             | Proposal_future ->
-               log_node t.config.my_addr
-                 "event = ignore_future_vote reason = unresolved_validator_set epoch = %Ld local_height = %Ld"
-                 v.epoch_id
-                 t.engine.state.height
+               remember_frame t frame.msg_type frame.payload
+             | Proposal_future
              | Proposal_stale -> ());
+            log_node t.config.my_addr
+              "event = ignore_vote reason = unresolved_validator_set epoch = %Ld local_height = %Ld validator = %s"
+              v.epoch_id
+              t.engine.state.height
+              v.validator;
             Lwt.return_unit
-          end else
-            let relay_candidate =
-              match status with
-              | Proposal_current ->
-                vote_relay_relevant
-                  ~current_height:t.engine.state.height
-                  ~current_round:t.engine.state.round
-                  v
-              | Proposal_stale
-              | Proposal_future -> false
-            in
+          end else if validation = `Bad_signature then begin
+            remember_frame t frame.msg_type frame.payload;
+            warn_node t.config.my_addr
+              "event = reject_vote reason = bad_signature epoch = %Ld validator = %s"
+              v.epoch_id
+              v.validator;
+            Octra_net.P2p_swarm.report_bad_peer
+              t.swarm
+              _conn
+              ~reason:"bad_signature_vote";
+            Lwt.return_unit
+          end else begin
+            remember_frame t frame.msg_type frame.payload;
             let future =
               match status with
               | Proposal_future -> defer_future_vote t v
               | Proposal_current
               | Proposal_stale -> Future_vote_not_applicable
+            in
+            let relay_candidate =
+              match status, future with
+              | Proposal_current, _ ->
+                vote_relay_relevant
+                  ~current_height:t.engine.state.height
+                  ~current_round:t.engine.state.round
+                  v
+              | Proposal_future, Future_vote_deferred ->
+                future_vote_relay_relevant
+                  ~current_height:t.engine.state.height
+                  v
+              | Proposal_future, _
+              | Proposal_stale, _ -> false
             in
             (match future with
              | Future_vote_deferred ->
@@ -2076,12 +2236,13 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             let evidence =
               match status, future with
               | Proposal_future, Future_vote_conflict prior ->
-                record_vote_conflict ~conn:_conn t prior v
+                record_vote_conflict ~validator_set t prior v
               | Proposal_future, _ ->
                 None
               | Proposal_current, _ ->
                 (match C_engine.conflicting_vote t.engine v with
-                 | Some prior -> record_vote_conflict ~conn:_conn t prior v
+                 | Some prior ->
+                   record_vote_conflict ~validator_set t prior v
                  | None ->
                    C_engine.on_vote t.engine v ~sign_fn:t.config.sign_fn;
                    None)
@@ -2105,8 +2266,10 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               else
                 Lwt.return_unit
             in
-            Lwt.return_unit)
+            Lwt.return_unit
+          end)
       (fun exn ->
+        remember_frame t frame.msg_type frame.payload;
         warn_node t.config.my_addr "event = bad_vote error = %s"
           (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"invalid_frame_vote";
@@ -2115,6 +2278,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch (fun () ->
         let f = C_codec.decode_finalize frame.payload in
         if f.chain_id <> t.config.chain_id then begin
+          remember_frame t frame.msg_type frame.payload;
           warn_node t.config.my_addr
             "event = reject_finalize reason = chain_id_mismatch got = %s ours = %s"
             f.chain_id t.config.chain_id;
@@ -2125,6 +2289,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
                 ~local_head:(t.config.local_head_epoch ())
                 ~proposal:f.epoch_id with
         | Proposal_stale ->
+          remember_frame t frame.msg_type frame.payload;
           Lwt.return_unit
         | Proposal_future ->
           log_node t.config.my_addr
@@ -2139,6 +2304,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               f.parent_commit
           with
           | Error reason ->
+            remember_frame t frame.msg_type frame.payload;
             warn_node t.config.my_addr
               "event = reject_finalize reason = parent_commit detail = %s"
               reason;
@@ -2156,6 +2322,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             f
           with
           | C_qc.Invalid reason ->
+            remember_frame t frame.msg_type frame.payload;
             warn_node t.config.my_addr
               "event = reject_finalize reason = qc_%s" reason;
             let peer_reason =
@@ -2165,6 +2332,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
             Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:peer_reason;
             Lwt.return_unit
           | C_qc.Valid ->
+            remember_frame t frame.msg_type frame.payload;
             let expected_pid = C_hash.proposal_id f.header in
           trace_node t.config.my_addr
             "event = recv_finalize epoch = %Ld commit_round = %d pid = %s creator = %s precommits = %d"
@@ -2192,6 +2360,7 @@ let on_p2p_message t _conn (frame : Frame.frame) =
               end
         )
       (fun exn ->
+        remember_frame t frame.msg_type frame.payload;
         warn_node t.config.my_addr "event = bad_finalize error = %s"
           (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"invalid_frame_finalize";
@@ -2483,17 +2652,43 @@ let on_p2p_message t _conn (frame : Frame.frame) =
     | t' when t' = Frame.msg_vote_evidence ->
       Lwt.catch (fun () ->
         let evidence = C_evidence.decode_vote_conflict frame.payload in
-        if not (verify_vote_evidence t evidence) then begin
+        let epoch = evidence.C_evidence.second.epoch_id in
+        let* validator_set = validator_set_for_frame t epoch in
+        match
+          validate_vote_evidence
+            ~chain_id:t.config.chain_id
+            ~validator_set
+            ~current:t.engine.state.height
+            evidence
+        with
+        | Evidence_unknown_validator ->
+          if epoch <= t.engine.state.height then
+            remember_frame t frame.msg_type frame.payload;
+          log_node t.config.my_addr
+            "event = ignore_vote_evidence reason = unresolved_validator_set epoch = %Ld"
+            epoch;
+          Lwt.return_unit
+        | Evidence_invalid ->
+          remember_frame t frame.msg_type frame.payload;
           Octra_net.P2p_swarm.report_bad_peer t.swarm _conn
             ~reason:"invalid_vote_evidence";
           Lwt.return_unit
-        end else if not (remember_vote_evidence t evidence) then
-          Lwt.return_unit
-        else
-          Octra_net.P2p_swarm.broadcast_except t.swarm
-            ~except:_conn.Octra_net.P2p_conn.peer_id
-            (vote_evidence_frame evidence))
+        | Evidence_valid ->
+          remember_frame t frame.msg_type frame.payload;
+          report_validator_identity
+            t
+            validator_set
+            evidence.C_evidence.second.validator
+            ~reason:"vote_equivocation";
+          if not (remember_vote_evidence t evidence) then
+            Lwt.return_unit
+          else
+            Octra_net.P2p_swarm.broadcast_except t.swarm
+              ~except:_conn.Octra_net.P2p_conn.peer_id
+              (vote_evidence_frame evidence)
+        )
       (fun exn ->
+        remember_frame t frame.msg_type frame.payload;
         log_node t.config.my_addr "event = bad_vote_evidence error = %s"
           (Printexc.to_string exn);
         Octra_net.P2p_swarm.report_bad_peer t.swarm _conn

@@ -780,6 +780,20 @@ let peer_score ~now (row : Octra_net.P2p_peer_guard.score_record) =
     "stale_root_count", `Int row.stale_root_count;
   ]
 
+let peer_record_rejection (row : Octra_net.P2p_peer_diag.rejection) =
+  `Assoc [
+    "reason", `String row.reason;
+    "count", `Int row.count;
+  ]
+
+let relayed_record_diag (stats : Octra_net.P2p_peer_diag.relayed_records) =
+  `Assoc [
+    "accepted", `Int stats.accepted;
+    "unchanged", `Int stats.unchanged;
+    "rejected", `Int stats.rejected;
+    "rejections", `List (List.map peer_record_rejection stats.rejections);
+  ]
+
 let peer_diag = function
   | None -> fun ~now:_ -> `Null, []
   | Some diag ->
@@ -790,6 +804,7 @@ let peer_diag = function
           "known", `Int diag.known;
           "public_sources", `Int diag.public_sources;
           "sources", `List (List.map peer_source diag.sources);
+          "relayed_records", relayed_record_diag diag.relayed_records;
           "risks", `List (List.map (fun s -> `String s) diag.risks);
         ]
       in

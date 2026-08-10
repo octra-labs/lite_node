@@ -555,6 +555,7 @@ let realign_round t round =
 
 let start_height t height =
   t.generation <- t.generation + 1;
+  t.outputs <- [];
   t.state <- initial_engine_state height;
   t.proposal_cache <- Hashtbl.create 8;
   t.proposal_messages <- Hashtbl.create 8;

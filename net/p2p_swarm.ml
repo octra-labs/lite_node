@@ -29,6 +29,10 @@ type t = {
   dialing : (string, unit) Hashtbl.t;
   registry : P2p_peer_registry.t;
   peer_guard : P2p_peer_guard.t;
+  relayed_record_rejections : (string, int) Hashtbl.t;
+  mutable relayed_record_accepted : int;
+  mutable relayed_record_unchanged : int;
+  mutable relayed_record_rejected : int;
   mutable validator_pubkeys : string list option;
   mutable on_message : (P2p_conn.t -> P2p_frame.frame -> unit Lwt.t);
   mutable running : bool;
@@ -43,6 +47,10 @@ let create config =
     dialing = Hashtbl.create 16;
     registry = P2p_peer_registry.create ();
     peer_guard = P2p_peer_guard.create ();
+    relayed_record_rejections = Hashtbl.create 8;
+    relayed_record_accepted = 0;
+    relayed_record_unchanged = 0;
+    relayed_record_rejected = 0;
     validator_pubkeys =
       if config.allowed_pubkeys = [] then None
       else Some config.allowed_pubkeys;
@@ -72,6 +80,26 @@ let peer_ids t =
 let peer_scores t =
   P2p_peer_guard.snapshot t.peer_guard
 
+let relayed_record_stats t =
+  let rejections =
+    Hashtbl.fold
+      (fun reason count acc ->
+        P2p_peer_diag.{ reason; count } :: acc)
+      t.relayed_record_rejections
+      []
+    |> List.sort
+         (fun
+           (left : P2p_peer_diag.rejection)
+           (right : P2p_peer_diag.rejection) ->
+           String.compare left.reason right.reason)
+  in
+  P2p_peer_diag.{
+    accepted = t.relayed_record_accepted;
+    unchanged = t.relayed_record_unchanged;
+    rejected = t.relayed_record_rejected;
+    rejections;
+  }
+
 let validator_node_ids t =
   match t.validator_pubkeys with
   | None -> []
@@ -84,6 +112,10 @@ let peer_role t peer_id =
   | Some _ ->
     if List.mem peer_id (validator_node_ids t) then Validator
     else Observer
+
+let frame_peer_class = function
+  | Validator -> P2p_frame_budget.Validator
+  | Observer -> P2p_frame_budget.Observer
 
 let local_is_validator t =
   match t.validator_pubkeys with
@@ -105,6 +137,10 @@ let set_validator_pubkeys t pubkeys =
     Ok ()
   else begin
     t.validator_pubkeys <- Some pubkeys;
+    Hashtbl.iter
+      (fun peer_id conn ->
+        P2p_conn.set_peer_class conn (frame_peer_class (peer_role t peer_id)))
+      t.peers;
     P2p_peer_registry.clear t.registry;
     Ok ()
   end
@@ -145,7 +181,13 @@ let find_peer t peer_id =
   Hashtbl.find_opt t.peers peer_id
 
 let peer_key conn =
-  P2p_peer_guard.host_of_addr conn.P2p_conn.addr
+  P2p_peer_guard.identity_key conn.P2p_conn.peer_id
+
+let identity_is_banned t peer_id =
+  P2p_peer_guard.is_banned
+    t.peer_guard
+    ~now:(Unix.gettimeofday ())
+    ~key:(P2p_peer_guard.identity_key peer_id)
 
 let log_node addr fmt =
   Printf.ksprintf
@@ -157,8 +199,7 @@ let err_node addr fmt =
     (fun msg -> Octra_log.warn "p2p" "node = %s %s" addr msg)
     fmt
 
-let report_bad_peer t conn ~reason =
-  let key = peer_key conn in
+let report_bad_key t ~key ~reason ~on_ban =
   match P2p_peer_guard.report_bad t.peer_guard
     ~now:(Unix.gettimeofday ()) ~key ~reason with
   | P2p_peer_guard.Noted count ->
@@ -166,7 +207,26 @@ let report_bad_peer t conn ~reason =
       key count reason
   | P2p_peer_guard.Banned until_ts ->
     err_node t.config.node_addr "event = peer_banned key = %s until = %.0f reason = %s"
-      key until_ts reason
+      key until_ts reason;
+    on_ban ()
+
+let report_bad_identity t ~peer_id ~reason =
+  let key = P2p_peer_guard.identity_key peer_id in
+  report_bad_key
+    t
+    ~key
+    ~reason
+    ~on_ban:(fun () ->
+      match find_peer t peer_id with
+      | Some conn -> Lwt.async (fun () -> P2p_conn.close conn)
+      | None -> ())
+
+let report_bad_peer t conn ~reason =
+  report_bad_key
+    t
+    ~key:(peer_key conn)
+    ~reason
+    ~on_ban:(fun () -> Lwt.async (fun () -> P2p_conn.close conn))
 
 let is_peer_connected t peer_id =
   match Hashtbl.find_opt t.peers peer_id with
@@ -247,6 +307,7 @@ let peer_diagnostics t =
     ~connected:(List.map (fun conn -> conn.P2p_conn.addr) (connected_peers t))
     ~records:(peer_records t)
     ~scores:(peer_scores t)
+    ~relayed_records:(relayed_record_stats t)
     ()
 
 let broadcast t (frame : P2p_frame.frame) =
@@ -377,9 +438,17 @@ let dial t host port =
         | P2p_handshake.Ok peer_hello ->
           let peer_id = peer_hello.node_id in
           let addr_str = Printf.sprintf "%s:%d" host port in
-          let conn = P2p_conn.create fd ~peer_id ~addr:addr_str
+          let conn = P2p_conn.create
+            ~peer_class:(frame_peer_class (peer_role t peer_id))
+            fd ~peer_id ~addr:addr_str
             ~direction:P2p_conn.Outbound in
-          if add_peer t conn then begin
+          if identity_is_banned t peer_id then begin
+            err_node t.config.node_addr
+              "event = outbound_peer_rejected peer = %s reason = identity_banned"
+              peer_id;
+            let* () = P2p_conn.close conn in
+            Lwt.return_none
+          end else if add_peer t conn then begin
             log_node t.config.node_addr
               "event = connected peer = %s addr = %s"
               peer_id addr_str;
@@ -428,9 +497,26 @@ let accept_relayed_records t records =
   records
   |> List.iter (fun r ->
     match accept_record t r with
-    | Ok true -> maybe_dial_record t r
-    | Ok false
-    | Error _ -> ())
+    | Ok true ->
+      t.relayed_record_accepted <- t.relayed_record_accepted + 1;
+      maybe_dial_record t r
+    | Ok false ->
+      t.relayed_record_unchanged <- t.relayed_record_unchanged + 1
+    | Error reason ->
+      t.relayed_record_rejected <- t.relayed_record_rejected + 1;
+      let count =
+        Option.value
+          ~default:0
+          (Hashtbl.find_opt t.relayed_record_rejections reason)
+        + 1
+      in
+      Hashtbl.replace t.relayed_record_rejections reason count;
+      if count land (count - 1) = 0 then
+        err_node t.config.node_addr
+          "event = relayed_peer_record_rejected reason = %s count = %d node_id = %s"
+          reason
+          count
+          r.P2p_peer_record.node_id)
 
 let handle_peers t conn payload =
   Lwt.catch
@@ -494,9 +580,17 @@ let accept t fd addr =
               Printf.sprintf "%s:%d" (Unix.string_of_inet_addr ip) port
             | Unix.ADDR_UNIX s -> s
           in
-          let conn = P2p_conn.create fd ~peer_id ~addr:addr_str
+          let conn = P2p_conn.create
+            ~peer_class:(frame_peer_class (peer_role t peer_id))
+            fd ~peer_id ~addr:addr_str
             ~direction:P2p_conn.Inbound in
-          if add_peer t conn then begin
+          if identity_is_banned t peer_id then begin
+            err_node t.config.node_addr
+              "event = inbound_peer_rejected peer = %s reason = identity_banned"
+              peer_id;
+            let* () = P2p_conn.close conn in
+            Lwt.return_unit
+          end else if add_peer t conn then begin
             Lwt.async (fun () -> P2p_conn.start conn ~on_message:t.on_message);
             Lwt.async (fun () -> exchange_peers t conn);
             Lwt.return_unit

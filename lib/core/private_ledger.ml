@@ -220,6 +220,46 @@ let key_switch_migration_of_name = function
   | "historical_owner_proof" -> Ok Historical_owner_proof
   | value -> Error ("unknown key_switch migration_mode = " ^ value)
 
+let json_member json name =
+  match json with
+  | `Assoc fields ->
+    begin
+      match
+        List.filter_map
+          (fun (field_name, value) ->
+            if String.equal field_name name then Some value else None)
+          fields
+      with
+      | [] -> Ok None
+      | [value] -> Ok (Some value)
+      | _ -> Error ("duplicate " ^ name)
+    end
+  | _ -> Error "encrypted_data must be a JSON object"
+
+let required_string_field json name =
+  match json_member json name with
+  | Ok (Some (`String value)) -> Ok value
+  | Ok None
+  | Ok (Some `Null) -> Error ("missing " ^ name)
+  | Ok (Some _) -> Error (name ^ " must be a string")
+  | Error reason -> Error reason
+
+let optional_string_field json name =
+  match json_member json name with
+  | Ok None
+  | Ok (Some `Null) -> Ok None
+  | Ok (Some (`String value)) -> Ok (Some value)
+  | Ok (Some _) -> Error (name ^ " must be a string")
+  | Error reason -> Error reason
+
+let optional_bool_field json name =
+  match json_member json name with
+  | Ok None
+  | Ok (Some `Null) -> Ok None
+  | Ok (Some (`Bool value)) -> Ok (Some value)
+  | Ok (Some _) -> Error (name ^ " must be a boolean")
+  | Error reason -> Error reason
+
 let compatibility_migration json =
   let legacy_fields = [
     "legacy_ct_migration", Rejected_rebinding;
@@ -227,29 +267,35 @@ let compatibility_migration json =
     "legacy_commitment_migration", Commitment_history;
     "legacy_zero_reset", Verified_zero_reset;
   ] in
-  let requested =
-    List.filter_map
-      (fun (name, migration) ->
-        if Yojson.Safe.Util.(member name json |> to_bool_option) = Some true
-        then Some migration
-        else None)
-      legacy_fields
+  let rec collect requested = function
+    | [] -> Ok (List.rev requested)
+    | (name, migration) :: rest ->
+      begin
+        match optional_bool_field json name with
+        | Error reason -> Error reason
+        | Ok (Some true) -> collect (migration :: requested) rest
+        | Ok (Some false)
+        | Ok None -> collect requested rest
+      end
   in
-  match requested with
-  | [] -> Ok Standard
-  | [migration] -> Ok migration
-  | _ -> Error "key_switch migration modes are mutually exclusive"
+  match collect [] legacy_fields with
+  | Error reason -> Error reason
+  | Ok [] -> Ok Standard
+  | Ok [migration] -> Ok migration
+  | Ok _ -> Error "key_switch migration modes are mutually exclusive"
 
 let parse_key_switch_migration json =
-  let requested =
-    Yojson.Safe.Util.(member "migration_mode" json |> to_string_option)
-  in
-  match requested, compatibility_migration json with
-  | _, Error reason -> Error reason
-  | None, Ok migration -> Ok migration
-  | Some name, Ok Standard -> key_switch_migration_of_name name
-  | Some _, Ok _ ->
-    Error "migration_mode cannot be mixed with legacy migration fields"
+  match optional_string_field json "migration_mode" with
+  | Error reason -> Error reason
+  | Ok requested ->
+    begin
+      match requested, compatibility_migration json with
+      | _, Error reason -> Error reason
+      | None, Ok migration -> Ok migration
+      | Some name, Ok Standard -> key_switch_migration_of_name name
+      | Some _, Ok _ ->
+        Error "migration_mode cannot be mixed with legacy migration fields"
+    end
 
 let error ?user_reason tag reason =
   let user_reason = match user_reason with
@@ -369,10 +415,7 @@ let claim_gate claimer (so : Ledger_types.stealth_output) (claim : SC.t) =
       "stealth output predates key-bound PVAC send verification; legacy output migration is required"
   else Ok ()
 
-let field json name =
-  match Yojson.Safe.Util.(member name json |> to_string_option) with
-  | Some s -> Ok s
-  | None -> Error ("missing " ^ name)
+let field = required_string_field
 
 let json_payload op raw =
   match raw with
@@ -418,10 +461,15 @@ let parse_decrypt raw =
       field json "zero_proof",
       field json "blinding" with
     | Ok cipher, Ok amount_commitment, Ok zero_proof, Ok blinding ->
-      let range_proof_balance =
-        Yojson.Safe.Util.(member "range_proof_balance" json |> to_string_option)
-      in
-      Ok { cipher; amount_commitment; zero_proof; blinding; range_proof_balance }
+      begin
+        match optional_string_field json "range_proof_balance" with
+        | Ok range_proof_balance ->
+          Ok { cipher; amount_commitment; zero_proof; blinding; range_proof_balance }
+        | Error e ->
+          error "malformed_transaction"
+            ("decrypt: cannot parse encrypted_data: " ^ e)
+            ~user_reason:"decrypt: malformed encrypted_data"
+      end
     | Error e, _, _, _
     | _, Error e, _, _
     | _, _, Error e, _
@@ -435,31 +483,42 @@ let parse_key_switch raw =
   | Error e ->
     error "key_switch_rejected" e.reason ~user_reason:"encrypted_data must be JSON with new_pubkey and aes_kat"
   | Ok json ->
-    match field json "new_pubkey", field json "aes_kat" with
-    | Ok new_pubkey_b64, Ok aes_kat ->
-      begin
-        match parse_key_switch_migration json with
-        | Error reason -> error "key_switch_rejected" reason
-        | Ok migration ->
-          Ok {
-            new_pubkey_b64;
-            aes_kat;
-            old_bound_pubkey_b64 = Yojson.Safe.Util.(member "old_bound_pubkey" json |> to_string_option);
-            old_bound_cipher = Yojson.Safe.Util.(member "old_bound_cipher" json |> to_string_option);
-            source_cipher_hash = Yojson.Safe.Util.(member "source_cipher_hash" json |> to_string_option);
-            new_cipher = Yojson.Safe.Util.(member "new_cipher" json |> to_string_option);
-            old_zero_proof = Yojson.Safe.Util.(member "old_zero_proof" json |> to_string_option);
-            new_zero_proof = Yojson.Safe.Util.(member "new_zero_proof" json |> to_string_option);
-            amount_commitment = Yojson.Safe.Util.(member "amount_commitment" json |> to_string_option);
-            amount_blinding = Yojson.Safe.Util.(member "amount_blinding" json |> to_string_option);
-            migration;
-          }
-      end
-    | Error e, _
-    | _, Error e ->
-      error "key_switch_rejected"
-        ("encrypted_data must be JSON with new_pubkey and aes_kat: " ^ e)
-        ~user_reason:"encrypted_data must be JSON with new_pubkey and aes_kat"
+    let ( let* ) value next = Result.bind value next in
+    let decoded =
+      let* new_pubkey_b64 = required_string_field json "new_pubkey" in
+      let* aes_kat = required_string_field json "aes_kat" in
+      let* migration = parse_key_switch_migration json in
+      let* old_bound_pubkey_b64 =
+        optional_string_field json "old_bound_pubkey"
+      in
+      let* old_bound_cipher = optional_string_field json "old_bound_cipher" in
+      let* source_cipher_hash = optional_string_field json "source_cipher_hash" in
+      let* new_cipher = optional_string_field json "new_cipher" in
+      let* old_zero_proof = optional_string_field json "old_zero_proof" in
+      let* new_zero_proof = optional_string_field json "new_zero_proof" in
+      let* amount_commitment = optional_string_field json "amount_commitment" in
+      let* amount_blinding = optional_string_field json "amount_blinding" in
+      Ok {
+        new_pubkey_b64;
+        aes_kat;
+        old_bound_pubkey_b64;
+        old_bound_cipher;
+        source_cipher_hash;
+        new_cipher;
+        old_zero_proof;
+        new_zero_proof;
+        amount_commitment;
+        amount_blinding;
+        migration;
+      }
+    in
+    begin
+      match decoded with
+      | Ok payload -> Ok payload
+      | Error reason ->
+        error "key_switch_rejected" reason
+          ~user_reason:"encrypted_data must be JSON with new_pubkey and aes_kat"
+    end
 
 let key_switch_requests_legacy_public_migration tx =
   match parse_key_switch tx.T.encrypted_data with
@@ -486,37 +545,50 @@ let key_switch_requests_legacy_audit tx =
   | Error _ -> false
 
 let version json =
-  match Yojson.Safe.Util.(member "version" json |> to_int_option) with
-  | Some v -> v
-  | None -> 0
+  match json_member json "version" with
+  | Ok (Some (`Int value)) -> Ok value
+  | Ok None
+  | Ok (Some `Null) -> Ok 0
+  | Ok (Some _) -> Error "version must be an integer"
+  | Error reason -> Error reason
 
 let parse_stealth raw =
   match safe_json raw with
   | Error "missing" -> error "missing_encrypted_data" "encrypted_data required for stealth transfer"
   | Error _ -> error "version_rejected" "only version 5 stealth transfers are accepted"
   | Ok json ->
-    if version json <> 5 then
-      error "version_rejected" "only version 5 stealth transfers are accepted"
-    else
-      match PT.of_json json with
-      | Error e -> error "invalid_stealth_data" ("cannot parse V5 payload: " ^ e)
-      | Ok ptd ->
-        if String.length ptd.PT.claim_pub <> 64 then
-          error "invalid_claim_pub" "claim_pub must be 64 hex characters"
-        else
-          Ok ptd
+    begin
+      match version json with
+      | Error _ ->
+        error "version_rejected" "only version 5 stealth transfers are accepted"
+      | Ok value when value <> 5 ->
+        error "version_rejected" "only version 5 stealth transfers are accepted"
+      | Ok _ ->
+        match PT.of_json json with
+        | Error e -> error "invalid_stealth_data" ("cannot parse V5 payload: " ^ e)
+        | Ok ptd ->
+          if String.length ptd.PT.claim_pub <> 64 then
+            error "invalid_claim_pub" "claim_pub must be 64 hex characters"
+          else
+            Ok ptd
+    end
 
 let parse_claim raw =
   match safe_json raw with
   | Error "missing" -> error "missing_encrypted_data" "encrypted_data required for claim"
   | Error _ -> error "version_rejected" "only version 5 (private) claim operations are accepted"
   | Ok json ->
-    if version json <> 5 then
-      error "version_rejected" "only version 5 (private) claim operations are accepted"
-    else
-      match SC.of_json json with
-      | Error e -> error "invalid_claim_data" ("cannot parse V5 claim payload: " ^ e)
-      | Ok claim -> Ok claim
+    begin
+      match version json with
+      | Error _ ->
+        error "version_rejected" "only version 5 (private) claim operations are accepted"
+      | Ok value when value <> 5 ->
+        error "version_rejected" "only version 5 (private) claim operations are accepted"
+      | Ok _ ->
+        match SC.of_json json with
+        | Error e -> error "invalid_claim_data" ("cannot parse V5 claim payload: " ^ e)
+        | Ok claim -> Ok claim
+    end
 
 let private_verifier = "pvac_private_preverify"
 

@@ -7,13 +7,33 @@ type source = {
   connected : int;
 }
 
+type rejection = {
+  reason : string;
+  count : int;
+}
+
+type relayed_records = {
+  accepted : int;
+  unchanged : int;
+  rejected : int;
+  rejections : rejection list;
+}
+
 type t = {
   connected : int;
   known : int;
   public_sources : int;
   sources : source list;
   scores : P2p_peer_guard.score_record list;
+  relayed_records : relayed_records;
   risks : string list;
+}
+
+let empty_relayed_records = {
+  accepted = 0;
+  unchanged = 0;
+  rejected = 0;
+  rejections = [];
 }
 
 let bump tbl key f =
@@ -70,7 +90,13 @@ let risk_rows ~min_public_sources public_sources (sources : source list) =
   else
     []
 
-let make ?(min_public_sources = 2) ~connected ~records ~scores () =
+let make
+    ?(min_public_sources = 2)
+    ?(relayed_records = empty_relayed_records)
+    ~connected
+    ~records
+    ~scores
+    () =
   let sources = source_rows records connected in
   let public_sources =
     (sources : source list)
@@ -84,5 +110,6 @@ let make ?(min_public_sources = 2) ~connected ~records ~scores () =
     public_sources;
     sources;
     scores;
+    relayed_records;
     risks = risk_rows ~min_public_sources public_sources sources;
   }

@@ -150,6 +150,9 @@ let unix_key = function
   | Unix.ADDR_INET (ip, _) -> Unix.string_of_inet_addr ip
   | Unix.ADDR_UNIX s -> s
 
+let identity_key node_id =
+  "node:" ^ node_id
+
 let handshake_penalty reason =
   if contains reason "invalid Ed25519 signature" then
     Some "bad_signature_handshake"

@@ -994,18 +994,12 @@ fn run_describe(payload: &Payload) -> Result<JsonValue, String> {
         .get_func(&runtime.store, "octra_manifest")
         .is_some()
     {
-        let (code, response_bytes, _effort_used) = runtime
-            .call_export("octra_manifest", &[])
-            .map_err(|error| format!("wasm manifest execution failed: {error}"))?;
-        if code != 0 {
-            return Err(format!("wasm manifest returned {code}"));
+        match runtime.call_export("octra_manifest", &[]) {
+            Ok((_code, response_bytes, _effort_used)) => {
+                serde_json::from_slice::<JsonValue>(&response_bytes).ok()
+            }
+            Err(_) => None,
         }
-        let value = serde_json::from_slice::<JsonValue>(&response_bytes)
-            .map_err(|error| format!("invalid wasm manifest json: {error}"))?;
-        if !value.is_object() {
-            return Err("wasm manifest must be an object".to_owned());
-        }
-        Some(value)
     } else {
         None
     };
@@ -6481,6 +6475,33 @@ mod tests {
         }
     }
 
+    fn manifest_module(body: &[u8]) -> Vec<u8> {
+        let mut wasm = vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x02, 0x60, 0x01, 0x7f,
+            0x01, 0x7f, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x03, 0x02, 0x00, 0x01, 0x05,
+            0x03, 0x01, 0x00, 0x01, 0x07, 0x37, 0x04, 0x06, b'm', b'e', b'm', b'o', b'r', b'y',
+            0x02, 0x00, 0x0b, b'o', b'c', b't', b'r', b'a', b'_', b'a', b'l', b'l', b'o', b'c',
+            0x00, 0x00, 0x0e, b'o', b'c', b't', b'r', b'a', b'_', b'm', b'a', b'n', b'i', b'f',
+            b'e', b's', b't', 0x00, 0x01, 0x0b, b'o', b'c', b't', b'r', b'a', b'_', b'q', b'u',
+            b'e', b'r', b'y', 0x00, 0x01, 0x0a, (7 + body.len()) as u8, 0x02, 0x04, 0x00, 0x41,
+            0x00, 0x0b, body.len() as u8,
+        ];
+        wasm.extend_from_slice(body);
+        wasm
+    }
+
+    fn inspect_manifest(action: &str, wasm: &[u8]) -> JsonValue {
+        let input = serde_json::json!({
+            "action": action,
+            "code_b64": BASE64.encode(wasm),
+            "execution_profile": "manifest",
+            "is_view": true
+        })
+        .to_string();
+        let output = run_json(input.as_ptr(), input.len()).expect("manifest inspection rejected");
+        serde_json::from_str(&output).expect("invalid manifest inspection output")
+    }
+
     #[test]
     fn manifest_profile_has_deterministic_standard_budget() {
         assert_eq!(
@@ -6495,26 +6516,19 @@ mod tests {
     }
 
     #[test]
-    fn trapped_manifest_is_rejected_instead_of_falling_back() {
-        let wasm = [
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x02, 0x60, 0x01, 0x7f,
-            0x01, 0x7f, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x03, 0x02, 0x00, 0x01, 0x05,
-            0x03, 0x01, 0x00, 0x01, 0x07, 0x37, 0x04, 0x06, b'm', b'e', b'm', b'o', b'r', b'y',
-            0x02, 0x00, 0x0b, b'o', b'c', b't', b'r', b'a', b'_', b'a', b'l', b'l', b'o', b'c',
-            0x00, 0x00, 0x0e, b'o', b'c', b't', b'r', b'a', b'_', b'm', b'a', b'n', b'i', b'f',
-            b'e', b's', b't', 0x00, 0x01, 0x0b, b'o', b'c', b't', b'r', b'a', b'_', b'q', b'u',
-            b'e', b'r', b'y', 0x00, 0x01, 0x0a, 0x0a, 0x02, 0x04, 0x00, 0x41, 0x00, 0x0b, 0x03,
-            0x00, 0x00, 0x0b,
+    fn manifest_failure_modes_preserve_exports() {
+        let cases = [
+            manifest_module(&[0x00, 0x00, 0x0b]),
+            manifest_module(&[0x00, 0x41, 0x00, 0x0b]),
+            manifest_module(&[0x00, 0x41, 0x01, 0x0b]),
         ];
-        let input = serde_json::json!({
-            "action": "describe",
-            "code_b64": BASE64.encode(wasm),
-            "execution_profile": "manifest",
-            "is_view": true
-        })
-        .to_string();
-        let error = run_json(input.as_ptr(), input.len()).expect_err("trapped manifest accepted");
-        assert!(error.contains("wasm manifest execution failed"), "{error}");
+        for wasm in cases {
+            let admitted = inspect_manifest("validate", &wasm);
+            let loaded = inspect_manifest("describe", &wasm);
+            assert!(admitted["manifest"].is_object());
+            assert!(loaded["manifest"].is_null());
+            assert_eq!(loaded["exports"], admitted["exports"]);
+        }
     }
 
     #[test]

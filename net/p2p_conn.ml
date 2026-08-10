@@ -25,7 +25,7 @@ let read_idle_timeout_s = 60.0
 let monotonic_seconds () =
   Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.0
 
-let create fd ~peer_id ~addr ~direction = {
+let create ~peer_class fd ~peer_id ~addr ~direction = {
   fd;
   peer_id;
   addr;
@@ -35,8 +35,14 @@ let create fd ~peer_id ~addr ~direction = {
   msg_count_in = 0;
   msg_count_out = 0;
   last_seen = Unix.gettimeofday ();
-  frame_budget = P2p_frame_budget.create ~now:(monotonic_seconds ());
+  frame_budget = P2p_frame_budget.create ~now:(monotonic_seconds ()) ~peer_class;
 }
+
+let set_peer_class t peer_class =
+  P2p_frame_budget.set_peer_class t.frame_budget peer_class
+
+let peer_class t =
+  P2p_frame_budget.peer_class t.frame_budget
 
 let is_connected t = t.connected
 
@@ -115,8 +121,21 @@ let read_loop t ~on_message =
           let budget_now = monotonic_seconds () in
           match P2p_frame_budget.admit t.frame_budget ~now:budget_now
             ~msg_type:frame.msg_type ~bytes:(String.length frame.payload) with
-          | P2p_frame_budget.Drop reason ->
-            Lwt.fail (Failure reason)
+          | P2p_frame_budget.Drop rejection ->
+            err_conn t.addr
+              "event = frame_budget_rejected reason = %s action = %s lane = %s peer_class = %s frames = %d bytes = %d frame_bytes = %d max_frames = %d max_bytes = %d"
+              rejection.reason
+              (P2p_frame_budget.rejection_action_name rejection.action)
+              (P2p_frame_budget.lane_name rejection.lane)
+              (P2p_frame_budget.peer_class_name rejection.peer_class)
+              rejection.frames
+              rejection.bytes
+              rejection.frame_bytes
+              rejection.max_frames
+              rejection.max_bytes;
+            (match rejection.action with
+             | P2p_frame_budget.Close -> close t
+             | P2p_frame_budget.Discard -> loop ())
           | P2p_frame_budget.Accept ->
             t.msg_count_in <- t.msg_count_in + 1;
             t.last_seen <- Unix.gettimeofday ();
