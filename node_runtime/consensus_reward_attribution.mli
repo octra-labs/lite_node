@@ -30,6 +30,12 @@ val of_source :
   Octra_consensus.C_types.reward_source ->
   (t, string) result
 
+val bind_finality :
+  validator_set:Octra_consensus.C_types.validator_set ->
+  Octra_consensus.C_types.finalize ->
+  t ->
+  (t, string) result
+
 val epoch_source :
   validator_activation_epoch:int option ->
   validator_pubkeys:(string * string) list ->

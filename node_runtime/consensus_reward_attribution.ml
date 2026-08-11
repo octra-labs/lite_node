@@ -189,6 +189,41 @@ let of_parent_commit parent =
           participants;
     }
 
+let legacy_finality_reward ~validator_set finalize =
+  let validator_pubkeys =
+    List.map
+      (fun (validator : C_types.validator_info) ->
+        validator.address,
+        Base64.encode_exn validator.pubkey)
+      validator_set.C_types.validators
+  in
+  fallback
+    ~proposer_addr:finalize.C_types.header.creator_addr
+    ~validator_pubkeys
+  |> to_source
+  |> fun source -> Result.bind source of_source
+
+let bind_finality ~validator_set finalize supplied =
+  match finalize.C_types.header.proto_version with
+  | version when version = C_types.proto_version_parent_legacy ->
+    legacy_finality_reward ~validator_set finalize
+    |> fun expected ->
+    Result.bind expected (fun expected ->
+      if expected = supplied then Ok expected
+      else Error "reward source does not match legacy finality")
+  | version when version = C_types.proto_version_current ->
+    begin
+      match finalize.C_types.parent_commit with
+      | None -> Ok supplied
+      | Some parent ->
+        of_parent_commit parent
+        |> fun expected ->
+        Result.bind expected (fun expected ->
+          if expected = supplied then Ok expected
+          else Error "reward source does not match parent commit")
+    end
+  | _ -> Error "reward finality protocol is unsupported"
+
 let resolve ~proposer_addr ~validator_pubkeys = function
   | None -> Ok (fallback ~proposer_addr ~validator_pubkeys)
   | Some parent -> of_parent_commit parent

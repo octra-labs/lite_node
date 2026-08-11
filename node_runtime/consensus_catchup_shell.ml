@@ -605,14 +605,18 @@ let bind_finality validated finalized =
       Error "catchup finality proposer is missing"
     | Some proposer ->
       let reward =
-        match finalized.Octra_consensus.C_types.parent_commit with
-        | None -> Ok validated.reward
-        | Some parent ->
+        match record.Octra_consensus.C_codec.finality with
+        | None -> Error "catchup finality metadata is missing"
+        | Some finality ->
           begin
-            match Consensus_reward_attribution.of_parent_commit parent with
-            | Error error -> Error error
-            | Ok expected when expected = validated.reward -> Ok expected
-            | Ok _ -> Error "catchup reward source does not match parent commit"
+            match
+              Consensus_reward_attribution.bind_finality
+                ~validator_set:finality.validator_set
+                finalized
+                validated.reward
+            with
+            | Ok _ as bound -> bound
+            | Error error -> Error ("catchup " ^ error)
           end
       in
       Result.map

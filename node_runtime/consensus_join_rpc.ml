@@ -442,17 +442,14 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
     match Consensus_reward_attribution.of_source record.reward_source with
     | Error error -> failwith ("join reward source: " ^ error)
     | Ok reward ->
-      begin
-        match record.finality.finalize.Octra_consensus.C_types.parent_commit with
-        | None -> reward
-        | Some parent ->
-          begin
-            match Consensus_reward_attribution.of_parent_commit parent with
-            | Error error -> failwith ("join parent reward: " ^ error)
-            | Ok expected when expected = reward -> expected
-            | Ok _ -> failwith "join reward source does not match parent commit"
-          end
-      end
+      match
+        Consensus_reward_attribution.bind_finality
+          ~validator_set:record.finality.validator_set
+          record.finality.finalize
+          reward
+      with
+      | Ok bound -> bound
+      | Error error -> failwith ("join reward binding: " ^ error)
   in
   let partition =
     match Octra_core.Tx_outcome.decode ~confirmed:txs record.receipts_json with
