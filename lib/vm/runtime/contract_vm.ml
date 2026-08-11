@@ -926,6 +926,29 @@ let add_dyn_product st factors divisor =
   | None -> false
   | Some cost -> add_dyn_effort st cost
 
+let fhe_view_shape cipher =
+  let shape = Pvac_ffi.cipher_shape cipher in
+  Fhe_view_policy.{
+    slots = shape.Pvac_ffi.slots;
+    layers = shape.layers;
+    edges = shape.edges;
+  }
+
+let admit_fhe_view_mul st left right =
+  if not st.is_view then
+    true
+  else
+    try
+      match
+        Fhe_view_policy.additional_effort
+          ~left:(fhe_view_shape left)
+          ~right:(fhe_view_shape right)
+      with
+      | Some effort -> add_dyn_effort st effort
+      | None -> false
+    with _ ->
+      false
+
 let object_apply_dyn_cost writes =
   List.fold_left
     (fun acc write ->
@@ -2579,16 +2602,19 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
-         (try
-            let seed = deterministic_seed [
-              "aml.fhe_mul";
-              st.ctx.tx_hash;
-              st.address;
-              string_of_int st.pc;
-              string_of_int rd;
-            ] in
-            setr st rd (VCipher (Pvac_ffi.ct_mul_seeded pk a b seed)); true
-          with _ -> revert st)
+         if not (admit_fhe_view_mul st a b) then
+           revert st
+         else
+           (try
+              let seed = deterministic_seed [
+                "aml.fhe_mul";
+                st.ctx.tx_hash;
+                st.address;
+                string_of_int st.pc;
+                string_of_int rd;
+              ] in
+              setr st rd (VCipher (Pvac_ffi.ct_mul_seeded pk a b seed)); true
+            with _ -> revert st)
        | _ -> revert st)
   | FHE_SCALE (rd, rpk, rct, rscalar) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then

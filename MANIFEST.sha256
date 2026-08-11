@@ -1,7 +1,7 @@
 0c3f6f84b19f6568fc15aa24e77acfa7f982722079ed77949a90e4185c9b442b  ./.gitignore
 88ed90f15b3ffef2595a253fdecec4e32ba25ed0d5315f2b401ca016a00118a9  ./LICENSE
 a75de72808baae6befbcb0f33d0fa8098d43ccf60fc13d406483ba07224451d1  ./README.md
-048f32db6979e6762cd4d306b35272a6c758d186d01e73b3b6ddda8e8f910a1e  ./SOURCE_COMMIT
+b0cf6b41c3d5555040ba89de106a74815d7ab1bf6e7aab9b77d98d779fcf0252  ./SOURCE_COMMIT
 cabc8aeab28e74a3dc55db65c26823637cd86ae36fd3cef86f42acd29bc50d98  ./bin/bft_control_tx.ml
 cd60f31657750a4b8dd9d20eefe0614bba0f7472017709c9528bd5c6ffdc2998  ./bin/dune
 df093205fff2f2693c5c4177b5326af9eb22fdb92a3adb8533e4d34563048f0c  ./bin/octra_node.ml
@@ -340,11 +340,13 @@ f86331d67acb130f874547f3067e329effe2a5da1334d2176a41b0aea81ac959  ./lib/vm/runti
 41dcaa9e6a0895a87928f2f2d1b13478690c919ec6a0868209b3a1fd4711470c  ./lib/vm/runtime/call_plan.ml
 bca0bfb1fc1851455a6970d462900ccf24cc56d256901f6bd46076c46cc80841  ./lib/vm/runtime/call_plan.mli
 8e44cd54ffe8ab3d5fcb123df9b43618b52b2ff39a9bd81aa229816954bafd3b  ./lib/vm/runtime/contract.ml
-8fa3197a3c849a555b0c1fea2743bca30136b4b905ed0de6f9fd20d8ff68fafe  ./lib/vm/runtime/contract_vm.ml
+859e9e61606a1491aa12423cc2a7967125a1ea115a8b280772657a9112c715da  ./lib/vm/runtime/contract_vm.ml
 cc0cc3bcd4073a3e78a5258cb2f2ed6bd3badbae2a4c680cbb5d757b5d86f8fe  ./lib/vm/runtime/cost.ml
 409ecbdd0b173d4de08d64156c9e817d8beab854186f5fcc1f70fe2328f0d5e4  ./lib/vm/runtime/cost.mli
 a325f1f9ba33ff63735ef6eb21e7458ff4618b14ffa2643dbecef45deac08b72  ./lib/vm/runtime/direct_exec.ml
 40b479257f38294517f182a9395c89ef198099278415d5cf9b54167f4b67e8ba  ./lib/vm/runtime/direct_exec.mli
+31fb4ddfd60767b8c45714302d2f44c0e19bb8ee61f597806515cb6dc4faf331  ./lib/vm/runtime/fhe_view_policy.ml
+b257b67253bfe6c4a14f7430a90b21ef065ca2957447cf16a451ba30e3a2c5bf  ./lib/vm/runtime/fhe_view_policy.mli
 abc71c36fa3d5727e6e2f5054df532316b446520489ff057b9530d627a1080a4  ./lib/vm/runtime/fixed_q16.ml
 acd7516019b8b4d0414f103d1697bc069859d7335d0f394b2b9edf1100c37721  ./lib/vm/runtime/fixed_q16.mli
 d49ebfb73012479b1c95372159956410aabd769bfc5c5c2bae8ae674e9310c00  ./lib/vm/runtime/multi_exec.ml
@@ -915,7 +917,7 @@ e5a24791964d289f4497a56bb3ae553478b68694b1b308c65a5548330f20ad23  ./pvac/include
 f3c7d63f2cce13b080c06c43d2f39a183fd4cce7465e62010c03198d94367826  ./pvac_ffi/pvac_ffi.ml
 bd82081b146fbb905d469de24fd20000c41ea2dde4f9ff89ac47c27a98a21c12  ./pvac_ffi/pvac_ffi.mli
 9d242f17914cbc1d91226b4196e71582d7cd967a44cea9bb061605a8c4b2daa7  ./pvac_ffi/pvac_serialize.hpp
-2bfdfdddfff4bf5ce1045a96a28840328d3d042972d96b05817a44696f2f934d  ./pvac_ffi/pvac_stubs.cpp
+ab78d0c9022d2f1225ad192ff0c265ead08bb7fbc38daa8d7d053d73fa5e94ba  ./pvac_ffi/pvac_stubs.cpp
 a8d3dbe5c9d1f6baf2ac884d231e3a0ea141f4c3d375ff10c5e3ec0c1be8fc4b  ./zk_ffi/dune
 6d10535cf73fb289c75558a95199895c6e61a5d18418874827ff9ee623b9451a  ./zk_ffi/zk_ffi.ml
 355f4fd45edb89c4008dc790ffd8aa3ad4542deb86636bf2bae5187695c9b19d  ./zk_ffi/zk_ffi.mli

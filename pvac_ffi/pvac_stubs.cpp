@@ -729,20 +729,29 @@ CAMLprim value caml_pvac_ct_mul_seeded(value v_pk, value v_a, value v_b, value v
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
     pvac::Cipher& a = *Handle_val(pvac::Cipher, v_a);
     pvac::Cipher& b = *Handle_val(pvac::Cipher, v_b);
-    const uint8_t* seed = bytes_data(v_seed);
     DBG_SIZE("a.layers", a.L.size());
     DBG_SIZE("a.edges", a.E.size());
     DBG_SIZE("b.layers", b.L.size());
     DBG_SIZE("b.edges", b.E.size());
 
     if (bytes_len(v_seed) < 32) caml_failwith("seed must be 32 bytes");
+    uint8_t seed[32];
+    std::memcpy(seed, bytes_data(v_seed), sizeof(seed));
 
     pvac::Cipher* ct = new pvac::Cipher();
+    char err_buf[256] = {0};
+    caml_release_runtime_system();
     try {
         *ct = pvac::ct_mul_seeded(pk, a, b, seed);
     } catch (const std::exception& e) {
+        snprintf(err_buf, sizeof(err_buf), "%s", e.what());
+    } catch (...) {
+        snprintf(err_buf, sizeof(err_buf), "ct_mul_seeded failed: unknown error");
+    }
+    caml_acquire_runtime_system();
+    if (err_buf[0]) {
         delete ct;
-        caml_failwith(e.what());
+        caml_failwith(err_buf);
     }
 
     DBG_SIZE("out.layers", ct->L.size());
