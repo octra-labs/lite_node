@@ -91,6 +91,10 @@ type chunk_query_step =
   | Query_chunk of C_driver.catchup_range_response_record
   | Query_failed of string
 
+type query_progress =
+  | Await_range
+  | Restart_from_head
+
 type chunk_apply_step =
   | Chunk_continue of C_driver.catchup_range_response_record
   | Chunk_finish of string
@@ -310,6 +314,38 @@ let query_range deps ~attempts ~retry_delay ~from_epoch ~max_epochs
   in
   loop attempts
 
+let parse_record_txs record =
+  try
+    Ok (
+      List.map
+        (fun tx_json ->
+          match Yojson.Safe.from_string tx_json
+                |> Octra_core.Transaction.of_yojson with
+          | Ok tx -> tx
+          | Error e -> failwith ("bad tx_json: " ^ e))
+        record.Octra_consensus.C_codec.txs_json
+    )
+  with exn ->
+    Error ("tx_json parse failed: " ^ Printexc.to_string exn)
+
+let record_payload_valid record =
+  match parse_record_txs record with
+  | Error _ -> false
+  | Ok parsed_txs ->
+    let parsed_tx_hashes =
+      List.map Octra_core.Transaction.hash parsed_txs
+    in
+    begin
+      match C_catchup.verify_record_hashes ~record ~parsed_tx_hashes with
+      | Error _ -> false
+      | Ok () ->
+        Result.is_ok (C_catchup.verify_record_receipts ~record)
+    end
+
+let response_payload_valid = function
+  | [] -> false
+  | records -> List.for_all record_payload_valid records
+
 let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
   let open Lwt.Syntax in
   let range_plan =
@@ -328,6 +364,7 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       ~status:r.C_driver.status
       ~records:r.records
       ~from_epoch
+    && response_payload_valid r.records
     &&
     match C_catchup.verify_chain_continuity
             ~records:r.records
@@ -355,6 +392,12 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       "event = query_failed attempts = 3 from = %Ld reason = %s"
       from_epoch reason;
     Lwt.return (Query_failed ("catchup_failed:" ^ reason))
+
+let query_progress ~head ~from_epoch =
+  if Int64.compare (Int64.of_int head) from_epoch >= 0 then
+    Restart_from_head
+  else
+    Await_range
 
 let base_gate ~target_epoch ~start_head ~current_head ~from_epoch ~reason
     ~head =
@@ -402,20 +445,6 @@ let final_apply_gate ~last_epoch ~expected_root ~expected_eic ~expected_txid
           ~head with
   | Ok () -> Ok chunk
   | Error e -> Error e
-
-let parse_record_txs record =
-  try
-    Ok (
-      List.map
-        (fun tx_json ->
-          match Yojson.Safe.from_string tx_json
-                |> Octra_core.Transaction.of_yojson with
-          | Ok tx -> tx
-          | Error e -> failwith ("bad tx_json: " ^ e))
-        record.Octra_consensus.C_codec.txs_json
-    )
-  with exn ->
-    Error ("tx_json parse failed: " ^ Printexc.to_string exn)
 
 let proposer_of_record record =
   if String.length record.Octra_consensus.C_codec.creator_addr > 3 then
@@ -842,6 +871,68 @@ let last_applied_epoch chunk =
   | [] ->
     failwith "catchup empty chunk after application"
 
+type target_query_step =
+  | Range_step of chunk_query_step
+  | Local_apply
+
+let rec wait_for_local_apply (deps : target_deps) ~from_epoch =
+  let open Lwt.Syntax in
+  match query_progress ~head:(deps.head_epoch ()) ~from_epoch with
+  | Restart_from_head ->
+    Lwt.return_unit
+  | Await_range ->
+    let* () = deps.query.range_query.sleep 0.1 in
+    let* () = Lwt.pause () in
+    wait_for_local_apply deps ~from_epoch
+
+let cancel_and_wait ~sleep task =
+  let open Lwt.Syntax in
+  Lwt.cancel task;
+  let settled =
+    Lwt.catch
+      (fun () ->
+        let+ _ = task in
+        true)
+      (fun _ -> Lwt.return_true)
+  in
+  let expired =
+    let* () = Lwt.pause () in
+    let+ () = sleep 0.5 in
+    false
+  in
+  Lwt.pick [settled; expired]
+
+let query_or_local_apply deps ~target_epoch ~from_epoch ~reason =
+  let open Lwt.Syntax in
+  let range_step =
+    let+ step = query_chunk deps.query ~target_epoch ~from_epoch ~reason in
+    Range_step step
+  in
+  let local_step =
+    let+ () = wait_for_local_apply deps ~from_epoch in
+    Local_apply
+  in
+  let cancel task =
+    cancel_and_wait ~sleep:deps.query.range_query.sleep task
+  in
+  Lwt.catch
+    (fun () ->
+      let* step = Lwt.choose [range_step; local_step] in
+      let* settled =
+        match step with
+        | Range_step _ -> cancel local_step
+        | Local_apply -> cancel range_step
+      in
+      if not settled then
+        Log.warn "catchup"
+          "event = query_cancel_pending from = %Ld reason = %s"
+          from_epoch reason;
+      Lwt.return step)
+    (fun exn ->
+      let* _ = cancel range_step in
+      let* _ = cancel local_step in
+      Lwt.fail exn)
+
 let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
     ~fail_catchup =
   let open Lwt.Syntax in
@@ -858,12 +949,17 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
         finish_success reason
       end else
         let* query_step =
-          query_chunk deps.query ~target_epoch ~from_epoch ~reason
+          query_or_local_apply deps ~target_epoch ~from_epoch ~reason
         in
         match query_step with
-        | Query_failed tag ->
+        | Local_apply ->
+          Log.info "catchup"
+            "event = query_obsolete from = %Ld head = %d reason = %s"
+            from_epoch (deps.head_epoch ()) reason;
+          run ()
+        | Range_step (Query_failed tag) ->
           fail_catchup tag
-        | Query_chunk chunk ->
+        | Range_step (Query_chunk chunk) ->
           let* step =
             apply_chunk_gate
               deps.apply
@@ -938,11 +1034,20 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
     deps.mark_quarantine quarantine_tag;
     Lwt.return_unit
   and run_queued queued =
-    run_one
-      ~target_epoch:queued.target_epoch
-      ~reason:queued.reason
-      ~finish_success
-      ~fail_catchup
+    Lwt.catch
+      (fun () ->
+        run_one
+          ~target_epoch:queued.target_epoch
+          ~reason:queued.reason
+          ~finish_success
+          ~fail_catchup)
+      (fun exn ->
+        Log.error "catchup"
+          "event = actor_failed target = %Ld reason = %s error = %s"
+          queued.target_epoch
+          queued.reason
+          (Printexc.to_string exn);
+        fail_catchup "catchup_failed:unexpected")
   in
   if deps.catchup_active () then
     queue_active deps ~target_epoch ~reason

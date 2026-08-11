@@ -68,6 +68,7 @@ type ctx = {
   rules : Octra_core.Rule_graph.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t;
+  token_rpc : Octra_vm.Token_rpc_actor.t;
   deps : deps;
 } [@@warning "-69"]
 
@@ -268,6 +269,11 @@ let contract_save_abi _params _ctx =
           "program ABI writes are disabled; use program verification"
           None))
 
+let program_tokens_by_address params ctx =
+  Octra_vm.Contract_rpc.tokens_by_address_params
+    ~actor:ctx.token_rpc
+    params
+
 let fhe_pubkey_loader store addr =
   match run_s (Store_irmin.get_pvac_pubkey store addr) with
   | None -> None
@@ -407,6 +413,7 @@ let program_dispatch =
     program_call = contract_call;
     program_list = program_list_read;
     program_save_abi = contract_save_abi;
+    program_tokens_by_address;
   }
 
 let effect_dispatch =
@@ -493,6 +500,7 @@ let state_sensitive_http req =
 
 let start (cfg : config) =
   let { Wallet.address; _ } = cfg.wallet in
+  let token_rpc = Octra_vm.Token_rpc_actor.create ~store:cfg.store () in
   let rpc_ctx = {
     ledger = cfg.ledger;
     store = cfg.store;
@@ -512,6 +520,7 @@ let start (cfg : config) =
     rules = cfg.rules;
     consensus_driver_ref = cfg.consensus_driver_ref;
     resource_compute = cfg.resource_compute;
+    token_rpc;
     deps = cfg.deps;
   } in
   let routes = dispatch cfg.epoch_visibility in
@@ -546,4 +555,6 @@ let start (cfg : config) =
       ~rpc_handler
       ~fallback_handler:state_http_handler
   in
-  Rpc_http.create_server ~port:cfg.port ~callback
+  Lwt.finalize
+    (fun () -> Rpc_http.create_server ~port:cfg.port ~callback)
+    (fun () -> Octra_vm.Token_rpc_actor.shutdown token_rpc)

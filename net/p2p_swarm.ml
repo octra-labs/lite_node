@@ -322,7 +322,7 @@ let broadcast_except t ~except (frame : P2p_frame.frame) =
 let send_to t ~peer_id (frame : P2p_frame.frame) =
   match Hashtbl.find_opt t.peers peer_id with
   | Some conn when P2p_conn.is_connected conn ->
-    P2p_conn.send conn frame
+    send_with_timeout conn frame 2.0
   | _ -> Lwt.return_unit
 
 let make_my_hello t =

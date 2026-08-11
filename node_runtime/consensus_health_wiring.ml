@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+module Log = Octra_log
+
 type deps = {
   sleep : float -> unit Lwt.t;
   catchup_active : unit -> bool;
@@ -663,10 +665,21 @@ let poll_once (deps : deps) =
     let* () = deps.probe_health () in
     deps.reset_liveness ~source:"health_poll"
 
+let poll_step deps =
+  Lwt.catch
+    (fun () -> poll_once deps)
+    (function
+      | Lwt.Canceled -> Lwt.fail Lwt.Canceled
+      | exn ->
+        Log.error "consensus"
+          "event = health_poll_failed error = %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
+
 let rec poll_loop (deps : deps) ~interval =
   let open Lwt.Syntax in
   let* () = deps.sleep interval in
-  let* () = poll_once deps in
+  let* () = poll_step deps in
   poll_loop deps ~interval
 
 let launch (deps : launch_deps) =

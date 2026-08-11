@@ -657,7 +657,6 @@ let finalized_deps (deps : deps) =
     run_catchup_to_target = deps.run_catchup_to_target;
     mark_quarantine = deps.gates.mark_quarantine;
     clear_quarantine = deps.gates.clear_quarantine;
-    set_catchup_active = deps.set_catchup_active;
     apply_finalized = deps.apply_finalized;
     replay_stashed_while_safe = deps.replay_stashed_while_safe;
   }

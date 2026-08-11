@@ -229,13 +229,48 @@ let log fmt =
     (fun msg -> Octra_log.info "consensus" "module = driver %s" msg)
     fmt
 
+let catchup_record_complete (record : C_codec.catchup_epoch_record) =
+  Option.is_some record.reward_source
+  && Option.is_some record.finality
+
+let catchup_records_complete = function
+  | [] -> false
+  | records -> List.for_all catchup_record_complete records
+
+let normalize_legacy_range_response
+    (response : C_codec.catchup_range_response) =
+  match List.rev response.records with
+  | [] -> None
+  | last :: _ when catchup_records_complete response.records ->
+    Some {
+      response with
+      status = "ok";
+      error_code = None;
+      next_epoch = Some (Int64.succ last.epoch_id);
+    }
+  | _ -> None
+
+let response_source_matches
+    validator_set
+    ~peer_id
+    ~responder_addr =
+  match C_types.pubkey_of_addr validator_set responder_addr with
+  | None -> false
+  | Some public_key ->
+    String.equal
+      peer_id
+      (Octra_net.P2p_handshake.node_id_of_pubkey public_key)
+
 let catchup_response_key (rec_ : catchup_range_response_record) =
-  let records_root = C_hash.catchup_records_root rec_.records in
-  let next_epoch_s =
-    match rec_.next_epoch with
-    | Some e -> Int64.to_string e
-    | None -> "-" in
-  rec_.status ^ "|" ^ next_epoch_s ^ "|" ^ records_root
+  if List.for_all catchup_record_complete rec_.records then
+    let records_root = C_hash.catchup_records_root rec_.records in
+    let next_epoch_s =
+      match rec_.next_epoch with
+      | Some e -> Int64.to_string e
+      | None -> "-" in
+    Some (rec_.status ^ "|" ^ next_epoch_s ^ "|" ^ records_root)
+  else
+    None
 
 let catchup_source_validator_set = C_types.resilient_validator_set
 
@@ -2703,10 +2738,11 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               ~from_epoch
               ~records_root in
             let complete_request =
-              is_v2 && C_hash.catchup_request_is_complete r.request_id
+              C_hash.catchup_request_is_complete r.request_id
             in
             let complete_valid =
-              complete_request
+              is_v2
+              && complete_request
               && verify_set_signature
                    validator_set
                    r.responder_addr
@@ -2725,16 +2761,22 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
             let finality_request =
               Hashtbl.mem t.finality_query_requests r.request_id
             in
+            let request_scope =
+              C_finality_query.request_scope
+                ~complete_request
+                ~finality_request
+            in
+            let response_proof =
+              C_finality_query.response_proof
+                ~complete_valid
+                ~legacy_valid
+                ~legacy_complete:
+                  (is_v2 && catchup_records_complete r.records)
+            in
             let response_route =
-              if complete_request then
-                C_finality_query.response_route
-                  ~finality_request
-                  ~complete_valid
-                  ~legacy_valid
-              else if legacy_valid then
-                C_finality_query.Complete_response
-              else
-                C_finality_query.Reject_response
+              C_finality_query.response_route
+                request_scope
+                response_proof
             in
             if response_route = C_finality_query.Ignore_legacy_response then begin
               log_node t.config.my_addr
@@ -2751,8 +2793,51 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                 is_v2 (String.sub r.responder_addr 0 (min 12 (String.length r.responder_addr)));
               Octra_net.P2p_swarm.report_bad_peer t.swarm _conn ~reason:"bad_signature_catchup_range";
               Lwt.return_unit
-            end else if response_route = C_finality_query.Finality_response then begin
-              match Hashtbl.find_opt t.finality_query_requests r.request_id with
+            end else if
+              response_route = C_finality_query.Legacy_range_response
+              && not
+                   (response_source_matches
+                      validator_set
+                      ~peer_id:_conn.Octra_net.P2p_conn.peer_id
+                      ~responder_addr:r.responder_addr)
+            then begin
+              log_node t.config.my_addr
+                "event = ignore_catchup_range_response v2 = %b reason = relayed_legacy_response from = %s"
+                is_v2
+                (String.sub
+                   r.responder_addr
+                   0
+                   (min 12 (String.length r.responder_addr)));
+              Octra_net.P2p_swarm.report_bad_peer
+                t.swarm
+                _conn
+                ~reason:"relayed_legacy_catchup_range";
+              Lwt.return_unit
+            end else
+            let routed_response : C_codec.catchup_range_response option =
+              match response_route with
+              | C_finality_query.Legacy_range_response ->
+                normalize_legacy_range_response r
+              | C_finality_query.Complete_response
+              | C_finality_query.Finality_response -> Some r
+              | C_finality_query.Ignore_legacy_response
+              | C_finality_query.Reject_response -> None
+            in
+            match routed_response with
+            | None ->
+              log_node t.config.my_addr
+                "event = ignore_catchup_range_response v2 = %b reason = incomplete_legacy from = %s"
+                is_v2
+                (String.sub
+                   r.responder_addr
+                   0
+                   (min 12 (String.length r.responder_addr)));
+              Lwt.return_unit
+            | Some (r : C_codec.catchup_range_response)
+              when response_route = C_finality_query.Finality_response ->
+              begin match
+                Hashtbl.find_opt t.finality_query_requests r.request_id
+              with
               | Some expected_epoch ->
                 let finalize =
                   match r.records with
@@ -2774,7 +2859,17 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                  | Some _
                  | None -> Lwt.return_unit)
               | None -> Lwt.return_unit
-            end else begin
+              end
+            | Some (r : C_codec.catchup_range_response) ->
+              if response_route = C_finality_query.Legacy_range_response then begin
+                log_node t.config.my_addr
+                  "event = accept_catchup_range_response proof = legacy_complete from = %s records = %d"
+                  (String.sub
+                     r.responder_addr
+                     0
+                     (min 12 (String.length r.responder_addr)))
+                  (List.length r.records)
+              end;
               let checked_epoch, state_root =
                 match List.rev r.records with
                 | last :: _ -> last.C_codec.epoch_id, Some last.C_codec.state_root
@@ -2836,7 +2931,6 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                     r.request_id
                     (record :: prior);
                 Lwt.return_unit
-            end
         end)
         (fun exn ->
           log_node t.config.my_addr
@@ -3010,6 +3104,10 @@ let catchup_query_waves validator_set peer_ids =
   let second, rest = split_prefix width rest in
   [first; second; rest] |> List.filter (fun wave -> wave <> [])
 
+let catchup_wave_delay ~budget ~wave_count =
+  if wave_count <= 1 then budget
+  else min 0.5 (budget /. float_of_int wave_count)
+
 let catchup_query_limit ~from_epoch ~max_epochs = function
   | Some cfg when from_epoch < cfg.activate_epoch ->
     let until_activation = Int64.sub cfg.activate_epoch from_epoch in
@@ -3158,13 +3256,20 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
     List.iter (fun (rec_ : catchup_range_response_record) ->
       if not (Hashtbl.mem rejected rec_.responder_addr) then begin
         if validate rec_ then begin
+          match catchup_response_key rec_ with
+          | None ->
+            Hashtbl.replace rejected rec_.responder_addr ();
+            log_node t.config.my_addr
+              "event = reject_catchup_range_response reason = incomplete_record from = %s"
+              (String.sub rec_.responder_addr 0
+                (min 14 (String.length rec_.responder_addr)))
+          | Some key ->
           let agreement_epoch =
             catchup_agreement_epoch ~from_epoch rec_.records
           in
           let responder_weight =
             weight_of_responder agreement_epoch rec_.responder_addr
           in
-          let key = catchup_response_key rec_ in
           let weight, count, agreement_epoch, repr =
             match Hashtbl.find_opt groups key with
             | Some (weight, count, agreement_epoch, repr) ->
@@ -3316,8 +3421,8 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
         peer_ids
     in
     let deadline = deadline_after budget in
-    let wave_budget =
-      budget /. float_of_int (max 1 (List.length waves))
+    let wave_delay =
+      catchup_wave_delay ~budget ~wave_count:(List.length waves)
     in
     let rec send = function
       | [] -> wait_valid_with request_id rejected deadline
@@ -3331,7 +3436,7 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
         in
         let wave_deadline =
           if rest = [] then deadline
-          else min deadline (deadline_after wave_budget)
+          else min deadline (deadline_after wave_delay)
         in
         let* result = wait_valid_with request_id rejected wave_deadline in
         (match result with

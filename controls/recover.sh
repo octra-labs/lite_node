@@ -11,4 +11,4 @@ if [ ! -f "$CONFIG" ]; then
   exit 1
 fi
 
-exec python3 "$ROOT/controls/lib/validator_recover.py" --config "$CONFIG"
+exec python3 "$ROOT/controls/lib/validator_recover.py" --config "$CONFIG" "$@"

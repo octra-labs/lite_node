@@ -18,6 +18,7 @@ from validator_common import ValidatorError
 from validator_common import address_from_pubkey
 from validator_common import ensure_wallet
 from validator_common import load_network
+from validator_common import load_wallet
 from validator_common import parse_env
 from validator_common import rpc_url
 from validator_common import validate_checkpoint
@@ -62,6 +63,7 @@ from validator_process import remaining_owners
 from validator_process import active_data_owners
 from validator_process import wait_stopped
 from validator_recover import recover
+from validator_recover import preserved_state_path
 from validator_status import promotion_readiness
 
 RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
@@ -542,6 +544,13 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertLess(runtime, start)
         self.assertNotIn("pm2 restart", script)
 
+    def test_recover_forwards_explicit_options(self):
+        source_path = Path(__file__).resolve().parent / "recover.sh"
+        exported_path = Path(__file__).resolve().parent.parent / "recover.sh"
+        script_path = source_path if source_path.is_file() else exported_path
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn('validator_recover.py" --config "$CONFIG" "$@"', script)
+
     def test_runtime_rebind_preserves_node_state(self):
         root = WORK / "candidate"
         config = root / ".keys/validator/node.env"
@@ -822,6 +831,7 @@ class ValidatorToolsTest(unittest.TestCase):
         network = network_values()
         write_env(bundle, network)
         config = WORK / "node.env"
+        wallet = ensure_wallet(config.parent / "wallet.json")
         write_env(config, {
             **network,
             "OCTRA_DATA_DIR": str(data),
@@ -846,6 +856,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with mock.patch("validator_recover.sync_snapshot", side_effect=install) as sync:
                 recover(config)
         sync.assert_called_once()
+        self.assertEqual(load_wallet(data / "wallet.json"), wallet)
 
     def test_recovery_preserves_nonempty_invalid_state(self):
         data = WORK / "data"
@@ -857,6 +868,91 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "evidence-preserving"):
             recover(config)
         self.assertEqual(evidence.read_bytes(), b"preserve")
+
+    def test_recovery_replaces_valid_state_and_preserves_identity(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        config = WORK / "keys" / "node.env"
+        identity_path = config.parent / "wallet.json"
+        wallet = ensure_wallet(identity_path)
+        (data / "wallet.json").write_bytes(identity_path.read_bytes())
+        (data / "wallet.json").chmod(0o600)
+        bundle = WORK / "network.env"
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        network = network_values()
+        write_env(bundle, network)
+        write_env(config, {
+            **network,
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+            "OCTRA_OPERATOR_SYNC_BINARY_HASH": hashlib.sha256(b"client").hexdigest(),
+            "OCTRA_OPERATOR_SYNC_CONCURRENCY": "4",
+            "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
+            "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
+        })
+
+        def install(*_):
+            self.assertFalse(data.exists())
+            (data / "irmin_store").mkdir(parents=True)
+            (data / "chaindata").mkdir()
+            (data / "HEAD.json").write_text(
+                '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
+                encoding="utf-8",
+            )
+
+        with mock.patch("validator_recover.pm2_entries", return_value=[]):
+            with mock.patch("validator_recover.sync_snapshot", side_effect=install):
+                recover(config, replace_state=True)
+        preserved = preserved_state_path(data, 99)
+        self.assertTrue((preserved / "HEAD.json").is_file())
+        self.assertEqual(load_wallet(data / "wallet.json"), wallet)
+
+    def test_recovery_restores_state_after_sync_failure(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        head_bytes = (
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n'
+        ).encode("utf-8")
+        (data / "HEAD.json").write_bytes(head_bytes)
+        config = WORK / "keys" / "node.env"
+        identity_path = config.parent / "wallet.json"
+        ensure_wallet(identity_path)
+        (data / "wallet.json").write_bytes(identity_path.read_bytes())
+        (data / "wallet.json").chmod(0o600)
+        bundle = WORK / "network.env"
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        network = network_values()
+        write_env(bundle, network)
+        write_env(config, {
+            **network,
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+            "OCTRA_OPERATOR_SYNC_BINARY_HASH": hashlib.sha256(b"client").hexdigest(),
+            "OCTRA_OPERATOR_SYNC_CONCURRENCY": "4",
+            "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
+            "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
+        })
+        with mock.patch("validator_recover.pm2_entries", return_value=[]):
+            with mock.patch(
+                "validator_recover.sync_snapshot",
+                side_effect=ValidatorError("source unavailable"),
+            ):
+                with self.assertRaisesRegex(ValidatorError, "source unavailable"):
+                    recover(config, replace_state=True)
+        self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
+        self.assertFalse(preserved_state_path(data, 99).exists())
 
     def test_config_root_matches_layout(self):
         source = Path(__file__).resolve()

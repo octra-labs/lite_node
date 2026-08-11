@@ -270,17 +270,21 @@ let process_body meta body ctx routes =
   | Ok (`Single req) ->
     let open Lwt.Syntax in
     let* resp = handle_request meta req ctx routes in
-    Lwt.return (Rpc.response_json resp)
+    Lwt.return (Rpc_response_limit.single resp)
   | Ok (`Batch reqs) ->
     let open Lwt.Syntax in
+    let count = List.length reqs in
     let* results =
       Lwt_list.map_s
         (function
          | Ok req ->
            let* resp = handle_request meta req ctx routes in
-           Lwt.return (Rpc.response_json resp)
+           Lwt.return (Rpc_response_limit.batch_item ~count resp)
          | Error e ->
-           Lwt.return (Rpc.response_json (Rpc.Error_ (e, `Null))))
+           Lwt.return
+             (Rpc_response_limit.batch_item
+                ~count
+                (Rpc.Error_ (e, `Null))))
         reqs
     in
     Lwt.return (`List results)

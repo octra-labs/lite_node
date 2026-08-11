@@ -26,7 +26,6 @@ type 'driver deps = {
     unit Lwt.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
-  set_catchup_active : bool -> unit;
   apply_finalized : C_types.finalize -> unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }

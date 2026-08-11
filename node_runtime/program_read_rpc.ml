@@ -20,6 +20,7 @@ type 'handler dispatch_adapters = {
   program_list : 'handler;
   program_call : 'handler;
   program_save_abi : 'handler;
+  program_tokens_by_address : 'handler;
 }
 
 let compile_active = ref false
@@ -95,6 +96,5 @@ let dispatch adapters =
         compile_rpc
           (fun value -> Octra_vm.Contract_rpc.compile_aml_multi ~json:value)
           json);
-    program_tokens_by_address =
-      store_label_read Octra_vm.Contract_rpc.tokens_by_address_params;
+    program_tokens_by_address = adapters.program_tokens_by_address;
   }

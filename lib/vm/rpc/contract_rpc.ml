@@ -546,156 +546,35 @@ let program_bytecode_params ~store params =
   | Ok addr ->
     program_bytecode ~store ~addr
 
-type token_contract_meta = {
-  address : string;
-  owner : string;
-  symbol : string;
-  name : string;
-  decimals : string;
-  total_supply : string;
-}
+let token_page_int params index default_value =
+  Option.value ~default:default_value (Rpc.param_int params index)
 
-let token_contracts_cache : token_contract_meta list ref = ref []
-let token_contracts_cache_ts = ref 0.0
-let token_contracts_cache_ttl = 60.0
-let token_contracts_cache_lock = Lwt_mutex.create ()
-let token_balances_cache : (string, float * Yojson.Safe.t) Hashtbl.t = Hashtbl.create 128
-let token_balances_cache_ttl = 10.0
-let token_balances_cache_limit = 256
+let token_actor_error = function
+  | Token_rpc_actor.Busy ->
+    Rpc.err (-32005) "Program token read busy" None
+  | Token_rpc_actor.Stopped ->
+    Rpc.service_unavailable
+  | Token_rpc_actor.Read_failed ->
+    Rpc.err (-32000) "Program token read failed" None
 
-let trim_max limit value =
-  if String.length value > limit then String.sub value 0 limit else value
-
-let token_contracts_cache_fresh now =
-  now -. !token_contracts_cache_ts < token_contracts_cache_ttl
-
-let refresh_token_contracts store =
-  let open Lwt.Syntax in
-  let* addrs = Store_irmin.list_contracts store in
-  let* metas =
-    Lwt_list.filter_map_p
-      (fun addr ->
-        let* symbol_opt = Store_irmin.read_contract_storage_key store addr "symbol" in
-        match symbol_opt with
-        | None ->
-          Lwt.return_none
-        | Some symbol when String.equal symbol "" || String.equal symbol "0" ->
-          Lwt.return_none
-        | Some symbol ->
-          let* name_opt = Store_irmin.read_contract_storage_key store addr "name" in
-          let* decimals_opt = Store_irmin.read_contract_storage_key store addr "decimals" in
-          let* total_supply_opt = Store_irmin.read_contract_storage_key store addr "total_supply" in
-          let* info = Store_irmin.get_contract_info store addr in
-          let owner =
-            match info with
-            | Some (_, _, _, owner) -> owner
-            | None -> ""
-          in
-          Lwt.return_some {
-            address = addr;
-            owner;
-            symbol = trim_max 32 symbol;
-            name = trim_max 64 (Option.value ~default:symbol name_opt);
-            decimals = Option.value ~default:"0" decimals_opt;
-            total_supply = Option.value ~default:"0" total_supply_opt;
-          })
-      addrs
-  in
-  token_contracts_cache := metas;
-  token_contracts_cache_ts := Unix.gettimeofday ();
-  Lwt.return metas
-
-let load_token_contracts store =
-  let now = Unix.gettimeofday () in
-  if token_contracts_cache_fresh now then Lwt.return !token_contracts_cache
-  else
-    Lwt_mutex.with_lock token_contracts_cache_lock (fun () ->
-      let locked_now = Unix.gettimeofday () in
-      if token_contracts_cache_fresh locked_now then
-        Lwt.return !token_contracts_cache
-      else
-        refresh_token_contracts store)
-
-let prune_token_balances_cache now =
-  Hashtbl.filter_map_inplace
-    (fun _ (ts, payload) ->
-      if now -. ts < token_balances_cache_ttl then Some (ts, payload) else None)
-    token_balances_cache
-
-let cache_token_balance holder_addr now payload =
-  prune_token_balances_cache now;
-  if not (Hashtbl.mem token_balances_cache holder_addr)
-     && Hashtbl.length token_balances_cache >= token_balances_cache_limit then
-    Hashtbl.clear token_balances_cache;
-  Hashtbl.replace token_balances_cache holder_addr (now, payload)
-
-let is_plain_token_balance value =
-  let len = String.length value in
-  let rec loop index =
-    if index >= len then true
-    else
-      match value.[index] with
-      | '0' .. '9' -> loop (index + 1)
-      | _ -> false
-  in
-  len > 0 && loop 0
-
-let token_row ~holder_addr ~store token_meta =
-  let open Lwt.Syntax in
-  let* balance_opt =
-    Store_irmin.read_contract_storage_key
-      store
-      token_meta.address
-      ("balances:" ^ holder_addr)
-  in
-  match balance_opt with
-  | None ->
-    Lwt.return_none
-  | Some balance when String.equal balance "" || String.equal balance "0" ->
-    Lwt.return_none
-  | Some balance ->
-    let balance_kind, balance_is_encrypted =
-      if is_plain_token_balance balance then "plain", false else "encrypted", true
-    in
-    Lwt.return_some (`Assoc [
-      "address", `String token_meta.address;
-      "name", `String token_meta.name;
-      "symbol", `String token_meta.symbol;
-      "total_supply", `String token_meta.total_supply;
-      "balance", `String balance;
-      "balance_kind", `String balance_kind;
-      "balance_is_encrypted", `Bool balance_is_encrypted;
-      "decimals", `String token_meta.decimals;
-      "owner", `String token_meta.owner;
-    ])
-
-let tokens_by_address ~store ~holder_addr =
-  let now = Unix.gettimeofday () in
-  match Hashtbl.find_opt token_balances_cache holder_addr with
-  | Some (ts, payload) when now -. ts < token_balances_cache_ttl ->
-    ok_lwt payload
-  | _ ->
-    let open Lwt.Syntax in
-    let* token_contracts = load_token_contracts store in
-    let* token_rows =
-      Lwt_list.filter_map_p
-        (token_row ~holder_addr ~store)
-        token_contracts
-    in
-    let payload = `Assoc [
-      "address", `String holder_addr;
-      "tokens", `List token_rows;
-      "count", `Int (List.length token_rows);
-    ] in
-    cache_token_balance holder_addr now payload;
-    ok_lwt payload
-
-let tokens_by_address_params ~store params =
+let tokens_by_address_params ~actor params =
   match Rpc.require_address params 0 "address" with
-  | Error e ->
-    err_lwt e
-  | Ok holder_addr ->
-    tokens_by_address ~store ~holder_addr
+  | Error e -> err_lwt e
+  | Ok holder ->
+    let offset = token_page_int params 1 0 in
+    let limit =
+      token_page_int params 2 Token_rpc_policy.max_page_rows
+    in
+    if offset < 0 || offset > Token_rpc_policy.max_scan_programs then
+      err_lwt (Rpc.invalid_params "token offset outside read limit")
+    else if limit <= 0 || limit > Token_rpc_policy.max_page_rows then
+      err_lwt (Rpc.invalid_params "token page size outside read limit")
+    else
+      let open Lwt.Syntax in
+      let* result = Token_rpc_actor.query actor ~holder ~offset ~limit in
+      match result with
+      | Ok payload -> ok_lwt payload
+      | Error error -> err_lwt (token_actor_error error)
 
 let verify ~store ~addr ~source ~files_json =
   let open Lwt.Syntax in

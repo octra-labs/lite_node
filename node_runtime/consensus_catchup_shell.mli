@@ -87,6 +87,10 @@ type chunk_query_step =
   | Query_chunk of Octra_consensus.C_driver.catchup_range_response_record
   | Query_failed of string
 
+type query_progress =
+  | Await_range
+  | Restart_from_head
+
 type chunk_apply_step =
   | Chunk_continue of Octra_consensus.C_driver.catchup_range_response_record
   | Chunk_finish of string
@@ -298,6 +302,10 @@ val range_plan :
   target_epoch:int64 ->
   range_plan
 
+val response_payload_valid :
+  Octra_consensus.C_codec.catchup_epoch_record list ->
+  bool
+
 val query_range :
   query_deps ->
   attempts:int ->
@@ -308,6 +316,11 @@ val query_range :
   reason:string ->
   validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
   Octra_consensus.C_driver.catchup_range_response_record option Lwt.t
+
+val query_progress :
+  head:int ->
+  from_epoch:int64 ->
+  query_progress
 
 val query_chunk :
   chunk_query_deps ->

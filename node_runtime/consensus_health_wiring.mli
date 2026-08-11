@@ -343,6 +343,10 @@ val poll_once :
   deps ->
   unit Lwt.t
 
+val poll_step :
+  deps ->
+  unit Lwt.t
+
 val poll_loop :
   deps ->
   interval:float ->

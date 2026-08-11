@@ -3,6 +3,8 @@
 
 module Head = Octra_core.Head_manifest
 module Irmin = Octra_core.Store_irmin
+module Chaindata = Octra_core.Store_chaindata
+module Floor = Octra_core.History_floor
 module Verify = State_sync_verify
 module Checkpoint = State_sync_checkpoint
 
@@ -157,17 +159,37 @@ let snapshot_shape data_dir =
     count + 1, Int64.add total size
   ) (0, 0L)
 
-let checkpoint_of_head head =
+let checkpoint_of_head head floor =
   Checkpoint.of_head
-    ~chain_id:"octra-checkpoint-compactor"
-    ~config_hash:(String.make 64 '0')
-    ~validator_set_hash:(String.make 64 '0')
+    ~chain_id:(Floor.chain_id floor)
+    ~config_hash:(Floor.config_hash floor)
+    ~validator_set_hash:(Floor.validator_set_hash floor)
     ~created_at:1L
     ~valid_until:2L
     head
 
+let source_floor data_dir =
+  try
+    let store =
+      Chaindata.open_chaindata
+        ~readonly:true
+        (Filename.concat data_dir "chaindata")
+    in
+    Fun.protect
+      ~finally:(fun () -> Chaindata.close store)
+      (fun () ->
+        match Chaindata.history_floor store with
+        | Error reason -> Error ("source history floor is invalid: " ^ reason)
+        | Ok None -> Error "source history floor is missing"
+        | Ok (Some floor) -> Ok floor)
+  with exn ->
+    Error ("source history floor read failed: " ^ Printexc.to_string exn)
+
 let verify_data head data_dir =
-  Lwt_main.run (Verify.verify (checkpoint_of_head head) data_dir)
+  match source_floor data_dir with
+  | Error _ as error -> error
+  | Ok floor ->
+      Lwt_main.run (Verify.verify (checkpoint_of_head head floor) data_dir)
 
 let inspect_store data_dir expected_commit expected_root =
   let path = Filename.concat data_dir "irmin_store" in

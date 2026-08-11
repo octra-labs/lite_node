@@ -28,7 +28,6 @@ type 'driver deps = {
     unit Lwt.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
-  set_catchup_active : bool -> unit;
   apply_finalized : C_types.finalize -> unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }
@@ -93,9 +92,9 @@ let run_stashed_plan deps finalize (header : C_types.epoch_header)
     Log.warn "consensus"
       "directly applying stashed finalized epoch = %d during %s (prev_root matches local HEAD)"
       header_epoch phase_label;
-    deps.set_catchup_active false;
+    let* () = deps.apply_finalized finalize in
     deps.clear_quarantine clear_reason;
-    deps.apply_finalized finalize
+    Lwt.return_unit
   | Flow.Wait_stashed ->
     Lwt.return_unit
   | Flow.Replay_stashed ->

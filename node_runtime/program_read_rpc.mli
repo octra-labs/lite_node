@@ -20,6 +20,7 @@ type 'handler dispatch_adapters = {
   program_list : 'handler;
   program_call : 'handler;
   program_save_abi : 'handler;
+  program_tokens_by_address : 'handler;
 }
 
 val dispatch :
