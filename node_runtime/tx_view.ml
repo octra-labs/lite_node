@@ -771,6 +771,10 @@ let cipher_payload_ok encoded_cipher =
   | Ok _ -> true
   | Error _ -> false
 
+let stealth_delta_cipher_allowed encoded_cipher =
+  Octra_core.Pvac_verify_policy.ciphertext_allowed encoded_cipher
+  && Crypto.FheBalance.cipher_is_wrapped_scalar encoded_cipher
+
 let zero_proof_payload_ok encoded_proof =
   match Crypto.FheBalance.decode_zero_proof encoded_proof with
   | Ok _ -> true
@@ -800,7 +804,7 @@ let stealth_payload_ok json =
           hex_len 64 ptd.claim_pub
           && hex_len 32 ptd.stealth_tag
           && String.length ptd.eph_pub > 0
-          && cipher_payload_ok ptd.delta_cipher
+          && stealth_delta_cipher_allowed ptd.delta_cipher
           && range_proof_payload_ok ptd.range_proof_delta
           && range_proof_payload_ok ptd.range_proof_balance
           && base64_decodes_to_len 32 ptd.commitment
@@ -904,41 +908,42 @@ let preverify_range ~pubkey ~cipher ~proof =
 
 let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
   let open Lwt.Syntax in
-  let* new_enc =
-    run_preverify_compute
-      (fun () ->
-      match Crypto.FheBalance.load_pubkey_result pubkey_blob with
-      | Error e -> Error e
-      | Ok pk ->
-        Crypto.FheBalance.ct_sub_encoded
-          pk
-          sender_enc
-          ptd.Crypto.PrivateTransferV4.delta_cipher)
-  in
-  match new_enc with
-  | Error reason -> Lwt.return_error (Preverify_unavailable reason)
-  | Ok (Error reason) -> Lwt.return_error (Preverify_invalid reason)
-  | Ok (Ok new_enc) ->
-    let* delta =
-      preverify_range
-        ~pubkey:pubkey_blob
-        ~cipher:ptd.Crypto.PrivateTransferV4.delta_cipher
-        ~proof:ptd.Crypto.PrivateTransferV4.range_proof_delta
+  let delta_cipher = ptd.Crypto.PrivateTransferV4.delta_cipher in
+  if not (stealth_delta_cipher_allowed delta_cipher) then
+    Lwt.return_error (Preverify_invalid "stealth delta cipher shape invalid")
+  else
+    let* new_enc =
+      run_preverify_compute
+        (fun () ->
+        match Crypto.FheBalance.load_pubkey_result pubkey_blob with
+        | Error e -> Error e
+        | Ok pk ->
+          Crypto.FheBalance.ct_sub_encoded pk sender_enc delta_cipher)
     in
-    begin
-      match delta with
-      | Error reason -> Lwt.return_error (Preverify_unavailable reason)
-      | Ok delta ->
-        let* balance =
-          preverify_range
-            ~pubkey:pubkey_blob
-            ~cipher:new_enc
-            ~proof:ptd.Crypto.PrivateTransferV4.range_proof_balance
-        in
-        match balance with
+    match new_enc with
+    | Error reason -> Lwt.return_error (Preverify_unavailable reason)
+    | Ok (Error reason) -> Lwt.return_error (Preverify_invalid reason)
+    | Ok (Ok new_enc) ->
+      let* delta =
+        preverify_range
+          ~pubkey:pubkey_blob
+          ~cipher:delta_cipher
+          ~proof:ptd.Crypto.PrivateTransferV4.range_proof_delta
+      in
+      begin
+        match delta with
         | Error reason -> Lwt.return_error (Preverify_unavailable reason)
-        | Ok balance -> Lwt.return_ok (delta, balance)
-    end
+        | Ok delta ->
+          let* balance =
+            preverify_range
+              ~pubkey:pubkey_blob
+              ~cipher:new_enc
+              ~proof:ptd.Crypto.PrivateTransferV4.range_proof_balance
+          in
+          match balance with
+          | Error reason -> Lwt.return_error (Preverify_unavailable reason)
+          | Ok balance -> Lwt.return_ok (delta, balance)
+      end
 
 let claim_payload_ok json =
   try

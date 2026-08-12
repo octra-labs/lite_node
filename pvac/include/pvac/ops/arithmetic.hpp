@@ -317,6 +317,8 @@ inline Cipher ct_sub(const PubKey& pk, const Cipher& A, const Cipher& B) {
 }
 
 inline Cipher ct_mul(const PubKey& pk, const Cipher& A, const Cipher& B, size_t S = 8) {
+    if (A.slots != B.slots)
+        throw std::runtime_error("pvac: ct_mul: slot count mismatch between operands");
     auto a0 = A.c0;
     auto b0 = B.c0;
 
@@ -380,6 +382,8 @@ inline Cipher ct_square(const PubKey& pk, const Cipher& A, size_t S = 8) {
 }
 
 inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, const uint8_t seed[32], size_t S = 8) {
+    if (A.slots != B.slots)
+        throw std::runtime_error("pvac: ct_mul: slot count mismatch between operands");
     SeedableRng rng = make_seeded_rng(seed);
     auto a0 = A.c0;
     auto b0 = B.c0;

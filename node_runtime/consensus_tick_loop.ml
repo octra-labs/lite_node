@@ -16,7 +16,11 @@ type deps = {
   warn : string -> unit;
   info : string -> unit;
   clear_finalized : unit -> unit;
-  apply : now:float -> elapsed:float -> unit Lwt.t;
+  apply :
+    finalize:Octra_consensus.C_types.finalize option ->
+    now:float ->
+    elapsed:float ->
+    unit Lwt.t;
   sleep : float -> unit Lwt.t;
 }
 
@@ -30,7 +34,11 @@ type node_runtime = {
   queue_missing_bundle : target_epoch:int64 -> reason:string -> unit;
   warn : string -> unit;
   info : string -> unit;
-  apply : now:float -> elapsed:float -> unit Lwt.t;
+  apply :
+    finalize:Octra_consensus.C_types.finalize option ->
+    now:float ->
+    elapsed:float ->
+    unit Lwt.t;
   sleep : float -> unit Lwt.t;
 }
 
@@ -84,7 +92,7 @@ let step (deps : deps) ~consensus_mode =
          (max 0. (effective_duration -. elapsed)));
   Lwt.bind
     (if Plan.should_apply tick_plan.action then
-       deps.apply ~now ~elapsed
+       deps.apply ~finalize:prepared.finalize ~now ~elapsed
      else
        Lwt.return_unit)
     (fun () -> Lwt.return tick_plan.next_sleep)

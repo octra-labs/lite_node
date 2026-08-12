@@ -934,20 +934,20 @@ let fhe_view_shape cipher =
     edges = shape.edges;
   }
 
-let admit_fhe_view_mul st left right =
-  if not st.is_view then
-    true
-  else
-    try
-      match
-        Fhe_view_policy.additional_effort
-          ~left:(fhe_view_shape left)
-          ~right:(fhe_view_shape right)
-      with
+let admit_fhe_mul st left right =
+  try
+    let left_shape = fhe_view_shape left in
+    let right_shape = fhe_view_shape right in
+    if left_shape.slots <> right_shape.slots then
+      false
+    else if not st.is_view then
+      true
+    else
+      match Fhe_view_policy.additional_effort ~left:left_shape ~right:right_shape with
       | Some effort -> add_dyn_effort st effort
       | None -> false
-    with _ ->
-      false
+  with _ ->
+    false
 
 let object_apply_dyn_cost writes =
   List.fold_left
@@ -2602,7 +2602,7 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
-         if not (admit_fhe_view_mul st a b) then
+         if not (admit_fhe_mul st a b) then
            revert st
          else
            (try

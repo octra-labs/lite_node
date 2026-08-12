@@ -83,31 +83,53 @@ let get_u32le s pos =
   ((Char.code (Bytes.get s (pos + 3))) lsl 24)
 
 let op_tag = function
-  | Contract_vm.ADD _ -> 0x00  | Contract_vm.SUB _ -> 0x01
-  | Contract_vm.MUL _ -> 0x02  | Contract_vm.DIV _ -> 0x03
-  | Contract_vm.MOD _ -> 0x04  | Contract_vm.NEG _ -> 0x05
-  | Contract_vm.ABS _ -> 0x06  | Contract_vm.EQ _ -> 0x07
-  | Contract_vm.LT _ -> 0x08   | Contract_vm.GT _ -> 0x09
-  | Contract_vm.NEQ _ -> 0x0A  | Contract_vm.LDI _ -> 0x0B
-  | Contract_vm.MOV _ -> 0x0C  | Contract_vm.SLOAD _ -> 0x0D
-  | Contract_vm.SSTORE _ -> 0x0E | Contract_vm.SDEL _ -> 0x0F
-  | Contract_vm.SLOADK _ -> 0x10 | Contract_vm.SSTOREK _ -> 0x11
+  | Contract_vm.ADD _ -> 0x00
+  | Contract_vm.SUB _ -> 0x01
+  | Contract_vm.MUL _ -> 0x02
+  | Contract_vm.DIV _ -> 0x03
+  | Contract_vm.MOD _ -> 0x04
+  | Contract_vm.NEG _ -> 0x05
+  | Contract_vm.ABS _ -> 0x06
+  | Contract_vm.EQ _ -> 0x07
+  | Contract_vm.LT _ -> 0x08
+  | Contract_vm.GT _ -> 0x09
+  | Contract_vm.NEQ _ -> 0x0A
+  | Contract_vm.LDI _ -> 0x0B
+  | Contract_vm.MOV _ -> 0x0C
+  | Contract_vm.SLOAD _ -> 0x0D
+  | Contract_vm.SSTORE _ -> 0x0E
+  | Contract_vm.SDEL _ -> 0x0F
+  | Contract_vm.SLOADK _ -> 0x10
+  | Contract_vm.SSTOREK _ -> 0x11
   | Contract_vm.SDELK _ -> 0x54
-  | Contract_vm.MLOAD _ -> 0x12  | Contract_vm.MSTORE _ -> 0x13
-  | Contract_vm.JMP _ -> 0x14    | Contract_vm.JIF _ -> 0x15
-  | Contract_vm.JDEST _ -> 0x16  | Contract_vm.STOP -> 0x17
-  | Contract_vm.REVERT -> 0x18   | Contract_vm.CALLER _ -> 0x19
-  | Contract_vm.ORIGIN _ -> 0x1A | Contract_vm.SELF _ -> 0x1B
-  | Contract_vm.EPOCH _ -> 0x1C  | Contract_vm.VALUE _ -> 0x1D
+  | Contract_vm.MLOAD _ -> 0x12
+  | Contract_vm.MSTORE _ -> 0x13
+  | Contract_vm.JMP _ -> 0x14
+  | Contract_vm.JIF _ -> 0x15
+  | Contract_vm.JDEST _ -> 0x16
+  | Contract_vm.STOP -> 0x17
+  | Contract_vm.REVERT -> 0x18
+  | Contract_vm.CALLER _ -> 0x19
+  | Contract_vm.ORIGIN _ -> 0x1A
+  | Contract_vm.SELF _ -> 0x1B
+  | Contract_vm.EPOCH _ -> 0x1C
+  | Contract_vm.VALUE _ -> 0x1D
   | Contract_vm.EPOCH_TIME _ -> 0x7B
-  | Contract_vm.BALANCE _ -> 0x1E | Contract_vm.TREEHASH _ -> 0x1F
-  | Contract_vm.NODEID _ -> 0x20  | Contract_vm.XCALL _ -> 0x21
+  | Contract_vm.BALANCE _ -> 0x1E
+  | Contract_vm.TREEHASH _ -> 0x1F
+  | Contract_vm.NODEID _ -> 0x20
+  | Contract_vm.XCALL _ -> 0x21
   | Contract_vm.TXHASH _ -> 0x7A
-  | Contract_vm.SPAWN _ -> 0x22   | Contract_vm.TRANSFER _ -> 0x23
-  | Contract_vm.CHECKPOINT -> 0x24 | Contract_vm.ROLLBACK -> 0x25
-  | Contract_vm.COMMIT -> 0x26    | Contract_vm.EMIT _ -> 0x27
-  | Contract_vm.CONCAT _ -> 0x28  | Contract_vm.ASSERT _ -> 0x29
-  | Contract_vm.EFFORT _ -> 0x2A  | Contract_vm.NOP -> 0x2B
+  | Contract_vm.SPAWN _ -> 0x22
+  | Contract_vm.TRANSFER _ -> 0x23
+  | Contract_vm.CHECKPOINT -> 0x24
+  | Contract_vm.ROLLBACK -> 0x25
+  | Contract_vm.COMMIT -> 0x26
+  | Contract_vm.EMIT _ -> 0x27
+  | Contract_vm.CONCAT _ -> 0x28
+  | Contract_vm.ASSERT _ -> 0x29
+  | Contract_vm.EFFORT _ -> 0x2A
+  | Contract_vm.NOP -> 0x2B
   | Contract_vm.STRLEN _ -> 0x2C
   | Contract_vm.CALL_INT _ -> 0x2D
   | Contract_vm.MLOADR _ -> 0x2E
@@ -138,13 +160,20 @@ let op_tag = function
   | Contract_vm.SSTOREN _ -> 0x4E
   | Contract_vm.FSTORE _ -> 0x4F
   | Contract_vm.FLOAD _ -> 0x50
-  | Contract_vm.FHE_LOAD_PK _ -> 0x30 | Contract_vm.FHE_ADD _ -> 0x31
-  | Contract_vm.FHE_SUB _ -> 0x32     | Contract_vm.FHE_SCALE _ -> 0x33
-  | Contract_vm.FHE_ADD_CONST _ -> 0x34 | Contract_vm.FHE_SUB_CONST _ -> 0x35
-  | Contract_vm.FHE_VERIFY_ZERO _ -> 0x36 | Contract_vm.FHE_VERIFY_RANGE _ -> 0x37
-  | Contract_vm.FHE_VERIFY_BOUND _ -> 0x38 | Contract_vm.FHE_COMMIT _ -> 0x39
-  | Contract_vm.FHE_PEDERSEN _ -> 0x3A | Contract_vm.FHE_SER _ -> 0x3B
-  | Contract_vm.FHE_DESER _ -> 0x3C   | Contract_vm.FHE_SER_PK _ -> 0x3D
+  | Contract_vm.FHE_LOAD_PK _ -> 0x30
+  | Contract_vm.FHE_ADD _ -> 0x31
+  | Contract_vm.FHE_SUB _ -> 0x32
+  | Contract_vm.FHE_SCALE _ -> 0x33
+  | Contract_vm.FHE_ADD_CONST _ -> 0x34
+  | Contract_vm.FHE_SUB_CONST _ -> 0x35
+  | Contract_vm.FHE_VERIFY_ZERO _ -> 0x36
+  | Contract_vm.FHE_VERIFY_RANGE _ -> 0x37
+  | Contract_vm.FHE_VERIFY_BOUND _ -> 0x38
+  | Contract_vm.FHE_COMMIT _ -> 0x39
+  | Contract_vm.FHE_PEDERSEN _ -> 0x3A
+  | Contract_vm.FHE_SER _ -> 0x3B
+  | Contract_vm.FHE_DESER _ -> 0x3C
+  | Contract_vm.FHE_SER_PK _ -> 0x3D
   | Contract_vm.FHE_DESER_PK _ -> 0x3E
   | Contract_vm.GROTH16_VERIFY_BN254 _ -> 0x3F
   | Contract_vm.FHE_MUL _ -> 0x5B

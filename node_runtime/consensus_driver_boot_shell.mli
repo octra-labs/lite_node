@@ -36,6 +36,7 @@ type deps = {
   runtime_state : Consensus_runtime_state.t;
   liveness_state : Consensus_liveness.state ref;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  on_driver : Octra_consensus.C_driver.t -> unit;
   proposal_state : Consensus_proposal_state.t;
   proposal_bundles : Consensus_bundle_cache.t;
   bundle_runtime : Consensus_bundle_cache.node_runtime;

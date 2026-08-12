@@ -69,6 +69,7 @@ type ctx = {
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t;
   token_rpc : Octra_vm.Token_rpc_actor.t;
+  pvac_status : Pvac_status_actor.t;
   deps : deps;
 } [@@warning "-69"]
 
@@ -343,6 +344,7 @@ let octra_pvac_migration_status params ctx =
   | Ok owner_migration_mode ->
     with_account params ctx (fun addr account ->
       Account_read_rpc.pvac_migration_status
+        ctx.pvac_status
         ctx.store
         ctx.migration_entitlements
         ~epoch:!(ctx.current_epoch)
@@ -501,6 +503,15 @@ let state_sensitive_http req =
 let start (cfg : config) =
   let { Wallet.address; _ } = cfg.wallet in
   let token_rpc = Octra_vm.Token_rpc_actor.create ~store:cfg.store () in
+  let pvac_status =
+    Pvac_status_actor.create {
+      load_pubkey = (fun ~addr ->
+        Octra_core.Store_irmin.get_pvac_pubkey cfg.store addr);
+      hash_pubkey = Octra_core.Store_irmin.pvac_hash;
+      classify_cipher = Octra_core.Pvac_migration.classify_cipher;
+      classify_key = Octra_core.Pvac_migration.classify_key;
+    }
+  in
   let rpc_ctx = {
     ledger = cfg.ledger;
     store = cfg.store;
@@ -521,6 +532,7 @@ let start (cfg : config) =
     consensus_driver_ref = cfg.consensus_driver_ref;
     resource_compute = cfg.resource_compute;
     token_rpc;
+    pvac_status;
     deps = cfg.deps;
   } in
   let routes = dispatch cfg.epoch_visibility in
@@ -557,4 +569,7 @@ let start (cfg : config) =
   in
   Lwt.finalize
     (fun () -> Rpc_http.create_server ~port:cfg.port ~callback)
-    (fun () -> Octra_vm.Token_rpc_actor.shutdown token_rpc)
+    (fun () ->
+      let open Lwt.Syntax in
+      let* () = Pvac_status_actor.shutdown pvac_status in
+      Octra_vm.Token_rpc_actor.shutdown token_rpc)

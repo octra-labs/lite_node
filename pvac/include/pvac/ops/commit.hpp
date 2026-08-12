@@ -81,8 +81,8 @@ inline std::array<uint8_t, 32> commit_ct(const PubKey & pk, const Cipher & C)
         }
 
         size_t bytes = (e.s.nbits + 7) / 8;
-        size_t full  = bytes / 8;
-        size_t rem   = bytes % 8;
+        size_t full = bytes / 8;
+        size_t rem = bytes % 8;
 
         for (size_t i = 0; i < full; i++) {
             uint8_t b[8];

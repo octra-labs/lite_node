@@ -256,7 +256,7 @@ inline Fp rand_fp_nonzero() {
     for (;;) {
         uint64_t lo = csprng_u64();
         uint64_t hi = csprng_u64() & MASK63;
-        Fp x  = fp_from_words(lo, hi);
+        Fp x = fp_from_words(lo, hi);
 
         if (x.lo || x.hi) {
             return x;

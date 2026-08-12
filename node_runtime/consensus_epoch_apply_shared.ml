@@ -269,7 +269,7 @@ let run_runtime ?preverify ?save_receipt_raw (runtime : runtime) txs =
   in
   runtime.advance_validator_set ()
 
-let run_node ?preverify (runtime : node_runtime) ordered_txs =
+let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
   let open Lwt.Syntax in
   let tx_sink =
     Sender.live_tx_sink
@@ -289,7 +289,7 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
     tx_sink.confirm tx
   in
   let deferred_stealth_txs = ref [] in
-  let process_sender private_field_policy sender_txs =
+  let process_sender ~fold ~env private_field_policy sender_txs =
     Sender_live.run
       {
         ledger = runtime.ledger;
@@ -298,7 +298,8 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         program_trust = runtime.program_trust;
         wallet_addr = runtime.wallet_addr;
         pre_state_hash = runtime.pre_state_hash;
-        standard_env = runtime.standard_env;
+        fold;
+        standard_env = (fun () -> env);
         current_epoch = runtime.current_epoch;
         max_fhe_per_epoch = runtime.max_fhe_per_epoch;
         max_stealth_per_epoch = runtime.max_stealth_per_epoch;
@@ -371,6 +372,18 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
+    let env = runtime.standard_env () in
+    let fold =
+      match
+        Set_rule.bind
+          runtime.rules
+          ~chain_id:env.chain_id
+          ~parent:parent_commit
+          ~epoch:epoch_id
+      with
+      | Ok fold -> fold
+      | Error error -> failwith error
+    in
     let* () =
       run_runtime
         ?preverify
@@ -387,11 +400,14 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
         fatal = runtime.fatal;
         exit = runtime.exit;
         backend = (fun () ->
-          Epoch_exec.make_live_backend runtime.store runtime.ledger);
-        env = runtime.standard_env;
+          Epoch_exec.make_live_backend
+            ~fold
+            runtime.store
+            runtime.ledger);
+        env = (fun () -> env);
         max_fhe_per_epoch = runtime.max_fhe_per_epoch;
         max_stealth_per_epoch = runtime.max_stealth_per_epoch;
-        process_sender = process_sender private_field_policy;
+        process_sender = process_sender ~fold ~env private_field_policy;
         confirm_tx;
         reject_tx = log_rejected;
         notify_confirmed = runtime.notify_confirmed;
@@ -407,11 +423,14 @@ let run_node ?preverify (runtime : node_runtime) ordered_txs =
           runtime.confirmed_fees := Z.add !(runtime.confirmed_fees) fee);
         advance_validator_set = (fun () ->
           let backend =
-            Epoch_exec.make_live_backend runtime.store runtime.ledger
+            Epoch_exec.make_live_backend
+              ~fold
+              runtime.store
+              runtime.ledger
           in
           Epoch_exec.advance_validator_set
             ~backend
-            ~env:(runtime.standard_env ()));
+            ~env);
       }
         ordered_txs
     in

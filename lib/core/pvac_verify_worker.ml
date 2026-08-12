@@ -641,6 +641,14 @@ let verify_range_bound_sync_classified ~pubkey ~cipher ~proof ~commitment =
   classified_result_sync
     (P.Range_bound { pubkey; cipher; proof; commitment })
 
+let try_verify_range_bound_sync_classified
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment =
+  try_classified_result_sync
+    (P.Range_bound { pubkey; cipher; proof; commitment })
+
 let try_verify_zero_sync ~pubkey ~cipher ~proof =
   try_result_sync (P.Zero { pubkey; cipher; proof })
 

@@ -31,6 +31,11 @@ val classify_cipher : string -> cipher_class
 
 val classify_key : string option -> key_class
 
+val status_of_classes :
+  cipher_class ->
+  key_class ->
+  status
+
 val status_of_state :
   cipher:string ->
   pubkey:string option ->

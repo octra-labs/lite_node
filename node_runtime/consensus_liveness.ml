@@ -113,7 +113,6 @@ let record state (sample : sample) =
       {
         state with
         key_started_at = sample.now;
-        height_started_at = sample.now;
       }
     else
       state
@@ -131,7 +130,6 @@ let record state (sample : sample) =
   let height_realign_allowed =
     height_stalled
     && protocol_realign_allowed
-    && sample.step = "propose"
     && sample.round > 0
   in
   let stalled = state_stalled || height_realign_allowed in

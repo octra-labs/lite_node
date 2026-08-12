@@ -35,6 +35,7 @@ module Consensus_proposal_preview_shell = Octra_node_runtime.Consensus_proposal_
 module Consensus_proposal_state = Octra_node_runtime.Consensus_proposal_state
 module Consensus_runtime_boot_shell = Octra_node_runtime.Consensus_runtime_boot_shell
 module Consensus_tick_loop = Octra_node_runtime.Consensus_tick_loop
+module Set_actor = Octra_node_runtime.Set_actor
 module Epoch_atomic = Octra_node_runtime.Epoch_atomic
 module Epoch_visibility = Octra_node_runtime.Epoch_visibility
 module Log = Octra_node_runtime.Log
@@ -444,6 +445,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "private_payload"
       (Rule_graph.private_payload_activation rules)
       (fun epoch -> Rule_graph.private_payload rules ~epoch);
+    bind_rule
+      "set_fold"
+      (Rule_graph.set_fold_activation rules)
+      (fun epoch -> Rule_graph.set_fold rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -519,6 +524,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
   let apply_finalized_epoch ?override_ordered_txs ?override_receipts_json
       ?override_proposer_info ?override_reward ?override_epoch_ts
+      ~parent_commit
       ~now ~elapsed () =
     let open Lwt.Syntax in
     let* start =
@@ -624,6 +630,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let* shared_result =
       Consensus_epoch_apply_shared.run_node
         ?preverify
+        ?parent_commit
         {
           consensus_mode;
           ledger;
@@ -751,7 +758,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
   let apply_finalized_epoch_checked ?override_ordered_txs
       ?override_receipts_json ?override_proposer_info ?override_reward
-      ?override_epoch_ts ~now ~elapsed () =
+      ?override_epoch_ts ~parent_commit ~now ~elapsed () =
     Consensus_epoch_apply_checked.run_node
       ~consensus_mode
       ~current_epoch
@@ -779,6 +786,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 ?override_proposer_info
                 ?override_reward
                 ?override_epoch_ts
+                ~parent_commit
                 ~now
                 ~elapsed
                 ())))
@@ -796,8 +804,17 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         queue_missing_bundle = catchup_node_queue.queue_finalized_gap;
         warn = Log.warn "epoch" "%s";
         info = Log.info "epoch" "%s";
-        apply = (fun ~now ~elapsed ->
-          apply_finalized_epoch_checked ~now ~elapsed ());
+        apply = (fun ~finalize ~now ~elapsed ->
+          let parent_commit =
+            Option.bind
+              finalize
+              (fun value -> value.Octra_consensus.C_types.parent_commit)
+          in
+          apply_finalized_epoch_checked
+            ~parent_commit
+            ~now
+            ~elapsed
+            ());
         sleep = Lwt_unix.sleep;
       }
       ~consensus_mode
@@ -830,7 +847,20 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           chaindata;
           finality = finality_callbacks;
           set_proposal = Consensus_proposal_state.set proposal_state;
-          apply_finalized = apply_finalized_epoch_checked;
+          apply_finalized = (fun ?override_ordered_txs
+              ?override_receipts_json ?override_proposer_info
+              ?override_reward ?override_epoch_ts ?override_parent_commit
+              ~now ~elapsed () ->
+            apply_finalized_epoch_checked
+              ?override_ordered_txs
+              ?override_receipts_json
+              ?override_proposer_info
+              ?override_reward
+              ?override_epoch_ts
+              ~parent_commit:override_parent_commit
+              ~now
+              ~elapsed
+              ());
           consensus_role = Octra_consensus.C_role.label consensus_role;
           wallet = {
             address = wallet.address;
@@ -883,12 +913,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       let record = validated.record in
       let now = Unix.gettimeofday () in
       let override_proposer_info = validated.proposer in
+      let parent_commit =
+        Option.bind
+          validated.record.Octra_consensus.C_codec.finality
+          (fun finality ->
+            finality.Octra_consensus.C_codec.finalize.parent_commit)
+      in
       apply_finalized_epoch_checked
         ~override_ordered_txs:validated.parsed_txs
         ~override_receipts_json:record.receipts_json
         ?override_proposer_info
         ~override_reward:validated.reward
         ~override_epoch_ts:record.epoch_ts
+        ~parent_commit
         ~now
         ~elapsed:0.0
         ()
@@ -1001,6 +1038,131 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         drops_by_addr = Tx_drop.by_addr drop_db;
       }
     in
+    let fold_enabled epoch =
+      match Rule_graph.set_fold rules ~epoch with
+      | Ok Rule_graph.Active -> true
+      | Ok Rule_graph.Prior
+      | Error _ -> false
+    in
+    let fold_bonded () =
+      match
+        irmin_get_meta store Octra_core.Validator_registry.meta_key
+      with
+      | None -> false
+      | Some raw ->
+        begin
+          match Octra_core.Validator_registry.of_string raw with
+          | Error _ -> false
+          | Ok registry ->
+            begin
+              match
+                Octra_core.Validator_registry.find wallet.address registry
+              with
+              | Some candidate ->
+                candidate.Octra_core.Validator_admission.exit_epoch = None
+              | None -> false
+            end
+        end
+    in
+    let fold_message action ~head_epoch ~state_root =
+      let fields = [
+        "consensus_pubkey", `String wallet.pub;
+        "head_epoch", `String (Int64.to_string head_epoch);
+        "state_root", `String state_root;
+      ] in
+      let fields =
+        match action with
+        | Set_actor.Pulse -> fields
+        | Set_actor.Appeal proof ->
+          fields @ [
+            "duty_vote",
+              `String
+                (Base64.encode_exn
+                   (Octra_consensus.C_codec.encode_vote proof.vote));
+            "duty_commit",
+              `String
+                (Base64.encode_exn
+                   (Octra_consensus.C_parent_commit.encode proof.commit));
+          ]
+      in
+      Yojson.Safe.to_string (`Assoc fields)
+    in
+    let send_fold action =
+      let open Lwt.Syntax in
+      let epoch = !current_epoch in
+      if not (fold_enabled epoch) then
+        Lwt.return_error "validator set fold rule is not active"
+      else
+        let head_epoch = Int64.of_int (epoch - 1) in
+        let* state_root = ready_state_root_at (epoch - 1) in
+        match state_root, Ledger.find_opt ledger wallet.address with
+        | None, _ -> Lwt.return_error "validator set fold head root is unavailable"
+        | _, None -> Lwt.return_error "validator set fold account is unavailable"
+        | Some state_root, Some account ->
+          let nonce =
+            Staging.pending_nonce wallet.address account.Ledger.nonce + 1
+          in
+          let draft = Transaction.{
+            from = wallet.address;
+            to_ = wallet.address;
+            amount = Z.zero;
+            nonce;
+            ou = Z.zero;
+            timestamp = Unix.gettimeofday ();
+            signature = "";
+            public_key = Some wallet.pub;
+            message = Some (fold_message action ~head_epoch ~state_root);
+            op_type = ValidatorReady;
+            encrypted_data = None;
+          } in
+          let tx = { draft with ou = Transaction.ou_cost draft } in
+          let tx = Transaction.sign_with_privkey tx wallet.priv in
+          begin
+            match
+              Rest.add_tx_to_staging
+                ~bft_mode:consensus_mode
+                rest_runtime
+                ledger
+                tx
+            with
+            | Ok _ -> Lwt.return_ok ()
+            | Error error -> Lwt.return_error error
+          end
+    in
+    let fold_actor =
+      Set_actor.create Set_actor.{
+        sample = (fun () ->
+          let epoch = !current_epoch in
+          {
+            epoch = Int64.of_int epoch;
+            active =
+              Octra_consensus.C_types.is_validator
+                !consensus_validator_set_ref
+                wallet.address;
+            bonded = fold_enabled epoch && fold_bonded ();
+          });
+        send = send_fold;
+        warn = (fun reason ->
+          Log.warn "validator"
+            "event = set_actor_send_failed reason = %s"
+            reason);
+      }
+    in
+    let bind_fold driver =
+      Octra_consensus.C_driver.set_fold_handler
+        driver
+        (fun ~next_epoch proof ->
+          match Set_actor.notify fold_actor ~epoch:next_epoch proof with
+          | Set_actor.Accepted -> ()
+          | Set_actor.Busy ->
+            Log.warn "validator"
+              "event = set_actor_overload epoch = %Ld"
+              next_epoch
+          | Set_actor.Stopped ->
+            Log.warn "validator"
+              "event = set_actor_stopped epoch = %Ld"
+              next_epoch)
+    in
     let run_preverify prepared txs =
       Octra_core.Preverify_worker.run_many
         ~field_policy:(private_field_policy !current_epoch)
@@ -1075,6 +1237,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         runtime_state = consensus_state;
         liveness_state = consensus_liveness;
         driver_ref;
+        on_driver = bind_fold;
         proposal_state;
         proposal_bundles;
         bundle_runtime = proposal_bundle_runtime;

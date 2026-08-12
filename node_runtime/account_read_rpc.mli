@@ -75,6 +75,7 @@ val pvac_status :
   rpc_result Lwt.t
 
 val pvac_migration_status :
+  Pvac_status_actor.t ->
   Octra_core.Store_irmin.t ->
   Octra_core.Pvac_migration_entitlement.t ->
   epoch:int ->

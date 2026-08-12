@@ -75,6 +75,7 @@ let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id ~proposal_
           sender_key_activation_epoch =
             Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
           validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
+          fold = Epoch_exec.prior_fold;
           begin_batch = (fun () -> Store_irmin.begin_epoch_batch preview_t);
           commit_batch = (fun () ->
             Store_irmin.commit_epoch_batch preview_t "preview");

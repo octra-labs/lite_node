@@ -10,6 +10,7 @@ type deps = {
   program_trust : Octra_vm.Program_trust.t;
   wallet_addr : string;
   pre_state_hash : string;
+  fold : int -> (Octra_core.Epoch_exec.fold_ctx, string) result;
   standard_env : unit -> Octra_core.Epoch_exec.env;
   current_epoch : unit -> int;
   max_fhe_per_epoch : int;

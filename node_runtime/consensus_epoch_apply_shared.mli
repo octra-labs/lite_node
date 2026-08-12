@@ -142,6 +142,7 @@ val run_runtime :
 
 val run_node :
   ?preverify:Octra_core.Preverify_commit.t ->
+  ?parent_commit:Octra_consensus.C_types.parent_commit ->
   node_runtime ->
   Transaction.t list ->
   node_result Lwt.t

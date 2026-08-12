@@ -169,6 +169,8 @@ struct Op {
     }
 
     static std::vector<Fp> mul(const std::vector<Fp>& a, const std::vector<Fp>& b) {
+        if (a.size() != b.size())
+            throw std::runtime_error("pvac: field mul: vector size mismatch");
         std::vector<Fp> r(a.size());
         for (size_t i = 0; i < a.size(); ++i) r[i] = fp_mul(a[i], b[i]);
         return r;

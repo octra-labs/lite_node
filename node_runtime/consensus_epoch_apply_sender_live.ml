@@ -11,6 +11,7 @@ type deps = {
   program_trust : Octra_vm.Program_trust.t;
   wallet_addr : string;
   pre_state_hash : string;
+  fold : int -> (Octra_core.Epoch_exec.fold_ctx, string) result;
   standard_env : unit -> Octra_core.Epoch_exec.env;
   current_epoch : unit -> int;
   max_fhe_per_epoch : int;
@@ -145,7 +146,10 @@ let run deps sender_txs =
     let epoch_exec_deps =
       Sender.live_epoch_exec_deps
         ~backend:(fun () ->
-          Octra_core.Epoch_exec.make_live_backend deps.store deps.ledger)
+          Octra_core.Epoch_exec.make_live_backend
+            ~fold:deps.fold
+            deps.store
+            deps.ledger)
         ~standard_env:deps.standard_env
         ~reject:reject_current_tx
         ~confirm:confirm_current_tx

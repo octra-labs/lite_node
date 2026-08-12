@@ -22,6 +22,7 @@ val parse_bundle :
   Octra_core.Transaction.t list
 
 val build_plan :
+  parent_commit:Octra_consensus.C_types.parent_commit option ->
   header:Octra_consensus.C_types.epoch_header ->
   commit_round:int ->
   txs:Octra_core.Transaction.t list ->

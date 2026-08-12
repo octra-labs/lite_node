@@ -12,13 +12,7 @@ type deps = {
   set_proposal : Octra_core.Transaction.t list -> string list -> unit;
   write_entry : Octra_consensus.Finality_log.entry -> unit;
   apply_replay : Consensus_replay.plan -> unit Lwt.t;
-  apply_join :
-    txs:Octra_core.Transaction.t list ->
-    receipts_json:string list ->
-    proposer_info:Octra_core.Epochlog.proposer_info option ->
-    reward:Consensus_reward_attribution.t ->
-    epoch_ts:float ->
-    unit Lwt.t;
+  apply_join : Consensus_join_rpc.apply;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
   data_dir : string;
@@ -37,6 +31,7 @@ type apply_finalized =
   ?override_proposer_info:Octra_core.Epochlog.proposer_info ->
   ?override_reward:Consensus_reward_attribution.t ->
   ?override_epoch_ts:float ->
+  ?override_parent_commit:Octra_consensus.C_types.parent_commit ->
   now:float ->
   elapsed:float ->
   unit ->
@@ -50,6 +45,7 @@ type apply_callbacks = {
     proposer_info:Octra_core.Epochlog.proposer_info option ->
     reward:Consensus_reward_attribution.t ->
     epoch_ts:float ->
+    parent_commit:Octra_consensus.C_types.parent_commit option ->
     unit Lwt.t;
 }
 

@@ -135,6 +135,7 @@ let pvac_status store ~addr =
           pk_opt))
 
 let pvac_migration_status
+    status_actor
     store
     entitlements
     ~epoch
@@ -143,20 +144,23 @@ let pvac_migration_status
     ~account =
   let open Lwt.Syntax in
   let cipher = account_cipher account in
-  let* pubkey = Octra_core.Store_irmin.get_pvac_pubkey store addr in
+  let* key_hash = Octra_core.Store_irmin.get_pvac_hash store addr in
   let* status =
-    Octra_core.Proof_pool.try_run
-      ~priority:Octra_core.Proof_pool.Speculative
-      (fun () ->
-        Octra_core.Pvac_migration.status_of_state
-          ~cipher
-          ~pubkey)
+    Pvac_status_actor.query
+      status_actor
+      ~addr
+      ~key_hash
+      ~cipher
   in
   match status with
-  | None ->
+  | Error Pvac_status_actor.Busy
+  | Error Pvac_status_actor.Stopped ->
     Lwt.return_error
       (Rpc.err (-32005) "pvac migration status busy" None)
-  | Some status ->
+  | Error Pvac_status_actor.Read_failed ->
+    Lwt.return_error
+      (Rpc.err (-32005) "pvac migration status unavailable" None)
+  | Ok status ->
     ok
       (Rpc_view.pvac_migration_status
          ~addr

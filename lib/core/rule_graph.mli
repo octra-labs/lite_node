@@ -36,6 +36,7 @@ val validator_quorum_activation : t -> activation option
 val epoch_time_activation : t -> activation option
 val owner_migration_activation : t -> activation option
 val private_payload_activation : t -> activation option
+val set_fold_activation : t -> activation option
 
 val root_after_floor :
   chain_id:string ->
@@ -69,6 +70,11 @@ val owner_migration :
   (mode, fault) result
 
 val private_payload :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val set_fold :
   t ->
   epoch:int ->
   (mode, fault) result

@@ -231,7 +231,7 @@ inline void prepare_bit(
     out.ct_check = ct_mul_seeded(pk, ct_bit_i, ct_b_m1, mul_seed);
 
     size_t nL = out.ct_check.L.size();
-    size_t S  = out.ct_check.slots;
+    size_t S = out.ct_check.slots;
 
     std::vector<std::vector<Fp>> cache(nL);
     std::vector<uint8_t> st(nL, 0);
@@ -256,7 +256,7 @@ inline void prepare_lc(
     out.ct_check = ct_lc_diff;
 
     size_t nL = ct_lc_diff.L.size();
-    size_t S  = ct_lc_diff.slots;
+    size_t S = ct_lc_diff.slots;
 
     std::vector<std::vector<Fp>> cache(nL);
     std::vector<uint8_t> st(nL, 0);

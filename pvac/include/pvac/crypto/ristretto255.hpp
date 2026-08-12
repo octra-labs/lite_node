@@ -135,7 +135,7 @@ inline Fe25519 fe_inv(const Fe25519& z) {
 }
 
 inline Fe25519 fe_frombytes(const uint8_t s[32]) {
-    uint64_t h0 = (uint64_t)s[0]  | ((uint64_t)s[1] <<8) | ((uint64_t)s[2] <<16) |
+    uint64_t h0 = (uint64_t)s[0] | ((uint64_t)s[1] <<8) | ((uint64_t)s[2] <<16) |
                   ((uint64_t)s[3] <<24) | ((uint64_t)s[4] <<32) | ((uint64_t)s[5] <<40) |
                   ((uint64_t)s[6] & 0x07) << 48;
     uint64_t h1 = ((uint64_t)s[6] >>3) | ((uint64_t)s[7] <<5) | ((uint64_t)s[8] <<13) |

@@ -31,6 +31,7 @@ type t = {
   epoch_time_activation : activation option;
   owner_migration_activation : activation option;
   private_payload_activation : activation option;
+  set_fold_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -56,6 +57,13 @@ let devnet_wasm_compute_activation = devnet_private_transition_activation
 
 let devnet_private_payload_activation = devnet_private_transition_activation
 
+let devnet_set_fold_activation = {
+  anchor_epoch = 1_325_398;
+  anchor_state_root =
+    "257254d363a6864cb28461d80b0d40885e561ee3d17a97bfccb3af906a010229";
+  activation_epoch = 1_334_000;
+}
+
 let owner_migration_activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then
     Some devnet_owner_migration_activation
@@ -71,6 +79,12 @@ let wasm_compute_activation_for_chain chain_id =
 let private_payload_activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then
     Some devnet_private_payload_activation
+  else
+    None
+
+let set_fold_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_set_fold_activation
   else
     None
 
@@ -110,6 +124,7 @@ let create ~chain_id ~root_at =
     epoch_time_activation = epoch_time_activation_for_chain chain_id;
     owner_migration_activation = owner_migration_activation_for_chain chain_id;
     private_payload_activation = private_payload_activation_for_chain chain_id;
+    set_fold_activation = set_fold_activation_for_chain chain_id;
     root_at;
   }
 
@@ -119,6 +134,7 @@ let validator_quorum_activation t = t.validator_quorum_activation
 let epoch_time_activation t = t.epoch_time_activation
 let owner_migration_activation t = t.owner_migration_activation
 let private_payload_activation t = t.private_payload_activation
+let set_fold_activation t = t.set_fold_activation
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
   if String.equal chain_id devnet_chain_id
@@ -132,6 +148,7 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       owner_migration_activation_for_chain chain_id;
       wasm_compute_activation_for_chain chain_id;
       private_payload_activation_for_chain chain_id;
+      set_fold_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -209,6 +226,11 @@ let private_payload t ~epoch =
   match t.private_payload_activation with
   | Some activation -> mode t (Some activation) ~epoch
   | None -> Ok Active
+
+let set_fold t ~epoch =
+  match t.set_fold_activation with
+  | Some activation -> mode t (Some activation) ~epoch
+  | None -> Ok Prior
 
 let fault_message = function
   | Anchor_missing epoch ->

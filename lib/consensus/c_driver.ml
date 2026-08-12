@@ -178,7 +178,7 @@ type t = {
   activated_validator_set_fingerprints : (string, bool) Hashtbl.t;
   pending_votes : (string, C_types.vote) Hashtbl.t;
   future_votes : (string, C_types.vote) Hashtbl.t;
-  durable_votes : (string, unit) Hashtbl.t;
+  durable_votes : (string, C_types.vote) Hashtbl.t;
   pending_finalizes : (int64, pending_finalize) Hashtbl.t;
   pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
@@ -193,6 +193,10 @@ type t = {
   proposal_work_gate : C_proposal_work_gate.t;
   mutable on_validator_set_activated :
     C_types.validator_set -> string -> unit Lwt.t;
+  mutable on_fold :
+    next_epoch:int64 ->
+    (C_types.vote * C_types.parent_commit) option ->
+    unit;
   mutable output_actor : C_output_actor.t;
 }
 
@@ -363,10 +367,14 @@ let create ~config ~validator_set ~swarm ~start_height =
     proposal_work_gate = C_proposal_work_gate.create ();
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
+    on_fold = (fun ~next_epoch:_ _ -> ());
     output_actor = C_output_actor.idle }
 
 let set_validator_set_activation_handler t handler =
   t.on_validator_set_activated <- handler
+
+let set_fold_handler t handler =
+  t.on_fold <- handler
 
 let grace_ms name ~default ~limit =
   match Sys.getenv_opt name with
@@ -723,7 +731,7 @@ let vote_durable t (v : C_types.vote) =
             ~proposal_wire:(C_codec.encode_propose proposal)
             ~vote_wire:(C_codec.encode_vote v)
         in
-        if durable then Hashtbl.replace t.durable_votes key ();
+        if durable then Hashtbl.replace t.durable_votes key v;
         Lwt.return durable
       | None ->
         error_node t.config.my_addr
@@ -1374,16 +1382,21 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
   match cfg_opt with
   | None -> Lwt.return_unit
   | Some cfg ->
-    if Hashtbl.mem t.activated_validator_set_fingerprints cfg.fingerprint
-       || Int64.compare target_epoch cfg.activate_epoch < 0 then
+    if Int64.compare target_epoch cfg.activate_epoch < 0 then
       Lwt.return_unit
-    else begin
+    else
       let validator_set =
         C_types.validator_set_for_epoch
           ~chain_id:t.config.chain_id
           ~epoch_id:target_epoch
           cfg.validator_set
       in
+      let current_hash = C_config.validator_set_hash t.engine.vs in
+      let target_hash = C_config.validator_set_hash validator_set in
+      if Hashtbl.mem t.activated_validator_set_fingerprints cfg.fingerprint
+         && String.equal current_hash target_hash then
+        Lwt.return_unit
+      else begin
       let* () =
         t.on_validator_set_activated
           validator_set
@@ -1403,7 +1416,7 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
           target_epoch;
         Lwt.return_unit
       end
-    end
+      end
 
 let maybe_activate_quorum_policy t ~target_epoch =
   let open Lwt.Syntax in
@@ -1749,6 +1762,45 @@ let replay_future_votes t =
        (List.length !ready));
   evidence
 
+let fold_event t (finalize : C_types.finalize) =
+  let signed =
+    List.exists
+      (fun (vote : C_types.vote) ->
+        String.equal vote.validator t.config.my_addr)
+      finalize.precommits
+  in
+  if signed then None
+  else
+    let votes =
+      Hashtbl.to_seq_values t.durable_votes
+      |> List.of_seq
+      |> List.filter (fun (vote : C_types.vote) ->
+        vote.vote_type = C_types.Precommit
+        && String.equal vote.validator t.config.my_addr
+        && Int64.equal vote.epoch_id finalize.epoch_id
+        && vote.round = finalize.commit_round
+        && String.equal vote.proposal_id finalize.proposal_id)
+      |> List.sort (fun left right ->
+        String.compare (vote_key left) (vote_key right))
+    in
+    match votes with
+    | [] -> None
+    | vote :: _ ->
+      Some
+        (vote,
+         C_types.{
+           certificate = C_types.certificate_of_finalize finalize;
+           validator_set = t.engine.vs;
+         })
+
+let notify_fold t ~next_epoch event =
+  try t.on_fold ~next_epoch event
+  with exn ->
+    warn_node t.config.my_addr
+      "event = set_fold_notice_failed epoch = %Ld reason = %s"
+      next_epoch
+      (Printexc.to_string exn)
+
 let rec process_outputs_once t =
   let open Lwt.Syntax in
   C_engine.on_ready t.engine ~sign_fn:t.config.sign_fn;
@@ -1925,6 +1977,7 @@ let rec process_outputs_once t =
             | C_engine.Finalized { epoch_id; finalize } ->
               let header = finalize.header in
               let round = finalize.commit_round in
+              let fold = fold_event t finalize in
               log_node t.config.my_addr
                 "event = finalized epoch = %Ld round = %d creator = %s root = %s"
                 epoch_id
@@ -1951,6 +2004,7 @@ let rec process_outputs_once t =
                   ~target_epoch:(Int64.add epoch_id 1L)
               in
               let next = Int64.add epoch_id 1L in
+              notify_fold t ~next_epoch:next fold;
               Hashtbl.clear t.durable_votes;
               C_engine.start_height t.engine next;
               let now_ns = Mtime_clock.elapsed_ns () in

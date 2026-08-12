@@ -3,6 +3,8 @@
 
 module Transaction = Octra_core.Transaction
 module C_types = Octra_consensus.C_types
+module C_hash = Octra_consensus.C_hash
+module C_parent_commit = Octra_consensus.C_parent_commit
 
 type plan = {
   header : C_types.epoch_header;
@@ -116,6 +118,15 @@ let parse_bundle json =
        | Error e -> failwith ("replay bundle tx decode: " ^ e))
     items
 
+let parse_parent_commit json =
+  let module U = Yojson.Safe.Util in
+  match json |> U.member "parent_commit" with
+  | `Null -> None
+  | `String encoded when encoded <> "" ->
+    Some (encoded |> Base64.decode_exn |> C_parent_commit.decode)
+  | `String _ -> failwith "replay parent commit is empty"
+  | _ -> failwith "replay parent commit has invalid type"
+
 let proposer_info (header : C_types.epoch_header) commit_round =
   if String.length header.C_types.creator_addr > 3 then
     Some {
@@ -132,7 +143,7 @@ let expected_root (header : C_types.epoch_header) =
   else
     None
 
-let finalize (header : C_types.epoch_header) commit_round =
+let finalize (header : C_types.epoch_header) commit_round parent_commit =
   C_types.{
     chain_id = header.chain_id;
     epoch_id = header.epoch_id;
@@ -140,14 +151,17 @@ let finalize (header : C_types.epoch_header) commit_round =
     header;
     proposal_id = Octra_consensus.C_hash.proposal_id header;
     precommits = [];
-    parent_commit = None;
+    parent_commit;
   }
 
-let build_plan ~(header : C_types.epoch_header) ~commit_round ~txs =
+let build_plan ~parent_commit ~(header : C_types.epoch_header) ~commit_round ~txs =
+  let expected_parent_hash = C_hash.parent_commit_hash_opt parent_commit in
+  if header.parent_commit_hash <> expected_parent_hash then
+    failwith "replay parent commit hash mismatch";
   {
     header;
     commit_round;
-    finalize = finalize header commit_round;
+    finalize = finalize header commit_round parent_commit;
     txs;
     tx_hashes = List.map Transaction.hash txs;
     epoch = Int64.to_int header.C_types.epoch_id;
@@ -156,17 +170,19 @@ let build_plan ~(header : C_types.epoch_header) ~commit_round ~txs =
   }
 
 let load_plan ~default_chain_id ~header_path ~bundle_path =
+  let header_json = Yojson.Safe.from_file header_path in
   let header, commit_round =
     parse_header
       ~default_chain_id
-      (Yojson.Safe.from_file header_path)
+      header_json
   in
+  let parent_commit = parse_parent_commit header_json in
   let txs =
     match bundle_path with
     | None -> []
     | Some path -> parse_bundle (Yojson.Safe.from_file path)
   in
-  build_plan ~header ~commit_round ~txs
+  build_plan ~parent_commit ~header ~commit_round ~txs
 
 type one_shot_deps = {
   current_epoch : unit -> int;

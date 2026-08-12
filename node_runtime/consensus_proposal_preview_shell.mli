@@ -7,6 +7,7 @@ type backend = {
     proposal_id:string ->
     expected_prev_root:string option ->
     preverify:Octra_core.Preverify_commit.t ->
+    parent_commit:Octra_consensus.C_types.parent_commit option ->
     reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
     txs:Octra_core.Transaction.t list ->

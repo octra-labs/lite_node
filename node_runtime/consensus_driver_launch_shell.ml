@@ -10,6 +10,7 @@ type runtime = {
     string ->
     unit Lwt.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  on_driver : Octra_consensus.C_driver.t -> unit;
   start_height : int64;
   sleep : float -> unit Lwt.t;
   health : Consensus_health_wiring.node_driver_health_runtime;
@@ -92,12 +93,16 @@ let create_driver runtime =
     ~swarm:runtime.swarm
     ~start_height:runtime.start_height
 
+let publish slot on_driver driver =
+  slot := Some driver;
+  on_driver driver
+
 let run runtime =
   let driver = create_driver runtime in
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
     runtime.activate_validator_set;
-  runtime.driver_ref := Some driver;
+  publish runtime.driver_ref runtime.on_driver driver;
   Consensus_health_wiring.launch_node_consensus_driver
     (health_runtime_of_node runtime)
     driver;

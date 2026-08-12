@@ -255,11 +255,11 @@ private:
         for (const auto& [var, coeff] : lc.terms) {
             Scalar v;
             switch (var.type) {
-                case VarType::ONE:       v = Scalar{{1,0,0,0}}; break;
+                case VarType::ONE: v = Scalar{{1,0,0,0}}; break;
                 case VarType::COMMITTED: v = committed_[var.index].value; break;
                 case VarType::MULT_LEFT: v = gates_[var.index].a_L; break;
                 case VarType::MULT_RIGHT:v = gates_[var.index].a_R; break;
-                case VarType::MULT_OUT:  v = gates_[var.index].a_O; break;
+                case VarType::MULT_OUT: v = gates_[var.index].a_O; break;
             }
             r = sc_add(r, sc_mul(coeff, v));
         }
@@ -276,11 +276,11 @@ private:
             for (const auto& [var, coeff] : c.lc.terms) {
                 Scalar zc = sc_mul(zp, coeff);
                 switch (var.type) {
-                    case VarType::MULT_LEFT:  if (var.index<N) wL[var.index]=sc_add(wL[var.index],zc); break;
+                    case VarType::MULT_LEFT: if (var.index<N) wL[var.index]=sc_add(wL[var.index],zc); break;
                     case VarType::MULT_RIGHT: if (var.index<N) wR[var.index]=sc_add(wR[var.index],zc); break;
-                    case VarType::MULT_OUT:   if (var.index<N) wO[var.index]=sc_add(wO[var.index],zc); break;
-                    case VarType::COMMITTED:  if (var.index<m) wV[var.index]=sc_add(wV[var.index],zc); break;
-                    case VarType::ONE:        wc = sc_add(wc, zc); break;
+                    case VarType::MULT_OUT: if (var.index<N) wO[var.index]=sc_add(wO[var.index],zc); break;
+                    case VarType::COMMITTED: if (var.index<m) wV[var.index]=sc_add(wV[var.index],zc); break;
+                    case VarType::ONE: wc = sc_add(wc, zc); break;
                 }
             }
             zp = sc_mul(zp, z);

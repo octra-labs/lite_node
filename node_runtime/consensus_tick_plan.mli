@@ -30,6 +30,7 @@ type 'header prepared = {
   state : finalized_state;
   empty_bundle_header : 'header option;
   commit_round : int option;
+  finalize : Octra_consensus.C_types.finalize option;
 }
 
 val finalized_state :

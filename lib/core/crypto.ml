@@ -888,7 +888,7 @@ module Wallet = struct
         else
           let sk, pk = Mirage_crypto_ec.Ed25519.generate () in
           let priv_s = Base64.encode_exn (Mirage_crypto_ec.Ed25519.priv_to_octets sk) in
-          let pub_s  = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
+          let pub_s = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
           let address = Address.address_from_pubkey pub_s in
           if is_octra_address address then begin
             let json = `Assoc [

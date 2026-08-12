@@ -7,6 +7,7 @@ type backend = {
     proposal_id:string ->
     expected_prev_root:string option ->
     preverify:Octra_core.Preverify_commit.t ->
+    parent_commit:Octra_consensus.C_types.parent_commit option ->
     reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
     txs:Octra_core.Transaction.t list ->
@@ -32,8 +33,8 @@ let node_backend
     store
     ledger =
   {
-    run = (fun ~epoch_id ~proposal_id ~expected_prev_root ~preverify ~reward
-        ~env ~txs ->
+    run = (fun ~epoch_id ~proposal_id ~expected_prev_root ~preverify
+        ~parent_commit ~reward ~env ~txs ->
       match Octra_core.Rule_graph.circle rules ~epoch:epoch_id with
       | Error fault ->
         Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
@@ -62,13 +63,26 @@ let node_backend
                     Lwt.return_error
                       (Octra_core.Rule_graph.fault_message fault)
                   | Ok private_payload_mode ->
-            Octra_core.State_preview.with_preview
-              ~base_store:store
-              ~base_ledger:ledger
-              ~epoch_id
-              ~proposal_id
-              ?expected_prev_root
-              (fun backend ->
+                    match
+                      Set_rule.bind
+                        rules
+                        ~chain_id:env.Octra_core.Epoch_exec.chain_id
+                        ~parent:parent_commit
+                        ~epoch:epoch_id
+                    with
+                    | Error error -> Lwt.return_error error
+                    | Ok fold ->
+                      Octra_core.State_preview.with_preview
+                        ~base_store:store
+                        ~base_ledger:ledger
+                        ~epoch_id
+                        ~proposal_id
+                        ?expected_prev_root
+                        (fun backend ->
+                let backend = {
+                  backend with
+                  Octra_core.Epoch_exec.fold = fold;
+                } in
                 let private_transition =
                   Octra_core.Private_transition.create
                     ~preverify:(Some preverify)
@@ -136,6 +150,7 @@ let run (deps : deps) =
           ~proposal_id:request.proposal_id
           ~expected_prev_root:(Some request.expected_prev_root)
           ~preverify:request.preverify
+          ~parent_commit:request.parent_commit
           ~reward
           ~env
           ~txs:request.txs);

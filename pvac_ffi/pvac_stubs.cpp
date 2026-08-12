@@ -734,6 +734,9 @@ CAMLprim value caml_pvac_ct_mul_seeded(value v_pk, value v_a, value v_b, value v
     DBG_SIZE("b.layers", b.L.size());
     DBG_SIZE("b.edges", b.E.size());
 
+    if (a.slots != b.slots)
+        caml_failwith("pvac: ct_mul: slot count mismatch between operands");
+
     if (bytes_len(v_seed) < 32) caml_failwith("seed must be 32 bytes");
     uint8_t seed[32];
     std::memcpy(seed, bytes_data(v_seed), sizeof(seed));

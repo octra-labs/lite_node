@@ -1,6 +1,15 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type apply =
+  txs:Octra_core.Transaction.t list ->
+  receipts_json:string list ->
+  proposer_info:Octra_core.Epochlog.proposer_info option ->
+  reward:Consensus_reward_attribution.t ->
+  epoch_ts:float ->
+  parent_commit:Octra_consensus.C_types.parent_commit option ->
+  unit Lwt.t
+
 type head = {
   epoch : int64;
   root : string;
@@ -92,13 +101,7 @@ type apply_deps = {
   put_root : int -> string -> unit;
   stage_finality : prepared -> unit;
   promote_finality : unit -> unit;
-  apply :
-    txs:Octra_core.Transaction.t list ->
-    receipts_json:string list ->
-    proposer_info:Octra_core.Epochlog.proposer_info option ->
-    reward:Consensus_reward_attribution.t ->
-    epoch_ts:float ->
-    unit Lwt.t;
+  apply : apply;
   root : unit -> string;
   eic : unit -> string option;
 }
@@ -137,13 +140,7 @@ type node_deps = {
   put_root : int -> string -> unit;
   stage_finality : prepared -> unit;
   promote_finality : unit -> unit;
-  apply :
-    txs:Octra_core.Transaction.t list ->
-    receipts_json:string list ->
-    proposer_info:Octra_core.Epochlog.proposer_info option ->
-    reward:Consensus_reward_attribution.t ->
-    epoch_ts:float ->
-    unit Lwt.t;
+  apply : apply;
   local_eic : unit -> string option;
   write_ready :
     base:string ->
@@ -165,13 +162,7 @@ type node_runtime_deps = {
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root_raw : int -> string -> unit;
   write_entry : Octra_consensus.Finality_log.entry -> unit;
-  apply :
-    txs:Octra_core.Transaction.t list ->
-    receipts_json:string list ->
-    proposer_info:Octra_core.Epochlog.proposer_info option ->
-    reward:Consensus_reward_attribution.t ->
-    epoch_ts:float ->
-    unit Lwt.t;
+  apply : apply;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
   data_dir : string;
@@ -191,13 +182,7 @@ type node_runtime_wiring = {
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
   write_entry : Octra_consensus.Finality_log.entry -> unit;
-  apply :
-    txs:Octra_core.Transaction.t list ->
-    receipts_json:string list ->
-    proposer_info:Octra_core.Epochlog.proposer_info option ->
-    reward:Consensus_reward_attribution.t ->
-    epoch_ts:float ->
-    unit Lwt.t;
+  apply : apply;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
   data_dir : string;

@@ -54,14 +54,14 @@ let ensure_dir data_dir =
 let write data_dir entry =
   ensure_dir data_dir;
   let path = entry_path data_dir entry.epoch_id in
-  let tmp = path ^ ".tmp" in
+  let staged = path ^ ".staged" in
   let json = to_json entry in
-  let oc = open_out_bin tmp in
+  let oc = open_out_bin staged in
   output_string oc json;
   flush oc;
   (try Unix.fsync (Unix.descr_of_out_channel oc) with _ -> ());
   close_out oc;
-  Unix.rename tmp path;
+  Unix.rename staged path;
 
   (try
     let dfd = Unix.openfile (wal_dir data_dir) [Unix.O_RDONLY] 0 in
@@ -227,18 +227,18 @@ let write_pending_commit data_dir p =
   ensure_dir data_dir;
   let path = pending_commit_path data_dir p.epoch_id p.round in
   let write () =
-    let tmp = path ^ ".tmp" in
+    let staged = path ^ ".staged" in
     let json = pending_commit_to_json p in
     if String.length json > max_pending_commit_bytes then
       failwith "pending commit exceeds size limit";
-    let oc = open_out_bin tmp in
+    let oc = open_out_bin staged in
     Fun.protect
       ~finally:(fun () -> close_out_noerr oc)
       (fun () ->
         output_string oc json;
         flush oc;
         Unix.fsync (Unix.descr_of_out_channel oc));
-    Unix.rename tmp path;
+    Unix.rename staged path;
     let dfd = Unix.openfile (wal_dir data_dir) [Unix.O_RDONLY] 0 in
     Fun.protect
       ~finally:(fun () -> Unix.close dfd)

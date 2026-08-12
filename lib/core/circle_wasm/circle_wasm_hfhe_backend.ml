@@ -39,6 +39,23 @@ let verification_value = function
   | Error (VW.Proof_rejected _) -> Ok false
   | Error failure -> Error (VW.verification_failure_message failure)
 
+let verify_zero_worker ~pubkey ~cipher ~proof =
+  VW.try_verify_zero_sync_classified ~pubkey ~cipher ~proof
+
+let verify_range_worker ~pubkey ~cipher ~proof ~commitment =
+  VW.try_verify_range_bound_sync_classified
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
+let verify_bound_worker ~pubkey ~cipher ~proof ~commitment =
+  VW.try_verify_claim_sync_classified
+    ~pubkey
+    ~cipher
+    ~proof
+    ~commitment
+
 let require_string fields key =
   match List.assoc_opt key fields with
   | Some (`String value) ->
@@ -212,7 +229,7 @@ let decode_range_proof_bounded value =
 let verify_zero_bounded pk ciphertext proof =
   match decode_verifier_cipher ciphertext, decode_zero_proof_bounded proof with
   | Ok cipher, Ok _ ->
-    VW.verify_zero_sync_classified
+    verify_zero_worker
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof
@@ -227,7 +244,7 @@ let verify_range_bounded pk ciphertext proof amount_commitment =
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok range_proof, Ok commitment ->
-    VW.verify_range_bound_sync_classified
+    verify_range_worker
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof:
@@ -245,7 +262,7 @@ let verify_bound_bounded pk ciphertext proof amount_commitment =
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok _, Ok commitment ->
-    VW.verify_claim_sync_classified
+    verify_bound_worker
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof

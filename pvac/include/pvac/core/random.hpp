@@ -98,8 +98,8 @@ inline void csprng_bytes(uint8_t * out, size_t n) {
     size_t off = 0;
 
     while (off < n) {
-        uint64_t x   = ((uint64_t)rd() << 32) ^ rd();
-        size_t   take = std::min((size_t)8, n - off);
+        uint64_t x = ((uint64_t)rd() << 32) ^ rd();
+        size_t take = std::min((size_t)8, n - off);
         std::memcpy(out + off, &x, take);
         off += take;
     }

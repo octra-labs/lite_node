@@ -12,18 +12,18 @@ let marker_path data_dir =
 
 let write_marker data_dir epoch_id phase =
   let path = marker_path data_dir in
-  let tmp = path ^ ".tmp" in
+  let staged = path ^ ".staged" in
   let j = `Assoc [
     "epoch_id", `Int epoch_id;
     "phase", `String phase;
     "ts", `Float (Unix.gettimeofday ());
   ] in
-  let oc = open_out_bin tmp in
+  let oc = open_out_bin staged in
   Yojson.Safe.to_channel oc j;
   flush oc;
   (try Unix.fsync (Unix.descr_of_out_channel oc) with _ -> ());
   close_out oc;
-  Unix.rename tmp path
+  Unix.rename staged path
 
 let clear_marker data_dir =
   let path = marker_path data_dir in

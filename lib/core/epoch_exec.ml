@@ -14,21 +14,21 @@ type reward_attribution = {
 }
 
 type env = {
-  chain_id        : string;
-  epoch_id        : int;
-  proposer_addr   : string;
+  chain_id : string;
+  epoch_id : int;
+  proposer_addr : string;
   validator_addrs : string list;
   validator_pubkeys : (string * string) list;
   prev_state_root : string;
-  epoch_ts        : float;
+  epoch_ts : float;
   ready_state_root_at : (int -> string option Lwt.t) option;
   ready_max_lag : int;
 }
 
 type tx_reject = {
-  tx         : Transaction.t;
+  tx : Transaction.t;
   error_type : string;
-  reason     : string;
+  reason : string;
 }
 
 type tx_effect =
@@ -40,15 +40,15 @@ type tx_effect =
     }
 
 type artifacts = {
-  confirmed      : (Transaction.t * int) list;
-  rejected       : tx_reject list;
+  confirmed : (Transaction.t * int) list;
+  rejected : tx_reject list;
   confirmed_fees : Z.t;
-  tx_count       : int;
+  tx_count : int;
 }
 
 type exec_result = {
   post_state_root : string;
-  artifacts       : artifacts;
+  artifacts : artifacts;
 }
 
 type account_ops = {
@@ -63,6 +63,13 @@ type account_ops = {
   register_public_key : string -> string -> unit;
   apply_op01_burn : from:string -> to_:string -> Z.t -> int ->
     (unit, string) Stdlib.result;
+}
+
+type fold_ctx = {
+  mode : Rule_graph.mode;
+  start : int64;
+  parent : Octra_consensus.C_types.parent_commit option;
+  members : string list;
 }
 
 let ledger_ops (l : Ledger.t) : account_ops = {
@@ -94,19 +101,20 @@ let overlay_ops (o : Ledger.Overlay.overlay) : account_ops = {
 }
 
 type backend = {
-  store       : Store_irmin.t;
-  ledger      : Ledger.t;
-  ops         : account_ops;
+  store : Store_irmin.t;
+  ledger : Ledger.t;
+  ops : account_ops;
   emission_policy : Emission_policy.t;
   emission_schedule : Emission_schedule.t;
   legacy_total_supply : string option;
   sender_key_activation_epoch : int option;
   validator_policy : Validator_policy.t;
+  fold : int -> (fold_ctx, string) result;
   begin_batch : unit -> unit Lwt.t;
-  commit_batch: unit -> unit Lwt.t;
+  commit_batch : unit -> unit Lwt.t;
   flush_dirty : unit -> unit Lwt.t;
-  get_head_hash: unit -> string option Lwt.t;
-  set_meta    : string -> string -> unit Lwt.t;
+  get_head_hash : unit -> string option Lwt.t;
+  set_meta : string -> string -> unit Lwt.t;
 }
 
 let resolve_legacy_total = function
@@ -117,8 +125,12 @@ let resolve_sender_key_activation = function
   | Some epoch -> Some epoch
   | None -> Sender_key_policy.activation_epoch_exn Sys.getenv_opt
 
+let prior_fold _ =
+  Ok { mode = Rule_graph.Prior; start = 0L; parent = None; members = [] }
+
 let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
-    ?sender_key_activation_epoch ?validator_policy store ledger = {
+    ?sender_key_activation_epoch ?validator_policy ?(fold=prior_fold)
+    store ledger = {
   store;
   ledger;
   ops = ledger_ops ledger;
@@ -134,6 +146,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
     Option.value
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
+  fold;
   begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch");
   flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
@@ -143,7 +156,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
 
 let make_overlay_backend ?emission_policy ?emission_schedule
     ?legacy_total_supply ?sender_key_activation_epoch ?validator_policy
-    store ledger overlay = {
+    ?(fold=prior_fold) store ledger overlay = {
   store;
   ledger;
   ops = overlay_ops overlay;
@@ -159,6 +172,7 @@ let make_overlay_backend ?emission_policy ?emission_schedule
     Option.value
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
+  fold;
   begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch_overlay");
   flush_dirty = (fun () -> Lwt.return_unit);
@@ -2251,6 +2265,58 @@ let save_validator_registry backend registry =
     Validator_registry.meta_key
     (Validator_registry.to_string registry)
 
+let load_set_fold backend =
+  let open Lwt.Syntax in
+  let* stored = Store_irmin.get_meta backend.store Set_fold.meta_key in
+  match stored with
+  | None -> Lwt.return (Ok Set_fold.empty)
+  | Some raw -> Lwt.return (Set_fold.of_string raw)
+
+let save_set_fold backend state =
+  backend.set_meta Set_fold.meta_key (Set_fold.to_string state)
+
+let fold_at backend epoch =
+  match backend.fold epoch with
+  | Ok ctx -> ctx
+  | Error error -> failwith ("validator set fold rule rejected: " ^ error)
+
+let apply_set_fold ~backend ~env =
+  let open Lwt.Syntax in
+  let ctx = fold_at backend env.epoch_id in
+  match ctx.mode with
+  | Rule_graph.Prior -> Lwt.return_unit
+  | Rule_graph.Active ->
+    let at = Int64.of_int env.epoch_id in
+    let* stored = load_set_fold backend in
+    let state =
+      match stored with
+      | Ok state -> state
+      | Error error -> failwith ("validator set fold state corrupt: " ^ error)
+    in
+    begin
+      match
+        Set_fold.advance
+          Set_fold.standard
+          ~chain_id:env.chain_id
+          ~start:ctx.start
+          ~at
+          ~parent:ctx.parent
+          state
+      with
+      | Error error -> failwith ("validator set fold update rejected: " ^ error)
+      | Ok (next, reason, changed) ->
+        Option.iter
+          (fun reason ->
+            Octra_log.warn
+              "validator"
+              "event = set_fold_delayed epoch = %Ld reason = %s"
+              at
+              reason)
+          reason;
+        if changed then save_set_fold backend next
+        else Lwt.return_unit
+    end
+
 let ensure_validator_escrow backend =
   if backend.ops.mem Validator_registry.escrow_address then
     Ok ()
@@ -2674,6 +2740,55 @@ let validate_validator_ready_reference ~env ~head_epoch ~state_root =
       else
         Lwt.return (Ok ())
 
+let validator_ready_proof ctx tx =
+  match ctx.mode with
+  | Rule_graph.Prior -> Ok None
+  | Rule_graph.Active ->
+    begin
+      match Set_fold.proof_of_message tx.Transaction.message with
+      | Error _ as error -> error
+      | Ok None -> Ok None
+      | Ok (Some proof) ->
+        if String.equal proof.Set_fold.vote.validator tx.from then
+          Ok (Some proof)
+        else
+          Error "validator set fold proof owner mismatch"
+    end
+
+let update_ready_fold ~backend ~env ~address proof =
+  let open Lwt.Syntax in
+  let ctx = fold_at backend env.epoch_id in
+  match ctx.mode with
+  | Rule_graph.Prior -> Lwt.return (Ok None)
+  | Rule_graph.Active ->
+    let* stored = load_set_fold backend in
+    begin
+      match stored with
+      | Error _ as error -> Lwt.return error
+      | Ok state ->
+        let active = List.mem address ctx.members in
+        let result =
+          match proof with
+          | None ->
+            Set_fold.note_pulse
+              Set_fold.standard
+              ~epoch:(Int64.of_int env.epoch_id)
+              ~active
+              ~address
+              state
+          | Some proof ->
+            Set_fold.apply_proof
+              Set_fold.standard
+              ~chain_id:env.chain_id
+              ~epoch:(Int64.of_int env.epoch_id)
+              ~active
+              ~address
+              proof
+              state
+        in
+        Lwt.return (Result.map Option.some result)
+    end
+
 let process_bonded_validator_ready_tx ~backend ~env tx
     (ready : Validator_registry.ready_payload) =
   let open Lwt.Syntax in
@@ -2683,6 +2798,11 @@ let process_bonded_validator_ready_tx ~backend ~env tx
          ("validator_ready_rejected",
           "bonded validator readiness must be self-directed"))
   else
+    let ctx = fold_at backend env.epoch_id in
+    match validator_ready_proof ctx tx with
+    | Error error ->
+      Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
+    | Ok proof ->
     let* reference =
       validate_validator_ready_reference
         ~env
@@ -2711,6 +2831,19 @@ let process_bonded_validator_ready_tx ~backend ~env tx
               Lwt.return
                 (Stdlib.Error ("validator_ready_rejected", error))
             | Ok next ->
+              let* fold =
+                update_ready_fold
+                  ~backend
+                  ~env
+                  ~address:tx.from
+                  proof
+              in
+              begin
+                match fold with
+                | Error error ->
+                  Lwt.return
+                    (Stdlib.Error ("validator_ready_rejected", error))
+                | Ok fold ->
               begin
                 match backend.ops.debit tx.from tx.ou tx.nonce with
                 | Error error ->
@@ -2718,7 +2851,13 @@ let process_bonded_validator_ready_tx ~backend ~env tx
                     (Stdlib.Error ("insufficient_balance", error))
                 | Ok () ->
                   let* () = save_validator_registry backend next in
+                  let* () =
+                    match fold with
+                    | None -> Lwt.return_unit
+                    | Some state -> save_set_fold backend state
+                  in
                   Lwt.return (Stdlib.Ok tx.ou)
+              end
               end
           end
       end
@@ -2936,6 +3075,44 @@ let process_standard_tx ~(backend : backend) ~(env : env) tx =
     ~env
     tx
 
+let validator_snapshot_input ~backend ~env policy registry =
+  let open Lwt.Syntax in
+  let source = Int64.of_int env.epoch_id in
+  let ctx = fold_at backend env.epoch_id in
+  match ctx.mode with
+  | Rule_graph.Prior ->
+    Lwt.return
+      (policy.Validator_policy.parameters, Validator_registry.candidates registry)
+  | Rule_graph.Active ->
+    let* stored = load_set_fold backend in
+    let state =
+      match stored with
+      | Ok state -> state
+      | Error error -> failwith ("validator set fold state corrupt: " ^ error)
+    in
+    let candidates, counts =
+      Set_fold.filter
+        Set_fold.standard
+        ~start:ctx.start
+        ~source
+        (Validator_registry.candidates registry)
+        state
+    in
+    Octra_log.info
+      "validator"
+      "event = set_fold_snapshot source_epoch = %Ld live = %d shadow = %d allowed = %d"
+      source
+      counts.Set_fold.live
+      counts.shadow
+      counts.allowed;
+    let parameters =
+      {
+        policy.parameters with
+        Validator_admission.max_validators = Set_fold.standard.max_members;
+      }
+    in
+    Lwt.return (parameters, candidates)
+
 let schedule_validator_snapshot ~backend ~env =
   let open Lwt.Syntax in
   let source_epoch = Int64.of_int env.epoch_id in
@@ -2956,11 +3133,14 @@ let schedule_validator_snapshot ~backend ~env =
           match backend.validator_policy with
           | Validator_policy.Inactive -> Lwt.return_unit
           | Validator_policy.Bonded policy ->
+            let* parameters, candidates =
+              validator_snapshot_input ~backend ~env policy registry
+            in
             match
-              Validator_registry.snapshot
-                policy.parameters
+              Validator_admission.snapshot
+                parameters
                 ~activate_epoch
-                registry
+                candidates
             with
             | Error "validator snapshot has fewer than four eligible members" ->
               Octra_log.info
@@ -3029,6 +3209,7 @@ let promote_active_validator_set ~backend ~env =
 
 let advance_validator_set ~backend ~env =
   let open Lwt.Syntax in
+  let* () = apply_set_fold ~backend ~env in
   let* () = promote_active_validator_set ~backend ~env in
   schedule_validator_snapshot ~backend ~env
 

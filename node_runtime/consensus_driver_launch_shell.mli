@@ -10,6 +10,7 @@ type runtime = {
     string ->
     unit Lwt.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  on_driver : Octra_consensus.C_driver.t -> unit;
   start_height : int64;
   sleep : float -> unit Lwt.t;
   health : Consensus_health_wiring.node_driver_health_runtime;
@@ -49,6 +50,12 @@ val health_runtime_of_node :
 val create_driver :
   runtime ->
   Octra_consensus.C_driver.t
+
+val publish :
+  'a option ref ->
+  ('a -> unit) ->
+  'a ->
+  unit
 
 val run :
   runtime ->
