@@ -835,6 +835,26 @@ class ValidatorToolsTest(unittest.TestCase):
             "vote_log_conflict",
         )
 
+    def test_rejoin_waits_for_not_ready(self):
+        values = {"OCTRA_OPERATOR_ROLE": "validator"}
+        wallet = {"address": identity()[0]}
+        snapshot = {
+            "pid": 17,
+            "local_head": 41,
+            "remote_head": 41,
+            "voting": False,
+            "voting_reason": "not_ready",
+        }
+        member = {
+            "active": True,
+            "scheduled": False,
+            "activate_epoch": None,
+        }
+        with mock.patch("validator_rejoin.membership", return_value=member):
+            with mock.patch("validator_rejoin.emit") as emit:
+                self.assertIsNone(report_ready(values, wallet, snapshot))
+        emit.assert_not_called()
+
     def test_rejoin_wait_bounds(self):
         self.assertEqual(positive_seconds("30"), 30)
         with self.assertRaisesRegex(ValidatorError, "outside"):
