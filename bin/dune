@@ -82,3 +82,7 @@
    -w @a-4-27-40-41-42-44-45-48-58-66
    -warn-error -a
    -safe-string)))
+
+(executable
+ (name vote_floor)
+ (libraries octra_node_runtime))

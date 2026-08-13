@@ -11,6 +11,7 @@ type runtime = {
     unit Lwt.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   on_driver : Octra_consensus.C_driver.t -> unit;
+  data_dir : string;
   start_height : int64;
   sleep : float -> unit Lwt.t;
   health : Consensus_health_wiring.node_driver_health_runtime;
@@ -83,6 +84,30 @@ let health_runtime_of_node (runtime : runtime) =
       role_label = runtime.role_label;
     }
 
+let pending_vote_wires ~data_dir ~epoch_id =
+  try
+    Octra_core.Wal.read_pending_commits data_dir
+    |> List.fold_left
+      (fun result (entry : Octra_core.Wal.pending_commit) ->
+        match result with
+        | Error _ -> result
+        | Ok wires when not (Int64.equal (Int64.of_int entry.epoch_id) epoch_id) ->
+          Ok wires
+        | Ok wires ->
+          (match entry.vote_b64 with
+           | None ->
+             Error "vote log record has no stored vote"
+           | Some encoded ->
+             (try Ok (Base64.decode_exn encoded :: wires)
+              with exn ->
+                Error
+                  ("vote log wire decode failed: "
+                   ^ Printexc.to_string exn))))
+      (Ok [])
+    |> Result.map List.rev
+  with exn ->
+    Error ("vote log record read failed: " ^ Printexc.to_string exn)
+
 let create_driver runtime =
   let config =
     Consensus_driver_wiring.node_driver_config runtime.driver_config
@@ -92,6 +117,7 @@ let create_driver runtime =
     ~validator_set:runtime.validator_set
     ~swarm:runtime.swarm
     ~start_height:runtime.start_height
+    ~vote_log:(Octra_consensus.C_vote_log.disk ~data_dir:runtime.data_dir)
 
 let publish slot on_driver driver =
   slot := Some driver;
@@ -99,6 +125,12 @@ let publish slot on_driver driver =
 
 let run runtime =
   let driver = create_driver runtime in
+  Octra_consensus.C_driver.restore_votes
+    driver
+    (pending_vote_wires
+       ~data_dir:runtime.data_dir
+       ~epoch_id:runtime.start_height);
+  Octra_consensus.C_driver.require_vote_floor driver;
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
     runtime.activate_validator_set;

@@ -12,6 +12,8 @@ type deps = {
   clear_state_attested : unit -> unit;
   log_already : current_epoch:int -> head:int -> unit;
   log_defer : Admission.catchup -> Catchup.queue_event -> unit;
+  preflight : unit -> (unit, string) result;
+  defer : string -> unit;
   apply : unit -> unit Lwt.t;
 }
 
@@ -32,10 +34,14 @@ let run deps ~consensus_mode ~current_epoch =
     deps.log_defer catchup event;
     Lwt.return_unit
   | Admission.Apply_now ->
-    deps.apply ()
+    (match deps.preflight () with
+     | Ok () -> deps.apply ()
+     | Error reason ->
+       deps.defer reason;
+       Lwt.return_unit)
 
 let run_node ~consensus_mode ~current_epoch ~head ~catchup_queue
-    ~catchup_in_progress ~clear_state_attested ~apply =
+    ~catchup_in_progress ~clear_state_attested ~preflight ~defer ~apply =
   run
     {
       head;
@@ -55,6 +61,8 @@ let run_node ~consensus_mode ~current_epoch ~head ~catchup_queue
           catchup.Admission.reason
           event.Catchup.queued_label
           event.queued_active);
+      preflight;
+      defer;
       apply;
     }
     ~consensus_mode

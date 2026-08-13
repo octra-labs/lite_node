@@ -30,6 +30,11 @@ val consensus_peer_states :
   now:float ->
   diag:Octra_net.P2p_peer_diag.t option ->
   peer_records:Octra_consensus.C_driver.peer_state_record list option ->
+  voting:bool ->
+  voting_reason:string option ->
+  round_state:Octra_consensus.C_driver.round_state option ->
+  round_peers:Yojson.Safe.t list ->
+  round_agreed:bool ->
   Yojson.Safe.t
 
 val node_status :

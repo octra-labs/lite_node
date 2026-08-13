@@ -823,9 +823,40 @@ let consensus_peer ~now (row : Octra_consensus.C_driver.peer_state_record) =
     "age_sec", `Float (max 0.0 (now -. row.last_seen));
   ]
 
-let consensus_peer_states ~enabled ~peers ~scores ~diag =
+let round_step = function
+  | Octra_consensus.C_types.ProposeStep -> "propose"
+  | Octra_consensus.C_types.PrevoteStep -> "prevote"
+  | Octra_consensus.C_types.PrecommitStep -> "precommit"
+
+let consensus_round (state : Octra_consensus.C_driver.round_state) =
+  `Assoc [
+    "epoch_id", `String (Int64.to_string state.epoch_id);
+    "round", `Int state.round;
+    "step", `String (round_step state.step);
+  ]
+
+let consensus_round_peer ~now (row : Octra_consensus.C_driver.round_peer_record) =
+  `Assoc [
+    "validator_addr", `String row.validator_addr;
+    "epoch_id", `String (Int64.to_string row.epoch_id);
+    "round", `Int row.round;
+    "step", `String (round_step row.step);
+    "age_sec", `Float (max 0.0 (now -. row.last_seen));
+  ]
+
+let consensus_peer_states
+    ~enabled ~voting ~voting_reason ~round_state ~round_peers ~round_agreed
+    ~peers ~scores ~diag =
   `Assoc [
     "enabled", `Bool enabled;
+    "voting", `Bool voting;
+    "voting_reason", opt_string voting_reason;
+    "round_state",
+      (match round_state with
+       | Some state -> consensus_round state
+       | None -> `Null);
+    "round_peers", `List round_peers;
+    "round_agreed", `Bool round_agreed;
     "peers", `List peers;
     "scores", `List scores;
     "p2p_diagnostics", diag;

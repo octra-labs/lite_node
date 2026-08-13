@@ -11,19 +11,23 @@ if [ ! -f "$CONFIG" ]; then
   exit 1
 fi
 
-case "${1:-}" in
-  "")
+case "$#" in
+  0)
     python3 "$ROOT/controls/lib/validator_config.py" \
       --check-runtime \
       --config "$CONFIG"
     ;;
-  --rebind-runtime)
+  1)
+    if [ "$1" != "--rebind-runtime" ]; then
+      printf 'status = refused reason = unsupported_argument value = %s\n' "$1" >&2
+      exit 1
+    fi
     python3 "$ROOT/controls/lib/validator_config.py" \
       --rebind-runtime \
       --config "$CONFIG"
     ;;
   *)
-    printf 'status = refused reason = unsupported_argument value = %s\n' "$1" >&2
+    printf 'status = refused reason = unsupported_arguments\n' >&2
     exit 1
     ;;
 esac

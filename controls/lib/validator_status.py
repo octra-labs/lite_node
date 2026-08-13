@@ -122,6 +122,31 @@ def promotion_readiness(values, data_dir):
     marker = Path(data_dir) / "ready_to_vote.json"
     return "ready" if marker.is_file() else "pending"
 
+def round_view(payload):
+    if not isinstance(payload, dict):
+        return {}
+    state = payload.get("round_state")
+    if not isinstance(state, dict):
+        return {}
+    try:
+        epoch = int(state["epoch_id"])
+        round_id = int(state["round"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    step = state.get("step")
+    agreed = payload.get("round_agreed")
+    peers = payload.get("round_peers")
+    if epoch < 0 or round_id < 0 or not isinstance(step, str):
+        return {}
+    return {
+        "round_epoch": epoch,
+        "round": round_id,
+        "round_step": step,
+        "round_agreed": agreed if isinstance(agreed, bool) else "unknown",
+        "round_peers": len(peers) if isinstance(peers, list) else 0,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(prog="stat.sh")
     parser.add_argument("--config", required=True)
@@ -194,6 +219,16 @@ def main():
         diagnostics = peers.get("p2p_diagnostics") or {}
         records = peers.get("peers") or []
         emit("peer_rpc", "ready")
+        voting = peers.get("voting")
+        if isinstance(voting, bool):
+            emit("voting", "enabled" if voting else "disabled")
+            reason = peers.get("voting_reason")
+            if isinstance(reason, str) and reason:
+                emit("voting_reason", reason)
+        else:
+            emit("voting", "unavailable")
+        for key, value in round_view(peers).items():
+            emit(key, value)
         emit("p2p_connected", diagnostics.get("connected", 0))
         emit("p2p_known", diagnostics.get("known", 0))
         emit("consensus_peers", len(records))

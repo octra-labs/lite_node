@@ -16,7 +16,7 @@ type finalized =
   | Finalized_accepted of accepted
 
 type proposal =
-  | Proposal_fallback
+  | Proposal_missing
   | Proposal_accepted of accepted
 
 type proposal_bundle = {
@@ -24,6 +24,10 @@ type proposal_bundle = {
   receipts_json : string list;
   rejections : Octra_core.Tx_outcome.rejection list;
 }
+
+type proposal_state =
+  | Proposal_ready of proposal_bundle
+  | Proposal_wait
 
 type finalized_state =
   | Finalized_ready
@@ -70,7 +74,7 @@ let finalized ~response ~bundle =
 let proposal ~response ~bundle =
   match response, bundle with
   | Some response, Some bundle -> Proposal_accepted (accepted response bundle)
-  | _ -> Proposal_fallback
+  | _ -> Proposal_missing
 
 let proposal_bundle_of_accepted bundle =
   {
@@ -127,17 +131,10 @@ let ensure_finalized (deps : finalized_deps) ~epoch_id =
     Lwt.return Finalized_ready
   else begin
     Log.warn "consensus"
-      "event = finalized_bundle_wait epoch = %Ld reason = canonical_bundle_unavailable"
+      "event = finalized_bundle_wait epoch = %Ld reason = committed_bundle_unavailable"
       epoch_id;
     Lwt.return Finalized_deferred
   end
-
-let local_proposal_fallback (deps : proposal_deps) ~reason ~local_tx_count
-    ~expected_hash_count =
-  Log.warn "consensus"
-    "verify_proposal canonical_bundle = fallback reason = %s have = %d need = %d"
-    reason local_tx_count expected_hash_count;
-  deps.local_preverify_bundle ()
 
 let fetch_proposal (deps : proposal_deps) ~local_tx_count ~expected_hash_count =
   let open Lwt.Syntax in
@@ -154,22 +151,22 @@ let fetch_proposal (deps : proposal_deps) ~local_tx_count ~expected_hash_count =
   | Proposal_accepted accepted ->
     deps.store_proposal_bundle accepted;
     Log.info "consensus"
-      "verify_proposal canonical_bundle = fetched n = %d peer = %s"
+      "verify_proposal committed_bundle = fetched n = %d peer = %s"
       (List.length accepted.bundle.Bundle.txs)
       (short14 accepted.responder_addr);
-    Lwt.return (proposal_bundle_of_accepted accepted.bundle)
-  | Proposal_fallback ->
-    local_proposal_fallback deps
-      ~reason:"fetch_failed"
-      ~local_tx_count
-      ~expected_hash_count
+    Lwt.return (Proposal_ready (proposal_bundle_of_accepted accepted.bundle))
+  | Proposal_missing ->
+    Log.warn "consensus"
+      "verify_proposal committed_bundle = wait reason = fetch_failed have = %d need = %d"
+      local_tx_count expected_hash_count;
+    Lwt.return Proposal_wait
 
 let local_complete_or_fetch (deps : proposal_deps) ~local_tx_count
     ~expected_hash_count =
   let open Lwt.Syntax in
   let* local = deps.local_preverify_bundle () in
   if deps.local_bundle_valid local then
-    Lwt.return local
+    Lwt.return (Proposal_ready local)
   else if deps.driver_available () then begin
     Log.info "consensus"
       "verify_proposal committed_bundle = fetch_outcome_artifacts";
@@ -177,7 +174,7 @@ let local_complete_or_fetch (deps : proposal_deps) ~local_tx_count
   end else begin
     Log.warn "consensus"
       "verify_proposal committed_bundle = local_root_mismatch driver = unavailable";
-    Lwt.return local
+    Lwt.return Proposal_wait
   end
 
 let ensure_proposal (deps : proposal_deps) ~epoch_id:_ ~proposal_id_short ~expected_hash_count
@@ -185,24 +182,26 @@ let ensure_proposal (deps : proposal_deps) ~epoch_id:_ ~proposal_id_short ~expec
   match deps.cached_proposal_bundle () with
   | Some bundle ->
     Log.info "consensus"
-      "verify_proposal canonical_bundle = cached pid = %s n = %d"
+      "verify_proposal committed_bundle = cached pid = %s n = %d"
       proposal_id_short
       (List.length bundle.txs);
-    Lwt.return bundle
+    Lwt.return (Proposal_ready bundle)
   | None when hashes_empty ->
-    Lwt.return { txs = []; receipts_json = []; rejections = [] }
+    Lwt.return
+      (Proposal_ready { txs = []; receipts_json = []; rejections = [] })
   | None when missing_count = 0 ->
     local_complete_or_fetch deps
       ~local_tx_count
       ~expected_hash_count
   | None ->
     Log.info "consensus"
-      "verify_proposal canonical_bundle = fetch_missing missing = %d total = %d"
+      "verify_proposal committed_bundle = fetch_missing missing = %d total = %d"
       missing_count expected_hash_count;
     if deps.driver_available () then
       fetch_proposal deps ~local_tx_count ~expected_hash_count
-    else
-      local_proposal_fallback deps
-        ~reason:"no_driver"
-        ~local_tx_count
-        ~expected_hash_count
+    else begin
+      Log.warn "consensus"
+        "verify_proposal committed_bundle = wait reason = driver_unavailable have = %d need = %d"
+        local_tx_count expected_hash_count;
+      Lwt.return Proposal_wait
+    end

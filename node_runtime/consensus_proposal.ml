@@ -260,6 +260,7 @@ type verify_proposal_deps = {
   next_txid : unit -> int64;
   root_to_raw32 : string -> string;
   set_proposal : Transaction.t list -> string list -> unit;
+  share_txs : Transaction.t list -> unit;
   verify_parent_commit :
     epoch_id:int64 ->
     Octra_consensus.C_types.parent_commit option ->
@@ -1465,6 +1466,9 @@ let handle_proposal_admission ~start_height ~epoch_id ~current_epoch
 let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
+  let accept = Octra_consensus.C_driver.Proposal_accept in
+  let reject = Octra_consensus.C_driver.Proposal_reject in
+  let wait = Octra_consensus.C_driver.Proposal_wait in
   match
     deps.verify_parent_commit
       ~epoch_id:propose.epoch_id
@@ -1474,7 +1478,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
     Octra_log.warn "consensus"
       "reject proposal reason = parent_commit detail = %s"
       reason;
-    Lwt.return_false
+    Lwt.return reject
   | Ok () ->
   let previous =
     if propose.epoch_id <= 0L then Ok None
@@ -1493,7 +1497,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
     Octra_log.warn "consensus"
       "reject proposal reason = invalid_epoch_time detail = %s"
       reason;
-    Lwt.return_false
+    Lwt.return reject
   | Ok previous ->
     let epoch_time_check =
       if not
@@ -1522,13 +1526,13 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
     Octra_log.warn "consensus"
       "reject proposal reason = invalid_epoch_time detail = %s"
       reason;
-    Lwt.return_false
+    Lwt.return reject
   | Ok _ when deps.quarantine_active () -> begin
       Octra_log.warn "consensus"
         "reject proposal reason = self_quarantine epoch = %Ld detail = %s"
         propose.epoch_id
         (deps.quarantine_reason ());
-      Lwt.return_false
+      Lwt.return reject
     end
   | Ok _ ->
     let target = propose.header.prev_state_root in
@@ -1573,7 +1577,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         (raw_hex8 initial_our)
         waited_steps
         deps.prev_root_wait_delay_seconds;
-      Lwt.return_false
+      Lwt.return reject
     | Prev_root_match ->
       let tx_hashes_hex = List.map raw32_to_hex propose.tx_hashes in
       match
@@ -1584,7 +1588,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
       | Tx_hash_mismatch ->
         Octra_log.warn "consensus"
           "reject proposal reason = tx_list_hash_mismatch";
-        Lwt.return_false
+        Lwt.return reject
       | Tx_hash_ok tx_hashes_hex ->
         let pid = Octra_consensus.C_hash.proposal_id propose.header in
         let staging_snapshot = deps.staging_txs () in
@@ -1622,7 +1626,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
           }
         in
         let proposal_id_short = proposal_id_short pid in
-        let* proposal_bundle =
+        let* bundle_state =
           Consensus_bundle_fetch.ensure_proposal
             {
               cached_proposal_bundle = (fun () ->
@@ -1660,6 +1664,10 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
             ~hashes_empty:
               (Consensus_bundle_cache.header_has_empty_bundle propose.header)
         in
+        match bundle_state with
+        | Consensus_bundle_fetch.Proposal_wait ->
+          Lwt.return wait
+        | Consensus_bundle_fetch.Proposal_ready proposal_bundle ->
         let tx_list = proposal_bundle.Consensus_bundle_fetch.txs in
         let receipts_json = proposal_bundle.receipts_json in
         match
@@ -1677,7 +1685,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         with
         | Error reason ->
           log_reject ~epoch_id:propose.epoch_id reason;
-          Lwt.return_false
+          Lwt.return reject
         | Ok verified ->
           let candidate_hashes = List.map Transaction.hash verified.candidates in
           let* local_candidates =
@@ -1702,7 +1710,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
             Octra_log.warn "consensus"
               "reject proposal reason = candidate_preverify_mismatch epoch = %Ld"
               propose.epoch_id;
-            Lwt.return_false
+            Lwt.return reject
           end else
             let local = {
               local_candidates with
@@ -1723,7 +1731,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                 "reject proposal reason = local_preverify_mismatch epoch = %Ld detail = %s"
                 propose.epoch_id
                 reason;
-              Lwt.return_false
+              Lwt.return reject
             | Ok _ ->
             let tx_list = verified.txs in
             let receipts_json = verified.receipts_json in
@@ -1775,7 +1783,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                 "reject proposal reason = rejection_partition_mismatch epoch = %Ld detail = %s"
                 propose.epoch_id
                 reason;
-              Lwt.return_false
+              Lwt.return reject
             | Ok () ->
             let* preview_result =
               deps.preview {
@@ -1803,7 +1811,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                 "reject proposal reason = accepted_partition_mismatch epoch = %Ld detail = %s"
                 propose.epoch_id
                 reason;
-              Lwt.return_false
+              Lwt.return reject
             | Ok () ->
             let decision =
             preview_decision
@@ -1858,12 +1866,13 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
               deps.set_prev_root_streak 0;
               deps.set_state_root_streak 0;
               deps.set_proposal tx_list tx_hashes_hex;
+              deps.share_txs tx_list;
               deps.store_bundle
                 ~proposal_id:pid
                 ~tx_hashes:tx_hashes_hex
                 ~txs:tx_list
                 ~receipts_json;
-              Lwt.return_true
+              Lwt.return accept
             end else begin
               let next_streak = deps.state_root_streak () + 1 in
               deps.set_state_root_streak next_streak;
@@ -1873,7 +1882,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                      "state_root_mismatch_streak = %d epoch = %Ld"
                      next_streak
                      propose.epoch_id);
-              Lwt.return_false
+              Lwt.return reject
             end
 
 let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =

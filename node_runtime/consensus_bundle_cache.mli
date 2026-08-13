@@ -59,6 +59,22 @@ type node_runtime = {
 
 val create : cap:int -> t
 
+val create_with_limits :
+  cap:int ->
+  shared_cap:int ->
+  shared_limit:int ->
+  t
+
+val share :
+  t ->
+  Transaction.t list ->
+  string list
+
+val find_shared :
+  t ->
+  string ->
+  Transaction.t option
+
 val stats : t -> stats
 
 val store :

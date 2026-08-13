@@ -616,6 +616,7 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
       activate_validator_set = p2p_start.activate_validator_set;
       driver_ref = deps.driver_ref;
       on_driver = deps.on_driver;
+      data_dir = deps.data_dir;
       start_height;
       sleep = deps.sleep;
       health =

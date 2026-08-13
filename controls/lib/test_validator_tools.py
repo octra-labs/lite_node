@@ -29,6 +29,7 @@ from validator_config import BUILD_WORK
 from validator_config import build_candidate
 from validator_config import CARGO_HOME
 from validator_config import check_sync_sources
+from validator_config import ensure_build_toolchain
 from validator_config import OPAM_SWITCH
 from validator_config import ROOT as CONFIG_ROOT
 from validator_config import RUSTUP_HOME
@@ -61,10 +62,32 @@ from validator_process import process_plan
 from validator_process import process_pids
 from validator_process import remaining_owners
 from validator_process import active_data_owners
+from validator_process import entry_data
 from validator_process import wait_stopped
 from validator_recover import recover
 from validator_recover import preserved_state_path
+from validator_rejoin import configured_data
+from validator_rejoin import captured_round
+from validator_rejoin import floor_binary
+from validator_rejoin import floor_source
+from validator_rejoin import launch
+from validator_rejoin import legacy_handoff
+from validator_rejoin import log_round
+from validator_rejoin import node_binary
+from validator_rejoin import place_floor
+from validator_rejoin import rejoin
+from validator_rejoin import online_entry
+from validator_rejoin import peer_head
+from validator_rejoin import positive_seconds
+from validator_rejoin import rpc_call
+from validator_rejoin import round_alignment
+from validator_rejoin import report_ready
+from validator_rejoin import signed_round
+from validator_rejoin import snapshot
+from validator_rejoin import sync_state
+from validator_rejoin import vote_state
 from validator_status import promotion_readiness
+from validator_status import round_view
 
 RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
 WORK = RUNTIME_DATA_ROOT / "validator_tools_test"
@@ -175,6 +198,659 @@ class ValidatorToolsTest(unittest.TestCase):
                     return_value=usage,
                 ):
                     resource_report(WORK, "observer")
+
+    def test_rejoin_requires_configured_data_directory(self):
+        values = {"OCTRA_DATA_DIR": str(WORK)}
+        self.assertEqual(configured_data(values, WORK), WORK.resolve())
+        with self.assertRaisesRegex(
+            ValidatorError,
+            "does not match node configuration",
+        ):
+            configured_data(values, WORK / "other")
+
+    def test_rejoin_defaults_to_configured_data_directory(self):
+        values = {"OCTRA_DATA_DIR": str(WORK)}
+        self.assertEqual(configured_data(values), WORK.resolve())
+
+    def test_config_build_only_mode(self):
+        self.assertTrue(parser().parse_args(["--build-only"]).build_only)
+
+    def test_rejoin_uses_packaged_floor_tool(self):
+        root = WORK / "candidate"
+        tool = root / "artifacts/vote_floor.exe"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"floor")
+        self.assertEqual(floor_binary(root), tool)
+
+    def test_rejoin_uses_built_node_binary(self):
+        root = WORK / "source"
+        binary = root / "_build/default/bin/octra_node.exe"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"node")
+        self.assertEqual(node_binary(root), binary)
+
+    def test_rejoin_invokes_floor_tool_with_bound_identity(self):
+        root = WORK / "candidate"
+        tool = root / "artifacts/vote_floor.exe"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"floor")
+        values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        with mock.patch("validator_rejoin.subprocess.run") as run:
+            place_floor(root, values, wallet, WORK, 41, 7, check=True)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                str(tool),
+                "--data-dir",
+                str(WORK),
+                "--chain-id",
+                "octra-devnet-test",
+                "--validator",
+                wallet["address"],
+                "--validator-pub",
+                wallet["pub"],
+                "--head-epoch",
+                "41",
+                "--round",
+                "7",
+                "--check",
+            ],
+        )
+
+    def test_rejoin_binds_signed_round_with_local_minimum(self):
+        root = WORK / "candidate"
+        tool = root / "artifacts/vote_floor.exe"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"floor")
+        values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        with mock.patch("validator_rejoin.subprocess.run") as run:
+            place_floor(
+                root,
+                values,
+                wallet,
+                WORK,
+                41,
+                7,
+                sync="signed",
+                check=True,
+            )
+        self.assertEqual(
+            run.call_args.args[0][-5:],
+            ["--round-sync", "signed", "--round-min", "7", "--check"],
+        )
+
+    def test_rejoin_requires_running_validator(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK),
+            "OCTRA_OPERATOR_ROLE": "validator",
+        }
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        with mock.patch("validator_rejoin.require_root"):
+            with mock.patch("validator_rejoin.private_mode"):
+                with mock.patch("validator_rejoin.parse_env", return_value=values):
+                    with mock.patch("validator_rejoin.state_ready", return_value=True):
+                        with mock.patch(
+                            "validator_rejoin.validate_checkpoint",
+                            return_value={"epoch": 41},
+                        ):
+                            with mock.patch(
+                                "validator_rejoin.load_wallet",
+                                return_value=wallet,
+                            ):
+                                with mock.patch(
+                                    "validator_rejoin.data_pids",
+                                    return_value=[],
+                                ):
+                                    with self.assertRaisesRegex(
+                                        ValidatorError,
+                                        "running validator is required",
+                                    ):
+                                        rejoin(
+                                            WORK,
+                                            WORK / "node.env",
+                                            WORK,
+                                            30,
+                                        )
+
+    def test_rejoin_captures_round_before_stopping(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK),
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_OPERATOR_PM2_NAME": "octra-test",
+        }
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        entries = [{
+            "name": "octra-test",
+            "pid": 17,
+            "pm2_env": {
+                "env": {"OCTRA_DATA_DIR": str(WORK)},
+                "status": "online",
+            },
+        }]
+        before = {"round_epoch": 42, "round": 7, "peer_round": 9}
+        after = {
+            "state": "synced",
+            "pid": 18,
+            "local_head": 41,
+            "remote_head": 41,
+            "voting": True,
+            "round": 8,
+            "peer_round": 8,
+            "round_peers": 4,
+            "round_agreed": True,
+        }
+        with mock.patch("validator_rejoin.require_root"):
+            with mock.patch("validator_rejoin.private_mode"):
+                with mock.patch("validator_rejoin.parse_env", return_value=values):
+                    with mock.patch("validator_rejoin.state_ready", return_value=True):
+                        with mock.patch(
+                            "validator_rejoin.validate_checkpoint",
+                            return_value={"epoch": 41},
+                        ):
+                            with mock.patch(
+                                "validator_rejoin.load_wallet",
+                                return_value=wallet,
+                            ):
+                                with mock.patch(
+                                    "validator_rejoin.data_pids",
+                                    side_effect=[[17], []],
+                                ):
+                                    with mock.patch(
+                                        "validator_rejoin.pm2_entries",
+                                        return_value=entries,
+                                    ):
+                                        with mock.patch(
+                                            "validator_rejoin.snapshot",
+                                            side_effect=[before, after],
+                                        ):
+                                            with mock.patch(
+                                                "validator_rejoin.place_floor",
+                                            ) as floor:
+                                                with mock.patch(
+                                                    "validator_rejoin.stop",
+                                                ) as stop_node:
+                                                    with mock.patch(
+                                                        "validator_rejoin.launch",
+                                                    ) as launch_node:
+                                                        with mock.patch(
+                                                            "validator_rejoin.report_ready",
+                                                            return_value=0,
+                                                        ):
+                                                            with mock.patch("validator_rejoin.emit"):
+                                                                result = rejoin(
+                                                                    WORK,
+                                                                    WORK / "node.env",
+                                                                    WORK,
+                                                                    30,
+                                                                )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            floor.call_args_list[0].args,
+            (WORK, values, wallet, WORK, 41, 10),
+        )
+        self.assertTrue(floor.call_args_list[0].kwargs["check"])
+        self.assertEqual(
+            floor.call_args_list[1].args,
+            (WORK, values, wallet, WORK, 41, 10),
+        )
+        stop_node.assert_called_once_with(WORK, WORK / "node.env")
+        launch_node.assert_called_once_with(WORK, WORK / "node.env")
+
+    def test_rejoin_check_never_stops_validator(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK),
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_OPERATOR_PM2_NAME": "octra-test",
+        }
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        entries = [{
+            "name": "octra-test",
+            "pid": 17,
+            "pm2_env": {
+                "env": {"OCTRA_DATA_DIR": str(WORK)},
+                "status": "online",
+            },
+        }]
+        before = {"round_epoch": 42, "round": 7, "peer_round": 9}
+        with mock.patch("validator_rejoin.require_root"):
+            with mock.patch("validator_rejoin.private_mode"):
+                with mock.patch("validator_rejoin.parse_env", return_value=values):
+                    with mock.patch("validator_rejoin.state_ready", return_value=True):
+                        with mock.patch(
+                            "validator_rejoin.validate_checkpoint",
+                            return_value={"epoch": 41},
+                        ):
+                            with mock.patch(
+                                "validator_rejoin.load_wallet",
+                                return_value=wallet,
+                            ):
+                                with mock.patch(
+                                    "validator_rejoin.data_pids",
+                                    return_value=[17],
+                                ):
+                                    with mock.patch(
+                                        "validator_rejoin.pm2_entries",
+                                        return_value=entries,
+                                    ):
+                                        with mock.patch(
+                                            "validator_rejoin.snapshot",
+                                            return_value=before,
+                                        ):
+                                            with mock.patch(
+                                                "validator_rejoin.place_floor",
+                                            ) as floor:
+                                                with mock.patch(
+                                                    "validator_rejoin.stop",
+                                                ) as stop_node:
+                                                    with mock.patch(
+                                                        "validator_rejoin.launch",
+                                                    ) as launch_node:
+                                                        with mock.patch("validator_rejoin.emit"):
+                                                            result = rejoin(
+                                                                WORK,
+                                                                WORK / "node.env",
+                                                                WORK,
+                                                                30,
+                                                                check=True,
+                                                            )
+        self.assertEqual(result, 0)
+        floor.assert_called_once()
+        self.assertTrue(floor.call_args.kwargs["check"])
+        stop_node.assert_not_called()
+        launch_node.assert_not_called()
+
+    def test_rejoin_legacy_pauses_before_handoff(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK),
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_OPERATOR_PM2_NAME": "octra-test",
+        }
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        entries = [{
+            "name": "octra-test",
+            "pid": 17,
+            "pm2_env": {
+                "env": {"OCTRA_DATA_DIR": str(WORK)},
+                "status": "online",
+            },
+        }]
+        before = {"pid": 17}
+        after = {
+            "state": "synced",
+            "pid": 18,
+            "local_head": 41,
+            "remote_head": 41,
+            "voting": True,
+            "round": 13,
+            "peer_round": 13,
+            "round_peers": 4,
+            "round_agreed": True,
+        }
+        with mock.patch("validator_rejoin.require_root"):
+            with mock.patch("validator_rejoin.private_mode"):
+                with mock.patch("validator_rejoin.parse_env", return_value=values):
+                    with mock.patch("validator_rejoin.state_ready", return_value=True):
+                        with mock.patch(
+                            "validator_rejoin.validate_checkpoint",
+                            return_value={"epoch": 41},
+                        ):
+                            with mock.patch(
+                                "validator_rejoin.load_wallet",
+                                return_value=wallet,
+                            ):
+                                with mock.patch(
+                                    "validator_rejoin.data_pids",
+                                    side_effect=[[17], [], []],
+                                ):
+                                    with mock.patch(
+                                        "validator_rejoin.pm2_entries",
+                                        return_value=entries,
+                                    ):
+                                        with mock.patch(
+                                            "validator_rejoin.snapshot",
+                                            side_effect=[before, after],
+                                        ):
+                                            with mock.patch(
+                                                "validator_rejoin.log_round",
+                                                return_value=14,
+                                            ):
+                                                with mock.patch(
+                                                    "validator_rejoin.signed_round",
+                                                    return_value="signed",
+                                                ):
+                                                    with mock.patch(
+                                                        "validator_rejoin.place_floor",
+                                                    ) as floor:
+                                                        with mock.patch(
+                                                            "validator_rejoin.stop",
+                                                        ):
+                                                            with mock.patch(
+                                                                "validator_rejoin.pause_node",
+                                                            ) as pause_node:
+                                                                with mock.patch(
+                                                                    "validator_rejoin.resume_node",
+                                                                ) as resume_node:
+                                                                    with mock.patch(
+                                                                        "validator_rejoin.launch",
+                                                                    ):
+                                                                        with mock.patch(
+                                                                            "validator_rejoin.report_ready",
+                                                                            return_value=0,
+                                                                        ):
+                                                                            with mock.patch("validator_rejoin.emit"):
+                                                                                result = rejoin(
+                                                                                    WORK,
+                                                                                    WORK / "node.env",
+                                                                                    WORK,
+                                                                                    30,
+                                                                                    legacy=True,
+                                                                                )
+        self.assertEqual(result, 0)
+        pause_node.assert_called_once_with(17)
+        resume_node.assert_not_called()
+        self.assertEqual(floor.call_args_list[0].args[5], 14)
+        self.assertEqual(floor.call_args_list[1].args[5], 14)
+
+    def test_legacy_handoff_resumes_after_log_refusal(self):
+        values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        with mock.patch("validator_rejoin.pause_node") as pause_node:
+            with mock.patch(
+                "validator_rejoin.log_round",
+                side_effect=ValidatorError("validator round is unavailable in local log"),
+            ):
+                with mock.patch("validator_rejoin.resume_node") as resume_node:
+                    with mock.patch("validator_rejoin.stop") as stop_node:
+                        with self.assertRaisesRegex(ValidatorError, "round is unavailable"):
+                            legacy_handoff(
+                                WORK,
+                                WORK / "node.env",
+                                values,
+                                wallet,
+                                WORK,
+                                41,
+                                17,
+                                "signed",
+                            )
+        pause_node.assert_called_once_with(17)
+        resume_node.assert_called_once_with(17)
+        stop_node.assert_not_called()
+
+    def test_rejoin_captured_round_requires_current_epoch(self):
+        with self.assertRaisesRegex(ValidatorError, "does not match"):
+            captured_round({"round_epoch": 41, "round": 7}, 41)
+
+    def test_rejoin_captured_round_moves_past_peer_round(self):
+        self.assertEqual(
+            captured_round({"round_epoch": 42, "round": 7, "peer_round": 9}, 41),
+            10,
+        )
+
+    def test_rejoin_requires_explicit_legacy_handoff(self):
+        snapshot = {}
+        values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
+        wallet = {"address": identity()[0]}
+        with self.assertRaisesRegex(ValidatorError, "legacy handoff"):
+            floor_source(snapshot, values, wallet, 41, False)
+
+    def test_rejoin_uses_signed_legacy_handoff(self):
+        snapshot = {}
+        values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
+        wallet = {"address": identity()[0]}
+        with mock.patch("validator_rejoin.signed_round", return_value="signed"):
+            self.assertEqual(
+                floor_source(snapshot, values, wallet, 41, True),
+                (None, "signed"),
+            )
+
+    def test_rejoin_reads_local_round_log(self):
+        output = (
+            "event = round_skip height = 42 old_round = 9 new_round = 10\n"
+            "event = make_proposal epoch = 42 round = 11\n"
+        )
+        result = mock.Mock(returncode=0, stdout=output)
+        with mock.patch("validator_rejoin.subprocess.run", return_value=result):
+            self.assertEqual(log_round("octra-test", 42), 11)
+
+    def test_rejoin_refuses_missing_local_round_log(self):
+        result = mock.Mock(returncode=0, stdout="")
+        with mock.patch("validator_rejoin.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(ValidatorError, "local log"):
+                log_round("octra-test", 42)
+
+    def test_rejoin_reads_signed_round(self):
+        values = {"OCTRA_OPERATOR_RPC_URL": "https://devnet.example/rpc"}
+        wallet = {"address": identity()[0]}
+        with mock.patch(
+            "validator_rejoin.rpc_call",
+            return_value={"round_sync": "signed"},
+        ):
+            self.assertEqual(signed_round(values, wallet), "signed")
+
+    def test_rejoin_witness_sets_operator_agent(self):
+        response = mock.Mock()
+        response.read.return_value = b'{"result":{"round_sync":"signed"}}'
+        context = mock.Mock()
+        context.__enter__ = mock.Mock(return_value=response)
+        context.__exit__ = mock.Mock(return_value=False)
+        with mock.patch("urllib.request.urlopen", return_value=context) as open_rpc:
+            self.assertEqual(
+                rpc_call(
+                    "https://devnet.example/rpc",
+                    "octra_roundWitness",
+                    [identity()[0]],
+                ),
+                {"round_sync": "signed"},
+            )
+        request = open_rpc.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), "octra-validator-rejoin/1")
+
+    def test_rejoin_requires_one_online_process(self):
+        data_dir = WORK.resolve()
+        entries = [{
+            "name": "octra-test",
+            "pid": 17,
+            "pm2_env": {
+                "OCTRA_DATA_DIR": str(data_dir),
+                "status": "online",
+            },
+        }]
+        self.assertEqual(online_entry(entries, "octra-test", data_dir), 17)
+        with self.assertRaisesRegex(ValidatorError, "exactly one"):
+            online_entry(entries + entries, "octra-test", data_dir)
+
+    def test_pm2_data_reads_both_forms(self):
+        data_dir = str(WORK.resolve())
+        self.assertEqual(
+            entry_data({"pm2_env": {"OCTRA_DATA_DIR": data_dir}}),
+            data_dir,
+        )
+        self.assertEqual(
+            entry_data({"pm2_env": {"env": {"OCTRA_DATA_DIR": data_dir}}}),
+            data_dir,
+        )
+        self.assertIsNone(
+            entry_data({
+                "pm2_env": {
+                    "OCTRA_DATA_DIR": data_dir,
+                    "env": {"OCTRA_DATA_DIR": data_dir + "/other"},
+                },
+            }),
+        )
+
+    def test_rejoin_peer_head_ignores_invalid_entries(self):
+        payload = {
+            "peers": [
+                {"head_epoch": "41"},
+                {"head_epoch": 39},
+                {"head_epoch": "bad"},
+                {},
+            ],
+        }
+        self.assertEqual(peer_head(payload), 41)
+        self.assertIsNone(peer_head({"peers": []}))
+
+    def test_rejoin_reads_vote_state(self):
+        self.assertEqual(vote_state({"voting": True}), (True, None))
+        self.assertEqual(
+            vote_state({"voting": False, "voting_reason": "vote_log_conflict"}),
+            (False, "vote_log_conflict"),
+        )
+        self.assertEqual(vote_state({"voting": "true"}), (None, None))
+
+    def test_status_reports_round_view(self):
+        self.assertEqual(
+            round_view({
+                "round_state": {
+                    "epoch_id": "41",
+                    "round": 18,
+                    "step": "prevote",
+                },
+                "round_agreed": True,
+                "round_peers": [{}, {}],
+            }),
+            {
+                "round_epoch": 41,
+                "round": 18,
+                "round_step": "prevote",
+                "round_agreed": True,
+                "round_peers": 2,
+            },
+        )
+        self.assertEqual(round_view({"round_state": {}}), {})
+
+    def test_rejoin_requires_round_alignment(self):
+        aligned = round_alignment({
+            "round_state": {"epoch_id": "41", "round": 18},
+            "round_agreed": True,
+            "round_peers": [
+                {"epoch_id": "41", "round": 17, "age_sec": 1.0},
+                {"epoch_id": "41", "round": 19, "age_sec": 2.0},
+            ],
+        })
+        self.assertEqual(aligned["state"], "round_aligned")
+        lagging = round_alignment({
+            "round_state": {"epoch_id": "41", "round": 16},
+            "round_agreed": False,
+            "round_peers": [
+                {"epoch_id": "41", "round": 186, "age_sec": 1.0},
+            ],
+        })
+        self.assertEqual(lagging["state"], "round_lagging")
+        self.assertEqual(lagging["peer_round"], 186)
+        unconfirmed = round_alignment({
+            "round_state": {"epoch_id": "41", "round": 186},
+            "round_agreed": False,
+            "round_peers": [
+                {"epoch_id": "41", "round": 186, "age_sec": 1.0},
+            ],
+        })
+        self.assertEqual(unconfirmed["state"], "round_unconfirmed")
+        self.assertEqual(
+            round_alignment({
+                "round_state": {"epoch_id": "41", "round": 18},
+                "round_agreed": True,
+                "round_peers": [],
+            })["state"],
+            "round_aligned",
+        )
+        waiting = round_alignment({
+            "round_state": {"epoch_id": "41", "round": 18},
+            "round_agreed": False,
+            "round_peers": [],
+        })
+        self.assertEqual(waiting["state"], "waiting_round")
+
+    def test_rejoin_requires_current_round_not_global_agreement(self):
+        self.assertEqual(
+            sync_state(41, 41, {"state": "round_unconfirmed"}),
+            "synced",
+        )
+        self.assertEqual(
+            sync_state(41, 41, {"state": "round_lagging"}),
+            "round_lagging",
+        )
+        self.assertEqual(
+            sync_state(41, 41, {"state": "waiting_round"}),
+            "waiting_round",
+        )
+
+    def test_snapshot_keeps_local_vote_ready_state(self):
+        values = {
+            "OCTRA_OPERATOR_PM2_NAME": "octra-test",
+            "OCTRA_API_PORT": "8080",
+        }
+        entries = [{
+            "name": "octra-test",
+            "pid": 17,
+            "pm2_env": {
+                "env": {"OCTRA_DATA_DIR": str(WORK)},
+                "status": "online",
+            },
+        }]
+        peers = {
+            "peers": [{"head_epoch": "41"}],
+            "round_state": {"epoch_id": "42", "round": 18},
+            "round_agreed": False,
+            "round_peers": [{"epoch_id": "42", "round": 18, "age_sec": 1.0}],
+            "voting": True,
+        }
+        with mock.patch("validator_rejoin.pm2_entries", return_value=entries):
+            with mock.patch("validator_rejoin.data_pids", return_value=[17]):
+                with mock.patch("validator_rejoin.running_binary", return_value=WORK):
+                    with mock.patch("validator_rejoin.rpc_status", return_value={"head_epoch": "41"}):
+                        with mock.patch("validator_rejoin.rpc_method", return_value=peers):
+                            self.assertEqual(snapshot(values, WORK)["state"], "synced")
+
+    def test_rejoin_refuses_vote_log_conflict(self):
+        values = {"OCTRA_OPERATOR_ROLE": "validator"}
+        wallet = {"address": identity()[0]}
+        snapshot = {
+            "pid": 17,
+            "local_head": 41,
+            "remote_head": 41,
+            "voting": False,
+            "voting_reason": "vote_log_conflict",
+        }
+        member = {
+            "active": True,
+            "scheduled": False,
+            "activate_epoch": None,
+        }
+        with mock.patch("validator_rejoin.membership", return_value=member):
+            with mock.patch("validator_rejoin.emit") as emit:
+                self.assertEqual(report_ready(values, wallet, snapshot), 4)
+        self.assertEqual(emit.call_args.kwargs["status"], "voting_disabled")
+        self.assertEqual(
+            emit.call_args.kwargs["reason"],
+            "vote_log_conflict",
+        )
+
+    def test_rejoin_wait_bounds(self):
+        self.assertEqual(positive_seconds("30"), 30)
+        with self.assertRaisesRegex(ValidatorError, "outside"):
+            positive_seconds("29")
+
+    def test_rejoin_launch_rebinds_runtime(self):
+        root = WORK / "release"
+        config = WORK / "node.env"
+        root.mkdir()
+        config.write_text("OCTRA_DATA_DIR=/data\n", encoding="utf-8")
+        with mock.patch("validator_rejoin.subprocess.run") as run:
+            launch(root, config)
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(command[-1], "--rebind-runtime")
+        self.assertEqual(environment["OCTRA_OPERATOR_CONFIG"], str(config))
 
     def test_validator_accepts_active_on_chain_identity(self):
         require_validator_membership(
@@ -560,6 +1236,7 @@ class ValidatorToolsTest(unittest.TestCase):
         worker = root / "artifacts/octra_pvac_worker.exe"
         sync_binary = root / "artifacts/octra_state_sync_client.exe"
         control_binary = root / "artifacts/bft_control_tx.exe"
+        floor_binary = root / "artifacts/vote_floor.exe"
         for path, body in (
             (root / "SOURCE_COMMIT", b"a" * 40 + b"\n"),
             (packaged_network, b"network\n"),
@@ -568,6 +1245,7 @@ class ValidatorToolsTest(unittest.TestCase):
             (worker, b"worker"),
             (sync_binary, b"sync"),
             (control_binary, b"control"),
+            (floor_binary, b"floor"),
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
@@ -585,6 +1263,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "DEFAULT_WORKER": worker,
             "DEFAULT_SYNC_BINARY": sync_binary,
             "DEFAULT_CONTROL_BINARY": control_binary,
+            "DEFAULT_FLOOR_BINARY": floor_binary,
         }
         with mock.patch.multiple("validator_config", **paths):
             with self.assertRaisesRegex(ValidatorError, "candidate paths are stale"):
@@ -680,6 +1359,26 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn(["npm", "install", "-g", "pm2"], commands)
         startup = next(command for command in commands if "startup" in command)
         self.assertEqual(startup[-4:], ["-u", "octra", "--hp", "/home/octra"])
+
+    def test_build_toolchain_bootstraps_old_rust(self):
+        old = {"PATH": "old"}
+        fresh = {"PATH": "fresh"}
+
+        def locate(command, path=None):
+            return f"/{path}/{command}"
+
+        def probe(command, **_):
+            version = "1.75.0" if command[0].startswith("/old/") else "1.80.1"
+            return subprocess.CompletedProcess(command, 0, f"rustc {version}\n", "")
+
+        with mock.patch(
+            "validator_config.rust_environment", side_effect=[old, fresh]
+        ):
+            with mock.patch("validator_config.shutil.which", side_effect=locate):
+                with mock.patch("validator_config.subprocess.run", side_effect=probe):
+                    with mock.patch("validator_config.install_rust_toolchain") as install:
+                        self.assertEqual(ensure_build_toolchain(), fresh)
+        install.assert_called_once_with()
 
     def test_gate_reports_missing_python_runtime(self):
         source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
@@ -1011,6 +1710,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "octra_state_sync_client.exe",
             "octra_state_sync_manifest.exe",
             "bft_control_tx.exe",
+            "vote_floor.exe",
         ]
 
         def run_build(command, cwd=WORK, env=None):
@@ -1055,8 +1755,10 @@ class ValidatorToolsTest(unittest.TestCase):
         command_values = [command for command, _, _ in commands]
         install = next(command for command in command_values if command[:2] == ["opam", "install"])
         build = next(command for command in command_values if "dune" in command)
+        build_env = next(env for command, _, env in commands if command == build)
         self.assertIn("--locked", install)
         self.assertIn("--require-checksums", install)
+        self.assertEqual(build_env["OCTRA_SRC_ROOT"], str(WORK))
         self.assertTrue((WORK / "mcl/obj").is_dir())
         self.assertTrue((WORK / "mcl/lib").is_dir())
         for name in names:

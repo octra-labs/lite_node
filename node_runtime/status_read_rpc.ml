@@ -148,14 +148,54 @@ let consensus_peer_states ~swarm ~driver_ref =
     | Some swarm ->
       Some (Octra_net.P2p_swarm.peer_diagnostics swarm)
   in
-  let peer_records =
+  let peer_records, voting, voting_reason, round_state, round_peers,
+      round_agreed =
     match !driver_ref with
     | None ->
-      None
+      None, false, Some "driver_unavailable", None, [], false
     | Some driver ->
-      Some (Octra_consensus.C_driver.peer_state_snapshot driver)
+      let voting, voting_reason = Octra_consensus.C_driver.vote_state driver in
+      let round_peers =
+        Octra_consensus.C_driver.round_peer_snapshot driver
+        |> List.sort (fun left right ->
+          String.compare left.Octra_consensus.C_driver.validator_addr
+            right.Octra_consensus.C_driver.validator_addr)
+        |> List.map (Rpc_view.consensus_round_peer ~now)
+      in
+      Some (Octra_consensus.C_driver.peer_state_snapshot driver),
+      voting,
+      voting_reason,
+      Some (Octra_consensus.C_driver.round_state driver),
+      round_peers,
+      Octra_consensus.C_driver.round_agreed driver ~now
   in
-  ok (Status_rpc.consensus_peer_states ~now ~diag ~peer_records)
+  ok
+    (Status_rpc.consensus_peer_states
+       ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers
+       ~round_agreed)
+
+let round_witness params ~driver_ref =
+  match Octra_core.Rpc.require_address params 0 "validator" with
+  | Error error -> Lwt.return (Error error)
+  | Ok validator ->
+    begin
+      match !driver_ref with
+      | None ->
+        Lwt.return (Error (Octra_core.Rpc.not_found "round witness unavailable"))
+      | Some driver ->
+        begin
+          match Octra_consensus.C_driver.round_witness driver ~validator with
+          | None ->
+            Lwt.return (Error (Octra_core.Rpc.not_found "round witness unavailable"))
+          | Some witness ->
+            ok
+              (`Assoc [
+                "validator", `String validator;
+                "seen_at", `Float witness.seen_at;
+                "round_sync", `String (Base64.encode_exn witness.wire);
+              ])
+        end
+    end
 
 let node_status ~tree_ref ~validator =
   let t = !tree_ref in
@@ -261,6 +301,9 @@ let consensus_peer_states_params _params ctx =
     ~swarm:(ctx.swarm ())
     ~driver_ref:ctx.driver_ref
 
+let round_witness_params params ctx =
+  round_witness params ~driver_ref:ctx.driver_ref
+
 let node_status_params _params ctx =
   node_status
     ~tree_ref:ctx.tree_ref
@@ -296,6 +339,7 @@ let proof_dispatch adapters =
     "octra_epochProof", adapters.status_read epoch_proof_params;
     "octra_txInclusionProof", adapters.status_read tx_inclusion_proof_params;
     "octra_consensusPeerStates", adapters.status_read consensus_peer_states_params;
+    "octra_roundWitness", adapters.status_read round_witness_params;
   ]
 
 let dispatch adapters =

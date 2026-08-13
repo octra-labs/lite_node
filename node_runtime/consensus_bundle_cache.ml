@@ -40,6 +40,11 @@ type t = {
   cache : (string, encoded) Hashtbl.t;
   fifo : string Queue.t;
   cap : int;
+  shared : (string, Transaction.t * int) Hashtbl.t;
+  shared_fifo : string Queue.t;
+  shared_cap : int;
+  shared_limit : int;
+  mutable shared_bytes : int;
   frozen : (string, frozen) Hashtbl.t;
   preverify : (string, Octra_core.Preverify_worker.checked Lwt.t) Hashtbl.t;
   preverify_fifo : string Queue.t;
@@ -64,11 +69,16 @@ type node_runtime = {
   lookup_raw : string -> encoded option;
 }
 
-let create ~cap =
+let create_with_limits ~cap ~shared_cap ~shared_limit =
   {
     cache = Hashtbl.create 8;
     fifo = Queue.create ();
     cap;
+    shared = Hashtbl.create 16;
+    shared_fifo = Queue.create ();
+    shared_cap = max 1 shared_cap;
+    shared_limit = max 1 shared_limit;
+    shared_bytes = 0;
     frozen = Hashtbl.create 16;
     preverify = Hashtbl.create 8;
     preverify_fifo = Queue.create ();
@@ -77,6 +87,12 @@ let create ~cap =
     misses = 0;
     evictions = 0;
   }
+
+let create ~cap =
+  create_with_limits
+    ~cap
+    ~shared_cap:1024
+    ~shared_limit:(32 * 1024 * 1024)
 
 let stats t =
   {
@@ -92,6 +108,52 @@ let encode_txs txs =
   List.map
     (fun tx -> Yojson.Safe.to_string (Transaction.to_yojson tx))
     txs
+
+let tx_bytes tx =
+  Yojson.Safe.to_string (Transaction.to_yojson tx)
+  |> String.length
+
+let evict_shared t =
+  let rec loop () =
+    if Hashtbl.length t.shared > t.shared_cap
+       || t.shared_bytes > t.shared_limit then
+      match Queue.take_opt t.shared_fifo with
+      | Some hash ->
+        begin
+          match Hashtbl.find_opt t.shared hash with
+          | Some (_, bytes) ->
+            Hashtbl.remove t.shared hash;
+            t.shared_bytes <- t.shared_bytes - bytes
+          | None -> ()
+        end;
+        loop ()
+      | None -> ()
+  in
+  loop ()
+
+let share t txs =
+  List.iter
+    (fun tx ->
+       let hash = Transaction.hash tx in
+       if not (Hashtbl.mem t.shared hash) then begin
+         let bytes = tx_bytes tx in
+         if bytes <= t.shared_limit then begin
+           Hashtbl.add t.shared hash (tx, bytes);
+           Queue.push hash t.shared_fifo;
+           t.shared_bytes <- t.shared_bytes + bytes;
+           evict_shared t
+         end
+       end)
+    txs;
+  List.filter_map
+    (fun tx ->
+       let hash = Transaction.hash tx in
+       if Hashtbl.mem t.shared hash then Some hash else None)
+    txs
+
+let find_shared t hash =
+  Hashtbl.find_opt t.shared hash
+  |> Option.map fst
 
 let evict_excess t =
   let rec loop () =

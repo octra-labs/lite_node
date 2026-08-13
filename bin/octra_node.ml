@@ -13,6 +13,7 @@ module Tx_drop = Octra_core.Tx_drop
 module Pvac_migration_entitlement = Octra_core.Pvac_migration_entitlement
 module Pvac_verify_worker = Octra_core.Pvac_verify_worker
 module Private_ledger = Octra_core.Private_ledger
+module Consensus_bundle_cache = Octra_node_runtime.Consensus_bundle_cache
 module Consensus_catchup_shell = Octra_node_runtime.Consensus_catchup_shell
 module Consensus_circle_preverify = Octra_node_runtime.Consensus_circle_preverify
 module Consensus_circle_cell_preverify = Octra_node_runtime.Consensus_circle_cell_preverify
@@ -36,6 +37,7 @@ module Consensus_proposal_state = Octra_node_runtime.Consensus_proposal_state
 module Consensus_runtime_boot_shell = Octra_node_runtime.Consensus_runtime_boot_shell
 module Consensus_tick_loop = Octra_node_runtime.Consensus_tick_loop
 module Set_actor = Octra_node_runtime.Set_actor
+module Set_rule = Octra_node_runtime.Set_rule
 module Epoch_atomic = Octra_node_runtime.Epoch_atomic
 module Epoch_visibility = Octra_node_runtime.Epoch_visibility
 module Log = Octra_node_runtime.Log
@@ -766,6 +768,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~catchup_queue
       ~catchup_in_progress
       ~clear_state_attested
+      ~preflight:(fun () ->
+        Set_rule.bind
+          rules
+          ~chain_id:startup_network.chain_id
+          ~parent:parent_commit
+          ~epoch:!current_epoch
+        |> Result.map (fun _ -> ()))
+      ~defer:(fun reason ->
+        Log.error "finality" "event = refuse_apply reason = %s" reason;
+        mark_quarantine reason;
+        catchup_node_queue.queue_finalized_gap
+          ~target_epoch:(Int64.of_int !current_epoch)
+          ~reason)
       ~apply:(fun () ->
         Epoch_visibility.with_apply epoch_visibility (fun () ->
           Epoch_atomic.run
@@ -1419,7 +1434,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         tick_loop;
         swarm = !swarm_opt;
         guard = tx_gossip_guard;
-        find_tx = Staging.find_by_hash;
+        find_tx = (fun hash ->
+          match Staging.find_by_hash hash with
+          | Some _ as tx -> tx
+          | None -> Consensus_bundle_cache.find_shared proposal_bundles hash);
         find_account = Ledger.find_opt ledger;
         add_tx = (fun tx ->
           Rest.add_tx_to_staging

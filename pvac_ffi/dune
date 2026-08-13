@@ -11,7 +11,7 @@
  (targets flags.sexp)
  (action
   (with-stdout-to flags.sexp
-   (bash "SRC_ROOT=$(cd %{workspace_root} && pwd | sed -E 's|/_build[^/]*/.*||'); ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; echo \"(-std=c++17 -O2 -fPIC $AES_FLAGS -I $SRC_ROOT/pvac/include -I $SRC_ROOT/pvac_ffi)\""))))
+   (bash "find_root () { p=$(cd \"$1\" && pwd); while [ \"$p\" != / ]; do if [ -f \"$p/dune-project\" ] && [ -d \"$p/pvac/include\" ]; then printf '%s\\n' \"$p\"; return 0; fi; p=$(dirname \"$p\"); done; return 1; }; SRC_ROOT=${OCTRA_SRC_ROOT:-$(find_root '%{project_root}')}; test -f \"$SRC_ROOT/dune-project\" && test -d \"$SRC_ROOT/pvac/include\"; ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; echo \"(-std=c++17 -O2 -fPIC $AES_FLAGS -I $SRC_ROOT/pvac/include -I $SRC_ROOT/pvac_ffi)\""))))
 
 (rule
  (targets clib_flags.sexp)

@@ -37,6 +37,7 @@ ARTIFACT_BINARY = ROOT / "artifacts/octra_node.exe"
 ARTIFACT_WORKER = ROOT / "artifacts/octra_pvac_worker.exe"
 ARTIFACT_SYNC_BINARY = ROOT / "artifacts/octra_state_sync_client.exe"
 ARTIFACT_CONTROL_BINARY = ROOT / "artifacts/bft_control_tx.exe"
+ARTIFACT_FLOOR_BINARY = ROOT / "artifacts/vote_floor.exe"
 DEFAULT_BINARY = (
     ARTIFACT_BINARY
     if ARTIFACT_BINARY.is_file()
@@ -56,6 +57,11 @@ DEFAULT_CONTROL_BINARY = (
     ARTIFACT_CONTROL_BINARY
     if ARTIFACT_CONTROL_BINARY.is_file()
     else ROOT / "_build/default/bin/bft_control_tx.exe"
+)
+DEFAULT_FLOOR_BINARY = (
+    ARTIFACT_FLOOR_BINARY
+    if ARTIFACT_FLOOR_BINARY.is_file()
+    else ROOT / "_build/default/bin/vote_floor.exe"
 )
 DEFAULT_CONFIG = ROOT / ".keys/validator/node.env"
 DEFAULT_DATA = ROOT / "data"
@@ -302,6 +308,23 @@ def install_rust_toolchain():
 
 def ensure_build_toolchain():
     environment = rust_environment()
+    rustc = shutil.which("rustc", path=environment["PATH"])
+    if rustc is None:
+        install_rust_toolchain()
+        environment = rust_environment()
+        rustc = shutil.which("rustc", path=environment["PATH"])
+    elif tool_version(
+        subprocess.run(
+            [rustc, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        ).stdout
+    ) < (1, 80, 0):
+        install_rust_toolchain()
+        environment = rust_environment()
+        rustc = shutil.which("rustc", path=environment["PATH"])
     commands = ["cargo", "g++", "make", "opam", "rustc"]
     missing = [
         command
@@ -310,14 +333,16 @@ def ensure_build_toolchain():
     ]
     if missing:
         raise ValidatorError("missing build tools: " + ",".join(missing))
-    rustc = subprocess.run(
+    if rustc is None:
+        raise ValidatorError("source build requires rustc 1.80 or newer")
+    version = subprocess.run(
         ["rustc", "--version"],
         check=True,
         capture_output=True,
         text=True,
         env=environment,
     ).stdout
-    if tool_version(rustc) < (1, 80, 0):
+    if tool_version(version) < (1, 80, 0):
         raise ValidatorError("source build requires rustc 1.80 or newer")
     return environment
 
@@ -342,6 +367,7 @@ def build_candidate():
     if not locked.is_file():
         raise ValidatorError("source build lock is missing")
     environment = ensure_build_toolchain()
+    environment["OCTRA_SRC_ROOT"] = str(ROOT)
     switch = str(OPAM_SWITCH)
     run(
         [
@@ -421,6 +447,7 @@ def build_candidate():
         "bin/octra_state_sync_client.exe",
         "bin/octra_state_sync_manifest.exe",
         "bin/bft_control_tx.exe",
+        "bin/vote_floor.exe",
     ], env=environment)
     for name in [
         "octra_node.exe",
@@ -428,6 +455,7 @@ def build_candidate():
         "octra_state_sync_client.exe",
         "octra_state_sync_manifest.exe",
         "bft_control_tx.exe",
+        "vote_floor.exe",
     ]:
         if not (ROOT / "_build/default/bin" / name).is_file():
             raise ValidatorError(f"source build artifact is missing: {name}")
@@ -729,6 +757,7 @@ def parser():
     value.add_argument("--api-port", default="8080")
     value.add_argument("--binary", default=str(DEFAULT_BINARY))
     value.add_argument("--build", action="store_true")
+    value.add_argument("--build-only", action="store_true")
     value.add_argument("--check-runtime", action="store_true")
     value.add_argument("--check-sync", action="store_true")
     value.add_argument("--config", default=str(DEFAULT_CONFIG))
@@ -756,9 +785,18 @@ def parser():
 
 def main():
     args = parser().parse_args()
-    modes = [args.check_runtime, args.check_sync, args.rebind_runtime]
+    modes = [
+        args.build_only,
+        args.check_runtime,
+        args.check_sync,
+        args.rebind_runtime,
+    ]
     if sum(bool(mode) for mode in modes) > 1:
-        raise ValidatorError("runtime and state sync checks are mutually exclusive")
+        raise ValidatorError("command modes are mutually exclusive")
+    if args.build_only:
+        build_candidate()
+        emit(event="source_build", status="ready")
+        return
     if args.check_runtime:
         require_runtime_binding(args.config)
         return

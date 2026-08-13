@@ -16,6 +16,8 @@ type deps = {
     Consensus_epoch_apply_admission.catchup ->
     Consensus_catchup_shell.queue_event ->
     unit;
+  preflight : unit -> (unit, string) result;
+  defer : string -> unit;
   apply : unit -> unit Lwt.t;
 }
 
@@ -32,5 +34,7 @@ val run_node :
   catchup_queue:Consensus_catchup_queue.t ->
   catchup_in_progress:bool ref ->
   clear_state_attested:(unit -> unit) ->
+  preflight:(unit -> (unit, string) result) ->
+  defer:(string -> unit) ->
   apply:(unit -> unit Lwt.t) ->
   unit Lwt.t

@@ -27,12 +27,19 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
 let epoch_tags ~tags ~keep_epochs =
   Rpc_view.epoch_tags ~tags ~keep_epochs
 
-let consensus_peer_states ~now ~diag ~peer_records =
+let consensus_peer_states
+    ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers
+    ~round_agreed =
   let diag_json, score_rows = Rpc_view.peer_diag diag ~now in
   match peer_records with
   | None ->
     Rpc_view.consensus_peer_states
       ~enabled:false
+      ~voting
+      ~voting_reason
+      ~round_state
+      ~round_peers
+      ~round_agreed
       ~peers:[]
       ~scores:score_rows
       ~diag:diag_json
@@ -46,6 +53,11 @@ let consensus_peer_states ~now ~diag ~peer_records =
     in
     Rpc_view.consensus_peer_states
       ~enabled:true
+      ~voting
+      ~voting_reason
+      ~round_state
+      ~round_peers
+      ~round_agreed
       ~peers
       ~scores:score_rows
       ~diag:diag_json

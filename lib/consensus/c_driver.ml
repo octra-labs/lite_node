@@ -26,6 +26,11 @@ type proposal_plan = {
   parent_commit : C_types.parent_commit option;
 }
 
+type proposal_verdict =
+  | Proposal_accept
+  | Proposal_wait
+  | Proposal_reject
+
 type config = {
   chain_id : string;
   my_addr : string;
@@ -34,7 +39,7 @@ type config = {
   role_can_vote : unit -> bool;
   can_vote : unit -> bool;
   execute_fn : C_types.propose -> bool;
-  verify_proposal : C_types.propose -> bool Lwt.t;
+  verify_proposal : C_types.propose -> proposal_verdict Lwt.t;
   verify_parent_commit :
     epoch_id:int64 ->
     C_types.parent_commit option ->
@@ -99,6 +104,25 @@ type peer_state_record = {
   mutable source : string;
 }
 
+type round_state = {
+  epoch_id : int64;
+  round : int;
+  step : C_types.round_step;
+}
+
+type round_witness = {
+  wire : string;
+  seen_at : float;
+}
+
+type round_peer_record = {
+  validator_addr : string;
+  mutable epoch_id : int64;
+  mutable round : int;
+  mutable step : C_types.round_step;
+  mutable last_seen : float;
+}
+
 type proposal_build = {
   gen : int;
   height : int64;
@@ -141,6 +165,15 @@ type verified_proposal_route =
       payload : string;
     }
 
+type proposal_wait = {
+  gen : int;
+  pid : string;
+  proposal : C_types.propose;
+  route : verified_proposal_route;
+  attempt : int;
+  retry_at : int64;
+}
+
 type proposal_fetch = {
   height : int64;
   round : int;
@@ -159,6 +192,12 @@ type round_sync_reply = {
   sent_at : int64;
 }
 
+type vote_fault = {
+  epoch_id : int64;
+  round : int;
+  reason : string;
+}
+
 type t = {
   mutable n_validators : int;
   config : config;
@@ -172,17 +211,22 @@ type t = {
   bundle_responses : (string, bundle_response_record list) Hashtbl.t;
   catchup_responses : (string, catchup_range_response_record list) Hashtbl.t;
   peer_states : (string, peer_state_record) Hashtbl.t;
+  round_peers : (string, round_peer_record) Hashtbl.t;
   resource_attestations : (string, Resource_attestations.attestation) Hashtbl.t;
   resource_admission : Resource_attestation_admission.pool;
   vote_evidence : (string, C_evidence.vote_conflict) Hashtbl.t;
   activated_validator_set_fingerprints : (string, bool) Hashtbl.t;
   pending_votes : (string, C_types.vote) Hashtbl.t;
   future_votes : (string, C_types.vote) Hashtbl.t;
+  vote_log : C_vote_log.t;
+  mutable vote_log_issue : string option;
+  mutable vote_fault : vote_fault option;
   durable_votes : (string, C_types.vote) Hashtbl.t;
   pending_finalizes : (int64, pending_finalize) Hashtbl.t;
   pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
   round_sync_replies : (string, round_sync_reply) Hashtbl.t;
+  round_pool : C_round_pool.t;
   finality_query_requests : (string, int64) Hashtbl.t;
   mutable finality_query : C_finality_query.t;
   proposal_fetches : (string, unit) Hashtbl.t;
@@ -190,6 +234,7 @@ type t = {
   mutable proposal_build : proposal_build option;
   mutable proposal_retry : proposal_build option;
   mutable proposal_verify : proposal_build option;
+  mutable proposal_wait : proposal_wait option;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable on_validator_set_activated :
     C_types.validator_set -> string -> unit Lwt.t;
@@ -325,7 +370,7 @@ let catchup_response_in_window window records =
          catchup_epoch_in_window window record.epoch_id)
        records
 
-let create ~config ~validator_set ~swarm ~start_height =
+let create ~config ~validator_set ~swarm ~start_height ~vote_log =
   let validator_set =
     C_types.validator_set_for_epoch
       ~chain_id:config.chain_id
@@ -346,17 +391,22 @@ let create ~config ~validator_set ~swarm ~start_height =
     bundle_responses = Hashtbl.create 16;
     catchup_responses = Hashtbl.create 8;
     peer_states = Hashtbl.create 16;
+    round_peers = Hashtbl.create 32;
     resource_attestations = Hashtbl.create 256;
     resource_admission = Resource_attestation_admission.create_pool ();
     vote_evidence = Hashtbl.create 16;
     activated_validator_set_fingerprints = Hashtbl.create 8;
     pending_votes = Hashtbl.create 16;
     future_votes = Hashtbl.create 32;
+    vote_log;
+    vote_log_issue = None;
+    vote_fault = None;
     durable_votes = Hashtbl.create 16;
     pending_finalizes = Hashtbl.create 16;
     pending_proposals = Hashtbl.create 8;
     deferred_proposals = Hashtbl.create 16;
     round_sync_replies = Hashtbl.create 16;
+    round_pool = C_round_pool.create ();
     finality_query_requests = Hashtbl.create 4;
     finality_query = C_finality_query.idle;
     proposal_fetches = Hashtbl.create 4;
@@ -364,6 +414,7 @@ let create ~config ~validator_set ~swarm ~start_height =
     proposal_build = None;
     proposal_retry = None;
     proposal_verify = None;
+    proposal_wait = None;
     proposal_work_gate = C_proposal_work_gate.create ();
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
@@ -414,7 +465,7 @@ let deadline_after seconds =
 let deadline_reached deadline =
   Int64.compare (Mtime_clock.elapsed_ns ()) deadline >= 0
 
-let same_proposal_build b ~gen ~height ~round ~step =
+let same_proposal_build (b : proposal_build) ~gen ~height ~round ~step =
   b.gen = gen
   && b.height = height
   && b.round = round
@@ -565,6 +616,9 @@ let round_sync_relay_relevant
   && sync.round >= current_round
   && sync.round <= current_round + C_engine.max_round_ahead
 
+let round_sync_allowed ~current_round (sync : C_codec.round_sync) =
+  sync.round <= current_round + C_engine.max_sync_ahead
+
 let proposal_frame_error_label = function
   | Proposal_unknown_validator -> "unknown_validator"
   | Proposal_bad_signature -> "bad_signature"
@@ -708,11 +762,22 @@ let vote_still_relevant t (v : C_types.vote) =
   Int64.compare v.epoch_id t.engine.state.height = 0
   && Int64.compare v.epoch_id t.engine.finalized_height > 0
 
-let vote_durable t (v : C_types.vote) =
+let hold_vote_fault t (v : C_types.vote) reason =
+  t.vote_fault <- Some { epoch_id = v.epoch_id; round = v.round; reason };
+  error_node t.config.my_addr
+    "event = refuse_precommit_broadcast reason = %s epoch = %Ld round = %d"
+    reason
+    v.epoch_id
+    v.round
+
+let persist_precommit t (v : C_types.vote) =
   let nil_hash = String.make 32 '\x00' in
   if v.vote_type = C_types.Precommit && v.proposal_id <> nil_hash then
     let key = vote_key v in
-    if Hashtbl.mem t.durable_votes key then Lwt.return_true
+    if Hashtbl.mem t.durable_votes key then begin
+      t.vote_fault <- None;
+      Lwt.return_true
+    end
     else
       match
         C_engine.find_proposal_message
@@ -731,45 +796,240 @@ let vote_durable t (v : C_types.vote) =
             ~proposal_wire:(C_codec.encode_propose proposal)
             ~vote_wire:(C_codec.encode_vote v)
         in
-        if durable then Hashtbl.replace t.durable_votes key v;
+        if durable then begin
+          Hashtbl.replace t.durable_votes key v;
+          t.vote_fault <- None
+        end else
+          hold_vote_fault t v "precommit_not_durable";
         Lwt.return durable
       | None ->
-        error_node t.config.my_addr
-          "event = refuse_precommit_broadcast reason = proposal_missing epoch = %Ld round = %d"
-          v.epoch_id
-          v.round;
+        hold_vote_fault t v "precommit_proposal_missing";
         Lwt.return_false
   else
     Lwt.return_true
 
+let hold_vote_log t reason =
+  t.vote_log_issue <- Some reason;
+  error_node t.config.my_addr
+    "event = refuse_local_vote reason = vote_log_error detail = %s"
+    reason
+
+let vote_log_reason reason =
+  if String.equal reason "local vote conflicts with stored vote" then
+    "vote_log_conflict"
+  else if String.equal reason "vote log reached round limit" then
+    "vote_log_limit"
+  else if String.equal reason "vote log bootstrap required" then
+    "vote_log_bootstrap"
+  else if String.starts_with ~prefix:"vote log record" reason
+       || String.starts_with ~prefix:"vote log wire" reason
+       || String.starts_with ~prefix:"vote log epoch" reason
+       || String.starts_with ~prefix:"vote log path" reason
+       || String.starts_with ~prefix:"vote log floor" reason then
+    "vote_log_corrupt"
+  else
+    "vote_log_storage"
+
+let vote_state t =
+  match t.vote_log_issue with
+  | Some reason -> false, Some (vote_log_reason reason)
+  | None ->
+    (match t.vote_fault with
+     | Some fault
+       when Int64.equal fault.epoch_id t.engine.state.height
+            && fault.round >= t.engine.state.round ->
+       false, Some fault.reason
+     | _ when not (t.config.role_can_vote ()) -> false, Some "role"
+     | _ when not (t.config.can_vote ()) -> false, Some "not_ready"
+     | _ -> true, None)
+
+let resume_local_vote t =
+  match
+    C_vote_log.max_round t.vote_log
+      ~chain_id:t.config.chain_id
+      ~validator:t.config.my_addr
+      ~epoch_id:t.engine.state.height
+  with
+  | Ok None -> ()
+  | Ok (Some round) when round < C_codec.max_round ->
+    let target = round + 1 in
+    if target > t.engine.state.round then begin
+      C_engine.realign_round t.engine target;
+      log_node t.config.my_addr
+        "event = resume_local_vote epoch = %Ld prior_round = %d next_round = %d"
+        t.engine.state.height
+        round
+        target
+    end
+  | Ok (Some _) ->
+    hold_vote_log t "vote log reached round limit"
+  | Error reason ->
+    hold_vote_log t reason
+
+let restored_vote t wire =
+  try
+    let vote = C_codec.decode_vote wire in
+    if not (String.equal (C_codec.encode_vote vote) wire) then
+      Error "vote log wire is not exact"
+    else if not (String.equal vote.chain_id t.config.chain_id) then
+      Error "vote log record chain does not match"
+    else if not (String.equal vote.validator t.config.my_addr) then
+      Error "vote log record validator does not match"
+    else if not (Int64.equal vote.epoch_id t.engine.state.height) then
+      Error "vote log record epoch does not match"
+    else
+      match C_types.pubkey_of_addr t.engine.vs vote.validator with
+      | Some pubkey when C_hash.verify_vote ~pubkey_raw:pubkey vote ->
+        (match C_vote_log.keep t.vote_log vote with
+         | Ok _ -> Ok ()
+         | Error reason -> Error reason)
+      | Some _ ->
+        Error "vote log record signature is invalid"
+      | None ->
+        Error "vote log record validator is unavailable"
+  with exn ->
+    Error ("vote log wire decode failed: " ^ Printexc.to_string exn)
+
+let restore_votes t wires =
+  match t.vote_log_issue, wires with
+  | Some _, _ -> ()
+  | None, Error reason ->
+    hold_vote_log t reason
+  | None, Ok wires ->
+    let restored =
+      List.fold_left
+        (fun result wire ->
+          match result with
+          | Error _ -> result
+          | Ok count ->
+            (match restored_vote t wire with
+             | Ok () -> Ok (count + 1)
+             | Error reason -> Error reason))
+        (Ok 0)
+        wires
+    in
+    (match restored with
+     | Error reason ->
+       hold_vote_log t reason
+     | Ok count ->
+       resume_local_vote t;
+       if count > 0 then
+         log_node t.config.my_addr
+           "event = vote_log_restore count = %d epoch = %Ld"
+           count
+           t.engine.state.height)
+
+let require_vote_floor t =
+  match t.vote_log_issue with
+  | Some _ ->
+    ()
+  | None ->
+    (match C_vote_log.floor t.vote_log with
+     | Error reason ->
+       hold_vote_log t reason
+     | Ok (Some floor)
+       when Int64.compare t.engine.state.height floor > 0 ->
+       ()
+     | Ok (Some _) ->
+       hold_vote_log t "vote log floor is not behind current height"
+     | Ok None when Int64.compare t.engine.state.height 1L <= 0 ->
+       (match
+          C_vote_log.set_floor
+            t.vote_log
+            ~through_epoch:(Int64.pred t.engine.state.height)
+        with
+        | Ok () -> ()
+        | Error reason -> hold_vote_log t reason)
+     | Ok None ->
+       hold_vote_log t "vote log bootstrap required")
+
+let saved_vote t (v : C_types.vote) =
+  if not (String.equal v.validator t.config.my_addr) then
+    Lwt.return_some v
+  else
+    match t.vote_log_issue with
+    | Some reason ->
+      error_node t.config.my_addr
+        "event = refuse_local_vote reason = vote_log_blocked detail = %s"
+        reason;
+      Lwt.return_none
+    | None ->
+      match C_vote_log.check t.vote_log v with
+      | Error reason ->
+        hold_vote_log t reason;
+        Lwt.return_none
+      | Ok () ->
+        let open Lwt.Syntax in
+        let* durable = persist_precommit t v in
+        if not durable then Lwt.return_none
+        else
+          match C_vote_log.keep t.vote_log v with
+          | Ok stored -> Lwt.return_some stored
+          | Error reason ->
+            hold_vote_log t reason;
+            Lwt.return_none
+
+let vote_durable t v =
+  let open Lwt.Syntax in
+  let* vote = saved_vote t v in
+  Lwt.return (Option.is_some vote)
+
 let broadcast_vote t (v : C_types.vote) =
   let open Lwt.Syntax in
-  let* allowed = vote_durable t v in
-  if not allowed then begin
+  let* stored = saved_vote t v in
+  match stored with
+  | None ->
     error_node t.config.my_addr
       "event = refuse_vote_broadcast type = %s epoch = %Ld round = %d"
       (vote_step_label v.vote_type)
       v.epoch_id
       v.round;
     Lwt.return_false
-  end else begin
+  | Some vote ->
     trace_node t.config.my_addr
       "event = send_vote type = %s epoch = %Ld round = %d pid = %s"
-      (vote_step_label v.vote_type)
-      v.epoch_id
-      v.round
+      (vote_step_label vote.vote_type)
+      vote.epoch_id
+      vote.round
       (let h =
          Digestif.SHA256.to_hex
-           (Digestif.SHA256.of_raw_string v.proposal_id)
+           (Digestif.SHA256.of_raw_string vote.proposal_id)
        in
        if String.length h >= 8 then String.sub h 0 8 else h);
-    let payload = C_codec.encode_vote v in
+    let payload = C_codec.encode_vote vote in
     let* () =
       Octra_net.P2p_swarm.broadcast t.swarm
         { msg_type = Frame.msg_cons_vote; payload }
     in
     Lwt.return_true
-  end
+
+let tx_hash_batches hashes =
+  let rec take count acc rest =
+    if count = 0 then List.rev acc, rest
+    else
+      match rest with
+      | [] -> List.rev acc, []
+      | hash :: tail -> take (count - 1) (hash :: acc) tail
+  in
+  let rec loop acc rest =
+    match rest with
+    | [] -> List.rev acc
+    | _ ->
+      let batch, tail = take Octra_net.P2p_tx_gossip.max_hashes [] rest in
+      loop (batch :: acc) tail
+  in
+  loop [] hashes
+
+let relay_txs t hashes =
+  Lwt_list.iter_s
+    (fun batch ->
+       let payload =
+         Octra_net.P2p_tx_gossip.encode
+           (Octra_net.P2p_tx_gossip.Inv batch)
+       in
+       Octra_net.P2p_swarm.broadcast t.swarm
+         { msg_type = Frame.msg_tx_gossip; payload })
+    (tx_hash_batches hashes)
 
 let make_round_sync_at t ~round ~step ~request =
   let unsigned =
@@ -805,10 +1065,13 @@ let broadcast_round_sync t ~request =
   if not (local_validator t)
      || (not request && not (t.config.can_vote ())) then
     Lwt.return_unit
-  else
+  else begin
+    let sync = make_round_sync t ~request in
+    C_round_pool.add t.round_pool sync;
     Octra_net.P2p_swarm.broadcast
       t.swarm
-      (round_sync_frame (make_round_sync t ~request))
+      (round_sync_frame sync)
+  end
 
 let round_sync_request_for_step = function
   | C_types.ProposeStep -> false
@@ -959,15 +1222,16 @@ let local_round_proposal t =
 
 let send_vote_to t conn vote =
   let open Lwt.Syntax in
-  let* durable = vote_durable t vote in
-  if not durable then begin
+  let* stored = saved_vote t vote in
+  match stored with
+  | None ->
     error_node t.config.my_addr
       "event = refuse_round_sync_vote type = %s epoch = %Ld round = %d"
       (vote_step_label vote.C_types.vote_type)
       vote.epoch_id
       vote.round;
     Lwt.return_unit
-  end else
+  | Some vote ->
     Octra_net.P2p_conn.send
       conn
       {
@@ -989,15 +1253,40 @@ let send_round_vote_to t conn (vote : C_types.vote) =
   else
     send_verified_vote_to conn vote
 
-let send_round_sync_response t conn ~requested_round =
+let send_round_sync_response t conn ~requested_round ~with_witness =
   let open Lwt.Syntax in
-  let* () =
+  let local_sync =
     if local_validator t && t.config.can_vote () then
+      Some (make_round_sync t ~request:false)
+    else
+      None
+  in
+  Option.iter (C_round_pool.add t.round_pool) local_sync;
+  let* () =
+    match local_sync with
+    | Some sync ->
       Octra_net.P2p_conn.send
         conn
-        (round_sync_frame (make_round_sync t ~request:false))
+        (round_sync_frame sync)
+    | None -> Lwt.return_unit
+  in
+  let witness =
+    if with_witness then
+      C_round_pool.witness
+        t.round_pool
+        ~chain_id:t.config.chain_id
+        ~epoch_id:t.engine.state.height
+        ~after_round:requested_round
+        ~validator_set:t.engine.vs
+      |> List.filter (fun sync -> sync.C_codec.validator <> t.config.my_addr)
     else
-      Lwt.return_unit
+      []
+  in
+  let* () =
+    Lwt_list.iter_s
+      (fun sync ->
+        Octra_net.P2p_conn.send conn (round_sync_frame sync))
+      witness
   in
   let* () =
     match local_round_proposal t with
@@ -1015,7 +1304,7 @@ let send_round_sync_response t conn ~requested_round =
   in
   if requested_round < t.engine.state.round then
     Lwt_list.iter_s
-      (send_verified_vote_to conn)
+      (send_round_vote_to t conn)
       (C_engine.polc_votes_for_round t.engine requested_round)
   else
     Lwt.return_unit
@@ -1025,11 +1314,98 @@ let round_step_rank = function
   | C_types.PrevoteStep -> 2
   | C_types.PrecommitStep -> 3
 
+let round_peer_gap = 2
+let round_peer_age = 30.0
+
+let round_peer_later (peer : round_peer_record) (sync : C_codec.round_sync) =
+  Int64.compare sync.C_codec.epoch_id peer.epoch_id > 0
+  || (sync.epoch_id = peer.epoch_id
+      && (sync.round > peer.round
+          || (sync.round = peer.round
+              && round_step_rank sync.step > round_step_rank peer.step)))
+
+let remember_round_peer t (sync : C_codec.round_sync) =
+  let now = Unix.gettimeofday () in
+  match Hashtbl.find_opt t.round_peers sync.C_codec.validator with
+  | Some peer when round_peer_later peer sync ->
+    begin
+      peer.epoch_id <- sync.epoch_id;
+      peer.round <- sync.round;
+      peer.step <- sync.step;
+      peer.last_seen <- now
+    end
+  | Some _ ->
+    ()
+  | None ->
+    Hashtbl.replace t.round_peers sync.validator {
+      validator_addr = sync.validator;
+      epoch_id = sync.epoch_id;
+      round = sync.round;
+      step = sync.step;
+      last_seen = now;
+    }
+
+let round_state t = {
+  epoch_id = t.engine.state.height;
+  round = t.engine.state.round;
+  step = t.engine.state.step;
+}
+
+let round_peer_snapshot t =
+  Hashtbl.fold (fun _ peer acc -> peer :: acc) t.round_peers []
+
+let round_witness t ~validator =
+  if not (C_types.is_validator t.engine.vs validator) then None
+  else
+    match
+      C_round_pool.reply
+        t.round_pool
+        ~epoch_id:t.engine.state.height
+        ~validator
+    with
+    | None -> None
+    | Some (sync, _) when sync.C_codec.request -> None
+    | Some (sync, seen_at) ->
+      Some {
+        wire = C_codec.encode_round_sync sync;
+        seen_at;
+      }
+
+let round_agreed t ~now =
+  let state = round_state t in
+  let signers =
+    Hashtbl.fold
+      (fun _ peer acc ->
+        let age = now -. peer.last_seen in
+        if peer.epoch_id = state.epoch_id
+           && abs (peer.round - state.round) <= round_peer_gap
+           && age >= 0.0
+           && age <= round_peer_age
+        then peer.validator_addr :: acc
+        else acc)
+      t.round_peers
+      (if local_validator t && t.config.can_vote () then [t.config.my_addr]
+       else [])
+  in
+  C_types.has_quorum_at
+    ~chain_id:t.config.chain_id
+    ~epoch_id:state.epoch_id
+    t.engine.vs
+    signers
+
 let round_sync_reply_needed t (sync : C_codec.round_sync) =
   sync.request
   || sync.round < t.engine.state.round
   || (sync.round = t.engine.state.round
       && round_step_rank sync.step < round_step_rank t.engine.state.step)
+
+let round_sync_source_matches t conn (sync : C_codec.round_sync) =
+  match C_types.pubkey_of_addr t.engine.vs sync.validator with
+  | None -> false
+  | Some pubkey ->
+    String.equal
+      conn.Octra_net.P2p_conn.peer_id
+      (Octra_net.P2p_handshake.node_id_of_pubkey pubkey)
 
 let round_sync_response_due ~last ~now =
   match last with
@@ -1038,7 +1414,7 @@ let round_sync_response_due ~last ~now =
     Int64.compare now prior >= 0
     && Int64.compare (Int64.sub now prior) 1_000_000_000L >= 0
 
-let round_sync_reply_progresses prior (sync : C_codec.round_sync) =
+let round_sync_reply_progresses (prior : round_sync_reply) (sync : C_codec.round_sync) =
   Int64.compare sync.epoch_id prior.epoch_id > 0
   || (Int64.equal sync.epoch_id prior.epoch_id
       && sync.round = prior.round
@@ -1081,7 +1457,7 @@ let round_sync_response_allowed t sync =
   round_sync_response_allowed_at t sync (Mtime_clock.elapsed_ns ())
 
 let flush_pending_votes t =
-  if not (t.config.can_vote ()) then Lwt.return_true
+  if not (t.config.can_vote ()) then Lwt.return_unit
   else begin
     let queued =
       Hashtbl.fold (fun key vote acc -> (key, vote) :: acc) t.pending_votes [] in
@@ -1098,15 +1474,15 @@ let flush_pending_votes t =
         compare (vote_step_label a.vote_type) (vote_step_label b.vote_type))
     in
     match votes with
-    | [] -> Lwt.return_true
+    | [] -> Lwt.return_unit
     | _ ->
       trace_node t.config.my_addr "event = flush_pending_votes count = %d"
         (List.length votes);
-      Lwt_list.fold_left_s
-        (fun allowed vote ->
-          if allowed then broadcast_vote t vote
-          else Lwt.return_false)
-        true
+      Lwt_list.iter_s
+        (fun vote ->
+          let open Lwt.Syntax in
+          let* _ = broadcast_vote t vote in
+          Lwt.return_unit)
         votes
   end
 
@@ -1403,6 +1779,7 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
           cfg.fingerprint
       in
       C_engine.replace_validator_set t.engine validator_set;
+      Hashtbl.clear t.round_peers;
       t.n_validators <- validator_set.C_types.n;
       Hashtbl.replace t.activated_validator_set_fingerprints cfg.fingerprint true;
       log_node t.config.my_addr
@@ -1439,6 +1816,7 @@ let maybe_activate_quorum_policy t ~target_epoch =
     in
     let* () = t.on_validator_set_activated effective fingerprint in
     C_engine.replace_validator_set t.engine effective;
+    Hashtbl.clear t.round_peers;
     t.n_validators <- effective.n;
     log_node t.config.my_addr
       "event = validator_quorum_policy_activated target_epoch = %Ld n = %d quorum = %d total_weight = %s quorum_weight = %s fingerprint = %s"
@@ -1497,6 +1875,7 @@ let maybe_activate_resource_committee t ~target_epoch =
                       Lwt.return_unit
                   | Some validator_set ->
                       C_engine.replace_validator_set t.engine validator_set;
+                      Hashtbl.clear t.round_peers;
                       t.n_validators <- validator_set.C_types.n;
                       let root_hex = raw_to_hex snapshot.committee_root in
                       log_node t.config.my_addr
@@ -1623,6 +2002,68 @@ let send_verified_proposal t route (p : C_types.propose) =
       ~except:source_peer
       { msg_type = Frame.msg_cons_propose; payload }
 
+let proposal_wait_delay attempt =
+  let ms =
+    match attempt with
+    | 1 -> 0
+    | 2 -> 500
+    | 3 -> 1_000
+    | 4 -> 2_000
+    | _ -> 4_000
+  in
+  Int64.mul (Int64.of_int ms) 1_000_000L
+
+let proposal_wait_id (p : C_types.propose) =
+  C_hash.proposal_id p.header
+
+let clear_proposal_wait t (p : C_types.propose) =
+  let pid = proposal_wait_id p in
+  match t.proposal_wait with
+  | Some wait when wait.pid = pid -> t.proposal_wait <- None
+  | Some _
+  | None -> ()
+
+let retain_proposal_wait t ~route (p : C_types.propose) =
+  let gen = t.engine.generation in
+  let pid = proposal_wait_id p in
+  let prior = t.proposal_wait in
+  let keep_prior =
+    match prior with
+    | Some wait when wait.gen = gen
+                     && wait.proposal.epoch_id = p.epoch_id
+                     && wait.pid <> pid ->
+      wait.proposal.round <= p.round
+    | Some _
+    | None -> false
+  in
+  if keep_prior then ()
+  else
+    let attempt =
+      match prior with
+      | Some wait when wait.gen = gen && wait.pid = pid ->
+        min 16 (wait.attempt + 1)
+      | Some _
+      | None -> 1
+    in
+    let retry_at =
+      Int64.add
+        (Mtime_clock.elapsed_ns ())
+        (proposal_wait_delay attempt)
+    in
+    t.proposal_wait <- Some {
+      gen;
+      pid;
+      proposal = p;
+      route;
+      attempt;
+      retry_at;
+    };
+    log_node t.config.my_addr
+      "event = proposal_wait epoch = %Ld round = %d attempt = %d"
+      p.epoch_id
+      p.round
+      attempt
+
 let admit_current_proposal t ~route (p : C_types.propose) =
   let open Lwt.Syntax in
   let signature_valid =
@@ -1647,7 +2088,10 @@ let admit_current_proposal t ~route (p : C_types.propose) =
              ~current_step:t.engine.state.step
              ~proposal_round:p.round)
   then
-    Lwt.return_unit
+    begin
+      clear_proposal_wait t p;
+      Lwt.return_unit
+    end
   else
     let* preview =
       C_proposal_work_gate.run
@@ -1659,37 +2103,69 @@ let admit_current_proposal t ~route (p : C_types.propose) =
           let round = t.engine.state.round in
           let step = t.engine.state.step in
           mark_proposal_verify t ~gen ~height ~round ~step;
-          let* valid =
+          let* verdict =
             Lwt.finalize
-              (fun () -> t.config.verify_proposal p)
+              (fun () ->
+                Lwt.catch
+                  (fun () -> t.config.verify_proposal p)
+                  (fun exn ->
+                    warn_node t.config.my_addr
+                      "event = proposal_verify_wait epoch = %Ld round = %d reason = %s"
+                      p.epoch_id
+                      p.round
+                      (Printexc.to_string exn);
+                    Lwt.return Proposal_wait))
               (fun () ->
                 clear_proposal_verify t ~gen ~height ~round ~step;
                 Lwt.return_unit)
           in
-          Lwt.return_some valid)
+          Lwt.return_some verdict)
     in
     match preview with
     | None ->
       Lwt.return_unit
     | Some _ when not (proposal_verify_current t p) ->
+      clear_proposal_wait t p;
       Lwt.return_unit
-    | Some preview_ok ->
+    | Some Proposal_wait ->
+      retain_proposal_wait t ~route p;
+      Lwt.return_unit
+    | Some verdict ->
+      clear_proposal_wait t p;
+      let accepted = verdict = Proposal_accept in
       let* () =
-        if preview_ok then
+        if accepted then
           send_verified_proposal t route p
         else
           Lwt.return_unit
       in
-      if preview_ok && p.round > t.engine.state.round then
+      if accepted && p.round > t.engine.state.round then
         defer_verified_proposal t p;
       ignore
         (C_engine.on_propose
            t.engine
            p
            ~verify_fn:(verify_engine_signature t)
-           ~execute_fn:(fun _ -> preview_ok)
+           ~execute_fn:(fun _ -> accepted)
            ~sign_fn:t.config.sign_fn);
       Lwt.return_unit
+
+let replay_waiting_proposal t =
+  match t.proposal_wait with
+  | Some wait when not (proposal_verify_current t wait.proposal) ->
+    t.proposal_wait <- None;
+    Lwt.return_unit
+  | Some wait when Int64.compare
+                     (Mtime_clock.elapsed_ns ())
+                     wait.retry_at >= 0 ->
+    log_node t.config.my_addr
+      "event = proposal_retry epoch = %Ld round = %d attempt = %d"
+      wait.proposal.epoch_id
+      wait.proposal.round
+      wait.attempt;
+    admit_current_proposal t ~route:wait.route wait.proposal
+  | Some _
+  | None -> Lwt.return_unit
 
 let replay_pending_proposal t =
   let height = t.engine.state.height in
@@ -1804,6 +2280,7 @@ let notify_fold t ~next_epoch event =
 let rec process_outputs_once t =
   let open Lwt.Syntax in
   C_engine.on_ready t.engine ~sign_fn:t.config.sign_fn;
+  let* () = replay_waiting_proposal t in
   let* () = replay_pending_proposal t in
   let replayed_evidence = replay_future_votes t in
   let* () =
@@ -1853,28 +2330,19 @@ let rec process_outputs_once t =
       | C_engine.Finalized _ -> "Finalized" in
     trace_node t.config.my_addr "event = engine_output output = %s" name
   ) outputs;
-  let proceed task =
-    let* () = task in
-    Lwt.return_true
-  in
-  let* pending_allowed = flush_pending_votes t in
-  let* output_allowed =
-    if not pending_allowed then Lwt.return_false
-    else
-      Lwt_list.fold_left_s
-        (fun allowed output ->
-          if not allowed then Lwt.return_false
-          else
-            match output with
+  let* () = flush_pending_votes t in
+  let* () =
+    Lwt_list.iter_s
+      (fun output ->
+        match output with
             | C_engine.SendPropose p ->
               trace_node t.config.my_addr
                 "event = send_propose epoch = %Ld round = %d"
                 p.epoch_id
                 p.round;
               let payload = C_codec.encode_propose p in
-              proceed
-                (Octra_net.P2p_swarm.broadcast t.swarm
-                  { msg_type = Frame.msg_cons_propose; payload })
+              Octra_net.P2p_swarm.broadcast t.swarm
+                { msg_type = Frame.msg_cons_propose; payload }
             | C_engine.SendFinalize f ->
               trace_node t.config.my_addr
                 "event = send_finalize epoch = %Ld round = %d pid = %s creator = %s precommits = %d"
@@ -1891,19 +2359,13 @@ let rec process_outputs_once t =
                   (min 14 (String.length f.header.creator_addr)))
                 (List.length f.precommits);
               let payload = C_codec.encode_finalize f in
-              proceed
-                (Octra_net.P2p_swarm.broadcast t.swarm
-                  { msg_type = Frame.msg_cons_finalize; payload })
+              Octra_net.P2p_swarm.broadcast t.swarm
+                { msg_type = Frame.msg_cons_finalize; payload }
             | C_engine.RequestProposal { round; proposal_id } ->
-              proceed (start_proposal_fetch t ~round ~proposal_id)
+              start_proposal_fetch t ~round ~proposal_id
             | C_engine.RequestRoundEvidence round ->
-              proceed (broadcast_round_sync_at t ~round)
+              broadcast_round_sync_at t ~round
             | C_engine.ScheduleTimeout { step; round; delay_ms; generation } ->
-              let* () =
-                broadcast_round_sync
-                  t
-                  ~request:(round_sync_request_for_step step)
-              in
               Lwt.async (fun () ->
                 let* () =
                   Lwt_unix.sleep (float_of_int delay_ms /. 1000.0)
@@ -1943,7 +2405,9 @@ let rec process_outputs_once t =
                   end
                 in
                 fire ());
-              Lwt.return_true
+              broadcast_round_sync
+                t
+                ~request:(round_sync_request_for_step step)
             | C_engine.SendVote v ->
               if not (vote_still_relevant t v) then begin
                 log_node t.config.my_addr
@@ -1952,28 +2416,29 @@ let rec process_outputs_once t =
                   v.epoch_id
                   v.round
                   t.engine.state.height;
-                Lwt.return_true
+                Lwt.return_unit
               end else if not (t.config.can_vote ()) then begin
-                let* durable = vote_durable t v in
-                if not durable then begin
+                let* stored = saved_vote t v in
+                match stored with
+                | None ->
                   error_node t.config.my_addr
                     "event = refuse_vote_queue type = %s epoch = %Ld round = %d"
                     (vote_step_label v.vote_type)
                     v.epoch_id
                     v.round;
-                  Lwt.return_false
-                end else begin
-                  queue_vote t v;
+                  Lwt.return_unit
+                | Some vote ->
+                  queue_vote t vote;
                   log_node t.config.my_addr
                     "event = queue_vote_not_ready type = %s epoch = %Ld round = %d pending = %d"
-                    (vote_step_label v.vote_type)
-                    v.epoch_id
-                    v.round
+                    (vote_step_label vote.vote_type)
+                    vote.epoch_id
+                    vote.round
                     (pending_vote_count t);
-                  Lwt.return_true
-                end
+                  Lwt.return_unit
               end else
-                broadcast_vote t v
+                let* _ = broadcast_vote t v in
+                Lwt.return_unit
             | C_engine.Finalized { epoch_id; finalize } ->
               let header = finalize.header in
               let round = finalize.commit_round in
@@ -1993,6 +2458,20 @@ let rec process_outputs_once t =
                  in
                  if String.length h >= 16 then String.sub h 0 16 else h);
               let* () = t.config.on_finalized finalize in
+              let vote_log_ready =
+                match C_vote_log.set_floor t.vote_log ~through_epoch:epoch_id with
+                | Error reason ->
+                  hold_vote_log t reason;
+                  false
+                | Ok () ->
+                  (match
+                     C_vote_log.prune t.vote_log ~through_epoch:epoch_id
+                   with
+                   | Ok () -> true
+                   | Error reason ->
+                     hold_vote_log t reason;
+                     false)
+              in
               let* () =
                 maybe_activate_scheduled_validator_set
                   t
@@ -2006,7 +2485,11 @@ let rec process_outputs_once t =
               let next = Int64.add epoch_id 1L in
               notify_fold t ~next_epoch:next fold;
               Hashtbl.clear t.durable_votes;
+              Hashtbl.clear t.round_peers;
+              t.vote_fault <- None;
+              if vote_log_ready then t.vote_log_issue <- None;
               C_engine.start_height t.engine next;
+              resume_local_vote t;
               let now_ns = Mtime_clock.elapsed_ns () in
               let slot_ns =
                 Int64.of_float (Epoch_time.interval_seconds *. 1e9)
@@ -2053,18 +2536,10 @@ let rec process_outputs_once t =
               t.epoch_start_mono <- Mtime_clock.elapsed_ns ();
               let* _ = try_current_leader_proposal t in
               let* () = process_outputs t in
-              Lwt.return_true)
-        true
-        outputs
+              Lwt.return_unit)
+      outputs
   in
-  if not output_allowed then begin
-    t.running <- false;
-    error_node t.config.my_addr
-      "event = consensus_driver_stop reason = vote_not_durable height = %Ld round = %d"
-      t.engine.state.height
-      t.engine.state.round;
-    Lwt.return_unit
-  end else if has_finalized then Lwt.return_unit
+  if has_finalized then Lwt.return_unit
   else
     let* proposed = try_current_leader_proposal t in
     if proposed then process_outputs t else Lwt.return_unit
@@ -2163,15 +2638,17 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               | Some _ ->
                 remember_frame t frame.msg_type frame.payload;
                 let current_round = t.engine.state.round in
+                remember_round_peer t sync;
                 let relay_candidate =
                   round_sync_relay_relevant
                     ~current_height:t.engine.state.height
                     ~current_round
                     sync
                 in
-                if sync.round > current_round + C_engine.max_round_ahead then
+                if not (round_sync_allowed ~current_round sync) then
                   Lwt.return_unit
                 else begin
+                  C_round_pool.add t.round_pool sync;
                   let* () =
                     if relay_candidate then
                       Octra_net.P2p_swarm.broadcast_except
@@ -2193,6 +2670,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                       t
                       _conn
                       ~requested_round:sync.round
+                      ~with_witness:(round_sync_source_matches t _conn sync)
                   else
                     Lwt.return_unit
                 end)
@@ -3694,11 +4172,17 @@ let clear_local_transients t =
 
 let clear_height_local_state t =
   clear_local_transients t;
+  t.proposal_wait <- None;
   Hashtbl.clear t.durable_votes;
   Hashtbl.clear t.deferred_proposals
 
 let clear_round_local_state t ~height ~round =
   clear_local_transients t;
+  (match t.proposal_wait with
+   | Some wait when wait.proposal.epoch_id = height
+                    && wait.proposal.round >= round -> ()
+   | Some _
+   | None -> t.proposal_wait <- None);
   Hashtbl.filter_map_inplace
     (fun _ (proposal : C_types.propose) ->
       if proposal.epoch_id = height && proposal.round >= round then
@@ -3707,11 +4191,16 @@ let clear_round_local_state t ~height ~round =
         None)
     t.deferred_proposals
 
+let reset_height t height =
+  Hashtbl.clear t.round_peers;
+  C_engine.start_height t.engine height;
+  resume_local_vote t
+
 let start_height t height =
   let open Lwt.Syntax in
   let* () = maybe_activate_scheduled_validator_set t ~target_epoch:height in
   clear_height_local_state t;
-  C_engine.start_height t.engine height;
+  reset_height t height;
   process_outputs t
 
 let restore_precommit_lock t proposal =
@@ -3744,6 +4233,7 @@ let realign_progress t ~height ~round =
     wake_ready t
 
 let start t =
+  resume_local_vote t;
   t.running <- true;
   let open Lwt.Syntax in
   log "event = driver_start node = %s height = %Ld n = %d quorum = %d"
@@ -3766,7 +4256,6 @@ let start t =
   log_node t.config.my_addr
     "event = start_consensus connected = %d validators = %d min = %d"
     (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
-
   let* () = Lwt_unix.sleep 3.0 in
   let* () =
     if C_engine.is_pristine t.engine then

@@ -533,6 +533,21 @@ let previous_epoch_ts (deps : deps) epoch =
   | None ->
     Consensus_driver_read.epoch_time deps.driver_read_deps epoch
 
+let share_txs (deps : deps) txs =
+  let hashes = Consensus_bundle_cache.share deps.proposal_bundles txs in
+  match !(deps.driver_ref), hashes with
+  | Some driver, _ :: _ ->
+    Lwt.async (fun () ->
+      Lwt.catch
+        (fun () -> Octra_consensus.C_driver.relay_txs driver hashes)
+        (fun exn ->
+          Octra_log.warn "consensus"
+            "event = tx_relay_failed reason = %s"
+            (Printexc.to_string exn);
+          Lwt.return_unit))
+  | Some _, []
+  | None, _ -> ()
+
 let verify_proposal_deps (deps : deps) =
   let validate_runner =
     Consensus_preverify_role.run_validate deps.validate_preverify
@@ -584,6 +599,7 @@ let verify_proposal_deps (deps : deps) =
     next_txid = deps.next_txid;
     root_to_raw32 = deps.root_to_raw32;
     set_proposal = deps.set_proposal;
+    share_txs = share_txs deps;
     verify_parent_commit = deps.verify_parent_commit;
   }
 

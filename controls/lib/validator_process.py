@@ -16,11 +16,25 @@ ACTIVE = frozenset({"launching", "online", "stopping"})
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
 
+
+def entry_data(entry):
+    meta = entry.get("pm2_env")
+    if not isinstance(meta, dict):
+        return None
+    direct = meta.get("OCTRA_DATA_DIR")
+    nested = meta.get("env")
+    inherited = nested.get("OCTRA_DATA_DIR") if isinstance(nested, dict) else None
+    if isinstance(direct, str) and isinstance(inherited, str):
+        return direct if direct == inherited else None
+    if isinstance(direct, str):
+        return direct
+    return inherited if isinstance(inherited, str) else None
+
 def process_plan(entries, name, data_dir):
     owned = [
         entry
         for entry in entries
-        if entry.get("pm2_env", {}).get("OCTRA_DATA_DIR") == data_dir
+        if entry_data(entry) == data_dir
     ]
     conflicts = [
         entry.get("name", "unknown")
@@ -36,7 +50,7 @@ def process_plan(entries, name, data_dir):
         if entry.get("name")
         and (
             entry.get("name") == name
-            or entry.get("pm2_env", {}).get("OCTRA_DATA_DIR") == data_dir
+            or entry_data(entry) == data_dir
         )
     })
 
@@ -55,7 +69,7 @@ def active_data_owners(entries, data_dir):
         entry.get("name")
         for entry in entries
         if entry.get("name")
-        and entry.get("pm2_env", {}).get("OCTRA_DATA_DIR") == data_dir
+        and entry_data(entry) == data_dir
         and entry.get("pm2_env", {}).get("status") in ACTIVE
     })
 
@@ -86,7 +100,7 @@ def remaining_owners(entries, names, data_dir):
         entry.get("name")
         for entry in entries
         if entry.get("name") in selected
-        or entry.get("pm2_env", {}).get("OCTRA_DATA_DIR") == data_dir
+        or entry_data(entry) == data_dir
     } - {None})
 
 def pm2_entries():

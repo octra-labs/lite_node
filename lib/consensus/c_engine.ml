@@ -9,6 +9,7 @@ type validator_set = C_types.validator_set
 let make_validator_set = C_types.make_validator_set
 let leader_of = C_types.leader_of
 let max_round_ahead = 64
+let max_sync_ahead = 1024
 let round_history_limit = 64
 let max_timeout_ms = 120_000
 let max_propose_timeout_ms = 300_000
@@ -199,6 +200,7 @@ type t = {
   mutable prevotes : vote_set;
   mutable prevotes_by_round : (int, vote_set) Hashtbl.t;
   mutable precommits : vote_set;
+  mutable precommits_by_round : (int, vote_set) Hashtbl.t;
   mutable current_proposal : propose option;
   mutable pending_prevote : (int64 * int * string) option;
   mutable proposal_cache : (string, proposal_cache_entry) Hashtbl.t;
@@ -215,7 +217,10 @@ type t = {
 let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
   let prevotes = create_vote_set () in
   let prevotes_by_round = Hashtbl.create 8 in
+  let precommits = create_vote_set () in
+  let precommits_by_round = Hashtbl.create 8 in
   Hashtbl.add prevotes_by_round 0 prevotes;
+  Hashtbl.add precommits_by_round 0 precommits;
   {
     chain_id;
     my_addr;
@@ -223,7 +228,8 @@ let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
     state = initial_engine_state start_height;
     prevotes;
     prevotes_by_round;
-    precommits = create_vote_set ();
+    precommits;
+    precommits_by_round;
     current_proposal = None;
     pending_prevote = None;
     proposal_cache = Hashtbl.create 8;
@@ -340,8 +346,7 @@ let vote_set_for t = function
 let vote_set_for_round t vote_type round =
   match vote_type with
   | Prevote -> Hashtbl.find_opt t.prevotes_by_round round
-  | Precommit when round = t.state.round -> Some t.precommits
-  | Precommit -> None
+  | Precommit -> Hashtbl.find_opt t.precommits_by_round round
 
 let conflicting_vote t (vote : vote) =
   if vote.epoch_id <> t.state.height then None
@@ -383,12 +388,16 @@ let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
     emit t (SendVote vote);
     LocalVoteCast result
 
-let precommits_for_pid t pid =
-  Hashtbl.fold (fun _ v acc ->
-    if v.vote_type = Precommit && v.proposal_id = pid then v :: acc
-    else acc)
-    t.precommits.votes []
-  |> List.sort (fun (a : vote) (b : vote) -> String.compare a.validator b.validator)
+let precommits_for_pid t ~round pid =
+  match Hashtbl.find_opt t.precommits_by_round round with
+  | None -> []
+  | Some votes ->
+    Hashtbl.fold (fun _ v acc ->
+      if v.vote_type = Precommit && v.proposal_id = pid then v :: acc
+      else acc)
+      votes.votes []
+    |> List.sort (fun (a : vote) (b : vote) ->
+      String.compare a.validator b.validator)
 
 type finalize_block =
   | Parent_commit_missing
@@ -412,7 +421,7 @@ let make_finalize t ~header ~proposal_id ~round =
       commit_round = round;
       header;
       proposal_id;
-      precommits = precommits_for_pid t proposal_id;
+      precommits = precommits_for_pid t ~round proposal_id;
       parent_commit;
     })
     (parent_commit_for_finalize t ~header ~proposal_id)
@@ -523,21 +532,27 @@ let retry_polc_request t ~except =
     Hashtbl.replace t.polc_requests round t.state.round
 
 let prune_round_history t =
-  Hashtbl.filter_map_inplace
-    (fun round vote_set ->
-      if round_retained t round then Some vote_set else None)
-    t.prevotes_by_round
+  let prune table =
+    Hashtbl.filter_map_inplace
+      (fun round vote_set ->
+        if round_retained t round then Some vote_set else None)
+      table
+  in
+  prune t.prevotes_by_round;
+  prune t.precommits_by_round
 
 let start_round t round =
   let prevotes = create_vote_set () in
+  let precommits = create_vote_set () in
   t.state <- { t.state with round; step = ProposeStep };
   let previous = if round > 0 then Some (round - 1) else None in
   Option.iter (request_polc t) previous;
   retry_polc_request t ~except:previous;
   t.prevotes <- prevotes;
   Hashtbl.replace t.prevotes_by_round round prevotes;
+  t.precommits <- precommits;
+  Hashtbl.replace t.precommits_by_round round precommits;
   prune_round_history t;
-  t.precommits <- create_vote_set ();
   t.current_proposal <- None;
   t.pending_prevote <- None;
   emit t (ScheduleTimeout {
@@ -562,6 +577,7 @@ let start_height t height =
   t.polc_by_round <- Hashtbl.create 4;
   t.polc_requests <- Hashtbl.create 4;
   t.prevotes_by_round <- Hashtbl.create 8;
+  t.precommits_by_round <- Hashtbl.create 8;
   t.higher_round_evidence <- Hashtbl.create 4;
   start_round t 0
 
@@ -642,10 +658,10 @@ let restore_precommit_lock t (proposal : propose) =
     Ok ()
   end
 
-let record_higher_round t ~round ~validator =
+let record_higher_round t ~max_ahead ~round ~validator =
   if C_types.is_validator t.vs validator
      && round > t.state.round
-     && round <= t.state.round + max_round_ahead then begin
+     && round <= t.state.round + max_ahead then begin
     let set =
       match Hashtbl.find_opt t.higher_round_evidence round with
       | Some s -> s
@@ -702,8 +718,8 @@ let try_round_skip t =
 let on_round_sync t ~round ~validator =
   if C_types.is_validator t.vs validator
      && round > t.state.round
-     && round <= t.state.round + max_round_ahead then begin
-    record_higher_round t ~round ~validator;
+     && round <= t.state.round + max_sync_ahead then begin
+    record_higher_round t ~max_ahead:max_sync_ahead ~round ~validator;
     try_round_skip t
   end
 
@@ -1012,7 +1028,11 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
   else if p.round > t.state.round + max_round_ahead then ()
   else begin
     if p.round > t.state.round then begin
-      record_higher_round t ~round:p.round ~validator:p.proposer;
+      record_higher_round
+        t
+        ~max_ahead:max_round_ahead
+        ~round:p.round
+        ~validator:p.proposer;
       try_round_skip t
     end;
   if p.round <> t.state.round then ()
@@ -1141,6 +1161,55 @@ let find_known_header t proposal_id =
         | Some h when C_hash.proposal_id h = proposal_id -> Some h
         | _ -> None
 
+let record_historical_precommit t (vote : vote) =
+  if vote.round >= 0
+     && vote.round < t.state.round
+     && round_retained t vote.round then begin
+    let votes =
+      match Hashtbl.find_opt t.precommits_by_round vote.round with
+      | Some value -> value
+      | None ->
+        let value = create_vote_set () in
+        Hashtbl.add t.precommits_by_round vote.round value;
+        value
+    in
+    let result = add_vote votes vote ~validator_set:t.vs in
+    Option.iter
+      (fun (round, proposal_id) ->
+        emit t (RequestProposal { round; proposal_id }))
+      (missing_proposal_request
+         ~proposal_known:
+           (Option.is_some
+              (find_proposal_message
+                 t
+                 ~proposal_id:vote.proposal_id
+                 ~round:vote.round))
+         vote
+         result);
+    match result with
+    | `QuorumOf proposal_id when local_voting_allowed t ->
+      (match find_known_header t proposal_id with
+       | None -> ()
+       | Some header ->
+         log_node t.my_addr
+           "event = late_precommit_quorum height = %Ld round = %d current_round = %d pid = %s"
+           t.state.height
+           vote.round
+           t.state.round
+           (short_hex_raw proposal_id);
+         ignore
+           (emit_local_finalize
+              t
+              ~header
+              ~proposal_id
+              ~round:vote.round))
+    | `Duplicate
+    | `Rejected
+    | `Added
+    | `QuorumAny
+    | `QuorumOf _ -> ()
+  end
+
 let on_vote t (v : vote) ~sign_fn =
   if v.epoch_id <= t.finalized_height then ()
   else if v.epoch_id <> t.state.height then ()
@@ -1149,10 +1218,14 @@ let on_vote t (v : vote) ~sign_fn =
   else if v.round < t.state.round then
     match v.vote_type with
     | Prevote -> record_historical_prevote t v
-    | Precommit -> ()
+    | Precommit -> record_historical_precommit t v
   else begin
     if v.round > t.state.round then begin
-      record_higher_round t ~round:v.round ~validator:v.validator;
+      record_higher_round
+        t
+        ~max_ahead:max_round_ahead
+        ~round:v.round
+        ~validator:v.validator;
       try_round_skip t
     end;
   if v.round <> t.state.round then ()

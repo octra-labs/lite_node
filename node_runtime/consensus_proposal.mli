@@ -261,6 +261,7 @@ type verify_proposal_deps = {
   next_txid : unit -> int64;
   root_to_raw32 : string -> string;
   set_proposal : Transaction.t list -> string list -> unit;
+  share_txs : Transaction.t list -> unit;
   verify_parent_commit :
     epoch_id:int64 ->
     Octra_consensus.C_types.parent_commit option ->
@@ -613,7 +614,7 @@ val verify_proposal :
   verify_proposal_deps ->
   chain_id:string ->
   Octra_consensus.C_types.propose ->
-  bool Lwt.t
+  Octra_consensus.C_driver.proposal_verdict Lwt.t
 
 val make_proposal :
   make_proposal_deps ->

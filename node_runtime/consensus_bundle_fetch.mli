@@ -14,7 +14,7 @@ type finalized =
   | Finalized_accepted of accepted
 
 type proposal =
-  | Proposal_fallback
+  | Proposal_missing
   | Proposal_accepted of accepted
 
 type proposal_bundle = {
@@ -22,6 +22,10 @@ type proposal_bundle = {
   receipts_json : string list;
   rejections : Octra_core.Tx_outcome.rejection list;
 }
+
+type proposal_state =
+  | Proposal_ready of proposal_bundle
+  | Proposal_wait
 
 type finalized_state =
   | Finalized_ready
@@ -77,4 +81,4 @@ val ensure_proposal :
   local_tx_count:int ->
   missing_count:int ->
   hashes_empty:bool ->
-  proposal_bundle Lwt.t
+  proposal_state Lwt.t
