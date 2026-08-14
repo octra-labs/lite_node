@@ -360,6 +360,9 @@ def bind_build_toolchains(environment, switch):
     environment_cache = OPAM_SWITCH / "_opam/.opam-switch/environment"
     environment_cache.unlink(missing_ok=True)
 
+def switch_exists(switch, listed):
+    return switch in listed or (Path(switch) / "_opam").is_dir()
+
 def build_candidate():
     if sys.platform != "linux" or os.uname().machine not in {"amd64", "x86_64", "aarch64", "arm64"}:
         raise ValidatorError("source build requires a supported Linux architecture")
@@ -388,7 +391,7 @@ def build_candidate():
         text=True,
         env=environment,
     ).stdout.splitlines()
-    if switch not in switches:
+    if not switch_exists(switch, switches):
         run(
             ["opam", "switch", "create", switch, "4.14.2", "-y"],
             env=environment,

@@ -68,11 +68,14 @@ from validator_recover import recover
 from validator_recover import preserved_state_path
 from validator_rejoin import configured_data
 from validator_rejoin import captured_round
+from validator_rejoin import checked_floor
 from validator_rejoin import floor_binary
 from validator_rejoin import floor_source
 from validator_rejoin import launch
 from validator_rejoin import legacy_handoff
 from validator_rejoin import log_round
+from validator_rejoin import meet_handoff
+from validator_rejoin import meet_round
 from validator_rejoin import node_binary
 from validator_rejoin import place_floor
 from validator_rejoin import rejoin
@@ -282,6 +285,70 @@ class ValidatorToolsTest(unittest.TestCase):
             run.call_args.args[0][-5:],
             ["--round-sync", "signed", "--round-min", "7", "--check"],
         )
+
+    def test_rejoin_checks_meet_floor_exactly(self):
+        root = WORK / "candidate"
+        tool = root / "artifacts/vote_floor.exe"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"floor")
+        values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        result = mock.Mock(stdout="status = vote_floor_checked head_epoch = 41 round = 10\n")
+        with mock.patch("validator_rejoin.subprocess.run", return_value=result) as run:
+            checked_floor(root, values, wallet, WORK, 41, 10)
+        self.assertEqual(run.call_args.args[0][-3:], ["--round", "10", "--check"])
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_rejoin_refuses_meet_floor_above_target(self):
+        root = WORK / "candidate"
+        tool = root / "artifacts/vote_floor.exe"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"floor")
+        values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        result = mock.Mock(stdout="status = vote_floor_checked head_epoch = 41 round = 11\n")
+        with mock.patch("validator_rejoin.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(ValidatorError, "does not exceed durable vote"):
+                checked_floor(root, values, wallet, WORK, 41, 10)
+
+    def test_rejoin_meet_round_stays_in_legacy_window(self):
+        snapshot = {"round_epoch": 42, "round": 7}
+        self.assertEqual(meet_round(snapshot, 41, "70"), 70)
+        with self.assertRaisesRegex(ValidatorError, "outside local window"):
+            meet_round(snapshot, 41, "71")
+        with self.assertRaisesRegex(ValidatorError, "outside local window"):
+            meet_round(snapshot, 41, "7")
+
+    def test_rejoin_meet_round_requires_current_epoch(self):
+        snapshot = {"round_epoch": 41, "round": 7}
+        with self.assertRaisesRegex(ValidatorError, "does not match finalized head"):
+            meet_round(snapshot, 41, "10")
+
+    def test_rejoin_meet_handoff_pauses_before_floor_write(self):
+        values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+        with mock.patch("validator_rejoin.pause_node") as pause_node:
+            with mock.patch("validator_rejoin.checked_floor") as checked:
+                with mock.patch("validator_rejoin.stop") as stop_node:
+                    with mock.patch("validator_rejoin.data_pids", return_value=[]):
+                        with mock.patch("validator_rejoin.place_floor") as floor:
+                            meet_handoff(
+                                WORK,
+                                WORK / "node.env",
+                                values,
+                                wallet,
+                                WORK,
+                                41,
+                                17,
+                                10,
+                            )
+        pause_node.assert_called_once_with(17)
+        checked.assert_called_once_with(WORK, values, wallet, WORK, 41, 10)
+        stop_node.assert_called_once_with(WORK, WORK / "node.env")
+        floor.assert_called_once_with(WORK, values, wallet, WORK, 41, 10)
 
     def test_rejoin_requires_running_validator(self):
         values = {
@@ -834,6 +901,26 @@ class ValidatorToolsTest(unittest.TestCase):
             emit.call_args.kwargs["reason"],
             "vote_log_conflict",
         )
+
+    def test_rejoin_waits_ready(self):
+        values = {"OCTRA_OPERATOR_ROLE": "validator"}
+        wallet = {"address": identity()[0]}
+        snapshot = {
+            "pid": 17,
+            "local_head": 41,
+            "remote_head": 41,
+            "voting": False,
+            "voting_reason": "not_ready",
+        }
+        member = {
+            "active": True,
+            "scheduled": False,
+            "activate_epoch": None,
+        }
+        with mock.patch("validator_rejoin.membership", return_value=member):
+            with mock.patch("validator_rejoin.emit") as emit:
+                self.assertIsNone(report_ready(values, wallet, snapshot))
+        emit.assert_not_called()
 
     def test_rejoin_wait_bounds(self):
         self.assertEqual(positive_seconds("30"), 30)
@@ -1767,6 +1854,71 @@ class ValidatorToolsTest(unittest.TestCase):
                 (WORK / "_build/default/bin" / name).read_bytes(),
                 name.encode("ascii"),
             )
+
+    def test_source_build_reuses_existing_local_switch(self):
+        (WORK / "octra_node.opam.locked").write_text(
+            'opam-version: "2.0"\n',
+            encoding="utf-8",
+        )
+        switch = WORK / "runtime_data/toolchains/ocaml"
+        (switch / "_opam").mkdir(parents=True)
+        names = [
+            "octra_node.exe",
+            "octra_pvac_worker.exe",
+            "octra_state_sync_client.exe",
+            "octra_state_sync_manifest.exe",
+            "bft_control_tx.exe",
+            "vote_floor.exe",
+        ]
+        commands = []
+
+        def run_build(command, cwd=WORK, env=None):
+            commands.append((command, cwd, env))
+            if "dune" in command:
+                target = WORK / "_build/default/bin"
+                target.mkdir(parents=True)
+                for name in names:
+                    (target / name).write_bytes(name.encode("ascii"))
+
+        def run_probe(command, **_):
+            if command == ["opam", "switch", "list", "--short"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[-2:] == ["ocamlc", "-version"]:
+                return subprocess.CompletedProcess(command, 0, "4.14.2\n", "")
+            raise AssertionError(command)
+
+        with mock.patch.multiple(
+            "validator_config",
+            ROOT=WORK,
+            OPAM_SWITCH=switch,
+        ):
+            with mock.patch("validator_config.sys.platform", "linux"):
+                with mock.patch(
+                    "validator_config.os.uname",
+                    return_value=mock.Mock(machine="aarch64"),
+                ):
+                    with mock.patch(
+                        "validator_config.ensure_build_toolchain",
+                        return_value={"PATH": "test"},
+                    ):
+                        with mock.patch(
+                            "validator_config.subprocess.run",
+                            side_effect=run_probe,
+                        ):
+                            with mock.patch(
+                                "validator_config.run",
+                                side_effect=run_build,
+                            ):
+                                build_candidate()
+        values = [command for command, _, _ in commands]
+        self.assertNotIn(
+            ["opam", "switch", "create", str(switch), "4.14.2", "-y"],
+            values,
+        )
+        self.assertIn(
+            ["opam", "switch", "link", str(switch), str(WORK), "-y"],
+            values,
+        )
 
     def test_hashed_file_rejects_tampering(self):
         worker = WORK / "octra_pvac_worker.exe"

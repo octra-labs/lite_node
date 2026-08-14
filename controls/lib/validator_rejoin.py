@@ -30,6 +30,7 @@ ROUND_AGE_SECONDS = 30.0
 ROUND_GAP = 2
 ROUND_LOG_LIMIT = 320
 WITNESS_BYTES = 2048
+MEET_AHEAD = 64
 
 
 def emit(**fields):
@@ -113,6 +114,65 @@ def place_floor(root, values, wallet, data_dir, head_epoch, round_id, sync=None,
     if check:
         command.append("--check")
     subprocess.run(command, check=True)
+
+
+def checked_floor(root, values, wallet, data_dir, head_epoch, round_id):
+    command = [
+        str(floor_binary(root)),
+        "--data-dir",
+        str(data_dir),
+        "--chain-id",
+        values["OCTRA_CHAIN_ID"],
+        "--validator",
+        wallet["address"],
+        "--validator-pub",
+        wallet["pub"],
+        "--head-epoch",
+        str(head_epoch),
+        "--round",
+        str(round_id),
+        "--check",
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    match = re.search(r"\bround = ([0-9]+)\s*$", result.stdout)
+    if match is None:
+        raise ValidatorError("vote floor check output is invalid")
+    marked = int(match.group(1))
+    if marked != round_id:
+        raise ValidatorError("meet round does not exceed durable vote")
+    print(result.stdout, end="")
+
+
+def meet_round(snapshot, head_epoch, raw):
+    try:
+        target = int(raw)
+    except (TypeError, ValueError) as error:
+        raise ValidatorError("meet round is invalid") from error
+    epoch = round_value(snapshot, "round_epoch")
+    local = snapshot.get("round")
+    if not isinstance(epoch, int) or not isinstance(local, int):
+        raise ValidatorError("running node did not report a consensus round")
+    if epoch != head_epoch + 1:
+        raise ValidatorError("running node round does not match finalized head")
+    if target <= local or target >= local + MEET_AHEAD:
+        raise ValidatorError("meet round is outside local window")
+    return target
+
+
+def meet_handoff(root, config, values, wallet, data_dir, head_epoch, pid, round_id):
+    pause_node(pid)
+    paused = True
+    try:
+        checked_floor(root, values, wallet, data_dir, head_epoch, round_id)
+        stop(root, config)
+        paused = False
+        if data_pids(data_dir):
+            raise ValidatorError("node process remained after vote floor preparation")
+        place_floor(root, values, wallet, data_dir, head_epoch, round_id)
+    except BaseException:
+        if paused:
+            resume_node(pid)
+        raise
 
 
 def data_pids(data_dir):
@@ -454,7 +514,7 @@ def report_ready(values, wallet, snapshot):
         return 0
     if member["active"]:
         reason = snapshot.get("voting_reason")
-        if isinstance(reason, str):
+        if isinstance(reason, str) and reason != "not_ready":
             emit(status="voting_disabled", reason=reason, **common)
             return 4
         return None
@@ -580,7 +640,7 @@ def legacy_handoff(root, config, values, wallet, data_dir, head_epoch, pid, sync
         raise
 
 
-def rejoin(root, config, supplied_data, wait_seconds, legacy=False, check=False):
+def rejoin(root, config, supplied_data, wait_seconds, legacy=False, check=False, meet=None):
     require_root(root)
     private_mode(config)
     values = parse_env(config)
@@ -617,38 +677,51 @@ def rejoin(root, config, supplied_data, wait_seconds, legacy=False, check=False)
         if not prior:
             raise ValidatorError("running validator is required to prepare the vote journal")
         before = snapshot(values, data_dir)
-        round_id, sync = floor_source(
-            before,
-            values,
-            wallet,
-            head["epoch"],
-            legacy,
-        )
-        if sync is None:
-            place_floor(
-                root,
+        if meet is not None:
+            round_id = meet_round(before, head["epoch"], meet)
+            sync = None
+            if check:
+                checked_floor(
+                    root,
+                    values,
+                    wallet,
+                    data_dir,
+                    head["epoch"],
+                    round_id,
+                )
+        else:
+            round_id, sync = floor_source(
+                before,
                 values,
                 wallet,
-                data_dir,
                 head["epoch"],
-                round_id,
-                check=True,
+                legacy,
             )
-        elif check:
-            round_id = log_round(
-                values["OCTRA_OPERATOR_PM2_NAME"],
-                head["epoch"] + 1,
-            )
-            place_floor(
-                root,
-                values,
-                wallet,
-                data_dir,
-                head["epoch"],
-                round_id,
-                sync=sync,
-                check=True,
-            )
+            if sync is None:
+                place_floor(
+                    root,
+                    values,
+                    wallet,
+                    data_dir,
+                    head["epoch"],
+                    round_id,
+                    check=True,
+                )
+            elif check:
+                round_id = log_round(
+                    values["OCTRA_OPERATOR_PM2_NAME"],
+                    head["epoch"] + 1,
+                )
+                place_floor(
+                    root,
+                    values,
+                    wallet,
+                    data_dir,
+                    head["epoch"],
+                    round_id,
+                    sync=sync,
+                    check=True,
+                )
         if check:
             emit(
                 status="rejoin_ready",
@@ -657,13 +730,32 @@ def rejoin(root, config, supplied_data, wait_seconds, legacy=False, check=False)
                 data_dir=data_dir,
                 head_epoch=head["epoch"],
                 round=round_id,
-                handoff="legacy" if sync is not None else "current",
+                handoff="meet" if meet is not None else "legacy" if sync is not None else "current",
             )
             return 0
-        if sync is None:
+        if meet is not None:
+            meet_handoff(
+                root,
+                config,
+                values,
+                wallet,
+                data_dir,
+                head["epoch"],
+                before["pid"],
+                round_id,
+            )
+        elif sync is None:
             stop(root, config)
             if data_pids(data_dir):
                 raise ValidatorError("node process remained after vote floor preparation")
+            place_floor(
+                root,
+                values,
+                wallet,
+                data_dir,
+                head["epoch"],
+                round_id,
+            )
         else:
             round_id = legacy_handoff(
                 root,
@@ -675,15 +767,17 @@ def rejoin(root, config, supplied_data, wait_seconds, legacy=False, check=False)
                 before["pid"],
                 sync,
             )
-        place_floor(
-            root,
-            values,
-            wallet,
-            data_dir,
-            head["epoch"],
-            round_id,
-            sync=sync,
-        )
+            place_floor(
+                root,
+                values,
+                wallet,
+                data_dir,
+                head["epoch"],
+                round_id,
+                sync=sync,
+            )
+    elif meet is not None:
+        raise ValidatorError("meet round requires validator")
     elif check:
         emit(
             status="rejoin_ready",
@@ -750,12 +844,15 @@ def main():
     parser.add_argument("--data-dir")
     parser.add_argument("--wait-seconds", default="600")
     parser.add_argument("--legacy-handoff", action="store_true")
+    parser.add_argument("--meet-round")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     root = resolved(args.root)
     config = resolved(args.config or root / ".keys/validator/node.env")
     if not config.is_file():
         raise ValidatorError("node configuration is missing: " + str(config))
+    if args.legacy_handoff and args.meet_round is not None:
+        raise ValidatorError("meet round cannot use legacy handoff")
     return rejoin(
         root,
         config,
@@ -763,6 +860,7 @@ def main():
         positive_seconds(args.wait_seconds),
         args.legacy_handoff,
         args.check,
+        args.meet_round,
     )
 
 
