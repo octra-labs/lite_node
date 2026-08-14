@@ -8,7 +8,10 @@ module Bundle_fetch = Consensus_bundle_fetch
 type deps = {
   check_finality : C_types.finalize -> unit;
   write_finality : C_types.finalize -> unit;
-  persist_finality_certificate : C_types.finalize -> unit;
+  persist_finality_certificate :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -40,7 +43,10 @@ type deps = {
 type node_deps = {
   check_finality : C_types.finalize -> unit;
   write_finality : C_types.finalize -> unit;
-  persist_finality_certificate : C_types.finalize -> unit;
+  persist_finality_certificate :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -72,4 +78,8 @@ val node_deps :
   node_deps ->
   deps
 
-val run : deps -> C_types.finalize -> unit Lwt.t
+val run :
+  deps ->
+  validator_set:C_types.validator_set ->
+  C_types.finalize ->
+  unit Lwt.t

@@ -222,7 +222,7 @@ let startup_journal (deps : deps) validator_set pending =
         Octra_consensus.Finality_log.write
           deps.data_dir
           (Octra_consensus.Finality_log.of_finalize finalize));
-      store_finalized = deps.finality.store_finalized;
+      store_finalized = deps.finality.store_finalized_with_set;
       store_proposer = deps.finality.store_flow_proposer;
       store_expected_root = deps.finality.store_expected_root;
       store_bundle = deps.bundle_runtime.store_bundle;
@@ -276,7 +276,7 @@ let startup_backlog (deps : deps) validator_set pending =
           Octra_consensus.Finality_log.write
             deps.data_dir
             (Octra_consensus.Finality_log.of_finalize finalize));
-        store_finalized = deps.finality.store_finalized;
+        store_finalized = deps.finality.store_finalized_with_set;
         store_proposer = deps.finality.store_flow_proposer;
         store_expected_root = deps.finality.store_expected_root;
         store_bundle = deps.bundle_runtime.store_bundle;
@@ -302,11 +302,99 @@ let startup_recovery (deps : deps) validator_set =
         pending_outcome
     end
 
+let rebind_committed (deps : deps) validator_set =
+  match deps.read_active_validator_meta () with
+  | None
+  | Some "" ->
+    Log.warn "finality"
+      "event = finality_journal_rebind status = skipped reason = active_validator_set_missing";
+    false
+  | Some _ ->
+    match Octra_consensus.Finality_log.last deps.data_dir with
+    | None ->
+      false
+    | Some entry ->
+      let proof_needed =
+        Consensus_finality_journal.proof_needed
+          ~chain_id:deps.chain_id
+          ~validator_set
+          ~entry
+          deps.data_dir
+      in
+      begin
+        match
+          Consensus_finality_journal.rebind_committed
+            ~chain_id:deps.chain_id
+            ~validator_set
+            ~entry
+            deps.data_dir
+        with
+        | Ok Consensus_finality_journal.Rebound ->
+          Log.warn "finality"
+            "event = finality_journal_rebind status = repaired height = %d"
+            entry.Octra_consensus.Finality_log.height;
+          false
+        | Ok Consensus_finality_journal.Unchanged ->
+          false
+        | Error reason ->
+          Log.warn "finality"
+            "event = finality_journal_rebind status = skipped height = %d reason = %s"
+            entry.Octra_consensus.Finality_log.height
+            reason;
+          proof_needed
+      end
+
+let repair_finality_proof (deps : deps) validator_set finalize =
+  match Octra_consensus.Finality_log.last deps.data_dir with
+  | None ->
+    Lwt.return_false
+  | Some entry ->
+    begin
+      match
+        Consensus_finality_journal.repair_committed
+          ~chain_id:deps.chain_id
+          ~validator_set
+          ~entry
+          ~finalize
+          deps.data_dir
+      with
+      | Ok Consensus_finality_journal.Proof_repaired ->
+        Log.warn "finality"
+          "event = finality_journal_proof status = repaired height = %d"
+          entry.Octra_consensus.Finality_log.height;
+        Lwt.return_true
+      | Ok Consensus_finality_journal.Proof_current ->
+        Lwt.return_true
+      | Error reason ->
+        Log.warn "finality"
+          "event = finality_journal_proof status = refused height = %d reason = %s"
+          entry.Octra_consensus.Finality_log.height
+          reason;
+        Lwt.return_false
+    end
+
+let check_finality_proof (deps : deps) validator_set finalize =
+  match Octra_consensus.Finality_log.last deps.data_dir with
+  | None ->
+    Error "finality proof finality entry is missing"
+  | Some entry
+    when not
+           (Int64.equal
+              finalize.Octra_consensus.C_types.epoch_id
+              (Int64.of_int entry.Octra_consensus.Finality_log.height)) ->
+    Error "finality proof epoch does not match local finality"
+  | Some entry ->
+    Consensus_finality_journal.check_proof
+      ~chain_id:deps.chain_id
+      ~validator_set
+      ~entry
+      ~finalize
+      deps.data_dir
+
 let finality_runtime (deps : deps) =
   Consensus_finality_runtime.create_node_runtime
     Consensus_finality_runtime.{
       data_dir = deps.data_dir;
-      validator_set = (fun () -> !(deps.p2p_refs.consensus_validator_set));
       bundles = deps.bundle_runtime;
       driver_ref = deps.driver_ref;
       proposal_state = deps.proposal_state;
@@ -532,7 +620,7 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
         ~cached_head:deps.cached_head
         ~lookup_bundle:deps.bundle_runtime.lookup_raw
       |> committed_reads ~readable:deps.state_readable;
-    scheduled_validator_set_config = p2p.scheduled_validator_set_config;
+    scheduled_validator_set_config = None;
     load_scheduled_validator_set_config =
       p2p_start.Startup_p2p_shell.load_scheduled_validator_set_config;
   }
@@ -602,7 +690,7 @@ let durable_start_height (deps : deps) =
   max current (max logged recovering)
 
 let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
-    run_catchup_to_target =
+    run_catchup_to_target finality_proof_needed =
   let fork_repair = fork_repair_runtime deps in
   let gates = driver_gates deps p2p in
   let start_height = durable_start_height deps in
@@ -614,6 +702,9 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
       validator_set = p2p.Startup_p2p_shell.active_vs;
       swarm = p2p.swarm;
       activate_validator_set = p2p_start.activate_validator_set;
+      finality_proof_needed;
+      check_finality_proof = check_finality_proof deps;
+      on_finality_proof = repair_finality_proof deps;
       driver_ref = deps.driver_ref;
       on_driver = deps.on_driver;
       data_dir = deps.data_dir;
@@ -640,6 +731,7 @@ let run (deps : deps) =
     let p2p_start = start_p2p deps in
     let p2p = p2p_start.view in
     if deps.consensus_mode then
+      let finality_proof_needed = rebind_committed deps p2p.active_vs in
       let startup = startup_finality deps in
       let normalize =
         Consensus_startup_finality.node_normalizer startup
@@ -656,3 +748,4 @@ let run (deps : deps) =
       in
       run_driver deps p2p_start p2p normalize finality_runtime
         run_catchup_to_target
+        finality_proof_needed

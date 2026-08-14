@@ -5,8 +5,17 @@ type t
 
 type callbacks = {
   find_finalized : int -> Octra_consensus.C_types.finalize option;
+  find_finalized_with_set :
+    int ->
+    (Octra_consensus.C_types.finalize
+     * Octra_consensus.C_types.validator_set) option;
   has_finalized : int -> bool;
   store_finalized : epoch:int -> Octra_consensus.C_types.finalize -> unit;
+  store_finalized_with_set :
+    epoch:int ->
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit;
   store_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   store_flow_proposer : Consensus_finalized_flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
@@ -17,8 +26,19 @@ type callbacks = {
 
 val create : unit -> t
 val find_finalized : t -> int -> Octra_consensus.C_types.finalize option
+val find_finalized_with_set :
+  t ->
+  int ->
+  (Octra_consensus.C_types.finalize
+   * Octra_consensus.C_types.validator_set) option
 val has_finalized : t -> int -> bool
 val store_finalized : t -> int -> Octra_consensus.C_types.finalize -> unit
+val store_finalized_with_set :
+  t ->
+  int ->
+  Octra_consensus.C_types.validator_set ->
+  Octra_consensus.C_types.finalize ->
+  unit
 val remove_finalized : t -> int -> unit
 val find_proposer : t -> int -> Octra_core.Epochlog.proposer_info option
 val store_proposer : t -> int -> Octra_core.Epochlog.proposer_info -> unit

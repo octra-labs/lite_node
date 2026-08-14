@@ -9,6 +9,15 @@ type runtime = {
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
+  finality_proof_needed : bool;
+  check_finality_proof :
+    Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    (unit, string) result;
+  on_finality_proof :
+    Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    bool Lwt.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   on_driver : Octra_consensus.C_driver.t -> unit;
   data_dir : string;

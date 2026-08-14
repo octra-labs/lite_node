@@ -44,7 +44,10 @@ type config = {
     epoch_id:int64 ->
     C_types.parent_commit option ->
     (unit, string) result;
-  on_finalized : C_types.finalize -> unit Lwt.t;
+  on_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
   make_proposal : int64 -> proposal_plan option Lwt.t;
   before_precommit_broadcast :
     epoch_id:int64 -> round:int -> proposal_id:string ->
@@ -108,6 +111,19 @@ type round_state = {
   epoch_id : int64;
   round : int;
   step : C_types.round_step;
+}
+
+type round_tally = {
+  proposal_id : string;
+  voters : int;
+  weight : Z.t;
+}
+
+type round_votes = {
+  prevotes : round_tally list;
+  precommits : round_tally list;
+  quorum : int;
+  quorum_weight : Z.t;
 }
 
 type round_witness = {
@@ -216,6 +232,7 @@ type t = {
   resource_admission : Resource_attestation_admission.pool;
   vote_evidence : (string, C_evidence.vote_conflict) Hashtbl.t;
   activated_validator_set_fingerprints : (string, bool) Hashtbl.t;
+  mutable plan_seen : bool;
   pending_votes : (string, C_types.vote) Hashtbl.t;
   future_votes : (string, C_types.vote) Hashtbl.t;
   vote_log : C_vote_log.t;
@@ -228,6 +245,12 @@ type t = {
   round_sync_replies : (string, round_sync_reply) Hashtbl.t;
   round_pool : C_round_pool.t;
   finality_query_requests : (string, int64) Hashtbl.t;
+  finality_proof_requests : (string, int64) Hashtbl.t;
+  finality_proof_needed : bool ref;
+  mutable check_finality_proof :
+    C_types.validator_set -> C_types.finalize -> (unit, string) result;
+  mutable on_finality_proof :
+    C_types.validator_set -> C_types.finalize -> bool Lwt.t;
   mutable finality_query : C_finality_query.t;
   proposal_fetches : (string, unit) Hashtbl.t;
   catchup_query_windows : (string, catchup_query_window) Hashtbl.t;
@@ -371,6 +394,10 @@ let catchup_response_in_window window records =
        records
 
 let create ~config ~validator_set ~swarm ~start_height ~vote_log =
+  let finality_proof_needed = ref false in
+  let can_vote () =
+    config.can_vote () && not !finality_proof_needed
+  in
   let validator_set =
     C_types.validator_set_for_epoch
       ~chain_id:config.chain_id
@@ -382,7 +409,7 @@ let create ~config ~validator_set ~swarm ~start_height ~vote_log =
     ~my_addr:config.my_addr
     ~validator_set
     ~start_height
-    ~can_vote:config.can_vote in
+    ~can_vote in
   { n_validators = validator_set.C_types.n; config; engine; swarm;
     seen = C_seen.create ~capacity:10_000; running = false;
     historical_replays = C_seen.create ~capacity:4_096;
@@ -396,6 +423,7 @@ let create ~config ~validator_set ~swarm ~start_height ~vote_log =
     resource_admission = Resource_attestation_admission.create_pool ();
     vote_evidence = Hashtbl.create 16;
     activated_validator_set_fingerprints = Hashtbl.create 8;
+    plan_seen = false;
     pending_votes = Hashtbl.create 16;
     future_votes = Hashtbl.create 32;
     vote_log;
@@ -408,6 +436,11 @@ let create ~config ~validator_set ~swarm ~start_height ~vote_log =
     round_sync_replies = Hashtbl.create 16;
     round_pool = C_round_pool.create ();
     finality_query_requests = Hashtbl.create 4;
+    finality_proof_requests = Hashtbl.create 4;
+    finality_proof_needed;
+    check_finality_proof =
+      (fun _ _ -> Error "finality proof check unavailable");
+    on_finality_proof = (fun _ _ -> Lwt.return_false);
     finality_query = C_finality_query.idle;
     proposal_fetches = Hashtbl.create 4;
     catchup_query_windows = Hashtbl.create 8;
@@ -426,6 +459,11 @@ let set_validator_set_activation_handler t handler =
 
 let set_fold_handler t handler =
   t.on_fold <- handler
+
+let set_finality_proof_handler t ~needed ~check handler =
+  t.finality_proof_needed := needed;
+  t.check_finality_proof <- check;
+  t.on_finality_proof <- handler
 
 let grace_ms name ~default ~limit =
   match Sys.getenv_opt name with
@@ -473,6 +511,21 @@ let same_proposal_build (b : proposal_build) ~gen ~height ~round ~step =
 
 let local_validator t =
   C_types.is_validator t.engine.vs t.config.my_addr
+
+let vote_allowed t =
+  t.config.can_vote () && not !(t.finality_proof_needed)
+
+let clear_finality_proof_requests t =
+  Hashtbl.iter
+    (fun request_id _ ->
+      Hashtbl.remove t.catchup_query_windows request_id)
+    t.finality_proof_requests;
+  Hashtbl.clear t.finality_proof_requests
+
+let finality_request_epoch t request_id =
+  match Hashtbl.find_opt t.finality_query_requests request_id with
+  | Some epoch -> Some epoch
+  | None -> Hashtbl.find_opt t.finality_proof_requests request_id
 
 let repeatable_query_frame (frame : Frame.frame) =
   (frame.msg_type = Frame.msg_cons_round_sync
@@ -840,7 +893,8 @@ let vote_state t =
             && fault.round >= t.engine.state.round ->
        false, Some fault.reason
      | _ when not (t.config.role_can_vote ()) -> false, Some "role"
-     | _ when not (t.config.can_vote ()) -> false, Some "not_ready"
+     | _ when !(t.finality_proof_needed) -> false, Some "finality_proof"
+     | _ when not (vote_allowed t) -> false, Some "not_ready"
      | _ -> true, None)
 
 let resume_local_vote t =
@@ -946,6 +1000,8 @@ let require_vote_floor t =
 let saved_vote t (v : C_types.vote) =
   if not (String.equal v.validator t.config.my_addr) then
     Lwt.return_some v
+  else if !(t.finality_proof_needed) then
+    Lwt.return_none
   else
     match t.vote_log_issue with
     | Some reason ->
@@ -1063,7 +1119,7 @@ let round_sync_frame sync =
 
 let broadcast_round_sync t ~request =
   if not (local_validator t)
-     || (not request && not (t.config.can_vote ())) then
+     || (not request && not (vote_allowed t)) then
     Lwt.return_unit
   else begin
     let sync = make_round_sync t ~request in
@@ -1079,7 +1135,7 @@ let round_sync_request_for_step = function
   | C_types.PrecommitStep -> true
 
 let broadcast_round_sync_at t ~round =
-  if not (local_validator t) || not (t.config.can_vote ()) then
+  if not (local_validator t) || not (vote_allowed t) then
     Lwt.return_unit
   else
     Octra_net.P2p_swarm.broadcast
@@ -1122,7 +1178,7 @@ let decide_proposal_fetch
     Send_proposal_fetch
 
 let start_proposal_fetch t ~round ~proposal_id =
-  if not (local_validator t) || not (t.config.can_vote ()) then
+  if not (local_validator t) || not (vote_allowed t) then
     Lwt.return_unit
   else
     let fetch = {
@@ -1256,7 +1312,7 @@ let send_round_vote_to t conn (vote : C_types.vote) =
 let send_round_sync_response t conn ~requested_round ~with_witness =
   let open Lwt.Syntax in
   let local_sync =
-    if local_validator t && t.config.can_vote () then
+    if local_validator t && vote_allowed t then
       Some (make_round_sync t ~request:false)
     else
       None
@@ -1351,6 +1407,44 @@ let round_state t = {
   step = t.engine.state.step;
 }
 
+let vote_tallies validator_set votes =
+  let table = Hashtbl.create validator_set.C_types.n in
+  Hashtbl.iter
+    (fun _ (vote : C_types.vote) ->
+      let voters, weight =
+        match Hashtbl.find_opt table vote.proposal_id with
+        | Some value -> value
+        | None -> 0, Z.zero
+      in
+      let weight =
+        match C_types.weight_of_addr validator_set vote.validator with
+        | Some value -> Z.add weight value
+        | None -> weight
+      in
+      Hashtbl.replace table vote.proposal_id (voters + 1, weight))
+    votes.C_engine.votes;
+  Hashtbl.to_seq table
+  |> List.of_seq
+  |> List.map (fun (proposal_id, (voters, weight)) -> {
+       proposal_id;
+       voters;
+       weight;
+     })
+  |> List.sort (fun left right ->
+       let by_weight = Z.compare right.weight left.weight in
+       if by_weight <> 0 then by_weight
+       else
+         let by_voters = Int.compare right.voters left.voters in
+         if by_voters <> 0 then by_voters
+         else String.compare left.proposal_id right.proposal_id)
+
+let round_vote_snapshot t = {
+  prevotes = vote_tallies t.engine.vs t.engine.prevotes;
+  precommits = vote_tallies t.engine.vs t.engine.precommits;
+  quorum = t.engine.vs.quorum;
+  quorum_weight = t.engine.vs.quorum_weight;
+}
+
 let round_peer_snapshot t =
   Hashtbl.fold (fun _ peer acc -> peer :: acc) t.round_peers []
 
@@ -1384,7 +1478,7 @@ let round_agreed t ~now =
         then peer.validator_addr :: acc
         else acc)
       t.round_peers
-      (if local_validator t && t.config.can_vote () then [t.config.my_addr]
+      (if local_validator t && vote_allowed t then [t.config.my_addr]
        else [])
   in
   C_types.has_quorum_at
@@ -1457,7 +1551,7 @@ let round_sync_response_allowed t sync =
   round_sync_response_allowed_at t sync (Mtime_clock.elapsed_ns ())
 
 let flush_pending_votes t =
-  if not (t.config.can_vote ()) then Lwt.return_unit
+  if not (vote_allowed t) then Lwt.return_unit
   else begin
     let queued =
       Hashtbl.fold (fun key vote acc -> (key, vote) :: acc) t.pending_votes [] in
@@ -1725,10 +1819,12 @@ let record_vote_conflict ~validator_set t prior vote =
 let load_validator_set_plan t =
   let open Lwt.Syntax in
   let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
-  Lwt.return
-    (match dynamic_cfg with
-     | Some cfg -> Some cfg
-     | None -> t.config.scheduled_validator_set_config)
+  match dynamic_cfg with
+  | Some cfg ->
+    t.plan_seen <- true;
+    Lwt.return_some cfg
+  | None when t.plan_seen -> Lwt.return_none
+  | None -> Lwt.return t.config.scheduled_validator_set_config
 
 let validator_set_at ~chain_id ~current ~epoch plan =
   let source =
@@ -2417,7 +2513,7 @@ let rec process_outputs_once t =
                   v.round
                   t.engine.state.height;
                 Lwt.return_unit
-              end else if not (t.config.can_vote ()) then begin
+              end else if not (vote_allowed t) then begin
                 let* stored = saved_vote t v in
                 match stored with
                 | None ->
@@ -2457,7 +2553,11 @@ let rec process_outputs_once t =
                        header.proposed_state_root)
                  in
                  if String.length h >= 16 then String.sub h 0 16 else h);
-              let* () = t.config.on_finalized finalize in
+              let* () =
+                t.config.on_finalized
+                  ~validator_set:t.engine.vs
+                  finalize
+              in
               let vote_log_ready =
                 match C_vote_log.set_floor t.vote_log ~through_epoch:epoch_id with
                 | Error reason ->
@@ -2564,6 +2664,66 @@ and process_outputs t =
           Lwt.fail exn)
     in
     run ()
+
+let finality_proof_target t (finalize : C_types.finalize) =
+  !(t.finality_proof_needed)
+  && Int64.equal finalize.epoch_id (t.config.local_head_epoch ())
+  && Int64.equal t.engine.state.height (Int64.succ finalize.epoch_id)
+
+let accept_finality_proof t finalize =
+  if not (finality_proof_target t finalize) then
+    Lwt.return_unit
+  else
+    Lwt.catch
+      (fun () ->
+        match
+          t.check_finality_proof t.engine.vs finalize
+        with
+        | Error reason ->
+          warn_node t.config.my_addr
+            "event = finality_proof status = refused reason = local_binding detail = %s"
+            reason;
+          Lwt.return_unit
+        | Ok () ->
+          let verify_vote (vote : C_types.vote) =
+            match C_types.pubkey_of_addr t.engine.vs vote.validator with
+            | Some pubkey -> C_hash.verify_vote ~pubkey_raw:pubkey vote
+            | None -> false
+          in
+          begin
+            match
+              C_qc.validate_finalize
+                ~chain_id:t.config.chain_id
+                ~validator_set:t.engine.vs
+                ~verify_vote
+                finalize
+            with
+            | C_qc.Invalid reason ->
+              warn_node t.config.my_addr
+                "event = finality_proof status = refused reason = qc_%s"
+                reason;
+              Lwt.return_unit
+            | C_qc.Valid ->
+              let open Lwt.Syntax in
+              let* repaired = t.on_finality_proof t.engine.vs finalize in
+              if not repaired then
+                Lwt.return_unit
+              else begin
+                t.finality_proof_needed := false;
+                clear_finality_proof_requests t;
+                log_node t.config.my_addr
+                  "event = finality_proof status = repaired epoch = %Ld"
+                  finalize.epoch_id;
+                let* () = broadcast_round_sync t ~request:true in
+                let* _ = try_current_leader_proposal t in
+                process_outputs t
+              end
+          end)
+      (fun exn ->
+        warn_node t.config.my_addr
+          "event = finality_proof status = refused reason = local_error detail = %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
 
 let rec on_p2p_message t _conn (frame : Frame.frame) =
   let open Lwt.Syntax in
@@ -2926,7 +3086,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                 ~proposal:f.epoch_id with
         | Proposal_stale ->
           remember_frame t frame.msg_type frame.payload;
-          Lwt.return_unit
+          accept_finality_proof t f
         | Proposal_future ->
           log_node t.config.my_addr
             "event = ignore_future_finalize reason = unresolved_validator_set epoch = %Ld local_height = %Ld"
@@ -3291,7 +3451,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                 r.signature
             in
             let finality_request =
-              Hashtbl.mem t.finality_query_requests r.request_id
+              Option.is_some (finality_request_epoch t r.request_id)
             in
             let request_scope =
               C_finality_query.request_scope
@@ -3367,9 +3527,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               Lwt.return_unit
             | Some (r : C_codec.catchup_range_response)
               when response_route = C_finality_query.Finality_response ->
-              begin match
-                Hashtbl.find_opt t.finality_query_requests r.request_id
-              with
+              begin match finality_request_epoch t r.request_id with
               | Some expected_epoch ->
                 let finalize =
                   match r.records with
@@ -3416,9 +3574,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                 ~head_epoch
                 ~checked_epoch
                 ~state_root;
-              match
-                Hashtbl.find_opt t.finality_query_requests r.request_id
-              with
+              match finality_request_epoch t r.request_id with
               | Some expected_epoch ->
                 let finalize =
                   match r.records with
@@ -4043,6 +4199,17 @@ let finality_query_peer_ids validator_set ~epoch_id records =
   |> List.sort_uniq String.compare
   |> List.filteri (fun index _ -> index < limit)
 
+let finality_proof_peer_ids validator_set ~epoch_id records =
+  records
+  |> List.filter (fun (record : epoch_root_response_record) ->
+    Int64.compare record.responder_head_epoch epoch_id >= 0)
+  |> List.filter_map (fun (record : epoch_root_response_record) ->
+    match C_types.pubkey_of_addr validator_set record.responder_addr with
+    | Some pubkey ->
+      Some (Octra_net.P2p_handshake.node_id_of_pubkey pubkey)
+    | None -> None)
+  |> List.sort_uniq String.compare
+
 let close_finality_query_windows t =
   Hashtbl.iter
     (fun request_id _ ->
@@ -4105,8 +4272,52 @@ let request_missing_finalize t ~epoch_id records =
           Octra_net.P2p_swarm.send_to t.swarm ~peer_id frame)
         peer_ids
 
+let request_finality_proof t ~epoch_id records =
+  let open Lwt.Syntax in
+  let* validator_set = validator_set_for_frame t epoch_id in
+  let peer_ids = finality_proof_peer_ids validator_set ~epoch_id records in
+  match peer_ids with
+  | [] ->
+    warn_node t.config.my_addr
+      "event = finality_proof status = unavailable epoch = %Ld reason = no_peer"
+      epoch_id;
+    Lwt.return_unit
+  | _ ->
+    let now = Mtime_clock.elapsed_ns () in
+    let request_id =
+      Octra_net.Hash_domain.hash
+        "octra:finality_proof_request"
+        (Printf.sprintf "%s:%Ld:%Ld" t.config.my_addr epoch_id now)
+      |> C_hash.mark_complete_catchup_request
+    in
+    let query = C_codec.{
+      chain_id = t.config.chain_id;
+      request_id;
+      from_epoch = epoch_id;
+      max_epochs = 1;
+    } in
+    let frame = {
+      Frame.msg_type = Frame.msg_query_catchup_range_v2;
+      payload = C_codec.encode_catchup_query_range query;
+    } in
+    clear_finality_proof_requests t;
+    Hashtbl.replace
+      t.catchup_query_windows
+      request_id
+      { from_epoch = epoch_id; max_epochs = 1 };
+    Hashtbl.replace t.finality_proof_requests request_id epoch_id;
+    log_node t.config.my_addr
+      "event = finality_proof status = request epoch = %Ld peers = %d"
+      epoch_id
+      (List.length peer_ids);
+    Lwt_list.iter_p
+      (fun peer_id ->
+        Octra_net.P2p_swarm.send_to t.swarm ~peer_id frame)
+      peer_ids
+
 let query_epoch_root
     ?(wait_for = Source_agreement)
+    ?(request_next = true)
     t
     ~epoch_id
     ~timeout_seconds =
@@ -4137,7 +4348,8 @@ let query_epoch_root
   let* collected = wait () in
   let local_head = t.config.local_head_epoch () in
   let* () =
-    if epoch_id = local_head
+    if request_next
+       && epoch_id = local_head
        && Int64.sub t.engine.state.height local_head = 1L then
       request_missing_finalize
         t
@@ -4148,6 +4360,47 @@ let query_epoch_root
   in
   Hashtbl.remove t.epoch_root_responses epoch_id;
   Lwt.return collected
+
+let proof_wait tries =
+  match tries with
+  | 0 -> 5.0
+  | 1 -> 10.0
+  | _ -> 30.0
+
+let rec recover_finality_proof t tries =
+  let open Lwt.Syntax in
+  let retry () =
+    let* () = Lwt_unix.sleep (proof_wait tries) in
+    recover_finality_proof t (min 2 (tries + 1))
+  in
+  if not t.running || not !(t.finality_proof_needed) then
+    Lwt.return_unit
+  else
+    Lwt.catch
+      (fun () ->
+        let local_head = t.config.local_head_epoch () in
+        if Int64.compare local_head 0L < 0
+           || not (Int64.equal t.engine.state.height (Int64.succ local_head))
+        then
+          retry ()
+        else begin
+          let* records =
+            query_epoch_root
+              ~request_next:false
+              t
+              ~epoch_id:local_head
+              ~timeout_seconds:3.0
+          in
+          let* () = request_finality_proof t ~epoch_id:local_head records in
+          let* () = Lwt_unix.sleep (proof_wait tries) in
+          clear_finality_proof_requests t;
+          recover_finality_proof t (min 2 (tries + 1))
+        end)
+      (fun exn ->
+        warn_node t.config.my_addr
+          "event = finality_proof status = retry reason = local_error detail = %s"
+          (Printexc.to_string exn);
+        retry ())
 
 let try_propose ?parent_commit t ~header ~tx_hashes =
   C_engine.do_propose
@@ -4265,6 +4518,9 @@ let start t =
         t
         ~target_epoch:t.engine.state.height
   in
+  if !(t.finality_proof_needed) then
+    Lwt.async (fun () ->
+      recover_finality_proof t 0);
   let* () = broadcast_round_sync t ~request:true in
   let* _ = try_current_leader_proposal t in
   process_outputs t

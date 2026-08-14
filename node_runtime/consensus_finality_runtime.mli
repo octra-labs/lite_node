@@ -18,6 +18,7 @@ type node_deps = {
   check_finality : Octra_consensus.C_types.finalize -> unit;
   write_finality : Octra_consensus.C_types.finalize -> unit;
   persist_finality_certificate :
+    validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->
     unit;
   persist_finality_bundle :
@@ -59,7 +60,6 @@ type node_deps = {
 
 type node_runtime = {
   data_dir : string;
-  validator_set : unit -> Octra_consensus.C_types.validator_set;
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
   proposal_state : Consensus_proposal_state.t;
@@ -79,7 +79,10 @@ type node_runtime = {
 }
 
 type t = {
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   drain_pending : unit -> unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }

@@ -27,6 +27,14 @@ type read_result =
   | Valid of record
   | Invalid of string
 
+type rebind_result =
+  | Rebound
+  | Unchanged
+
+type proof_result =
+  | Proof_repaired
+  | Proof_current
+
 let schema = "octra_finality_journal"
 let max_bytes = 128 * 1024 * 1024
 let history_limit = 4096L
@@ -197,48 +205,58 @@ let same_bundle left right =
      = List.map Transaction.to_yojson right.txs
   && left.receipts_json = right.receipts_json
 
-let temporary_counter = ref 0
+let same_record left right =
+  same_finalize left.finalize right.finalize
+  && C_config.validator_set_hash left.validator_set
+     = C_config.validator_set_hash right.validator_set
+  &&
+  match left.bundle, right.bundle with
+  | None, None -> true
+  | Some left, Some right -> same_bundle left right
+  | _ -> false
 
-let rec open_temporary target attempts =
+let staged_counter = ref 0
+
+let rec open_staged target attempts =
   if attempts <= 0 then
-    failwith "unable to allocate finality journal temporary file";
-  incr temporary_counter;
-  let temporary =
+    failwith "unable to allocate finality journal staged file";
+  incr staged_counter;
+  let staged =
     Printf.sprintf
       "%s.next.%d.%d"
       target
       (Unix.getpid ())
-      !temporary_counter
+      !staged_counter
   in
   try
     let fd =
       Unix.openfile
-        temporary
+        staged
         [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
         0o640
     in
-    temporary, fd
+    staged, fd
   with
   | Unix.Unix_error (Unix.EEXIST, _, _) ->
-    open_temporary target (attempts - 1)
+    open_staged target (attempts - 1)
 
-let remove_temporary path =
+let remove_staged path =
   try Unix.unlink path with
   | Unix.Unix_error (Unix.ENOENT, _, _) -> ()
 
 let write_encoded target encoded =
-  let temporary, fd = open_temporary target 1024 in
+  let staged, fd = open_staged target 1024 in
   let renamed = ref false in
   Fun.protect
     ~finally:(fun () ->
-      if not !renamed then remove_temporary temporary)
+      if not !renamed then remove_staged staged)
     (fun () ->
       Fun.protect
         ~finally:(fun () -> Unix.close fd)
         (fun () ->
           write_all fd encoded 0;
           Unix.fsync fd);
-      Unix.rename temporary target;
+      Unix.rename staged target;
       renamed := true;
       fsync_directory (Filename.dirname target))
 
@@ -273,6 +291,26 @@ let archive_record base record =
       fsync_directory (history_dir base)
     end
   end
+
+let proof_path base record =
+  Filename.concat
+    (history_dir base)
+    (Int64.to_string record.finalize.C_types.epoch_id
+     ^ ".proof-"
+     ^ Finality_log.hash_finalize record.finalize
+     ^ ".json")
+
+let archive_proof base record =
+  ensure_history_dir base;
+  let target = proof_path base record in
+  if Sys.file_exists target then begin
+    match read_record target with
+    | Some prior when same_record prior record -> ()
+    | Some _
+    | None ->
+      failwith "conflicting finality proof history"
+  end else
+    write_encoded target (bytes record)
 
 let persist_certificate base ~validator_set finalize =
   match read_record (path base) with
@@ -377,6 +415,17 @@ let committed_matches entry record =
     entry
     (Finality_log.of_finalize record.finalize)
 
+let same_block left right =
+  String.equal left.C_types.chain_id right.C_types.chain_id
+  && Int64.equal left.epoch_id right.epoch_id
+  && left.commit_round = right.commit_round
+  && String.equal left.proposal_id right.proposal_id
+  && C_hash.parent_commit_hash_opt left.parent_commit
+     = C_hash.parent_commit_hash_opt right.parent_commit
+  && Finality_log.same_commitment
+       (Finality_log.of_finalize left)
+       (Finality_log.of_finalize right)
+
 let committed_record_path base epoch =
   let current = committed_path base in
   let historical = history_path base epoch in
@@ -419,6 +468,182 @@ let read_committed_epoch_validated ~chain_id ~validator_set ~epoch base =
       | Ok () -> Valid record
       | Error reason -> Invalid reason
     end
+
+let rebind_committed ~chain_id ~validator_set ~entry base =
+  try
+    match committed_record_path base (Int64.of_int entry.Finality_log.height) with
+    | None ->
+      Error "committed finality journal is missing"
+    | Some target ->
+      begin
+        match read_record target with
+        | None ->
+          Error "committed finality journal disappeared"
+        | Some record ->
+          let got = Finality_log.of_finalize record.finalize in
+          if not (committed_matches entry record) then
+            Error "committed finality journal commitment mismatch"
+          else if
+            entry.Finality_log.qc_hash <> got.Finality_log.qc_hash
+            && C_config.validator_set_hash record.validator_set
+               <> C_config.validator_set_hash validator_set
+          then
+            Error "committed finality journal certificate mismatch"
+          else
+            match validate_record ~chain_id { record with validator_set } with
+            | Error reason -> Error reason
+            | Ok () ->
+              if
+                C_config.validator_set_hash record.validator_set
+                = C_config.validator_set_hash validator_set
+              then
+                Ok Unchanged
+              else begin
+                write_encoded target (bytes { record with validator_set });
+                Ok Rebound
+              end
+      end
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let proof_needed ~chain_id ~validator_set ~entry base =
+  try
+    match committed_record_path base (Int64.of_int entry.Finality_log.height) with
+    | None -> false
+    | Some target ->
+      begin
+        match read_record target with
+        | None -> false
+        | Some record when not (committed_matches entry record) -> false
+        | Some record ->
+          begin
+            match validate_record ~chain_id record with
+            | Error _ -> false
+            | Ok () ->
+              C_config.validator_set_hash record.validator_set
+              <> C_config.validator_set_hash validator_set
+          end
+      end
+  with _ ->
+    false
+
+let check_proof ~chain_id ~validator_set ~entry ~finalize base =
+  try
+    match committed_record_path base (Int64.of_int entry.Finality_log.height) with
+    | None ->
+      Error "committed finality journal is missing"
+    | Some target ->
+      begin
+        match read_record target with
+        | None ->
+          Error "committed finality journal disappeared"
+        | Some record when not (committed_matches entry record) ->
+          Error "committed finality journal commitment mismatch"
+        | Some record when not (same_block record.finalize finalize) ->
+          Error "finality proof block mismatch"
+        | Some record ->
+          begin
+            match validate_record ~chain_id record with
+            | Error reason -> Error reason
+            | Ok () ->
+              let replacement = { record with finalize; validator_set } in
+              begin
+                match validate_record ~chain_id replacement with
+                | Error reason -> Error reason
+                | Ok () ->
+                  if
+                    C_config.validator_set_hash record.validator_set
+                    = C_config.validator_set_hash validator_set
+                    && not (same_finalize record.finalize finalize)
+                  then
+                    Error "finality proof validator set already current"
+                  else
+                    Ok ()
+              end
+          end
+      end
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let repair_committed ~chain_id ~validator_set ~entry ~finalize base =
+  try
+    match committed_record_path base (Int64.of_int entry.Finality_log.height) with
+    | None ->
+      Error "committed finality journal is missing"
+    | Some target ->
+      begin
+        match read_record target with
+        | None ->
+          Error "committed finality journal disappeared"
+        | Some record when not (committed_matches entry record) ->
+          Error "committed finality journal commitment mismatch"
+        | Some record when not (same_block record.finalize finalize) ->
+          Error "finality proof block mismatch"
+        | Some record ->
+          begin
+            match validate_record ~chain_id record with
+            | Error reason -> Error reason
+            | Ok () ->
+              let replacement = { record with finalize; validator_set } in
+              begin
+                match validate_record ~chain_id replacement with
+                | Error reason -> Error reason
+                | Ok () ->
+                  if
+                    C_config.validator_set_hash record.validator_set
+                    = C_config.validator_set_hash validator_set
+                  then
+                    if same_finalize record.finalize finalize then
+                      Ok Proof_current
+                    else
+                      Error "finality proof validator set already current"
+                  else begin
+                    archive_proof base record;
+                    write_encoded target (bytes replacement);
+                    Ok Proof_repaired
+                  end
+              end
+          end
+      end
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let proof_file ~validator_set_hash proof =
+  match read_record proof with
+  | None -> Error "finality proof file is invalid"
+  | Some record ->
+    let actual = C_config.validator_set_hash record.validator_set in
+    if String.equal actual validator_set_hash
+    then Ok record
+    else Error "finality proof validator set mismatch"
+
+let check_file ~chain_id ~validator_set_hash ~entry ~proof base =
+  try
+    match proof_file ~validator_set_hash proof with
+    | Error _ as error -> error
+    | Ok record ->
+      check_proof
+        ~chain_id
+        ~validator_set:record.validator_set
+        ~entry
+        ~finalize:record.finalize
+        base
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let repair_file ~chain_id ~validator_set_hash ~entry ~proof base =
+  try
+    match proof_file ~validator_set_hash proof with
+    | Error _ as error -> error
+    | Ok record ->
+      repair_committed
+        ~chain_id
+        ~validator_set:record.validator_set
+        ~entry
+        ~finalize:record.finalize
+        base
+  with exn ->
+    Error (Printexc.to_string exn)
 
 let read_history_epoch_validated ~chain_id ~validator_set ~epoch base =
   read_validated_path
@@ -563,16 +788,6 @@ let drop_invalid_unapplied base ~head =
 
 let pending base =
   Sys.file_exists (path base)
-
-let same_record left right =
-  same_finalize left.finalize right.finalize
-  && C_config.validator_set_hash left.validator_set
-     = C_config.validator_set_hash right.validator_set
-  &&
-  match left.bundle, right.bundle with
-  | None, None -> true
-  | Some left, Some right -> same_bundle left right
-  | _ -> false
 
 let committed_for ~chain_id ~entry base =
   match read_committed_validated ~chain_id ~entry base with

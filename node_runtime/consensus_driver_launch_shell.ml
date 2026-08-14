@@ -9,6 +9,15 @@ type runtime = {
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
+  finality_proof_needed : bool;
+  check_finality_proof :
+    Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    (unit, string) result;
+  on_finality_proof :
+    Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    bool Lwt.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   on_driver : Octra_consensus.C_driver.t -> unit;
   data_dir : string;
@@ -134,6 +143,11 @@ let run runtime =
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
     runtime.activate_validator_set;
+  Octra_consensus.C_driver.set_finality_proof_handler
+    driver
+    ~needed:runtime.finality_proof_needed
+    ~check:runtime.check_finality_proof
+    runtime.on_finality_proof;
   publish runtime.driver_ref runtime.on_driver driver;
   Consensus_health_wiring.launch_node_consensus_driver
     (health_runtime_of_node runtime)

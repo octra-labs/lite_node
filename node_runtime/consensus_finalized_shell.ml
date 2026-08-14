@@ -9,7 +9,11 @@ type 'driver deps = {
   prune_frozen : finalized_epoch:int64 -> unit;
   store_proposer : Flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
-  store_finalized : epoch:int -> C_types.finalize -> unit;
+  store_finalized :
+    epoch:int ->
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   remove_finalized : epoch:int -> unit;
   remove_proposer : epoch:int -> unit;
   committed_head_epoch : unit -> int;
@@ -28,7 +32,10 @@ type 'driver deps = {
     unit Lwt.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
-  apply_finalized : C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }
 
@@ -47,7 +54,8 @@ let remove_stashed deps epoch =
   deps.remove_finalized ~epoch;
   deps.remove_proposer ~epoch
 
-let record_finalized deps finalize (header : C_types.epoch_header) header_epoch =
+let record_finalized deps validator_set finalize (header : C_types.epoch_header)
+    header_epoch =
   deps.prune_frozen ~finalized_epoch:header.C_types.epoch_id;
   (match Flow.proposer_info
            ~epoch:header_epoch
@@ -58,7 +66,7 @@ let record_finalized deps finalize (header : C_types.epoch_header) header_epoch 
   (match Flow.expected_root header.C_types.proposed_state_root with
    | Some root -> deps.store_expected_root ~epoch:header_epoch ~root
    | None -> ());
-  deps.store_finalized ~epoch:header_epoch finalize
+  deps.store_finalized ~epoch:header_epoch ~validator_set finalize
 
 let run_catchup_plan deps header_epoch (header : C_types.epoch_header)
     (catchup : Flow.catchup_plan) driver_opt =
@@ -72,7 +80,7 @@ let run_catchup_plan deps header_epoch (header : C_types.epoch_header)
     deps.run_catchup_to_target driver ~target_epoch ~reason:catchup.reason
   | None -> Lwt.return_unit
 
-let run_stashed_plan deps finalize (header : C_types.epoch_header)
+let run_stashed_plan deps validator_set finalize (header : C_types.epoch_header)
     header_epoch phase =
   let open Lwt.Syntax in
   let phase_label = Flow.phase_label phase in
@@ -92,7 +100,7 @@ let run_stashed_plan deps finalize (header : C_types.epoch_header)
     Log.warn "consensus"
       "directly applying stashed finalized epoch = %d during %s (prev_root matches local HEAD)"
       header_epoch phase_label;
-    let* () = deps.apply_finalized finalize in
+    let* () = deps.apply_finalized ~validator_set finalize in
     deps.clear_quarantine clear_reason;
     Lwt.return_unit
   | Flow.Wait_stashed ->
@@ -100,10 +108,10 @@ let run_stashed_plan deps finalize (header : C_types.epoch_header)
   | Flow.Replay_stashed ->
     deps.replay_stashed_while_safe ~source:"on_finalized_quarantine"
 
-let handle deps finalize =
+let handle deps ~validator_set finalize =
   let header : C_types.epoch_header = finalize.C_types.header in
   let header_epoch = Int64.to_int header.C_types.epoch_id in
-  record_finalized deps finalize header header_epoch;
+  record_finalized deps validator_set finalize header header_epoch;
   let head = deps.committed_head_epoch () in
   let driver_opt = deps.driver () in
   let plan =
@@ -130,6 +138,6 @@ let handle deps finalize =
     deps.mark_quarantine no_driver.reason;
     Lwt.return_unit
   | Flow.Apply_now ->
-    deps.apply_finalized finalize
+    deps.apply_finalized ~validator_set finalize
   | Flow.Stash phase ->
-    run_stashed_plan deps finalize header header_epoch phase
+    run_stashed_plan deps validator_set finalize header header_epoch phase

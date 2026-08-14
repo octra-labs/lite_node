@@ -454,8 +454,6 @@ def report_ready(values, wallet, snapshot):
         return 0
     if member["active"]:
         reason = snapshot.get("voting_reason")
-        if reason == "not_ready":
-            return None
         if isinstance(reason, str):
             emit(status="voting_disabled", reason=reason, **common)
             return 4

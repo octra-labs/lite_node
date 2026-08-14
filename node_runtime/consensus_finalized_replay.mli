@@ -7,9 +7,14 @@ type deps = {
   current_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
-  find_finalized : int -> C_types.finalize option;
+  find_finalized :
+    int ->
+    (C_types.finalize * C_types.validator_set) option;
   read_local_root_raw : unit -> string Lwt.t;
-  apply_finalized : C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
 }
 
 type node_deps = {
@@ -18,7 +23,10 @@ type node_deps = {
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;
   read_local_root_raw : unit -> string Lwt.t;
-  apply_finalized : C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
 }
 
 type runner = {

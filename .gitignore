@@ -14,3 +14,4 @@ runtime_data/
 *.log
 *.pyc
 *.wasm
+.DS_Store

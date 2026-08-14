@@ -20,6 +20,7 @@ type deps = {
   write_finality : Octra_consensus.C_types.finalize -> unit;
   store_finalized :
     epoch:int ->
+    validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->
     unit;
   store_proposer : Consensus_finalized_flow.proposer_info -> unit;

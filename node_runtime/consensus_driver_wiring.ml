@@ -184,7 +184,10 @@ type deps = {
     reason:string ->
     unit Lwt.t;
   set_catchup_active : bool -> unit;
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
   driver_read_deps : Consensus_driver_read.deps;
   scheduled_validator_set_config :
@@ -241,7 +244,10 @@ type config_with_standard_input = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
   driver_read_deps : Consensus_driver_read.deps;
   scheduled_validator_set_config :
@@ -298,7 +304,10 @@ type node_driver_config_runtime = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
   driver_read_deps : Consensus_driver_read.deps;
   scheduled_validator_set_config :
@@ -658,7 +667,7 @@ let finalized_deps (deps : deps) =
         ~finalized_epoch);
     store_proposer = deps.finality.store_flow_proposer;
     store_expected_root = deps.finality.store_expected_root;
-    store_finalized = deps.finality.store_finalized;
+    store_finalized = deps.finality.store_finalized_with_set;
     remove_finalized = deps.finality.remove_finalized;
     remove_proposer = deps.finality.remove_proposer;
     committed_head_epoch = deps.committed_head_epoch;
@@ -728,8 +737,11 @@ let config (deps : deps) =
         ~chain_id:deps.chain_id
         propose);
     verify_parent_commit = deps.verify_parent_commit;
-    on_finalized = (fun finalize ->
-      Consensus_finalized_shell.handle (finalized_deps deps) finalize);
+    on_finalized = (fun ~validator_set finalize ->
+      Consensus_finalized_shell.handle
+        (finalized_deps deps)
+        ~validator_set
+        finalize);
     make_proposal = (fun epoch_id ->
       Consensus_proposal.make_proposal
         (make_proposal_deps deps)

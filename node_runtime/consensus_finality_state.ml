@@ -3,14 +3,25 @@
 
 type t = {
   finalized : (int, Octra_consensus.C_types.finalize) Hashtbl.t;
+  finalized_sets :
+    (int, Octra_consensus.C_types.validator_set) Hashtbl.t;
   proposers : (int, Octra_core.Epochlog.proposer_info) Hashtbl.t;
   expected_roots : (int, string) Hashtbl.t;
 }
 
 type callbacks = {
   find_finalized : int -> Octra_consensus.C_types.finalize option;
+  find_finalized_with_set :
+    int ->
+    (Octra_consensus.C_types.finalize
+     * Octra_consensus.C_types.validator_set) option;
   has_finalized : int -> bool;
   store_finalized : epoch:int -> Octra_consensus.C_types.finalize -> unit;
+  store_finalized_with_set :
+    epoch:int ->
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit;
   store_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   store_flow_proposer : Consensus_finalized_flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
@@ -21,6 +32,7 @@ type callbacks = {
 
 let create () = {
   finalized = Hashtbl.create 16;
+  finalized_sets = Hashtbl.create 16;
   proposers = Hashtbl.create 16;
   expected_roots = Hashtbl.create 16;
 }
@@ -28,14 +40,32 @@ let create () = {
 let find_finalized t epoch =
   Hashtbl.find_opt t.finalized epoch
 
+let find_finalized_with_set t epoch =
+  match
+    Hashtbl.find_opt t.finalized epoch,
+    Hashtbl.find_opt t.finalized_sets epoch
+  with
+  | Some finalize, Some validator_set -> Some (finalize, validator_set)
+  | Some _, None
+  | None, Some _ ->
+    None
+  | None, None ->
+    None
+
 let has_finalized t epoch =
   Hashtbl.mem t.finalized epoch
 
 let store_finalized t epoch finalize =
-  Hashtbl.replace t.finalized epoch finalize
+  Hashtbl.replace t.finalized epoch finalize;
+  Hashtbl.remove t.finalized_sets epoch
+
+let store_finalized_with_set t epoch validator_set finalize =
+  Hashtbl.replace t.finalized epoch finalize;
+  Hashtbl.replace t.finalized_sets epoch validator_set
 
 let remove_finalized t epoch =
-  Hashtbl.remove t.finalized epoch
+  Hashtbl.remove t.finalized epoch;
+  Hashtbl.remove t.finalized_sets epoch
 
 let find_proposer t epoch =
   Hashtbl.find_opt t.proposers epoch
@@ -82,15 +112,19 @@ let prune_after table epoch =
 
 let prune_after_epoch t epoch =
   prune_after t.finalized epoch;
+  prune_after t.finalized_sets epoch;
   prune_after t.proposers epoch;
   prune_after t.expected_roots epoch
 
 let callbacks t =
   {
     find_finalized = find_finalized t;
+    find_finalized_with_set = find_finalized_with_set t;
     has_finalized = has_finalized t;
     store_finalized = (fun ~epoch finalize ->
       store_finalized t epoch finalize);
+    store_finalized_with_set = (fun ~epoch ~validator_set finalize ->
+      store_finalized_with_set t epoch validator_set finalize);
     store_proposer = store_proposer t;
     store_flow_proposer = store_flow_proposer t;
     store_expected_root = (fun ~epoch ~root ->

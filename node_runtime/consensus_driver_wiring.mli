@@ -182,7 +182,10 @@ type deps = {
     reason:string ->
     unit Lwt.t;
   set_catchup_active : bool -> unit;
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
   driver_read_deps : Consensus_driver_read.deps;
   scheduled_validator_set_config :
@@ -239,7 +242,10 @@ type config_with_standard_input = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
   driver_read_deps : Consensus_driver_read.deps;
   scheduled_validator_set_config :
@@ -296,7 +302,10 @@ type node_driver_config_runtime = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
   driver_read_deps : Consensus_driver_read.deps;
   scheduled_validator_set_config :

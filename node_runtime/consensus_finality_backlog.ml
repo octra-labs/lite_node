@@ -14,7 +14,11 @@ type outcome =
 type deps = {
   read_backlog : unit -> (Journal.record list, string) result;
   write_finality : C_types.finalize -> unit;
-  store_finalized : epoch:int -> C_types.finalize -> unit;
+  store_finalized :
+    epoch:int ->
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   store_proposer : Flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
   store_bundle :
@@ -39,7 +43,10 @@ let stage deps record =
   let finalize = record.Journal.finalize in
   let epoch = Int64.to_int finalize.C_types.epoch_id in
   deps.write_finality finalize;
-  deps.store_finalized ~epoch finalize;
+  deps.store_finalized
+    ~epoch
+    ~validator_set:record.Journal.validator_set
+    finalize;
   (match
      Flow.proposer_info
        ~epoch

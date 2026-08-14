@@ -7,7 +7,11 @@ type 'driver deps = {
   prune_frozen : finalized_epoch:int64 -> unit;
   store_proposer : Consensus_finalized_flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
-  store_finalized : epoch:int -> C_types.finalize -> unit;
+  store_finalized :
+    epoch:int ->
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   remove_finalized : epoch:int -> unit;
   remove_proposer : epoch:int -> unit;
   committed_head_epoch : unit -> int;
@@ -26,8 +30,15 @@ type 'driver deps = {
     unit Lwt.t;
   mark_quarantine : string -> unit;
   clear_quarantine : string -> unit;
-  apply_finalized : C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }
 
-val handle : 'driver deps -> C_types.finalize -> unit Lwt.t
+val handle :
+  'driver deps ->
+  validator_set:C_types.validator_set ->
+  C_types.finalize ->
+  unit Lwt.t

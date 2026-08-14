@@ -8,9 +8,14 @@ type deps = {
   current_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
-  find_finalized : int -> C_types.finalize option;
+  find_finalized :
+    int ->
+    (C_types.finalize * C_types.validator_set) option;
   read_local_root_raw : unit -> string Lwt.t;
-  apply_finalized : C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
 }
 
 type node_deps = {
@@ -19,7 +24,10 @@ type node_deps = {
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;
   read_local_root_raw : unit -> string Lwt.t;
-  apply_finalized : C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit Lwt.t;
 }
 
 type runner = {
@@ -37,9 +45,9 @@ let rec drain (deps : deps) =
   let open Lwt.Syntax in
   let epoch = deps.current_epoch () in
   match deps.find_finalized epoch with
-  | Some finalize ->
+  | Some (finalize, validator_set) ->
     Log.info "consensus" "replaying stashed finalized epoch = %d reason = drain" epoch;
-    let* () = deps.apply_finalized finalize in
+    let* () = deps.apply_finalized ~validator_set finalize in
     drain deps
   | None -> Lwt.return_unit
 
@@ -51,7 +59,7 @@ let rec replay_while_safe (deps : deps) ~source =
     let epoch = deps.current_epoch () in
     match deps.find_finalized epoch with
     | None -> Lwt.return_unit
-    | Some finalize ->
+    | Some (finalize, validator_set) ->
       let header = finalize.C_types.header in
       let* local_root = deps.read_local_root_raw () in
       if header.prev_state_root <> local_root then begin
@@ -64,7 +72,7 @@ let rec replay_while_safe (deps : deps) ~source =
         Log.warn "consensus"
           "quarantine replay applying stashed finalized epoch = %d source = %s"
           epoch source;
-        let* () = deps.apply_finalized finalize in
+        let* () = deps.apply_finalized ~validator_set finalize in
         replay_while_safe deps ~source
       end
 
@@ -73,7 +81,7 @@ let node_deps (deps : node_deps) =
     current_epoch = deps.current_epoch;
     catchup_active = deps.catchup_active;
     quarantine_active = deps.quarantine_active;
-    find_finalized = deps.finality.find_finalized;
+    find_finalized = deps.finality.find_finalized_with_set;
     read_local_root_raw = deps.read_local_root_raw;
     apply_finalized = deps.apply_finalized;
   }

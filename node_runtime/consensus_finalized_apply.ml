@@ -11,7 +11,10 @@ module Log = Octra_log
 type deps = {
   check_finality : C_types.finalize -> unit;
   write_finality : C_types.finalize -> unit;
-  persist_finality_certificate : C_types.finalize -> unit;
+  persist_finality_certificate :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -43,7 +46,10 @@ type deps = {
 type node_deps = {
   check_finality : C_types.finalize -> unit;
   write_finality : C_types.finalize -> unit;
-  persist_finality_certificate : C_types.finalize -> unit;
+  persist_finality_certificate :
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -180,13 +186,13 @@ let rec await_bundle (deps : deps) header proposal_id delay remaining quarantine
         (if quarantined then remaining else remaining -. wait)
         quarantined
 
-let run (deps : deps) finalize =
+let run (deps : deps) ~validator_set finalize =
   let open Lwt.Syntax in
   let header = finalize.C_types.header in
   let round = finalize.C_types.commit_round in
   let proposal_id = C_hash.proposal_id header in
   deps.check_finality finalize;
-  deps.persist_finality_certificate finalize;
+  deps.persist_finality_certificate ~validator_set finalize;
   let bundle_persisted =
     persist_available_bundle deps finalize proposal_id
   in

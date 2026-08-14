@@ -21,6 +21,7 @@ type node_deps = {
   check_finality : Octra_consensus.C_types.finalize -> unit;
   write_finality : Octra_consensus.C_types.finalize -> unit;
   persist_finality_certificate :
+    validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->
     unit;
   persist_finality_bundle :
@@ -62,7 +63,6 @@ type node_deps = {
 
 type node_runtime = {
   data_dir : string;
-  validator_set : unit -> Octra_consensus.C_types.validator_set;
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
   proposal_state : Consensus_proposal_state.t;
@@ -82,7 +82,10 @@ type node_runtime = {
 }
 
 type t = {
-  apply_finalized : Octra_consensus.C_types.finalize -> unit Lwt.t;
+  apply_finalized :
+    validator_set:Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize ->
+    unit Lwt.t;
   drain_pending : unit -> unit Lwt.t;
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }
@@ -90,12 +93,15 @@ type t = {
 let create_with_failure deps on_failure =
   let apply_deps = Consensus_finalized_apply.node_deps deps.apply in
   let active_apply = ref None in
-  let rec apply_finalized finalize =
+  let rec apply_finalized ~validator_set finalize =
     let epoch = finalize.Octra_consensus.C_types.epoch_id in
     let encoded = C_codec.encode_finalize finalize in
+    let validator_set_hash =
+      Octra_consensus.C_config.validator_set_hash validator_set
+    in
     match !active_apply with
-    | Some (active_epoch, active_encoded, pending) ->
-      if encoded = active_encoded then begin
+    | Some (active_epoch, active_encoded, active_set_hash, pending) ->
+      if encoded = active_encoded && validator_set_hash = active_set_hash then begin
         Log.info "consensus"
           "event = finalized_apply_join epoch = %Ld"
           epoch;
@@ -105,15 +111,16 @@ let create_with_failure deps on_failure =
       else
         let open Lwt.Syntax in
         let* () = pending in
-        apply_finalized finalize
+        apply_finalized ~validator_set finalize
     | None ->
       let pending, resolver = Lwt.wait () in
-      active_apply := Some (epoch, encoded, pending);
+      active_apply := Some (epoch, encoded, validator_set_hash, pending);
       let running =
         Lwt.catch
           (fun () ->
             Consensus_finalized_apply.run
               apply_deps
+              ~validator_set
               finalize)
           (on_failure finalize)
       in
@@ -225,10 +232,10 @@ let node_deps_of_runtime runtime =
     write_finality = (fun finalize ->
       Octra_consensus.Finality_log.write runtime.data_dir
         (Octra_consensus.Finality_log.of_finalize finalize));
-    persist_finality_certificate = (fun finalize ->
+    persist_finality_certificate = (fun ~validator_set finalize ->
       Consensus_finality_journal.persist_certificate
         runtime.data_dir
-        ~validator_set:(runtime.validator_set ())
+        ~validator_set
         finalize);
     persist_finality_bundle = (fun finalize bundle ->
       Consensus_finality_journal.persist_bundle

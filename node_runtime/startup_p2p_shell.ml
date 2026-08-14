@@ -307,6 +307,18 @@ let same_validator_set left right =
     (Octra_consensus.C_config.validator_set_hash left)
     (Octra_consensus.C_config.validator_set_hash right)
 
+let same_scheduled
+    (left : Octra_consensus.C_driver.scheduled_validator_set_config option)
+    (right : Octra_consensus.C_driver.scheduled_validator_set_config option) =
+  match left, right with
+  | None, None -> true
+  | Some left, Some right ->
+    Int64.equal left.activate_epoch right.activate_epoch
+    && String.equal left.fingerprint right.fingerprint
+    && same_validator_set left.validator_set right.validator_set
+  | None, Some _
+  | Some _, None -> false
+
 let runtime_config_hash runtime view active scheduled =
   if runtime.consensus_mode then
     Octra_consensus.C_config.hash
@@ -372,14 +384,18 @@ let start_node runtime =
         | None -> Lwt.return_none
         | Some config ->
           let next =
-            if same_validator_set !active config.validator_set then
+            if same_validator_set !active config.validator_set
+               && Int64.compare config.activate_epoch (runtime.current_height ()) <= 0 then
               None
             else
               Some config
           in
-          let* () = install next in
+          let* () =
+            if same_scheduled !scheduled next then Lwt.return_unit
+            else install next
+          in
           Lwt.return next);
-      activate_validator_set = (fun validator_set _ ->
+      activate_validator_set = (fun validator_set fingerprint ->
         let next =
           match !scheduled with
           | Some config when
@@ -388,7 +404,8 @@ let start_node runtime =
                 (Octra_consensus.C_types.validator_set_for_epoch
                    ~chain_id:runtime.chain_id
                    ~epoch_id:config.activate_epoch
-                   config.validator_set) ->
+                   config.validator_set)
+              && String.equal fingerprint config.fingerprint ->
             None
           | current -> current
         in

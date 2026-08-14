@@ -23,7 +23,11 @@ type deps = {
   root_at_epoch : int -> string option;
   current_root : unit -> string option;
   write_finality : C_types.finalize -> unit;
-  store_finalized : epoch:int -> C_types.finalize -> unit;
+  store_finalized :
+    epoch:int ->
+    validator_set:C_types.validator_set ->
+    C_types.finalize ->
+    unit;
   store_proposer : Flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
   store_bundle :
@@ -138,7 +142,10 @@ let arm deps record target =
   | Ok (Some _) ->
     try
       deps.write_finality finalize;
-      deps.store_finalized ~epoch:target finalize;
+      deps.store_finalized
+        ~epoch:target
+        ~validator_set:record.Journal.validator_set
+        finalize;
       (match
          Flow.proposer_info
            ~epoch:target
