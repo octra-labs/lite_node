@@ -14,6 +14,7 @@ let max_wire_bytes = 512
 let max_epoch_files = 4_096
 let max_floor_bytes = 32
 let max_round_mark_bytes = 64
+let staged_serial = ref 0
 
 let disk ~data_dir =
   Disk (Filename.concat data_dir "vote_log")
@@ -212,48 +213,47 @@ let rec write_all fd wire offset =
     write_all fd wire (offset + written)
   end
 
-let write_floor path value =
-  let record = floor_path path in
-  let staged = record ^ "." ^ Int64.to_string value ^ ".staged" in
-  let wire = Int64.to_string value ^ "\n" in
-  try
-    let fd =
-      Unix.openfile staged
-        [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
-        0o600
+let rec open_staged record attempt =
+  if attempt >= 1024 then
+    Error "vote log staged record limit exceeded"
+  else
+    let serial = !staged_serial in
+    incr staged_serial;
+    let staged =
+      record ^ "." ^ string_of_int (Unix.getpid ()) ^ "."
+      ^ string_of_int serial ^ ".staged"
     in
+    try
+      Ok (staged,
+          Unix.openfile staged
+            [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
+            0o600)
+    with
+    | Unix.Unix_error (Unix.EEXIST, _, _) ->
+      open_staged record (attempt + 1)
+    | exn -> Error (error exn)
+
+let publish_record path record wire =
+  let* staged, fd = open_staged record 0 in
+  let renamed = ref false in
+  try
     Fun.protect
       ~finally:(fun () -> Unix.close fd)
       (fun () ->
         write_all fd wire 0;
         Unix.fsync fd);
     Unix.rename staged record;
+    renamed := true;
     sync_directory path
   with exn ->
+    if not !renamed then (try Unix.unlink staged with _ -> ());
     Error (error exn)
 
+let write_floor path value =
+  publish_record path (floor_path path) (Int64.to_string value ^ "\n")
+
 let write_round_mark path epoch_id round =
-  let record = round_mark_path path in
-  let staged =
-    record ^ "." ^ Int64.to_string epoch_id ^ "." ^ string_of_int round
-    ^ ".staged"
-  in
-  let wire = round_mark_wire epoch_id round in
-  try
-    let fd =
-      Unix.openfile staged
-        [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
-        0o600
-    in
-    Fun.protect
-      ~finally:(fun () -> Unix.close fd)
-      (fun () ->
-        write_all fd wire 0;
-        Unix.fsync fd);
-    Unix.rename staged record;
-    sync_directory path
-  with exn ->
-    Error (error exn)
+  publish_record path (round_mark_path path) (round_mark_wire epoch_id round)
 
 let set_floor store ~through_epoch =
   match store with

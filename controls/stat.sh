@@ -6,6 +6,11 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CONFIG=${OCTRA_OPERATOR_CONFIG:-"$ROOT/.keys/validator/node.env"}
 
+if [ "${1:-}" = "--config" ]; then
+  CONFIG=${2:-}
+  shift 2
+fi
+
 if [ ! -f "$CONFIG" ]; then
   printf 'status = unavailable reason = configuration_missing path = %s\n' "$CONFIG" >&2
   exit 1

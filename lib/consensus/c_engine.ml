@@ -11,8 +11,10 @@ let leader_of = C_types.leader_of
 let max_round_ahead = 64
 let max_sync_ahead = 1024
 let round_history_limit = 64
+let sync_history_limit = max_sync_ahead
 let max_timeout_ms = 120_000
 let max_propose_timeout_ms = 300_000
+let timeout_round_cap = 8
 
 let short_hex_raw s =
   let hex = Digestif.SHA256.to_hex (Digestif.SHA256.of_raw_string s) in
@@ -169,10 +171,11 @@ let timeout_ms_with ~round ~step ~base ~propose ~per_round =
     | PrevoteStep
     | PrecommitStep -> base, max_timeout_ms
   in
+  let span = min (max 0 round) timeout_round_cap in
   let raw =
     Int64.add
       (Int64.of_int step_base)
-      (Int64.mul (Int64.of_int round) (Int64.of_int per_round))
+      (Int64.mul (Int64.of_int span) (Int64.of_int per_round))
   in
   Int64.to_int (Int64.min (Int64.of_int cap) raw)
 

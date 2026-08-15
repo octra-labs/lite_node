@@ -29,7 +29,7 @@ let epoch_tags ~tags ~keep_epochs =
 
 let consensus_peer_states
     ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers
-    ~round_agreed =
+    ~round_votes ~round_agreed =
   let diag_json, score_rows = Rpc_view.peer_diag diag ~now in
   match peer_records with
   | None ->
@@ -39,6 +39,7 @@ let consensus_peer_states
       ~voting_reason
       ~round_state
       ~round_peers
+      ~round_votes
       ~round_agreed
       ~peers:[]
       ~scores:score_rows
@@ -57,6 +58,7 @@ let consensus_peer_states
       ~voting_reason
       ~round_state
       ~round_peers
+      ~round_votes
       ~round_agreed
       ~peers
       ~scores:score_rows

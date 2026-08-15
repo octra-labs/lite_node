@@ -844,8 +844,23 @@ let consensus_round_peer ~now (row : Octra_consensus.C_driver.round_peer_record)
     "age_sec", `Float (max 0.0 (now -. row.last_seen));
   ]
 
+let consensus_tally (row : Octra_consensus.C_driver.round_tally) =
+  `Assoc [
+    "proposal_id", `String (raw_to_hex row.proposal_id);
+    "voters", `Int row.voters;
+    "weight", `String (Z.to_string row.weight);
+  ]
+
+let consensus_votes (rows : Octra_consensus.C_driver.round_votes) =
+  `Assoc [
+    "prevotes", `List (List.map consensus_tally rows.prevotes);
+    "precommits", `List (List.map consensus_tally rows.precommits);
+    "quorum", `Int rows.quorum;
+    "quorum_weight", `String (Z.to_string rows.quorum_weight);
+  ]
+
 let consensus_peer_states
-    ~enabled ~voting ~voting_reason ~round_state ~round_peers ~round_agreed
+    ~enabled ~voting ~voting_reason ~round_state ~round_peers ~round_votes ~round_agreed
     ~peers ~scores ~diag =
   `Assoc [
     "enabled", `Bool enabled;
@@ -856,6 +871,10 @@ let consensus_peer_states
        | Some state -> consensus_round state
        | None -> `Null);
     "round_peers", `List round_peers;
+    "round_votes",
+      (match round_votes with
+       | Some rows -> consensus_votes rows
+       | None -> `Null);
     "round_agreed", `Bool round_agreed;
     "peers", `List peers;
     "scores", `List scores;

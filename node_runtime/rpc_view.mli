@@ -353,12 +353,21 @@ val consensus_round_peer :
   Octra_consensus.C_driver.round_peer_record ->
   Yojson.Safe.t
 
+val consensus_tally :
+  Octra_consensus.C_driver.round_tally ->
+  Yojson.Safe.t
+
+val consensus_votes :
+  Octra_consensus.C_driver.round_votes ->
+  Yojson.Safe.t
+
 val consensus_peer_states :
   enabled:bool ->
   voting:bool ->
   voting_reason:string option ->
   round_state:Octra_consensus.C_driver.round_state option ->
   round_peers:Yojson.Safe.t list ->
+  round_votes:Octra_consensus.C_driver.round_votes option ->
   round_agreed:bool ->
   peers:Yojson.Safe.t list ->
   scores:Yojson.Safe.t list ->

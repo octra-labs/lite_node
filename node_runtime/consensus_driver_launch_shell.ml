@@ -126,6 +126,7 @@ let create_driver runtime =
     ~validator_set:runtime.validator_set
     ~swarm:runtime.swarm
     ~start_height:runtime.start_height
+    ~sync_log:(Octra_consensus.C_sync_log.disk ~data_dir:runtime.data_dir)
     ~vote_log:(Octra_consensus.C_vote_log.disk ~data_dir:runtime.data_dir)
 
 let publish slot on_driver driver =

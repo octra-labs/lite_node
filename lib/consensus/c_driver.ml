@@ -208,6 +208,17 @@ type round_sync_reply = {
   sent_at : int64;
 }
 
+type round_fetch_reply = {
+  sent_at : int64;
+}
+
+type past_round = {
+  epoch_id : int64;
+  target : int;
+  sent_at : int64;
+  tries : int;
+}
+
 type vote_fault = {
   epoch_id : int64;
   round : int;
@@ -233,9 +244,11 @@ type t = {
   vote_evidence : (string, C_evidence.vote_conflict) Hashtbl.t;
   activated_validator_set_fingerprints : (string, bool) Hashtbl.t;
   mutable plan_seen : bool;
+  mutable plan_mark : (int64 * string) option;
   pending_votes : (string, C_types.vote) Hashtbl.t;
   future_votes : (string, C_types.vote) Hashtbl.t;
   vote_log : C_vote_log.t;
+  sync_log : C_sync_log.t;
   mutable vote_log_issue : string option;
   mutable vote_fault : vote_fault option;
   durable_votes : (string, C_types.vote) Hashtbl.t;
@@ -243,6 +256,8 @@ type t = {
   pending_proposals : (string, C_types.propose) Hashtbl.t;
   deferred_proposals : (string, C_types.propose) Hashtbl.t;
   round_sync_replies : (string, round_sync_reply) Hashtbl.t;
+  round_fetch_replies : (string, round_fetch_reply) Hashtbl.t;
+  mutable past_round : past_round option;
   round_pool : C_round_pool.t;
   finality_query_requests : (string, int64) Hashtbl.t;
   finality_proof_requests : (string, int64) Hashtbl.t;
@@ -393,7 +408,7 @@ let catchup_response_in_window window records =
          catchup_epoch_in_window window record.epoch_id)
        records
 
-let create ~config ~validator_set ~swarm ~start_height ~vote_log =
+let create ~config ~validator_set ~swarm ~start_height ~sync_log ~vote_log =
   let finality_proof_needed = ref false in
   let can_vote () =
     config.can_vote () && not !finality_proof_needed
@@ -424,9 +439,11 @@ let create ~config ~validator_set ~swarm ~start_height ~vote_log =
     vote_evidence = Hashtbl.create 16;
     activated_validator_set_fingerprints = Hashtbl.create 8;
     plan_seen = false;
+    plan_mark = None;
     pending_votes = Hashtbl.create 16;
     future_votes = Hashtbl.create 32;
     vote_log;
+    sync_log;
     vote_log_issue = None;
     vote_fault = None;
     durable_votes = Hashtbl.create 16;
@@ -434,6 +451,8 @@ let create ~config ~validator_set ~swarm ~start_height ~vote_log =
     pending_proposals = Hashtbl.create 8;
     deferred_proposals = Hashtbl.create 16;
     round_sync_replies = Hashtbl.create 16;
+    round_fetch_replies = Hashtbl.create 16;
+    past_round = None;
     round_pool = C_round_pool.create ();
     finality_query_requests = Hashtbl.create 4;
     finality_proof_requests = Hashtbl.create 4;
@@ -532,6 +551,7 @@ let repeatable_query_frame (frame : Frame.frame) =
    &&
    try (C_codec.decode_round_sync frame.payload).request
    with _ -> false)
+  || frame.msg_type = Frame.msg_cons_round_fetch
   || frame.msg_type = Frame.msg_query_epoch_root
   || frame.msg_type = Frame.msg_epoch_root_response
   || frame.msg_type = Frame.msg_query_bundle
@@ -1117,16 +1137,74 @@ let round_sync_frame sync =
     payload = C_codec.encode_round_sync sync;
   }
 
+let round_fetch_frame fetch =
+  {
+    Frame.msg_type = Frame.msg_cons_round_fetch;
+    payload = C_codec.encode_round_fetch fetch;
+  }
+
+let local_round_sync_valid t sync =
+  match C_types.pubkey_of_addr t.engine.vs t.config.my_addr with
+  | Some pubkey -> C_hash.verify_round_sync ~pubkey_raw:pubkey sync
+  | None -> false
+
+let save_round_sync t sync =
+  if sync.C_codec.request then begin
+    C_round_pool.add_local t.round_pool sync;
+    Some sync
+  end else
+    match
+      C_sync_log.keep
+        t.sync_log
+        ~verify:(local_round_sync_valid t)
+        sync
+    with
+    | Ok saved ->
+      C_round_pool.add_local t.round_pool saved;
+      Some saved
+    | Error reason ->
+      warn_node t.config.my_addr
+        "event = round_sync_store_failed epoch = %Ld round = %d reason = %s"
+        sync.epoch_id
+        sync.round
+        reason;
+      None
+
+let load_round_sync t =
+  if not (local_validator t) then ()
+  else
+    match
+      C_sync_log.load
+        t.sync_log
+        ~chain_id:t.config.chain_id
+        ~validator:t.config.my_addr
+        ~epoch_id:t.engine.state.height
+        ~verify:(local_round_sync_valid t)
+    with
+    | Ok syncs ->
+      List.iter (C_round_pool.add_local t.round_pool) syncs;
+      if syncs <> [] then
+        log_node t.config.my_addr
+          "event = round_sync_load epoch = %Ld count = %d"
+          t.engine.state.height
+          (List.length syncs)
+    | Error reason ->
+      warn_node t.config.my_addr
+        "event = round_sync_load_failed epoch = %Ld reason = %s"
+        t.engine.state.height
+        reason
+
 let broadcast_round_sync t ~request =
   if not (local_validator t)
      || (not request && not (vote_allowed t)) then
     Lwt.return_unit
   else begin
-    let sync = make_round_sync t ~request in
-    C_round_pool.add t.round_pool sync;
-    Octra_net.P2p_swarm.broadcast
-      t.swarm
-      (round_sync_frame sync)
+    match save_round_sync t (make_round_sync t ~request) with
+    | Some sync ->
+      Octra_net.P2p_swarm.broadcast
+        t.swarm
+        (round_sync_frame sync)
+    | None -> Lwt.return_unit
   end
 
 let round_sync_request_for_step = function
@@ -1146,6 +1224,80 @@ let broadcast_round_sync_at t ~round =
             ~round
             ~step:C_types.PrevoteStep
             ~request:true))
+
+let broadcast_round_fetch t fetch =
+  if not (local_validator t) then Lwt.return_unit
+  else Octra_net.P2p_swarm.broadcast t.swarm (round_fetch_frame fetch)
+
+let round_peer_gap = 2
+let round_peer_age = 30.0
+
+let next_past_round ~height ~round ~limit ~(prior : past_round option) ~now =
+  match prior with
+  | Some prior
+    when Int64.equal prior.epoch_id height
+      && Int64.compare (Int64.sub now prior.sent_at) 5_000_000_000L < 0 ->
+    None
+  | Some prior
+    when Int64.equal prior.epoch_id height
+      && prior.tries = 0
+      && round < prior.target ->
+    Some (prior.target, 1)
+  | Some prior when Int64.equal prior.epoch_id height ->
+    let base = max round prior.target in
+    Some (min limit (base + C_engine.round_history_limit), 0)
+  | Some _
+  | None ->
+    Some (min limit (round + C_engine.round_history_limit), 0)
+
+let past_round_target t ~limit now =
+  next_past_round
+    ~height:t.engine.state.height
+    ~round:t.engine.state.round
+    ~limit
+    ~prior:t.past_round
+    ~now
+
+let ask_past t =
+  let state = t.engine.state in
+  let gap = C_engine.round_history_limit / 2 in
+  let now = Unix.gettimeofday () in
+  let ahead =
+    Hashtbl.fold
+      (fun _ (peer : round_peer_record) found ->
+        if Int64.equal peer.epoch_id state.height
+           && peer.round >= state.round + gap
+           && now -. peer.last_seen >= 0.0
+           && now -. peer.last_seen <= round_peer_age
+        then Some (max peer.round (Option.value ~default:0 found))
+        else found)
+      t.round_peers
+      None
+  in
+  match ahead with
+  | None -> Lwt.return_unit
+  | Some peer ->
+    let sent_at = Mtime_clock.elapsed_ns () in
+    let limit = min peer (state.round + C_engine.max_sync_ahead) in
+    (match past_round_target t ~limit sent_at with
+     | None -> Lwt.return_unit
+     | Some (target, tries) ->
+       let after = max state.round (target - C_engine.round_history_limit) in
+       if after >= target then Lwt.return_unit
+       else begin
+         t.past_round <- Some { epoch_id = state.height; target; sent_at; tries };
+         log_node t.config.my_addr
+           "event = round_fetch epoch = %Ld after = %d through = %d"
+           state.height
+           after
+           target;
+         broadcast_round_fetch t C_codec.{
+           chain_id = t.config.chain_id;
+           epoch_id = state.height;
+           after_round = after;
+           through_round = target;
+         }
+       end)
 
 let proposal_fetch_attempts = 4
 let proposal_fetch_interval = 1.05
@@ -1311,20 +1463,35 @@ let send_round_vote_to t conn (vote : C_types.vote) =
 
 let send_round_sync_response t conn ~requested_round ~with_witness =
   let open Lwt.Syntax in
-  let local_sync =
+  let current_sync =
     if local_validator t && vote_allowed t then
-      Some (make_round_sync t ~request:false)
+      save_round_sync t (make_round_sync t ~request:false)
     else
       None
   in
-  Option.iter (C_round_pool.add t.round_pool) local_sync;
+  let compat_sync =
+    C_round_pool.sent_reply
+      t.round_pool
+      ~epoch_id:t.engine.state.height
+      ~after_round:requested_round
+      ~through_round:(requested_round + C_engine.max_round_ahead)
+  in
   let* () =
-    match local_sync with
+    match current_sync with
     | Some sync ->
       Octra_net.P2p_conn.send
         conn
         (round_sync_frame sync)
     | None -> Lwt.return_unit
+  in
+  let* () =
+    match current_sync, compat_sync with
+    | Some current, Some compat when current = compat -> Lwt.return_unit
+    | _, Some sync ->
+      Octra_net.P2p_conn.send
+        conn
+        (round_sync_frame sync)
+    | _, None -> Lwt.return_unit
   in
   let witness =
     if with_witness then
@@ -1333,6 +1500,7 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
         ~chain_id:t.config.chain_id
         ~epoch_id:t.engine.state.height
         ~after_round:requested_round
+        ~through_round:(requested_round + C_engine.max_sync_ahead)
         ~validator_set:t.engine.vs
       |> List.filter (fun sync -> sync.C_codec.validator <> t.config.my_addr)
     else
@@ -1369,9 +1537,6 @@ let round_step_rank = function
   | C_types.ProposeStep -> 1
   | C_types.PrevoteStep -> 2
   | C_types.PrecommitStep -> 3
-
-let round_peer_gap = 2
-let round_peer_age = 30.0
 
 let round_peer_later (peer : round_peer_record) (sync : C_codec.round_sync) =
   Int64.compare sync.C_codec.epoch_id peer.epoch_id > 0
@@ -1501,6 +1666,14 @@ let round_sync_source_matches t conn (sync : C_codec.round_sync) =
       conn.Octra_net.P2p_conn.peer_id
       (Octra_net.P2p_handshake.node_id_of_pubkey pubkey)
 
+let round_fetch_source_matches t conn =
+  List.exists
+    (fun (validator : C_types.validator_info) ->
+      String.equal
+        conn.Octra_net.P2p_conn.peer_id
+        (Octra_net.P2p_handshake.node_id_of_pubkey validator.pubkey))
+    t.engine.vs.validators
+
 let round_sync_response_due ~last ~now =
   match last with
   | None -> true
@@ -1518,7 +1691,7 @@ let round_sync_response_allowed_at t (sync : C_codec.round_sync) now =
   let prior = Hashtbl.find_opt t.round_sync_replies sync.validator in
   let due =
     round_sync_response_due
-      ~last:(Option.map (fun reply -> reply.sent_at) prior)
+      ~last:(Option.map (fun (reply : round_sync_reply) -> reply.sent_at) prior)
       ~now
   in
   let progresses =
@@ -1549,6 +1722,37 @@ let round_sync_response_allowed_at t (sync : C_codec.round_sync) now =
 
 let round_sync_response_allowed t sync =
   round_sync_response_allowed_at t sync (Mtime_clock.elapsed_ns ())
+
+let round_fetch_valid t (fetch : C_codec.round_fetch) =
+  let state = t.engine.state in
+  String.equal fetch.chain_id t.config.chain_id
+  && Int64.equal fetch.epoch_id state.height
+  && fetch.after_round >= max 0 (state.round - C_engine.sync_history_limit)
+  && fetch.after_round < fetch.through_round
+  && fetch.through_round <= state.round
+  && fetch.through_round - fetch.after_round <= C_engine.round_history_limit
+
+let round_fetch_response_allowed t conn =
+  let now = Mtime_clock.elapsed_ns () in
+  match Hashtbl.find_opt t.round_fetch_replies conn.Octra_net.P2p_conn.peer_id with
+  | Some prior
+    when Int64.compare (Int64.sub now prior.sent_at) 5_000_000_000L < 0 -> false
+  | None
+  | Some _ ->
+    Hashtbl.replace
+      t.round_fetch_replies
+      conn.Octra_net.P2p_conn.peer_id
+      { sent_at = now };
+    true
+
+let send_round_fetch_response t conn (fetch : C_codec.round_fetch) =
+  C_round_pool.sent_range
+    t.round_pool
+    ~epoch_id:fetch.C_codec.epoch_id
+    ~after_round:fetch.after_round
+    ~through_round:fetch.through_round
+  |> Lwt_list.iter_s (fun sync ->
+    Octra_net.P2p_conn.send conn (round_sync_frame sync))
 
 let flush_pending_votes t =
   if not (vote_allowed t) then Lwt.return_unit
@@ -1816,15 +2020,50 @@ let record_vote_conflict ~validator_set t prior vote =
       ~reason:"vote_equivocation";
     if remembered then Some evidence else None
 
+let accept_dynamic_plan t cfg =
+  match t.plan_mark with
+  | None ->
+    t.plan_mark <- Some (cfg.activate_epoch, cfg.fingerprint);
+    true
+  | Some (prior_epoch, prior_fingerprint) ->
+    let order = Int64.compare cfg.activate_epoch prior_epoch in
+    if order > 0 then begin
+      t.plan_mark <- Some (cfg.activate_epoch, cfg.fingerprint);
+      true
+    end
+    else if order = 0 && String.equal cfg.fingerprint prior_fingerprint then
+      true
+    else begin
+      error_node t.config.my_addr
+        "event = validator_set_plan_refused reason = regression activate_epoch = %Ld prior_epoch = %Ld"
+        cfg.activate_epoch
+        prior_epoch;
+      false
+    end
+
+let static_plan t =
+  match t.config.scheduled_validator_set_config with
+  | Some cfg when Int64.compare cfg.activate_epoch t.engine.state.height < 0 ->
+    t.plan_seen <- true;
+    error_node t.config.my_addr
+      "event = validator_set_plan_refused reason = stale_static activate_epoch = %Ld head = %Ld"
+      cfg.activate_epoch
+      t.engine.state.height;
+    None
+  | plan -> plan
+
 let load_validator_set_plan t =
   let open Lwt.Syntax in
   let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
   match dynamic_cfg with
-  | Some cfg ->
+  | Some cfg when accept_dynamic_plan t cfg ->
     t.plan_seen <- true;
     Lwt.return_some cfg
+  | Some _ ->
+    t.plan_seen <- true;
+    Lwt.return_none
   | None when t.plan_seen -> Lwt.return_none
-  | None -> Lwt.return t.config.scheduled_validator_set_config
+  | None -> Lwt.return (static_plan t)
 
 let validator_set_at ~chain_id ~current ~epoch plan =
   let source =
@@ -1865,9 +2104,15 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
       in
       let current_hash = C_config.validator_set_hash t.engine.vs in
       let target_hash = C_config.validator_set_hash validator_set in
-      if Hashtbl.mem t.activated_validator_set_fingerprints cfg.fingerprint
-         && String.equal current_hash target_hash then
+      if String.equal current_hash target_hash then
         Lwt.return_unit
+      else if Int64.compare cfg.activate_epoch t.engine.state.height < 0 then begin
+        error_node t.config.my_addr
+          "event = validator_set_activation_refused reason = stale_plan activate_epoch = %Ld head = %Ld"
+          cfg.activate_epoch
+          t.engine.state.height;
+        Lwt.return_unit
+      end
       else begin
       let* () =
         t.on_validator_set_activated
@@ -2501,9 +2746,12 @@ let rec process_outputs_once t =
                   end
                 in
                 fire ());
-              broadcast_round_sync
-                t
-                ~request:(round_sync_request_for_step step)
+              let* () =
+                broadcast_round_sync
+                  t
+                  ~request:(round_sync_request_for_step step)
+              in
+              if step = C_types.ProposeStep then ask_past t else Lwt.return_unit
             | C_engine.SendVote v ->
               if not (vote_still_relevant t v) then begin
                 log_node t.config.my_addr
@@ -2572,6 +2820,13 @@ let rec process_outputs_once t =
                      hold_vote_log t reason;
                      false)
               in
+              (match C_sync_log.prune t.sync_log ~through_epoch:epoch_id with
+               | Ok () -> ()
+               | Error reason ->
+                 warn_node t.config.my_addr
+                   "event = round_sync_prune_failed epoch = %Ld reason = %s"
+                   epoch_id
+                   reason);
               let* () =
                 maybe_activate_scheduled_validator_set
                   t
@@ -2756,6 +3011,26 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
     Lwt.return_unit
   else begin
     (match frame.msg_type with
+    | t' when t' = Frame.msg_cons_round_fetch ->
+      Lwt.catch
+        (fun () ->
+          let fetch = C_codec.decode_round_fetch frame.payload in
+          if not t.running
+             || not (local_validator t)
+             || not (round_fetch_source_matches t _conn)
+             || not (round_fetch_valid t fetch)
+             || not (round_fetch_response_allowed t _conn)
+          then Lwt.return_unit
+          else send_round_fetch_response t _conn fetch)
+        (fun exn ->
+          warn_node t.config.my_addr
+            "event = reject_round_fetch reason = invalid_frame detail = %s"
+            (Printexc.to_string exn);
+          Octra_net.P2p_swarm.report_bad_peer
+            t.swarm
+            _conn
+            ~reason:"invalid_frame_round_fetch";
+          Lwt.return_unit)
     | t' when t' = Frame.msg_cons_round_sync ->
       Lwt.catch
         (fun () ->
@@ -2808,7 +3083,10 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                 if not (round_sync_allowed ~current_round sync) then
                   Lwt.return_unit
                 else begin
-                  C_round_pool.add t.round_pool sync;
+                  C_round_pool.add_at
+                    t.round_pool
+                    ~current:current_round
+                    sync;
                   let* () =
                     if relay_candidate then
                       Octra_net.P2p_swarm.broadcast_except
@@ -4426,6 +4704,8 @@ let clear_local_transients t =
 let clear_height_local_state t =
   clear_local_transients t;
   t.proposal_wait <- None;
+  t.past_round <- None;
+  Hashtbl.clear t.round_fetch_replies;
   Hashtbl.clear t.durable_votes;
   Hashtbl.clear t.deferred_proposals
 
@@ -4454,6 +4734,7 @@ let start_height t height =
   let* () = maybe_activate_scheduled_validator_set t ~target_epoch:height in
   clear_height_local_state t;
   reset_height t height;
+  load_round_sync t;
   process_outputs t
 
 let restore_precommit_lock t proposal =
@@ -4510,14 +4791,16 @@ let start t =
     "event = start_consensus connected = %d validators = %d min = %d"
     (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
   let* () = Lwt_unix.sleep 3.0 in
+  let pristine = C_engine.is_pristine t.engine in
   let* () =
-    if C_engine.is_pristine t.engine then
+    if pristine then
       start_height t t.engine.state.height
     else
       maybe_activate_scheduled_validator_set
         t
         ~target_epoch:t.engine.state.height
   in
+  if not pristine then load_round_sync t;
   if !(t.finality_proof_needed) then
     Lwt.async (fun () ->
       recover_finality_proof t 0);

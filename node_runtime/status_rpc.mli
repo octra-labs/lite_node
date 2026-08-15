@@ -34,6 +34,7 @@ val consensus_peer_states :
   voting_reason:string option ->
   round_state:Octra_consensus.C_driver.round_state option ->
   round_peers:Yojson.Safe.t list ->
+  round_votes:Octra_consensus.C_driver.round_votes option ->
   round_agreed:bool ->
   Yojson.Safe.t
 

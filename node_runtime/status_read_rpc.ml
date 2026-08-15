@@ -149,10 +149,10 @@ let consensus_peer_states ~swarm ~driver_ref =
       Some (Octra_net.P2p_swarm.peer_diagnostics swarm)
   in
   let peer_records, voting, voting_reason, round_state, round_peers,
-      round_agreed =
+      round_votes, round_agreed =
     match !driver_ref with
     | None ->
-      None, false, Some "driver_unavailable", None, [], false
+      None, false, Some "driver_unavailable", None, [], None, false
     | Some driver ->
       let voting, voting_reason = Octra_consensus.C_driver.vote_state driver in
       let round_peers =
@@ -167,12 +167,13 @@ let consensus_peer_states ~swarm ~driver_ref =
       voting_reason,
       Some (Octra_consensus.C_driver.round_state driver),
       round_peers,
+      Some (Octra_consensus.C_driver.round_vote_snapshot driver),
       Octra_consensus.C_driver.round_agreed driver ~now
   in
   ok
     (Status_rpc.consensus_peer_states
        ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers
-       ~round_agreed)
+       ~round_votes ~round_agreed)
 
 let round_witness params ~driver_ref =
   match Octra_core.Rpc.require_address params 0 "validator" with

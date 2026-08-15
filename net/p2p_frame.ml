@@ -28,6 +28,7 @@ let msg_catchup_range_response_v2 = 0x3b
 let msg_resource_attestation = 0x3c
 let msg_vote_evidence = 0x3d
 let msg_cons_round_sync = 0x3e
+let msg_cons_round_fetch = 0x3f
 let msg_epoch_broadcast = 0x40
 let msg_resource_compute = 0x41
 
@@ -59,6 +60,7 @@ let known_msg_types = [
   msg_cons_finalize;
   msg_cons_timeout;
   msg_cons_round_sync;
+  msg_cons_round_fetch;
   msg_query_epoch_root;
   msg_epoch_root_response;
   msg_query_bundle;
@@ -143,6 +145,7 @@ let msg_type_name = function
   | 0x3c -> "RESOURCE_ATTESTATION"
   | 0x3d -> "VOTE_EVIDENCE"
   | 0x3e -> "CONS_ROUND_SYNC"
+  | 0x3f -> "CONS_ROUND_FETCH"
   | 0x40 -> "EPOCH_BROADCAST"
   | 0x41 -> "RESOURCE_COMPUTE"
   | n -> Printf.sprintf "UNKNOWN(0x%02x)" n

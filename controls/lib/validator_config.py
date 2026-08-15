@@ -86,7 +86,7 @@ def source_commit():
     return value
 
 def runtime_binding(config):
-    key_dir = ROOT / ".keys/validator"
+    key_dir = Path(config).expanduser().resolve().parent
     binding = {
         "OCTRA_BINARY_HASH": sha256_file(DEFAULT_BINARY),
         "OCTRA_SOURCE_COMMIT": source_commit() or "",
@@ -114,10 +114,10 @@ def require_runtime_files():
     if missing:
         raise ValidatorError("candidate files are missing: " + ",".join(missing))
 
-def require_network_binding(values):
+def require_network_binding(values, config):
     expected = values.get("OCTRA_OPERATOR_NETWORK_SHA256", "")
     packaged = ROOT / "config/network.env"
-    installed = ROOT / ".keys/validator/network.env"
+    installed = Path(config).expanduser().resolve().parent / "network.env"
     if not expected:
         raise ValidatorError("network hash is missing from node config")
     for path in (packaged, installed):
@@ -127,7 +127,7 @@ def require_network_binding(values):
 def require_runtime_binding(config):
     values = parse_env(config)
     require_runtime_files()
-    require_network_binding(values)
+    require_network_binding(values, config)
     expected = runtime_binding(config)
     stale = [key for key, value in expected.items() if values.get(key) != value]
     if stale:
@@ -139,7 +139,7 @@ def require_runtime_binding(config):
 def rebind_runtime(config):
     values = parse_env(config)
     require_runtime_files()
-    require_network_binding(values)
+    require_network_binding(values, config)
     write_env(config, {**values, **runtime_binding(config)})
     require_runtime_binding(config)
     emit(event="runtime_binding", status="ready", root=ROOT)

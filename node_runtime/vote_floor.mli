@@ -10,6 +10,24 @@ val check :
   round:int ->
   (int, string) result
 
+val staged :
+  data_dir:string ->
+  chain_id:string ->
+  validator:string ->
+  pubkey:string ->
+  through_epoch:int64 ->
+  round:int ->
+  (int, string) result
+
+val prepared :
+  data_dir:string ->
+  chain_id:string ->
+  validator:string ->
+  pubkey:string ->
+  through_epoch:int64 ->
+  round:int ->
+  (int, string) result
+
 val set :
   data_dir:string ->
   chain_id:string ->
