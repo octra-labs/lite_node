@@ -273,6 +273,7 @@ type t = {
   mutable proposal_retry : proposal_build option;
   mutable proposal_verify : proposal_build option;
   mutable proposal_wait : proposal_wait option;
+  mutable round_spread_warned_at : float;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable on_validator_set_activated :
     C_types.validator_set -> string -> unit Lwt.t;
@@ -467,6 +468,7 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~vote_log =
     proposal_retry = None;
     proposal_verify = None;
     proposal_wait = None;
+    round_spread_warned_at = 0.0;
     proposal_work_gate = C_proposal_work_gate.create ();
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
@@ -1231,6 +1233,8 @@ let broadcast_round_fetch t fetch =
 
 let round_peer_gap = 2
 let round_peer_age = 30.0
+let round_spread_limit = 100
+let round_spread_warn_interval = 60.0
 
 let next_past_round ~height ~round ~limit ~(prior : past_round option) ~now =
   match prior with
@@ -1538,6 +1542,63 @@ let round_step_rank = function
   | C_types.PrevoteStep -> 2
   | C_types.PrecommitStep -> 3
 
+let round_spread = function
+  | []
+  | [ _ ] -> 0
+  | rounds ->
+    let low = List.fold_left min max_int rounds in
+    let high = List.fold_left max min_int rounds in
+    high - low
+
+let round_spread_warning
+    ~now
+    ~last_warned_at
+    ~epoch_id
+    ~local_round
+    observations =
+  if now -. last_warned_at < round_spread_warn_interval then
+    None
+  else
+    let rounds =
+      List.fold_left
+        (fun acc (peer_epoch, peer_round, last_seen) ->
+          if peer_epoch = epoch_id && now -. last_seen <= round_peer_age then
+            peer_round :: acc
+          else
+            acc)
+        [ local_round ]
+        observations
+    in
+    let spread = round_spread rounds in
+    if spread > round_spread_limit then
+      Some (spread, List.length rounds - 1)
+    else
+      None
+
+let warn_round_spread t ~now =
+  let state = t.engine.state in
+  let observations =
+    Hashtbl.fold
+      (fun _ (peer : round_peer_record) acc ->
+        (peer.epoch_id, peer.round, peer.last_seen) :: acc)
+      t.round_peers
+      []
+  in
+  match round_spread_warning
+          ~now
+          ~last_warned_at:t.round_spread_warned_at
+          ~epoch_id:state.height
+          ~local_round:state.round
+          observations with
+  | Some (spread, peers) ->
+    t.round_spread_warned_at <- now;
+    warn_node t.config.my_addr
+      "event = consensus_round_spread spread = %d peers = %d local_round = %d"
+      spread
+      peers
+      state.round
+  | None -> ()
+
 let round_peer_later (peer : round_peer_record) (sync : C_codec.round_sync) =
   Int64.compare sync.C_codec.epoch_id peer.epoch_id > 0
   || (sync.epoch_id = peer.epoch_id
@@ -1547,24 +1608,25 @@ let round_peer_later (peer : round_peer_record) (sync : C_codec.round_sync) =
 
 let remember_round_peer t (sync : C_codec.round_sync) =
   let now = Unix.gettimeofday () in
-  match Hashtbl.find_opt t.round_peers sync.C_codec.validator with
-  | Some peer when round_peer_later peer sync ->
-    begin
+  begin
+    match Hashtbl.find_opt t.round_peers sync.C_codec.validator with
+    | Some peer when round_peer_later peer sync ->
       peer.epoch_id <- sync.epoch_id;
       peer.round <- sync.round;
       peer.step <- sync.step;
       peer.last_seen <- now
-    end
-  | Some _ ->
-    ()
-  | None ->
-    Hashtbl.replace t.round_peers sync.validator {
-      validator_addr = sync.validator;
-      epoch_id = sync.epoch_id;
-      round = sync.round;
-      step = sync.step;
-      last_seen = now;
-    }
+    | Some _ ->
+      ()
+    | None ->
+      Hashtbl.replace t.round_peers sync.validator {
+        validator_addr = sync.validator;
+        epoch_id = sync.epoch_id;
+        round = sync.round;
+        step = sync.step;
+        last_seen = now;
+      }
+  end;
+  warn_round_spread t ~now
 
 let round_state t = {
   epoch_id = t.engine.state.height;
