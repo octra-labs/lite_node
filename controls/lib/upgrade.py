@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 
+from release import trusted as trusted_release
 from validator_common import ValidatorError
 from validator_common import load_wallet
 from validator_common import parse_env
@@ -62,22 +63,9 @@ def git_release(root):
         return unknown
     result = {**unknown, "repo_head": head if HEX40.fullmatch(head) else "unknown"}
     try:
-        branch = capture(
-            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
-            cwd=root,
-        )
-        remote = capture(
-            ["git", "config", "--get", f"branch.{branch}.remote"],
-            cwd=root,
-        )
-        merge = capture(
-            ["git", "config", "--get", f"branch.{branch}.merge"],
-            cwd=root,
-        )
-        if not remote or not merge:
-            return result
+        remote, merge = update_ref(root)
         result["upstream"] = f"{remote}:{merge}"
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, ValidatorError):
         return result
     try:
         raw = capture(
@@ -90,6 +78,29 @@ def git_release(root):
         return result
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return result
+
+
+def update_ref(root):
+    try:
+        branch = capture(
+            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=root,
+        )
+        remote = capture(
+            ["git", "config", "--get", f"branch.{branch}.remote"],
+            cwd=root,
+        )
+        merge = capture(
+            ["git", "config", "--get", f"branch.{branch}.merge"],
+            cwd=root,
+        )
+        if remote and merge:
+            return remote, merge
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    remotes = capture(["git", "remote"], cwd=root).splitlines()
+    candidates = ["origin"] if "origin" in remotes else remotes
+    return choose("git release remote", candidates), "refs/heads/main"
 
 
 def choose(label, values):
@@ -394,7 +405,7 @@ def peer_head(payload):
     return max(values) if values else None
 
 
-def view(values, pid, source):
+def view(values, pid, release):
     status = rpc_status(values["OCTRA_API_PORT"])
     peers = rpc_method(values["OCTRA_API_PORT"], "octra_consensusPeerStates")
     version = rpc_method(values["OCTRA_API_PORT"], "octra_runtimeVersion")
@@ -409,6 +420,16 @@ def view(values, pid, source):
         member = {"active": None, "scheduled": None, "activate_epoch": None}
     expected = values.get("OCTRA_BINARY_HASH")
     live = proc_hash(pid)
+    source_match = (
+        isinstance(version, dict)
+        and version.get("source_commit") == release["source_commit"]
+    )
+    runtime_match = (
+        source_match
+        and version.get("runtime_profile_hash") == release["runtime_profile_hash"]
+        and version.get("consensus_profile") == release["consensus_profile"]
+        and version.get("consensus_rules_id") == release["consensus_rules_id"]
+    )
     return {
         "pid": pid,
         "process": "online" if process_alive(pid) else "offline",
@@ -416,7 +437,8 @@ def view(values, pid, source):
         "binary_match": live is not None and live == expected,
         "live_source": version.get("source_commit", "unknown")
         if isinstance(version, dict) else "unknown",
-        "source_match": isinstance(version, dict) and version.get("source_commit") == source,
+        "source_match": source_match,
+        "runtime_match": runtime_match,
         "rpc": "ready" if isinstance(status, dict) else "unavailable",
         "head_epoch": local,
         "peer_epoch": remote,
@@ -429,17 +451,36 @@ def view(values, pid, source):
     }
 
 
-def ready(role, state):
+def installed(role, state):
     common = (
         state.get("process") == "online"
         and state.get("rpc") == "ready"
         and state.get("binary_match") is True
         and state.get("source_match") is True
-        and state.get("lag") == 0
+        and state.get("runtime_match") is True
+        and isinstance(state.get("head_epoch"), int)
     )
     if role == "validator":
         return common and state.get("validator_member") is True and state.get("voting") is True
     return common and state.get("voting") is False and state.get("voting_reason") == "role"
+
+
+def ready(role, state):
+    return installed(role, state) and state.get("lag") == 0
+
+
+def recovery_installed(role, state, release):
+    return (
+        release["notice_code"] == "consensus_recovery"
+        and installed(role, state)
+        and state.get("peer_epoch") is None
+    )
+
+
+def deadline_result(role, state, release):
+    if recovery_installed(role, state, release):
+        return "installed", "network_not_finalizing", "leave_running", 0
+    return "pending", "health_deadline", "do_not_restart", 2
 
 
 def current(sup, rows, entries):
@@ -500,25 +541,56 @@ def preflight(root, sup, values, use_sudo):
         raise ValidatorError("less than 4 GiB is free; expand the volume before building")
 
 
-def git_update(root, public=None, source=None):
+def git_update(root, public, source):
     dirty = capture(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root)
     if dirty:
         raise ValidatorError("tracked source tree is dirty")
-    call(["git", "pull", "--ff-only"], cwd=root)
+    remote, merge = update_ref(root)
+    call(["git", "fetch", "--no-tags", remote, merge], cwd=root)
+    target = capture(["git", "rev-parse", "FETCH_HEAD"], cwd=root)
+    if not HEX40.fullmatch(target):
+        raise ValidatorError("fetched release commit is invalid")
+    if target != public:
+        raise ValidatorError(f"public commit mismatch: {target}")
+    call(["git", "merge", "--ff-only", target], cwd=root)
     head = capture(["git", "rev-parse", "HEAD"], cwd=root)
-    upstream = capture(["git", "rev-parse", "@{u}"], cwd=root)
-    if not HEX40.fullmatch(head) or head != upstream:
-        raise ValidatorError("local HEAD does not equal the tracked release")
-    if public is not None and head != public:
+    if not HEX40.fullmatch(head) or head != target:
+        raise ValidatorError("local HEAD does not equal the fetched release")
+    if head != public:
         raise ValidatorError(f"public commit mismatch: {head}")
     source_path = root / "SOURCE_COMMIT"
     actual = source_path.read_text(encoding="utf-8").strip() if source_path.is_file() else ""
     if not HEX40.fullmatch(actual):
         raise ValidatorError("SOURCE_COMMIT is missing or invalid")
-    if source is not None and actual != source:
+    if actual != source:
         raise ValidatorError(f"source commit mismatch: {actual or 'missing'}")
     emit(event="upgrade_target", public_commit=head, source_commit=actual)
     return head, actual
+
+
+def release_target(release, args, values):
+    if release["action"] == "hold":
+        raise ValidatorError("release channel is on hold")
+    if values.get("OCTRA_CHAIN_ID") != release["chain_id"]:
+        raise ValidatorError("node chain does not match the release channel")
+    assertions = (
+        ("--public-commit", args.public_commit, release["public_commit"]),
+        ("--source-commit", args.source_commit, release["source_commit"]),
+    )
+    for label, supplied, trusted in assertions:
+        if supplied is not None and supplied != trusted:
+            raise ValidatorError(f"{label} does not match the signed release marker")
+    return release["public_commit"], release["source_commit"]
+
+
+def verify_release_tree(root, release):
+    network = root / "config/network.env"
+    if not network.is_file() or sha256_file(network) != release["network_sha256"]:
+        raise ValidatorError("network configuration does not match the signed release")
+    source = root / "SOURCE_COMMIT"
+    actual = source.read_text(encoding="utf-8").strip() if source.is_file() else ""
+    if actual != release["source_commit"]:
+        raise ValidatorError("source commit does not match the signed release")
 
 
 def verify_unit(sup, values):
@@ -536,7 +608,7 @@ def verify_unit(sup, values):
     return binary
 
 
-def diagnose(root, sup, values, source):
+def diagnose(root, sup, values, release):
     pid = sup["pid"] if sup["active"] else 0
     emit(
         status="diagnostic",
@@ -550,28 +622,40 @@ def diagnose(root, sup, values, source):
         pid=pid,
     )
     if pid:
-        state = view(values, pid, source)
+        state = view(values, pid, release)
         emit(**state)
     else:
         state = {"process": "offline", "source_match": False, "binary_match": False}
-    release = git_release(root)
-    remote_known = release["upstream_head"] != "unknown"
+    git = git_release(root)
+    remote_known = git["upstream_head"] != "unknown"
+    published = remote_known and git["upstream_head"] == release["public_commit"]
     upgrade = (
-        (remote_known and release["repo_head"] != release["upstream_head"])
+        git["repo_head"] != release["public_commit"]
         or state.get("source_match") is not True
         or state.get("binary_match") is not True
+        or state.get("runtime_match") is not True
     )
-    action = "upgrade" if upgrade else ("none" if remote_known else "verify_remote")
+    action = "upgrade" if upgrade else "none"
     emit(
         event="upgrade_check",
-        **release,
-        release_source=source,
+        **git,
+        release_sequence=release["sequence"],
+        release_action=release["action"],
+        release_public=release["public_commit"],
+        release_source=release["source_commit"],
+        release_published=published,
         upgrade_available=upgrade,
         action=action,
     )
     faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
     for fault in faults:
         emit(fault=fault[0], path=fault[1], detail=fault[2] if len(fault) > 2 else "invalid")
+    if release["action"] == "hold":
+        emit(status="hold", reason="release_channel_hold", action="do_not_apply")
+        return 2
+    if not published:
+        emit(status="hold", reason="release_target_not_published", action="do_not_apply")
+        return 2
     if faults:
         emit(status="hold", reason="durable_record_requires_review", action="do_not_delete")
         return 2
@@ -579,11 +663,13 @@ def diagnose(root, sup, values, source):
     return 0
 
 
-def apply(root, sup, values, args):
+def apply(root, sup, values, args, release):
+    public, source = release_target(release, args, values)
     preflight(root, sup, values, args.sudo)
     prior_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
     unit_binary = verify_unit(sup, values)
-    _, source = git_update(root, args.public_commit, args.source_commit)
+    git_update(root, public, source)
+    verify_release_tree(root, release)
     call(["sh", str(root / "controls/check.sh")], cwd=root)
     call(["sh", str(root / "controls/build.sh")], cwd=root)
     call([
@@ -620,7 +706,7 @@ def apply(root, sup, values, args):
         names = [(sup["scope"], sup["name"], props(sup["scope"], sup["name"]))] \
             if sup["kind"] == "systemd" else []
         live = current(sup, names, entries)
-        state = view(values, live["pid"], source) if live["pid"] else {
+        state = view(values, live["pid"], release) if live["pid"] else {
             "process": "offline",
             "pid": 0,
         }
@@ -633,15 +719,20 @@ def apply(root, sup, values, args):
             emit(status=result, **state)
             return 0
         if time.monotonic() >= deadline:
+            status, reason, action, code = deadline_result(
+                values["OCTRA_OPERATOR_ROLE"],
+                state,
+                release,
+            )
             emit(
-                status="pending",
-                reason="health_deadline",
-                action="do_not_restart",
+                status=status,
+                reason=reason,
+                action=action,
                 prior_binary=prior_binary,
                 config=sup["config"],
                 **state,
             )
-            return 2
+            return code
         time.sleep(args.interval)
 
 
@@ -674,6 +765,16 @@ def main():
             raise ValidatorError("--public-commit must be a full commit hash")
         if args.source_commit is not None and not HEX40.fullmatch(args.source_commit):
             raise ValidatorError("--source-commit must be a full commit hash")
+    marker, marker_source = trusted_release(root)
+    emit(
+        event="release_marker",
+        source=marker_source,
+        sequence=marker["sequence"],
+        action=marker["action"],
+        public_commit=marker["public_commit"],
+        source_commit=marker["source_commit"],
+        expires_at=marker["expires_at"],
+    )
     scope = "user" if args.user_unit else "system"
     names = [args.unit] if args.unit else unit_names(scope)
     rows = unit_rows(scope, names)
@@ -681,11 +782,11 @@ def main():
     config = config_path(root, args.config, rows, entries)
     values = parse_env(config)
     sup = supervisor(config, values, rows, entries, unit=args.unit)
-    source_path = root / "SOURCE_COMMIT"
-    source = source_path.read_text(encoding="utf-8").strip() if source_path.is_file() else "unknown"
     if args.apply:
-        return apply(root, sup, values, args)
-    return diagnose(root, sup, values, source)
+        return apply(root, sup, values, args, marker)
+    if values.get("OCTRA_CHAIN_ID") != marker["chain_id"]:
+        raise ValidatorError("node chain does not match the release channel")
+    return diagnose(root, sup, values, marker)
 
 
 if __name__ == "__main__":

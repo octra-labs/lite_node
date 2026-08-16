@@ -2,6 +2,7 @@
 # Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -102,11 +103,14 @@ from validator_rejoin import sync_state
 from validator_rejoin import vote_state
 from validator_status import promotion_readiness
 from validator_status import round_view
+import release as release_tool
 import upgrade as upgrade_tool
 from upgrade import choose
+from upgrade import deadline_result
 from upgrade import env_paths
 from upgrade import inspect_pending
 from upgrade import inspect_votes
+from upgrade import recovery_installed
 from upgrade import ready
 
 RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
@@ -149,6 +153,46 @@ def network_values():
         "OCTRA_VALIDATORS": validators,
     }
 
+
+def release_value(public="a" * 40, source="b" * 40, notice="consensus_recovery"):
+    return {
+        "schema": "octra-devnet-release-v2",
+        "chain_id": "octra-devnet-9871-cluster",
+        "key_id": "devnet-release-f912b4891be62acc",
+        "sequence": 2,
+        "action": "required",
+        "notice_code": notice,
+        "public_commit": public,
+        "source_commit": source,
+        "network_sha256": "c" * 64,
+        "runtime_profile_hash": "d" * 64,
+        "consensus_profile": 16,
+        "consensus_rules_id": "finalized_rejection_commitment",
+        "issued_at": "2026-08-16T18:47:00Z",
+        "expires_at": "2026-08-19T18:46:00Z",
+        "signature": "A" * 86 + "==",
+    }
+
+
+def signed_release_value():
+    return {
+        "schema": "octra-devnet-release-v2",
+        "chain_id": "octra-devnet-9871-cluster",
+        "key_id": "devnet-release-f912b4891be62acc",
+        "sequence": 1,
+        "action": "current",
+        "notice_code": "release_current",
+        "public_commit": "dd0698132d46af57e59e90c52886827483e33fac",
+        "source_commit": "c544ebd5b4f1feedf54ee9d86faf589ba44a78e1",
+        "network_sha256": "26e5ca5a46753eb6f41962312991254fcbc2bdf55fb3ce73679dbf2511627a78",
+        "runtime_profile_hash": "14bac4b24aa67795bcaecf618b6c10a6ef0f3b2a113ded7f5f9117362375cee6",
+        "consensus_profile": 16,
+        "consensus_rules_id": "finalized_rejection_commitment",
+        "issued_at": "2026-08-16T18:47:00Z",
+        "expires_at": "2026-08-19T18:46:00Z",
+        "signature": "xpCmekCmFyhuEqF9CbT6T239rNbjGqzyu+6zjmFtrK+quNUg+Z4J6Ij55Ek6K3ZsfoF1YrShFYfKYbUZhn/aBg==",
+    }
+
 class ValidatorToolsTest(unittest.TestCase):
     def setUp(self):
         if WORK.exists():
@@ -187,6 +231,51 @@ class ValidatorToolsTest(unittest.TestCase):
             ],
         )
 
+    def test_upgrade_verifies_pinned_release_signature(self):
+        marker = signed_release_value()
+        raw = json.dumps(marker).encode("utf-8")
+        now = datetime.datetime(2026, 8, 16, 20, tzinfo=datetime.timezone.utc)
+        self.assertEqual(release_tool.decode(raw, now=now), marker)
+        marker["public_commit"] = "a" * 40
+        with self.assertRaisesRegex(ValidatorError, "signature verification failed"):
+            release_tool.decode(json.dumps(marker).encode("utf-8"), now=now)
+
+    def test_upgrade_refuses_release_rollback_and_sequence_reuse(self):
+        prior = release_value()
+        rollback = {**prior, "sequence": 1}
+        reused = {**prior, "action": "recommended"}
+        for candidate, message in (
+            (rollback, "would roll back"),
+            (reused, "was reused"),
+        ):
+            with mock.patch.object(release_tool, "cache_path", return_value=WORK / "release"), mock.patch.object(
+                release_tool, "read", return_value=prior
+            ), mock.patch.object(
+                release_tool, "fetch", return_value=candidate
+            ), self.assertRaisesRegex(ValidatorError, message):
+                release_tool.trusted(WORK)
+
+    def test_upgrade_uses_cache_only_when_origin_is_unavailable(self):
+        cached = release_value()
+        with mock.patch.object(release_tool, "cache_path", return_value=WORK / "release"), mock.patch.object(
+            release_tool, "read", side_effect=[cached, cached]
+        ), mock.patch.object(
+            release_tool,
+            "fetch",
+            side_effect=release_tool.OriginError("offline"),
+        ), mock.patch.object(release_tool, "write") as write:
+            self.assertEqual(release_tool.trusted(WORK), (cached, "cache"))
+        write.assert_not_called()
+
+        with mock.patch.object(release_tool, "cache_path", return_value=WORK / "release"), mock.patch.object(
+            release_tool, "read", return_value=cached
+        ), mock.patch.object(
+            release_tool,
+            "fetch",
+            side_effect=ValidatorError("signature verification failed"),
+        ), self.assertRaisesRegex(ValidatorError, "signature verification failed"):
+            release_tool.trusted(WORK)
+
     def test_upgrade_checks_remote_without_fetching(self):
         (WORK / ".git").mkdir()
         head = "a" * 40
@@ -212,7 +301,31 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(state["upstream"], "origin:refs/heads/main")
         self.assertFalse(any(call.args[0][1] == "fetch" for call in capture_git.call_args_list))
 
-    def test_upgrade_uses_tracked_release_when_hashes_are_omitted(self):
+    def test_upgrade_checks_detached_remote_without_fetching(self):
+        (WORK / ".git").mkdir()
+        head = "a" * 40
+        latest = "b" * 40
+
+        def output(command, **_):
+            if command[1:3] == ["rev-parse", "HEAD"]:
+                return head
+            if command[1] == "symbolic-ref":
+                raise subprocess.CalledProcessError(1, command)
+            if command[1] == "remote":
+                return "backup\norigin"
+            if command[1] == "ls-remote":
+                return latest + "\trefs/heads/main"
+            self.fail(f"unexpected command: {command}")
+
+        with mock.patch.object(upgrade_tool, "capture", side_effect=output) as capture_git:
+            state = upgrade_tool.git_release(WORK)
+
+        self.assertEqual(state["repo_head"], head)
+        self.assertEqual(state["upstream_head"], latest)
+        self.assertEqual(state["upstream"], "origin:refs/heads/main")
+        self.assertFalse(any(call.args[0][1] == "fetch" for call in capture_git.call_args_list))
+
+    def test_upgrade_uses_signed_release_target(self):
         public = "a" * 40
         source = "b" * 40
         (WORK / "SOURCE_COMMIT").write_text(source + "\n", encoding="utf-8")
@@ -220,9 +333,15 @@ class ValidatorToolsTest(unittest.TestCase):
         def output(command, **_):
             if command[1:3] == ["status", "--porcelain"]:
                 return ""
-            if command[1:3] == ["rev-parse", "HEAD"]:
+            if command[1] == "symbolic-ref":
+                return "main"
+            if command[-1] == "branch.main.remote":
+                return "origin"
+            if command[-1] == "branch.main.merge":
+                return "refs/heads/main"
+            if command[1:3] == ["rev-parse", "FETCH_HEAD"]:
                 return public
-            if command[1:3] == ["rev-parse", "@{u}"]:
+            if command[1:3] == ["rev-parse", "HEAD"]:
                 return public
             self.fail(f"unexpected command: {command}")
 
@@ -230,11 +349,55 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool, "call"
         ) as run:
             self.assertEqual(
-                upgrade_tool.git_update(WORK),
+                upgrade_tool.git_update(WORK, public, source),
                 (public, source),
             )
 
-        run.assert_called_once_with(["git", "pull", "--ff-only"], cwd=WORK)
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    ["git", "fetch", "--no-tags", "origin", "refs/heads/main"],
+                    cwd=WORK,
+                ),
+                mock.call(["git", "merge", "--ff-only", public], cwd=WORK),
+            ],
+        )
+
+    def test_upgrade_fast_forwards_detached_release(self):
+        public = "a" * 40
+        source = "b" * 40
+        (WORK / "SOURCE_COMMIT").write_text(source + "\n", encoding="utf-8")
+
+        def output(command, **_):
+            if command[1:3] == ["status", "--porcelain"]:
+                return ""
+            if command[1] == "symbolic-ref":
+                raise subprocess.CalledProcessError(1, command)
+            if command[1] == "remote":
+                return "backup\norigin"
+            if command[1:3] in (["rev-parse", "FETCH_HEAD"], ["rev-parse", "HEAD"]):
+                return public
+            self.fail(f"unexpected command: {command}")
+
+        with mock.patch.object(upgrade_tool, "capture", side_effect=output), mock.patch.object(
+            upgrade_tool, "call"
+        ) as run:
+            self.assertEqual(
+                upgrade_tool.git_update(WORK, public, source),
+                (public, source),
+            )
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    ["git", "fetch", "--no-tags", "origin", "refs/heads/main"],
+                    cwd=WORK,
+                ),
+                mock.call(["git", "merge", "--ff-only", public], cwd=WORK),
+            ],
+        )
 
     def test_upgrade_diagnoses_durable_records_without_deleting_them(self):
         wal = WORK / "wal"
@@ -256,6 +419,9 @@ class ValidatorToolsTest(unittest.TestCase):
             "rpc": "ready",
             "binary_match": True,
             "source_match": True,
+            "runtime_match": True,
+            "head_epoch": 41,
+            "peer_epoch": 41,
             "lag": 0,
             "validator_member": True,
             "voting": True,
@@ -273,6 +439,69 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(ready("validator", observer))
         self.assertFalse(ready("observer", {**observer, "binary_match": False}))
 
+    def test_upgrade_reports_installed_during_consensus_recovery(self):
+        state = {
+            "process": "online",
+            "rpc": "ready",
+            "binary_match": True,
+            "source_match": True,
+            "runtime_match": True,
+            "head_epoch": 41,
+            "peer_epoch": None,
+            "lag": None,
+            "validator_member": True,
+            "voting": True,
+            "voting_reason": None,
+        }
+        self.assertTrue(recovery_installed("validator", state, release_value()))
+        self.assertEqual(
+            deadline_result("validator", state, release_value()),
+            ("installed", "network_not_finalizing", "leave_running", 0),
+        )
+        self.assertFalse(
+            recovery_installed(
+                "validator",
+                state,
+                release_value(notice="routine_update"),
+            )
+        )
+        self.assertFalse(recovery_installed("validator", {**state, "voting": False}, release_value()))
+        self.assertEqual(
+            deadline_result(
+                "validator",
+                {**state, "voting": False},
+                release_value(),
+            ),
+            ("pending", "health_deadline", "do_not_restart", 2),
+        )
+
+    def test_upgrade_manual_hashes_are_assertions_only(self):
+        release = release_value()
+        values = {"OCTRA_CHAIN_ID": release["chain_id"]}
+        args = mock.Mock(public_commit=None, source_commit=None)
+        self.assertEqual(
+            upgrade_tool.release_target(release, args, values),
+            (release["public_commit"], release["source_commit"]),
+        )
+        args.public_commit = "f" * 40
+        with self.assertRaisesRegex(ValidatorError, "does not match the signed release"):
+            upgrade_tool.release_target(release, args, values)
+
+    def test_upgrade_verifies_signed_release_tree(self):
+        network = WORK / "config/network.env"
+        network.parent.mkdir()
+        network.write_text("OCTRA_CHAIN_ID=octra-devnet-9871-cluster\n", encoding="utf-8")
+        source = "b" * 40
+        (WORK / "SOURCE_COMMIT").write_text(source + "\n", encoding="utf-8")
+        release = {
+            **release_value(source=source),
+            "network_sha256": hashlib.sha256(network.read_bytes()).hexdigest(),
+        }
+        upgrade_tool.verify_release_tree(WORK, release)
+        network.write_text("OCTRA_CHAIN_ID=wrong\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValidatorError, "network configuration"):
+            upgrade_tool.verify_release_tree(WORK, release)
+
     def test_upgrade_builds_and_checks_before_one_stop_start(self):
         events = []
         config = WORK / "node.env"
@@ -281,6 +510,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_OPERATOR_BINARY": str(binary),
             "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
         }
         supervisor = {
             "kind": "pm2",
@@ -303,6 +533,9 @@ class ValidatorToolsTest(unittest.TestCase):
             "rpc": "ready",
             "binary_match": True,
             "source_match": True,
+            "runtime_match": True,
+            "head_epoch": 41,
+            "peer_epoch": 41,
             "lag": 0,
             "validator_member": True,
             "voting": True,
@@ -324,6 +557,8 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool, "git_update", side_effect=update
         ), mock.patch.object(
+            upgrade_tool, "verify_release_tree"
+        ), mock.patch.object(
             upgrade_tool, "call", side_effect=command
         ), mock.patch.object(
             upgrade_tool, "parse_env", return_value=values
@@ -343,7 +578,7 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool, "view", return_value=healthy
         ):
             self.assertEqual(
-                upgrade_tool.apply(WORK, supervisor, values, args),
+                upgrade_tool.apply(WORK, supervisor, values, args, release_value()),
                 0,
             )
 
@@ -369,6 +604,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_OPERATOR_BINARY": str(WORK / "candidate/octra_node.exe"),
             "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
         }
         supervisor = {
             "kind": "pm2",
@@ -397,12 +633,14 @@ class ValidatorToolsTest(unittest.TestCase):
             "git_update",
             return_value=("a" * 40, "b" * 40),
         ), mock.patch.object(
+            upgrade_tool, "verify_release_tree"
+        ), mock.patch.object(
             upgrade_tool, "call", side_effect=command
         ), mock.patch.object(upgrade_tool, "stop") as stop_node, mock.patch.object(
             upgrade_tool, "start"
         ) as start_node:
             with self.assertRaises(subprocess.CalledProcessError):
-                upgrade_tool.apply(WORK, supervisor, values, args)
+                upgrade_tool.apply(WORK, supervisor, values, args, release_value())
 
         stop_node.assert_not_called()
         start_node.assert_not_called()
