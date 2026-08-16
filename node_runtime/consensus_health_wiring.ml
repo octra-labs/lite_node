@@ -769,8 +769,17 @@ let node_consensus_driver_runtime runtime =
         runtime.quorum);
   }
 
-let launch_consensus_driver deps driver =
-  launch_driver (consensus_driver_deps deps) driver
+let prepared_start prepare start driver =
+  prepare driver;
+  start driver
 
-let launch_node_consensus_driver runtime driver =
-  launch_consensus_driver (node_consensus_driver_runtime runtime) driver
+let launch_consensus_driver ?(prepare = ignore) deps driver =
+  let launch = consensus_driver_deps deps in
+  let start_driver = prepared_start prepare launch.start_driver in
+  launch_driver { launch with start_driver } driver
+
+let launch_node_consensus_driver ?prepare runtime driver =
+  launch_consensus_driver
+    ?prepare
+    (node_consensus_driver_runtime runtime)
+    driver

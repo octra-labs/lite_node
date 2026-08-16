@@ -1019,6 +1019,18 @@ let require_vote_floor t =
      | Ok None ->
        hold_vote_log t "vote log bootstrap required")
 
+let prepare_vote_log t wires =
+  if t.running then
+    Error "consensus driver is already running"
+  else begin
+    t.vote_log_issue <- None;
+    restore_votes t wires;
+    require_vote_floor t;
+    match t.vote_log_issue with
+    | None -> Ok ()
+    | Some reason -> Error reason
+  end
+
 let saved_vote t (v : C_types.vote) =
   if not (String.equal v.validator t.config.my_addr) then
     Lwt.return_some v
@@ -2967,20 +2979,16 @@ and process_outputs t =
   match request with
   | C_output_actor.Join -> Lwt.return_unit
   | C_output_actor.Start ->
-    let rec run () =
-      Lwt.catch
-        (fun () ->
-          let* () = process_outputs_once t in
-          let actor, completion = C_output_actor.complete t.output_actor in
-          t.output_actor <- actor;
-          match completion with
-          | C_output_actor.Continue -> run ()
-          | C_output_actor.Stop -> Lwt.return_unit)
-        (fun exn ->
-          t.output_actor <- C_output_actor.fail t.output_actor;
-          Lwt.fail exn)
+    let step () =
+      let* () = process_outputs_once t in
+      let actor, completion = C_output_actor.complete t.output_actor in
+      t.output_actor <- actor;
+      Lwt.return completion
     in
-    run ()
+    let fail _ =
+      t.output_actor <- C_output_actor.fail t.output_actor
+    in
+    C_output_actor.drain ~step ~fail
 
 let finality_proof_target t (finalize : C_types.finalize) =
   !(t.finality_proof_needed)
@@ -4707,40 +4715,43 @@ let proof_wait tries =
   | 1 -> 10.0
   | _ -> 30.0
 
-let rec recover_finality_proof t tries =
+let recover_finality_proof t =
   let open Lwt.Syntax in
-  let retry () =
+  let retry tries =
     let* () = Lwt_unix.sleep (proof_wait tries) in
-    recover_finality_proof t (min 2 (tries + 1))
+    Lwt.return (C_loop.Next (min 2 (tries + 1)))
   in
-  if not t.running || not !(t.finality_proof_needed) then
-    Lwt.return_unit
-  else
-    Lwt.catch
-      (fun () ->
-        let local_head = t.config.local_head_epoch () in
-        if Int64.compare local_head 0L < 0
-           || not (Int64.equal t.engine.state.height (Int64.succ local_head))
-        then
-          retry ()
-        else begin
-          let* records =
-            query_epoch_root
-              ~request_next:false
-              t
-              ~epoch_id:local_head
-              ~timeout_seconds:3.0
-          in
-          let* () = request_finality_proof t ~epoch_id:local_head records in
-          let* () = Lwt_unix.sleep (proof_wait tries) in
-          clear_finality_proof_requests t;
-          recover_finality_proof t (min 2 (tries + 1))
-        end)
-      (fun exn ->
-        warn_node t.config.my_addr
-          "event = finality_proof status = retry reason = local_error detail = %s"
-          (Printexc.to_string exn);
-        retry ())
+  let turn tries =
+    if not t.running || not !(t.finality_proof_needed) then
+      Lwt.return C_loop.Stop
+    else
+      Lwt.catch
+        (fun () ->
+          let local_head = t.config.local_head_epoch () in
+          if Int64.compare local_head 0L < 0
+             || not (Int64.equal t.engine.state.height (Int64.succ local_head))
+          then
+            retry tries
+          else begin
+            let* records =
+              query_epoch_root
+                ~request_next:false
+                t
+                ~epoch_id:local_head
+                ~timeout_seconds:3.0
+            in
+            let* () = request_finality_proof t ~epoch_id:local_head records in
+            let* () = Lwt_unix.sleep (proof_wait tries) in
+            clear_finality_proof_requests t;
+            Lwt.return (C_loop.Next (min 2 (tries + 1)))
+          end)
+        (fun exn ->
+          warn_node t.config.my_addr
+            "event = finality_proof status = retry reason = local_error detail = %s"
+            (Printexc.to_string exn);
+          retry tries)
+  in
+  C_loop.run turn 0
 
 let try_propose ?parent_commit t ~header ~tx_hashes =
   C_engine.do_propose
@@ -4829,6 +4840,9 @@ let realign_progress t ~height ~round =
     wake_ready t
 
 let start t =
+  C_engine.set_round_skip_ready
+    t.engine
+    (fun () -> not (proposal_work_active t));
   resume_local_vote t;
   t.running <- true;
   let open Lwt.Syntax in
@@ -4865,7 +4879,7 @@ let start t =
   if not pristine then load_round_sync t;
   if !(t.finality_proof_needed) then
     Lwt.async (fun () ->
-      recover_finality_proof t 0);
+      recover_finality_proof t);
   let* () = broadcast_round_sync t ~request:true in
   let* _ = try_current_leader_proposal t in
   process_outputs t

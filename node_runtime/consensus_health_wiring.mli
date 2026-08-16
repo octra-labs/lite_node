@@ -384,12 +384,20 @@ val node_consensus_driver_runtime :
   node_consensus_driver_runtime ->
   consensus_driver_runtime
 
+val prepared_start :
+  ('driver -> unit) ->
+  ('driver -> 'result) ->
+  'driver ->
+  'result
+
 val launch_consensus_driver :
+  ?prepare:(Octra_consensus.C_driver.t -> unit) ->
   consensus_driver_runtime ->
   Octra_consensus.C_driver.t ->
   unit
 
 val launch_node_consensus_driver :
+  ?prepare:(Octra_consensus.C_driver.t -> unit) ->
   node_consensus_driver_runtime ->
   Octra_consensus.C_driver.t ->
   unit

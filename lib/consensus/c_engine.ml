@@ -227,6 +227,7 @@ type t = {
   mutable finalized_height : int64;
   mutable generation : int;
   can_vote : unit -> bool;
+  mutable round_skip_ready : unit -> bool;
 }
 
 let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
@@ -256,7 +257,14 @@ let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
     finalized_height = Int64.pred start_height;
     generation = 0;
     can_vote;
+    round_skip_ready = (fun () -> true);
   }
+
+let set_round_skip_ready t ready =
+  t.round_skip_ready <- ready
+
+let round_skip_ready t =
+  try t.round_skip_ready () with _ -> false
 
 let replace_validator_set t validator_set =
   t.vs <- validator_set
@@ -642,10 +650,21 @@ let record_historical_prevote t (vote : vote) =
     | `QuorumAny -> ()
   end
 
+let restored_precommit_lock t (proposal : propose) =
+  let proposal_id = C_hash.proposal_id proposal.header in
+  let same_value = function
+    | Some header -> String.equal (C_hash.proposal_id header) proposal_id
+    | None -> false
+  in
+  Int64.equal proposal.epoch_id t.state.height
+  && t.state.locked_round = proposal.round
+  && t.state.valid_round = proposal.round
+  && t.state.round >= proposal.round + 1
+  && same_value t.state.locked_value
+  && same_value t.state.valid_value
+
 let restore_precommit_lock t (proposal : propose) =
-  if not (is_pristine t) then
-    Error "consensus engine is not pristine"
-  else if proposal.chain_id <> t.chain_id then
+  if proposal.chain_id <> t.chain_id then
     Error "pending proposal chain mismatch"
   else if proposal.epoch_id <> t.state.height then
     Error "pending proposal height mismatch"
@@ -658,6 +677,10 @@ let restore_precommit_lock t (proposal : propose) =
     Error "pending proposal header chain mismatch"
   else if proposal.header.epoch_id <> proposal.epoch_id then
     Error "pending proposal header height mismatch"
+  else if restored_precommit_lock t proposal then
+    Ok ()
+  else if not (is_pristine t) then
+    Error "consensus engine is not pristine"
   else begin
     let proposal_id = C_hash.proposal_id proposal.header in
     cache_proposal_message t proposal;
@@ -689,7 +712,8 @@ let record_higher_round t ~max_ahead ~round ~validator =
   end
 
 let try_round_skip t =
-  if Int64.compare t.state.height t.finalized_height <= 0 then ()
+  if not (round_skip_ready t) then ()
+  else if Int64.compare t.state.height t.finalized_height <= 0 then ()
   else begin
     let best =
       Hashtbl.fold (fun round set acc ->

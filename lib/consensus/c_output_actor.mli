@@ -16,3 +16,7 @@ val request : t -> t * request
 val complete : t -> t * completion
 val fail : t -> t
 val is_idle : t -> bool
+val drain :
+  step:(unit -> completion Lwt.t) ->
+  fail:(exn -> unit) ->
+  unit Lwt.t

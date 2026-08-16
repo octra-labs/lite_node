@@ -4,10 +4,6 @@
 let ( let* ) result next =
   Result.bind result next
 
-let vote_hash value =
-  Digestif.SHA256.digest_string value
-  |> Digestif.SHA256.to_hex
-
 let matching_head data_dir through_epoch =
   match Octra_core.Head_manifest.load_result data_dir with
   | Octra_core.Head_manifest.Present head
@@ -92,7 +88,9 @@ let current_vote ~chain_id ~validator ~pubkey ~epoch_id entry =
         Error "pending vote round does not match"
       else if vote.vote_type <> Octra_consensus.C_types.Precommit then
         Error "pending vote type is invalid"
-      else if not (String.equal (vote_hash vote.proposal_id) entry.proposal_id) then
+      else if not
+        (String.equal (Text.hash32_hex vote.proposal_id) entry.proposal_id)
+      then
         Error "pending vote proposal does not match"
       else if not (Octra_consensus.C_hash.verify_vote ~pubkey_raw:pubkey vote) then
         Error "pending vote signature is invalid"

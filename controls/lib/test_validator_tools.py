@@ -102,6 +102,12 @@ from validator_rejoin import sync_state
 from validator_rejoin import vote_state
 from validator_status import promotion_readiness
 from validator_status import round_view
+import upgrade as upgrade_tool
+from upgrade import choose
+from upgrade import env_paths
+from upgrade import inspect_pending
+from upgrade import inspect_votes
+from upgrade import ready
 
 RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
 WORK = RUNTIME_DATA_ROOT / "validator_tools_test"
@@ -164,6 +170,242 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(len(wallet["address"]), 47)
         self.assertEqual(os.stat(wallet_path).st_mode & 0o777, 0o600)
         self.assertEqual(ensure_wallet(wallet_path), wallet)
+
+    def test_upgrade_requires_one_proven_choice(self):
+        self.assertEqual(choose("config", ["a", "a"]), "a")
+        with self.assertRaisesRegex(ValidatorError, "was not found"):
+            choose("config", [])
+        with self.assertRaisesRegex(ValidatorError, "is ambiguous"):
+            choose("config", ["a", "b"])
+
+    def test_upgrade_reads_systemd_environment_files(self):
+        self.assertEqual(
+            env_paths("/etc/octra/node.env (ignore_errors=no) -/etc/octra/extra.env"),
+            [
+                Path("/etc/octra/node.env").resolve(),
+                Path("/etc/octra/extra.env").resolve(),
+            ],
+        )
+
+    def test_upgrade_checks_remote_without_fetching(self):
+        (WORK / ".git").mkdir()
+        head = "a" * 40
+
+        def output(command, **_):
+            if command[1:3] == ["rev-parse", "HEAD"]:
+                return head
+            if command[1] == "symbolic-ref":
+                return "main"
+            if command[-1] == "branch.main.remote":
+                return "origin"
+            if command[-1] == "branch.main.merge":
+                return "refs/heads/main"
+            if command[1] == "ls-remote":
+                return head + "\trefs/heads/main"
+            self.fail(f"unexpected command: {command}")
+
+        with mock.patch.object(upgrade_tool, "capture", side_effect=output) as capture_git:
+            state = upgrade_tool.git_release(WORK)
+
+        self.assertEqual(state["repo_head"], head)
+        self.assertEqual(state["upstream_head"], head)
+        self.assertEqual(state["upstream"], "origin:refs/heads/main")
+        self.assertFalse(any(call.args[0][1] == "fetch" for call in capture_git.call_args_list))
+
+    def test_upgrade_uses_tracked_release_when_hashes_are_omitted(self):
+        public = "a" * 40
+        source = "b" * 40
+        (WORK / "SOURCE_COMMIT").write_text(source + "\n", encoding="utf-8")
+
+        def output(command, **_):
+            if command[1:3] == ["status", "--porcelain"]:
+                return ""
+            if command[1:3] == ["rev-parse", "HEAD"]:
+                return public
+            if command[1:3] == ["rev-parse", "@{u}"]:
+                return public
+            self.fail(f"unexpected command: {command}")
+
+        with mock.patch.object(upgrade_tool, "capture", side_effect=output), mock.patch.object(
+            upgrade_tool, "call"
+        ) as run:
+            self.assertEqual(
+                upgrade_tool.git_update(WORK),
+                (public, source),
+            )
+
+        run.assert_called_once_with(["git", "pull", "--ff-only"], cwd=WORK)
+
+    def test_upgrade_diagnoses_durable_records_without_deleting_them(self):
+        wal = WORK / "wal"
+        votes = WORK / "vote_log"
+        wal.mkdir()
+        votes.mkdir()
+        pending = wal / "0000000041_0003.pending"
+        pending.write_bytes(b"")
+        vote = votes / ("00000000000000000041_00000003_" + "a" * 64 + ".vote")
+        vote.write_bytes(b"")
+        self.assertEqual(inspect_pending(WORK)[0][0], "pending_store_unreadable")
+        self.assertEqual(inspect_votes(WORK)[0][0], "vote_record_unreadable")
+        self.assertTrue(pending.is_file())
+        self.assertTrue(vote.is_file())
+
+    def test_upgrade_success_is_role_specific(self):
+        common = {
+            "process": "online",
+            "rpc": "ready",
+            "binary_match": True,
+            "source_match": True,
+            "lag": 0,
+            "validator_member": True,
+            "voting": True,
+            "voting_reason": None,
+        }
+        self.assertTrue(ready("validator", common))
+        self.assertFalse(ready("observer", common))
+        observer = {
+            **common,
+            "validator_member": False,
+            "voting": False,
+            "voting_reason": "role",
+        }
+        self.assertTrue(ready("observer", observer))
+        self.assertFalse(ready("validator", observer))
+        self.assertFalse(ready("observer", {**observer, "binary_match": False}))
+
+    def test_upgrade_builds_and_checks_before_one_stop_start(self):
+        events = []
+        config = WORK / "node.env"
+        binary = WORK / "candidate/octra_node.exe"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_OPERATOR_BINARY": str(binary),
+            "OCTRA_OPERATOR_ROLE": "validator",
+        }
+        supervisor = {
+            "kind": "pm2",
+            "scope": "user",
+            "name": "octra-test",
+            "pid": 41,
+            "active": True,
+            "state": "online",
+            "config": config,
+        }
+        args = mock.Mock(
+            sudo=False,
+            public_commit="a" * 40,
+            source_commit="b" * 40,
+            wait_seconds=1.0,
+            interval=0.01,
+        )
+        healthy = {
+            "process": "online",
+            "rpc": "ready",
+            "binary_match": True,
+            "source_match": True,
+            "lag": 0,
+            "validator_member": True,
+            "voting": True,
+            "voting_reason": None,
+        }
+
+        def command(command, **_):
+            events.append(Path(command[1]).name)
+            return mock.Mock()
+
+        def update(*_):
+            events.append("git")
+            return "a" * 40, "b" * 40
+
+        with mock.patch.object(
+            upgrade_tool, "preflight", side_effect=lambda *_: events.append("preflight")
+        ), mock.patch.object(
+            upgrade_tool, "verify_unit", side_effect=lambda *_: events.append("verify")
+        ), mock.patch.object(
+            upgrade_tool, "git_update", side_effect=update
+        ), mock.patch.object(
+            upgrade_tool, "call", side_effect=command
+        ), mock.patch.object(
+            upgrade_tool, "parse_env", return_value=values
+        ), mock.patch.object(
+            upgrade_tool, "inspect_pending", return_value=[]
+        ), mock.patch.object(
+            upgrade_tool, "inspect_votes", return_value=[]
+        ), mock.patch.object(
+            upgrade_tool, "stop", side_effect=lambda *_: events.append("stop")
+        ) as stop_node, mock.patch.object(
+            upgrade_tool, "start", side_effect=lambda *_: events.append("start")
+        ) as start_node, mock.patch.object(
+            upgrade_tool, "pm2_entries", return_value=[]
+        ), mock.patch.object(
+            upgrade_tool, "current", return_value={**supervisor, "pid": 42}
+        ), mock.patch.object(
+            upgrade_tool, "view", return_value=healthy
+        ):
+            self.assertEqual(
+                upgrade_tool.apply(WORK, supervisor, values, args),
+                0,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "preflight",
+                "verify",
+                "git",
+                "check.sh",
+                "build.sh",
+                "validator_config.py",
+                "validator_guard.py",
+                "stop",
+                "start",
+            ],
+        )
+        stop_node.assert_called_once()
+        start_node.assert_called_once()
+
+    def test_upgrade_never_stops_when_build_fails(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_OPERATOR_BINARY": str(WORK / "candidate/octra_node.exe"),
+            "OCTRA_OPERATOR_ROLE": "validator",
+        }
+        supervisor = {
+            "kind": "pm2",
+            "scope": "user",
+            "name": "octra-test",
+            "pid": 41,
+            "active": True,
+            "state": "online",
+            "config": WORK / "node.env",
+        }
+        args = mock.Mock(
+            sudo=False,
+            public_commit="a" * 40,
+            source_commit="b" * 40,
+        )
+
+        def command(command, **_):
+            if Path(command[1]).name == "build.sh":
+                raise subprocess.CalledProcessError(1, command)
+            return mock.Mock()
+
+        with mock.patch.object(upgrade_tool, "preflight"), mock.patch.object(
+            upgrade_tool, "verify_unit", return_value=None
+        ), mock.patch.object(
+            upgrade_tool,
+            "git_update",
+            return_value=("a" * 40, "b" * 40),
+        ), mock.patch.object(
+            upgrade_tool, "call", side_effect=command
+        ), mock.patch.object(upgrade_tool, "stop") as stop_node, mock.patch.object(
+            upgrade_tool, "start"
+        ) as start_node:
+            with self.assertRaises(subprocess.CalledProcessError):
+                upgrade_tool.apply(WORK, supervisor, values, args)
+
+        stop_node.assert_not_called()
+        start_node.assert_not_called()
 
     def test_validator_reports_resources(self):
         usage = mock.Mock(

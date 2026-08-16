@@ -79,43 +79,88 @@ let health_runtime (input : health_runtime_input) =
     quorum = validator_set.quorum;
   }
 
-let health_runtime_of_node (runtime : runtime) =
-  health_runtime
-    {
-      validator_set = runtime.validator_set;
-      sleep = runtime.sleep;
-      replay_stashed = runtime.driver_config.replay_stashed_while_safe;
-      health = runtime.health;
-      pending = runtime.pending;
-      recovery_pending = runtime.recovery_pending;
-      poll_interval = runtime.poll_interval;
-      pending_delay = runtime.pending_delay;
-      role_label = runtime.role_label;
-    }
+type pending_error =
+  | Store_unreadable of string
+  | Record_invalid of string
+
+let pending_vote_wires_of_entries ~epoch_id entries =
+  entries
+  |> List.fold_left
+    (fun result (entry : Octra_core.Wal.pending_commit) ->
+      match result with
+      | Error _ -> result
+      | Ok wires when not (Int64.equal (Int64.of_int entry.epoch_id) epoch_id) ->
+        Ok wires
+      | Ok wires ->
+        (match entry.vote_b64 with
+         | None ->
+           Error (Record_invalid "pending commit has no stored vote")
+         | Some encoded ->
+           (try Ok (Base64.decode_exn encoded :: wires)
+            with exn ->
+              Error
+                (Record_invalid
+                   ("pending commit vote decode failed: "
+                    ^ Printexc.to_string exn)))))
+    (Ok [])
+  |> Result.map List.rev
 
 let pending_vote_wires ~data_dir ~epoch_id =
   try
     Octra_core.Wal.read_pending_commits data_dir
-    |> List.fold_left
-      (fun result (entry : Octra_core.Wal.pending_commit) ->
-        match result with
-        | Error _ -> result
-        | Ok wires when not (Int64.equal (Int64.of_int entry.epoch_id) epoch_id) ->
-          Ok wires
-        | Ok wires ->
-          (match entry.vote_b64 with
-           | None ->
-             Error "vote log record has no stored vote"
-           | Some encoded ->
-             (try Ok (Base64.decode_exn encoded :: wires)
-              with exn ->
-                Error
-                  ("vote log wire decode failed: "
-                   ^ Printexc.to_string exn))))
-      (Ok [])
-    |> Result.map List.rev
+    |> pending_vote_wires_of_entries ~epoch_id
   with exn ->
-    Error ("vote log record read failed: " ^ Printexc.to_string exn)
+    Error (Store_unreadable (Printexc.to_string exn))
+
+let prepare_votes runtime driver =
+  match
+    pending_vote_wires
+      ~data_dir:runtime.data_dir
+      ~epoch_id:runtime.start_height
+  with
+  | Error (Store_unreadable error) ->
+    Octra_log.error "consensus"
+      "event = pending_vote_restore action = hold reason = store_unreadable error = %s"
+      error;
+    false
+  | Error (Record_invalid error) ->
+    Octra_log.error "consensus"
+      "event = pending_vote_restore action = hold reason = record_invalid error = %s"
+      error;
+    false
+  | Ok wires ->
+    (match Octra_consensus.C_driver.prepare_vote_log driver (Ok wires) with
+     | Ok () -> true
+     | Error error ->
+       Octra_log.error "consensus"
+         "event = pending_vote_restore action = hold reason = vote_restore_invalid error = %s"
+         error;
+       false)
+
+let health_runtime_of_node (runtime : runtime) =
+  let base =
+    health_runtime
+      {
+        validator_set = runtime.validator_set;
+        sleep = runtime.sleep;
+        replay_stashed = runtime.driver_config.replay_stashed_while_safe;
+        health = runtime.health;
+        pending = runtime.pending;
+        recovery_pending = runtime.recovery_pending;
+        poll_interval = runtime.poll_interval;
+        pending_delay = runtime.pending_delay;
+        role_label = runtime.role_label;
+      }
+  in
+  let recover = base.Consensus_health_wiring.pending_recovery in
+  {
+    base with
+    pending_recovery = (fun driver ->
+      let open Lwt.Syntax in
+      let* ready = recover driver in
+      if ready then Lwt.return (prepare_votes runtime driver)
+      else Lwt.return_false);
+  }
 
 let create_driver runtime =
   let config =
@@ -135,12 +180,6 @@ let publish slot on_driver driver =
 
 let run runtime =
   let driver = create_driver runtime in
-  Octra_consensus.C_driver.restore_votes
-    driver
-    (pending_vote_wires
-       ~data_dir:runtime.data_dir
-       ~epoch_id:runtime.start_height);
-  Octra_consensus.C_driver.require_vote_floor driver;
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
     runtime.activate_validator_set;
