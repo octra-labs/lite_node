@@ -13,12 +13,75 @@ end
 
 module KV = Irmin_pack_unix.KV(Conf)
 module Store = KV.Make(Irmin.Contents.String)
+module Int_set = Set.Make(Int)
+
+type tag_index = {
+  ids : Int_set.t;
+  count : int;
+  min_epoch : int;
+  max_epoch : int;
+}
+
+let empty_tags = {
+  ids = Int_set.empty;
+  count = 0;
+  min_epoch = 0;
+  max_epoch = 0;
+}
+
+let tag_id branch =
+  if String.length branch > 6 && String.sub branch 0 6 = "epoch_" then
+    try Some (int_of_string (String.sub branch 6 (String.length branch - 6)))
+    with _ -> None
+  else None
+
+let add_tag epoch tags =
+  if Int_set.mem epoch tags.ids then tags
+  else {
+    ids = Int_set.add epoch tags.ids;
+    count = tags.count + 1;
+    min_epoch = if tags.count = 0 then epoch else min epoch tags.min_epoch;
+    max_epoch = if tags.count = 0 then epoch else max epoch tags.max_epoch;
+  }
+
+let drop_tag epoch tags =
+  if not (Int_set.mem epoch tags.ids) then tags
+  else
+    let ids = Int_set.remove epoch tags.ids in
+    let count = tags.count - 1 in
+    if count = 0 then empty_tags
+    else {
+      ids;
+      count;
+      min_epoch = Int_set.min_elt ids;
+      max_epoch = Int_set.max_elt ids;
+    }
+
+let load_tags repo =
+  let* branches = Store.Branch.list repo in
+  let rec loop scanned tags = function
+    | [] -> Lwt.return tags
+    | branch :: rest ->
+      let tags =
+        match tag_id branch with
+        | Some epoch -> add_tag epoch tags
+        | None -> tags
+      in
+      let scanned = scanned + 1 in
+      let* () =
+        if scanned mod 256 = 0 then Lwt.pause () else Lwt.return_unit
+      in
+      loop scanned tags rest
+  in
+  loop 0 empty_tags branches
 
 type t = {
   repo : Store.repo;
   mutable store : Store.t;
   mutable batch_tree : Store.tree option;
   stealth_counter : int64 ref;
+  mutable tags : tag_index;
+  tag_lock : Lwt_mutex.t;
   pvac_dir : string;
   state_root_file : string;
 }
@@ -85,6 +148,7 @@ let open_store ?(fresh=false) ?(readonly=false) path =
   in
   let* repo = Store.Repo.v config in
   let* store = Store.main repo in
+  let* tags = load_tags repo in
   let counter = ref 0L in
   let* v = Store.find store ["index"; "stealth_counter"] in
   (match v with
@@ -104,6 +168,8 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     store;
     batch_tree = None;
     stealth_counter = counter;
+    tags;
+    tag_lock = Lwt_mutex.create ();
     pvac_dir = pvac_dir_of_store_path path;
     state_root_file = state_root_file_of_store_path path;
   }
@@ -166,9 +232,12 @@ let remove_path t path =
        Lwt.fail (Irmin_remove_failed errmsg))
 
 let begin_epoch_batch t =
-  let* tree = Store.get_tree t.store [] in
-  t.batch_tree <- Some tree;
-  Lwt.return_unit
+  match t.batch_tree with
+  | Some _ -> Lwt.fail_with "store epoch batch is already active"
+  | None ->
+    let* tree = Store.get_tree t.store [] in
+    t.batch_tree <- Some tree;
+    Lwt.return_unit
 
 let commit_epoch_batch t msg =
   match t.batch_tree with
@@ -532,21 +601,21 @@ let write_blob t hash blob =
   | Some _ -> failwith "pvac blob hash collision"
   | None ->
     incr pvac_write_id;
-    let tmp =
-      Printf.sprintf "%s.%d.%d.tmp" path (Unix.getpid ()) !pvac_write_id
+    let staged =
+      Printf.sprintf "%s.%d.%d.staged" path (Unix.getpid ()) !pvac_write_id
     in
     let cleanup () =
-      try Unix.unlink tmp with Unix.Unix_error _ -> ()
+      try Unix.unlink staged with Unix.Unix_error _ -> ()
     in
     try
-      let oc = open_out_bin tmp in
+      let oc = open_out_bin staged in
       Fun.protect
         ~finally:(fun () -> close_out_noerr oc)
         (fun () ->
           output_string oc blob;
           flush oc;
           Unix.fsync (Unix.descr_of_out_channel oc));
-      Unix.rename tmp path;
+      Unix.rename staged path;
       fsync_dir dir;
       fsync_dir t.pvac_dir;
       fsync_dir (Filename.dirname t.pvac_dir)
@@ -1932,13 +2001,15 @@ let epoch_binding t epoch_id =
       }
 
 let tag_epoch t epoch_id =
-  let* head = Store.Head.find t.store in
-  match head with
-  | Some commit ->
-    let branch = Printf.sprintf "epoch_%d" epoch_id in
-    let* () = Store.Branch.set t.repo branch commit in
-    Lwt.return_unit
-  | None -> Lwt.return_unit
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    let* head = Store.Head.find t.store in
+    match head with
+    | Some commit ->
+      let branch = Printf.sprintf "epoch_%d" epoch_id in
+      let* () = Store.Branch.set t.repo branch commit in
+      t.tags <- add_tag epoch_id t.tags;
+      Lwt.return_unit
+    | None -> Lwt.return_unit)
 
 let rollback_to_epoch t epoch_id =
   let branch = Printf.sprintf "epoch_%d" epoch_id in
@@ -1948,6 +2019,28 @@ let rollback_to_epoch t epoch_id =
   | Some commit ->
     let* () = Store.Head.set t.store commit in
     Lwt.return (Ok ())
+
+let drop_epoch_tags_after t epoch_id =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    let rec loop removed seq =
+      match seq () with
+      | Seq.Nil ->
+        Store.flush t.repo;
+        Lwt.return removed
+      | Seq.Cons (epoch, rest) when epoch <= epoch_id ->
+        loop removed rest
+      | Seq.Cons (epoch, rest) ->
+        let* () =
+          Store.Branch.remove t.repo (Printf.sprintf "epoch_%d" epoch)
+        in
+        t.tags <- drop_tag epoch t.tags;
+        let removed = removed + 1 in
+        let* () =
+          if removed mod 256 = 0 then Lwt.pause () else Lwt.return_unit
+        in
+        loop removed rest
+    in
+    loop 0 (Int_set.to_seq t.tags.ids))
 
 let read_at_epoch t epoch_id path =
   let branch = Printf.sprintf "epoch_%d" epoch_id in
@@ -1959,14 +2052,22 @@ let read_at_epoch t epoch_id path =
     Store.Tree.find tree path
 
 let list_epoch_tags t =
-  let* branches = Store.Branch.list t.repo in
-  let epochs = List.filter_map (fun b ->
-    if String.length b > 6 && String.sub b 0 6 = "epoch_" then
-      (try Some (int_of_string (String.sub b 6 (String.length b - 6)))
-       with _ -> None)
-    else None
-  ) branches in
-  Lwt.return (List.sort compare epochs)
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    let rec loop read acc seq =
+      match seq () with
+      | Seq.Nil -> Lwt.return (List.rev acc)
+      | Seq.Cons (epoch, rest) ->
+        let read = read + 1 in
+        let* () =
+          if read mod 256 = 0 then Lwt.pause () else Lwt.return_unit
+        in
+        loop read (epoch :: acc) rest
+    in
+    loop 0 [] (Int_set.to_seq t.tags.ids))
+
+let epoch_tag_stats t =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    Lwt.return (t.tags.count, t.tags.min_epoch, t.tags.max_epoch))
 
 let gc_keep_epochs = 50000
 
@@ -1974,9 +2075,20 @@ let cleanup_old_tags t current_epoch =
   let cutoff = current_epoch - gc_keep_epochs in
   if cutoff <= 0 then Lwt.return_unit
   else
-    let* tags = list_epoch_tags t in
-    Lwt_list.iter_s (fun eid ->
-      if eid < cutoff then
-        Store.Branch.remove t.repo (Printf.sprintf "epoch_%d" eid)
-      else Lwt.return_unit
-    ) tags
+    Lwt_mutex.with_lock t.tag_lock (fun () ->
+      let rec loop removed seq =
+        match seq () with
+        | Seq.Nil -> Lwt.return_unit
+        | Seq.Cons (epoch, _) when epoch >= cutoff -> Lwt.return_unit
+        | Seq.Cons (epoch, rest) ->
+          let* () =
+            Store.Branch.remove t.repo (Printf.sprintf "epoch_%d" epoch)
+          in
+          t.tags <- drop_tag epoch t.tags;
+          let removed = removed + 1 in
+          let* () =
+            if removed mod 256 = 0 then Lwt.pause () else Lwt.return_unit
+          in
+          loop removed rest
+      in
+      loop 0 (Int_set.to_seq t.tags.ids))

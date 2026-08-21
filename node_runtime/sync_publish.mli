@@ -7,6 +7,7 @@ type prepared = {
   checkpoint_hash : string;
   anchor : Octra_bootstrap.Sync_anchor.t;
   trusted_validator_set : Octra_consensus.C_types.validator_set;
+  roots : Octra_consensus.C_types.finalize list;
 }
 
 type deps = {
@@ -21,6 +22,9 @@ type deps = {
     (Octra_consensus.C_types.validator_set, string) result;
   head : unit -> Octra_core.Head_manifest.t option;
   read_finality :
+    int64 ->
+    Consensus_finality_journal.read_result;
+  read_root :
     int64 ->
     Consensus_finality_journal.read_result;
   exporter_set :
@@ -59,6 +63,21 @@ val retention_plan :
 val publisher_addresses :
   Octra_consensus.C_types.validator_set ->
   string list
+
+val publisher_override :
+  string option ->
+  (bool, string) result
+
+val exporter_wallet :
+  force:bool ->
+  Octra_consensus.C_types.validator_set ->
+  Octra_core.Crypto.Wallet.t ->
+  (unit, string) result
+
+val capture_epochs :
+  target:int64 ->
+  Octra_core.Head_manifest.t option ->
+  int64 list
 
 val run :
   deps ->

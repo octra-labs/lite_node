@@ -110,6 +110,10 @@ type node_start = {
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
+  activate_validator_set_relief :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
 }
 
 val raw32_zero : string

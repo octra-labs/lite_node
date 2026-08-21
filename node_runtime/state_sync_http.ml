@@ -374,11 +374,16 @@ let field_list_len name json =
       end
   | _ -> 0
 
-let handle_head ~current_epoch =
+let handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
-    respond_json (State_sync.head_json ~current_epoch)
+    let snapshot_epoch =
+      match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
+      | Ok cached -> Some cached.certificate.Manifest.checkpoint.epoch
+      | Error _ -> None
+    in
+    respond_json (State_sync.head_json ~current_epoch ~snapshot_epoch)
 
 let handle_client_progress body =
   if not (state_sync_enabled ()) then
@@ -442,6 +447,11 @@ let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
           ~chain_id
           ~data_dir:(Some data_dir)
           ~chaindata
+          ~on_stop:(fun ~epoch ~reason ->
+            Log.warn "state_sync"
+              "event = catchup_range_stop epoch = %Ld reason = %s"
+              epoch
+              reason)
           ~reward_source:
             (fun _ header ->
               Consensus_reward_attribution.epoch_source
@@ -635,7 +645,7 @@ let handle
   | `GET, "/state-sync/manifest" ->
       handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set
   | `GET, "/state-sync/head" ->
-      handle_head ~current_epoch
+      handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch
   | `POST, "/state-sync/client-progress" ->
       handle_client_progress body
   | `GET, "/state-sync/readiness" ->

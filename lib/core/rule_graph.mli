@@ -30,6 +30,12 @@ val create :
   root_at:(int -> root_read) ->
   t
 
+val create_ready :
+  ready_config_hash:string ->
+  chain_id:string ->
+  root_at:(int -> root_read) ->
+  t
+
 val circle_activation : t -> activation option
 val wasm_compute_activation : t -> activation option
 val validator_quorum_activation : t -> activation option
@@ -37,6 +43,10 @@ val epoch_time_activation : t -> activation option
 val owner_migration_activation : t -> activation option
 val private_payload_activation : t -> activation option
 val set_fold_activation : t -> activation option
+val validator_ready_activation : t -> activation option
+val set_fold_cap_activation : t -> activation option
+val object_cost_activation : t -> activation option
+val ready_config_hash : t -> string option
 
 val root_after_floor :
   chain_id:string ->
@@ -75,6 +85,21 @@ val private_payload :
   (mode, fault) result
 
 val set_fold :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val validator_ready :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val set_fold_cap :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val object_cost :
   t ->
   epoch:int ->
   (mode, fault) result

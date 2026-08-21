@@ -23,10 +23,16 @@ type peer_role =
   | Validator
   | Observer
 
+type dial_plan =
+  | Hold
+  | Start of float
+
 type t = {
   config : config;
   peers : (string, P2p_conn.t) Hashtbl.t;
   dialing : (string, unit) Hashtbl.t;
+  record_dialing : (string, unit) Hashtbl.t;
+  record_due : (string, float) Hashtbl.t;
   registry : P2p_peer_registry.t;
   peer_guard : P2p_peer_guard.t;
   relayed_record_rejections : (string, int) Hashtbl.t;
@@ -39,12 +45,24 @@ type t = {
 }
 
 let max_observer_peers = 8
+let max_record_dials = 4
+let record_retry_s = 30.0
+let connect_wait_s = 10.0
+
+let record_dial_plan ~now ~due ~active =
+  if active >= max_record_dials then Hold
+  else
+    match due with
+    | Some at when now < at -> Hold
+    | _ -> Start (now +. record_retry_s)
 
 let create config =
   {
     config;
     peers = Hashtbl.create 16;
     dialing = Hashtbl.create 16;
+    record_dialing = Hashtbl.create 8;
+    record_due = Hashtbl.create 32;
     registry = P2p_peer_registry.create ();
     peer_guard = P2p_peer_guard.create ();
     relayed_record_rejections = Hashtbl.create 8;
@@ -142,6 +160,7 @@ let set_validator_pubkeys t pubkeys =
         P2p_conn.set_peer_class conn (frame_peer_class (peer_role t peer_id)))
       t.peers;
     P2p_peer_registry.clear t.registry;
+    Hashtbl.clear t.record_due;
     Ok ()
   end
 
@@ -425,7 +444,10 @@ let dial t host port =
       | ai :: _ ->
         let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
         fd_ref := Some fd;
-        let* () = Lwt_unix.connect fd ai.Unix.ai_addr in
+        let* () =
+          Lwt_unix.with_timeout connect_wait_s (fun () ->
+            Lwt_unix.connect fd ai.Unix.ai_addr)
+        in
         let my_hello = make_my_hello t in
         let* hs_result = P2p_handshake.dial_handshake fd ~my_hello
           ~allowed_pubkeys:t.config.allowed_pubkeys ~sign_fn:t.config.sign_fn in
@@ -470,7 +492,7 @@ let dial t host port =
       Lwt.return_none)
   end
 
-let maybe_dial_record t r =
+let maybe_dial_record_at t ~now r =
   let endpoint = P2p_peer_record.endpoint r in
   if not t.running
      || r.P2p_peer_record.node_id = t.config.node_id
@@ -482,16 +504,43 @@ let maybe_dial_record t r =
     match P2p_endpoint.of_string endpoint with
     | None -> ()
     | Some { P2p_endpoint.host; port } ->
-      Hashtbl.replace t.dialing endpoint ();
-      Lwt.async (fun () ->
-        Lwt.finalize
-          (fun () ->
-            let open Lwt.Syntax in
-            let* _ = dial t host port in
-            Lwt.return_unit)
-          (fun () ->
-            Hashtbl.remove t.dialing endpoint;
-            Lwt.return_unit))
+      match
+        record_dial_plan
+          ~now
+          ~due:(Hashtbl.find_opt t.record_due endpoint)
+          ~active:(Hashtbl.length t.record_dialing)
+      with
+      | Hold -> ()
+      | Start due ->
+        Hashtbl.replace t.record_due endpoint due;
+        Hashtbl.replace t.dialing endpoint ();
+        Hashtbl.replace t.record_dialing endpoint ();
+        Lwt.async (fun () ->
+          Lwt.finalize
+            (fun () ->
+              let open Lwt.Syntax in
+              let* _ = dial t host port in
+              Lwt.return_unit)
+            (fun () ->
+              Hashtbl.remove t.dialing endpoint;
+              Hashtbl.remove t.record_dialing endpoint;
+              Lwt.return_unit))
+
+let maybe_dial_record t r =
+  maybe_dial_record_at t ~now:(Unix.gettimeofday ()) r
+
+let retry_records t =
+  let now = Unix.gettimeofday () in
+  let records = P2p_peer_registry.values ~now t.registry in
+  let live = Hashtbl.create (List.length records) in
+  List.iter
+    (fun r -> Hashtbl.replace live (P2p_peer_record.endpoint r) ())
+    records;
+  Hashtbl.filter_map_inplace
+    (fun endpoint due ->
+      if Hashtbl.mem live endpoint then Some due else None)
+    t.record_due;
+  List.iter (maybe_dial_record_at t ~now) records
 
 let accept_relayed_records t records =
   records
@@ -501,7 +550,8 @@ let accept_relayed_records t records =
       t.relayed_record_accepted <- t.relayed_record_accepted + 1;
       maybe_dial_record t r
     | Ok false ->
-      t.relayed_record_unchanged <- t.relayed_record_unchanged + 1
+      t.relayed_record_unchanged <- t.relayed_record_unchanged + 1;
+      maybe_dial_record t r
     | Error reason ->
       t.relayed_record_rejected <- t.relayed_record_rejected + 1;
       let count =
@@ -613,6 +663,7 @@ let listen t =
     else
       let* (client_fd, client_addr) = Lwt_unix.accept fd in
       accept t client_fd client_addr;
+      let* () = Lwt.pause () in
       accept_loop ()
   in
   accept_loop ()
@@ -661,6 +712,7 @@ let reconnect_loop t =
       List.iter (fun id -> Hashtbl.remove t.peers id) dead;
       if validator_count t < List.length (bootstrap_endpoints t) then
         Lwt.async (fun () -> dial_bootstrap t);
+      retry_records t;
       let* () = Lwt_unix.sleep 10.0 in
       loop ()
     end

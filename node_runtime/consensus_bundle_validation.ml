@@ -20,7 +20,7 @@ let parse_txs txs_json =
        | Ok lst ->
          try
            let json = Yojson.Safe.from_string tx_json in
-           match Transaction.of_yojson json with
+           match Octra_core.Tx_payload.decode json with
            | Ok tx -> Ok (tx :: lst)
            | Error e -> Error ("of_yojson: " ^ e)
          with exn ->

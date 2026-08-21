@@ -28,6 +28,8 @@ type counts = {
   allowed : int;
 }
 
+type cap_mode = Reject | Prune
+
 val meta_key : string
 val standard : cfg
 val empty : t
@@ -38,8 +40,15 @@ val note_set :
   active:string list ->
   t ->
   (t, string) result
+val lock :
+  cfg ->
+  active:string list ->
+  t ->
+  ((t * bool), string) result
+val seats : t -> int option
 val delay : cfg -> at:int64 -> t -> (t, string) result
 val note_final :
+  ?cap_mode:cap_mode ->
   cfg ->
   at:int64 ->
   active:string list ->
@@ -48,6 +57,7 @@ val note_final :
   t ->
   (t, string) result
 val note_pulse :
+  ?cap_mode:cap_mode ->
   cfg ->
   epoch:int64 ->
   active:bool ->
@@ -55,6 +65,7 @@ val note_pulse :
   t ->
   (t, string) result
 val apply_proof :
+  ?cap_mode:cap_mode ->
   cfg ->
   chain_id:string ->
   epoch:int64 ->
@@ -86,6 +97,7 @@ val read_parent :
   Octra_consensus.C_types.parent_commit ->
   ((final * string list * string list), string) result
 val advance :
+  ?cap_mode:cap_mode ->
   cfg ->
   chain_id:string ->
   start:int64 ->

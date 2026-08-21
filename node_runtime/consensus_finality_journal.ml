@@ -35,6 +35,44 @@ type proof_result =
   | Proof_repaired
   | Proof_current
 
+type seed_result =
+  | Seeded
+  | Seed_current
+
+type conflict =
+  | History
+  | Committed
+  | Proof
+  | Certificate
+  | Bundle
+
+let classify_conflict = function
+  | Failure message when String.equal message "conflicting finality history" ->
+    Some History
+  | Failure message
+    when String.equal message "conflicting finality at committed height" ->
+    Some Committed
+  | Failure message
+    when String.equal message "conflicting committed finality journal" ->
+    Some Committed
+  | Failure message
+    when String.equal message "conflicting finality proof history" ->
+    Some Proof
+  | Failure message
+    when String.equal message "conflicting finality journal certificate" ->
+    Some Certificate
+  | Failure message
+    when String.equal message "conflicting finality journal bundle" ->
+    Some Bundle
+  | _ -> None
+
+let conflict_label = function
+  | History -> "history"
+  | Committed -> "committed"
+  | Proof -> "proof"
+  | Certificate -> "certificate"
+  | Bundle -> "bundle"
+
 let schema = "octra_finality_journal"
 let max_bytes = 128 * 1024 * 1024
 let history_limit = 4096L
@@ -129,7 +167,7 @@ let record_to_json record =
   ]
 
 let parse_transaction json =
-  match Transaction.of_yojson json with
+  match Octra_core.Tx_payload.decode json with
   | Ok tx -> tx
   | Error error -> failwith ("finality journal transaction: " ^ error)
 
@@ -407,6 +445,59 @@ let read_pending_epoch base =
       (Option.map
          (fun record -> record.finalize.C_types.epoch_id)
          (read_record (path base)))
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let check_seed ~chain_id ~validator_set ~finalize label = function
+  | None -> Ok false
+  | Some record ->
+    begin
+      match validate ~chain_id ~validator_set record with
+      | Error reason -> Error (label ^ " is invalid: " ^ reason)
+      | Ok () when not (same_finalize record.finalize finalize) ->
+        Error (label ^ " conflicts with checkpoint")
+      | Ok () -> Ok true
+    end
+
+let seed ~chain_id ~validator_set ~finalize base =
+  try
+    let record = { finalize; validator_set; bundle = None } in
+    match validate ~chain_id ~validator_set record with
+    | Error reason -> Error reason
+    | Ok () ->
+      begin
+        match read_pending_epoch base with
+        | Error reason -> Error reason
+        | Ok (Some _) -> Error "pending finality journal blocks checkpoint seed"
+        | Ok None ->
+          let epoch = finalize.C_types.epoch_id in
+          let current = read_record (committed_path base) in
+          let history = read_record (history_path base epoch) in
+          begin
+            match
+              check_seed
+                ~chain_id
+                ~validator_set
+                ~finalize
+                "committed finality journal"
+                current,
+              check_seed
+                ~chain_id
+                ~validator_set
+                ~finalize
+                "committed finality history"
+                history
+            with
+            | Error reason, _
+            | _, Error reason -> Error reason
+            | Ok has_current, Ok has_history ->
+              archive_record base record;
+              if not has_current then
+                write_encoded (committed_path base) (bytes record);
+              if has_current && has_history then Ok Seed_current
+              else Ok Seeded
+          end
+      end
   with exn ->
     Error (Printexc.to_string exn)
 
@@ -754,6 +845,30 @@ let read_committed_validated ~chain_id ~entry base =
   | Invalid _ as invalid -> invalid
   | Valid record when committed_matches entry record -> Valid record
   | Valid _ -> Invalid "committed finality journal commitment mismatch"
+
+let attested_root ~chain_id ~validator_set ~head ~root ~entry base =
+  if entry.Finality_log.height <> head then
+    Error "finality entry height does not match committed head"
+  else
+    match
+      read_committed_epoch_validated
+        ~chain_id
+        ~validator_set
+        ~epoch:(Int64.of_int head)
+        base
+    with
+    | Missing -> Error "committed finality journal is missing"
+    | Invalid reason -> Error reason
+    | Valid record when not (committed_matches entry record) ->
+      Error "committed finality journal commitment mismatch"
+    | Valid record ->
+      let expected = record.finalize.C_types.header.proposed_state_root in
+      if String.equal expected zero_root then
+        Error "committed finality root is zero"
+      else if not (String.equal expected root) then
+        Error "committed finality root mismatch"
+      else
+        Ok expected
 
 let remove base =
   let target = path base in

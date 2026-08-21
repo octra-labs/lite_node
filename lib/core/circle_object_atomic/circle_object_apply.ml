@@ -89,11 +89,11 @@ let collect_existing_members storage_tbl object_ref =
     storage_tbl
     []
 
-let active_members_after_deltas storage_tbl object_ref deltas =
+let active_members_after_deltas members deltas =
   let active = Hashtbl.create 16 in
   List.iter
     (fun member_ref -> Hashtbl.replace active member_ref true)
-    (collect_existing_members storage_tbl object_ref);
+    members;
   List.iter
     (fun (delta : Circle_object_member_delta.t) ->
       match delta.operation with
@@ -103,9 +103,6 @@ let active_members_after_deltas storage_tbl object_ref deltas =
         Hashtbl.remove active delta.member_ref)
     deltas;
   Hashtbl.fold (fun member_ref _value acc -> member_ref :: acc) active []
-
-let active_members_before_deltas storage_tbl object_ref =
-  collect_existing_members storage_tbl object_ref
 
 let validate_unique_member_refs deltas =
   let seen = Hashtbl.create 16 in
@@ -272,6 +269,7 @@ let normalize_transition_inputs
     Error message
 
 let apply
+    ?member_refs
     ~current_epoch
     ~storage_tbl
     ~transition_ref
@@ -283,7 +281,8 @@ let apply
     ~proof_kind_raw
     ~proof_receipt_hash_raw
     ~status
-    ~intent_id =
+    ~intent_id
+    () =
   match
     normalize_transition_inputs
       ~transition_ref
@@ -333,9 +332,11 @@ let apply
                   0
                   deltas in
               let active_members_before =
-                active_members_before_deltas storage_tbl object_ref in
+                match member_refs with
+                | Some load -> load ()
+                | None -> collect_existing_members storage_tbl object_ref in
               let active_members =
-                active_members_after_deltas storage_tbl object_ref deltas in
+                active_members_after_deltas active_members_before deltas in
               let bootstrap =
                 Option.is_none binding.current_state_ref
                 && active_members_before = [] in

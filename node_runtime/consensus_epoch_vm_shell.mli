@@ -36,6 +36,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
     nonce:int ->
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -262,6 +263,7 @@ type live_contract_ctx_args = {
   trusted_program_keys : Octra_vm.Program_trust.t;
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -294,6 +296,7 @@ type live_sender_vm_tx_args = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   tx : Transaction.t;
+  object_cost : bool;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
   pre_state_hash : string;

@@ -19,20 +19,26 @@ inline void toep_127_full(
     uint64_t& out_lo,
     uint64_t& out_hi
 ) {
-    if (!bits) throw std::invalid_argument("pvac: toeplitz width rejected");
+    if (!bits) throw std::runtime_error("pvac: toeplitz width rejected");
 
     const size_t y_words = (bits + 63) / 64;
     const size_t top_bits = bits + 126;
     const size_t top_words = (top_bits + 63) / 64;
 
     if (ybits.size() != y_words || top.size() != top_words)
-        throw std::invalid_argument("pvac: toeplitz shape rejected");
+        throw std::runtime_error("pvac: toeplitz shape rejected");
 
     std::vector<uint64_t> y = ybits;
     if (bits & 63) y.back() &= (1ull << (bits & 63)) - 1;
 
     std::vector<uint64_t> conv;
+#if defined(__PCLMUL__)
+    gf2_conv_clmul(y, top, conv);
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    gf2_conv_pmull(y, top, conv);
+#else
     gf2_conv_scalar(y, top, conv);
+#endif
 
     const size_t offset = bits - 1;
     out_lo = 0;

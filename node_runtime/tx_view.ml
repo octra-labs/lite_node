@@ -332,10 +332,10 @@ let requires_heavy_preverify tx =
   | _ -> false
 
 let decode_submit_tx tx_json =
-  try Transaction.of_yojson tx_json with _ -> Error "invalid tx JSON"
+  try Octra_core.Tx_payload.decode tx_json with _ -> Error "invalid tx JSON"
 
 let decode_submit_batch_tx tx_json =
-  try Transaction.of_yojson tx_json with _ -> Error "invalid tx"
+  try Octra_core.Tx_payload.decode tx_json with _ -> Error "invalid tx"
 
 let submit_params params =
   match Rpc.param_json params 0 with
@@ -1008,7 +1008,7 @@ let encrypted_payload_ok tx =
     | Transaction.ClaimOp), None -> false
   | _ -> true
 
-type payload_limits = {
+type payload_limits = Octra_core.Tx_payload.limits = {
   encrypted_data_len : int;
   message_len : int;
   message_zkp_len : int;
@@ -1016,59 +1016,7 @@ type payload_limits = {
   message_program_len : int;
 }
 
-let payload_limits = {
-  encrypted_data_len = 50_000_000;
-  message_len = 256;
-  message_zkp_len = 50_000;
-  message_validator_len = 16_384;
-  message_program_len = 10_000_000;
-}
-
-let payload_message_limit limits tx =
-  match tx.Transaction.op_type with
-  | Transaction.RecryptOp
-  | Transaction.ClaimOp -> limits.message_zkp_len
-  | Transaction.CircleAssetPut
-  | Transaction.CircleAssetPutEncrypted
-  | Transaction.CircleSealedSlotPut -> Transaction.circle_asset_message_len
-  | Transaction.ContractCall
-  | Transaction.ProgramExec
-  | Transaction.MultiExec
-  | Transaction.CircleCall
-  | Transaction.CircleSlotPolicyPut
-  | Transaction.CircleStateDescriptorPut
-  | Transaction.CircleBalanceCellPut
-  | Transaction.CircleRegisterCellPut
-  | Transaction.CircleTransportPolicyPut
-  | Transaction.CircleHfhePolicyPut
-  | Transaction.CircleKeyPolicyPut
-  | Transaction.CircleKeyGrant
-  | Transaction.CircleKeyExtend
-  | Transaction.CircleKeyRevoke
-  | Transaction.CircleKeyErase
-  | Transaction.CircleOutboxOpen
-  | Transaction.CircleRelayClaim
-  | Transaction.CircleRelayCancel
-  | Transaction.CircleIngressCommit
-  | Transaction.ContractDeploy
-  | Transaction.ProgramDeploy
-  | Transaction.CircleDeploy
-  | Transaction.CircleProgramUpdate -> limits.message_program_len
-  | Transaction.ValidatorSetUpdate
-  | Transaction.ValidatorReady
-  | Transaction.ValidatorBond
-  | Transaction.ValidatorEvidence -> limits.message_validator_len
-  | _ -> limits.message_len
-
-let payload_encrypted_data_limit limits tx =
-  match tx.Transaction.op_type with
-  | Transaction.CircleAssetPut
-  | Transaction.CircleAssetPutEncrypted
-  | Transaction.CircleSealedSlotPut
-  | Transaction.CircleBalanceCellPut
-  | Transaction.CircleRegisterCellPut ->
-    Transaction.circle_asset_max_encrypted_data_len
-  | _ -> limits.encrypted_data_len
+let payload_limits = Octra_core.Tx_payload.standard
 
 let circle_asset_body_too_large tx =
   match tx.Transaction.op_type, tx.Transaction.encrypted_data with
@@ -1080,23 +1028,11 @@ let circle_asset_body_too_large tx =
     String.length value > Transaction.circle_asset_max_encrypted_data_len
   | _ -> false
 
-let payload_size_ok ~limits tx =
-  let enc_limit = payload_encrypted_data_limit limits tx in
-  let msg_limit = payload_message_limit limits tx in
-  (match tx.Transaction.encrypted_data with
-   | Some value -> String.length value <= enc_limit
-   | None -> true)
-  && (match tx.Transaction.message with
-      | Some value -> String.length value <= msg_limit
-      | None -> true)
-
 let payload_admission ~limits tx =
   if circle_asset_body_too_large tx then
     Error ("malformed_transaction", "circle asset body exceeds max encoded size")
-  else if not (payload_size_ok ~limits tx) then
-    Error ("malformed_transaction", "encrypted_data or message exceeds size limit")
   else
-    match Octra_core.Bft_control_admission.validate_message tx.Transaction.op_type tx.Transaction.message with
+    match Octra_core.Tx_payload.admit ~limits tx with
     | Error e -> Error ("malformed_transaction", e)
     | Ok () ->
       if not (encrypted_payload_ok tx) then

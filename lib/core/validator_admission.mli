@@ -36,6 +36,7 @@ val validate_parameters : parameters -> (unit, string) result
 val validate_candidate : candidate -> (unit, string) result
 val quorum_weight : Z.t -> (Z.t, string) result
 val snapshot :
+  ?incumbents:string list ->
   parameters ->
   activate_epoch:int64 ->
   candidate list ->

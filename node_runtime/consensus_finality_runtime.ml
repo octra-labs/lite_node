@@ -52,9 +52,11 @@ type node_deps = {
   read_local_root_raw : unit -> string Lwt.t;
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
+  set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
   bundle_wait_expired : epoch_id:int64 -> unit;
   bundle_wait_recovered : epoch_id:int64 -> unit;
+  require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
@@ -75,6 +77,7 @@ type node_runtime = {
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
   apply_timeout_seconds : float;
+  require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
   runtime_state : Consensus_runtime_state.t;
@@ -197,6 +200,7 @@ let create_node deps =
                 read_local_root_raw = deps.read_local_root_raw;
                 commit_finality_journal = deps.commit_finality_journal;
                 remove_pending_finalized = deps.remove_pending_finalized;
+                set_state_attested = deps.set_state_attested;
                 apply_timeout_seconds = deps.apply_timeout_seconds;
                 fatal_exit = deps.fatal_exit;
               }
@@ -213,11 +217,25 @@ let create_node deps =
       };
     }
     (fun finalize exn ->
+      let epoch = finalize.Octra_consensus.C_types.epoch_id in
       Log.fatal "consensus"
         "event = finalized_apply_failure epoch = %Ld reason = %s action = exit"
-        finalize.Octra_consensus.C_types.epoch_id
+        epoch
         (Printexc.to_string exn);
-      deps.fatal_exit ();
+      begin
+        match Consensus_finality_journal.classify_conflict exn with
+        | Some conflict
+          when Int64.compare epoch 0L >= 0
+               && Int64.compare epoch (Int64.of_int max_int) <= 0 ->
+            Log.fatal "consensus"
+              "event = finality_conflict kind = %s epoch = %Ld action = signed_snapshot"
+              (Consensus_finality_journal.conflict_label conflict)
+              epoch;
+            let epoch = Int64.to_int epoch in
+            deps.require_sync
+              (Sync_need.journal ~epoch ~head:(max 0 (epoch - 1)))
+        | _ -> deps.fatal_exit ()
+      end;
       stop_after_fatal ())
 
 let node_deps_of_runtime runtime =
@@ -281,6 +299,12 @@ let node_deps_of_runtime runtime =
              runtime.runtime_state
              ~evidence:(bundle_wait_reason epoch_id)));
     remove_pending_finalized = runtime.finality.remove_finalized;
+    set_state_attested = (fun ~head ~root ->
+      Consensus_runtime_state.set_state_attested
+        runtime.runtime_state
+        ~head
+        ~root);
+    require_sync = runtime.require_sync;
     fatal_exit = runtime.fatal_exit;
     catchup_active = (fun () -> !(runtime.catchup_active));
     quarantine_active = (fun () ->

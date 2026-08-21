@@ -47,6 +47,7 @@ type runtime = {
   program_trust : Octra_vm.Program_trust.t;
   circle_mode : Octra_core.Rule_graph.mode;
   wasm_compute_mode : Octra_core.Rule_graph.mode;
+  object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
   private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :
@@ -212,6 +213,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
                   ~circle_mode:runtime.circle_mode
                   ~wasm_compute_mode:runtime.wasm_compute_mode
                   ~program_trust:runtime.program_trust
+                  ~object_cost:runtime.object_cost
                   tx
             in
             begin
@@ -289,13 +291,14 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
     tx_sink.confirm tx
   in
   let deferred_stealth_txs = ref [] in
-  let process_sender ~fold ~env private_field_policy sender_txs =
+  let process_sender ~fold ~env ~object_cost private_field_policy sender_txs =
     Sender_live.run
       {
         ledger = runtime.ledger;
         store = runtime.store;
         chaindata = runtime.chaindata;
         program_trust = runtime.program_trust;
+        object_cost;
         wallet_addr = runtime.wallet_addr;
         pre_state_hash = runtime.pre_state_hash;
         fold;
@@ -366,6 +369,17 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
+    let object_cost =
+      match
+        Octra_core.Rule_graph.object_cost
+          runtime.rules
+          ~epoch:epoch_id
+      with
+      | Ok Octra_core.Rule_graph.Active -> true
+      | Ok Octra_core.Rule_graph.Prior -> false
+      | Error fault ->
+        failwith (Octra_core.Rule_graph.fault_message fault)
+    in
     let private_field_policy =
       match private_field_policy_at runtime.rules epoch_id with
       | Ok policy -> policy
@@ -407,7 +421,8 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         env = (fun () -> env);
         max_fhe_per_epoch = runtime.max_fhe_per_epoch;
         max_stealth_per_epoch = runtime.max_stealth_per_epoch;
-        process_sender = process_sender ~fold ~env private_field_policy;
+        process_sender =
+          process_sender ~fold ~env ~object_cost private_field_policy;
         confirm_tx;
         reject_tx = log_rejected;
         notify_confirmed = runtime.notify_confirmed;
@@ -415,6 +430,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         program_trust = runtime.program_trust;
         circle_mode;
         wasm_compute_mode;
+        object_cost;
         owner_migration_mode;
         private_field_policy;
         legacy_replay = runtime.legacy_replay;

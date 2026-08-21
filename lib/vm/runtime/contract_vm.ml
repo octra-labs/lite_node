@@ -201,6 +201,7 @@ type exec_ctx = {
   circle_hfhe_key_id : string option;
   circle_hfhe_intent_id : string option;
   circle_hfhe_active_relay_id : string option;
+  object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -220,6 +221,7 @@ let default_ctx = {
   circle_hfhe_key_id = None;
   circle_hfhe_intent_id = None;
   circle_hfhe_active_relay_id = None;
+  object_cost = false;
   current_epoch = 0;
   epoch_time_ms = 0L;
   tree_hash = String.make 64 '0';
@@ -237,10 +239,16 @@ type storage_kind =
   | StorageU256
   | StorageAddr
 
+type member_index = {
+  keys : string array;
+  refs : (string, string array) Hashtbl.t;
+}
+
 type s = {
   regs : v array;
   mutable memory : mem;
   storage : (string, string) Hashtbl.t;
+  mutable member_index : member_index option;
   mutable effort_used : int;
   effort_limit : int;
   mutable reverted : bool;
@@ -363,6 +371,7 @@ let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=fals
     regs = Array.make 64 (VInt Z.zero);
     memory = { data = Hashtbl.create 1024; size = 0 };
     storage;
+    member_index = None;
     effort_used = 0;
     effort_limit = limit;
     reverted = false;
@@ -926,6 +935,44 @@ let add_dyn_product st factors divisor =
   | None -> false
   | Some cost -> add_dyn_effort st cost
 
+let storage_replace st key value =
+  st.member_index <- None;
+  Hashtbl.replace st.storage key value
+
+let storage_remove st key =
+  st.member_index <- None;
+  Hashtbl.remove st.storage key
+
+let object_members st object_ref =
+  let index =
+    match st.member_index with
+    | Some index -> index
+    | None ->
+      let index = {
+        keys =
+          Octra_core.Circle_object_member_query.member_keys_from_storage_tbl
+            st.storage;
+        refs = Hashtbl.create 8;
+      } in
+      st.member_index <- Some index;
+      index
+  in
+  match Hashtbl.find_opt index.refs object_ref with
+  | Some members -> members
+  | None ->
+    let members =
+      Octra_core.Circle_object_member_query.member_refs_from_keys
+        index.keys
+        object_ref in
+    Hashtbl.replace index.refs object_ref members;
+    members
+
+let add_object_scan_effort st =
+  if st.ctx.object_cost then
+    add_dyn_product st [Hashtbl.length st.storage; 5] 1
+  else
+    true
+
 let fhe_view_shape cipher =
   let shape = Pvac_ffi.cipher_shape cipher in
   Fhe_view_policy.{
@@ -966,12 +1013,12 @@ let apply_object_write st = function
   | Octra_core.Circle_object_apply.Set (key, value) ->
     let old_val = Hashtbl.find_opt st.storage key in
     st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-    Hashtbl.replace st.storage key value;
+    storage_replace st key value;
     true
   | Octra_core.Circle_object_apply.Del key ->
     let old_val = Hashtbl.find_opt st.storage key in
     st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-    Hashtbl.remove st.storage key;
+    storage_remove st key;
     true
 
 let rec apply_object_writes st = function
@@ -1067,7 +1114,7 @@ let exec_one st op =
          else begin
            let old_val = Hashtbl.find_opt st.storage key in
            st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-           Hashtbl.replace st.storage key s; true
+           storage_replace st key s; true
          end
        end)
   | SDEL key ->
@@ -1076,7 +1123,7 @@ let exec_one st op =
     else begin
       let old_val = Hashtbl.find_opt st.storage key in
       st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-      Hashtbl.remove st.storage key; true
+      storage_remove st key; true
     end
   | SDELK rk ->
     if not (view_guard st) then false
@@ -1086,7 +1133,7 @@ let exec_one st op =
       else begin
         let old_val = Hashtbl.find_opt st.storage key in
         st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-        Hashtbl.remove st.storage key; true
+        storage_remove st key; true
       end
   | SLOADK (rd, rs) ->
     let key = to_string (getr st rs) in
@@ -1110,7 +1157,7 @@ let exec_one st op =
          else begin
            let old_val = Hashtbl.find_opt st.storage key in
            st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-           Hashtbl.replace st.storage key s; true
+           storage_replace st key s; true
          end
        end)
   | MLOAD (rd, idx) ->
@@ -1193,12 +1240,12 @@ let exec_one st op =
     end
   | OBJECT_MEMBER_COUNT (rd, robject_ref) ->
     let object_ref = to_string (getr st robject_ref) in
-    let count =
-      Octra_core.Circle_object_member_query.member_count_in_storage_tbl
-        st.storage
-        object_ref in
-    setr st rd (VInt (Z.of_int count));
-    true
+    if not (add_object_scan_effort st) then
+      revert st
+    else begin
+      setr st rd (VInt (Z.of_int (Array.length (object_members st object_ref))));
+      true
+    end
   | OBJECT_HAS_MEMBER (rd, robject_ref, rmember_ref) ->
     let object_ref = to_string (getr st robject_ref) in
     let member_ref = to_string (getr st rmember_ref) in
@@ -1212,19 +1259,15 @@ let exec_one st op =
   | OBJECT_MEMBER_REF_AT (rd, robject_ref, rindex) ->
     let object_ref = to_string (getr st robject_ref) in
     let index = Z.to_int (to_z (getr st rindex)) in
-    begin
-      match
-        Octra_core.Circle_object_member_query.member_ref_at_in_storage_tbl
-          st.storage
-          object_ref
-          index
-      with
-      | Some member_ref ->
-        setr st rd (VString member_ref);
-        true
-      | None ->
+    if not (add_object_scan_effort st) then
+      revert st
+    else begin
+      let members = object_members st object_ref in
+      if index >= 0 && index < Array.length members then
+        setr st rd (VString members.(index))
+      else
         setr st rd (VString "");
-        true
+      true
     end
   | OBJECT_TRANSITION_APPLY
       ( rd,
@@ -1240,13 +1283,18 @@ let exec_one st op =
         rintent_id ) ->
     if not (view_guard st) then false
     else
+      let object_ref = to_string (getr st robject_ref) in
+      if not (add_object_scan_effort st) then
+        revert st
+      else
       begin
         match
           Octra_core.Circle_object_apply.apply
+            ~member_refs:(fun () -> Array.to_list (object_members st object_ref))
             ~current_epoch:st.ctx.current_epoch
             ~storage_tbl:st.storage
             ~transition_ref:(to_string (getr st rtransition_ref))
-            ~object_ref:(to_string (getr st robject_ref))
+            ~object_ref
             ~previous_state_ref:(to_string (getr st rprevious_state_ref))
             ~next_state_ref:(to_string (getr st rnext_state_ref))
             ~member_bundle:(to_string (getr st rmember_bundle))
@@ -1255,6 +1303,7 @@ let exec_one st op =
             ~proof_receipt_hash_raw:(to_string (getr st rproof_receipt_hash))
             ~status:(to_string (getr st rstatus))
             ~intent_id:(to_string (getr st rintent_id))
+            ()
         with
         | Error _ ->
           revert st
@@ -1488,7 +1537,7 @@ let exec_one st op =
            && not (is_reserved_key key) then begin
           let old_val = Hashtbl.find_opt st.storage key in
           st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
-          Hashtbl.replace st.storage key value
+          storage_replace st key value
         end;
         if not (add_dyn_effort st 80) then ok := false;
         incr i
@@ -2468,7 +2517,7 @@ let exec_one st op =
         let nonce_key = "\x00spawn_nonce" in
         let nonce = match Hashtbl.find_opt st.storage nonce_key with
           | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
-        Hashtbl.replace st.storage nonce_key (string_of_int (nonce + 1));
+        storage_replace st nonce_key (string_of_int (nonce + 1));
 
         let spawn_effort = 5000 + (String.length bytecode_raw / 100) in
         if not (add_dyn_effort st spawn_effort) then revert st
@@ -2485,7 +2534,7 @@ let exec_one st op =
            Octra_log.warn "program"
              "event = spawn_reverted error = %s bytecode_bytes = %d"
              e (String.length bytecode_raw);
-           Hashtbl.replace st.storage nonce_key (string_of_int nonce); revert st)
+           storage_replace st nonce_key (string_of_int nonce); revert st)
   | SPAWN2 (rd, rs, base, nargs) ->
     if not (valid_reg_span base nargs) then revert st
     else if not (view_guard st) then false
@@ -2501,7 +2550,7 @@ let exec_one st op =
         let nonce_key = "\x00spawn_nonce" in
         let nonce = match Hashtbl.find_opt st.storage nonce_key with
           | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
-        Hashtbl.replace st.storage nonce_key (string_of_int (nonce + 1));
+        storage_replace st nonce_key (string_of_int (nonce + 1));
         let spawn_effort = 5000 + (String.length bytecode_raw / 100) in
         if not (add_dyn_effort st spawn_effort) then revert st
         else
@@ -2517,7 +2566,7 @@ let exec_one st op =
            Octra_log.warn "program"
              "event = spawn_reverted version = 2 error = %s bytecode_bytes = %d params = %d"
              e (String.length bytecode_raw) nargs;
-           Hashtbl.replace st.storage nonce_key (string_of_int nonce); revert st)
+           storage_replace st nonce_key (string_of_int nonce); revert st)
   | TRANSFER (rd, ra, rv) ->
     if not (view_guard st) then false
     else
@@ -2540,9 +2589,9 @@ let exec_one st op =
       | [] -> []
       | UndoMarker _ :: rest -> rest
       | UndoWrite (k, Some v) :: rest ->
-        Hashtbl.replace st.storage k v; restore rest
+        storage_replace st k v; restore rest
       | UndoWrite (k, None) :: rest ->
-        Hashtbl.remove st.storage k; restore rest
+        storage_remove st k; restore rest
     in
     st.undo_stack <- restore st.undo_stack;
     true

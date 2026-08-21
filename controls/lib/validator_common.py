@@ -251,8 +251,8 @@ def private_sync_host(host):
 
 def state_sync_sources(raw):
     sources = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
-    if len(sources) < 2:
-        raise ValidatorError("at least two state sync sources are required")
+    if not sources:
+        raise ValidatorError("at least one state sync source is required")
     if len(sources) != len(set(sources)):
         raise ValidatorError("duplicate state sync source")
     for source in sources:

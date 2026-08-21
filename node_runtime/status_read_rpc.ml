@@ -70,8 +70,13 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
 
 let epoch_tags store =
   let open Lwt.Syntax in
-  let* tags = Store_irmin.list_epoch_tags store in
-  ok (Status_rpc.epoch_tags ~tags ~keep_epochs:Store_irmin.gc_keep_epochs)
+  let* count, min_epoch, max_epoch = Store_irmin.epoch_tag_stats store in
+  ok
+    (Status_rpc.epoch_tags
+       ~count
+       ~min_epoch
+       ~max_epoch
+       ~keep_epochs:Store_irmin.gc_keep_epochs)
 
 let signed_root signer head =
   match head with
@@ -230,7 +235,7 @@ let node_stats ~ledger ~chaindata ~current_epoch ~total_confirmed ~encrypted =
        ~encrypted
        ~max_supply:(Ledger.get_max_supply ())
        ~total_confirmed
-       ~staging:(List.length (Staging.all ()))
+       ~staging:(Staging.staging_size ())
        ~recent_tx_count
        ~latest_epochs:recent_epochs
        ~head:(Octra_core.Head_manifest.get_cached ()))

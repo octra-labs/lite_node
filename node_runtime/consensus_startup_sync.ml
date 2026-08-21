@@ -21,6 +21,7 @@ type deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -68,6 +69,7 @@ type node_deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -118,6 +120,7 @@ let node_deps runtime =
     validator = runtime.validator;
     validator_pubkey = runtime.validator_pubkey;
     priv_b64 = runtime.priv_b64;
+    require_sync = runtime.require_sync;
     exit_error = runtime.exit_error;
     exit_success = runtime.exit_success;
   }
@@ -152,6 +155,7 @@ let join_wiring (deps : deps) =
     validator = deps.validator;
     validator_pubkey = deps.validator_pubkey;
     priv_b64 = deps.priv_b64;
+    require_sync = deps.require_sync;
   }
 
 let run_replay (deps : deps) =

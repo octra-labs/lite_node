@@ -241,7 +241,7 @@ let prepared_matches tx prepared =
   | T.ClaimOp, Private_ledger.Prepared_claim _ -> true
   | _ -> false
 
-let prepared_operation verify prepared tx =
+let prepared_operation ~field_policy ~ledger verify prepared tx =
   let open Lwt.Syntax in
   match prepared with
   | None ->
@@ -259,7 +259,21 @@ let prepared_operation verify prepared tx =
       | A.Pending -> Lwt.return A.Pending
       | A.Invalid reason -> Lwt.return (A.Invalid reason)
       | A.Ready value when prepared_matches tx value ->
-        Lwt.return (A.Ready value)
+        let* current =
+          Private_ledger.prepared_current
+            ~field_policy
+            ledger
+            tx
+            value
+        in
+        if current then Lwt.return (A.Ready value)
+        else
+          let* result = verify tx in
+          Lwt.return
+            (Result.fold
+               ~ok:(fun value -> A.Ready value)
+               ~error:(fun reason -> A.Invalid reason)
+               result)
       | A.Ready _ ->
         Lwt.return (A.Invalid "prepared operation mismatch")
     end
@@ -286,12 +300,19 @@ let run_heavy
            ~error:(fun reason -> A.Invalid reason)
            result)
     else
-      prepared_operation (verify_key_switch field_policy ledger) prepared tx
+      prepared_operation
+        ~field_policy
+        ~ledger
+        (verify_key_switch field_policy ledger)
+        prepared
+        tx
   | (T.EncryptOp | T.DecryptOp | T.StealthOp | T.ClaimOp), Some ledger ->
     prepared_operation
       (verify_private field_policy result_policy ledger)
       prepared
       tx
+      ~field_policy
+      ~ledger
   | T.PrivateOp, _ -> Lwt.return (A.Invalid "private_disabled")
   | T.RecryptOp, _ -> Lwt.return (A.Invalid "recrypt_disabled")
   | T.CircleBalanceCellPut, _ ->
@@ -627,3 +648,12 @@ let run_many
 let checked_cacheable = function
   | Checked_ready _ -> true
   | Checked_skip item -> item.kind = Invalid
+
+let defer reason txs =
+  {
+    ready = [];
+    skipped =
+      List.map
+        (fun tx -> { tx; reason; kind = Deferred })
+        txs;
+  }

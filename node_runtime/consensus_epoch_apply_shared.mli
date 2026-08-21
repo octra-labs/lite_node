@@ -45,6 +45,7 @@ type runtime = {
   program_trust : Octra_vm.Program_trust.t;
   circle_mode : Octra_core.Rule_graph.mode;
   wasm_compute_mode : Octra_core.Rule_graph.mode;
+  object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
   private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :

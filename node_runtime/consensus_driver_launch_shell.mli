@@ -9,6 +9,10 @@ type runtime = {
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
+  activate_validator_set_relief :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
   finality_proof_needed : bool;
   check_finality_proof :
     Octra_consensus.C_types.validator_set ->
@@ -60,6 +64,15 @@ val health_runtime_of_node :
 type pending_error =
   | Store_unreadable of string
   | Record_invalid of string
+
+type vote_plan =
+  | Observe
+  | Hold
+
+val vote_plan :
+  observer:bool ->
+  bootstrap:bool ->
+  vote_plan
 
 val pending_vote_wires_of_entries :
   epoch_id:int64 ->

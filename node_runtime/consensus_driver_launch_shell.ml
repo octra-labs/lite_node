@@ -9,6 +9,10 @@ type runtime = {
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
+  activate_validator_set_relief :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
   finality_proof_needed : bool;
   check_finality_proof :
     Octra_consensus.C_types.validator_set ->
@@ -83,6 +87,13 @@ type pending_error =
   | Store_unreadable of string
   | Record_invalid of string
 
+type vote_plan =
+  | Observe
+  | Hold
+
+let vote_plan ~observer ~bootstrap =
+  if observer || bootstrap then Observe else Hold
+
 let pending_vote_wires_of_entries ~epoch_id entries =
   entries
   |> List.fold_left
@@ -132,10 +143,23 @@ let prepare_votes runtime driver =
     (match Octra_consensus.C_driver.prepare_vote_log driver (Ok wires) with
      | Ok () -> true
      | Error error ->
-       Octra_log.error "consensus"
-         "event = pending_vote_restore action = hold reason = vote_restore_invalid error = %s"
-         error;
-       false)
+       let plan =
+         vote_plan
+           ~observer:(String.equal runtime.role_label "observer")
+           ~bootstrap:
+             (Octra_consensus.C_driver.vote_log_bootstrap_pending driver)
+       in
+       match plan with
+       | Observe ->
+         Octra_log.warn "consensus"
+           "event = pending_vote_restore action = observe reason = vote_restore_invalid error = %s"
+           error;
+         true
+       | Hold ->
+         Octra_log.error "consensus"
+           "event = pending_vote_restore action = hold reason = vote_restore_invalid error = %s"
+           error;
+         false)
 
 let health_runtime_of_node (runtime : runtime) =
   let base =
@@ -172,6 +196,7 @@ let create_driver runtime =
     ~swarm:runtime.swarm
     ~start_height:runtime.start_height
     ~sync_log:(Octra_consensus.C_sync_log.disk ~data_dir:runtime.data_dir)
+    ~relief_log:(Octra_consensus.C_relief_log.disk ~data_dir:runtime.data_dir)
     ~vote_log:(Octra_consensus.C_vote_log.disk ~data_dir:runtime.data_dir)
 
 let publish slot on_driver driver =
@@ -183,6 +208,9 @@ let run runtime =
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
     runtime.activate_validator_set;
+  Octra_consensus.C_driver.set_validator_set_relief_handler
+    driver
+    runtime.activate_validator_set_relief;
   Octra_consensus.C_driver.set_finality_proof_handler
     driver
     ~needed:runtime.finality_proof_needed

@@ -9,6 +9,7 @@ type deps = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   program_trust : Octra_vm.Program_trust.t;
+  object_cost : bool;
   wallet_addr : string;
   pre_state_hash : string;
   fold : int -> (Octra_core.Epoch_exec.fold_ctx, string) result;
@@ -125,6 +126,7 @@ let run deps sender_txs =
           store = deps.store;
           chaindata = deps.chaindata;
           tx;
+          object_cost = deps.object_cost;
           current_epoch = deps.current_epoch;
           epoch_time_ms =
             (match Octra_consensus.Epoch_time.of_seconds

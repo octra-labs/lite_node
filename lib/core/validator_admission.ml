@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+module String_set = Set.Make (String)
+
 type candidate = {
   address : string;
   pubkey : string;
@@ -77,6 +79,13 @@ let compare_candidate (left : candidate) (right : candidate) =
     if by_address <> 0 then by_address
     else String.compare left.pubkey right.pubkey
 
+let compare_selected incumbents (left : candidate) (right : candidate) =
+  match String_set.mem left.address incumbents,
+        String_set.mem right.address incumbents with
+  | true, false -> -1
+  | false, true -> 1
+  | _ -> compare_candidate left right
+
 let rec take count values =
   if count <= 0 then []
   else
@@ -145,7 +154,7 @@ let source_epoch (parameters : parameters) activate_epoch =
   else
     Ok (Int64.sub activate_epoch parameters.activation_delay)
 
-let snapshot (parameters : parameters) ~activate_epoch
+let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
     (candidates : candidate list) =
   match validate_parameters parameters with
   | Error _ as error -> error
@@ -171,10 +180,16 @@ let snapshot (parameters : parameters) ~activate_epoch
               match validate_unique candidates with
               | Error _ as error -> error
               | Ok () ->
+                let incumbents =
+                  List.fold_left
+                    (fun set address -> String_set.add address set)
+                    String_set.empty
+                    incumbents
+                in
                 let validators =
                   candidates
                   |> List.filter (eligible ~parameters ~source_epoch)
-                  |> List.sort compare_candidate
+                  |> List.sort (compare_selected incumbents)
                   |> take parameters.max_validators
                   |> List.map
                     (fun (candidate : candidate) -> {

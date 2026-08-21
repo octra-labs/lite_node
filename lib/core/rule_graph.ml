@@ -25,6 +25,7 @@ type activation = {
 
 type t = {
   chain_id : string;
+  ready_config_hash : string option;
   circle_activation : activation option;
   wasm_compute_activation : activation option;
   validator_quorum_activation : activation option;
@@ -32,6 +33,9 @@ type t = {
   owner_migration_activation : activation option;
   private_payload_activation : activation option;
   set_fold_activation : activation option;
+  validator_ready_activation : activation option;
+  set_fold_cap_activation : activation option;
+  object_cost_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -64,6 +68,13 @@ let devnet_set_fold_activation = {
   activation_epoch = 1_334_000;
 }
 
+let devnet_validator_transition_activation = {
+  anchor_epoch = 1_353_962;
+  anchor_state_root =
+    "1def67e4c5886e28f648972ab3275901e66def42147b1b8b0d57a7578d19dec4";
+  activation_epoch = 1_380_000;
+}
+
 let owner_migration_activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then
     Some devnet_owner_migration_activation
@@ -88,6 +99,24 @@ let set_fold_activation_for_chain chain_id =
   else
     None
 
+let validator_ready_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_validator_transition_activation
+  else
+    None
+
+let set_fold_cap_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_validator_transition_activation
+  else
+    None
+
+let object_cost_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_validator_transition_activation
+  else
+    None
+
 let validator_quorum_activation_for_chain chain_id : activation option =
   match Octra_consensus.C_quorum_policy.activation_for_chain chain_id with
   | None -> None
@@ -108,7 +137,7 @@ let epoch_time_activation_for_chain chain_id : activation option =
       activation_epoch = source.activation_epoch;
     }
 
-let create ~chain_id ~root_at =
+let make ~ready_config_hash ~chain_id ~root_at =
   let circle_activation =
     if String.equal chain_id devnet_chain_id then
       Some devnet_circle_activation
@@ -117,6 +146,7 @@ let create ~chain_id ~root_at =
   in
   {
     chain_id;
+    ready_config_hash;
     circle_activation;
     wasm_compute_activation = wasm_compute_activation_for_chain chain_id;
     validator_quorum_activation =
@@ -125,8 +155,17 @@ let create ~chain_id ~root_at =
     owner_migration_activation = owner_migration_activation_for_chain chain_id;
     private_payload_activation = private_payload_activation_for_chain chain_id;
     set_fold_activation = set_fold_activation_for_chain chain_id;
+    validator_ready_activation = validator_ready_activation_for_chain chain_id;
+    set_fold_cap_activation = set_fold_cap_activation_for_chain chain_id;
+    object_cost_activation = object_cost_activation_for_chain chain_id;
     root_at;
   }
+
+let create ~chain_id ~root_at =
+  make ~ready_config_hash:None ~chain_id ~root_at
+
+let create_ready ~ready_config_hash ~chain_id ~root_at =
+  make ~ready_config_hash:(Some ready_config_hash) ~chain_id ~root_at
 
 let circle_activation t = t.circle_activation
 let wasm_compute_activation t = t.wasm_compute_activation
@@ -135,6 +174,10 @@ let epoch_time_activation t = t.epoch_time_activation
 let owner_migration_activation t = t.owner_migration_activation
 let private_payload_activation t = t.private_payload_activation
 let set_fold_activation t = t.set_fold_activation
+let validator_ready_activation t = t.validator_ready_activation
+let set_fold_cap_activation t = t.set_fold_cap_activation
+let object_cost_activation t = t.object_cost_activation
+let ready_config_hash t = t.ready_config_hash
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
   if String.equal chain_id devnet_chain_id
@@ -149,6 +192,9 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       wasm_compute_activation_for_chain chain_id;
       private_payload_activation_for_chain chain_id;
       set_fold_activation_for_chain chain_id;
+      validator_ready_activation_for_chain chain_id;
+      set_fold_cap_activation_for_chain chain_id;
+      object_cost_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -231,6 +277,15 @@ let set_fold t ~epoch =
   match t.set_fold_activation with
   | Some activation -> mode t (Some activation) ~epoch
   | None -> Ok Prior
+
+let validator_ready t ~epoch =
+  mode t t.validator_ready_activation ~epoch
+
+let set_fold_cap t ~epoch =
+  mode t t.set_fold_cap_activation ~epoch
+
+let object_cost t ~epoch =
+  mode t t.object_cost_activation ~epoch
 
 let fault_message = function
   | Anchor_missing epoch ->

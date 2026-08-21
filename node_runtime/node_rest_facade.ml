@@ -47,7 +47,7 @@ let encrypted_supply_aggregate store ledger () =
   | Ok hidden -> hidden
   | Error error -> failwith error
 
-let notify_staging_update ?(total_txs = List.length (Staging.all ()))
+let notify_staging_update ?(total_txs = Staging.staging_size ())
     ?(total_ou = !Staging.total_ou) ?(max_ou = Staging.max_ou) () =
   WSServer.notify_staging_update ~total_txs ~total_ou ~max_ou
 
@@ -111,7 +111,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
               Tx_view.staging_submit_effects
                 ~relay
                 ~peer_count
-                ~total_txs:(List.length (Staging.all ()))
+                ~total_txs:(Staging.staging_size ())
                 ~total_ou:!Staging.total_ou
                 ~max_ou:Staging.max_ou
                 ~tx_hash

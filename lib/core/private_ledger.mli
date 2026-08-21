@@ -218,6 +218,13 @@ val bind_private_artifact :
   private_artifact ->
   private_binding Lwt.t
 
+val prepared_current :
+  field_policy:field_policy ->
+  Ledger.t ->
+  Transaction.t ->
+  prepared ->
+  bool Lwt.t
+
 val prepare_key_switch_plan :
   field_policy:field_policy ->
   Ledger.t ->

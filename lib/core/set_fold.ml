@@ -37,6 +37,7 @@ type t = {
   finals : final list;
   safe_after : int64;
   applied : int64 option;
+  seats : int option;
 }
 
 type cfg = {
@@ -58,6 +59,12 @@ type counts = {
   allowed : int;
 }
 
+type cap_mode = Reject | Prune
+
+type final_step =
+  | Final_applied of t
+  | Final_held of t * string
+
 let meta_key = "bft.validator_duty"
 
 let standard = {
@@ -68,7 +75,13 @@ let standard = {
   max_members = 200;
 }
 
-let empty = { members = []; finals = []; safe_after = 0L; applied = None }
+let empty = {
+  members = [];
+  finals = [];
+  safe_after = 0L;
+  applied = None;
+  seats = None;
+}
 
 let validate_cfg cfg =
   if Int64.compare cfg.window 64L < 0 || Int64.compare cfg.window 128L > 0 then
@@ -161,6 +174,66 @@ let retain_member cfg ~epoch member =
     not (Z.equal member.marks.bits Z.zero)
     || pulse_fresh cfg ~epoch pulse
 
+let last_mark marks =
+  if Z.equal marks.bits Z.zero then None
+  else
+    Some
+      (Int64.add
+         marks.floor
+         (Int64.of_int (Z.numbits marks.bits - 1)))
+
+let shadow_epoch member =
+  match member.phase, last_mark member.marks with
+  | Live _, _ -> None
+  | Shadow None, mark -> mark
+  | Shadow (Some pulse), None -> Some pulse.last
+  | Shadow (Some pulse), Some mark -> Some (Int64.max pulse.last mark)
+
+let compare_shadow (left_address, left) (right_address, right) =
+  let by_epoch =
+    match shadow_epoch left, shadow_epoch right with
+    | None, None -> 0
+    | None, Some _ -> -1
+    | Some _, None -> 1
+    | Some left_epoch, Some right_epoch ->
+      Int64.compare left_epoch right_epoch
+  in
+  if by_epoch <> 0 then by_epoch
+  else String.compare left_address right_address
+
+let rec remove_oldest count table = function
+  | _ when count <= 0 -> Ok table
+  | [] -> Error "validator duty live state exceeds member limit"
+  | (address, _) :: rest ->
+    remove_oldest (count - 1) (String_map.remove address table) rest
+
+let prune_table cfg ~epoch table =
+  let table =
+    String_map.map
+      (fun member ->
+        { member with marks = prune_marks cfg epoch member.marks })
+      table
+    |> String_map.filter (fun _ member -> retain_member cfg ~epoch member)
+  in
+  let overflow = String_map.cardinal table - member_cap cfg in
+  if overflow <= 0 then Ok table
+  else
+    table
+    |> String_map.bindings
+    |> List.filter (fun (_, member) ->
+      match member.phase with
+      | Live _ -> false
+      | Shadow _ -> true)
+    |> List.sort compare_shadow
+    |> remove_oldest overflow table
+
+let bound_table cfg ~cap_mode ~epoch table =
+  match cap_mode with
+  | Reject when String_map.cardinal table > member_cap cfg ->
+    Error "validator duty state exceeds member limit"
+  | Reject -> Ok table
+  | Prune -> prune_table cfg ~epoch table
+
 let sync cfg ~epoch ~active state =
   let active = List.sort_uniq String.compare active in
   if List.length active > cfg.max_members then
@@ -210,6 +283,25 @@ let note_set cfg ~epoch ~active state =
     Error "validator duty set epoch is negative"
   | Ok () -> sync cfg ~epoch ~active state
 
+let lock cfg ~active state =
+  match validate_cfg cfg with
+  | Error _ as error -> error
+  | Ok () ->
+    begin
+      match state.seats with
+      | Some seats when seats < 4 || seats > cfg.max_members ->
+        Error "validator seat limit is outside bounds"
+      | Some _ -> Ok (state, false)
+      | None ->
+        let seats = active |> List.sort_uniq String.compare |> List.length in
+        if seats < 4 || seats > cfg.max_members then
+          Error "validator seat limit is outside bounds"
+        else
+          Ok ({ state with seats = Some seats }, true)
+    end
+
+let seats state = state.seats
+
 let delay cfg ~at state =
   match validate_cfg cfg with
   | Error _ as error -> error
@@ -239,17 +331,17 @@ let put_final cfg ~at final finals =
   | Some _ -> Error "validator duty finality conflict"
   | None -> Ok (retain_finals cfg ~at (final :: finals) |> sort_finals)
 
-let note_final cfg ~at ~active ~final ~signers state =
+let note_final_step ~cap_mode cfg ~at ~active ~final ~signers state =
   match validate_cfg cfg with
-  | Error _ as error -> error
+  | Error error -> Final_held (state, error)
   | Ok () when Int64.compare at 0L <= 0 ->
-    Error "validator duty apply epoch is not positive"
+    Final_held (state, "validator duty apply epoch is not positive")
   | Ok () when not (Int64.equal (Int64.succ final.epoch) at) ->
-    Error "validator duty finality epoch is not parent"
+    Final_held (state, "validator duty finality epoch is not parent")
   | Ok () ->
     begin
       match sync cfg ~epoch:at ~active state with
-      | Error _ as error -> error
+      | Error error -> Final_held (state, error)
       | Ok state ->
         let signers = List.sort_uniq String.compare signers in
         let table = table_of_members state.members in
@@ -259,19 +351,31 @@ let note_final cfg ~at ~active ~final ~signers state =
             table
             signers
         in
-        if String_map.cardinal table > member_cap cfg then
-          Error "validator duty state exceeds member limit"
-        else
+        begin
+          match bound_table cfg ~cap_mode ~epoch:at table with
+          | Error error -> Final_held (state, error)
+          | Ok table ->
+            let state = {
+              state with
+              members = String_map.bindings table |> List.map snd;
+            } in
           match put_final cfg ~at final state.finals with
-          | Error _ as error -> error
+          | Error error -> Final_held (state, error)
           | Ok finals ->
-            Ok {
+            Final_applied {
               members = String_map.bindings table |> List.map snd;
               finals;
               safe_after = state.safe_after;
               applied = state.applied;
+              seats = state.seats;
             }
+        end
     end
+
+let note_final ?(cap_mode=Reject) cfg ~at ~active ~final ~signers state =
+  match note_final_step ~cap_mode cfg ~at ~active ~final ~signers state with
+  | Final_applied state -> Ok state
+  | Final_held (_, error) -> Error error
 
 let advance_pulse cfg epoch = function
   | None -> Ok { first = epoch; last = epoch; count = 1 }
@@ -285,7 +389,7 @@ let advance_pulse cfg epoch = function
     else
       Ok { first = epoch; last = epoch; count = 1 }
 
-let note_pulse cfg ~epoch ~active ~address state =
+let note_pulse ?(cap_mode=Reject) cfg ~epoch ~active ~address state =
   match validate_cfg cfg with
   | Error _ as error -> error
   | Ok () when address = "" -> Error "validator duty pulse address is empty"
@@ -314,10 +418,9 @@ let note_pulse cfg ~epoch ~active ~address state =
           marks = prune_marks cfg epoch member.marks;
         } in
         let table = String_map.add address member table in
-        if String_map.cardinal table > member_cap cfg then
-          Error "validator duty state exceeds member limit"
-        else
-          Ok { state with members = String_map.bindings table |> List.map snd }
+        bound_table cfg ~cap_mode ~epoch table
+        |> Result.map (fun table ->
+          { state with members = String_map.bindings table |> List.map snd })
     end
 
 let find_final epoch state =
@@ -384,7 +487,7 @@ let read_parent ~chain_id (commit : C_types.parent_commit) =
     in
     Ok (final, signers, active)
 
-let advance cfg ~chain_id ~start ~at ~parent state =
+let advance ?(cap_mode=Reject) cfg ~chain_id ~start ~at ~parent state =
   match state.applied with
   | Some epoch when Int64.equal epoch at -> Ok (state, None, false)
   | Some epoch when Int64.compare epoch at > 0 ->
@@ -410,9 +513,18 @@ let advance cfg ~chain_id ~start ~at ~parent state =
             | Error _ as error -> error
             | Ok (final, signers, active) ->
               begin
-                match note_final cfg ~at ~active ~final ~signers state with
-                | Ok state -> Ok (state, None)
-                | Error error -> hold state error
+                match
+                  note_final_step
+                    ~cap_mode
+                    cfg
+                    ~at
+                    ~active
+                    ~final
+                    ~signers
+                    state
+                with
+                | Final_applied state -> Ok (state, None)
+                | Final_held (state, error) -> hold state error
               end
           end
       in
@@ -450,7 +562,7 @@ let verify_proof cfg ~chain_id ~epoch ~address proof state =
         | Error _ as error -> error
         | Ok () -> verify_commit ~chain_id commit
 
-let apply_proof cfg ~chain_id ~epoch ~active ~address proof state =
+let apply_proof ?(cap_mode=Reject) cfg ~chain_id ~epoch ~active ~address proof state =
   match verify_proof cfg ~chain_id ~epoch ~address proof state with
   | Error _ as error -> error
   | Ok () ->
@@ -463,10 +575,9 @@ let apply_proof cfg ~chain_id ~epoch ~active ~address proof state =
     in
     let marks = add_mark cfg proof.vote.epoch_id member.marks in
     let table = String_map.add address { member with marks } table in
-    if String_map.cardinal table > member_cap cfg then
-      Error "validator duty state exceeds member limit"
-    else
-      Ok { state with members = String_map.bindings table |> List.map snd }
+    bound_table cfg ~cap_mode ~epoch table
+    |> Result.map (fun table ->
+      { state with members = String_map.bindings table |> List.map snd })
 
 let warm_end cfg start = Int64.add start (Int64.add cfg.window cfg.challenge)
 
@@ -643,7 +754,7 @@ let final_to_json item =
   ]
 
 let to_yojson state =
-  `Assoc [
+  let fields = [
     "standard", `String "octra-validator-duty";
     "safe_after", `String (Int64.to_string state.safe_after);
     "applied",
@@ -653,7 +764,13 @@ let to_yojson state =
         state.applied;
     "members", `List (List.map member_to_json (sort_members state.members));
     "finals", `List (List.map final_to_json (sort_finals state.finals));
-  ]
+  ] in
+  let fields =
+    match state.seats with
+    | None -> fields
+    | Some seats -> fields @ ["seats", `Int seats]
+  in
+  `Assoc fields
 
 let int64_json label = function
   | `String raw ->
@@ -689,6 +806,17 @@ let optional_int64 label = function
   | json -> int64_json label json |> Result.map Option.some
 
 let bind f result = Result.bind result f
+
+let optional_seats fields =
+  match List.assoc_opt "seats" fields with
+  | None
+  | Some `Null -> Ok None
+  | Some json ->
+    int_json "validator duty seats" json
+    |> bind (fun seats ->
+      if seats < 4 || seats > standard.max_members then
+        Error "validator duty seats are outside bounds"
+      else Ok (Some seats))
 
 let pulse_of_json json =
   assoc "validator duty pulse" json
@@ -815,6 +943,7 @@ let of_yojson json =
       |> bind (fun safe_after ->
       field "applied" fields |> bind (optional_int64 "validator duty applied epoch")
       |> bind (fun applied ->
+      optional_seats fields |> bind (fun seats ->
       field "members" fields |> bind (list "validator duty members")
       |> bind (decode_list member_of_json)
       |> bind (fun members ->
@@ -828,7 +957,8 @@ let of_yojson json =
                 finals = sort_finals finals;
                 safe_after;
                 applied;
-              }))))))
+                seats;
+              })))))))
     | _ -> Error "validator duty standard is invalid")
 
 let to_string state = Yojson.Safe.to_string (to_yojson state)

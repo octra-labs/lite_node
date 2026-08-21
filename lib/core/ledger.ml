@@ -29,6 +29,12 @@ type t = {
   mutable epoch_journals : epoch_journal list;
 }
 
+type snap = {
+  items : (string, account) Hashtbl.t;
+  supply : Z.t;
+  active : int;
+}
+
 type transfer_error =
   | Debit_rejected of string
   | Credit_rejected of string
@@ -148,22 +154,32 @@ let create_from_store store =
 let create store =
   create_from_store store
 
-let clone_clean store source =
+let freeze source =
   if source.dirty || Hashtbl.length source.dirty_addrs > 0 then
     Error "ledger clone requires flushed accounts"
   else if journal_active source then
     Error "ledger clone requires no active journal"
   else
     Ok {
+      items = Hashtbl.copy source.cache;
+      supply = source.total_supply;
+      active = source.active_accounts;
+    }
+
+let thaw store snap =
+  {
       store;
-      cache = Hashtbl.copy source.cache;
+      cache = Hashtbl.copy snap.items;
       dirty_addrs = Hashtbl.create 64;
       dirty = false;
-      total_supply = source.total_supply;
-      active_accounts = source.active_accounts;
+      total_supply = snap.supply;
+      active_accounts = snap.active;
       spent_nonces = Hashtbl.create 1000;
       epoch_journals = [];
     }
+
+let clone_clean store source =
+  Result.map (thaw store) (freeze source)
 
 let get_account_internal l addr =
   match Hashtbl.find_opt l.cache addr with
@@ -220,7 +236,6 @@ let register_public_key l addr pk =
   | Some a -> set_account_internal l addr { a with public_key = Some pk }
 
 let credit ?encrypted_balance l addr amount =
-
   if Z.sign amount < 0 then Error "negative credit amount"
   else if not (supply_check l amount) then
     Error "supply violation: would exceed 1B hard cap"
@@ -232,7 +247,6 @@ let credit ?encrypted_balance l addr amount =
     Ok ()
 
 let debit ?encrypted_balance l addr amount nonce =
-
   if Z.sign amount < 0 then Error "negative debit amount"
   else match get_account_internal l addr with
   | None -> Error "Sender not found"

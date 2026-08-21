@@ -17,6 +17,7 @@ type prev_root_result =
 
 type prev_root_effects = {
   fatal : string -> unit;
+  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 
@@ -100,6 +101,7 @@ type post_root_effects = {
   warn : string -> unit;
   error : string -> unit;
   fatal : string -> unit;
+  require_sync : Sync_need.t -> unit;
   remove_expected_root : int -> unit;
   prune_expected_roots_before : int -> unit;
   exit : unit -> unit;
@@ -342,6 +344,10 @@ let run_prev_root_check (effects : prev_root_effects) context =
            ~epoch_id:context.epoch_id
            ~local_raw
            ~expected_prev);
+      effects.require_sync
+        (Sync_need.root
+           ~epoch:context.epoch_id
+           ~head:(max 0 (context.epoch_id - 1)));
       effects.exit ();
       Prev_root_exited
 
@@ -508,7 +514,7 @@ let post_root_mismatch_fatal_lines ~epoch_id ~expected_root ~actual_root
       proposer
       tx_count;
     "event = commit_refused reason = divergent_state";
-    "event = recovery action = restart_and_catchup";
+    "event = recovery action = signed_snapshot";
   ]
 
 let post_root_action ~consensus_mode ~layera_diag ~epoch_id ~actual_root
@@ -601,7 +607,10 @@ let run_post_root_check effects (ctx : post_root_context) =
   | Post_root_fail { diag_lines; fatal_lines } ->
     List.iter effects.error diag_lines;
     List.iter effects.fatal fatal_lines;
-    effects.remove_expected_root ctx.epoch_id;
+    effects.require_sync
+      (Sync_need.root
+         ~epoch:ctx.epoch_id
+         ~head:(max 0 (ctx.epoch_id - 1)));
     effects.exit ();
     Post_root_exited
 

@@ -17,8 +17,22 @@ type entry = {
   hash : string;
 }
 
+module Index_key = struct
+  type t = string * int * string
+
+  let compare (af, an, ah) (bf, bn, bh) =
+    let sender = String.compare af bf in
+    if sender <> 0 then sender
+    else
+      let nonce = Int.compare an bn in
+      if nonce <> 0 then nonce else String.compare ah bh
+end
+
+module Index = Map.Make(Index_key)
+
 let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
 let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
+let view_index = ref Index.empty
 let total_ou = ref Z.zero
 
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
@@ -97,8 +111,23 @@ let all () =
   Hashtbl.fold (fun _ e acc -> e.tx :: acc) staging []
   |> Transaction.consensus_order
 
+let rec first limit seq acc =
+  if limit <= 0 then List.rev acc
+  else
+    match seq () with
+    | Seq.Nil -> List.rev acc
+    | Seq.Cons (value, rest) -> first (limit - 1) rest (value :: acc)
+
+let index_key entry =
+  entry.tx.Transaction.from, entry.tx.Transaction.nonce, entry.hash
+
+let sample limit =
+  first (max 0 limit) (Index.to_seq !view_index) []
+  |> List.map (fun (_, entry) -> entry.hash, entry.tx)
+
 let clear () =
   List.iter Hashtbl.clear [staging; hash_index];
+  view_index := Index.empty;
   Hashtbl.clear virtual_balances;
   Hashtbl.clear virtual_nonces;
   total_ou := Z.zero
@@ -113,6 +142,7 @@ let insert tx =
   let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash } in
   Hashtbl.add staging key entry;
   Hashtbl.add hash_index hash entry;
+  view_index := Index.add (index_key entry) entry !view_index;
   total_ou := Z.add !total_ou ou;
   Hashtbl.replace virtual_balances tx.from
     (Z.sub (Hashtbl.find virtual_balances tx.from) (public_balance_cost tx));
@@ -122,6 +152,7 @@ let insert tx =
 let evict entry =
   Hashtbl.remove staging entry.key;
   Hashtbl.remove hash_index entry.hash;
+  view_index := Index.remove (index_key entry) !view_index;
   total_ou := Z.sub !total_ou entry.ou;
   Hashtbl.replace virtual_balances entry.tx.from
     (Z.add (Hashtbl.find virtual_balances entry.tx.from)
@@ -396,8 +427,7 @@ let min_relay_fee tx =
   else if usage < 95 then Z.mul base (Z.of_int 2)
   else Z.mul base (Z.of_int 5)
 
-let get_stats () =
-  let txs = all () in
+let stats_of txs =
   let by_sender = Hashtbl.create 50 in
   List.iter (fun (tx : Transaction.t) ->
     let cost = public_balance_cost tx in
@@ -407,4 +437,8 @@ let get_stats () =
     in
     Hashtbl.replace by_sender tx.from (count, total)
   ) txs;
-  (txs, by_sender)
+  by_sender
+
+let get_stats () =
+  let txs = all () in
+  txs, stats_of txs

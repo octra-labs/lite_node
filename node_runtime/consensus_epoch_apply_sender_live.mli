@@ -8,6 +8,7 @@ type deps = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   program_trust : Octra_vm.Program_trust.t;
+  object_cost : bool;
   wallet_addr : string;
   pre_state_hash : string;
   fold : int -> (Octra_core.Epoch_exec.fold_ctx, string) result;

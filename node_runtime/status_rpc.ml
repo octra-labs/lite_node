@@ -24,8 +24,8 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
     ~validator_view_pub
     ~validator_address
 
-let epoch_tags ~tags ~keep_epochs =
-  Rpc_view.epoch_tags ~tags ~keep_epochs
+let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs =
+  Rpc_view.epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs
 
 let consensus_peer_states
     ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers

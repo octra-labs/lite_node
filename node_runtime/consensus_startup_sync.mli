@@ -21,6 +21,7 @@ type deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -68,6 +69,7 @@ type node_deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }

@@ -117,15 +117,12 @@ let plan ~head ~header_epoch ~observer ~driver_available ~catchup_active
       | None -> Apply_now
 
 let stashed_plan ~phase ~header_epoch ~current_epoch ~prev_root_matches
-    ~state_attested ~catchup_active =
-  if header_epoch = current_epoch && prev_root_matches then
-    if state_attested then
-      Direct_apply_stashed {
-        clear_reason = "direct_finalized_apply:" ^ phase_label phase;
-      }
-    else
-      Wait_stashed
-  else if catchup_active then
+    ~catchup_active =
+  if catchup_active then
     Wait_stashed
+  else if header_epoch = current_epoch && prev_root_matches then
+    Direct_apply_stashed {
+      clear_reason = "direct_finalized_apply:" ^ phase_label phase;
+    }
   else
     Replay_stashed

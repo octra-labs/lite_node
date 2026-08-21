@@ -93,7 +93,7 @@ let parse_rejection raw fields =
   | Some (`Int position), Some (`String hash), Some tx_json,
     Some (`String error_type), Some (`String reason) ->
     begin
-      match Transaction.of_yojson tx_json with
+      match Tx_payload.decode tx_json with
       | Error error -> Error ("rejection_tx_invalid:" ^ error)
       | Ok tx ->
         let rejection = { position; tx; error_type; reason } in

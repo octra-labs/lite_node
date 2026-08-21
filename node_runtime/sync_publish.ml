@@ -11,6 +11,7 @@ module Cycle = Octra_bootstrap.Sync_cycle
 module Epochlog = Octra_core.Epochlog
 module Head = Octra_core.Head_manifest
 module Manifest = Octra_bootstrap.State_sync_manifest
+module Roots = Octra_bootstrap.Root_win
 module State_sync = Octra_bootstrap.State_sync
 module C_config = Octra_consensus.C_config
 module C_types = Octra_consensus.C_types
@@ -23,6 +24,7 @@ type prepared = {
   checkpoint_hash : string;
   anchor : Anchor.t;
   trusted_validator_set : C_types.validator_set;
+  roots : C_types.finalize list;
 }
 
 type deps = {
@@ -35,6 +37,7 @@ type deps = {
   trusted_validator_set : unit -> (C_types.validator_set, string) result;
   head : unit -> Head.t option;
   read_finality : int64 -> Consensus_finality_journal.read_result;
+  read_root : int64 -> Consensus_finality_journal.read_result;
   exporter_set : unit -> (C_types.validator_set, string) result;
   certificate_path : unit -> string;
   now : unit -> float;
@@ -172,6 +175,7 @@ let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
           checkpoint_hash;
           anchor;
           trusted_validator_set;
+          roots = [];
         }
 
 let retention_plan ~retain ~current snapshots =
@@ -262,11 +266,17 @@ let publisher_addresses exporter_set =
   |> List.sort_uniq String.compare
   |> List.filteri (fun index _ -> index < publisher_count)
 
-let exporter_wallet exporter_set wallet =
+let publisher_override = function
+  | None | Some "" | Some "0" -> Ok false
+  | Some "1" -> Ok true
+  | Some _ -> Error "state sync publisher override must be 0 or 1"
+
+let exporter_wallet ~force exporter_set wallet =
   match C_types.pubkey_of_addr exporter_set wallet.Octra_core.Crypto.Wallet.address with
   | Some public_key
     when public_key = wallet.pub
-         && List.mem wallet.address (publisher_addresses exporter_set) ->
+         && (force
+             || List.mem wallet.address (publisher_addresses exporter_set)) ->
       Ok ()
   | Some public_key when public_key = wallet.pub ->
       Error "state sync publisher is not selected"
@@ -346,7 +356,12 @@ let publish deps exporter_set prepared =
       let fresh () =
         clear_stage target >>= fun () ->
         Capture.build
-          Capture.{ data_dir = deps.data_dir; head = prepared.head; store = deps.store }
+          Capture.{
+            data_dir = deps.data_dir;
+            head = prepared.head;
+            store = deps.store;
+            roots = prepared.roots;
+          }
           ~target >>= function
         | Error reason -> Lwt.return_error reason
         | Ok report ->
@@ -493,21 +508,81 @@ let read_prepared deps epoch =
                       validator_set >>= function
                     | Error reason -> Lwt.return_error reason
                     | Ok steps ->
-                        Lwt.return
-                          (prepare
-                             ~chain_id:deps.chain_id
-                             ~config_hash
-                             ~trusted_validator_set
-                             ~validator_set
-                             ~steps
-                             ~head
-                             record)
+                        begin
+                          match
+                            prepare
+                              ~chain_id:deps.chain_id
+                              ~config_hash
+                              ~trusted_validator_set
+                              ~validator_set
+                              ~steps
+                              ~head
+                              record
+                          with
+                          | Error _ as error -> Lwt.return error
+                          | Ok prepared ->
+                              let rec collect current left acc =
+                                if left = 0
+                                   || Int64.compare current.C_types.epoch_id 0L = 0 then
+                                  Lwt.return_ok (List.rev acc)
+                                else
+                                  let prior = Int64.pred current.epoch_id in
+                                  Lwt_preemptive.detach
+                                    (fun () -> deps.read_root prior)
+                                    () >>= function
+                                  | Consensus_finality_journal.Missing ->
+                                      Lwt.return_error
+                                        "ready root finality is missing"
+                                  | Consensus_finality_journal.Invalid reason ->
+                                      Lwt.return_error
+                                        ("ready root finality is invalid: " ^ reason)
+                                  | Consensus_finality_journal.Valid item ->
+                                      begin
+                                        match
+                                          Roots.bind
+                                            ~current
+                                            ~validator_set:item.validator_set
+                                            item.finalize
+                                        with
+                                        | Error _ as error -> Lwt.return error
+                                        | Ok next ->
+                                            begin
+                                              match Roots.verify ~anchor:current [next] with
+                                              | Error _ as error -> Lwt.return error
+                                              | Ok _ ->
+                                                  collect
+                                                    next
+                                                    (left - 1)
+                                                    (next :: acc)
+                                            end
+                                      end
+                              in
+                              collect
+                                (Anchor.finality prepared.anchor)
+                                Roots.width
+                                [] >>= function
+                              | Error _ as error -> Lwt.return error
+                              | Ok roots -> Lwt.return_ok { prepared with roots }
+                        end
           end
 
-let capture deps exporter_set epoch =
-  read_prepared deps epoch >>= function
-  | Error _ as error -> Lwt.return error
-  | Ok prepared -> publish deps exporter_set prepared
+let capture_epochs ~target = function
+  | Some head ->
+      let latest = Int64.of_int head.Head.epoch_id in
+      if Int64.compare latest target > 0 then [latest; target] else [target]
+  | None -> [target]
+
+let capture deps exporter_set target =
+  let rec loop last = function
+    | [] ->
+        Lwt.return_error
+          (Option.value ~default:"state sync HEAD is missing" last)
+    | epoch :: rest ->
+        read_prepared deps epoch >>= function
+        | Ok prepared -> publish deps exporter_set prepared
+        | Error reason -> loop (Some reason) rest
+  in
+  loop None (capture_epochs ~target (deps.head ()))
 
 let rec perform deps exporter_set state effects =
   match effects with
@@ -586,24 +661,31 @@ let run_loop deps exporter_set initial =
   loop initial
 
 let run deps =
-  match deps.exporter_set () with
+  match publisher_override (Sys.getenv_opt "OCTRA_STATE_SYNC_FORCE_PUBLISH") with
   | Error reason ->
       deps.warn ("event = sync_disabled reason = " ^ reason);
       dormant deps
-  | Ok exporter_set ->
+  | Ok force ->
       begin
-        match exporter_wallet exporter_set deps.wallet with
+        match deps.exporter_set () with
         | Error reason ->
-            deps.info ("event = sync_cycle_dormant reason = " ^ reason);
+            deps.warn ("event = sync_disabled reason = " ^ reason);
             dormant deps
-        | Ok () ->
-            load_published deps exporter_set >>= fun published ->
-            deps.info
-              (Printf.sprintf
-                 "event = sync_cycle_started published = %s interval_epochs = 360 retain = 10"
-                 (Option.fold
-                    ~none:"none"
-                    ~some:Int64.to_string
-                    published));
-            run_loop deps exporter_set (Cycle.init ~published)
+        | Ok exporter_set ->
+            begin
+              match exporter_wallet ~force exporter_set deps.wallet with
+              | Error reason ->
+                  deps.info ("event = sync_cycle_dormant reason = " ^ reason);
+                  dormant deps
+              | Ok () ->
+                  load_published deps exporter_set >>= fun published ->
+                  deps.info
+                    (Printf.sprintf
+                       "event = sync_cycle_started published = %s interval_epochs = 360 retain = 10"
+                       (Option.fold
+                          ~none:"none"
+                          ~some:Int64.to_string
+                          published));
+                  run_loop deps exporter_set (Cycle.init ~published)
+            end
       end

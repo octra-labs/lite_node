@@ -26,7 +26,8 @@ let finish outcome value =
   | Some _ ->
     Lwt.fail_with "vm transition completed more than once"
 
-let context ~program_trust backend env (tx : Transaction.t) effects tx_hash =
+let context ~program_trust ~object_cost backend env
+    (tx : Transaction.t) effects tx_hash =
   Vm.make_live_contract_ctx
     {
       value_journal = Tx_effects.value effects;
@@ -34,6 +35,7 @@ let context ~program_trust backend env (tx : Transaction.t) effects tx_hash =
       trusted_program_keys = program_trust;
       store = backend.Epoch_exec.store;
       get_fhe_pubkey = Vm.live_fhe_pubkey backend.store;
+      object_cost;
       current_epoch = env.Epoch_exec.epoch_id;
       epoch_time_ms =
         (match Octra_consensus.Epoch_time.of_seconds env.epoch_ts with
@@ -54,7 +56,7 @@ let wasm_load_profile = function
 
 let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
     ?(save_receipt_raw=(fun ~tx_hash:_ ~json:_ -> ()))
-    ~circle_mode ~wasm_compute_mode ~program_trust backend env
+    ~circle_mode ~wasm_compute_mode ~program_trust ~object_cost backend env
     (tx : Transaction.t) =
   let effects =
     Tx_effects.create
@@ -129,7 +131,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
         reject;
         debit = Tx_effects.debit effects;
         tx;
-        make_ctx = context ~program_trust backend env tx effects;
+        make_ctx = context ~program_trust ~object_cost backend env tx effects;
         balance = Tx_effects.balance effects;
         apply_value_effect = (fun effect ->
           ignore (Tx_effects.apply effects effect));
@@ -148,6 +150,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
         ~journal:(Tx_effects.program effects)
         ~ctx:(context
           ~program_trust
+          ~object_cost
           backend
           env
           tx
@@ -368,6 +371,7 @@ let preverify_circle
     ~backend
     ~env
     ~program_trust
+    ~object_cost
     tx =
   let open Lwt.Syntax in
   let capture = ref None in
@@ -378,6 +382,7 @@ let preverify_circle
       ~circle_mode
       ~wasm_compute_mode
       ~program_trust
+      ~object_cost
       backend
       env
       tx
@@ -401,7 +406,8 @@ let preverify_circle
     Lwt.return_error "circle_receipt_capture_missing"
 
 let process_tx ?preverify ?save_receipt_raw ~backend
-    ~(env : Epoch_exec.env) ~circle_mode ~wasm_compute_mode ~program_trust tx =
+    ~(env : Epoch_exec.env) ~circle_mode ~wasm_compute_mode ~program_trust
+    ~object_cost tx =
   match tx.Transaction.op_type with
   | Transaction.CircleBalanceCellPut
   | Transaction.CircleRegisterCellPut ->
@@ -432,6 +438,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
           ~circle_mode
           ~wasm_compute_mode
           ~program_trust
+          ~object_cost
           backend
           env
           tx
@@ -443,6 +450,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
           ~circle_mode
           ~wasm_compute_mode
           ~program_trust
+          ~object_cost
           backend
           env
           tx
@@ -458,6 +466,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       ~circle_mode
       ~wasm_compute_mode
       ~program_trust
+      ~object_cost
       backend
       env
       tx

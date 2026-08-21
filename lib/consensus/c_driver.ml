@@ -249,6 +249,9 @@ type t = {
   future_votes : (string, C_types.vote) Hashtbl.t;
   vote_log : C_vote_log.t;
   sync_log : C_sync_log.t;
+  relief_log : C_relief_log.t;
+  mutable relief_plan : scheduled_validator_set_config option;
+  mutable relief_notice : string option;
   mutable vote_log_issue : string option;
   mutable vote_fault : vote_fault option;
   durable_votes : (string, C_types.vote) Hashtbl.t;
@@ -276,6 +279,8 @@ type t = {
   mutable round_spread_warned_at : float;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable on_validator_set_activated :
+    C_types.validator_set -> string -> unit Lwt.t;
+  mutable on_validator_set_relief :
     C_types.validator_set -> string -> unit Lwt.t;
   mutable on_fold :
     next_epoch:int64 ->
@@ -409,7 +414,8 @@ let catchup_response_in_window window records =
          catchup_epoch_in_window window record.epoch_id)
        records
 
-let create ~config ~validator_set ~swarm ~start_height ~sync_log ~vote_log =
+let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
+    ~vote_log =
   let finality_proof_needed = ref false in
   let can_vote () =
     config.can_vote () && not !finality_proof_needed
@@ -445,6 +451,9 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~vote_log =
     future_votes = Hashtbl.create 32;
     vote_log;
     sync_log;
+    relief_log;
+    relief_plan = None;
+    relief_notice = None;
     vote_log_issue = None;
     vote_fault = None;
     durable_votes = Hashtbl.create 16;
@@ -472,11 +481,16 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~vote_log =
     proposal_work_gate = C_proposal_work_gate.create ();
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
+    on_validator_set_relief =
+      (fun _ _ -> Lwt.return_unit);
     on_fold = (fun ~next_epoch:_ _ -> ());
     output_actor = C_output_actor.idle }
 
 let set_validator_set_activation_handler t handler =
   t.on_validator_set_activated <- handler
+
+let set_validator_set_relief_handler t handler =
+  t.on_validator_set_relief <- handler
 
 let set_fold_handler t handler =
   t.on_fold <- handler
@@ -533,8 +547,15 @@ let same_proposal_build (b : proposal_build) ~gen ~height ~round ~step =
 let local_validator t =
   C_types.is_validator t.engine.vs t.config.my_addr
 
+let vote_floor_bootstrap = "vote log bootstrap required"
+
 let vote_allowed t =
-  t.config.can_vote () && not !(t.finality_proof_needed)
+  t.vote_log_issue = None
+  && t.config.can_vote ()
+  && not !(t.finality_proof_needed)
+
+let vote_log_bootstrap_pending t =
+  t.vote_log_issue = Some vote_floor_bootstrap
 
 let clear_finality_proof_requests t =
   Hashtbl.iter
@@ -692,7 +713,8 @@ let round_sync_relay_relevant
   && sync.round <= current_round + C_engine.max_round_ahead
 
 let round_sync_allowed ~current_round (sync : C_codec.round_sync) =
-  sync.round <= current_round + C_engine.max_sync_ahead
+  sync.round >= 0
+  && sync.round <= current_round + C_engine.max_sync_ahead
 
 let proposal_frame_error_label = function
   | Proposal_unknown_validator -> "unknown_validator"
@@ -845,7 +867,15 @@ let hold_vote_fault t (v : C_types.vote) reason =
     v.epoch_id
     v.round
 
-let persist_precommit t (v : C_types.vote) =
+let proposal_binds_vote (v : C_types.vote) (p : C_types.propose) =
+  String.equal p.chain_id v.chain_id
+  && Int64.equal p.epoch_id v.epoch_id
+  && p.round = v.round
+  && String.equal p.header.chain_id p.chain_id
+  && Int64.equal p.header.epoch_id p.epoch_id
+  && String.equal (C_hash.proposal_id p.header) v.proposal_id
+
+let persist_precommit ?proposal t (v : C_types.vote) =
   let nil_hash = String.make 32 '\x00' in
   if v.vote_type = C_types.Precommit && v.proposal_id <> nil_hash then
     let key = vote_key v in
@@ -854,13 +884,17 @@ let persist_precommit t (v : C_types.vote) =
       Lwt.return_true
     end
     else
-      match
-        C_engine.find_proposal_message
-          t.engine
-          ~proposal_id:v.proposal_id
-          ~round:v.round
-      with
-      | Some proposal ->
+      let proposal =
+        match proposal with
+        | Some _ as value -> value
+        | None ->
+          C_engine.find_proposal_message
+            t.engine
+            ~proposal_id:v.proposal_id
+            ~round:v.round
+      in
+      match proposal with
+      | Some proposal when proposal_binds_vote v proposal ->
         let open Lwt.Syntax in
         let* durable =
           t.config.before_precommit_broadcast
@@ -877,6 +911,9 @@ let persist_precommit t (v : C_types.vote) =
         end else
           hold_vote_fault t v "precommit_not_durable";
         Lwt.return durable
+      | Some _ ->
+        hold_vote_fault t v "precommit_proposal_mismatch";
+        Lwt.return_false
       | None ->
         hold_vote_fault t v "precommit_proposal_missing";
         Lwt.return_false
@@ -889,13 +926,17 @@ let hold_vote_log t reason =
     "event = refuse_local_vote reason = vote_log_error detail = %s"
     reason
 
+let vote_floor_wait = "vote log floor is not behind current height"
+
 let vote_log_reason reason =
   if String.equal reason "local vote conflicts with stored vote" then
     "vote_log_conflict"
   else if String.equal reason "vote log reached round limit" then
     "vote_log_limit"
-  else if String.equal reason "vote log bootstrap required" then
+  else if String.equal reason vote_floor_bootstrap then
     "vote_log_bootstrap"
+  else if String.equal reason vote_floor_wait then
+    "vote_floor_wait"
   else if String.starts_with ~prefix:"vote log record" reason
        || String.starts_with ~prefix:"vote log wire" reason
        || String.starts_with ~prefix:"vote log epoch" reason
@@ -1006,8 +1047,15 @@ let require_vote_floor t =
      | Ok (Some floor)
        when Int64.compare t.engine.state.height floor > 0 ->
        ()
+     | Ok (Some floor)
+       when not (local_validator t)
+            && Int64.equal t.engine.state.height floor ->
+       log_node t.config.my_addr
+         "event = vote_log_floor_deferred role = observer height = %Ld floor = %Ld"
+         t.engine.state.height
+         floor
      | Ok (Some _) ->
-       hold_vote_log t "vote log floor is not behind current height"
+       hold_vote_log t vote_floor_wait
      | Ok None when Int64.compare t.engine.state.height 1L <= 0 ->
        (match
           C_vote_log.set_floor
@@ -1017,7 +1065,7 @@ let require_vote_floor t =
         | Ok () -> ()
         | Error reason -> hold_vote_log t reason)
      | Ok None ->
-       hold_vote_log t "vote log bootstrap required")
+       hold_vote_log t vote_floor_bootstrap)
 
 let prepare_vote_log t wires =
   if t.running then
@@ -1031,7 +1079,7 @@ let prepare_vote_log t wires =
     | Some reason -> Error reason
   end
 
-let saved_vote t (v : C_types.vote) =
+let saved_vote ?proposal t (v : C_types.vote) =
   if not (String.equal v.validator t.config.my_addr) then
     Lwt.return_some v
   else if !(t.finality_proof_needed) then
@@ -1050,7 +1098,7 @@ let saved_vote t (v : C_types.vote) =
         Lwt.return_none
       | Ok () ->
         let open Lwt.Syntax in
-        let* durable = persist_precommit t v in
+        let* durable = persist_precommit ?proposal t v in
         if not durable then Lwt.return_none
         else
           match C_vote_log.keep t.vote_log v with
@@ -1064,9 +1112,9 @@ let vote_durable t v =
   let* vote = saved_vote t v in
   Lwt.return (Option.is_some vote)
 
-let broadcast_vote t (v : C_types.vote) =
+let broadcast_vote t ?proposal (v : C_types.vote) =
   let open Lwt.Syntax in
-  let* stored = saved_vote t v in
+  let* stored = saved_vote ?proposal t v in
   match stored with
   | None ->
     error_node t.config.my_addr
@@ -1914,6 +1962,27 @@ let replay_deferred_proposal t =
       ~execute_fn:(fun _ -> true)
       ~sign_fn:t.config.sign_fn
 
+let clear_round_sync_jump t ~height ~round =
+  t.proposal_build <- None;
+  t.proposal_retry <- None;
+  t.proposal_verify <- None;
+  t.past_round <- None;
+  Hashtbl.clear t.pending_votes;
+  Hashtbl.clear t.round_fetch_replies;
+  (match t.proposal_wait with
+   | Some wait when wait.proposal.epoch_id = height
+                    && wait.proposal.round >= round -> ()
+   | Some _
+   | None -> t.proposal_wait <- None);
+  Hashtbl.filter_map_inplace
+    (fun _ (proposal : C_types.propose) ->
+      if proposal.epoch_id = height && proposal.round >= round then
+        Some proposal
+      else
+        None)
+    t.deferred_proposals;
+  t.epoch_start_mono <- Mtime_clock.elapsed_ns ()
+
 let remember_peer_state t ~source ~responder_addr ~head_epoch ~checked_epoch ~state_root =
   match Hashtbl.find_opt t.peer_states responder_addr with
   | Some rec_ ->
@@ -1935,20 +2004,29 @@ let remember_peer_state t ~source ~responder_addr ~head_epoch ~checked_epoch ~st
 let peer_state_snapshot t =
   Hashtbl.fold (fun _ rec_ acc -> rec_ :: acc) t.peer_states []
 
-let msg_id msg_type payload =
+let replay_scoped_frame msg_type =
+  msg_type = Frame.msg_cons_propose || msg_type = Frame.msg_cons_vote
+
+let msg_id t msg_type payload =
+  let scope =
+    if replay_scoped_frame msg_type then
+      Printf.sprintf "%d:" t.engine.generation
+    else
+      ""
+  in
   Octra_net.Hash_domain.hash
     "octra:seen:consensus:v1"
-    (String.make 1 (Char.chr msg_type) ^ payload)
+    (scope ^ String.make 1 (Char.chr msg_type) ^ payload)
 
 let is_seen t msg_type payload =
-  let id = msg_id msg_type payload in
+  let id = msg_id t msg_type payload in
   not (C_seen.remember t.seen id)
 
 let frame_known t msg_type payload =
-  C_seen.known t.seen (msg_id msg_type payload)
+  C_seen.known t.seen (msg_id t msg_type payload)
 
 let remember_frame t msg_type payload =
-  ignore (C_seen.remember t.seen (msg_id msg_type payload))
+  ignore (C_seen.remember t.seen (msg_id t msg_type payload))
 
 let historical_vote_replay_needed t payload =
   try
@@ -1965,7 +2043,7 @@ let historical_vote_replay_needed t payload =
             ~validator:vote.validator)
     && C_seen.remember
          t.historical_replays
-         (msg_id Frame.msg_cons_vote payload)
+         (msg_id t Frame.msg_cons_vote payload)
   with _ -> false
 
 let finalize_replay_needed t payload =
@@ -1976,7 +2054,7 @@ let finalize_replay_needed t payload =
     && Int64.compare finalize.epoch_id t.engine.finalized_height > 0
     && C_seen.remember
          t.historical_replays
-         (msg_id Frame.msg_cons_finalize payload)
+         (msg_id t Frame.msg_cons_finalize payload)
   with _ -> false
 
 let historical_replay_needed t msg_type payload =
@@ -2126,7 +2204,7 @@ let static_plan t =
     None
   | plan -> plan
 
-let load_validator_set_plan t =
+let load_dynamic_plan t =
   let open Lwt.Syntax in
   let* dynamic_cfg = t.config.load_scheduled_validator_set_config () in
   match dynamic_cfg with
@@ -2136,8 +2214,18 @@ let load_validator_set_plan t =
   | Some _ ->
     t.plan_seen <- true;
     Lwt.return_none
-  | None when t.plan_seen -> Lwt.return_none
-  | None -> Lwt.return (static_plan t)
+  | None -> Lwt.return_none
+
+let load_validator_set_plan t =
+  match t.relief_plan with
+  | Some cfg -> Lwt.return_some cfg
+  | None ->
+    let open Lwt.Syntax in
+    let* dynamic_cfg = load_dynamic_plan t in
+    match dynamic_cfg with
+    | Some _ as plan -> Lwt.return plan
+    | None when t.plan_seen -> Lwt.return_none
+    | None -> Lwt.return (static_plan t)
 
 let validator_set_at ~chain_id ~current ~epoch plan =
   let source =
@@ -2161,6 +2249,175 @@ let validator_set_for_frame t epoch =
          ~epoch
          plan)
 
+let relief_target t cfg =
+  C_types.validator_set_for_epoch
+    ~chain_id:t.config.chain_id
+    ~epoch_id:cfg.activate_epoch
+    cfg.validator_set
+
+let clear_relief_work t =
+  t.proposal_build <- None;
+  t.proposal_retry <- None;
+  t.proposal_verify <- None;
+  t.proposal_wait <- None;
+  t.past_round <- None;
+  Hashtbl.clear t.pending_votes;
+  Hashtbl.clear t.future_votes;
+  Hashtbl.clear t.durable_votes;
+  Hashtbl.clear t.pending_finalizes;
+  Hashtbl.clear t.pending_proposals;
+  Hashtbl.clear t.deferred_proposals;
+  Hashtbl.clear t.round_sync_replies;
+  Hashtbl.clear t.round_fetch_replies;
+  Hashtbl.clear t.proposal_fetches;
+  Hashtbl.clear t.round_peers;
+  C_round_pool.clear t.round_pool
+
+let install_relief t cfg mark target =
+  let open Lwt.Syntax in
+  let next_round = t.engine.state.round + 1 in
+  let round =
+    if Int64.equal t.engine.state.height mark.C_relief.height then
+      max next_round (mark.round + 1)
+    else
+      next_round
+  in
+  clear_relief_work t;
+  C_engine.reconfigure_validator_set t.engine ~round target;
+  t.n_validators <- target.C_types.n;
+  t.relief_plan <- Some cfg;
+  Hashtbl.replace t.activated_validator_set_fingerprints cfg.fingerprint true;
+  let* () = t.on_validator_set_relief target cfg.fingerprint in
+  warn_node t.config.my_addr
+    "event = validator_set_relief height = %Ld round = %d activate_epoch = %Ld n = %d quorum = %d fingerprint = %s"
+    mark.height
+    round
+    cfg.activate_epoch
+    target.n
+    target.quorum
+    cfg.fingerprint;
+  Lwt.return_unit
+
+let apply_relief t cfg mark target =
+  match C_relief_log.keep t.relief_log mark with
+  | Error reason -> Lwt.return (Error reason)
+  | Ok saved ->
+    begin
+      match
+        C_relief.restore
+          ~chain_id:t.config.chain_id
+          ~height:t.engine.state.height
+          ~current:t.engine.vs
+          ~activate_epoch:cfg.activate_epoch
+          ~target
+          ~fingerprint:cfg.fingerprint
+          saved
+      with
+      | Error reason -> Lwt.return (Error reason)
+      | Ok None -> Lwt.return (Ok ())
+      | Ok (Some target) ->
+        let open Lwt.Syntax in
+        let* () = install_relief t cfg saved target in
+        Lwt.return (Ok ())
+    end
+
+let note_relief_refusal t cfg reason =
+  let key =
+    String.concat ":"
+      [Int64.to_string t.engine.state.height; cfg.fingerprint; reason]
+  in
+  if not (Option.equal String.equal t.relief_notice (Some key)) then begin
+    t.relief_notice <- Some key;
+    warn_node t.config.my_addr
+      "event = validator_set_relief action = refuse height = %Ld reason = %s fingerprint = %s"
+      t.engine.state.height
+      reason
+      cfg.fingerprint
+  end
+
+let maybe_activate_relief t =
+  let open Lwt.Syntax in
+  match t.relief_plan with
+  | Some _ -> Lwt.return_unit
+  | None ->
+    let height = t.engine.state.height in
+    if Int64.compare height C_relief.activation_epoch < 0 then
+      Lwt.return_unit
+    else if t.engine.state.round < C_relief.min_round then
+      Lwt.return_unit
+    else
+      let* cfg_opt = load_dynamic_plan t in
+      match cfg_opt with
+      | None -> Lwt.return_unit
+      | Some cfg ->
+        let target = relief_target t cfg in
+        let proof =
+          C_round_pool.witness
+            t.round_pool
+            ~chain_id:t.config.chain_id
+            ~epoch_id:height
+            ~after_round:(C_relief.min_round - 1)
+            ~through_round:t.engine.state.round
+            ~validator_set:t.engine.vs
+        in
+        match
+          C_relief.decide
+            ~chain_id:t.config.chain_id
+            ~height
+            ~current:t.engine.vs
+            ~activate_epoch:cfg.activate_epoch
+            ~target
+            ~fingerprint:cfg.fingerprint
+            ~proof
+        with
+        | C_relief.Wait -> Lwt.return_unit
+        | C_relief.Refuse reason ->
+          note_relief_refusal t cfg reason;
+          Lwt.return_unit
+        | C_relief.Apply mark ->
+          let* result = apply_relief t cfg mark target in
+          begin
+            match result with
+            | Ok () -> Lwt.return_unit
+            | Error reason ->
+              note_relief_refusal t cfg reason;
+              Lwt.return_unit
+          end
+
+let restore_relief t =
+  let open Lwt.Syntax in
+  let height = t.engine.state.height in
+  match C_relief_log.latest t.relief_log ~through_height:height with
+  | Error reason -> Lwt.return (Error reason)
+  | Ok None -> Lwt.return (Ok ())
+  | Ok (Some mark) when Int64.compare height mark.C_relief.activate_epoch >= 0 ->
+    Lwt.return (Ok ())
+  | Ok (Some mark) ->
+    let* cfg_opt = load_dynamic_plan t in
+    begin
+      match cfg_opt with
+      | None -> Lwt.return (Error "validator relief plan is missing")
+      | Some cfg ->
+        let target = relief_target t cfg in
+        begin
+          match
+            C_relief.restore
+              ~chain_id:t.config.chain_id
+              ~height
+              ~current:t.engine.vs
+              ~activate_epoch:cfg.activate_epoch
+              ~target
+              ~fingerprint:cfg.fingerprint
+              mark
+          with
+          | Error reason -> Lwt.return (Error reason)
+          | Ok None -> Lwt.return (Ok ())
+          | Ok (Some target) ->
+            let* () = install_relief t cfg mark target in
+            Lwt.return (Ok ())
+        end
+    end
+
 let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
   let open Lwt.Syntax in
   let* cfg_opt = load_validator_set_plan t in
@@ -2178,8 +2435,14 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
       in
       let current_hash = C_config.validator_set_hash t.engine.vs in
       let target_hash = C_config.validator_set_hash validator_set in
-      if String.equal current_hash target_hash then
-        Lwt.return_unit
+      if String.equal current_hash target_hash then begin
+        let relief = Option.is_some t.relief_plan in
+        t.relief_plan <- None;
+        if relief then
+          t.on_validator_set_activated validator_set cfg.fingerprint
+        else
+          Lwt.return_unit
+      end
       else if Int64.compare cfg.activate_epoch t.engine.state.height < 0 then begin
         error_node t.config.my_addr
           "event = validator_set_activation_refused reason = stale_plan activate_epoch = %Ld head = %Ld"
@@ -2197,6 +2460,7 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
       Hashtbl.clear t.round_peers;
       t.n_validators <- validator_set.C_types.n;
       Hashtbl.replace t.activated_validator_set_fingerprints cfg.fingerprint true;
+      t.relief_plan <- None;
       log_node t.config.my_addr
         "event = validator_set_activated target_epoch = %Ld n = %d quorum = %d fingerprint = %s"
         target_epoch validator_set.n validator_set.quorum cfg.fingerprint;
@@ -2303,6 +2567,7 @@ let maybe_activate_resource_committee t ~target_epoch =
 let try_current_leader_proposal t =
   let open Lwt.Syntax in
   if t.running
+     && vote_allowed t
      && C_engine.am_i_leader t.engine
      && t.engine.state.step = C_types.ProposeStep then begin
     let gen = t.engine.generation in
@@ -2332,6 +2597,7 @@ let try_current_leader_proposal t =
                 t.proposal_work_gate
                 ~relevant:(fun () ->
                   t.running
+                  && vote_allowed t
                   && C_engine.am_i_leader t.engine
                   && proposal_work_current t work)
                 (fun () -> t.config.make_proposal height))
@@ -2694,6 +2960,7 @@ let notify_fold t ~next_epoch event =
 
 let rec process_outputs_once t =
   let open Lwt.Syntax in
+  let* () = maybe_activate_relief t in
   C_engine.on_ready t.engine ~sign_fn:t.config.sign_fn;
   let* () = replay_waiting_proposal t in
   let* () = replay_pending_proposal t in
@@ -2826,7 +3093,7 @@ let rec process_outputs_once t =
                   ~request:(round_sync_request_for_step step)
               in
               if step = C_types.ProposeStep then ask_past t else Lwt.return_unit
-            | C_engine.SendVote v ->
+            | C_engine.SendVote (v, proposal) ->
               if not (vote_still_relevant t v) then begin
                 log_node t.config.my_addr
                   "event = drop_stale_vote_output type = %s epoch = %Ld round = %d height = %Ld"
@@ -2855,7 +3122,7 @@ let rec process_outputs_once t =
                     (pending_vote_count t);
                   Lwt.return_unit
               end else
-                let* _ = broadcast_vote t v in
+                let* _ = broadcast_vote t ?proposal v in
                 Lwt.return_unit
             | C_engine.Finalized { epoch_id; finalize } ->
               let header = finalize.header in
@@ -2899,6 +3166,13 @@ let rec process_outputs_once t =
                | Error reason ->
                  warn_node t.config.my_addr
                    "event = round_sync_prune_failed epoch = %Ld reason = %s"
+                   epoch_id
+                   reason);
+              (match C_relief_log.prune t.relief_log ~through_epoch:epoch_id with
+               | Ok () -> ()
+               | Error reason ->
+                 warn_node t.config.my_addr
+                   "event = validator_set_relief_prune_failed epoch = %Ld reason = %s"
                    epoch_id
                    reason);
               let* () =
@@ -3167,11 +3441,52 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                     else
                       Lwt.return_unit
                   in
-                  C_engine.on_round_sync
-                    t.engine
-                    ~round:sync.round
-                    ~validator:sync.validator;
+                  let jumped =
+                    C_engine.on_round_sync
+                      t.engine
+                      ~round:sync.round
+                      ~validator:sync.validator
+                  in
+                  if jumped then begin
+                    clear_round_sync_jump
+                      t
+                      ~height:t.engine.state.height
+                      ~round:t.engine.state.round;
+                    log_node t.config.my_addr
+                      "event = round_sync_jump_replay height = %Ld round = %d"
+                      t.engine.state.height
+                      t.engine.state.round
+                  end;
                   let* () = process_outputs t in
+                  let* () =
+                    if jumped then broadcast_round_sync t ~request:true
+                    else Lwt.return_unit
+                  in
+                  if jumped then begin
+                    let height = t.engine.state.height in
+                    let round = t.engine.state.round in
+                    Lwt.async (fun () ->
+                      Lwt.catch
+                        (fun () ->
+                          let* () = Lwt_unix.sleep 1.1 in
+                          if t.running
+                             && t.engine.state.height = height
+                             && t.engine.state.round = round then begin
+                            trace_node t.config.my_addr
+                              "event = round_sync_replay_retry height = %Ld round = %d"
+                              height
+                              round;
+                            broadcast_round_sync t ~request:true
+                          end else
+                            Lwt.return_unit)
+                        (fun exn ->
+                          warn_node t.config.my_addr
+                            "event = round_sync_replay_retry_failed height = %Ld round = %d error = %s"
+                            height
+                            round
+                            (Printexc.to_string exn);
+                          Lwt.return_unit))
+                  end;
                   if round_sync_reply_needed t sync
                      && round_sync_response_allowed t sync then
                     send_round_sync_response
@@ -3219,20 +3534,10 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
            with
            | Error error ->
              log_node t.config.my_addr
-               "event = ignore_future_propose reason = unresolved_validator_set predicate = %s epoch = %Ld local_height = %Ld"
+               "event = defer_future_propose reason = unresolved_validator_set predicate = %s epoch = %Ld local_height = %Ld"
                (proposal_frame_error_label error)
                p.epoch_id
                t.engine.state.height;
-             (match error with
-              | Proposal_unknown_validator -> ()
-              | _ ->
-                remember_frame t frame.msg_type frame.payload;
-                report_proposal_error
-                  t
-                  _conn
-                  validator_set
-                  p.proposer
-                  error);
              Lwt.return_unit
            | Ok () ->
              let deferred = defer_pending_proposal t p in
@@ -3499,7 +3804,8 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                 warn_node t.config.my_addr
                   "event = reject_finalize reason = engine_state epoch = %Ld round = %d pid = %s"
                   f.epoch_id f.commit_round
-                  (String.sub expected_pid 0 (min 16 (String.length expected_pid)));
+                  (let h = raw_to_hex expected_pid in
+                   String.sub h 0 (min 16 (String.length h)));
                 Lwt.return_unit
               end
         )
@@ -4797,16 +5103,41 @@ let clear_round_local_state t ~height ~round =
         None)
     t.deferred_proposals
 
-let reset_height t height =
+let set_height t height =
+  clear_height_local_state t;
   Hashtbl.clear t.round_peers;
-  C_engine.start_height t.engine height;
+  C_engine.start_height t.engine height
+
+let reset_height t height =
+  set_height t height;
   resume_local_vote t
 
-let start_height t height =
+let catchup_height t height =
   let open Lwt.Syntax in
   let* () = maybe_activate_scheduled_validator_set t ~target_epoch:height in
-  clear_height_local_state t;
-  reset_height t height;
+  let* () = maybe_activate_resource_committee t ~target_epoch:height in
+  set_height t height;
+  Lwt.return_unit
+
+let start_height t height =
+  (match t.vote_log_issue with
+   | Some reason when String.equal reason vote_floor_wait ->
+     begin
+       match C_vote_log.floor t.vote_log with
+       | Ok (Some floor) when Int64.compare height floor > 0 ->
+         t.vote_log_issue <- None;
+         log_node t.config.my_addr
+           "event = vote_floor_ready floor = %Ld height = %Ld"
+           floor
+           height
+       | Ok _
+       | Error _ -> ()
+     end
+   | Some _
+   | None -> ());
+  let open Lwt.Syntax in
+  let* () = catchup_height t height in
+  resume_local_vote t;
   load_round_sync t;
   process_outputs t
 
@@ -4843,9 +5174,19 @@ let start t =
   C_engine.set_round_skip_ready
     t.engine
     (fun () -> not (proposal_work_active t));
-  resume_local_vote t;
   t.running <- true;
   let open Lwt.Syntax in
+  let* restored = restore_relief t in
+  let* () =
+    match restored with
+    | Ok () -> Lwt.return_unit
+    | Error reason ->
+      error_node t.config.my_addr
+        "event = validator_set_relief action = refuse reason = %s"
+        reason;
+      Lwt.fail_with reason
+  in
+  resume_local_vote t;
   log "event = driver_start node = %s height = %Ld n = %d quorum = %d"
     t.config.my_addr t.engine.state.height t.engine.vs.n t.engine.vs.quorum;
   let min_peers =

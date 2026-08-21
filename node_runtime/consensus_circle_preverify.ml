@@ -47,6 +47,11 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok wasm_compute_mode ->
+    match Rule_graph.object_cost runtime.rules ~epoch:env.epoch_id with
+    | Error fault ->
+      Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
+    | Ok object_cost_mode ->
+    let object_cost = object_cost_mode = Rule_graph.Active in
     let proposal_id = "circle-" ^ Transaction.hash tx in
     let open Lwt.Syntax in
     let* result = Lwt.catch
@@ -69,6 +74,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
                       ~backend
                       ~env
                       ~program_trust:runtime.program_trust
+                      ~object_cost
                       tx
                   in
                   Lwt.return_ok result)

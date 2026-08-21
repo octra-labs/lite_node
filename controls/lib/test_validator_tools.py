@@ -27,6 +27,7 @@ from validator_common import validate_checkpoint
 from validator_common import validate_network
 from validator_common import write_env
 from validator_config import operator_pm2_name
+from validator_config import adopt_network
 from validator_config import BUILD_WORK
 from validator_config import build_candidate
 from validator_config import CARGO_HOME
@@ -50,6 +51,7 @@ from validator_config import require_validator_membership
 from validator_config import require_runtime_binding
 from validator_config import rebind_runtime
 from validator_config import source_commit
+from validator_config import sync_client_command
 from validator_config import validate_advertise
 from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
@@ -64,9 +66,13 @@ from validator_process import process_plan
 from validator_process import process_pids
 from validator_process import remaining_owners
 from validator_process import active_data_owners
+from validator_process import data_pids
 from validator_process import entry_data
+from validator_process import pm2_entries
 from validator_process import wait_stopped
 from validator_recover import recover
+from validator_recover import need_of
+from validator_recover import read_need
 from validator_recover import preserved_state_path
 from validator_rejoin import configured_data
 from validator_rejoin import confirmed_node
@@ -112,6 +118,9 @@ from upgrade import inspect_pending
 from upgrade import inspect_votes
 from upgrade import recovery_installed
 from upgrade import ready
+from upgrade import restore_need
+from upgrade import sync_plan
+from upgrade import sync_target
 
 RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
 WORK = RUNTIME_DATA_ROOT / "validator_tools_test"
@@ -153,7 +162,6 @@ def network_values():
         "OCTRA_VALIDATORS": validators,
     }
 
-
 def release_value(public="a" * 40, source="b" * 40, notice="consensus_recovery"):
     return {
         "schema": "octra-devnet-release-v2",
@@ -173,6 +181,18 @@ def release_value(public="a" * 40, source="b" * 40, notice="consensus_recovery")
         "signature": "A" * 86 + "==",
     }
 
+def write_need(data, chain, cause="root", epoch=100, head=99, target=None):
+    path = data / "recovery/sync_need.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema": "octra_sync_need_v1",
+        "chain_id": chain,
+        "cause": cause,
+        "epoch": epoch,
+        "head": head,
+        "target": target,
+    }) + "\n", encoding="utf-8")
+    return path
 
 def signed_release_value():
     return {
@@ -276,6 +296,23 @@ class ValidatorToolsTest(unittest.TestCase):
         ), self.assertRaisesRegex(ValidatorError, "signature verification failed"):
             release_tool.trusted(WORK)
 
+    def test_upgrade_cache_is_atomic(self):
+        path = WORK / "release.json"
+        marker = signed_release_value()
+        now = datetime.datetime(2026, 8, 16, 20, tzinfo=datetime.timezone.utc)
+        release_tool.write(path, marker)
+        self.assertEqual(release_tool.read(path, fresh=True, now=now), marker)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(list(WORK.glob("*.staged")), [])
+
+    def test_upgrade_refuses_linked_cache(self):
+        target = WORK / "target.json"
+        target.write_text("{}\n", encoding="utf-8")
+        path = WORK / "release.json"
+        path.symlink_to(target)
+        with self.assertRaisesRegex(ValidatorError, "unreadable"):
+            release_tool.read(path, fresh=False)
+
     def test_upgrade_checks_remote_without_fetching(self):
         (WORK / ".git").mkdir()
         head = "a" * 40
@@ -350,7 +387,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ) as run:
             self.assertEqual(
                 upgrade_tool.git_update(WORK, public, source),
-                (public, source),
+                (public, source, False),
             )
 
         self.assertEqual(
@@ -367,6 +404,7 @@ class ValidatorToolsTest(unittest.TestCase):
     def test_upgrade_fast_forwards_detached_release(self):
         public = "a" * 40
         source = "b" * 40
+        heads = iter(["c" * 40, public])
         (WORK / "SOURCE_COMMIT").write_text(source + "\n", encoding="utf-8")
 
         def output(command, **_):
@@ -376,8 +414,10 @@ class ValidatorToolsTest(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, command)
             if command[1] == "remote":
                 return "backup\norigin"
-            if command[1:3] in (["rev-parse", "FETCH_HEAD"], ["rev-parse", "HEAD"]):
+            if command[1:3] == ["rev-parse", "FETCH_HEAD"]:
                 return public
+            if command[1:3] == ["rev-parse", "HEAD"]:
+                return next(heads)
             self.fail(f"unexpected command: {command}")
 
         with mock.patch.object(upgrade_tool, "capture", side_effect=output), mock.patch.object(
@@ -385,7 +425,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ) as run:
             self.assertEqual(
                 upgrade_tool.git_update(WORK, public, source),
-                (public, source),
+                (public, source, True),
             )
 
         self.assertEqual(
@@ -439,6 +479,185 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(ready("validator", observer))
         self.assertFalse(ready("observer", {**observer, "binary_match": False}))
 
+    def test_upgrade_plans_terminal_range_sync(self):
+        values = {
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+            "OCTRA_CATCHUP_MAX_LAG": "5000",
+        }
+        state = {
+            "process": "online",
+            "rpc": "ready",
+            "head_epoch": 100,
+        }
+        self.assertIsNone(sync_plan(values, state, 5100))
+        self.assertEqual(
+            sync_plan(values, state, 5101),
+            {
+                "schema": "octra_sync_need_v1",
+                "chain_id": "octra-devnet-9871-cluster",
+                "cause": "range",
+                "epoch": 101,
+                "head": 100,
+                "target": 5101,
+            },
+        )
+        self.assertIsNone(sync_plan(values, {**state, "rpc": "unavailable"}, 5101))
+
+    def test_upgrade_reads_bounded_sync_head(self):
+        payload = json.dumps({
+            "version": "octra-state-sync",
+            "mode": "live_head",
+            "current_epoch": 42,
+            "head_epoch": 41,
+            "snapshot_epoch": 40,
+        }).encode("utf-8")
+        certificate = json.dumps({
+            "version": "octra-state-sync",
+            "checkpoint": {"epoch": "40"},
+            "manifest": {"files": [{"path": "ready_roots", "size": "1"}]},
+        }).encode("utf-8")
+        first = mock.MagicMock()
+        first.__enter__.return_value.read.return_value = payload
+        second = mock.MagicMock()
+        second.__enter__.return_value.read.return_value = certificate
+        with mock.patch.object(
+            upgrade_tool,
+            "urlopen",
+            side_effect=[first, second],
+        ):
+            self.assertEqual(
+                upgrade_tool.sync_epoch("https://seed.example"),
+                {"head": 41, "snapshot": 40},
+            )
+        first.__enter__.return_value.read.return_value = b"x" * 65_537
+        with mock.patch.object(upgrade_tool, "urlopen", return_value=first):
+            with self.assertRaisesRegex(ValidatorError, "byte limit"):
+                upgrade_tool.sync_epoch("https://seed.example")
+
+    def test_upgrade_reads_snapshot_epoch_from_certificate(self):
+        head = json.dumps({
+            "version": "octra-state-sync",
+            "mode": "live_head",
+            "current_epoch": 42,
+            "head_epoch": 41,
+        }).encode("utf-8")
+        certificate = json.dumps({
+            "version": "octra-state-sync",
+            "checkpoint": {"epoch": "39"},
+            "manifest": {"files": [{"path": "ready_roots", "size": "1"}]},
+        }).encode("utf-8")
+        first = mock.MagicMock()
+        first.__enter__.return_value.read.return_value = head
+        second = mock.MagicMock()
+        second.__enter__.return_value.read.return_value = certificate
+        with mock.patch.object(
+            upgrade_tool,
+            "urlopen",
+            side_effect=[first, second],
+        ):
+            self.assertEqual(
+                upgrade_tool.sync_epoch("https://seed.example"),
+                {"head": 41, "snapshot": 39},
+            )
+
+    def test_upgrade_rejects_snapshot_without_root_window(self):
+        head = json.dumps({
+            "version": "octra-state-sync",
+            "mode": "live_head",
+            "current_epoch": 42,
+            "head_epoch": 41,
+            "snapshot_epoch": 40,
+        }).encode("utf-8")
+        certificate = json.dumps({
+            "version": "octra-state-sync",
+            "checkpoint": {"epoch": "40"},
+            "manifest": {"files": []},
+        }).encode("utf-8")
+        first = mock.MagicMock()
+        first.__enter__.return_value.read.return_value = head
+        second = mock.MagicMock()
+        second.__enter__.return_value.read.return_value = certificate
+        with mock.patch.object(
+            upgrade_tool,
+            "urlopen",
+            side_effect=[first, second],
+        ):
+            with self.assertRaisesRegex(ValidatorError, "root window"):
+                upgrade_tool.sync_epoch("https://seed.example")
+
+    def test_upgrade_rejects_unsigned_snapshot_epoch(self):
+        head = json.dumps({
+            "version": "octra-state-sync",
+            "mode": "live_head",
+            "current_epoch": 42,
+            "head_epoch": 41,
+            "snapshot_epoch": 40,
+        }).encode("utf-8")
+        certificate = json.dumps({
+            "version": "octra-state-sync",
+            "checkpoint": {"epoch": "39"},
+            "manifest": {"files": [{"path": "ready_roots", "size": "1"}]},
+        }).encode("utf-8")
+        first = mock.MagicMock()
+        first.__enter__.return_value.read.return_value = head
+        second = mock.MagicMock()
+        second.__enter__.return_value.read.return_value = certificate
+        with mock.patch.object(
+            upgrade_tool,
+            "urlopen",
+            side_effect=[first, second],
+        ):
+            with self.assertRaisesRegex(ValidatorError, "fields differ"):
+                upgrade_tool.sync_epoch("https://seed.example")
+
+    def test_upgrade_waits_for_snapshot_boundary(self):
+        values = {"OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example"}
+        need = {"epoch": 101}
+        with mock.patch.object(
+            upgrade_tool,
+            "sync_head",
+            side_effect=[
+                {"head": 200, "snapshot": 100},
+                {"head": 201, "snapshot": 150},
+            ],
+        ), mock.patch.object(upgrade_tool.time, "sleep"):
+            self.assertEqual(
+                upgrade_tool.sync_wait(values, need, 10.0, 0.1),
+                {"head": 201, "snapshot": 150, "required": 101},
+            )
+
+    def test_upgrade_rejects_snapshot_beyond_catchup_window(self):
+        values = {
+            "OCTRA_CATCHUP_MAX_LAG": "5000",
+            "OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example",
+        }
+        need = {"epoch": 1337042, "target": 1344077}
+        with mock.patch.object(
+            upgrade_tool,
+            "sync_head",
+            side_effect=[
+                {"head": 1344077, "snapshot": 1337040},
+                {"head": 1344077, "snapshot": 1342801},
+            ],
+        ), mock.patch.object(upgrade_tool.time, "sleep"):
+            self.assertEqual(
+                upgrade_tool.sync_wait(values, need, 10.0, 0.1),
+                {
+                    "head": 1344077,
+                    "snapshot": 1342801,
+                    "required": 1339077,
+                },
+            )
+
+    def test_upgrade_prefers_live_peer_head(self):
+        self.assertEqual(
+            sync_target(
+                {"peer_epoch": 1344077},
+                {"head": 1342979, "snapshot": 1342801},
+            ),
+            1344077,
+        )
+
     def test_upgrade_reports_installed_during_consensus_recovery(self):
         state = {
             "process": "online",
@@ -474,6 +693,189 @@ class ValidatorToolsTest(unittest.TestCase):
             ),
             ("pending", "health_deadline", "do_not_restart", 2),
         )
+
+    def test_upgrade_floor_requires_synced_bootstrap_round(self):
+        state = {
+            "process": "online",
+            "rpc": "ready",
+            "head_epoch": 41,
+            "peer_epoch": 41,
+            "lag": 0,
+            "voting": False,
+            "voting_reason": "vote_log_bootstrap",
+            "round_epoch": 42,
+            "round": 7,
+        }
+        self.assertEqual(upgrade_tool.floor_target(state), (41, 8))
+        self.assertIsNone(upgrade_tool.floor_target({**state, "lag": 1}))
+        self.assertIsNone(
+            upgrade_tool.floor_target({**state, "round_epoch": 43})
+        )
+        self.assertIsNone(
+            upgrade_tool.floor_target({**state, "voting_reason": "vote_log_corrupt"})
+        )
+
+    def test_upgrade_installs_recovery_floor_around_one_stop(self):
+        events = []
+        config = WORK / "node.env"
+        data = WORK / "data"
+        values = {
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_CHAIN_ID": "octra-devnet-test",
+        }
+        supervisor = {
+            "kind": "systemd",
+            "scope": "system",
+            "name": "octra-node.service",
+            "pid": 42,
+            "config": config,
+        }
+        args = mock.Mock(sudo=True, wait_seconds=10.0, interval=0.1)
+        address, public_key = identity()
+        wallet = {"address": address, "pub": public_key}
+
+        def floor(*_, **kwargs):
+            events.append("check" if kwargs.get("check") else "write")
+
+        with mock.patch.object(
+            upgrade_tool, "load_wallet", return_value=wallet
+        ), mock.patch.object(
+            upgrade_tool, "place_floor", side_effect=floor
+        ), mock.patch.object(
+            upgrade_tool, "stop", side_effect=lambda *_: events.append("stop")
+        ), mock.patch.object(
+            upgrade_tool, "data_pids", return_value=[]
+        ), mock.patch.object(
+            upgrade_tool, "start", side_effect=lambda *_: events.append("start")
+        ):
+            upgrade_tool.install_floor(
+                WORK,
+                supervisor,
+                values,
+                args,
+                supervisor,
+                (41, 8),
+            )
+
+        self.assertEqual(events, ["check", "stop", "write", "start"])
+
+    def test_upgrade_floor_check_fails_before_stop(self):
+        config = WORK / "node.env"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-test",
+        }
+        supervisor = {
+            "kind": "pm2",
+            "scope": "user",
+            "name": "octra-test",
+            "pid": 42,
+            "config": config,
+        }
+        args = mock.Mock(sudo=False, wait_seconds=10.0, interval=0.1)
+        with mock.patch.object(
+            upgrade_tool,
+            "load_wallet",
+            return_value={"address": identity()[0], "pub": identity()[1]},
+        ), mock.patch.object(
+            upgrade_tool, "place_floor", side_effect=ValidatorError("unsafe")
+        ), mock.patch.object(upgrade_tool, "stop") as stop_node:
+            with self.assertRaisesRegex(ValidatorError, "unsafe"):
+                upgrade_tool.install_floor(
+                    WORK,
+                    supervisor,
+                    values,
+                    args,
+                    supervisor,
+                    (41, 8),
+                )
+        stop_node.assert_not_called()
+
+    def test_upgrade_restarts_when_floor_write_fails(self):
+        config = WORK / "node.env"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-test",
+        }
+        supervisor = {
+            "kind": "pm2",
+            "scope": "user",
+            "name": "octra-test",
+            "pid": 42,
+            "config": config,
+        }
+        args = mock.Mock(sudo=False, wait_seconds=10.0, interval=0.1)
+        address, public_key = identity()
+        calls = []
+
+        def floor(*_, **kwargs):
+            if kwargs.get("check"):
+                return
+            raise ValidatorError("write failed")
+
+        with mock.patch.object(
+            upgrade_tool,
+            "load_wallet",
+            return_value={"address": address, "pub": public_key},
+        ), mock.patch.object(
+            upgrade_tool, "place_floor", side_effect=floor
+        ), mock.patch.object(
+            upgrade_tool, "stop"
+        ), mock.patch.object(
+            upgrade_tool, "data_pids", return_value=[]
+        ), mock.patch.object(
+            upgrade_tool, "start", side_effect=lambda *_: calls.append("start")
+        ):
+            with self.assertRaisesRegex(ValidatorError, "write failed"):
+                upgrade_tool.install_floor(
+                    WORK,
+                    supervisor,
+                    values,
+                    args,
+                    supervisor,
+                    (41, 8),
+                )
+        self.assertEqual(calls, ["start"])
+
+    def test_upgrade_restarts_when_floor_owner_remains(self):
+        config = WORK / "node.env"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-test",
+        }
+        supervisor = {
+            "kind": "systemd",
+            "scope": "system",
+            "name": "octra-node.service",
+            "pid": 42,
+            "config": config,
+        }
+        args = mock.Mock(sudo=True)
+        address, public_key = identity()
+        calls = []
+        with mock.patch.object(
+            upgrade_tool,
+            "load_wallet",
+            return_value={"address": address, "pub": public_key},
+        ), mock.patch.object(
+            upgrade_tool, "place_floor"
+        ), mock.patch.object(
+            upgrade_tool, "stop"
+        ), mock.patch.object(
+            upgrade_tool, "data_pids", return_value=[71]
+        ), mock.patch.object(
+            upgrade_tool, "start", side_effect=lambda *_: calls.append("start")
+        ):
+            with self.assertRaisesRegex(ValidatorError, "active after stop: 71"):
+                upgrade_tool.install_floor(
+                    WORK,
+                    supervisor,
+                    values,
+                    args,
+                    supervisor,
+                    (41, 8),
+                )
+        self.assertEqual(calls, ["start"])
 
     def test_upgrade_manual_hashes_are_assertions_only(self):
         release = release_value()
@@ -543,12 +945,15 @@ class ValidatorToolsTest(unittest.TestCase):
         }
 
         def command(command, **_):
-            events.append(Path(command[1]).name)
+            name = Path(command[1]).name
+            if name == "validator_config.py":
+                name = "network" if "--adopt-network" in command else "runtime"
+            events.append(name)
             return mock.Mock()
 
         def update(*_):
             events.append("git")
-            return "a" * 40, "b" * 40
+            return "a" * 40, "b" * 40, False
 
         with mock.patch.object(
             upgrade_tool, "preflight", side_effect=lambda *_: events.append("preflight")
@@ -569,6 +974,10 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool, "stop", side_effect=lambda *_: events.append("stop")
         ) as stop_node, mock.patch.object(
+            upgrade_tool,
+            "restore_plan",
+            side_effect=lambda *_, **__: events.append("recover"),
+        ), mock.patch.object(
             upgrade_tool, "start", side_effect=lambda *_: events.append("start")
         ) as start_node, mock.patch.object(
             upgrade_tool, "pm2_entries", return_value=[]
@@ -576,6 +985,8 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool, "current", return_value={**supervisor, "pid": 42}
         ), mock.patch.object(
             upgrade_tool, "view", return_value=healthy
+        ), mock.patch.object(
+            upgrade_tool, "sync_head", return_value=None
         ):
             self.assertEqual(
                 upgrade_tool.apply(WORK, supervisor, values, args, release_value()),
@@ -590,9 +1001,11 @@ class ValidatorToolsTest(unittest.TestCase):
                 "git",
                 "check.sh",
                 "build.sh",
-                "validator_config.py",
+                "network",
+                "runtime",
                 "validator_guard.py",
                 "stop",
+                "recover",
                 "start",
             ],
         )
@@ -631,11 +1044,15 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool,
             "git_update",
-            return_value=("a" * 40, "b" * 40),
+            return_value=("a" * 40, "b" * 40, False),
         ), mock.patch.object(
             upgrade_tool, "verify_release_tree"
         ), mock.patch.object(
             upgrade_tool, "call", side_effect=command
+        ), mock.patch.object(
+            upgrade_tool, "view", return_value={}
+        ), mock.patch.object(
+            upgrade_tool, "sync_head", return_value=None
         ), mock.patch.object(upgrade_tool, "stop") as stop_node, mock.patch.object(
             upgrade_tool, "start"
         ) as start_node:
@@ -644,6 +1061,83 @@ class ValidatorToolsTest(unittest.TestCase):
 
         stop_node.assert_not_called()
         start_node.assert_not_called()
+
+    def test_upgrade_reexecs_after_fast_forward_before_build(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_OPERATOR_BINARY": str(WORK / "candidate/octra_node.exe"),
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        supervisor = {
+            "kind": "pm2",
+            "scope": "user",
+            "name": "octra-test",
+            "pid": 41,
+            "active": True,
+            "state": "online",
+            "config": WORK / "node.env",
+        }
+        args = mock.Mock(
+            sudo=False,
+            public_commit="a" * 40,
+            source_commit="b" * 40,
+        )
+        with mock.patch.object(upgrade_tool, "preflight"), mock.patch.object(
+            upgrade_tool, "view", return_value={}
+        ), mock.patch.object(
+            upgrade_tool, "sync_head", return_value=None
+        ), mock.patch.object(
+            upgrade_tool, "read_need", return_value=None
+        ), mock.patch.object(
+            upgrade_tool, "verify_unit", return_value=None
+        ), mock.patch.object(
+            upgrade_tool,
+            "git_update",
+            return_value=("a" * 40, "b" * 40, True),
+        ), mock.patch.object(
+            upgrade_tool, "verify_release_tree"
+        ), mock.patch.object(
+            upgrade_tool, "reexec", side_effect=SystemExit(0)
+        ) as restart, mock.patch.object(
+            upgrade_tool, "call"
+        ) as run, mock.patch.object(
+            upgrade_tool, "stop"
+        ) as stop_node, mock.patch.object(
+            upgrade_tool, "start"
+        ) as start_node:
+            with self.assertRaises(SystemExit):
+                upgrade_tool.apply(WORK, supervisor, values, args, release_value())
+
+        restart.assert_called_once_with(WORK)
+        run.assert_not_called()
+        stop_node.assert_not_called()
+        start_node.assert_not_called()
+
+    def test_upgrade_recovers_marked_state_once(self):
+        config = WORK / "node.env"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        need = {"cause": "root", "epoch": 100, "head": 99, "target": None}
+        with mock.patch.object(upgrade_tool, "read_need", return_value=need), mock.patch.object(
+            upgrade_tool, "recover"
+        ) as run:
+            self.assertEqual(restore_need(values, config), need)
+        run.assert_called_once_with(config, replace_state=True, plan=need)
+
+    def test_upgrade_skips_unmarked_state(self):
+        config = WORK / "node.env"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        with mock.patch.object(upgrade_tool, "read_need", return_value=None), mock.patch.object(
+            upgrade_tool, "recover"
+        ) as run:
+            self.assertIsNone(restore_need(values, config))
+        run.assert_not_called()
 
     def test_validator_reports_resources(self):
         usage = mock.Mock(
@@ -1868,6 +2362,14 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
+    def test_network_allows_one_signed_state_sync_source(self):
+        values = network_values()
+        values["OCTRA_STATE_SYNC_SOURCES"] = "https://seed-a.example"
+        self.assertEqual(
+            validate_network(values, WORK)["OCTRA_STATE_SYNC_SOURCES"],
+            "https://seed-a.example",
+        )
+
     def test_advertise_uses_consensus_port(self):
         self.assertEqual(
             validate_advertise("203.0.113.1:19000", 19000),
@@ -2183,6 +2685,36 @@ class ValidatorToolsTest(unittest.TestCase):
             str(installed_network.resolve()),
         )
 
+    def test_network_adoption_preserves_local_state(self):
+        config = WORK / "live/.keys/validator/node.env"
+        installed = config.parent / "network.env"
+        candidate = WORK / "candidate/config/network.env"
+        current = network_values()
+        current["OCTRA_BOOTSTRAP_PEERS"] = "old-a:19000,old-b:19000"
+        current["OCTRA_PEERS"] = current["OCTRA_BOOTSTRAP_PEERS"]
+        next_values = network_values()
+        next_values["OCTRA_BOOTSTRAP_PEERS"] = "new-a:19000,new-b:19000"
+        next_values["OCTRA_PEERS"] = next_values["OCTRA_BOOTSTRAP_PEERS"]
+        write_env(installed, current)
+        write_env(candidate, next_values)
+        write_env(config, {
+            **current,
+            "OCTRA_DATA_DIR": "/srv/octra/data/node",
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(installed),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(
+                installed.read_bytes()
+            ).hexdigest(),
+            "OCTRA_OPERATOR_ROLE": "validator",
+        })
+        candidate_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        adopt_network(config, candidate, candidate_hash)
+        values = parse_env(config)
+        self.assertEqual(values["OCTRA_DATA_DIR"], "/srv/octra/data/node")
+        self.assertEqual(values["OCTRA_OPERATOR_ROLE"], "validator")
+        self.assertEqual(values["OCTRA_BOOTSTRAP_PEERS"], "new-a:19000,new-b:19000")
+        self.assertEqual(values["OCTRA_OPERATOR_NETWORK_SHA256"], candidate_hash)
+        self.assertEqual(installed.read_bytes(), candidate.read_bytes())
+
     def test_install_prepares_operator_data_root(self):
         source_path = Path(__file__).resolve().parent / "install.sh"
         exported_path = Path(__file__).resolve().parent.parent / "install.sh"
@@ -2341,6 +2873,18 @@ class ValidatorToolsTest(unittest.TestCase):
             "2" * 64,
         )
 
+    def test_sync_minimum_epoch_reaches_client(self):
+        command = sync_client_command(
+            WORK / "state_sync_client",
+            WORK / "stage",
+            network_values(),
+            ["https://seed.example"],
+            4,
+            1,
+            min_epoch=1340000,
+        )
+        self.assertEqual(command[command.index("--min-epoch") + 1], "1340000")
+
     def test_sync_source_check_uses_each_published_source(self):
         sync_binary = WORK / "state_sync_client"
         sync_binary.write_bytes(b"client")
@@ -2418,6 +2962,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         config = WORK / "node.env"
         write_env(config, {
+            "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
             "OCTRA_CHECKPOINT_EPOCH": "99",
             "OCTRA_CHECKPOINT_STATE_ROOT": "3" * 64,
             "OCTRA_CHECKPOINT_TXID_HI": "500",
@@ -2426,6 +2971,50 @@ class ValidatorToolsTest(unittest.TestCase):
         with mock.patch("validator_recover.pm2_entries") as inspect:
             recover(config)
         inspect.assert_not_called()
+
+    def test_recovery_marker_is_chain_bound(self):
+        data = WORK / "data"
+        marker = write_need(data, "octra-devnet-bft-v1")
+        self.assertEqual(read_need(data, "octra-devnet-bft-v1"), {
+            "cause": "root",
+            "epoch": 100,
+            "head": 99,
+            "target": None,
+        })
+        with self.assertRaisesRegex(ValidatorError, "binding differs"):
+            read_need(data, "other-chain")
+        marker.unlink()
+        marker.mkdir()
+        with self.assertRaisesRegex(ValidatorError, "not a regular file"):
+            read_need(data, "octra-devnet-bft-v1")
+
+    def test_recovery_marker_fields_are_exact(self):
+        value = {
+            "schema": "octra_sync_need_v1",
+            "chain_id": "octra-devnet-bft-v1",
+            "cause": "root",
+            "epoch": 100,
+            "head": 99,
+            "target": None,
+            "extra": True,
+        }
+        with self.assertRaisesRegex(ValidatorError, "fields are invalid"):
+            need_of(value, "octra-devnet-bft-v1")
+
+    def test_recovery_refuses_systemd_data_owner(self):
+        data = WORK / "data"
+        data.mkdir()
+        config = WORK / "node.env"
+        write_env(config, {
+            "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
+            "OCTRA_DATA_DIR": str(data),
+        })
+        with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
+            "validator_recover.data_pids",
+            return_value=[41],
+        ):
+            with self.assertRaisesRegex(ValidatorError, "pid:41"):
+                recover(config)
 
     def test_recovery_downloads_verified_state(self):
         data = WORK / "data"
@@ -2448,7 +3037,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
         })
 
-        def install(*_):
+        def install(*_, **__):
             (data / "irmin_store").mkdir(parents=True)
             (data / "chaindata").mkdir()
             (data / "HEAD.json").write_text(
@@ -2460,6 +3049,10 @@ class ValidatorToolsTest(unittest.TestCase):
             with mock.patch("validator_recover.sync_snapshot", side_effect=install) as sync:
                 recover(config)
         sync.assert_called_once()
+        self.assertEqual(
+            sync.call_args.kwargs["min_epoch"],
+            int(network["OCTRA_CHECKPOINT_EPOCH"]),
+        )
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
 
     def test_recovery_preserves_nonempty_invalid_state(self):
@@ -2468,7 +3061,10 @@ class ValidatorToolsTest(unittest.TestCase):
         evidence = data / "unknown"
         evidence.write_bytes(b"preserve")
         config = WORK / "node.env"
-        write_env(config, {"OCTRA_DATA_DIR": str(data)})
+        write_env(config, {
+            "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
+            "OCTRA_DATA_DIR": str(data),
+        })
         with self.assertRaisesRegex(ValidatorError, "evidence-preserving"):
             recover(config)
         self.assertEqual(evidence.read_bytes(), b"preserve")
@@ -2503,7 +3099,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
         })
 
-        def install(*_):
+        def install(*_, **__):
             self.assertFalse(data.exists())
             (data / "irmin_store").mkdir(parents=True)
             (data / "chaindata").mkdir()
@@ -2557,6 +3153,99 @@ class ValidatorToolsTest(unittest.TestCase):
                     recover(config, replace_state=True)
         self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
         self.assertFalse(preserved_state_path(data, 99).exists())
+
+    def test_recovery_rejects_snapshot_below_marker(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        head_bytes = (
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n'
+        ).encode("utf-8")
+        (data / "HEAD.json").write_bytes(head_bytes)
+        config = WORK / "keys" / "node.env"
+        identity_path = config.parent / "wallet.json"
+        ensure_wallet(identity_path)
+        (data / "wallet.json").write_bytes(identity_path.read_bytes())
+        (data / "wallet.json").chmod(0o600)
+        network = network_values()
+        write_need(data, network["OCTRA_CHAIN_ID"])
+        bundle = WORK / "network.env"
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        write_env(bundle, network)
+        write_env(config, {
+            **network,
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+            "OCTRA_OPERATOR_SYNC_BINARY_HASH": hashlib.sha256(b"client").hexdigest(),
+            "OCTRA_OPERATOR_SYNC_CONCURRENCY": "4",
+            "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
+            "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
+        })
+
+        def install(*_, **__):
+            (data / "irmin_store").mkdir(parents=True)
+            (data / "chaindata").mkdir()
+            (data / "HEAD.json").write_bytes(head_bytes)
+
+        with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
+            "validator_recover.sync_snapshot", side_effect=install
+        ):
+            with self.assertRaisesRegex(ValidatorError, "below recovery boundary"):
+                recover(config, replace_state=True)
+        self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
+        self.assertIsNotNone(read_need(data, network["OCTRA_CHAIN_ID"]))
+        self.assertTrue(data.with_name(data.name + ".rejected-99").is_dir())
+
+    def test_recovery_accepts_snapshot_at_marker(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        config = WORK / "keys" / "node.env"
+        identity_path = config.parent / "wallet.json"
+        wallet = ensure_wallet(identity_path)
+        (data / "wallet.json").write_bytes(identity_path.read_bytes())
+        (data / "wallet.json").chmod(0o600)
+        network = network_values()
+        write_need(data, network["OCTRA_CHAIN_ID"])
+        bundle = WORK / "network.env"
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        write_env(bundle, network)
+        write_env(config, {
+            **network,
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+            "OCTRA_OPERATOR_SYNC_BINARY_HASH": hashlib.sha256(b"client").hexdigest(),
+            "OCTRA_OPERATOR_SYNC_CONCURRENCY": "4",
+            "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
+            "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
+        })
+
+        def install(*_, **__):
+            (data / "irmin_store").mkdir(parents=True)
+            (data / "chaindata").mkdir()
+            (data / "HEAD.json").write_text(
+                '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
+                encoding="utf-8",
+            )
+
+        with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
+            "validator_recover.sync_snapshot", side_effect=install
+        ):
+            recover(config, replace_state=True)
+        prior = preserved_state_path(data, 99)
+        self.assertIsNone(read_need(data, network["OCTRA_CHAIN_ID"]))
+        self.assertIsNotNone(read_need(prior, network["OCTRA_CHAIN_ID"]))
+        self.assertEqual(load_wallet(data / "wallet.json"), wallet)
 
     def test_config_root_matches_layout(self):
         source = Path(__file__).resolve()
@@ -2905,6 +3594,31 @@ class ValidatorToolsTest(unittest.TestCase):
             active_data_owners(entries, "/data/octra"),
             ["octra-validator"],
         )
+
+    def test_data_pids_find_systemd_owner(self):
+        root = WORK / "proc"
+        process = root / "41"
+        process.mkdir(parents=True)
+        data = WORK / "data"
+        (process / "environ").write_bytes(
+            b"PATH=/usr/bin\0OCTRA_DATA_DIR=" + os.fsencode(str(data.resolve())) + b"\0"
+        )
+        self.assertEqual(data_pids(data, root=root), [41])
+
+    def test_optional_pm2_inspection_allows_systemd_host(self):
+        with mock.patch("validator_process.shutil.which", return_value=None):
+            self.assertEqual(pm2_entries(required=False), [])
+            with self.assertRaisesRegex(ValidatorError, "PM2 process table"):
+                pm2_entries()
+
+    def test_optional_pm2_inspection_fails_closed(self):
+        with mock.patch(
+            "validator_process.shutil.which",
+            return_value="/usr/bin/pm2",
+        ):
+            with mock.patch("validator_process.subprocess.run", side_effect=OSError):
+                with self.assertRaisesRegex(ValidatorError, "PM2 process table"):
+                    pm2_entries(required=False)
 
     def test_remaining_owners_detects_name_and_data_dir(self):
         entries = [

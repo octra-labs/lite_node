@@ -72,6 +72,5 @@ val stashed_plan :
   header_epoch:int ->
   current_epoch:int ->
   prev_root_matches:bool ->
-  state_attested:bool ->
   catchup_active:bool ->
   stashed_plan

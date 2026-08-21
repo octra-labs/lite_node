@@ -127,6 +127,10 @@ val configure_process :
   exit_fatal:(unit -> unit) ->
   unit
 
+val set_async_exception_hook :
+  (exn -> unit) ->
+  unit
+
 val apply_gc_config :
   gc_config ->
   unit

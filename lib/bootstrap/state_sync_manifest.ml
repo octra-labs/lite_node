@@ -500,6 +500,7 @@ let pvac_file path =
 let reference_file path =
   path = "HEAD.json"
   || path = "state_root"
+  || path = Root_win.name
   || path = "ledger.dat"
   || path = Octra_core.Pvac_migration_entitlement.state_relative_path
   || pvac_file path
@@ -515,6 +516,8 @@ let validate_reference_body body =
         Error "reference snapshot has no state root"
     | None when not (List.mem "ledger.dat" paths) ->
         Error "reference snapshot has no ledger image"
+    | None when not (List.mem Root_win.name paths) ->
+        Error "reference snapshot has no ready root window"
     | None -> Ok ()
 
 let manifest_hash (body : body) =

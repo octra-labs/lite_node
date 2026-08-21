@@ -180,7 +180,9 @@ let read_exact_raw fd n =
       let open Lwt.Syntax in
       let* count = Lwt_unix.read fd buf off (n - off) in
       if count = 0 then Lwt.fail (Failure "connection_closed")
-      else loop (off + count)
+      else
+        let* () = Lwt.pause () in
+        loop (off + count)
   in
   let open Lwt.Syntax in
   let* () = loop 0 in
@@ -194,7 +196,9 @@ let write_all fd s =
       let open Lwt.Syntax in
       let* count = Lwt_unix.write_string fd s off (len - off) in
       if count = 0 then Lwt.fail (Failure "write_failed")
-      else loop (off + count)
+      else
+        let* () = Lwt.pause () in
+        loop (off + count)
   in
   loop 0
 

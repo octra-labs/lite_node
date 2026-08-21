@@ -26,6 +26,21 @@ type proof_result =
   | Proof_repaired
   | Proof_current
 
+type seed_result =
+  | Seeded
+  | Seed_current
+
+type conflict =
+  | History
+  | Committed
+  | Proof
+  | Certificate
+  | Bundle
+
+val classify_conflict : exn -> conflict option
+
+val conflict_label : conflict -> string
+
 val history_limit : int64
 
 val persist_certificate :
@@ -50,11 +65,27 @@ val read_pending_epoch :
   string ->
   (int64 option, string) result
 
+val seed :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  finalize:Octra_consensus.C_types.finalize ->
+  string ->
+  (seed_result, string) result
+
 val read_committed_validated :
   chain_id:string ->
   entry:Octra_consensus.Finality_log.entry ->
   string ->
   read_result
+
+val attested_root :
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  head:int ->
+  root:string ->
+  entry:Octra_consensus.Finality_log.entry ->
+  string ->
+  (string, string) result
 
 val read_committed_epoch :
   chain_id:string ->

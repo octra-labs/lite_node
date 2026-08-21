@@ -10,6 +10,17 @@ type queued = {
   reason : string;
 }
 
+type finish = {
+  tag : string;
+  root_verified : bool;
+}
+
+let finish_unverified tag =
+  { tag; root_verified = false }
+
+let finish_verified tag =
+  { tag; root_verified = true }
+
 type queue_event = {
   queued_target_epoch : int64;
   queued_reason : string;
@@ -48,7 +59,7 @@ type deps = {
 type run_one =
   target_epoch:int64 ->
   reason:string ->
-  finish_success:(string -> unit Lwt.t) ->
+  finish_success:(finish -> unit Lwt.t) ->
   fail_catchup:(string -> unit Lwt.t) ->
   unit Lwt.t
 
@@ -66,6 +77,10 @@ type query_deps = {
     max_epochs:int ->
     timeout_seconds:float ->
     validate:(C_driver.catchup_range_response_record -> bool) ->
+    C_driver.catchup_range_response_record option Lwt.t;
+  http_range :
+    from_epoch:int64 ->
+    max_epochs:int ->
     C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -142,6 +157,7 @@ type record_apply_deps = {
   write_finality : validated_record -> unit;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
+  advance_height : int64 -> unit Lwt.t;
 }
 
 type chunk_apply_deps = {
@@ -178,6 +194,7 @@ type target_wiring = {
   write_finality : validated_record -> unit;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
+  advance_height : int64 -> unit Lwt.t;
   read_local_root : unit -> string Lwt.t;
   base_eic : unit -> string;
   current_head : unit -> int64;
@@ -213,12 +230,14 @@ type node_target_wiring = {
   write_finality : validated_record -> unit;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
+  advance_height : int64 -> unit Lwt.t;
   base_eic : unit -> string;
   current_head : unit -> int64;
 }
 
 type driver_io = {
   start_height : int64 -> unit Lwt.t;
+  advance_height : int64 -> unit Lwt.t;
   wake_ready : unit -> unit Lwt.t;
   range_query : query_deps;
 }
@@ -245,6 +264,10 @@ type driver_runner_wiring = {
   mark_quarantine : string -> unit;
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
+  http_range :
+    from_epoch:int64 ->
+    max_epochs:int ->
+    C_driver.catchup_range_response_record option Lwt.t;
 }
 
 type driver_runner_node_wiring = {
@@ -268,7 +291,13 @@ type driver_runner_node_wiring = {
   mark_quarantine : string -> unit;
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
+  http_range :
+    from_epoch:int64 ->
+    max_epochs:int ->
+    C_driver.catchup_range_response_record option Lwt.t;
 }
+
+let range_cap = 16
 
 let short_hex8 s =
   String.concat ""
@@ -288,7 +317,7 @@ let range_plan ~env_timeout ~from_epoch ~target_epoch =
   let remain = Int64.to_int (Int64.sub target_epoch from_epoch) + 1 in
   {
     remain;
-    max_epochs = min 16 remain;
+    max_epochs = min range_cap remain;
     timeout_seconds = timeout_of_env ~remain env_timeout;
     log_progress = Int64.to_int from_epoch mod 100 = 0;
   }
@@ -320,7 +349,7 @@ let parse_record_txs record =
       List.map
         (fun tx_json ->
           match Yojson.Safe.from_string tx_json
-                |> Octra_core.Transaction.of_yojson with
+                |> Octra_core.Tx_payload.decode with
           | Ok tx -> tx
           | Error e -> failwith ("bad tx_json: " ^ e))
         record.Octra_consensus.C_codec.txs_json
@@ -328,23 +357,41 @@ let parse_record_txs record =
   with exn ->
     Error ("tx_json parse failed: " ^ Printexc.to_string exn)
 
-let record_payload_valid record =
+let record_payload_error record =
   match parse_record_txs record with
-  | Error _ -> false
+  | Error error -> Some error
   | Ok parsed_txs ->
     let parsed_tx_hashes =
       List.map Octra_core.Transaction.hash parsed_txs
     in
     begin
       match C_catchup.verify_record_hashes ~record ~parsed_tx_hashes with
-      | Error _ -> false
+      | Error error -> Some error
       | Ok () ->
-        Result.is_ok (C_catchup.verify_record_receipts ~record)
+        match C_catchup.verify_record_receipts ~record with
+        | Error error -> Some error
+        | Ok () -> None
     end
 
-let response_payload_valid = function
-  | [] -> false
-  | records -> List.for_all record_payload_valid records
+let response_payload_error records =
+  let rec first = function
+    | [] -> None
+    | record :: rest ->
+      match record_payload_error record with
+      | Some error ->
+        Some
+          (Printf.sprintf
+             "epoch = %Ld %s"
+             record.Octra_consensus.C_codec.epoch_id
+             error)
+      | None -> first rest
+  in
+  match records with
+  | [] -> Some "empty records"
+  | _ -> first records
+
+let response_payload_valid records =
+  Option.is_none (response_payload_error records)
 
 let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
   let open Lwt.Syntax in
@@ -359,19 +406,31 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       "event = progress epoch = %d remain = %d target = %Ld reason = %s"
       (Int64.to_int from_epoch) range_plan.remain target_epoch reason;
   let* local_root = deps.read_query_root () in
+  let reject (r : C_driver.catchup_range_response_record) reason =
+    Log.info "catchup"
+      "event = range_validate_failed from = %Ld peer = %s reason = %s"
+      from_epoch
+      (Text.addr_short r.C_driver.responder_addr)
+      reason;
+    false
+  in
   let validate r =
-    C_catchup.is_valid_chunk_first_epoch
-      ~status:r.C_driver.status
-      ~records:r.records
-      ~from_epoch
-    && response_payload_valid r.records
-    &&
-    match C_catchup.verify_chain_continuity
-            ~records:r.records
-            ~from_epoch
-            ~prev_root:local_root with
-    | Ok () -> true
-    | Error _ -> false
+    if not
+        (C_catchup.is_valid_chunk_first_epoch
+           ~status:r.C_driver.status
+           ~records:r.records
+           ~from_epoch)
+    then reject r "first epoch or status mismatch"
+    else
+      match response_payload_error r.records with
+      | Some error -> reject r ("payload: " ^ error)
+      | None ->
+        match C_catchup.verify_chain_continuity
+                ~records:r.records
+                ~from_epoch
+                ~prev_root:local_root with
+        | Ok () -> true
+        | Error error -> reject r ("continuity: " ^ error)
   in
   let* result =
     query_range
@@ -383,6 +442,34 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       ~timeout_seconds:range_plan.timeout_seconds
       ~reason
       ~validate
+  in
+  let* result =
+    match result with
+    | Some _ -> Lwt.return result
+    | None ->
+      let* response =
+        deps.range_query.http_range
+          ~from_epoch
+          ~max_epochs:range_cap
+      in
+      begin
+        match response with
+        | Some response when validate response ->
+          Log.warn "catchup"
+            "event = range_http_secondary from = %Ld records = %d reason = %s"
+            from_epoch
+            (List.length response.C_driver.records)
+            reason;
+          Lwt.return_some response
+        | Some response ->
+          Log.warn "catchup"
+            "event = range_http_rejected from = %Ld records = %d reason = %s"
+            from_epoch
+            (List.length response.C_driver.records)
+            reason;
+          Lwt.return_none
+        | None -> Lwt.return_none
+      end
   in
   match result with
   | Some chunk ->
@@ -712,6 +799,10 @@ let apply_validated_record (deps : record_apply_deps) ~head_before_record
       failwith error
   in
   store_record_metadata deps validated;
+  let advance () =
+    deps.advance_height
+      (Int64.succ validated.record.Octra_consensus.C_codec.epoch_id)
+  in
   match validated.apply_action with
   | Record_retry_moved_head err ->
     deps.activate_gap ();
@@ -721,13 +812,13 @@ let apply_validated_record (deps : record_apply_deps) ~head_before_record
     assert_already_applied ~head_before_record validated point;
     deps.write_finality validated;
     deps.promote_finality validated;
-    Lwt.return_unit
+    advance ()
   | Record_apply ->
     deps.write_finality validated;
     let* () = deps.apply_record validated in
     assert_post_apply validated (cached_apply_point deps.point_source);
     deps.promote_finality validated;
-    Lwt.return_unit
+    advance ()
 
 let apply_chunk_records (deps : record_apply_deps) ~prev_eic ~start_txid chunk =
   let open Lwt.Syntax in
@@ -944,13 +1035,16 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
     deps.normalize ~source:("catchup:" ^ reason);
     let our_head_int = deps.head_epoch () in
     let our_head = Int64.of_int our_head_int in
-    let rec loop ~from_epoch =
+    let rec loop ~from_epoch ~root_verified =
+      let* () = deps.apply.record_apply.advance_height from_epoch in
       if Int64.compare from_epoch target_epoch > 0 then begin
         Log.info "catchup"
           "event = complete epoch = %Ld reason = %s"
           target_epoch
           reason;
-        finish_success reason
+        finish_success
+          (if root_verified then finish_verified reason
+           else finish_unverified reason)
       end else
         let* query_step =
           query_or_local_apply deps ~target_epoch ~from_epoch ~reason
@@ -975,20 +1069,22 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
           in
           match step with
           | Chunk_finish tag ->
-            finish_success tag
+            finish_success (finish_unverified tag)
           | Chunk_retry ->
             run ()
           | Chunk_fail tag ->
             fail_catchup tag
           | Chunk_continue applied_chunk ->
-            loop ~from_epoch:(Int64.succ (last_applied_epoch applied_chunk))
+            loop
+              ~from_epoch:(Int64.succ (last_applied_epoch applied_chunk))
+              ~root_verified:true
     in
     if Int64.compare target_epoch our_head <= 0 then begin
       Log.info "catchup"
         "event = complete status = already_in_sync target = %Ld reason = %s"
         target_epoch
         reason;
-      finish_success ("already_in_sync:" ^ reason)
+      finish_success (finish_unverified ("already_in_sync:" ^ reason))
     end else begin
       Log.warn "catchup"
         "event = start local = %d target = %Ld lag = %d reason = %s"
@@ -996,7 +1092,7 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
         target_epoch
         (Int64.to_int (Int64.sub target_epoch our_head))
         reason;
-      loop ~from_epoch:(Int64.succ our_head)
+      loop ~from_epoch:(Int64.succ our_head) ~root_verified:false
     end
   in
   run ()
@@ -1010,7 +1106,8 @@ let queue_active (deps : deps) ~target_epoch ~reason =
 
 let run (deps : deps) ~run_one ~target_epoch ~reason =
   let open Lwt.Syntax in
-  let rec finish_success active_reason =
+  let rec finish_success finish =
+    let active_reason = finish.tag in
     let next_height = Int64.succ (Int64.of_int (deps.committed_head_epoch ())) in
     let* () = deps.start_height next_height in
     deps.set_catchup_active false;
@@ -1025,9 +1122,20 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
     | None ->
       deps.clear_queue ();
       let head = deps.committed_head_epoch () in
-      let* root = deps.read_local_root () in
-      deps.set_state_attested ~head ~root;
-      deps.clear_quarantine ("catchup_complete:" ^ active_reason);
+      let* () =
+        if finish.root_verified then begin
+          let* root = deps.read_local_root () in
+          deps.set_state_attested ~head ~root;
+          deps.clear_quarantine
+            ("catchup_complete:root_verified:" ^ active_reason);
+          Lwt.return_unit
+        end else begin
+          Log.warn "catchup"
+            "event = complete action = hold_attestation reason = unverified_root tag = %s head = %d"
+            active_reason head;
+          Lwt.return_unit
+        end
+      in
       if deps.observer then Lwt.return_unit
       else
         let* () = deps.drain_pending_finalized () in
@@ -1087,6 +1195,7 @@ let target_of_wiring (wiring : target_wiring) =
     write_finality = wiring.write_finality;
     promote_finality = wiring.promote_finality;
     apply_record = wiring.apply_record;
+    advance_height = wiring.advance_height;
   } in
   {
     normalize = wiring.normalize;
@@ -1157,6 +1266,7 @@ let target_wiring_of_node (wiring : node_target_wiring) =
     write_finality = wiring.write_finality;
     promote_finality = wiring.promote_finality;
     apply_record = wiring.apply_record;
+    advance_height = wiring.advance_height;
     read_local_root = wiring.read_local_root;
     base_eic = wiring.base_eic;
     current_head = wiring.current_head;
@@ -1167,6 +1277,7 @@ let target_wiring_of_node (wiring : node_target_wiring) =
 let driver_io_of_driver driver =
   {
     start_height = C_driver.start_height driver;
+    advance_height = C_driver.catchup_height driver;
     wake_ready = (fun () ->
       C_driver.wake_ready driver);
     range_query = {
@@ -1178,6 +1289,7 @@ let driver_io_of_driver driver =
           ~max_epochs
           ~timeout_seconds
           ~validate);
+      http_range = (fun ~from_epoch:_ ~max_epochs:_ -> Lwt.return_none);
     };
   }
 
@@ -1212,6 +1324,7 @@ let driver_runner_wiring_of_node wiring =
     mark_quarantine = wiring.mark_quarantine;
     observer = wiring.observer;
     drain_pending_finalized = wiring.drain_pending_finalized;
+    http_range = wiring.http_range;
   }
 
 let node_deps_of_driver_runner (wiring : driver_runner_wiring) io =
@@ -1239,7 +1352,7 @@ let target_wiring_of_driver_runner (wiring : driver_runner_wiring) io =
       head_epoch = wiring.committed_head_epoch;
       env_timeout = wiring.env_timeout;
       read_local_root = wiring.read_local_root;
-      range_query = io.range_query;
+      range_query = { io.range_query with http_range = wiring.http_range };
       cached_head = wiring.cached_head;
       next_txid = wiring.next_txid;
       finality = wiring.finality;
@@ -1247,6 +1360,7 @@ let target_wiring_of_driver_runner (wiring : driver_runner_wiring) io =
       write_finality = wiring.write_finality;
       promote_finality = wiring.promote_finality;
       apply_record = wiring.apply_record;
+      advance_height = io.advance_height;
       base_eic = wiring.base_eic;
       current_head = wiring.current_head;
     }

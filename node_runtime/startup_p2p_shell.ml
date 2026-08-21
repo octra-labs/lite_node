@@ -110,6 +110,10 @@ type node_start = {
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
+  activate_validator_set_relief :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
 }
 
 let raw32_zero = String.make 32 '\x00'
@@ -411,4 +415,7 @@ let start_node runtime =
         in
         active := validator_set;
         install next);
+      activate_validator_set_relief = (fun validator_set _ ->
+        active := validator_set;
+        install !scheduled);
     }

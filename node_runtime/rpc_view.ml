@@ -301,21 +301,11 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
     "validator_address", `String validator_address;
   ]
 
-let epoch_tags ~tags ~keep_epochs =
-  let min_tag =
-    match tags with
-    | first :: _ -> first
-    | [] -> 0
-  in
-  let max_tag =
-    match List.rev tags with
-    | last :: _ -> last
-    | [] -> 0
-  in
+let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs =
   `Assoc [
-    "count", `Int (List.length tags);
-    "min_epoch", `Int min_tag;
-    "max_epoch", `Int max_tag;
+    "count", `Int count;
+    "min_epoch", `Int min_epoch;
+    "max_epoch", `Int max_epoch;
     "keep_epochs", `Int keep_epochs;
   ]
 

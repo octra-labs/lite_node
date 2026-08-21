@@ -35,7 +35,7 @@ let parse_txs txs_json =
        | Error _ -> acc
        | Ok txs ->
          try
-           match Yojson.Safe.from_string tx_json |> Transaction.of_yojson with
+           match Yojson.Safe.from_string tx_json |> Octra_core.Tx_payload.decode with
            | Ok tx -> Ok (tx :: txs)
            | Error e -> Error e
          with exn -> Error (Printexc.to_string exn))

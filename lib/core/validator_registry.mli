@@ -20,6 +20,11 @@ type ready_payload = {
   consensus_pubkey_b64 : string;
   head_epoch : int64;
   state_root : string;
+  chain_id : string option;
+  binary_hash : string option;
+  config_hash : string option;
+  catchup_head_epoch : int64 option;
+  shadow_epochs : int option;
 }
 
 val meta_key : string

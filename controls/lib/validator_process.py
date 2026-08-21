@@ -4,9 +4,11 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from validator_common import ValidatorError
 from validator_common import parse_env
@@ -15,7 +17,6 @@ ACTIVE = frozenset({"launching", "online", "stopping"})
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
-
 
 def entry_data(entry):
     meta = entry.get("pm2_env")
@@ -103,7 +104,27 @@ def remaining_owners(entries, names, data_dir):
         or entry_data(entry) == data_dir
     } - {None})
 
-def pm2_entries():
+def data_pids(data_dir, root=Path("/proc")):
+    if not root.is_dir():
+        return []
+    expected = os.fsencode(str(Path(data_dir).resolve()))
+    result = []
+    for item in root.iterdir():
+        if not item.name.isdigit():
+            continue
+        try:
+            values = (item / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if b"OCTRA_DATA_DIR=" + expected in values:
+            result.append(int(item.name))
+    return sorted(result)
+
+def pm2_entries(required=True):
+    if shutil.which("pm2") is None:
+        if required:
+            raise ValidatorError("cannot inspect PM2 process table")
+        return []
     try:
         result = subprocess.run(
             ["pm2", "jlist"],

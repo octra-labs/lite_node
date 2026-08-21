@@ -44,6 +44,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
     nonce:int ->
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -266,6 +267,7 @@ type live_contract_ctx_args = {
   trusted_program_keys : Program_trust.t;
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -298,6 +300,7 @@ type live_sender_vm_tx_args = {
   store : Octra_core.Store_irmin.t;
   chaindata : Store_chaindata.t;
   tx : Transaction.t;
+  object_cost : bool;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
   pre_state_hash : string;
@@ -425,6 +428,7 @@ let make_contract_ctx deps =
       get_fhe_pubkey = deps.get_fhe_pubkey;
       get_fhe_keypair = (fun _ -> None);
       allow_fhe_capability = (fun _ -> true);
+      object_cost = deps.object_cost;
       current_epoch = deps.current_epoch;
       epoch_time_ms = deps.epoch_time_ms;
       tree_hash = deps.tree_hash;
@@ -460,6 +464,7 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
           ~journal:args.program_journal ~ctx ~depth
           ~params args.store ~deployer ~bytecode_raw ~nonce);
       get_fhe_pubkey = args.get_fhe_pubkey;
+      object_cost = args.object_cost;
       current_epoch = args.current_epoch;
       epoch_time_ms = args.epoch_time_ms;
       tree_hash = args.tree_hash;
@@ -1075,6 +1080,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         trusted_program_keys = args.trusted_program_keys;
         store = args.store;
         get_fhe_pubkey = live_fhe_pubkey args.store;
+        object_cost = args.object_cost;
         current_epoch = args.current_epoch ();
         epoch_time_ms = args.epoch_time_ms;
         tree_hash = args.pre_state_hash;

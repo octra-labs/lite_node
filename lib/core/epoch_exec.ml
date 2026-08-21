@@ -67,6 +67,10 @@ type account_ops = {
 
 type fold_ctx = {
   mode : Rule_graph.mode;
+  ready_mode : Rule_graph.mode;
+  seat_mode : Rule_graph.mode;
+  cap_mode : Set_fold.cap_mode;
+  ready_config_hash : string option;
   start : int64;
   parent : Octra_consensus.C_types.parent_commit option;
   members : string list;
@@ -126,7 +130,16 @@ let resolve_sender_key_activation = function
   | None -> Sender_key_policy.activation_epoch_exn Sys.getenv_opt
 
 let prior_fold _ =
-  Ok { mode = Rule_graph.Prior; start = 0L; parent = None; members = [] }
+  Ok {
+    mode = Rule_graph.Prior;
+    ready_mode = Rule_graph.Prior;
+    seat_mode = Rule_graph.Prior;
+    cap_mode = Set_fold.Reject;
+    ready_config_hash = None;
+    start = 0L;
+    parent = None;
+    members = [];
+  }
 
 let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
     ?sender_key_activation_epoch ?validator_policy ?(fold=prior_fold)
@@ -2296,6 +2309,7 @@ let apply_set_fold ~backend ~env =
     begin
       match
         Set_fold.advance
+          ~cap_mode:ctx.cap_mode
           Set_fold.standard
           ~chain_id:env.chain_id
           ~start:ctx.start
@@ -2305,6 +2319,17 @@ let apply_set_fold ~backend ~env =
       with
       | Error error -> failwith ("validator set fold update rejected: " ^ error)
       | Ok (next, reason, changed) ->
+        let next, locked =
+          match ctx.seat_mode with
+          | Rule_graph.Prior -> next, false
+          | Rule_graph.Active ->
+            begin
+              match Set_fold.lock Set_fold.standard ~active:env.validator_addrs next with
+              | Ok result -> result
+              | Error error ->
+                failwith ("validator seat lock rejected: " ^ error)
+            end
+        in
         Option.iter
           (fun reason ->
             Octra_log.warn
@@ -2313,7 +2338,7 @@ let apply_set_fold ~backend ~env =
               at
               reason)
           reason;
-        if changed then save_set_fold backend next
+        if changed || locked then save_set_fold backend next
         else Lwt.return_unit
     end
 
@@ -2755,6 +2780,32 @@ let validator_ready_proof ctx tx =
           Error "validator set fold proof owner mismatch"
     end
 
+let validate_validator_ready_policy ~env ctx
+    (ready : Validator_registry.ready_payload) =
+  match ctx.ready_mode with
+  | Rule_graph.Prior -> Ok ()
+  | Rule_graph.Active ->
+    begin
+      match ctx.ready_config_hash with
+      | None -> Error "validator ready config hash missing"
+      | Some config_hash ->
+        Validator_ready_policy.validate
+          ~runtime:{
+            chain_id = env.chain_id;
+            binary_hash = "";
+            config_hash;
+          }
+          ~requirements:(Validator_ready_policy.strict ())
+          {
+            head_epoch = ready.head_epoch;
+            chain_id = ready.chain_id;
+            binary_hash = ready.binary_hash;
+            config_hash = ready.config_hash;
+            catchup_head_epoch = ready.catchup_head_epoch;
+            shadow_epochs = ready.shadow_epochs;
+          }
+    end
+
 let update_ready_fold ~backend ~env ~address proof =
   let open Lwt.Syntax in
   let ctx = fold_at backend env.epoch_id in
@@ -2771,6 +2822,7 @@ let update_ready_fold ~backend ~env ~address proof =
           match proof with
           | None ->
             Set_fold.note_pulse
+              ~cap_mode:ctx.cap_mode
               Set_fold.standard
               ~epoch:(Int64.of_int env.epoch_id)
               ~active
@@ -2778,6 +2830,7 @@ let update_ready_fold ~backend ~env ~address proof =
               state
           | Some proof ->
             Set_fold.apply_proof
+              ~cap_mode:ctx.cap_mode
               Set_fold.standard
               ~chain_id:env.chain_id
               ~epoch:(Int64.of_int env.epoch_id)
@@ -2789,7 +2842,7 @@ let update_ready_fold ~backend ~env ~address proof =
         Lwt.return (Result.map Option.some result)
     end
 
-let process_bonded_validator_ready_tx ~backend ~env tx
+let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
     (ready : Validator_registry.ready_payload) =
   let open Lwt.Syntax in
   if not (String.equal tx.Transaction.from tx.to_) then
@@ -2798,69 +2851,75 @@ let process_bonded_validator_ready_tx ~backend ~env tx
          ("validator_ready_rejected",
           "bonded validator readiness must be self-directed"))
   else
-    let ctx = fold_at backend env.epoch_id in
     match validator_ready_proof ctx tx with
     | Error error ->
       Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
     | Ok proof ->
-    let* reference =
-      validate_validator_ready_reference
-        ~env
-        ~head_epoch:ready.head_epoch
-        ~state_root:ready.state_root
-    in
-    match reference with
-    | Error error ->
-      Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
-    | Ok () ->
-      let* registry_result = load_validator_registry backend in
-      begin
-        match registry_result with
-        | Error error ->
-          Lwt.return (Stdlib.Error ("validator_registry_corrupt", error))
-        | Ok registry ->
-          begin
-            match
-              Validator_registry.mark_ready
-                ~epoch:(Int64.of_int env.epoch_id)
-                ~address:tx.from
-                ~consensus_pubkey_b64:ready.consensus_pubkey_b64
-                registry
-            with
-            | Error error ->
-              Lwt.return
-                (Stdlib.Error ("validator_ready_rejected", error))
-            | Ok next ->
-              let* fold =
-                update_ready_fold
-                  ~backend
-                  ~env
-                  ~address:tx.from
-                  proof
-              in
-              begin
-                match fold with
-                | Error error ->
-                  Lwt.return
-                    (Stdlib.Error ("validator_ready_rejected", error))
-                | Ok fold ->
-              begin
-                match backend.ops.debit tx.from tx.ou tx.nonce with
-                | Error error ->
-                  Lwt.return
-                    (Stdlib.Error ("insufficient_balance", error))
-                | Ok () ->
-                  let* () = save_validator_registry backend next in
-                  let* () =
-                    match fold with
-                    | None -> Lwt.return_unit
-                    | Some state -> save_set_fold backend state
-                  in
-                  Lwt.return (Stdlib.Ok tx.ou)
-              end
-              end
-          end
-      end
+      let* reference =
+        validate_validator_ready_reference
+          ~env
+          ~head_epoch:ready.head_epoch
+          ~state_root:ready.state_root
+      in
+      match reference with
+      | Error error ->
+        Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
+      | Ok () ->
+        begin
+          match validate_validator_ready_policy ~env ctx ready with
+          | Error error ->
+            Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
+          | Ok () ->
+            let* registry_result = load_validator_registry backend in
+            begin
+              match registry_result with
+              | Error error ->
+                Lwt.return
+                  (Stdlib.Error ("validator_registry_corrupt", error))
+              | Ok registry ->
+                begin
+                  match
+                    Validator_registry.mark_ready
+                      ~epoch:(Int64.of_int env.epoch_id)
+                      ~address:tx.from
+                      ~consensus_pubkey_b64:ready.consensus_pubkey_b64
+                      registry
+                  with
+                  | Error error ->
+                    Lwt.return
+                      (Stdlib.Error ("validator_ready_rejected", error))
+                  | Ok next ->
+                    let* fold =
+                      update_ready_fold
+                        ~backend
+                        ~env
+                        ~address:tx.from
+                        proof
+                    in
+                    begin
+                      match fold with
+                      | Error error ->
+                        Lwt.return
+                          (Stdlib.Error ("validator_ready_rejected", error))
+                      | Ok fold ->
+                        begin
+                          match backend.ops.debit tx.from tx.ou tx.nonce with
+                          | Error error ->
+                            Lwt.return
+                              (Stdlib.Error ("insufficient_balance", error))
+                          | Ok () ->
+                            let* () = save_validator_registry backend next in
+                            let* () =
+                              match fold with
+                              | None -> Lwt.return_unit
+                              | Some state -> save_set_fold backend state
+                            in
+                            Lwt.return (Stdlib.Ok tx.ou)
+                        end
+                    end
+                end
+            end
+        end
 
 let process_legacy_validator_ready_tx ~backend ~env tx =
   let open Lwt.Syntax in
@@ -2935,16 +2994,30 @@ let process_legacy_validator_ready_tx ~backend ~env tx =
 
 let process_validator_ready_tx ~backend ~env tx =
   if Z.sign tx.Transaction.amount <> 0 then
-    Lwt.return (Stdlib.Error ("validator_ready_rejected", "amount must be zero"))
+    Lwt.return
+      (Stdlib.Error ("validator_ready_rejected", "amount must be zero"))
   else
-    match
-      backend.validator_policy,
-      Validator_registry.ready_payload_of_message tx.Transaction.message
-    with
-    | Validator_policy.Bonded _, Ok ready ->
-      process_bonded_validator_ready_tx ~backend ~env tx ready
-    | _ ->
+    match backend.validator_policy with
+    | Validator_policy.Inactive ->
       process_legacy_validator_ready_tx ~backend ~env tx
+    | Validator_policy.Bonded _ ->
+      let ctx = fold_at backend env.epoch_id in
+      begin
+        match
+          Validator_registry.ready_payload_of_message tx.Transaction.message
+        with
+        | Ok ready ->
+          process_bonded_validator_ready_tx ~backend ~env ~ctx tx ready
+        | Error error ->
+          begin
+            match ctx.ready_mode with
+            | Rule_graph.Prior ->
+              process_legacy_validator_ready_tx ~backend ~env tx
+            | Rule_graph.Active ->
+              Lwt.return
+                (Stdlib.Error ("validator_ready_rejected", error))
+          end
+      end
 
 let process_circle_operation_tx
     ?(wasm_profile=Circle_wasm_host.Standard)
@@ -3082,7 +3155,9 @@ let validator_snapshot_input ~backend ~env policy registry =
   match ctx.mode with
   | Rule_graph.Prior ->
     Lwt.return
-      (policy.Validator_policy.parameters, Validator_registry.candidates registry)
+      (policy.Validator_policy.parameters,
+       Validator_registry.candidates registry,
+       [])
   | Rule_graph.Active ->
     let* stored = load_set_fold backend in
     let state =
@@ -3105,13 +3180,22 @@ let validator_snapshot_input ~backend ~env policy registry =
       counts.Set_fold.live
       counts.shadow
       counts.allowed;
-    let parameters =
-      {
-        policy.parameters with
-        Validator_admission.max_validators = Set_fold.standard.max_members;
-      }
+    let max_validators, incumbents =
+      match ctx.seat_mode with
+      | Rule_graph.Prior -> Set_fold.standard.max_members, []
+      | Rule_graph.Active ->
+        begin
+          match Set_fold.seats state with
+          | Some seats -> seats, env.validator_addrs
+          | None -> failwith "validator seat limit is missing"
+        end
     in
-    Lwt.return (parameters, candidates)
+    let parameters = {
+      policy.parameters with
+      Validator_admission.max_validators;
+    }
+    in
+    Lwt.return (parameters, candidates, incumbents)
 
 let schedule_validator_snapshot ~backend ~env =
   let open Lwt.Syntax in
@@ -3133,11 +3217,12 @@ let schedule_validator_snapshot ~backend ~env =
           match backend.validator_policy with
           | Validator_policy.Inactive -> Lwt.return_unit
           | Validator_policy.Bonded policy ->
-            let* parameters, candidates =
+            let* parameters, candidates, incumbents =
               validator_snapshot_input ~backend ~env policy registry
             in
             match
               Validator_admission.snapshot
+                ~incumbents
                 parameters
                 ~activate_epoch
                 candidates

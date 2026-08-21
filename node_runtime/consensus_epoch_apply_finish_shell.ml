@@ -82,6 +82,7 @@ type node_deps = {
   log_epoch : string -> unit;
   fatal_epoch : string -> unit;
   short : string -> string;
+  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 
@@ -280,6 +281,7 @@ let run_node (deps : node_deps) request =
               match deps.get_meta "last_epoch" with
               | Some s -> Startup_process_shell.parse_int ~default:(-1) s
               | None -> -1);
+            require_sync = deps.require_sync;
             exit = deps.exit;
           }
           input);

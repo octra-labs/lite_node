@@ -5,6 +5,8 @@ type t
 
 val create : unit -> t
 
+val clear : t -> unit
+
 val add :
   t ->
   C_codec.round_sync ->

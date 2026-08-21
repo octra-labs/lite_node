@@ -40,6 +40,7 @@ let path_allowed rel =
   && rel <> "commit_journal.log"
   && (rel = "HEAD.json"
       || rel = "state_root"
+      || rel = Root_win.name
       || rel = "ledger.dat"
       || String.starts_with ~prefix:"irmin_store/" rel
       || String.starts_with ~prefix:"chaindata/" rel
@@ -85,6 +86,7 @@ let rec walk_dir ~base ~rel acc =
 let roots = [
   "HEAD.json";
   "state_root";
+  Root_win.name;
   "ledger.dat";
   "irmin_store";
   "chaindata";
@@ -179,7 +181,7 @@ let stable_head data_dir expected =
   | Some h -> head_equal h expected
   | None -> false
 
-let head_json ~current_epoch =
+let head_json ~current_epoch ~snapshot_epoch =
   let head_fields =
     match Octra_core.Head_manifest.get_cached () with
     | None -> [
@@ -197,6 +199,11 @@ let head_json ~current_epoch =
     "version", `String state_sync_version;
     "mode", `String "live_head";
     "current_epoch", `Int !current_epoch;
+    "snapshot_epoch",
+      Option.fold
+        ~none:`Null
+        ~some:(fun epoch -> `Intlit (Int64.to_string epoch))
+        snapshot_epoch;
   ] @ head_fields)
 
 let progress_accepted_json =
@@ -240,7 +247,34 @@ let hex_to_raw32 hh =
   else if String.length raw > 32 then String.sub raw 0 32
   else raw ^ String.make (32 - String.length raw) '\x00'
 
-let build_range ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
+let check_outcome ~epoch_id receipts txs =
+  match Octra_core.Tx_outcome.decode ~confirmed:txs receipts with
+  | Error error -> Error ("outcome:" ^ error)
+  | Ok partition ->
+    Octra_core.Preverify_receipt_policy.check
+      ~epoch_id
+      ~receipts:partition.preverify
+      txs
+
+let decode_range_txs txs_json =
+  List.fold_left
+    (fun acc tx_json ->
+      match acc with
+      | Error _ -> acc
+      | Ok txs ->
+        try
+          match
+            Yojson.Safe.from_string tx_json
+            |> Octra_core.Tx_payload.decode
+          with
+          | Ok tx -> Ok (tx :: txs)
+          | Error error -> Error error
+        with exn -> Error (Printexc.to_string exn))
+    (Ok [])
+    txs_json
+  |> Result.map List.rev
+
+let build_range ~on_stop ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
     ~from_epoch ~max_epochs =
   try
     let max_chunk = min (max 1 max_epochs) 16 in
@@ -253,17 +287,21 @@ let build_range ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
     while not !stop && !i < max_chunk do
       let target_epoch = Int64.add from_epoch (Int64.of_int !i) in
       let target_int = Int64.to_int target_epoch in
+      let halt reason =
+        on_stop ~epoch:target_epoch ~reason;
+        stop := true
+      in
       match Octra_core.Chaindata_index.get_epoch
         (Octra_core.Store_chaindata.index chaindata) target_int with
       | None ->
-          if !records = [] then stop := true
+          if !records = [] then halt "epoch_missing"
           else begin
             next_epoch := Some target_epoch;
-            stop := true
+            halt "epoch_missing"
           end
       | Some json_str ->
           match Octra_core.Epochlog.epoch_of_json json_str with
-          | None -> stop := true
+          | None -> halt "epoch_invalid"
           | Some elog ->
               let start_txid = elog.Octra_core.Epochlog.start_txid in
               let tx_count = elog.tx_count in
@@ -278,26 +316,15 @@ let build_range ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
                     tx_hashes := h :: !tx_hashes;
                     txs_json_list := j :: !txs_json_list
               done;
-              if not !txs_ok then stop := true
+              if not !txs_ok then halt "transaction_missing"
               else begin
                 let hashes_in_order = List.rev !tx_hashes in
                 let txs_in_order = List.rev !txs_json_list in
-                let parsed_txs =
-                  List.fold_left (fun acc tx_json ->
-                    match acc with
-                    | Stdlib.Error _ -> acc
-                    | Stdlib.Ok xs ->
-                      (try
-                         match Yojson.Safe.from_string tx_json |> Octra_core.Transaction.of_yojson with
-                         | Ok tx -> Stdlib.Ok (tx :: xs)
-                         | Error e -> Stdlib.Error e
-                       with e -> Stdlib.Error (Printexc.to_string e))
-                  ) (Stdlib.Ok []) txs_in_order
-                in
+                let parsed_txs = decode_range_txs txs_in_order in
                 match parsed_txs with
-                | Stdlib.Error _ -> stop := true
-                | Stdlib.Ok parsed_rev ->
-                  let parsed_txs = List.rev parsed_rev in
+                | Stdlib.Error error ->
+                  halt ("transaction_invalid:" ^ error)
+                | Stdlib.Ok parsed_txs ->
                   let receipts_json =
                     match data_dir with
                     | Some base ->
@@ -306,15 +333,16 @@ let build_range ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
                        | None -> [])
                     | None -> []
                   in
-                  match Octra_core.Preverify_receipt_policy.check
-                    ~epoch_id:target_int ~receipts:receipts_json parsed_txs with
-                  | Stdlib.Error _ -> stop := true
+                  match check_outcome ~epoch_id:target_int receipts_json parsed_txs with
+                  | Stdlib.Error error ->
+                    halt ("receipt_invalid:" ^ error)
                   | Stdlib.Ok () ->
                     match read_finality target_int with
-                    | None -> stop := true
+                    | None -> halt "finality_missing"
                     | Some finality ->
                     match reward_source target_int elog with
-                    | Stdlib.Error _ -> stop := true
+                    | Stdlib.Error error ->
+                      halt ("reward_source_invalid:" ^ error)
                     | Stdlib.Ok reward_source ->
                     let tx_list_hash_raw = Octra_net.Hash_domain.hash
                       "octra:tx_list:v1" (String.concat "" hashes_in_order) in
@@ -349,7 +377,8 @@ let build_range ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
                         ~expected_txid
                         ~record
                     with
-                    | Stdlib.Error _ -> stop := true
+                    | Stdlib.Error error ->
+                      halt ("finality_invalid:" ^ error)
                     | Stdlib.Ok _ ->
                     let tx_bytes =
                       List.fold_left (fun acc s -> acc + 32 + String.length s) 0 txs_in_order in
@@ -433,8 +462,8 @@ let record_json (r : Octra_consensus.C_codec.catchup_epoch_record) =
          ]);
   ]
 
-let range_json ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
-    ~from_epoch ~max_epochs =
+let range_json ~on_stop ~chain_id ~data_dir ~chaindata ~reward_source
+    ~read_finality ~from_epoch ~max_epochs =
   let head_fields =
     match Octra_core.Head_manifest.get_cached () with
     | None -> [ "head_epoch", `Null; "head_state_root", `Null ]
@@ -448,6 +477,7 @@ let range_json ~chain_id ~data_dir ~chaindata ~reward_source ~read_finality
       ~chain_id
       ~data_dir
       ~chaindata
+      ~on_stop
       ~reward_source
       ~read_finality
       ~from_epoch

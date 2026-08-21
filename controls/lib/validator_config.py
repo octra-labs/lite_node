@@ -14,6 +14,7 @@ from pathlib import Path
 
 from validator_common import ENDPOINT
 from validator_common import NAME
+from validator_common import NETWORK_KEYS
 from validator_common import ValidatorError
 from validator_common import copy_private
 from validator_common import ensure_wallet
@@ -27,6 +28,7 @@ from validator_common import sha256_file
 from validator_common import state_ready
 from validator_common import state_sync_sources
 from validator_common import validate_checkpoint
+from validator_common import validate_network_binding
 from validator_common import validator_entries
 from validator_common import write_env
 from validator_enroll import membership
@@ -143,6 +145,27 @@ def rebind_runtime(config):
     write_env(config, {**values, **runtime_binding(config)})
     require_runtime_binding(config)
     emit(event="runtime_binding", status="ready", root=ROOT)
+
+def adopt_network(config, network, expected_hash):
+    values = parse_env(config)
+    bundle, bundle_hash, network_values = load_network(network, expected_hash)
+    if values.get("OCTRA_CHAIN_ID") != network_values["OCTRA_CHAIN_ID"]:
+        raise ValidatorError("candidate network chain mismatch")
+    installed = Path(config).expanduser().resolve().parent / "network.env"
+    copy_private(bundle, installed)
+    updated = {
+        key: value
+        for key, value in values.items()
+        if key not in NETWORK_KEYS
+    }
+    updated.update(network_values)
+    updated["OCTRA_OPERATOR_NETWORK_BUNDLE"] = str(installed)
+    updated["OCTRA_OPERATOR_NETWORK_SHA256"] = bundle_hash
+    write_env(config, updated)
+    current = parse_env(config)
+    _, installed_hash, installed_values = load_network(installed, bundle_hash)
+    validate_network_binding(current, installed_values)
+    emit(event="network_binding", status="ready", sha256=installed_hash)
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
@@ -613,7 +636,11 @@ def sync_snapshot(
     sources,
     concurrency,
     source_concurrency,
+    min_epoch=None,
 ):
+    floor = int(values["OCTRA_CHECKPOINT_EPOCH"])
+    if min_epoch is not None:
+        floor = max(floor, int(min_epoch))
     validate_sync_layout(stage, data_path)
     command = sync_client_command(
         sync_binary,
@@ -622,9 +649,13 @@ def sync_snapshot(
         sources,
         concurrency,
         source_concurrency,
+        min_epoch=floor,
     )
     run(command)
     snapshot = load_verified_snapshot(stage, values)
+    head = validate_checkpoint(snapshot / "data", values, allow_progress=True)
+    if head["epoch"] < floor:
+        raise ValidatorError("signed snapshot is below required epoch")
     install_verified_snapshot(snapshot, data_path)
     if not state_ready(data_path):
         raise ValidatorError("state sync completed without a valid checkpoint")
@@ -637,6 +668,7 @@ def sync_client_command(
     sources,
     concurrency,
     source_concurrency,
+    min_epoch=None,
 ):
     validators = validator_entries(values["OCTRA_VALIDATORS"])
     exporters = exporter_entries(values["OCTRA_STATE_SYNC_EXPORTERS"])
@@ -653,7 +685,10 @@ def sync_client_command(
         "--source-concurrency",
         str(source_concurrency),
         "--min-epoch",
-        values["OCTRA_CHECKPOINT_EPOCH"],
+        str(max(
+            int(values["OCTRA_CHECKPOINT_EPOCH"]),
+            int(min_epoch) if min_epoch is not None else 0,
+        )),
     ]
     for source in sources:
         command.extend(["--source", source])
@@ -757,6 +792,7 @@ def maybe_sync(args, data_dir, values):
 def parser():
     value = argparse.ArgumentParser(prog="config_val.sh")
     value.add_argument("--advertise")
+    value.add_argument("--adopt-network", action="store_true")
     value.add_argument("--api-port", default="8080")
     value.add_argument("--binary", default=str(DEFAULT_BINARY))
     value.add_argument("--build", action="store_true")
@@ -789,6 +825,7 @@ def parser():
 def main():
     args = parser().parse_args()
     modes = [
+        args.adopt_network,
         args.build_only,
         args.check_runtime,
         args.check_sync,
@@ -823,6 +860,11 @@ def main():
             args.sync_stage or ROOT / "runtime_data/state_sync_check"
         ).expanduser().resolve()
         check_sync_sources(sync_binary, stage, values, sources)
+        return
+    if args.adopt_network:
+        network = args.network or str(ROOT / "config/network.env")
+        expected_hash = resolve_digest(args, network)
+        adopt_network(args.config, network, expected_hash)
         return
     if args.rebind_runtime:
         rebind_runtime(args.config)

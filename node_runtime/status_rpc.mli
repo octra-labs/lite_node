@@ -22,7 +22,9 @@ val validator_view_pubkey :
   Yojson.Safe.t
 
 val epoch_tags :
-  tags:int list ->
+  count:int ->
+  min_epoch:int ->
+  max_epoch:int ->
   keep_epochs:int ->
   Yojson.Safe.t
 

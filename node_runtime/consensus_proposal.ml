@@ -258,6 +258,7 @@ type verify_proposal_deps = {
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
+  head_txid_hi : unit -> int64 option;
   root_to_raw32 : string -> string;
   set_proposal : Transaction.t list -> string list -> unit;
   share_txs : Transaction.t list -> unit;
@@ -1579,6 +1580,19 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         deps.prev_root_wait_delay_seconds;
       Lwt.return reject
     | Prev_root_match ->
+      let expected_txid_hi =
+        proposal_txid_hi
+          ~final_count:(List.length propose.tx_hashes)
+          ~next_txid:(deps.next_txid ())
+          ~head_txid_hi:(deps.head_txid_hi ())
+      in
+      if not (Int64.equal propose.header.txid_hi expected_txid_hi) then begin
+        Octra_log.warn "consensus"
+          "reject proposal reason = txid_hi_mismatch expected = %Ld received = %Ld"
+          expected_txid_hi
+          propose.header.txid_hi;
+        Lwt.return reject
+      end else
       let tx_hashes_hex = List.map raw32_to_hex propose.tx_hashes in
       match
         tx_hash_admission
@@ -1590,6 +1604,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
           "reject proposal reason = tx_list_hash_mismatch";
         Lwt.return reject
       | Tx_hash_ok tx_hashes_hex ->
+        let* local_ledger_root_for_preview = deps.read_local_ledger_root () in
         let pid = Octra_consensus.C_hash.proposal_id propose.header in
         let staging_snapshot = deps.staging_txs () in
         let tx_list_local =
@@ -1604,7 +1619,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         let local_preverify txs =
           let run_many txs =
             deps.validate_preverify_once
-              ~state_root:propose.header.prev_state_root
+              ~state_root:local_ledger_root_for_preview
               ~tx_hashes:tx_hashes_hex
               txs
           in
@@ -1692,7 +1707,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
             local_preverify_bundle
               ~run_many:(fun txs ->
                 deps.validate_preverify_once
-                  ~state_root:propose.header.prev_state_root
+                  ~state_root:local_ledger_root_for_preview
                   ~tx_hashes:candidate_hashes
                   txs)
               ~tx_hashes:candidate_hashes
@@ -1744,7 +1759,6 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
             let proposer = propose.header.creator_addr in
             let validator_pubkeys = deps.validator_pubkeys propose.epoch_id in
             let validator_addrs = List.map fst validator_pubkeys in
-            let* local_ledger_root_for_preview = deps.read_local_ledger_root () in
             let candidate_preverify =
               Octra_core.Preverify_commit.create
                 (Octra_core.Preverify_worker.receipts_for_hashes
@@ -1970,7 +1984,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
         build_preverify
           ~run_many:(fun txs ->
             deps.build_preverify_once
-              ~state_root:prev_root
+              ~state_root:prev_ledger_root
               ~tx_hashes:admitted_hashes
               txs)
           ~limits

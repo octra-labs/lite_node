@@ -71,6 +71,7 @@ type node_effects = {
   chaindata : Octra_core.Store_chaindata.t;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   irmin_last_epoch : unit -> int;
+  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 
@@ -192,6 +193,7 @@ let node_effects refs effects input =
             chaindata = effects.chaindata;
             finality_state = refs.finality_state;
             irmin_last_epoch = effects.irmin_last_epoch;
+            require_sync = effects.require_sync;
             exit = effects.exit;
           })
           {

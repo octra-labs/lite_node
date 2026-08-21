@@ -5,6 +5,8 @@ module Transaction = Octra_core.Transaction
 module Runtime_text = Text
 module C_types = Octra_consensus.C_types
 
+exception Fetch_retry of string
+
 type apply =
   txs:Transaction.t list ->
   receipts_json:string list ->
@@ -37,7 +39,19 @@ type record = {
 
 type range =
   | Retry
+  | Missing
   | Records of record list
+
+type outcome =
+  | Synced
+  | Leader_stale of {
+      local_head : int64;
+      leader_head : int64;
+    }
+  | Need_range of {
+      head : int64;
+      target : int64;
+    }
 
 type sync_plan =
   | Fetch_range of int64
@@ -74,7 +88,7 @@ type prepared = {
 
 type ready_marker = {
   path : string;
-  tmp_path : string;
+  staged_path : string;
   payload : Yojson.Safe.t;
   ready_epoch : int64;
   state_root : string;
@@ -130,6 +144,7 @@ type run_deps = {
   sleep : float -> unit Lwt.t;
   log_start : base:string -> unit;
   log_applied : applied:int -> unit;
+  log_retry : phase:string -> delay:float -> error:string -> unit;
 }
 
 type node_deps = {
@@ -175,6 +190,7 @@ type node_runtime_deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  require_sync : Sync_need.t -> unit;
 }
 
 type node_runtime_wiring = {
@@ -195,11 +211,24 @@ type node_runtime_wiring = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  require_sync : Sync_need.t -> unit;
 }
 
 let configured_base = function
   | Some s when String.trim s <> "" -> Some (String.trim s)
   | _ -> None
+
+let first_source = function
+  | None -> None
+  | Some raw ->
+    raw
+    |> String.split_on_char ','
+    |> List.find_map (fun source -> configured_base (Some source))
+
+let configured_join env =
+  match configured_base (env "OCTRA_JOIN_RPC") with
+  | Some _ as base -> base
+  | None -> first_source (env "OCTRA_STATE_SYNC_SOURCES")
 
 let normalize_base s =
   if String.length s > 0 && s.[String.length s - 1] = '/' then
@@ -238,15 +267,38 @@ let range_url base ~from_epoch ~max_epochs =
   in
   base ^ "/state-sync/range?" ^ query
 
-let http_get_json url =
+let http_get_json ?(timeout = 20.0) url =
+  Lwt_unix.with_timeout timeout (fun () ->
+    let open Lwt.Syntax in
+    let* resp, body = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
+    let code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+    let* body_s = Cohttp_lwt.Body.to_string body in
+    if code = 429 || code >= 500 then
+      Lwt.fail
+        (Fetch_retry
+           (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s))
+    else if code < 200 || code >= 300 then
+      Lwt.fail_with (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s)
+    else
+      Lwt.return (Yojson.Safe.from_string body_s))
+
+let retry_delay failures =
+  let shift = min 4 (max 0 failures) in
+  min 15.0 (float_of_int (1 lsl shift))
+
+let fetch call =
   let open Lwt.Syntax in
-  let* resp, body = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
-  let code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-  let* body_s = Cohttp_lwt.Body.to_string body in
-  if code < 200 || code >= 300 then
-    Lwt.fail_with (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s)
-  else
-    Lwt.return (Yojson.Safe.from_string body_s)
+  Lwt.catch
+    (fun () ->
+      let* json = call () in
+      Lwt.return (Ok json))
+    (fun exn ->
+      match exn with
+      | Fetch_retry error -> Lwt.return (Error error)
+      | Lwt_unix.Timeout
+      | Unix.Unix_error _ ->
+        Lwt.return (Error (Printexc.to_string exn))
+      | _ -> Lwt.fail exn)
 
 let int64_field json name =
   let module U = Yojson.Safe.Util in
@@ -343,7 +395,7 @@ let parse_range ~from_epoch json =
   let module U = Yojson.Safe.Util in
   let status = json |> U.member "status" |> U.to_string in
   if status = "not_found" then
-    Retry
+    Missing
   else if status <> "ok" then
     failwith (Printf.sprintf "join range status = %s from = %Ld" status from_epoch)
   else
@@ -368,7 +420,7 @@ let sync_plan ~local_next ~local_root (head : head) =
     Fetch_range local_next
 
 let parse_tx tx_json =
-  match Yojson.Safe.from_string tx_json |> Transaction.of_yojson with
+  match Yojson.Safe.from_string tx_json |> Octra_core.Tx_payload.decode with
   | Ok tx -> tx
   | Error e -> failwith ("join bad tx_json: " ^ e)
 
@@ -401,6 +453,69 @@ let canonical_record (record : record) =
     reward_source = Some record.reward_source;
     finality = Some record.finality;
   }
+
+let range_response ~source ~from_epoch ~max_epochs = function
+  | Records records when max_epochs > 0 && List.length records <= max_epochs ->
+    let records = List.map canonical_record records in
+    let next_epoch =
+      match List.rev records with
+      | last :: _ -> Some (Int64.succ last.Octra_consensus.C_codec.epoch_id)
+      | [] -> None
+    in
+    Some Octra_consensus.C_driver.{
+      responder_addr = source;
+      request_id = "http:" ^ Int64.to_string from_epoch;
+      status = "ok";
+      records;
+      next_epoch;
+    }
+  | Retry
+  | Missing
+  | Records _ -> None
+
+let http_range ?(fetch_json = fun url -> http_get_json url) env ~from_epoch
+    ~max_epochs =
+  match configured_join env with
+  | None -> Lwt.return_none
+  | Some source ->
+    let open Lwt.Syntax in
+    Lwt.catch
+      (fun () ->
+        let source = normalize_base source in
+        let* json = fetch_json (range_url source ~from_epoch ~max_epochs) in
+        Lwt.return
+          (range_response
+             ~source
+             ~from_epoch
+             ~max_epochs
+             (parse_range ~from_epoch json)))
+      (fun exn ->
+        Octra_log.warn "catchup"
+          "event = range_http_unavailable from = %Ld error = %s"
+          from_epoch
+          (Printexc.to_string exn);
+        Lwt.return_none)
+
+let http_head ?(fetch_json = fun url -> http_get_json url) env =
+  match configured_join env with
+  | None -> Lwt.return_none
+  | Some source ->
+    let open Lwt.Syntax in
+    Lwt.catch
+      (fun () ->
+        let source = normalize_base source in
+        let* json = fetch_json (head_url source) in
+        let epoch = (parse_head json).epoch in
+        if Int64.compare epoch 0L < 0
+           || Int64.compare epoch (Int64.of_int max_int) > 0 then
+          Lwt.return_none
+        else
+          Lwt.return_some epoch)
+      (fun exn ->
+        Octra_log.warn "catchup"
+          "event = head_http_unavailable error = %s"
+          (Printexc.to_string exn);
+        Lwt.return_none)
 
 let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
   if record.epoch_id <> cursor.epoch then
@@ -569,44 +684,78 @@ let run_catchup (deps : run_deps) base =
   let open Lwt.Syntax in
   let base = normalize_base base in
   deps.log_start ~base;
-  let rec loop ~records_verified =
+  let rec retry ~phase ~records_verified ~missing ~failures error =
+    let delay = retry_delay failures in
+    deps.log_retry ~phase ~delay ~error;
+    let* () = deps.sleep delay in
+    loop ~records_verified ~missing ~failures:(failures + 1)
+  and loop ~records_verified ~missing ~failures =
     let local_next = deps.local_next () in
-    let* head_json = deps.fetch_head base in
-    let head = parse_head head_json in
-    match sync_plan ~local_next ~local_root:(deps.local_root ()) head with
-    | Local_ahead p ->
-      Lwt.fail_with
-        (Printf.sprintf
-           "join local head ahead of leader local = %Ld leader = %Ld"
-           p.local_head
-           p.leader_head)
-    | Root_mismatch p ->
-      Lwt.fail_with
-        (Printf.sprintf
-           "join ready root mismatch local = %s leader = %s epoch = %Ld"
-           p.local_root
-           p.leader_root
-           p.epoch)
-    | Ready p ->
-      deps.write_ready
-        ~base
-        ~ready_epoch:p.ready_epoch
-        ~state_root:p.state_root
-        ~records_verified;
-      Lwt.return_unit
-    | Fetch_range from_epoch ->
-      let* range_json = deps.fetch_range base ~from_epoch ~max_epochs:16 in
-      match parse_range ~from_epoch range_json with
-      | Retry ->
-        let* () = deps.sleep 1.0 in
-        loop ~records_verified
-      | Records records ->
-        let* _, applied =
-          deps.apply_range ~cursor:(deps.cursor ~from_epoch) records in
-        deps.log_applied ~applied;
-        loop ~records_verified:(records_verified + applied)
+    let* fetched_head = fetch (fun () -> deps.fetch_head base) in
+    match fetched_head with
+    | Error error ->
+      retry ~phase:"head" ~records_verified ~missing ~failures error
+    | Ok head_json ->
+      let head = parse_head head_json in
+      match sync_plan ~local_next ~local_root:(deps.local_root ()) head with
+      | Local_ahead p ->
+        Lwt.return
+          (Leader_stale {
+             local_head = p.local_head;
+             leader_head = p.leader_head;
+           })
+      | Root_mismatch p ->
+        Lwt.fail_with
+          (Printf.sprintf
+             "join ready root mismatch local = %s leader = %s epoch = %Ld"
+             p.local_root
+             p.leader_root
+             p.epoch)
+      | Ready p ->
+        deps.write_ready
+          ~base
+          ~ready_epoch:p.ready_epoch
+          ~state_root:p.state_root
+          ~records_verified;
+        Lwt.return Synced
+      | Fetch_range from_epoch ->
+        let* fetched_range =
+          fetch (fun () -> deps.fetch_range base ~from_epoch ~max_epochs:16)
+        in
+        begin
+          match fetched_range with
+          | Error error ->
+            retry ~phase:"range" ~records_verified ~missing ~failures error
+          | Ok range_json ->
+            match parse_range ~from_epoch range_json with
+            | Retry ->
+              let* () = deps.sleep 1.0 in
+              loop ~records_verified ~missing ~failures:0
+            | Missing ->
+              if missing + 1 >= 3 then
+                Lwt.return
+                  (Need_range {
+                     head = Int64.pred from_epoch;
+                     target = head.epoch;
+                   })
+              else
+                let* () = deps.sleep 1.0 in
+                loop
+                  ~records_verified
+                  ~missing:(missing + 1)
+                  ~failures:0
+            | Records records ->
+              let* _, applied =
+                deps.apply_range ~cursor:(deps.cursor ~from_epoch) records
+              in
+              deps.log_applied ~applied;
+              loop
+                ~records_verified:(records_verified + applied)
+                ~missing:0
+                ~failures:0
+        end
   in
-  loop ~records_verified:0
+  loop ~records_verified:0 ~missing:0 ~failures:0
 
 let node_cursor (deps : node_deps) ~from_epoch =
   {
@@ -654,12 +803,28 @@ let run_node_catchup (deps : node_deps) base =
         "applied catchup records = %d next_epoch = %d"
         applied
         (deps.current_epoch ()));
+    log_retry = (fun ~phase ~delay ~error ->
+      Octra_log.warn "join"
+        "RPC catchup retry phase = %s delay_sec = %.0f error = %s"
+        phase
+        delay
+        error);
   } in
-  let* () = run_catchup run_deps base in
-  Octra_log.info "join"
-    "RPC catchup complete local_next = %d"
-    (deps.current_epoch ());
-  Lwt.return_unit
+  let* outcome = run_catchup run_deps base in
+  begin
+    match outcome with
+    | Synced ->
+        Octra_log.info "join"
+          "RPC catchup complete local_next = %d"
+          (deps.current_epoch ())
+    | Leader_stale p ->
+        Octra_log.warn "join"
+          "event = join_source_stale local_head = %Ld source_head = %Ld action = continue_unattested"
+          p.local_head
+          p.leader_head
+    | Need_range _ -> ()
+  end;
+  Lwt.return outcome
 
 let ready_marker ~data_dir ~consensus_role ~leader_rpc ~chain_id ~validator
     ~validator_pubkey ~priv_b64 ~ready_epoch ~state_root ~records_verified
@@ -685,7 +850,7 @@ let ready_marker ~data_dir ~consensus_role ~leader_rpc ~chain_id ~validator
   let path = Filename.concat data_dir "ready_to_vote.json" in
   {
     path;
-    tmp_path = path ^ ".tmp";
+    staged_path = path ^ ".staged";
     ready_epoch;
     state_root;
     records_verified;
@@ -708,8 +873,8 @@ let ready_marker_payload_text marker =
   Yojson.Safe.pretty_to_string marker.payload ^ "\n"
 
 let write_ready_marker_with deps marker =
-  deps.write_text ~path:marker.tmp_path ~contents:(ready_marker_payload_text marker);
-  deps.rename ~src:marker.tmp_path ~dst:marker.path;
+  deps.write_text ~path:marker.staged_path ~contents:(ready_marker_payload_text marker);
+  deps.rename ~src:marker.staged_path ~dst:marker.path;
   deps.log_written marker
 
 let write_text_file ~path ~contents =
@@ -822,13 +987,34 @@ let node_runtime_deps (deps : node_runtime_wiring) =
     validator = deps.validator;
     validator_pubkey = deps.validator_pubkey;
     priv_b64 = deps.priv_b64;
+    require_sync = deps.require_sync;
   }
 
+let range_need ~head ~target =
+  if Int64.compare head 0L < 0
+     || Int64.compare head (Int64.of_int max_int) > 0 then
+    None
+  else
+    Sync_need.lost ~head:(Int64.to_int head) ~target
+
 let run_configured_node_catchup (deps : node_runtime_deps) =
-  match configured_base (deps.env "OCTRA_JOIN_RPC") with
+  match configured_join deps.env with
   | None -> Lwt.return_unit
   | Some base ->
-    run_node_catchup (node_deps_of_runtime deps) base
+    let open Lwt.Syntax in
+    let* outcome = run_node_catchup (node_deps_of_runtime deps) base in
+    match outcome with
+    | Synced -> Lwt.return_unit
+    | Leader_stale _ -> Lwt.return_unit
+    | Need_range gap ->
+        begin
+          match range_need ~head:gap.head ~target:gap.target with
+          | Some need ->
+              deps.require_sync need;
+              Lwt.fail_with "join range recovery returned"
+          | None ->
+              Lwt.fail_with "join range recovery boundary is invalid"
+        end
 
 let run_configured_node_wiring deps =
   run_configured_node_catchup (node_runtime_deps deps)

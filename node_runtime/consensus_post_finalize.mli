@@ -11,6 +11,7 @@ type deps = {
   read_local_root_raw : unit -> string Lwt.t;
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
+  set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
   fatal_exit : unit -> unit;
 }

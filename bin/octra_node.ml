@@ -58,6 +58,13 @@ module Startup_runtime_limits = Octra_node_runtime.Startup_runtime_limits
 module Startup_store_shell = Octra_node_runtime.Startup_store_shell
 module State_sync_http = Octra_node_runtime.State_sync_http
 module Sync_publish = Octra_node_runtime.Sync_publish
+module Sync_mark = Octra_node_runtime.Sync_mark
+module Sync_need = Octra_node_runtime.Sync_need
+module Root_win = Octra_bootstrap.Root_win
+module Sync_anchor = Octra_bootstrap.Sync_anchor
+module Sync_manifest = Octra_bootstrap.State_sync_manifest
+module State_sync = Octra_bootstrap.State_sync
+module Parent_commit = Octra_consensus.C_parent_commit
 module Program_trust = Octra_vm.Program_trust
 
 let addr_short = Octra_node_runtime.Text.addr_short
@@ -96,10 +103,81 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     end;
 
     let init_mode = cli_has_flag "--init" in
-    let role =
+    let publisher_mode = cli_has_flag "--state-sync-publisher" in
+    let base_role =
       Octra_node_runtime.Consensus_mode.of_inputs
-        ~cli_observer:(cli_has_flag "--observer")
+        ~cli_observer:(cli_has_flag "--observer" || publisher_mode)
         ~env_mode:(env_opt "OCTRA_CONSENSUS_MODE")
+    in
+    let data_dir = Startup_process_shell.data_dir ~env:env_opt in
+    Startup_process_shell.ensure_data_dir
+      ~init_mode
+      ~data_dir
+      ~exit_fatal:exit_error;
+    let startup_network =
+      Startup_process_shell.network_config ~env:env_opt
+    in
+    let recovery_need =
+      match
+        Sync_mark.read
+          ~data_dir
+          ~chain:startup_network.chain_id
+      with
+      | Sync_mark.Missing -> None
+      | Sync_mark.Ready need -> Some need
+      | Sync_mark.Invalid reason ->
+          Log.fatal "init"
+            "event = sync_recovery status = rejected reason = %s"
+            reason;
+          exit_error ()
+    in
+    let recovery_mode = Option.is_some recovery_need in
+    let role =
+      let selected =
+        if publisher_mode then
+          Octra_node_runtime.Consensus_mode.publisher base_role
+        else
+          base_role
+      in
+      if recovery_mode then
+        Octra_node_runtime.Consensus_mode.recovery selected
+      else
+        selected
+    in
+    Option.iter
+      (fun need ->
+        Log.warn "init"
+          "event = sync_recovery status = required cause = %s epoch = %d head = %d target = %s"
+          (Sync_need.label need.Sync_need.cause)
+          need.epoch
+          need.head
+          (match need.target with
+           | Some target -> Int64.to_string target
+           | None -> "-"))
+      recovery_need;
+    let require_sync need =
+      let status, stored =
+        match
+          Sync_mark.write
+            ~data_dir
+            ~chain:startup_network.chain_id
+            need
+        with
+        | Ok Sync_mark.Stored -> "stored", need
+        | Ok (Sync_mark.Present prior) -> "present", prior
+        | Error reason ->
+            Log.fatal "consensus"
+              "event = sync_recovery status = rejected reason = %s"
+              reason;
+            exit_error ()
+      in
+      Log.fatal "consensus"
+        "event = sync_recovery status = %s cause = %s epoch = %d head = %d action = exit"
+        status
+        (Sync_need.label stored.Sync_need.cause)
+        stored.epoch
+        stored.head;
+      exit_error ()
     in
     let consensus_role = role.role in
     let consensus_mode = role.consensus_enabled in
@@ -115,12 +193,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           error;
         exit_error ()
     in
-
-    let data_dir = Startup_process_shell.data_dir ~env:env_opt in
-    Startup_process_shell.ensure_data_dir
-      ~init_mode
-      ~data_dir
-      ~exit_fatal:exit_error;
     let drop_db = Tx_drop.open_db data_dir in
     let save_drops drops =
       match Tx_drop.save_many drop_db (List.map Staging.drop_row drops) with
@@ -129,10 +201,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Log.warn "staging"
           "event = drop_persist_failed reason = %s"
           reason
-    in
-
-    let startup_network =
-      Startup_process_shell.network_config ~env:env_opt
     in
     let private_result_activation_epoch =
       match Octra_core.Private_result_policy.activation_epoch_of env_opt with
@@ -270,8 +338,78 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 exit_error ()
           end
     in
+    let ready_roots =
+      let path = Filename.concat data_dir Root_win.name in
+      if not (Sys.file_exists path) then []
+      else
+        let reject reason =
+          Log.fatal "init"
+            "event = ready_roots status = rejected reason = %s"
+            reason;
+          exit_error ()
+        in
+        match history_floor with
+        | None -> reject "history floor is missing"
+        | Some floor ->
+            begin
+              match
+                Sync_manifest.load_certificate
+                  (State_sync.anchor_path data_dir)
+              with
+              | Error reason -> reject reason
+              | Ok certificate ->
+                  begin
+                    match Sync_manifest.finality certificate with
+                    | None -> reject "finality anchor is missing"
+                    | Some encoded ->
+                        begin
+                          match Sync_anchor.decode encoded with
+                          | Error reason -> reject reason
+                          | Ok anchor ->
+                              let anchor_parent = Octra_consensus.C_types.{
+                                certificate =
+                                  certificate_of_finalize
+                                    (Sync_anchor.finality anchor);
+                                validator_set = Sync_anchor.validator_set anchor;
+                              }
+                              in
+                              if
+                                Parent_commit.encode anchor_parent
+                                <> Parent_commit.encode
+                                     (History_floor.parent_commit floor)
+                              then
+                                reject "finality anchor differs from history floor"
+                              else
+                                begin
+                                  match Root_win.read path with
+                                  | Error reason -> reject reason
+                                  | Ok values ->
+                                      begin
+                                        match
+                                          Root_win.verify
+                                            ~anchor:(Sync_anchor.finality anchor)
+                                            values
+                                        with
+                                        | Error reason -> reject reason
+                                        | Ok roots -> roots
+                                      end
+                                end
+                        end
+                  end
+            end
+    in
+    let ready_config_hash =
+      Octra_consensus.C_config.network_hash
+        ~chain_id:startup_network.chain_id
+        ?program_trust_hash:(Program_trust.config_hash program_trust)
+        ~runtime_profile_hash:
+          (Octra_node_runtime.Consensus_profile.hash env_opt)
+        ()
+      |> raw_to_hex
+    in
     let rules =
-      Rule_graph.create
+      Rule_graph.create_ready
+        ~ready_config_hash
         ~chain_id:startup_network.chain_id
         ~root_at:(fun epoch ->
           match Store_chaindata.get_bound_epoch_header chaindata epoch with
@@ -451,6 +589,18 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "set_fold"
       (Rule_graph.set_fold_activation rules)
       (fun epoch -> Rule_graph.set_fold rules ~epoch);
+    bind_rule
+      "validator_ready"
+      (Rule_graph.validator_ready_activation rules)
+      (fun epoch -> Rule_graph.validator_ready rules ~epoch);
+    bind_rule
+      "set_fold_cap"
+      (Rule_graph.set_fold_cap_activation rules)
+      (fun epoch -> Rule_graph.set_fold_cap rules ~epoch);
+    bind_rule
+      "object_cost"
+      (Rule_graph.object_cost_activation rules)
+      (fun epoch -> Rule_graph.object_cost rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -461,7 +611,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         match Store_chaindata.get_epoch_header chaindata epoch_id with
         | Some h when String.length h.Epochlog.state_root > 0 ->
           Lwt.return_some h.Epochlog.state_root
-        | _ -> Lwt.return_none
+        | _ -> Lwt.return (List.assoc_opt epoch_id ready_roots)
     in
 
     let runtime_env = Startup_runtime_limits.{
@@ -565,6 +715,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 let header = finalize.Octra_consensus.C_types.header in
                 header.Octra_consensus.C_types.prev_state_root));
             fatal = Log.fatal "epoch" "%s";
+            require_sync;
             exit = exit_error;
           };
           epoch_env = Consensus_epoch_apply_env.{
@@ -724,6 +875,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           log_epoch = Log.info "epoch" "%s";
           fatal_epoch = Log.fatal "epoch" "%s";
           short = addr_short;
+          require_sync;
           exit = exit_error;
         }
         Consensus_epoch_apply_finish_shell.{
@@ -877,11 +1029,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               ~elapsed
               ());
           consensus_role = Octra_consensus.C_role.label consensus_role;
+          recovery = recovery_mode;
           wallet = {
             address = wallet.address;
             pub = wallet.pub;
             priv = wallet.Wallet.priv;
           };
+          require_sync;
           exit_error;
           exit_success;
         }
@@ -1084,6 +1238,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         "consensus_pubkey", `String wallet.pub;
         "head_epoch", `String (Int64.to_string head_epoch);
         "state_root", `String state_root;
+        "chain_id", `String chain_id;
+        "config_hash", `String ready_config_hash;
+        "catchup_head_epoch", `String (Int64.to_string head_epoch);
       ] in
       let fields =
         match action with
@@ -1178,22 +1335,52 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               "event = set_actor_stopped epoch = %Ld"
               next_epoch)
     in
-    let run_preverify prepared txs =
-      Octra_core.Preverify_worker.run_many
-        ~field_policy:(private_field_policy !current_epoch)
-        ~ledger
-        ~result_policy:(private_result_policy !current_epoch)
-        ~circle_preverify:
-          (Consensus_circle_preverify.run circle_preverify)
-        ~circle_cell_preverify:
-          (Consensus_circle_cell_preverify.run circle_cell_preverify)
-        ~legacy_replay:(fun ~address ~cipher ->
-          legacy_replay
-            ~epoch:!current_epoch
-            ~address
-            ~cipher)
-        ~prepared
+    let run_preverify prepared root txs =
+      let open Lwt.Syntax in
+      let id =
         txs
+        |> List.map Octra_core.Transaction.hash
+        |> String.concat ""
+        |> Digestif.SHA256.digest_string
+        |> Digestif.SHA256.to_hex
+      in
+      let* result =
+        Octra_core.State_preview.with_state
+          ~base_store:store
+          ~base_ledger:ledger
+          ~epoch_id:!current_epoch
+          ~proposal_id:("pv-" ^ String.sub id 0 12)
+          ~expected_prev_root:root
+          (fun _ ledger ->
+            let* batch =
+              Octra_core.Preverify_worker.run_many
+                ~field_policy:(private_field_policy !current_epoch)
+                ~ledger
+                ~result_policy:(private_result_policy !current_epoch)
+                ~circle_preverify:
+                  (Consensus_circle_preverify.run circle_preverify)
+                ~circle_cell_preverify:
+                  (Consensus_circle_cell_preverify.run circle_cell_preverify)
+                ~legacy_replay:(fun ~address ~cipher ->
+                  legacy_replay
+                    ~epoch:!current_epoch
+                    ~address
+                    ~cipher)
+                ~prepared
+                txs
+            in
+            Lwt.return_ok batch)
+      in
+      match result with
+      | Ok batch -> Lwt.return batch
+      | Error reason ->
+        Log.info "consensus"
+          "event = preverify_deferred reason = %s"
+          reason;
+        Lwt.return
+          (Octra_core.Preverify_worker.defer
+             "preverify_state_changed"
+             txs)
     in
     let prepared_lookup private_lookup key_switch_lookup tx =
       let open Lwt.Syntax in
@@ -1224,6 +1411,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         env_int;
         data_dir;
         chain_id;
+        sync_validators = State_sync_http.configured_validator_set;
+        sync_exporters = State_sync_http.exporter_set;
         store;
         chaindata;
         consensus_mode;
@@ -1303,6 +1492,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           not (Epoch_visibility.is_applying epoch_visibility));
         sleep = Lwt_unix.sleep;
         now = Unix.gettimeofday;
+        require_sync;
         exit_error;
       };
 
@@ -1318,6 +1508,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           trusted_validator_set = State_sync_http.configured_validator_set;
           head = Octra_core.Head_manifest.get_cached;
           read_finality = (fun epoch ->
+            Consensus_finality_journal.read_committed_epoch
+              ~chain_id
+              ~epoch
+              data_dir);
+          read_root = (fun epoch ->
             Consensus_finality_journal.read_committed_epoch
               ~chain_id
               ~epoch
@@ -1429,7 +1624,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Startup_node_launch_shell.{
         p2p_port;
         rpc = rpc_task;
-        services = [sync_task];
+        services = if recovery_mode then [] else [sync_task];
         observer = observer_mode;
         tick_loop;
         swarm = !swarm_opt;

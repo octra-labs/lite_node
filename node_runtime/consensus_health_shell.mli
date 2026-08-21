@@ -43,6 +43,7 @@ type deps = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
@@ -54,18 +55,10 @@ type fork_repair_deps = {
   rewind_allowed : target:int -> head:int -> bool;
   target_matches : target:int -> root:string -> bool;
   empty_after : target:int -> head:int -> bool;
-  finality_target_ready : int -> (unit, string) result;
-  run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
-  rewind_finality : int -> (unit, string) result;
-  drop_finality_after : int -> int;
-  prune_after_epoch : int -> unit;
-  set_current_epoch : int -> unit;
-  set_state_attested : head:int -> root:string -> unit;
-  set_catchup_in_progress : bool -> unit;
-  clear_quarantine : string -> unit;
+  finality_target_ready : target:int -> root:string -> (unit, string) result;
+  stage_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
   mark_quarantine : string -> unit;
-  start_height : int64 -> unit Lwt.t;
-  wake_ready : unit -> unit Lwt.t;
+  stop : string -> unit;
 }
 
 val repair_empty_fork :
@@ -78,6 +71,13 @@ val repair_empty_fork :
 
 val run :
   ?stale_retries:int ->
+  ?repair:(
+    target_epoch:int64 ->
+    target_root:string ->
+    required:int ->
+    current_root_quorum:bool ->
+    bool Lwt.t) ->
+  ?http_target:(unit -> int64 option Lwt.t) ->
   config ->
   deps ->
   unit Lwt.t

@@ -10,7 +10,10 @@ let member_ref_of_key object_ref raw_key =
   let prefix = member_prefix object_ref in
   let prefix_len = String.length prefix in
   let suffix_len = String.length state_ref_key_suffix in
-  if String.starts_with ~prefix raw_key && String.ends_with ~suffix:state_ref_key_suffix raw_key then
+  if
+    String.starts_with ~prefix raw_key
+    && String.ends_with ~suffix:state_ref_key_suffix raw_key
+  then
     let member_len = String.length raw_key - prefix_len - suffix_len in
     if member_len > 0 then
       Some (String.sub raw_key prefix_len member_len)
@@ -18,6 +21,51 @@ let member_ref_of_key object_ref raw_key =
       None
   else
     None
+
+let member_keys_from_storage_tbl storage_tbl =
+  let prefix = "object_member:" in
+  Hashtbl.fold
+    (fun raw_key _value keys ->
+      if
+        String.starts_with ~prefix raw_key
+        && String.ends_with ~suffix:state_ref_key_suffix raw_key
+      then
+        raw_key :: keys
+      else
+        keys)
+    storage_tbl
+    []
+  |> List.sort_uniq String.compare
+  |> Array.of_list
+
+let lower_bound values target =
+  let rec find low high =
+    if low >= high then
+      low
+    else
+      let middle = low + ((high - low) / 2) in
+      if String.compare values.(middle) target < 0 then
+        find (middle + 1) high
+      else
+        find low middle
+  in
+  find 0 (Array.length values)
+
+let member_refs_from_keys keys object_ref =
+  let prefix = member_prefix object_ref in
+  let rec collect index refs =
+    if index >= Array.length keys then
+      List.rev refs |> Array.of_list
+    else
+      let raw_key = keys.(index) in
+      if String.starts_with ~prefix raw_key then
+        match member_ref_of_key object_ref raw_key with
+        | Some member_ref -> collect (index + 1) (member_ref :: refs)
+        | None -> collect (index + 1) refs
+      else
+        List.rev refs |> Array.of_list
+  in
+  collect (lower_bound keys prefix) []
 
 let member_refs_from_storage_tbl storage_tbl object_ref =
   Hashtbl.fold

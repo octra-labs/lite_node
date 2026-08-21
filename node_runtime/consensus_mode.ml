@@ -20,3 +20,21 @@ let of_inputs ~cli_observer ~env_mode =
     voting_enabled = Octra_consensus.C_role.voting_enabled role;
     observer_enabled = Octra_consensus.C_role.is_observer role;
   }
+
+let publisher _ =
+  {
+    role = Octra_consensus.C_role.Observer;
+    label = "observer";
+    consensus_enabled = false;
+    voting_enabled = false;
+    observer_enabled = true;
+  }
+
+let recovery _ =
+  {
+    role = Octra_consensus.C_role.Observer;
+    label = "recovery";
+    consensus_enabled = false;
+    voting_enabled = false;
+    observer_enabled = true;
+  }

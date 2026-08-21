@@ -7,23 +7,22 @@ import datetime
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
-import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 
 from validator_common import ValidatorError
 
 URL = "https://releases.octra.network/v1/devnet/latest.json"
 KEY_ID = "devnet-release-f912b4891be62acc"
 CHAIN = "octra-devnet-9871-cluster"
-KEY = b"""-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA3csWqO5Eoat2ZtlmcclQ1LuCCafYPKv2uo9CwZv0Mzs=
------END PUBLIC KEY-----
-"""
+KEY = base64.b64decode("3csWqO5Eoat2ZtlmcclQ1LuCCafYPKv2uo9CwZv0Mzs=")
+STAGE_SERIAL = 0
 FIELDS = (
     "schema",
     "chain_id",
@@ -50,15 +49,12 @@ NOTICES = frozenset({
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
-
 class OriginError(ValidatorError):
     pass
-
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, file_pointer, code, message, headers, url):
         return None
-
 
 def release_time(raw):
     if not isinstance(raw, str):
@@ -71,14 +67,12 @@ def release_time(raw):
         raise ValidatorError("release marker time is invalid")
     return value.astimezone(datetime.timezone.utc)
 
-
 def payload(value):
     return json.dumps(
         [value[field] for field in FIELDS],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-
 
 def validate(value, fresh=True, now=None):
     if not isinstance(value, dict) or set(value) != {*FIELDS, "signature"}:
@@ -123,7 +117,6 @@ def validate(value, fresh=True, now=None):
     if issued >= expires or expires - issued > datetime.timedelta(hours=72):
         raise ValidatorError("release marker time range is invalid")
 
-
 def verify(value):
     try:
         signature = base64.b64decode(value["signature"], validate=True)
@@ -131,36 +124,10 @@ def verify(value):
         raise ValidatorError("release marker signature is invalid") from error
     if len(signature) != 64:
         raise ValidatorError("release marker signature is invalid")
-    if shutil.which("openssl") is None:
-        raise ValidatorError("openssl is required to verify the release marker")
-    with tempfile.TemporaryDirectory(prefix="octra-release-") as directory:
-        root = Path(directory)
-        data = root / "payload"
-        signed = root / "signature"
-        public = root / "public.pem"
-        data.write_bytes(payload(value))
-        signed.write_bytes(signature)
-        public.write_bytes(KEY)
-        result = subprocess.run(
-            [
-                "openssl",
-                "pkeyutl",
-                "-verify",
-                "-pubin",
-                "-inkey",
-                str(public),
-                "-rawin",
-                "-in",
-                str(data),
-                "-sigfile",
-                str(signed),
-            ],
-            check=False,
-            capture_output=True,
-        )
-    if result.returncode != 0:
-        raise ValidatorError("release marker signature verification failed")
-
+    try:
+        VerifyKey(KEY).verify(payload(value), signature)
+    except (BadSignatureError, ValueError) as error:
+        raise ValidatorError("release marker signature verification failed") from error
 
 def decode(raw, fresh=True, now=None):
     if len(raw) > 16_384:
@@ -173,7 +140,6 @@ def decode(raw, fresh=True, now=None):
     verify(value)
     return value
 
-
 def cache_path(root):
     result = subprocess.run(
         ["git", "rev-parse", "--git-path", "octra-release-v2.json"],
@@ -185,18 +151,24 @@ def cache_path(root):
     path = Path(result.stdout.strip())
     return path if path.is_absolute() else (root / path).resolve()
 
-
 def read(path, fresh, now=None):
-    if not path.exists():
-        return None
     try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or path.is_symlink() or info.st_size > 16_384:
-            raise ValidatorError("cached release marker is invalid")
-        return decode(path.read_bytes(), fresh=fresh, now=now)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
     except OSError as error:
         raise ValidatorError("cached release marker is unreadable") from error
-
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 16_384:
+                raise ValidatorError("cached release marker is invalid")
+            raw = handle.read(16_385)
+        if len(raw) > 16_384:
+            raise ValidatorError("cached release marker is invalid")
+        return decode(raw, fresh=fresh, now=now)
+    except OSError as error:
+        raise ValidatorError("cached release marker is unreadable") from error
 
 def sync_dir(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
@@ -205,25 +177,39 @@ def sync_dir(path):
     finally:
         os.close(descriptor)
 
+def open_stage(path):
+    global STAGE_SERIAL
+    for _ in range(1024):
+        serial = STAGE_SERIAL
+        STAGE_SERIAL += 1
+        stage = path.with_name(f".{path.name}.{os.getpid()}.{serial}.staged")
+        try:
+            descriptor = os.open(
+                stage,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            return descriptor, stage
+        except FileExistsError:
+            pass
+    raise ValidatorError("release marker staged record limit exceeded")
 
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, stage = open_stage(path)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        os.replace(stage, path)
         sync_dir(path.parent)
     finally:
         try:
-            os.unlink(temporary)
+            os.unlink(stage)
         except FileNotFoundError:
             pass
-
 
 def fetch(url=URL):
     request = urllib.request.Request(
@@ -239,7 +225,6 @@ def fetch(url=URL):
     except (OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
         raise OriginError("release marker origin is unavailable") from error
     return decode(raw)
-
 
 def trusted(root):
     path = cache_path(root)

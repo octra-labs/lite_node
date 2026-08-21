@@ -61,6 +61,17 @@ type 'driver driver_deps = {
   log_started : unit -> unit;
 }
 
+type fork_repair_runtime = {
+  committed_head_epoch : unit -> int;
+  rewind_allowed : target:int -> head:int -> bool;
+  target_matches : target:int -> root:string -> bool;
+  empty_after : target:int -> head:int -> bool;
+  finality_target_ready : target:int -> root:string -> (unit, string) result;
+  stage_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  mark_quarantine : string -> unit;
+  stop : string -> unit;
+}
+
 type driver_probe_deps = {
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -90,23 +101,8 @@ type driver_probe_deps = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-}
-
-type fork_repair_runtime = {
-  committed_head_epoch : unit -> int;
-  rewind_allowed : target:int -> head:int -> bool;
-  target_matches : target:int -> root:string -> bool;
-  empty_after : target:int -> head:int -> bool;
-  finality_target_ready : int -> (unit, string) result;
-  run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
-  rewind_finality : int -> (unit, string) result;
-  drop_finality_after : int -> int;
-  prune_after_epoch : int -> unit;
-  set_current_epoch : int -> unit;
-  set_state_attested : head:int -> root:string -> unit;
-  set_catchup_in_progress : bool -> unit;
-  clear_quarantine : string -> unit;
-  mark_quarantine : string -> unit;
+  fork_repair : fork_repair_runtime;
+  require_sync : Sync_need.t -> unit;
 }
 
 type node_fork_repair_runtime = {
@@ -115,12 +111,8 @@ type node_fork_repair_runtime = {
   data_dir : string;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
-  finality : Consensus_finality_state.callbacks;
-  current_epoch : int ref;
-  catchup_active : bool ref;
-  set_state_attested : head:int -> root:string -> unit;
-  clear_quarantine : string -> unit;
   mark_quarantine : string -> unit;
+  exit_error : unit -> unit;
 }
 
 type node_driver_probe_runtime = {
@@ -148,6 +140,7 @@ type node_driver_probe_runtime = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
 }
 
 type 'driver liveness_deps = {
@@ -208,6 +201,7 @@ type node_driver_health_runtime = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   liveness_state : Consensus_liveness.state ref;
   now : unit -> float;
   stall_sec : float;
@@ -395,13 +389,6 @@ let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
       (Octra_consensus.Finality_log.index runtime.data_dir)
       target
   in
-  let with_entry target action =
-    if not (Consensus_finality_journal.committed runtime.data_dir) then Ok ()
-    else
-      match entry target with
-      | None -> Error "finality entry is missing"
-      | Some value -> action value
-  in
   {
     committed_head_epoch = runtime.committed_head_epoch;
     rewind_allowed = (fun ~target ~head ->
@@ -419,62 +406,63 @@ let node_fork_repair_runtime (runtime : node_fork_repair_runtime) =
         runtime.chaindata
         ~target
         ~head);
-    finality_target_ready = (fun target ->
-      with_entry target (fun entry ->
-        Consensus_finality_journal.committed_for
-          ~chain_id:runtime.chain_id
-          ~entry
-          runtime.data_dir));
-    run_empty = (fun ~target ~root ->
-      Octra_core.Fork_head_repair.run_empty
+    finality_target_ready = (fun ~target ~root ->
+      match entry target with
+      | None -> Error "finality entry is missing"
+      | Some entry
+        when not
+          (String.equal
+             entry.Octra_consensus.Finality_log.state_root
+             (Octra_core.Epoch_index_commitment.root_hex root)) ->
+        Error "finality entry root mismatch"
+      | Some entry ->
+        begin
+          match Octra_core.Head_manifest.load_result runtime.data_dir with
+          | Octra_core.Head_manifest.Present head
+            when head.txid_hi <> entry.txid_hi ->
+            Error "finality entry txid boundary mismatch"
+          | Octra_core.Head_manifest.Missing -> Error "HEAD is missing"
+          | Octra_core.Head_manifest.Corrupt reason -> Error reason
+          | Octra_core.Head_manifest.Present _
+            when Consensus_finality_journal.committed runtime.data_dir ->
+            Consensus_finality_journal.committed_for
+              ~chain_id:runtime.chain_id
+              ~entry
+              runtime.data_dir
+          | Octra_core.Head_manifest.Present _ -> Ok ()
+        end
+      );
+    stage_empty = (fun ~target ~root ->
+      Octra_core.Fork_head_repair.stage_empty
         ~data_dir:runtime.data_dir
         ~store:runtime.store
         ~chaindata:runtime.chaindata
         ~target
         ~root);
-    rewind_finality = (fun target ->
-      with_entry target (fun entry ->
-        Consensus_finality_journal.rewind_committed
-          ~chain_id:runtime.chain_id
-          ~entry
-          runtime.data_dir));
-    drop_finality_after =
-      Octra_consensus.Finality_log.drop_after runtime.data_dir;
-    prune_after_epoch = runtime.finality.prune_after_epoch;
-    set_current_epoch = (fun epoch ->
-      runtime.current_epoch := epoch);
-    set_state_attested = runtime.set_state_attested;
-    set_catchup_in_progress = (fun active ->
-      runtime.catchup_active := active);
-    clear_quarantine = runtime.clear_quarantine;
     mark_quarantine = runtime.mark_quarantine;
+    stop = (fun reason ->
+      Log.fatal "catchup"
+        "event = fork_repair status = restart reason = %s"
+        reason;
+      runtime.exit_error ());
   }
 
-let fork_repair_deps (runtime : fork_repair_runtime) driver =
+let fork_repair_deps (runtime : fork_repair_runtime) =
   Consensus_health_shell.{
     committed_head_epoch = runtime.committed_head_epoch;
     rewind_allowed = runtime.rewind_allowed;
     target_matches = runtime.target_matches;
     empty_after = runtime.empty_after;
-    run_empty = runtime.run_empty;
+    stage_empty = runtime.stage_empty;
     finality_target_ready = runtime.finality_target_ready;
-    rewind_finality = runtime.rewind_finality;
-    drop_finality_after = runtime.drop_finality_after;
-    prune_after_epoch = runtime.prune_after_epoch;
-    set_current_epoch = runtime.set_current_epoch;
-    set_state_attested = runtime.set_state_attested;
-    set_catchup_in_progress = runtime.set_catchup_in_progress;
-    clear_quarantine = runtime.clear_quarantine;
     mark_quarantine = runtime.mark_quarantine;
-    start_height = Octra_consensus.C_driver.start_height driver;
-    wake_ready = (fun () ->
-      Octra_consensus.C_driver.wake_ready driver);
+    stop = runtime.stop;
   }
 
-let repair_empty_fork_with_driver (runtime : fork_repair_runtime) driver
+let repair_empty_fork (runtime : fork_repair_runtime)
     ~target_epoch ~target_root ~required ~current_root_quorum =
   Consensus_health_shell.repair_empty_fork
-    (fork_repair_deps runtime driver)
+    (fork_repair_deps runtime)
     ~target_epoch
     ~target_root
     ~required
@@ -518,6 +506,8 @@ let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
       Consensus_runtime_state.incr_ahead_streak runtime.runtime_state);
     run_catchup_to_target = (fun driver ~target_epoch ~reason ->
       runtime.run_catchup_to_target driver ~target_epoch ~reason);
+    fork_repair = runtime.fork_repair;
+    require_sync = runtime.require_sync;
   }
 
 let node_driver_health_deps (runtime : node_driver_health_runtime) =
@@ -549,6 +539,7 @@ let node_driver_health_deps (runtime : node_driver_health_runtime) =
           drain_pending_finalized = runtime.drain_pending_finalized;
           fork_repair = runtime.fork_repair;
           run_catchup_to_target = runtime.run_catchup_to_target;
+          require_sync = runtime.require_sync;
         } : node_driver_probe_runtime);
     liveness =
       node_liveness_deps
@@ -619,14 +610,17 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
       Octra_consensus.C_driver.wake_ready driver);
     run_catchup_to_target = (fun ~target_epoch ~reason ->
       deps.run_catchup_to_target driver ~target_epoch ~reason);
+    require_sync = deps.require_sync;
     quarantine_active = deps.quarantine_active;
     quarantine_reason = deps.quarantine_reason;
     ahead_streak = deps.ahead_streak;
     incr_ahead_streak = deps.incr_ahead_streak;
   }
 
-let run_driver_probe deps driver =
+let run_driver_probe (deps : driver_probe_deps) driver =
   Consensus_health_shell.run
+    ~repair:(repair_empty_fork deps.fork_repair)
+    ~http_target:(fun () -> Consensus_join_rpc.http_head deps.getenv)
     (driver_probe_config deps driver)
     (driver_probe_deps deps driver)
 
