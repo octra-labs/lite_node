@@ -16,6 +16,7 @@ from urllib.request import urlopen
 
 from release import trusted as trusted_release
 from validator_common import ValidatorError
+from validator_common import load_network
 from validator_common import load_wallet
 from validator_common import parse_env
 from validator_common import sha256_file
@@ -36,6 +37,10 @@ PENDING = re.compile(r"^[0-9]{10}_[0-9]{4}\.pending$")
 VOTE = re.compile(r"^[0-9]{20}_[0-9]{8}_[0-9a-f]{64}\.vote$")
 SYNC_LIMIT = 65_536
 CERT_LIMIT = 33_554_432
+SYNC_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "octra-upgrade/1",
+}
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()), flush=True)
@@ -398,7 +403,7 @@ def round_value(payload, key):
 def cert_epoch(source):
     request = Request(
         source + "/state-sync/manifest",
-        headers={"Accept": "application/json"},
+        headers=SYNC_HEADERS,
     )
     with urlopen(request, timeout=15.0) as response:
         raw = response.read(CERT_LIMIT + 1)
@@ -428,7 +433,7 @@ def cert_epoch(source):
 def sync_epoch(source):
     request = Request(
         source + "/state-sync/head",
-        headers={"Accept": "application/json"},
+        headers=SYNC_HEADERS,
     )
     with urlopen(request, timeout=15.0) as response:
         raw = response.read(SYNC_LIMIT + 1)
@@ -506,6 +511,8 @@ def sync_wait(values, need, wait, interval):
         if snapshot is not None and snapshot >= required:
             return {**tip, "required": required}
         if time.monotonic() >= deadline:
+            if snapshot is None:
+                raise ValidatorError("signed snapshot metadata is unavailable")
             raise ValidatorError("signed snapshot is below recovery boundary")
         time.sleep(interval)
 
@@ -757,6 +764,17 @@ def verify_release_tree(root, release):
     if actual != release["source_commit"]:
         raise ValidatorError("source commit does not match the signed release")
 
+def release_sync_values(root, values, release):
+    _, _, network = load_network(
+        root / "config/network.env",
+        release["network_sha256"],
+    )
+    selected = dict(values)
+    for key in ("OCTRA_STATE_SYNC_SOURCES", "OCTRA_CATCHUP_MAX_LAG"):
+        if key in network:
+            selected[key] = network[key]
+    return selected
+
 def reexec(root):
     script = root / "controls/lib/upgrade.py"
     if not script.is_file():
@@ -867,21 +885,22 @@ def apply(root, sup, values, args, release):
     public, source = release_target(release, args, values)
     preflight(root, sup, values, args.sudo)
     state = view(values, sup["pid"], release) if sup["pid"] else {}
-    tip = sync_head(values)
-    plan = sync_plan(values, state, sync_target(state, tip))
-    marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
-    need = marked or plan
-    fresh = (
-        sync_wait(values, need, args.wait_seconds, args.interval)
-        if need is not None
-        else None
-    )
     prior_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
     unit_binary = verify_unit(sup, values)
     _, _, changed = git_update(root, public, source)
     verify_release_tree(root, release)
     if changed:
         reexec(root)
+    sync_values = release_sync_values(root, values, release)
+    tip = sync_head(sync_values)
+    plan = sync_plan(sync_values, state, sync_target(state, tip))
+    marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+    need = marked or plan
+    fresh = (
+        sync_wait(sync_values, need, args.wait_seconds, args.interval)
+        if need is not None
+        else None
+    )
     call(["sh", str(root / "controls/check.sh")], cwd=root)
     call(["sh", str(root / "controls/build.sh")], cwd=root)
     call([

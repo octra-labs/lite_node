@@ -524,11 +524,16 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool,
             "urlopen",
             side_effect=[first, second],
-        ):
+        ) as opened:
             self.assertEqual(
                 upgrade_tool.sync_epoch("https://seed.example"),
                 {"head": 41, "snapshot": 40},
             )
+        self.assertEqual(len(opened.call_args_list), 2)
+        for item in opened.call_args_list:
+            request = item.args[0]
+            self.assertEqual(request.get_header("Accept"), "application/json")
+            self.assertEqual(request.get_header("User-agent"), "octra-upgrade/1")
         first.__enter__.return_value.read.return_value = b"x" * 65_537
         with mock.patch.object(upgrade_tool, "urlopen", return_value=first):
             with self.assertRaisesRegex(ValidatorError, "byte limit"):
@@ -625,6 +630,30 @@ class ValidatorToolsTest(unittest.TestCase):
                 upgrade_tool.sync_wait(values, need, 10.0, 0.1),
                 {"head": 201, "snapshot": 150, "required": 101},
             )
+
+    def test_upgrade_distinguishes_unavailable_snapshot_metadata(self):
+        values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
+        need = {"epoch": 101}
+        with mock.patch.object(
+            upgrade_tool, "sync_head", return_value=None
+        ), mock.patch.object(
+            upgrade_tool.time, "monotonic", side_effect=[0.0, 0.0]
+        ):
+            with self.assertRaisesRegex(ValidatorError, "metadata is unavailable"):
+                upgrade_tool.sync_wait(values, need, 0.0, 0.1)
+
+    def test_upgrade_reports_snapshot_below_boundary(self):
+        values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
+        need = {"epoch": 101}
+        with mock.patch.object(
+            upgrade_tool,
+            "sync_head",
+            return_value={"head": 110, "snapshot": 100},
+        ), mock.patch.object(
+            upgrade_tool.time, "monotonic", side_effect=[0.0, 0.0]
+        ):
+            with self.assertRaisesRegex(ValidatorError, "below recovery boundary"):
+                upgrade_tool.sync_wait(values, need, 0.0, 0.1)
 
     def test_upgrade_rejects_snapshot_beyond_catchup_window(self):
         values = {
@@ -904,6 +933,103 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "network configuration"):
             upgrade_tool.verify_release_tree(WORK, release)
 
+    def test_upgrade_uses_signed_snapshot_sources(self):
+        network = network_values()
+        network["OCTRA_STATE_SYNC_SOURCES"] = "https://fresh.example"
+        network["OCTRA_CATCHUP_MAX_LAG"] = "7000"
+        bundle = WORK / "config/network.env"
+        bundle.parent.mkdir()
+        write_env(bundle, network)
+        release = {
+            **release_value(),
+            "network_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        }
+        local = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_STATE_SYNC_SOURCES": "https://stale.example",
+            "OCTRA_CATCHUP_MAX_LAG": "5000",
+        }
+
+        selected = upgrade_tool.release_sync_values(WORK, local, release)
+
+        self.assertEqual(
+            selected["OCTRA_STATE_SYNC_SOURCES"],
+            "https://fresh.example",
+        )
+        self.assertEqual(selected["OCTRA_CATCHUP_MAX_LAG"], "7000")
+        self.assertEqual(selected["OCTRA_DATA_DIR"], str(WORK / "data"))
+
+    def test_upgrade_updates_release_before_snapshot_wait(self):
+        events = []
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_OPERATOR_BINARY": str(WORK / "candidate/octra_node.exe"),
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        supervisor = {
+            "kind": "pm2",
+            "scope": "user",
+            "name": "octra-test",
+            "pid": 41,
+            "active": True,
+            "state": "online",
+            "config": WORK / "node.env",
+        }
+        args = mock.Mock(
+            sudo=False,
+            public_commit="a" * 40,
+            source_commit="b" * 40,
+            wait_seconds=1.0,
+            interval=0.01,
+        )
+        need = {"cause": "root", "epoch": 100, "head": 99, "target": None}
+
+        def update(*_):
+            events.append("git")
+            return "a" * 40, "b" * 40, False
+
+        def verify(*_):
+            events.append("tree")
+
+        def select(*_):
+            events.append("network")
+            return values
+
+        def wait(*_):
+            events.append("wait")
+            raise SystemExit(0)
+
+        with mock.patch.object(upgrade_tool, "preflight"), mock.patch.object(
+            upgrade_tool, "view", return_value={}
+        ), mock.patch.object(
+            upgrade_tool, "verify_unit", return_value=None
+        ), mock.patch.object(
+            upgrade_tool, "git_update", side_effect=update
+        ), mock.patch.object(
+            upgrade_tool, "verify_release_tree", side_effect=verify
+        ), mock.patch.object(
+            upgrade_tool, "release_sync_values", side_effect=select
+        ), mock.patch.object(
+            upgrade_tool, "sync_head", return_value=None
+        ), mock.patch.object(
+            upgrade_tool, "sync_plan", return_value=None
+        ), mock.patch.object(
+            upgrade_tool, "read_need", return_value=need
+        ), mock.patch.object(
+            upgrade_tool, "sync_wait", side_effect=wait
+        ), mock.patch.object(
+            upgrade_tool, "call"
+        ) as run, mock.patch.object(
+            upgrade_tool, "stop"
+        ) as stop_node:
+            with self.assertRaises(SystemExit):
+                upgrade_tool.apply(WORK, supervisor, values, args, release_value())
+
+        self.assertEqual(events, ["git", "tree", "network", "wait"])
+        run.assert_not_called()
+        stop_node.assert_not_called()
+
     def test_upgrade_builds_and_checks_before_one_stop_start(self):
         events = []
         config = WORK / "node.env"
@@ -963,6 +1089,8 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool, "git_update", side_effect=update
         ), mock.patch.object(
             upgrade_tool, "verify_release_tree"
+        ), mock.patch.object(
+            upgrade_tool, "release_sync_values", return_value=values
         ), mock.patch.object(
             upgrade_tool, "call", side_effect=command
         ), mock.patch.object(
@@ -1047,6 +1175,8 @@ class ValidatorToolsTest(unittest.TestCase):
             return_value=("a" * 40, "b" * 40, False),
         ), mock.patch.object(
             upgrade_tool, "verify_release_tree"
+        ), mock.patch.object(
+            upgrade_tool, "release_sync_values", return_value=values
         ), mock.patch.object(
             upgrade_tool, "call", side_effect=command
         ), mock.patch.object(
