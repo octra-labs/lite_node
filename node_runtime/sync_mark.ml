@@ -135,6 +135,11 @@ let read ~data_dir ~chain =
       with exn ->
         Invalid (Printexc.to_string exn)
 
+let need = function
+  | Missing -> Ok None
+  | Ready value -> Ok (Some value)
+  | Invalid reason -> Error reason
+
 let rec write_all fd raw offset =
   if offset < String.length raw then
     let count = Unix.write_substring fd raw offset (String.length raw - offset) in
@@ -268,12 +273,6 @@ let consume ~data_dir ~chain expected =
           if Sys.file_exists target then Error (Printexc.to_string exn)
           else Ok ()
     end
-
-let consume_range ~data_dir ~chain expected =
-  if expected.Sync_need.cause <> Sync_need.Range then
-    Error "only a range recovery marker can be consumed"
-  else
-    consume ~data_dir ~chain expected
 
 let consume_journal ~data_dir ~chain ~verified_head expected =
   if expected.Sync_need.cause <> Sync_need.Journal then

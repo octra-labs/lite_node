@@ -124,28 +124,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Sync_mark.read
           ~data_dir
           ~chain:startup_network.chain_id
+        |> Sync_mark.need
       with
-      | Sync_mark.Missing -> None
-      | Sync_mark.Ready need when need.Sync_need.cause = Sync_need.Range ->
-        begin
-          match
-            Sync_mark.consume_range
-              ~data_dir
-              ~chain:startup_network.chain_id
-              need
-          with
-          | Ok () ->
-            Log.warn "init"
-              "event = sync_recovery status = consumed cause = range action = verify_signed_head";
-            None
-          | Error reason ->
-            Log.fatal "init"
-              "event = sync_recovery status = rejected reason = %s"
-              reason;
-            exit_error ()
-        end
-      | Sync_mark.Ready need -> Some need
-      | Sync_mark.Invalid reason ->
+      | Ok value -> value
+      | Error reason ->
           Log.fatal "init"
             "event = sync_recovery status = rejected reason = %s"
             reason;
@@ -159,10 +141,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         else
           base_role
       in
-      if recovery_mode then
-        Octra_node_runtime.Consensus_mode.recovery selected
-      else
-        selected
+      Octra_node_runtime.Consensus_mode.with_need recovery_need selected
     in
     Option.iter
       (fun need ->
@@ -1453,6 +1432,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         now = Unix.gettimeofday;
         wait = Lwt_unix.sleep;
         staged = (fun hash -> Staging.find_by_hash hash <> None);
+        landed = (fun tx ->
+          match Ledger.find_opt ledger tx.Transaction.from with
+          | Some account -> account.Ledger.nonce >= tx.nonce
+          | None -> false);
         post = post_fold;
         warn = (fun reason ->
           Log.warn "validator"

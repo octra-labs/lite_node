@@ -37,6 +37,7 @@ type t = {
   ready_ref_activation : activation option;
   set_live_activation : activation option;
   set_fold_cap_activation : activation option;
+  set_open_activation : activation option;
   object_cost_activation : activation option;
   root_at : int -> root_read;
 }
@@ -86,6 +87,13 @@ let devnet_ready_ref_activation = {
 
 let devnet_set_live_activation = devnet_ready_ref_activation
 
+let devnet_set_open_activation = {
+  anchor_epoch = 1_380_960;
+  anchor_state_root =
+    "20de716a0d578300de77508718d213db14c4164e229a5850eb0595324566c90e";
+  activation_epoch = 1_425_040;
+}
+
 let owner_migration_activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then
     Some devnet_owner_migration_activation
@@ -131,6 +139,12 @@ let set_live_activation_for_chain chain_id =
 let set_fold_cap_activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then
     Some devnet_validator_transition_activation
+  else
+    None
+
+let set_open_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_set_open_activation
   else
     None
 
@@ -182,6 +196,7 @@ let make ~ready_config_hash ~chain_id ~root_at =
     ready_ref_activation = ready_ref_activation_for_chain chain_id;
     set_live_activation = set_live_activation_for_chain chain_id;
     set_fold_cap_activation = set_fold_cap_activation_for_chain chain_id;
+    set_open_activation = set_open_activation_for_chain chain_id;
     object_cost_activation = object_cost_activation_for_chain chain_id;
     root_at;
   }
@@ -203,6 +218,7 @@ let validator_ready_activation t = t.validator_ready_activation
 let ready_ref_activation t = t.ready_ref_activation
 let set_live_activation t = t.set_live_activation
 let set_fold_cap_activation t = t.set_fold_cap_activation
+let set_open_activation t = t.set_open_activation
 let object_cost_activation t = t.object_cost_activation
 let ready_config_hash t = t.ready_config_hash
 
@@ -223,6 +239,7 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       ready_ref_activation_for_chain chain_id;
       set_live_activation_for_chain chain_id;
       set_fold_cap_activation_for_chain chain_id;
+      set_open_activation_for_chain chain_id;
       object_cost_activation_for_chain chain_id;
     ] in
     List.find_map
@@ -318,6 +335,9 @@ let set_live t ~epoch =
 
 let set_fold_cap t ~epoch =
   mode t t.set_fold_cap_activation ~epoch
+
+let set_open t ~epoch =
+  mode t t.set_open_activation ~epoch
 
 let object_cost t ~epoch =
   mode t t.object_cost_activation ~epoch

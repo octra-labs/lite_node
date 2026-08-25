@@ -71,6 +71,7 @@ type fold_ctx = {
   ready_ref_mode : Rule_graph.mode;
   live_mode : Rule_graph.mode;
   seat_mode : Rule_graph.mode;
+  open_mode : Rule_graph.mode;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
   start : int64;
@@ -138,6 +139,7 @@ let prior_fold _ =
     ready_ref_mode = Rule_graph.Prior;
     live_mode = Rule_graph.Prior;
     seat_mode = Rule_graph.Prior;
+    open_mode = Rule_graph.Prior;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
     start = 0L;
@@ -3242,7 +3244,12 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
       | Rule_graph.Active ->
         begin
           match Set_fold.seats state with
-          | Some seats -> seats, active
+          | Some seats ->
+            begin
+              match ctx.open_mode with
+              | Rule_graph.Prior -> seats, active
+              | Rule_graph.Active -> Set_fold.standard.max_members, []
+            end
           | None -> failwith "validator seat limit is missing"
         end
     in

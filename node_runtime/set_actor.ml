@@ -84,6 +84,10 @@ let control_capacity = 2
 let appeal_capacity = 32
 let lifetime = 120.0
 
+let pulse_step =
+  let half = Int64.div Octra_core.Set_fold.standard.pulse_gap 2L in
+  if Int64.compare half 1L < 0 then 1L else half
+
 let empty = {
   appeals = String_map.empty;
   last_pulse = None;
@@ -151,7 +155,7 @@ let pulse_due epoch = function
   | Some prior ->
     Int64.compare
       (Int64.sub epoch prior)
-      Octra_core.Set_fold.standard.pulse_gap
+      pulse_step
     >= 0
 
 let decide (sample : sample) state =

@@ -4,6 +4,7 @@
 module Transaction = Octra_core.Transaction
 module Runtime_text = Text
 module C_types = Octra_consensus.C_types
+module Range_part = Octra_bootstrap.Range_part
 
 exception Fetch_retry of string
 
@@ -282,16 +283,19 @@ let local_eic_from_head = function
 let head_url base =
   base ^ "/state-sync/head"
 
-let range_url base ~from_epoch ~max_epochs =
-  let query =
-    Uri.encoded_of_query [
+let range_url ?part base ~from_epoch ~max_epochs =
+  let fields =
+    [
       "from_epoch", [Int64.to_string from_epoch];
       "max_epochs", [string_of_int max_epochs];
     ]
   in
-  base ^ "/state-sync/range?" ^ query
-
-let max_http_response_bytes = 4_500_000
+  let fields =
+    match part with
+    | None -> fields
+    | Some index -> fields @ ["part", [string_of_int index]]
+  in
+  base ^ "/state-sync/range?" ^ Uri.encoded_of_query fields
 
 let read_http_body body =
   let open Lwt.Syntax in
@@ -303,7 +307,7 @@ let read_http_body body =
     | None -> Lwt.return (Buffer.contents buffer)
     | Some value ->
       let length = String.length value in
-      if length > max_http_response_bytes - total then
+      if length > Range_part.body_max - total then
         Lwt.fail (Fetch_retry "HTTP response exceeds join limit")
       else begin
         Buffer.add_string buffer value;
@@ -331,6 +335,36 @@ let http_get_json ?(timeout = 20.0) url =
                 "GET %s returned invalid JSON: %s"
                 url
                 (Printexc.to_string exn))))
+
+let fetch_range_json fetch_json base ~from_epoch ~max_epochs =
+  let open Lwt.Syntax in
+  let get ?part () =
+    fetch_json (range_url ?part base ~from_epoch ~max_epochs)
+  in
+  let* first_json = get () in
+  match Range_part.view first_json with
+  | Error error -> Lwt.fail (Fetch_retry error)
+  | Ok (Range_part.Full json) -> Lwt.return json
+  | Ok (Range_part.Part first) when first.index <> 0 ->
+    Lwt.fail (Fetch_retry "range first part index is invalid")
+  | Ok (Range_part.Part first) ->
+    let rec collect index parts =
+      if index = first.count then
+        match Range_part.join (List.rev parts) with
+        | Ok json -> Lwt.return json
+        | Error error -> Lwt.fail (Fetch_retry error)
+      else
+        let* json = get ~part:index () in
+        match Range_part.view json with
+        | Ok (Range_part.Part part) when part.index = index ->
+          collect (index + 1) (part :: parts)
+        | Ok (Range_part.Part _) ->
+          Lwt.fail (Fetch_retry "range part index does not match")
+        | Ok (Range_part.Full _) ->
+          Lwt.fail (Fetch_retry "range part response is incomplete")
+        | Error error -> Lwt.fail (Fetch_retry error)
+    in
+    collect 1 [first]
 
 let retry_delay failures =
   let shift = min 4 (max 0 failures) in
@@ -540,7 +574,9 @@ let http_range ?(fetch_json = fun url -> http_get_json url) env ~from_epoch
     Lwt.catch
       (fun () ->
         let source = normalize_base source in
-        let* json = fetch_json (range_url source ~from_epoch ~max_epochs) in
+        let* json =
+          fetch_range_json fetch_json source ~from_epoch ~max_epochs
+        in
         Lwt.return
           (range_response
              ~source
@@ -872,7 +908,7 @@ let run_node_catchup (deps : node_deps) base =
   let run_deps = {
     fetch_head = (fun base -> deps.fetch_json (head_url base));
     fetch_range = (fun base ~from_epoch ~max_epochs ->
-      deps.fetch_json (range_url base ~from_epoch ~max_epochs));
+      fetch_range_json deps.fetch_json base ~from_epoch ~max_epochs);
     local_next = (fun () -> Int64.of_int (deps.current_epoch ()));
     local_root = deps.local_root;
     cursor = node_cursor deps;

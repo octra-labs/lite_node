@@ -47,6 +47,7 @@ val validator_ready_activation : t -> activation option
 val ready_ref_activation : t -> activation option
 val set_live_activation : t -> activation option
 val set_fold_cap_activation : t -> activation option
+val set_open_activation : t -> activation option
 val object_cost_activation : t -> activation option
 val ready_config_hash : t -> string option
 
@@ -107,6 +108,11 @@ val set_live :
   (mode, fault) result
 
 val set_fold_cap :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val set_open :
   t ->
   epoch:int ->
   (mode, fault) result

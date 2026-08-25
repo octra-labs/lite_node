@@ -367,21 +367,28 @@ let catchup_response_key (rec_ : catchup_range_response_record) =
 
 let catchup_source_validator_set = C_types.resilient_validator_set
 
-let catchup_agreement_validator_set t ~epoch_id:_ =
-  catchup_source_validator_set t.engine.vs
+let catchup_agreement_validator_set t ~epoch_id =
+  C_types.validator_set_for_epoch
+    ~chain_id:t.config.chain_id
+    ~epoch_id
+    t.engine.vs
 
 let catchup_agreement_weight t ~epoch_id =
   catchup_agreement_validator_set t ~epoch_id
   |> C_types.round_skip_weight
 
-let catchup_source_agreement_reached validator_set
+let catchup_source_agreement_reached ?(count_required=true) validator_set
     ~signer_count ~signed_weight =
-  signer_count >= validator_set.C_types.f + 1
-  && Z.geq signed_weight (C_types.round_skip_weight validator_set)
+  Z.geq signed_weight (C_types.round_skip_weight validator_set)
+  && (not count_required || signer_count >= validator_set.C_types.f + 1)
 
 let catchup_agreement_reached t ~epoch_id ~count ~weight =
   let validator_set = catchup_agreement_validator_set t ~epoch_id in
   catchup_source_agreement_reached
+    ~count_required:
+      (C_quorum_policy.count_required
+         ~chain_id:t.config.chain_id
+         ~epoch_id)
     validator_set
     ~signer_count:count
     ~signed_weight:weight
@@ -4546,7 +4553,9 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
       ~current:t.engine.vs
       ~epoch:epoch_id
       validator_set_plan
-    |> catchup_source_validator_set
+    |> C_types.validator_set_for_epoch
+         ~chain_id:t.config.chain_id
+         ~epoch_id
   in
   let agreement_weight epoch_id =
     agreement_validator_set epoch_id
@@ -4563,6 +4572,10 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
   in
   let agreement_reached epoch_id count weight =
     catchup_source_agreement_reached
+      ~count_required:
+        (C_quorum_policy.count_required
+           ~chain_id:t.config.chain_id
+           ~epoch_id)
       (agreement_validator_set epoch_id)
       ~signer_count:count
       ~signed_weight:weight
@@ -5191,6 +5204,12 @@ let start t =
     t.config.my_addr t.engine.state.height t.engine.vs.n t.engine.vs.quorum;
   let min_peers =
     if t.n_validators <= 1 then 0
+    else if
+      not
+        (C_quorum_policy.count_required
+           ~chain_id:t.config.chain_id
+           ~epoch_id:t.engine.state.height)
+    then 1
     else max 1 (t.engine.vs.quorum - 1) in
   let rec wait_peers tries =
     let pc = Octra_net.P2p_swarm.connected_count t.swarm in

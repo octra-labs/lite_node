@@ -14,17 +14,13 @@ val path : string -> string
 
 val read : data_dir:string -> chain:string -> state
 
+val need : state -> (Sync_need.t option, string) result
+
 val write :
   data_dir:string ->
   chain:string ->
   Sync_need.t ->
   (write, string) result
-
-val consume_range :
-  data_dir:string ->
-  chain:string ->
-  Sync_need.t ->
-  (unit, string) result
 
 val consume_journal :
   data_dir:string ->

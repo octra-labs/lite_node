@@ -274,9 +274,35 @@ let run ?(stale_retries = 1) ?repair
             Log.warn "catchup"
               "event = attestation_http_secondary head = %d target = %Ld responses = %d required = %d"
               our_head_int target n_resp state_attest_required;
-            deps.run_catchup_to_target
-              ~target_epoch:target
-              ~reason:"attestation_secondary"
+            begin
+              match
+                C_catchup.classify_lag
+                  ~target
+                  ~our_head
+                  ~max_lag:cfg.snapshot_policy_threshold
+              with
+              | C_catchup.Snapshot_required lag ->
+                Log.warn "catchup"
+                  "event = signed_snapshot_required head = %d target = %Ld lag = %d source = http_attestation"
+                  our_head_int target lag;
+                deps.set_catchup_in_progress false;
+                if our_head_int < 0 || our_head_int = max_int then begin
+                  deps.mark_quarantine "snapshot_plan_invalid";
+                  Lwt.return_unit
+                end else begin
+                  deps.require_sync
+                    (Sync_need.root
+                       ~epoch:(our_head_int + 1)
+                       ~head:our_head_int);
+                  Lwt.return_unit
+                end
+              | C_catchup.Do_catchup _ ->
+                deps.run_catchup_to_target
+                  ~target_epoch:target
+                  ~reason:"attestation_secondary"
+              | C_catchup.In_sync
+              | C_catchup.Ahead_of_target _ -> Lwt.return_unit
+            end
           | _ -> Lwt.return_unit
         end else
           Lwt.return_unit

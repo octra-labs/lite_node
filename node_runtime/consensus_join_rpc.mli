@@ -255,10 +255,18 @@ val local_eic_from_head :
 val head_url : string -> string
 
 val range_url :
+  ?part:int ->
   string ->
   from_epoch:int64 ->
   max_epochs:int ->
   string
+
+val fetch_range_json :
+  (string -> Yojson.Safe.t Lwt.t) ->
+  string ->
+  from_epoch:int64 ->
+  max_epochs:int ->
+  Yojson.Safe.t Lwt.t
 
 val http_get_json :
   ?timeout:float ->

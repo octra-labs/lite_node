@@ -38,3 +38,8 @@ let recovery _ =
     voting_enabled = false;
     observer_enabled = true;
   }
+
+let with_need need mode =
+  match need with
+  | None -> mode
+  | Some _ -> recovery mode

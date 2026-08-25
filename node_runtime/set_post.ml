@@ -5,6 +5,7 @@ type deps = {
   now : unit -> float;
   wait : float -> unit Lwt.t;
   staged : string -> bool;
+  landed : Octra_core.Transaction.t -> bool;
   post : Octra_core.Transaction.t -> (unit, string) result Lwt.t;
   warn : string -> unit;
 }
@@ -54,6 +55,7 @@ and run t =
   match t.item with
   | None -> ()
   | Some _ when not t.open_ -> clear t
+  | Some item when t.deps.landed item.tx -> clear t
   | Some item when not (t.deps.staged item.hash) -> clear t
   | Some _ when t.busy -> ()
   | Some _ when t.deps.now () < t.due -> arm t
@@ -70,10 +72,19 @@ and run t =
       t.busy <- false;
       begin
         match result with
-        | Ok () -> ()
-        | Error reason -> t.deps.warn reason
+        | Ok () ->
+          begin
+            match t.item with
+            | Some current when current.hash = item.hash -> clear t
+            | _ -> arm t
+          end
+        | Error reason ->
+          if t.deps.landed item.tx then clear t
+          else begin
+            t.deps.warn reason;
+            arm t
+          end
       end;
-      arm t;
       Lwt.return_unit)
 
 let put t ~hash tx =

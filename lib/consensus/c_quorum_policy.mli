@@ -9,6 +9,7 @@ type activation = {
 
 val activation_for_chain : string -> activation option
 val active : chain_id:string -> epoch_id:int64 -> bool
+val count_required : chain_id:string -> epoch_id:int64 -> bool
 val rewind_allowed :
   chain_id:string ->
   from_epoch:int64 ->

@@ -5,6 +5,7 @@ type deps = {
   now : unit -> float;
   wait : float -> unit Lwt.t;
   staged : string -> bool;
+  landed : Octra_core.Transaction.t -> bool;
   post : Octra_core.Transaction.t -> (unit, string) result Lwt.t;
   warn : string -> unit;
 }
