@@ -137,7 +137,16 @@ let verify ~anchor values =
         loop prior (item :: roots) rest
   in
   if List.length values > width then Error "ready root window is too wide"
-  else loop anchor [] values
+  else
+    let* item = root anchor in
+    loop anchor [item] values
+
+let select ~stored ~signed =
+  match stored, signed with
+  | None, None -> Ok None
+  | Some root, None | None, Some root -> Ok (Some root)
+  | Some stored, Some signed when stored = signed -> Ok (Some stored)
+  | Some _, Some _ -> Error "ready root sources differ"
 
 let read path =
   match

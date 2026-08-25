@@ -96,13 +96,13 @@ type driver_probe_deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
+  require_sync : Sync_need.t -> unit;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
   fork_repair : fork_repair_runtime;
-  require_sync : Sync_need.t -> unit;
 }
 
 type node_fork_repair_runtime = {
@@ -134,13 +134,13 @@ type node_driver_probe_runtime = {
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   fork_repair : fork_repair_runtime;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  require_sync : Sync_need.t -> unit;
 }
 
 type 'driver liveness_deps = {
@@ -195,13 +195,13 @@ type node_driver_health_runtime = {
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   fork_repair : fork_repair_runtime;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  require_sync : Sync_need.t -> unit;
   liveness_state : Consensus_liveness.state ref;
   now : unit -> float;
   stall_sec : float;
@@ -358,9 +358,16 @@ let node_liveness_deps (deps : node_liveness_deps) =
   }
 
 let snapshot_policy_threshold ~getenv =
-  match getenv "OCTRA_CATCHUP_MAX_LAG" with
-  | Some s -> (try int_of_string s with _ -> 5000)
-  | None -> 5000
+  let retained =
+    Consensus_finality_journal.history_limit
+    |> Int64.to_int
+  in
+  let configured =
+    match getenv "OCTRA_CATCHUP_MAX_LAG" with
+    | Some s -> (try int_of_string s with _ -> retained)
+    | None -> retained
+  in
+  min retained (max 1 configured)
 
 let peer_state_label (record : Octra_consensus.C_driver.peer_state_record) =
   let root =
@@ -504,10 +511,10 @@ let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
       Consensus_runtime_state.ahead_streak runtime.runtime_state);
     incr_ahead_streak = (fun () ->
       Consensus_runtime_state.incr_ahead_streak runtime.runtime_state);
+    require_sync = runtime.require_sync;
     run_catchup_to_target = (fun driver ~target_epoch ~reason ->
       runtime.run_catchup_to_target driver ~target_epoch ~reason);
     fork_repair = runtime.fork_repair;
-    require_sync = runtime.require_sync;
   }
 
 let node_driver_health_deps (runtime : node_driver_health_runtime) =
@@ -537,9 +544,9 @@ let node_driver_health_deps (runtime : node_driver_health_runtime) =
           read_local_root_raw = runtime.read_local_root_raw;
           committed_epoch_root_raw = runtime.committed_epoch_root_raw;
           drain_pending_finalized = runtime.drain_pending_finalized;
+          require_sync = runtime.require_sync;
           fork_repair = runtime.fork_repair;
           run_catchup_to_target = runtime.run_catchup_to_target;
-          require_sync = runtime.require_sync;
         } : node_driver_probe_runtime);
     liveness =
       node_liveness_deps
@@ -608,9 +615,9 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
     drain_pending_finalized = deps.drain_pending_finalized;
     wake_ready = (fun () ->
       Octra_consensus.C_driver.wake_ready driver);
+    require_sync = deps.require_sync;
     run_catchup_to_target = (fun ~target_epoch ~reason ->
       deps.run_catchup_to_target driver ~target_epoch ~reason);
-    require_sync = deps.require_sync;
     quarantine_active = deps.quarantine_active;
     quarantine_reason = deps.quarantine_reason;
     ahead_streak = deps.ahead_streak;

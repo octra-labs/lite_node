@@ -5,7 +5,7 @@ module C_types = Octra_consensus.C_types
 module Log = Octra_log
 
 type deps = {
-  current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   find_finalized :
@@ -19,7 +19,7 @@ type deps = {
 }
 
 type node_deps = {
-  current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;
@@ -43,12 +43,16 @@ let short_hex8 s =
 
 let rec drain (deps : deps) =
   let open Lwt.Syntax in
-  let epoch = deps.current_epoch () in
+  let head = deps.committed_head_epoch () in
+  let epoch = head + 1 in
   match deps.find_finalized epoch with
   | Some (finalize, validator_set) ->
     Log.info "consensus" "replaying stashed finalized epoch = %d reason = drain" epoch;
     let* () = deps.apply_finalized ~validator_set finalize in
-    drain deps
+    if deps.committed_head_epoch () <= head then
+      Lwt.fail_with "finalized replay did not advance committed head"
+    else
+      drain deps
   | None -> Lwt.return_unit
 
 let rec replay_while_safe (deps : deps) ~source =
@@ -56,7 +60,8 @@ let rec replay_while_safe (deps : deps) ~source =
   if deps.catchup_active () then
     Lwt.return_unit
   else
-    let epoch = deps.current_epoch () in
+    let head = deps.committed_head_epoch () in
+    let epoch = head + 1 in
     match deps.find_finalized epoch with
     | None -> Lwt.return_unit
     | Some (finalize, validator_set) ->
@@ -73,12 +78,15 @@ let rec replay_while_safe (deps : deps) ~source =
           "quarantine replay applying stashed finalized epoch = %d source = %s"
           epoch source;
         let* () = deps.apply_finalized ~validator_set finalize in
-        replay_while_safe deps ~source
+        if deps.committed_head_epoch () <= head then
+          Lwt.fail_with "finalized replay did not advance committed head"
+        else
+          replay_while_safe deps ~source
       end
 
 let node_deps (deps : node_deps) =
   {
-    current_epoch = deps.current_epoch;
+    committed_head_epoch = deps.committed_head_epoch;
     catchup_active = deps.catchup_active;
     quarantine_active = deps.quarantine_active;
     find_finalized = deps.finality.find_finalized_with_set;

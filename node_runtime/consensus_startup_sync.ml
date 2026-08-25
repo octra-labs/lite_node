@@ -21,7 +21,7 @@ type deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
-  require_sync : Sync_need.t -> unit;
+  seed_floor : epoch:int64 -> (int option, string) result;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -32,6 +32,7 @@ type apply_finalized =
   ?override_proposer_info:Octra_core.Epochlog.proposer_info ->
   ?override_reward:Consensus_reward_attribution.t ->
   ?override_epoch_ts:float ->
+  ?override_validator_set:Octra_consensus.C_types.validator_set ->
   ?override_parent_commit:Octra_consensus.C_types.parent_commit ->
   now:float ->
   elapsed:float ->
@@ -46,6 +47,7 @@ type apply_callbacks = {
     proposer_info:Octra_core.Epochlog.proposer_info option ->
     reward:Consensus_reward_attribution.t ->
     epoch_ts:float ->
+    validator_set:Octra_consensus.C_types.validator_set ->
     parent_commit:Octra_consensus.C_types.parent_commit option ->
     unit Lwt.t;
 }
@@ -69,7 +71,6 @@ type node_deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
-  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -85,13 +86,14 @@ let apply_callbacks ~now (apply : apply_finalized) =
         ~elapsed:0.0
         ());
     join = (fun ~txs ~receipts_json ~proposer_info ~reward ~epoch_ts
-        ~parent_commit ->
+        ~validator_set ~parent_commit ->
       apply
         ~override_ordered_txs:txs
         ~override_receipts_json:receipts_json
         ?override_proposer_info:proposer_info
         ~override_reward:reward
         ~override_epoch_ts:epoch_ts
+        ~override_validator_set:validator_set
         ?override_parent_commit:parent_commit
         ~now:(now ())
         ~elapsed:0.0
@@ -100,6 +102,18 @@ let apply_callbacks ~now (apply : apply_finalized) =
 
 let node_deps runtime =
   let apply = apply_callbacks ~now:runtime.now runtime.apply_finalized in
+  let seed_floor ~epoch =
+    if not (String.equal runtime.consensus_role "validator") then Ok None
+    else
+      try
+        Vote_floor.seed
+          ~data_dir:runtime.data_dir
+          ~chain_id:runtime.chain_id
+          ~validator:runtime.validator
+          ~pubkey:(Base64.decode_exn runtime.validator_pubkey)
+          ~through_epoch:epoch
+      with exn -> Error (Printexc.to_string exn)
+  in
   {
     env = runtime.env;
     expected_validator_set_hash = runtime.expected_validator_set_hash;
@@ -120,7 +134,7 @@ let node_deps runtime =
     validator = runtime.validator;
     validator_pubkey = runtime.validator_pubkey;
     priv_b64 = runtime.priv_b64;
-    require_sync = runtime.require_sync;
+    seed_floor;
     exit_error = runtime.exit_error;
     exit_success = runtime.exit_success;
   }
@@ -155,7 +169,6 @@ let join_wiring (deps : deps) =
     validator = deps.validator;
     validator_pubkey = deps.validator_pubkey;
     priv_b64 = deps.priv_b64;
-    require_sync = deps.require_sync;
   }
 
 let run_replay (deps : deps) =
@@ -168,10 +181,41 @@ let run_join (deps : deps) =
   Consensus_join_rpc.run_configured_node_wiring
     (join_wiring deps)
 
+let seed_epoch ~validator = function
+  | Some (Consensus_join_rpc.Synced synced)
+    when validator && synced.count > 0 -> Some synced.epoch
+  | Some (Consensus_join_rpc.Synced _)
+  | Some (Consensus_join_rpc.Leader_stale _)
+  | Some (Consensus_join_rpc.Source_unavailable _)
+  | None -> None
+
 let run (deps : deps) =
   let open Lwt.Syntax in
   let* () = run_replay deps in
-  run_join deps
+  let* joined = run_join deps in
+  match seed_epoch
+          ~validator:(String.equal deps.consensus_role "validator")
+          joined
+  with
+  | Some epoch ->
+    begin
+      match deps.seed_floor ~epoch with
+      | Ok None -> Lwt.return_unit
+      | Ok (Some round) ->
+        Octra_log.info "join"
+          "event = vote_floor_seeded head = %Ld round = %d"
+          epoch
+          round;
+        Lwt.return_unit
+      | Error reason ->
+        Octra_log.fatal "join"
+          "event = vote_floor_seed_failed head = %Ld reason = %s"
+          epoch
+          reason;
+        deps.exit_error ();
+        Lwt.return_unit
+    end
+  | None -> Lwt.return_unit
 
 let run_node runtime =
   run (node_deps runtime)

@@ -83,7 +83,10 @@ let admit ?(limits=standard) tx =
       tx.Transaction.op_type
       tx.Transaction.message
 
-let decode ?(limits=standard) json =
-  match Transaction.of_yojson json with
+let decode_final json =
+  Transaction.of_yojson json
+
+let decode_admit ?(limits=standard) json =
+  match decode_final json with
   | Error _ as error -> error
   | Ok tx -> Result.map (fun () -> tx) (admit ~limits tx)

@@ -476,6 +476,7 @@ let finality_runtime (deps : deps) =
       fatal_exit = deps.exit_error;
       catchup_active = deps.catchup_active;
       runtime_state = deps.runtime_state;
+      set_state_attested = deps.set_state_attested;
       finality = deps.finality;
     }
 
@@ -719,9 +720,9 @@ let health (deps : deps) normalize finality_runtime fork_repair_runtime
     read_local_root_raw = deps.read_local_root_raw;
     committed_epoch_root_raw = deps.committed_epoch_root_raw;
     drain_pending_finalized = drain_pending;
+    require_sync = deps.require_sync;
     fork_repair = fork_repair_runtime;
     run_catchup_to_target;
-    require_sync = deps.require_sync;
     liveness_state = deps.liveness_state;
     now = deps.now;
     stall_sec = deps.liveness_stall_sec;

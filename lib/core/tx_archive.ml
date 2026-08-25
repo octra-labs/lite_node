@@ -132,7 +132,7 @@ let retain_signed_fields tx =
 let decode ~hash ~json:raw_json =
   try
     let json = Yojson.Safe.from_string raw_json in
-    match Tx_payload.decode json with
+    match Tx_payload.decode_final json with
     | Error reason -> Error reason
     | Ok tx when Transaction.hash tx = hash ->
         if Yojson.Safe.to_string (Transaction.to_yojson tx) = raw_json then

@@ -44,6 +44,8 @@ val owner_migration_activation : t -> activation option
 val private_payload_activation : t -> activation option
 val set_fold_activation : t -> activation option
 val validator_ready_activation : t -> activation option
+val ready_ref_activation : t -> activation option
+val set_live_activation : t -> activation option
 val set_fold_cap_activation : t -> activation option
 val object_cost_activation : t -> activation option
 val ready_config_hash : t -> string option
@@ -90,6 +92,16 @@ val set_fold :
   (mode, fault) result
 
 val validator_ready :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val ready_ref :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val set_live :
   t ->
   epoch:int ->
   (mode, fault) result

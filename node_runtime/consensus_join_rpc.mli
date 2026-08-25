@@ -7,6 +7,7 @@ type apply =
   proposer_info:Octra_core.Epochlog.proposer_info option ->
   reward:Consensus_reward_attribution.t ->
   epoch_ts:float ->
+  validator_set:Octra_consensus.C_types.validator_set ->
   parent_commit:Octra_consensus.C_types.parent_commit option ->
   unit Lwt.t
 
@@ -38,15 +39,21 @@ type range =
   | Missing
   | Records of record list
 
+type synced = {
+  epoch : int64;
+  root : string;
+  count : int;
+}
+
 type outcome =
-  | Synced
+  | Synced of synced
   | Leader_stale of {
       local_head : int64;
       leader_head : int64;
     }
-  | Need_range of {
-      head : int64;
-      target : int64;
+  | Source_unavailable of {
+      phase : string;
+      error : string;
     }
 
 type sync_plan =
@@ -104,6 +111,7 @@ type ready_marker_config = {
 type ready_marker_write_deps = {
   write_text : path:string -> contents:string -> unit;
   rename : src:string -> dst:string -> unit;
+  sync_dir : path:string -> unit;
   log_written : ready_marker -> unit;
 }
 
@@ -186,7 +194,6 @@ type node_runtime_deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
-  require_sync : Sync_need.t -> unit;
 }
 
 type node_runtime_wiring = {
@@ -207,7 +214,6 @@ type node_runtime_wiring = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
-  require_sync : Sync_need.t -> unit;
 }
 
 val configured_base :
@@ -217,6 +223,14 @@ val configured_base :
 val first_source :
   string option ->
   string option
+
+val source_list :
+  string option ->
+  string list
+
+val configured_sources :
+  (string -> string option) ->
+  string list
 
 val configured_join :
   (string -> string option) ->
@@ -320,11 +334,11 @@ val node_runtime_deps :
 
 val run_configured_node_catchup :
   node_runtime_deps ->
-  unit Lwt.t
+  outcome option Lwt.t
 
 val run_configured_node_wiring :
   node_runtime_wiring ->
-  unit Lwt.t
+  outcome option Lwt.t
 
 val ready_marker :
   data_dir:string ->

@@ -349,7 +349,7 @@ let parse_record_txs record =
       List.map
         (fun tx_json ->
           match Yojson.Safe.from_string tx_json
-                |> Octra_core.Tx_payload.decode with
+                |> Octra_core.Tx_payload.decode_final with
           | Ok tx -> tx
           | Error e -> failwith ("bad tx_json: " ^ e))
         record.Octra_consensus.C_codec.txs_json
@@ -597,7 +597,7 @@ let validate_record ~chain_id ~expected_validator_set_hash ~prev_eic
       | Error e -> Error e
       | Ok () ->
         match
-          Octra_core.Tx_outcome.decode
+          Octra_core.Tx_outcome.decode_final
             ~confirmed:parsed_txs
             record.receipts_json
         with
@@ -1148,6 +1148,7 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
   and run_queued queued =
     Lwt.catch
       (fun () ->
+        let* () = deps.drain_pending_finalized () in
         run_one
           ~target_epoch:queued.target_epoch
           ~reason:queued.reason

@@ -68,6 +68,8 @@ type account_ops = {
 type fold_ctx = {
   mode : Rule_graph.mode;
   ready_mode : Rule_graph.mode;
+  ready_ref_mode : Rule_graph.mode;
+  live_mode : Rule_graph.mode;
   seat_mode : Rule_graph.mode;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
@@ -133,6 +135,8 @@ let prior_fold _ =
   Ok {
     mode = Rule_graph.Prior;
     ready_mode = Rule_graph.Prior;
+    ready_ref_mode = Rule_graph.Prior;
+    live_mode = Rule_graph.Prior;
     seat_mode = Rule_graph.Prior;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
@@ -2789,21 +2793,32 @@ let validate_validator_ready_policy ~env ctx
       match ctx.ready_config_hash with
       | None -> Error "validator ready config hash missing"
       | Some config_hash ->
-        Validator_ready_policy.validate
-          ~runtime:{
-            chain_id = env.chain_id;
-            binary_hash = "";
-            config_hash;
-          }
-          ~requirements:(Validator_ready_policy.strict ())
-          {
-            head_epoch = ready.head_epoch;
-            chain_id = ready.chain_id;
-            binary_hash = ready.binary_hash;
-            config_hash = ready.config_hash;
-            catchup_head_epoch = ready.catchup_head_epoch;
-            shadow_epochs = ready.shadow_epochs;
-          }
+        let runtime : Validator_ready_policy.runtime = {
+          chain_id = env.chain_id;
+          config_hash;
+        } in
+        let claim : Validator_ready_policy.claim = {
+          chain_id = ready.chain_id;
+          config_hash = ready.config_hash;
+          catchup_head_epoch = ready.catchup_head_epoch;
+        } in
+        begin
+          match ctx.ready_ref_mode with
+          | Rule_graph.Prior ->
+            Validator_ready_policy.validate_prior
+              ~runtime
+              ~head_epoch:ready.head_epoch
+              claim
+          | Rule_graph.Active ->
+            let head_epoch = Int64.of_int (env.epoch_id - 1) in
+            if not (Int64.equal ready.head_epoch head_epoch) then
+              Error "head_epoch mismatch"
+            else
+              Validator_ready_policy.validate
+                ~runtime
+                ~head_epoch
+                claim
+        end
     end
 
 let update_ready_fold ~backend ~env ~address proof =
@@ -2841,6 +2856,15 @@ let update_ready_fold ~backend ~env ~address proof =
         in
         Lwt.return (Result.map Option.some result)
     end
+
+let ready_mark ~mode ~start ~source ~address ~prior ~marked fold =
+  match mode, fold with
+  | Rule_graph.Prior, _ -> marked
+  | Rule_graph.Active, None -> marked
+  | Rule_graph.Active, Some state
+    when Set_fold.allows Set_fold.standard ~start ~source ~address state ->
+    marked
+  | Rule_graph.Active, Some _ -> prior
 
 let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
     (ready : Validator_registry.ready_payload) =
@@ -2902,6 +2926,16 @@ let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
                         Lwt.return
                           (Stdlib.Error ("validator_ready_rejected", error))
                       | Ok fold ->
+                        let next =
+                          ready_mark
+                            ~mode:ctx.ready_ref_mode
+                            ~start:ctx.start
+                            ~source:(Int64.of_int env.epoch_id)
+                            ~address:tx.from
+                            ~prior:registry
+                            ~marked:next
+                            fold
+                        in
                         begin
                           match backend.ops.debit tx.from tx.ou tx.nonce with
                           | Error error ->
@@ -3148,10 +3182,23 @@ let process_standard_tx ~(backend : backend) ~(env : env) tx =
     ~env
     tx
 
-let validator_snapshot_input ~backend ~env policy registry =
+let fold_set ~mode ~source ~active state =
+  match mode with
+  | Rule_graph.Prior -> Ok (state, false)
+  | Rule_graph.Active ->
+    Set_fold.note_set Set_fold.standard ~epoch:source ~active state
+    |> Result.map (fun next -> next, next <> state)
+
+let validator_snapshot_input ?active ~backend ~env policy registry =
   let open Lwt.Syntax in
   let source = Int64.of_int env.epoch_id in
+  let promoted = Option.value active ~default:env.validator_addrs in
   let ctx = fold_at backend env.epoch_id in
+  let active =
+    match ctx.live_mode with
+    | Rule_graph.Prior -> env.validator_addrs
+    | Rule_graph.Active -> promoted
+  in
   match ctx.mode with
   | Rule_graph.Prior ->
     Lwt.return
@@ -3164,6 +3211,15 @@ let validator_snapshot_input ~backend ~env policy registry =
       match stored with
       | Ok state -> state
       | Error error -> failwith ("validator set fold state corrupt: " ^ error)
+    in
+    let state, changed =
+      match fold_set ~mode:ctx.live_mode ~source ~active state with
+      | Ok result -> result
+      | Error error -> failwith ("validator set fold active set rejected: " ^ error)
+    in
+    let* () =
+      if changed then save_set_fold backend state
+      else Lwt.return_unit
     in
     let candidates, counts =
       Set_fold.filter
@@ -3186,7 +3242,7 @@ let validator_snapshot_input ~backend ~env policy registry =
       | Rule_graph.Active ->
         begin
           match Set_fold.seats state with
-          | Some seats -> seats, env.validator_addrs
+          | Some seats -> seats, active
           | None -> failwith "validator seat limit is missing"
         end
     in
@@ -3197,7 +3253,7 @@ let validator_snapshot_input ~backend ~env policy registry =
     in
     Lwt.return (parameters, candidates, incumbents)
 
-let schedule_validator_snapshot ~backend ~env =
+let schedule_validator_snapshot ?active ~backend ~env () =
   let open Lwt.Syntax in
   let source_epoch = Int64.of_int env.epoch_id in
   match
@@ -3218,7 +3274,7 @@ let schedule_validator_snapshot ~backend ~env =
           | Validator_policy.Inactive -> Lwt.return_unit
           | Validator_policy.Bonded policy ->
             let* parameters, candidates, incumbents =
-              validator_snapshot_input ~backend ~env policy registry
+              validator_snapshot_input ?active ~backend ~env policy registry
             in
             match
               Validator_admission.snapshot
@@ -3274,7 +3330,7 @@ let promote_active_validator_set ~backend ~env =
       Validator_set_update.pending_meta_key
   in
   match pending with
-  | None -> Lwt.return_unit
+  | None -> Lwt.return_none
   | Some raw ->
     begin
       match Validator_set_update.of_string raw with
@@ -3285,18 +3341,23 @@ let promote_active_validator_set ~backend ~env =
            && Int64.compare
                 update.activate_epoch
                 (Int64.of_int env.epoch_id) <= 0 then
-          backend.set_meta
-            Validator_set_update.active_meta_key
-            raw
+          let* () =
+            backend.set_meta
+              Validator_set_update.active_meta_key
+              raw
+          in
+          update.validators
+          |> List.map (fun item -> item.Validator_set_update.address)
+          |> Lwt.return_some
         else
-          Lwt.return_unit
+          Lwt.return_none
     end
 
 let advance_validator_set ~backend ~env =
   let open Lwt.Syntax in
   let* () = apply_set_fold ~backend ~env in
-  let* () = promote_active_validator_set ~backend ~env in
-  schedule_validator_snapshot ~backend ~env
+  let* active = promote_active_validator_set ~backend ~env in
+  schedule_validator_snapshot ?active ~backend ~env ()
 
 let register_confirmed_sender_key ~backend ~env (tx : Transaction.t) =
   let stored =

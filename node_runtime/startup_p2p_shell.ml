@@ -71,8 +71,6 @@ type node_view = {
   scheduled_validator_set_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   consensus_config_hash : string;
   p2p_config : P2p_config.t;
-  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
-  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
   swarm_params : P2p_config.swarm_params;
   swarm : Octra_net.P2p_swarm.t;
 }
@@ -209,8 +207,6 @@ let stack_view (stack : P2p_config.node_stack) =
     scheduled_validator_set_config = runtime.scheduled_driver_config;
     consensus_config_hash = runtime.consensus_config_hash;
     p2p_config = runtime.handshake;
-    readiness_requirements = runtime.readiness_requirements;
-    readiness_runtime = runtime.readiness_runtime;
     swarm_params = swarm_start.params;
     swarm = swarm_start.swarm;
   }

@@ -2,7 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type replay_deps = {
-  current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;
@@ -78,6 +78,7 @@ type node_runtime = {
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
   runtime_state : Consensus_runtime_state.t;
+  set_state_attested : head:int -> root:string -> unit;
   finality : Consensus_finality_state.callbacks;
 }
 

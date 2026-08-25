@@ -477,7 +477,7 @@ let check_local_bundle ~expected_hashes
   else if local_hashes <> expected_hashes then
     Error "local_preverify_tx_mismatch"
   else
-    match Octra_core.Tx_outcome.split received.receipts_json with
+    match Octra_core.Tx_outcome.split_admit received.receipts_json with
     | Error error -> Error ("received_outcome_invalid:" ^ error)
     | Ok artifacts ->
       if local.receipts_json <> artifacts.preverify then
@@ -555,7 +555,7 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
   else if not (receipt_root_matches ~header receipts_json) then
     Error Receipt_root_mismatch
   else
-    match Octra_core.Tx_outcome.split receipts_json with
+    match Octra_core.Tx_outcome.split_admit receipts_json with
     | Error error -> Error (Receipt_decode_failed error)
     | Ok artifacts ->
       match

@@ -17,6 +17,7 @@ from validator_common import load_wallet
 from validator_common import parse_env
 from validator_common import sha256_file
 from validator_common import state_ready
+from validator_enroll import committed_enrollment
 from validator_enroll import membership
 
 def emit(key, value):
@@ -146,7 +147,6 @@ def round_view(payload):
         "round_peers": len(peers) if isinstance(peers, list) else 0,
     }
 
-
 def main():
     parser = argparse.ArgumentParser(prog="stat.sh")
     parser.add_argument("--config", required=True)
@@ -241,8 +241,18 @@ def main():
         emit("validator_active", str(validator_state["active"]).lower())
         emit("validator_scheduled", str(validator_state["scheduled"]).lower())
         emit("validator_activation_epoch", validator_state["activate_epoch"])
+        emit("validator_next_set_epoch", validator_state["next_set_epoch"])
     except ValidatorError:
         emit("validator_membership", "unavailable")
+    try:
+        enrollment = committed_enrollment(values, wallet)
+        emit("validator_enrollment", enrollment.state.value)
+        emit("validator_bond", enrollment.bond)
+        emit("validator_bonded_epoch", enrollment.bonded_epoch)
+        emit("validator_ready_epoch", enrollment.ready_epoch)
+        emit("validator_exit_epoch", enrollment.exit_epoch)
+    except ValidatorError:
+        emit("validator_enrollment", "unavailable")
     if args.logs:
         subprocess.run([
             "pm2",

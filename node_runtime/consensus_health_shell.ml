@@ -42,11 +42,11 @@ type deps = {
   peer_snapshot : unit -> string;
   drain_pending_finalized : unit -> unit Lwt.t;
   wake_ready : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   run_catchup_to_target :
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  require_sync : Sync_need.t -> unit;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
@@ -547,24 +547,21 @@ let run ?(stale_retries = 1) ?repair
                       Lwt.return_unit
                   end
                 | C_catchup.Snapshot_required lag ->
-                  begin
-                    match
-                      Sync_need.range
-                        ~head:our_head_int
-                        ~target:target_epoch
-                        ~limit:cfg.snapshot_policy_threshold
-                    with
-                    | Some need ->
-                        Log.fatal "catchup"
-                          "event = sync_recovery status = required cause = range head = %d target = %Ld lag = %d"
-                          our_head_int
-                          target_epoch
-                          lag;
-                        deps.require_sync need;
-                        Lwt.return_unit
-                    | None ->
-                        deps.mark_quarantine "snapshot_range_inconsistent";
-                        Lwt.return_unit
+                  Log.warn "catchup"
+                    "event = signed_snapshot_required head = %d target = %Ld lag = %d"
+                    our_head_int
+                    target_epoch
+                    lag;
+                  deps.set_catchup_in_progress false;
+                  if our_head_int < 0 || our_head_int = max_int then begin
+                    deps.mark_quarantine "snapshot_plan_invalid";
+                    Lwt.return_unit
+                  end else begin
+                    deps.require_sync
+                      (Sync_need.root
+                         ~epoch:(our_head_int + 1)
+                         ~head:our_head_int);
+                    Lwt.return_unit
                   end
                 | C_catchup.Do_catchup lag ->
                   begin

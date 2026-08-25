@@ -198,7 +198,7 @@ let parse_txs (_tx_hashes, txs_json, _receipts_json) =
        | Ok lst ->
          try
            let json = Yojson.Safe.from_string tx_json in
-           match Octra_core.Tx_payload.decode json with
+           match Octra_core.Tx_payload.decode_admit json with
            | Ok tx -> Ok (tx :: lst)
            | Error e -> Error ("of_yojson: " ^ e)
          with exn ->
@@ -218,7 +218,7 @@ let decode (tx_hashes, txs_json, receipts_json as raw) =
       if recomputed <> tx_hashes then
         Error "bundle tx hash mismatch"
       else
-        match Octra_core.Tx_outcome.split receipts_json with
+        match Octra_core.Tx_outcome.split_admit receipts_json with
         | Error error -> Error ("bundle outcome: " ^ error)
         | Ok artifacts ->
           begin

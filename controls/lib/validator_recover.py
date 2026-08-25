@@ -23,11 +23,9 @@ from validator_config import sync_snapshot
 from validator_process import active_data_owners
 from validator_process import data_pids
 from validator_process import pm2_entries
-
-NEED_SCHEMA = "octra_sync_need_v1"
-NEED_CAUSES = frozenset({"root", "journal", "range"})
-NEED_FIELDS = frozenset({"schema", "chain_id", "cause", "epoch", "head", "target"})
-NEED_BYTES = 4096
+from sync_need import MAX_BYTES as NEED_BYTES
+from sync_need import choose
+from sync_need import decode
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
@@ -66,26 +64,7 @@ def move_state(source, target):
     sync_dir(target.parent)
 
 def need_of(value, chain):
-    if not isinstance(value, dict) or set(value) != NEED_FIELDS:
-        raise ValidatorError("recovery marker fields are invalid")
-    if value.get("schema") != NEED_SCHEMA or value.get("chain_id") != chain:
-        raise ValidatorError("recovery marker binding differs")
-    cause = value["cause"]
-    epoch = value["epoch"]
-    head = value["head"]
-    target = value["target"]
-    if cause not in NEED_CAUSES:
-        raise ValidatorError("recovery marker cause is invalid")
-    if type(epoch) is not int or type(head) is not int:
-        raise ValidatorError("recovery marker height is invalid")
-    if head < 0 or epoch != head + 1:
-        raise ValidatorError("recovery marker boundary is invalid")
-    if cause == "range":
-        if type(target) is not int or target <= head:
-            raise ValidatorError("recovery marker target is invalid")
-    elif target is not None:
-        raise ValidatorError("recovery marker target is invalid")
-    return {"cause": cause, "epoch": epoch, "head": head, "target": target}
+    return decode(value, chain)
 
 def read_need(data_path, chain):
     path = data_path / "recovery/sync_need.json"
@@ -149,8 +128,7 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
     values = parse_env(config)
     data_path = Path(values["OCTRA_DATA_DIR"])
     marked = read_need(data_path, values["OCTRA_CHAIN_ID"])
-    planned = need_of(plan, values["OCTRA_CHAIN_ID"]) if plan is not None else None
-    need = marked or planned
+    need = choose(marked, plan, values["OCTRA_CHAIN_ID"])
     ready = state_ready(data_path)
     head = (
         validate_checkpoint(data_path, values, allow_progress=True)
@@ -158,7 +136,14 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
         else None
     )
     if ready and need is not None and not replace_state:
-        raise ValidatorError("terminal recovery requires --replace-state")
+        emit(
+            event="recovery",
+            status="verify",
+            cause=need.cause,
+            epoch=need.epoch,
+            action="start_observer",
+        )
+        return
     if ready and not replace_state:
         emit(event="recovery", status="ready", epoch=head["epoch"])
         return
@@ -187,7 +172,7 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
     sources = state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
     floor = int(values["OCTRA_CHECKPOINT_EPOCH"])
     if need is not None:
-        floor = max(floor, need["epoch"])
+        floor = max(floor, need.epoch)
     if min_epoch is not None:
         floor = max(floor, int(min_epoch))
     identity_path = Path(config).parent / "wallet.json"
@@ -207,7 +192,7 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
             min_epoch=floor,
         )
         head = validate_checkpoint(data_path, values, allow_progress=True)
-        if need is not None and head["epoch"] < need["epoch"]:
+        if need is not None and head["epoch"] < need.epoch:
             raise ValidatorError("signed snapshot is below recovery boundary")
         copy_private(identity_path, data_path / "wallet.json")
     except Exception:
@@ -224,7 +209,7 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
         event="recovery",
         status="restored",
         epoch=head["epoch"],
-        cause=need["cause"] if need is not None else "manual",
+        cause=need.cause if need is not None else "manual",
         preserved=preserved or "none",
     )
 

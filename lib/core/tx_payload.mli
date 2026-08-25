@@ -14,7 +14,8 @@ val message_limit : limits -> Transaction.t -> int
 val encrypted_data_limit : limits -> Transaction.t -> int
 val size_ok : limits:limits -> Transaction.t -> bool
 val admit : ?limits:limits -> Transaction.t -> (unit, string) result
-val decode :
+val decode_final : Yojson.Safe.t -> (Transaction.t, string) result
+val decode_admit :
   ?limits:limits ->
   Yojson.Safe.t ->
   (Transaction.t, string) result

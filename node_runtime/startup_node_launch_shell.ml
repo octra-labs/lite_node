@@ -6,6 +6,7 @@ type deps = {
   rpc : unit -> unit Lwt.t;
   services : (unit -> unit Lwt.t) list;
   observer : bool;
+  follow : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
   guard : Octra_net.P2p_tx_gossip_guard.t;
@@ -38,6 +39,7 @@ let run deps =
         rpc = deps.rpc;
         services = deps.services;
         observer = deps.observer;
+        follow = deps.follow;
         tick_loop = deps.tick_loop;
         swarm = deps.swarm;
         guard = deps.guard;

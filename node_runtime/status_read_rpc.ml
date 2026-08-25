@@ -10,6 +10,11 @@ module Tree = Octra_core.Tree
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
+type enrollment_snapshot = {
+  head_epoch : int;
+  candidate : Octra_core.Validator_admission.candidate option;
+}
+
 type read_ctx = {
   ledger : Ledger.t;
   store : Store_irmin.t;
@@ -29,6 +34,7 @@ type read_ctx = {
   encrypted : unit -> Z.t;
   swarm : unit -> Octra_net.P2p_swarm.t option;
   driver_ref : Octra_consensus.C_driver.t option ref;
+  validator_enrollment : unit -> (enrollment_snapshot, string) result;
 }
 
 type 'handler dispatch_adapters = {
@@ -122,6 +128,71 @@ let validator_set_proof ~chain_id ~program_trust_hash
        ?runtime_profile_hash
        ?scheduled
        validator_set)
+
+let load_validator_enrollment ~store ~head ~validator_address =
+  let open Lwt.Syntax in
+  match head with
+  | None -> Lwt.return_error "committed head unavailable"
+  | Some head ->
+    begin
+      match head.Octra_core.Head_manifest.ledger_state_root with
+      | None -> Lwt.return_error "committed ledger root unavailable"
+      | Some state_root ->
+        let* snapshot =
+          Store_irmin.capture_read_snapshot_at
+            store
+            ~epoch_id:(Int64.of_int head.epoch_id)
+            ~state_root
+        in
+        begin
+          match snapshot with
+          | Error error ->
+            Lwt.return_error
+              ("committed validator state unavailable: " ^ error)
+          | Ok snapshot ->
+            let* raw =
+              Store_irmin.read_snapshot
+                snapshot
+                ["meta"; Octra_core.Validator_registry.meta_key]
+            in
+            let registry =
+              match raw with
+              | None -> Ok Octra_core.Validator_registry.empty
+              | Some raw -> Octra_core.Validator_registry.of_string raw
+            in
+            begin
+              match registry with
+              | Error error ->
+                Lwt.return_error
+                  ("committed validator registry invalid: " ^ error)
+              | Ok registry ->
+                Lwt.return_ok {
+                  head_epoch = head.epoch_id;
+                  candidate =
+                    Octra_core.Validator_registry.find
+                      validator_address
+                      registry;
+                }
+            end
+        end
+    end
+
+let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
+  match snapshot with
+  | Error error ->
+    Lwt.return
+      (Error
+         (Octra_core.Rpc.err
+            (-32000)
+            error
+            None))
+  | Ok snapshot ->
+    Lwt.return
+      (Status_rpc.validator_enrollment
+         ~head_epoch:snapshot.head_epoch
+         ~address:validator_address
+         ~pubkey:validator_pubkey
+         snapshot.candidate)
 
 let runtime_version ~chain_id ~validator_address ~program_trust_hash
     ~runtime_profile_hash ~validator_set_ref ~scheduled_validator_set_ref =
@@ -296,6 +367,12 @@ let validator_set_proof_params _params ctx =
     ~validator_set_ref:ctx.validator_set_ref
     ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
 
+let validator_enrollment_params _params ctx =
+  validator_enrollment
+    ~snapshot:(ctx.validator_enrollment ())
+    ~validator_address:ctx.validator_address
+    ~validator_pubkey:ctx.validator_pubkey
+
 let epoch_proof_params params ctx =
   Light_rpc.epoch_proof_params ~chain_id:ctx.chain_id ctx.chaindata params
 
@@ -330,6 +407,7 @@ let core_dispatch adapters =
   [
     "node_version", adapters.status_read node_version_params;
     "octra_runtimeVersion", adapters.status_read runtime_version_params;
+    "octra_validatorEnrollment", adapters.status_read validator_enrollment_params;
     "node_status", adapters.status_read node_status_params;
     "node_stats", adapters.status_read node_stats_params;
     "node_metrics", adapters.status_read node_metrics_params;

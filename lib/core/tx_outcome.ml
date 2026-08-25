@@ -82,7 +82,7 @@ let encode_rejection rejection =
 let assoc name fields =
   List.assoc_opt name fields
 
-let parse_rejection raw fields =
+let parse_rejection decode_tx raw fields =
   match
     assoc "position" fields,
     assoc "hash" fields,
@@ -93,7 +93,7 @@ let parse_rejection raw fields =
   | Some (`Int position), Some (`String hash), Some tx_json,
     Some (`String error_type), Some (`String reason) ->
     begin
-      match Tx_payload.decode tx_json with
+      match decode_tx tx_json with
       | Error error -> Error ("rejection_tx_invalid:" ^ error)
       | Ok tx ->
         let rejection = { position; tx; error_type; reason } in
@@ -112,14 +112,14 @@ let parse_rejection raw fields =
     end
   | _ -> Error "rejection_fields_invalid"
 
-let parse raw =
+let parse_with decode_tx raw =
   try
     match Yojson.Safe.from_string raw with
     | `Assoc fields ->
       begin
         match assoc "schema" fields with
         | Some (`String value) when value = schema ->
-          parse_rejection raw fields
+          parse_rejection decode_tx raw fields
         | _ -> Ok (Preverify raw)
       end
     | _ -> Ok (Preverify raw)
@@ -139,7 +139,7 @@ let distinct_hashes rejections =
   let hashes = List.map (fun rejection -> Transaction.hash rejection.tx) rejections in
   List.length hashes = List.length (List.sort_uniq String.compare hashes)
 
-let split raws =
+let split_with decode_tx raws =
   let rec loop seen_rejection preverify rejections = function
     | [] ->
       let rejections = List.rev rejections in
@@ -156,7 +156,7 @@ let split raws =
         }
     | raw :: rest ->
       begin
-        match parse raw with
+        match parse_with decode_tx raw with
         | Error _ as error -> error
         | Ok (Preverify _) when seen_rejection ->
           Error "preverify_after_rejection"
@@ -167,6 +167,9 @@ let split raws =
       end
   in
   loop false [] [] raws
+
+let split_admit raws =
+  split_with Tx_payload.decode_admit raws
 
 let find_position hash txs =
   let rec loop position = function
@@ -247,13 +250,19 @@ let merge ~confirmed ~rejections =
     else
       loop 0 confirmed rejections []
 
-let decode ~confirmed raws =
-  match split raws with
+let decode_with decode_tx ~confirmed raws =
+  match split_with decode_tx raws with
   | Error _ as error -> error
   | Ok partition ->
     match merge ~confirmed ~rejections:partition.rejections with
     | Error _ as error -> error
     | Ok _ -> Ok partition
+
+let decode_admit ~confirmed raws =
+  decode_with Tx_payload.decode_admit ~confirmed raws
+
+let decode_final ~confirmed raws =
+  decode_with Tx_payload.decode_final ~confirmed raws
 
 let encode preverify rejections =
   preverify @ List.map encode_rejection rejections

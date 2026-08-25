@@ -13,6 +13,7 @@ type apply =
   proposer_info:Octra_core.Epochlog.proposer_info option ->
   reward:Consensus_reward_attribution.t ->
   epoch_ts:float ->
+  validator_set:C_types.validator_set ->
   parent_commit:C_types.parent_commit option ->
   unit Lwt.t
 
@@ -42,15 +43,21 @@ type range =
   | Missing
   | Records of record list
 
+type synced = {
+  epoch : int64;
+  root : string;
+  count : int;
+}
+
 type outcome =
-  | Synced
+  | Synced of synced
   | Leader_stale of {
       local_head : int64;
       leader_head : int64;
     }
-  | Need_range of {
-      head : int64;
-      target : int64;
+  | Source_unavailable of {
+      phase : string;
+      error : string;
     }
 
 type sync_plan =
@@ -108,6 +115,7 @@ type ready_marker_config = {
 type ready_marker_write_deps = {
   write_text : path:string -> contents:string -> unit;
   rename : src:string -> dst:string -> unit;
+  sync_dir : path:string -> unit;
   log_written : ready_marker -> unit;
 }
 
@@ -190,7 +198,6 @@ type node_runtime_deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
-  require_sync : Sync_need.t -> unit;
 }
 
 type node_runtime_wiring = {
@@ -211,7 +218,6 @@ type node_runtime_wiring = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
-  require_sync : Sync_need.t -> unit;
 }
 
 let configured_base = function
@@ -225,10 +231,28 @@ let first_source = function
     |> String.split_on_char ','
     |> List.find_map (fun source -> configured_base (Some source))
 
+let source_list = function
+  | None -> []
+  | Some raw ->
+    raw
+    |> String.split_on_char ','
+    |> List.filter_map (fun source -> configured_base (Some source))
+
+let configured_sources env =
+  let sources =
+    source_list (env "OCTRA_JOIN_RPC")
+    @ source_list (env "OCTRA_STATE_SYNC_SOURCES")
+  in
+  List.fold_left
+    (fun unique source ->
+      if List.mem source unique then unique else unique @ [source])
+    []
+    sources
+
 let configured_join env =
-  match configured_base (env "OCTRA_JOIN_RPC") with
-  | Some _ as base -> base
-  | None -> first_source (env "OCTRA_STATE_SYNC_SOURCES")
+  match configured_sources env with
+  | [] -> None
+  | source :: _ -> Some source
 
 let normalize_base s =
   if String.length s > 0 && s.[String.length s - 1] = '/' then
@@ -267,20 +291,46 @@ let range_url base ~from_epoch ~max_epochs =
   in
   base ^ "/state-sync/range?" ^ query
 
+let max_http_response_bytes = 4_500_000
+
+let read_http_body body =
+  let open Lwt.Syntax in
+  let stream = Cohttp_lwt.Body.to_stream body in
+  let buffer = Buffer.create 4096 in
+  let rec read total =
+    let* chunk = Lwt_stream.get stream in
+    match chunk with
+    | None -> Lwt.return (Buffer.contents buffer)
+    | Some value ->
+      let length = String.length value in
+      if length > max_http_response_bytes - total then
+        Lwt.fail (Fetch_retry "HTTP response exceeds join limit")
+      else begin
+        Buffer.add_string buffer value;
+        read (total + length)
+      end
+  in
+  read 0
+
 let http_get_json ?(timeout = 20.0) url =
   Lwt_unix.with_timeout timeout (fun () ->
     let open Lwt.Syntax in
     let* resp, body = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
     let code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-    let* body_s = Cohttp_lwt.Body.to_string body in
-    if code = 429 || code >= 500 then
+    let* body_s = read_http_body body in
+    if code < 200 || code >= 300 then
       Lwt.fail
         (Fetch_retry
            (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s))
-    else if code < 200 || code >= 300 then
-      Lwt.fail_with (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s)
     else
-      Lwt.return (Yojson.Safe.from_string body_s))
+      try Lwt.return (Yojson.Safe.from_string body_s)
+      with exn ->
+        Lwt.fail
+          (Fetch_retry
+             (Printf.sprintf
+                "GET %s returned invalid JSON: %s"
+                url
+                (Printexc.to_string exn))))
 
 let retry_delay failures =
   let shift = min 4 (max 0 failures) in
@@ -294,11 +344,19 @@ let fetch call =
       Lwt.return (Ok json))
     (fun exn ->
       match exn with
+      | Lwt.Canceled
+      | Out_of_memory
+      | Stack_overflow
+      | Sys.Break -> Lwt.fail exn
       | Fetch_retry error -> Lwt.return (Error error)
-      | Lwt_unix.Timeout
-      | Unix.Unix_error _ ->
-        Lwt.return (Error (Printexc.to_string exn))
-      | _ -> Lwt.fail exn)
+      | _ -> Lwt.return (Error (Printexc.to_string exn)))
+
+let decode call =
+  try Ok (call ()) with
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break as exn -> raise exn
+  | exn -> Error (Printexc.to_string exn)
 
 let int64_field json name =
   let module U = Yojson.Safe.Util in
@@ -420,7 +478,7 @@ let sync_plan ~local_next ~local_root (head : head) =
     Fetch_range local_next
 
 let parse_tx tx_json =
-  match Yojson.Safe.from_string tx_json |> Octra_core.Tx_payload.decode with
+  match Yojson.Safe.from_string tx_json |> Octra_core.Tx_payload.decode_final with
   | Ok tx -> tx
   | Error e -> failwith ("join bad tx_json: " ^ e)
 
@@ -553,7 +611,11 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
       | Error error -> failwith ("join reward binding: " ^ error)
   in
   let partition =
-    match Octra_core.Tx_outcome.decode ~confirmed:txs record.receipts_json with
+    match
+      Octra_core.Tx_outcome.decode_final
+        ~confirmed:txs
+        record.receipts_json
+    with
     | Stdlib.Ok value -> value
     | Stdlib.Error e ->
       failwith
@@ -641,6 +703,7 @@ let apply_prepared (deps : apply_deps) prepared =
       ~proposer_info:prepared.proposer_info
       ~reward:prepared.reward
       ~epoch_ts:record.epoch_ts
+      ~validator_set:record.finality.validator_set
       ~parent_commit:record.finality.finalize.parent_commit
   in
   let root = deps.root () in
@@ -684,20 +747,31 @@ let run_catchup (deps : run_deps) base =
   let open Lwt.Syntax in
   let base = normalize_base base in
   deps.log_start ~base;
-  let rec retry ~phase ~records_verified ~missing ~failures error =
-    let delay = retry_delay failures in
-    deps.log_retry ~phase ~delay ~error;
-    let* () = deps.sleep delay in
-    loop ~records_verified ~missing ~failures:(failures + 1)
-  and loop ~records_verified ~missing ~failures =
+  let max_failures = 3 in
+  let unavailable ~phase ~error =
+    Lwt.return (Source_unavailable { phase; error })
+  in
+  let rec retry ~phase ~records_verified ~failures error =
+    if failures + 1 >= max_failures then
+      unavailable ~phase ~error
+    else
+      let delay = retry_delay failures in
+      deps.log_retry ~phase ~delay ~error;
+      let* () = deps.sleep delay in
+      loop ~records_verified ~failures:(failures + 1)
+  and loop ~records_verified ~failures =
     let local_next = deps.local_next () in
     let* fetched_head = fetch (fun () -> deps.fetch_head base) in
     match fetched_head with
     | Error error ->
-      retry ~phase:"head" ~records_verified ~missing ~failures error
+      retry ~phase:"head" ~records_verified ~failures error
     | Ok head_json ->
-      let head = parse_head head_json in
-      match sync_plan ~local_next ~local_root:(deps.local_root ()) head with
+      begin
+        match decode (fun () -> parse_head head_json) with
+        | Error error ->
+          retry ~phase:"head_decode" ~records_verified ~failures error
+        | Ok head ->
+          match sync_plan ~local_next ~local_root:(deps.local_root ()) head with
       | Local_ahead p ->
         Lwt.return
           (Leader_stale {
@@ -705,19 +779,27 @@ let run_catchup (deps : run_deps) base =
              leader_head = p.leader_head;
            })
       | Root_mismatch p ->
-        Lwt.fail_with
-          (Printf.sprintf
-             "join ready root mismatch local = %s leader = %s epoch = %Ld"
-             p.local_root
-             p.leader_root
-             p.epoch)
+        unavailable
+          ~phase:"head_root"
+          ~error:
+            (Printf.sprintf
+               "local = %s source = %s epoch = %Ld"
+               p.local_root
+               p.leader_root
+               p.epoch)
       | Ready p ->
-        deps.write_ready
-          ~base
-          ~ready_epoch:p.ready_epoch
-          ~state_root:p.state_root
-          ~records_verified;
-        Lwt.return Synced
+        if records_verified > 0 then
+          deps.write_ready
+            ~base
+            ~ready_epoch:p.ready_epoch
+            ~state_root:p.state_root
+            ~records_verified;
+        Lwt.return
+          (Synced {
+             epoch = p.ready_epoch;
+             root = p.state_root;
+             count = records_verified;
+           })
       | Fetch_range from_epoch ->
         let* fetched_range =
           fetch (fun () -> deps.fetch_range base ~from_epoch ~max_epochs:16)
@@ -725,37 +807,42 @@ let run_catchup (deps : run_deps) base =
         begin
           match fetched_range with
           | Error error ->
-            retry ~phase:"range" ~records_verified ~missing ~failures error
+            retry ~phase:"range" ~records_verified ~failures error
           | Ok range_json ->
-            match parse_range ~from_epoch range_json with
-            | Retry ->
-              let* () = deps.sleep 1.0 in
-              loop ~records_verified ~missing ~failures:0
-            | Missing ->
-              if missing + 1 >= 3 then
-                Lwt.return
-                  (Need_range {
-                     head = Int64.pred from_epoch;
-                     target = head.epoch;
-                   })
-              else
-                let* () = deps.sleep 1.0 in
-                loop
-                  ~records_verified
-                  ~missing:(missing + 1)
-                  ~failures:0
-            | Records records ->
-              let* _, applied =
-                deps.apply_range ~cursor:(deps.cursor ~from_epoch) records
+            match decode (fun () -> parse_range ~from_epoch range_json) with
+            | Error error ->
+              retry ~phase:"range_decode" ~records_verified ~failures error
+            | Ok Retry ->
+              retry
+                ~phase:"range_empty"
+                ~records_verified
+                ~failures
+                "source returned no records"
+            | Ok Missing ->
+              retry
+                ~phase:"range_missing"
+                ~records_verified
+                ~failures
+                "source has no signed range"
+            | Ok (Records records) ->
+              let* applied_result =
+                fetch (fun () ->
+                  deps.apply_range ~cursor:(deps.cursor ~from_epoch) records)
               in
-              deps.log_applied ~applied;
-              loop
-                ~records_verified:(records_verified + applied)
-                ~missing:0
-                ~failures:0
+              begin
+                match applied_result with
+                | Error error ->
+                  retry ~phase:"range_verify" ~records_verified ~failures error
+                | Ok (_, applied) ->
+                  deps.log_applied ~applied;
+                  loop
+                    ~records_verified:(records_verified + applied)
+                    ~failures:0
+              end
         end
+      end
   in
-  loop ~records_verified:0 ~missing:0 ~failures:0
+  loop ~records_verified:0 ~failures:0
 
 let node_cursor (deps : node_deps) ~from_epoch =
   {
@@ -813,7 +900,7 @@ let run_node_catchup (deps : node_deps) base =
   let* outcome = run_catchup run_deps base in
   begin
     match outcome with
-    | Synced ->
+    | Synced _ ->
         Octra_log.info "join"
           "RPC catchup complete local_next = %d"
           (deps.current_epoch ())
@@ -822,7 +909,11 @@ let run_node_catchup (deps : node_deps) base =
           "event = join_source_stale local_head = %Ld source_head = %Ld action = continue_unattested"
           p.local_head
           p.leader_head
-    | Need_range _ -> ()
+    | Source_unavailable p ->
+        Octra_log.warn "join"
+          "event = join_source_unavailable phase = %s error = %s action = continue_unattested"
+          p.phase
+          p.error
   end;
   Lwt.return outcome
 
@@ -875,13 +966,23 @@ let ready_marker_payload_text marker =
 let write_ready_marker_with deps marker =
   deps.write_text ~path:marker.staged_path ~contents:(ready_marker_payload_text marker);
   deps.rename ~src:marker.staged_path ~dst:marker.path;
+  deps.sync_dir ~path:marker.path;
   deps.log_written marker
 
 let write_text_file ~path ~contents =
-  let oc = open_out path in
+  let oc = open_out_bin path in
   Fun.protect
     ~finally:(fun () -> close_out_noerr oc)
-    (fun () -> output_string oc contents)
+    (fun () ->
+      output_string oc contents;
+      flush oc;
+      Unix.fsync (Unix.descr_of_out_channel oc))
+
+let sync_dir ~path =
+  let fd = Unix.openfile (Filename.dirname path) [Unix.O_RDONLY] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () -> Unix.fsync fd)
 
 let log_ready_marker marker =
   Octra_log.info "join"
@@ -915,6 +1016,7 @@ let write_ready_marker
     {
       write_text = write_text_file;
       rename = (fun ~src ~dst -> Unix.rename src dst);
+      sync_dir;
       log_written = log_ready_marker;
     }
     marker
@@ -987,34 +1089,25 @@ let node_runtime_deps (deps : node_runtime_wiring) =
     validator = deps.validator;
     validator_pubkey = deps.validator_pubkey;
     priv_b64 = deps.priv_b64;
-    require_sync = deps.require_sync;
   }
 
-let range_need ~head ~target =
-  if Int64.compare head 0L < 0
-     || Int64.compare head (Int64.of_int max_int) > 0 then
-    None
-  else
-    Sync_need.lost ~head:(Int64.to_int head) ~target
-
 let run_configured_node_catchup (deps : node_runtime_deps) =
-  match configured_join deps.env with
-  | None -> Lwt.return_unit
-  | Some base ->
-    let open Lwt.Syntax in
-    let* outcome = run_node_catchup (node_deps_of_runtime deps) base in
-    match outcome with
-    | Synced -> Lwt.return_unit
-    | Leader_stale _ -> Lwt.return_unit
-    | Need_range gap ->
-        begin
-          match range_need ~head:gap.head ~target:gap.target with
-          | Some need ->
-              deps.require_sync need;
-              Lwt.fail_with "join range recovery returned"
-          | None ->
-              Lwt.fail_with "join range recovery boundary is invalid"
-        end
+  let open Lwt.Syntax in
+  let rec run = function
+    | [] ->
+      Octra_log.warn "join"
+        "event = join_sources_unavailable action = continue_unattested";
+      Lwt.return_none
+    | base :: rest ->
+      let* outcome = run_node_catchup (node_deps_of_runtime deps) base in
+      match outcome with
+      | Synced _ as synced -> Lwt.return_some synced
+      | Leader_stale _
+      | Source_unavailable _ -> run rest
+  in
+  match configured_sources deps.env with
+  | [] -> Lwt.return_none
+  | sources -> run sources
 
 let run_configured_node_wiring deps =
   run_configured_node_catchup (node_runtime_deps deps)

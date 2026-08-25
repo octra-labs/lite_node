@@ -29,7 +29,6 @@ type deps = {
   consensus_role : string;
   recovery : bool;
   wallet : wallet;
-  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -107,7 +106,6 @@ let run deps =
         validator = deps.wallet.address;
         validator_pubkey = deps.wallet.pub;
         priv_b64 = deps.wallet.priv;
-        require_sync = deps.require_sync;
         exit_error = deps.exit_error;
         exit_success = deps.exit_success;
       });

@@ -39,11 +39,11 @@ type deps = {
   peer_snapshot : unit -> string;
   drain_pending_finalized : unit -> unit Lwt.t;
   wake_ready : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   run_catchup_to_target :
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  require_sync : Sync_need.t -> unit;
   quarantine_active : unit -> bool;
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;

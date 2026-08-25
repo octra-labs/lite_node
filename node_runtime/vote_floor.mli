@@ -37,6 +37,14 @@ val set :
   round:int ->
   (int, string) result
 
+val seed :
+  data_dir:string ->
+  chain_id:string ->
+  validator:string ->
+  pubkey:string ->
+  through_epoch:int64 ->
+  (int option, string) result
+
 val check_sync :
   data_dir:string ->
   chain_id:string ->

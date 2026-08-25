@@ -113,7 +113,7 @@ let parse_bundle json =
   in
   List.map
     (fun item ->
-       match Octra_core.Tx_payload.decode item with
+       match Octra_core.Tx_payload.decode_final item with
        | Ok tx -> tx
        | Error e -> failwith ("replay bundle tx decode: " ^ e))
     items

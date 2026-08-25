@@ -121,6 +121,23 @@ let rec first limit seq acc =
 let index_key entry =
   entry.tx.Transaction.from, entry.tx.Transaction.nonce, entry.hash
 
+let sender_entries sender =
+  let rec collect sequence entries =
+    match sequence () with
+    | Seq.Nil -> List.rev entries
+    | Seq.Cons (((entry_sender, _, _), entry), rest) ->
+      if String.equal entry_sender sender then collect rest (entry :: entries)
+      else List.rev entries
+  in
+  Index.to_seq_from (sender, min_int, "") !view_index
+  |> fun sequence -> collect sequence []
+
+let sender_has_pending sender =
+  match Index.to_seq_from (sender, min_int, "") !view_index () with
+  | Seq.Cons (((entry_sender, _, _), _), _) ->
+    String.equal entry_sender sender
+  | Seq.Nil -> false
+
 let sample limit =
   first (max 0 limit) (Index.to_seq !view_index) []
   |> List.map (fun (_, entry) -> entry.hash, entry.tx)
@@ -159,37 +176,27 @@ let evict entry =
        (public_balance_cost entry.tx))
 
 let evict_nonce_dependents sender nonce =
-  let dependents = Hashtbl.fold (fun _ e acc ->
-    if e.tx.Transaction.from = sender && e.tx.Transaction.nonce > nonce then e :: acc else acc
-  ) staging [] in
-  let sorted = List.sort (fun a b -> compare a.tx.Transaction.nonce b.tx.Transaction.nonce) dependents in
-  List.map (fun e ->
+  sender_entries sender
+  |> List.filter (fun entry -> entry.tx.Transaction.nonce > nonce)
+  |> List.map (fun e ->
     evict e;
     record_drop e.hash e.tx Evicted "nonce gap from eviction"
-  ) sorted
+  )
 
 let init_virtual_state ~lookup addr =
-  let has_pending = Hashtbl.fold (fun _ e found ->
-    found || e.tx.Transaction.from = addr) staging false in
-
-  if not (Hashtbl.mem virtual_balances addr) || not has_pending then begin
+  if not (sender_has_pending addr) then begin
     let balance, nonce = match lookup addr with
       | Some (b, n) -> (b, n)
       | None -> (Z.zero, 0)
     in
     Hashtbl.replace virtual_balances addr balance;
     Hashtbl.replace virtual_nonces addr nonce;
-
-    if has_pending then
-      Hashtbl.iter (fun _ e ->
-        if e.tx.Transaction.from = addr then begin
-          Hashtbl.replace virtual_balances addr
-            (Z.sub (Hashtbl.find virtual_balances addr) (public_balance_cost e.tx));
-          Hashtbl.replace virtual_nonces addr
-            (max (Hashtbl.find virtual_nonces addr) e.tx.Transaction.nonce)
-        end
-      ) staging
-  end
+    Ok ()
+  end else if Hashtbl.mem virtual_balances addr
+              && Hashtbl.mem virtual_nonces addr then
+    Ok ()
+  else
+    Error "staging sender state is inconsistent"
 
 let check_virtual_balance addr amount =
   match Hashtbl.find_opt virtual_balances addr with
@@ -214,7 +221,9 @@ let add_smart ~lookup tx =
   let ou = Transaction.ou_cost tx in
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let total_cost = public_balance_cost tx in
-  init_virtual_state ~lookup tx.from;
+  match init_virtual_state ~lookup tx.from with
+  | Error _ as error -> error
+  | Ok () ->
   let base_nonce = match lookup tx.from with
     | Some (_, n) -> n | None -> 0
   in
@@ -375,9 +384,7 @@ let remove_by_hash h =
 
 let clear_virtual_state touched =
   Hashtbl.iter (fun addr () ->
-    let has_pending = Hashtbl.fold (fun _ e found ->
-      found || e.tx.Transaction.from = addr) staging false in
-    if not has_pending then begin
+    if not (sender_has_pending addr) then begin
       Hashtbl.remove virtual_balances addr;
       Hashtbl.remove virtual_nonces addr
     end

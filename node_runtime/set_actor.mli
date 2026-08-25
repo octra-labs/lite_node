@@ -25,6 +25,7 @@ type stats = {
 
 type deps = {
   sample : unit -> sample;
+  peers : unit -> int;
   send : action -> (unit, string) result Lwt.t;
   warn : string -> unit;
 }
@@ -38,6 +39,7 @@ val notify :
   epoch:int64 ->
   (Octra_consensus.C_types.vote * Octra_consensus.C_types.parent_commit) option ->
   admission
+val wake : t -> head:int -> admission
 val create : deps -> t
 val stats : t -> stats Lwt.t
 val shutdown : t -> unit Lwt.t

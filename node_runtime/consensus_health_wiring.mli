@@ -94,13 +94,13 @@ type driver_probe_deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
+  require_sync : Sync_need.t -> unit;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
   fork_repair : fork_repair_runtime;
-  require_sync : Sync_need.t -> unit;
 }
 
 type node_fork_repair_runtime = {
@@ -132,13 +132,13 @@ type node_driver_probe_runtime = {
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   fork_repair : fork_repair_runtime;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  require_sync : Sync_need.t -> unit;
 }
 
 type 'driver liveness_deps = {
@@ -193,13 +193,13 @@ type node_driver_health_runtime = {
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   fork_repair : fork_repair_runtime;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  require_sync : Sync_need.t -> unit;
   liveness_state : Consensus_liveness.state ref;
   now : unit -> float;
   stall_sec : float;

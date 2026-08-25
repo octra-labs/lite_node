@@ -167,7 +167,7 @@ let record_to_json record =
   ]
 
 let parse_transaction json =
-  match Octra_core.Tx_payload.decode json with
+  match Octra_core.Tx_payload.decode_final json with
   | Ok tx -> tx
   | Error error -> failwith ("finality journal transaction: " ^ error)
 
@@ -236,6 +236,17 @@ let read_record target =
 
 let same_finalize left right =
   C_codec.encode_finalize left = C_codec.encode_finalize right
+
+let same_block left right =
+  String.equal left.C_types.chain_id right.C_types.chain_id
+  && Int64.equal left.epoch_id right.epoch_id
+  && left.commit_round = right.commit_round
+  && String.equal left.proposal_id right.proposal_id
+  && C_hash.parent_commit_hash_opt left.parent_commit
+     = C_hash.parent_commit_hash_opt right.parent_commit
+  && Finality_log.same_commitment
+       (Finality_log.of_finalize left)
+       (Finality_log.of_finalize right)
 
 let same_bundle left right =
   left.tx_hashes = right.tx_hashes
@@ -355,7 +366,7 @@ let persist_certificate base ~validator_set finalize =
   | None ->
     write_record base { finalize; validator_set; bundle = None }
   | Some prior
-    when same_finalize prior.finalize finalize
+    when same_block prior.finalize finalize
          && C_config.validator_set_hash prior.validator_set
             = C_config.validator_set_hash validator_set ->
     ()
@@ -366,7 +377,7 @@ let persist_bundle base finalize bundle =
   match read_record (path base) with
   | None ->
     failwith "finality journal bundle requires certificate"
-  | Some prior when not (same_finalize prior.finalize finalize) ->
+  | Some prior when not (same_block prior.finalize finalize) ->
     failwith "conflicting finality journal certificate"
   | Some { bundle = Some existing; _ } ->
     if not (same_bundle existing bundle) then
@@ -505,17 +516,6 @@ let committed_matches entry record =
   Finality_log.same_commitment
     entry
     (Finality_log.of_finalize record.finalize)
-
-let same_block left right =
-  String.equal left.C_types.chain_id right.C_types.chain_id
-  && Int64.equal left.epoch_id right.epoch_id
-  && left.commit_round = right.commit_round
-  && String.equal left.proposal_id right.proposal_id
-  && C_hash.parent_commit_hash_opt left.parent_commit
-     = C_hash.parent_commit_hash_opt right.parent_commit
-  && Finality_log.same_commitment
-       (Finality_log.of_finalize left)
-       (Finality_log.of_finalize right)
 
 let committed_record_path base epoch =
   let current = committed_path base in

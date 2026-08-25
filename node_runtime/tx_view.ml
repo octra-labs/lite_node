@@ -332,10 +332,10 @@ let requires_heavy_preverify tx =
   | _ -> false
 
 let decode_submit_tx tx_json =
-  try Octra_core.Tx_payload.decode tx_json with _ -> Error "invalid tx JSON"
+  try Octra_core.Tx_payload.decode_admit tx_json with _ -> Error "invalid tx JSON"
 
 let decode_submit_batch_tx tx_json =
-  try Octra_core.Tx_payload.decode tx_json with _ -> Error "invalid tx"
+  try Octra_core.Tx_payload.decode_admit tx_json with _ -> Error "invalid tx"
 
 let submit_params params =
   match Rpc.param_json params 0 with

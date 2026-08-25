@@ -27,7 +27,6 @@ type deps = {
   consensus_role : string;
   recovery : bool;
   wallet : wallet;
-  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }

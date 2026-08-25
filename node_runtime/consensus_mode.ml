@@ -34,7 +34,7 @@ let recovery _ =
   {
     role = Octra_consensus.C_role.Observer;
     label = "recovery";
-    consensus_enabled = false;
+    consensus_enabled = true;
     voting_enabled = false;
     observer_enabled = true;
   }

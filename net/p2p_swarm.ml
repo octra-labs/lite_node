@@ -41,6 +41,7 @@ type t = {
   mutable relayed_record_rejected : int;
   mutable validator_pubkeys : string list option;
   mutable on_message : (P2p_conn.t -> P2p_frame.frame -> unit Lwt.t);
+  mutable on_peer : (P2p_conn.t -> unit);
   mutable running : bool;
 }
 
@@ -73,11 +74,18 @@ let create config =
       if config.allowed_pubkeys = [] then None
       else Some config.allowed_pubkeys;
     on_message = (fun _ _ -> Lwt.return_unit);
+    on_peer = (fun _ -> ());
     running = false;
   }
 
 let set_handler t handler =
   t.on_message <- handler
+
+let set_peer_hook t hook =
+  t.on_peer <- hook
+
+let note_peer t conn =
+  try t.on_peer conn with _ -> ()
 
 let peer_count t = Hashtbl.length t.peers
 
@@ -275,10 +283,12 @@ let add_peer t (conn : P2p_conn.t) =
       end else begin
         Lwt.async (fun () -> P2p_conn.close existing);
         Hashtbl.replace t.peers peer_id conn;
+        note_peer t conn;
         true
       end
     | Some _dead ->
       Hashtbl.replace t.peers peer_id conn;
+      note_peer t conn;
       true
     | None ->
       let role = peer_role t peer_id in
@@ -290,6 +300,7 @@ let add_peer t (conn : P2p_conn.t) =
         false
       end else begin
         Hashtbl.replace t.peers peer_id conn;
+        note_peer t conn;
         true
       end
 

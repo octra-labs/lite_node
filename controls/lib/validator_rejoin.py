@@ -33,21 +33,17 @@ ROUND_LOG_LIMIT = 320
 WITNESS_BYTES = 2048
 MEET_CAP = 1024
 
-
 class MeetError(ValidatorError):
     def __init__(self, state, reason, command=None):
         super().__init__(reason)
         self.state = state
         self.command = command
 
-
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
 
-
 def resolved(value):
     return Path(value).expanduser().resolve()
-
 
 def positive_seconds(value):
     try:
@@ -58,14 +54,12 @@ def positive_seconds(value):
         raise ValidatorError("wait seconds is outside 30..3600")
     return seconds
 
-
 def configured_data(values, supplied=None):
     data_dir = resolved(supplied or values["OCTRA_DATA_DIR"])
     configured = resolved(values["OCTRA_DATA_DIR"])
     if data_dir != configured:
         raise ValidatorError("data directory does not match node configuration")
     return data_dir
-
 
 def require_root(root):
     wanted = [
@@ -78,7 +72,6 @@ def require_root(root):
         raise ValidatorError("release package is incomplete: " + ",".join(missing))
     node_binary(root)
 
-
 def node_binary(root):
     paths = [
         root / "artifacts/octra_node.exe",
@@ -89,7 +82,6 @@ def node_binary(root):
             return path
     raise ValidatorError("node binary is missing")
 
-
 def floor_binary(root):
     paths = [
         root / "artifacts/vote_floor.exe",
@@ -99,7 +91,6 @@ def floor_binary(root):
         if path.is_file():
             return path
     raise ValidatorError("vote floor tool is missing")
-
 
 def place_floor(root, values, wallet, data_dir, head_epoch, round_id, sync=None, check=False):
     command = [
@@ -123,7 +114,6 @@ def place_floor(root, values, wallet, data_dir, head_epoch, round_id, sync=None,
         command.append("--check")
     subprocess.run(command, check=True)
 
-
 def checked_floor(root, values, wallet, data_dir, head_epoch, round_id):
     marked, output = floor_mark(
         root,
@@ -137,7 +127,6 @@ def checked_floor(root, values, wallet, data_dir, head_epoch, round_id):
     if marked != round_id:
         raise ValidatorError("meet round does not exceed durable vote")
     print(output, end="")
-
 
 def staged_floor(root, values, wallet, data_dir, head_epoch, round_id):
     marked, output = floor_mark(
@@ -153,7 +142,6 @@ def staged_floor(root, values, wallet, data_dir, head_epoch, round_id):
         raise ValidatorError("meet floor is not staged")
     print(output, end="")
 
-
 def prepared_floor(root, values, wallet, data_dir, head_epoch, round_id, show=True):
     marked, output = floor_mark(
         root,
@@ -168,7 +156,6 @@ def prepared_floor(root, values, wallet, data_dir, head_epoch, round_id, show=Tr
         raise ValidatorError("meet floor is not prepared")
     if show:
         print(output, end="")
-
 
 def floor_mark(root, values, wallet, data_dir, head_epoch, round_id, flag):
     command = [
@@ -194,7 +181,6 @@ def floor_mark(root, values, wallet, data_dir, head_epoch, round_id, flag):
     if match is None:
         raise ValidatorError("vote floor check output is invalid")
     return int(match.group(1)), result.stdout
-
 
 def meet_round(snapshot, head_epoch, raw):
     epoch = round_value(snapshot, "round_epoch")
@@ -222,7 +208,6 @@ def meet_round(snapshot, head_epoch, raw):
         raise ValidatorError("meet round exceeds peer window")
     return target
 
-
 def meet_value(raw):
     if raw == "next":
         raise ValidatorError("meet start requires an explicit round")
@@ -234,13 +219,11 @@ def meet_value(raw):
         raise ValidatorError("meet round is invalid")
     return target
 
-
 def active_member(values, wallet):
     member = membership(values, wallet)
     if not member["active"]:
         raise ValidatorError("meet stage requires an active validator")
     return member
-
 
 def meet_ready(snapshot):
     local_head = snapshot.get("local_head")
@@ -254,7 +237,6 @@ def meet_ready(snapshot):
     if snapshot.get("voting") is not True:
         raise ValidatorError("meet stage requires voting enabled")
 
-
 def confirmed_node(values, data_dir, pid):
     current = online_entry(
         pm2_entries(),
@@ -266,7 +248,6 @@ def confirmed_node(values, data_dir, pid):
     if data_pids(data_dir) != [pid]:
         raise ValidatorError("data directory is used by unexpected processes")
     running_binary(pid)
-
 
 def stage_marked(root, values, wallet, data_dir, head_epoch, round_id):
     try:
@@ -283,7 +264,6 @@ def stage_marked(root, values, wallet, data_dir, head_epoch, round_id):
     except (OSError, subprocess.CalledProcessError, ValidatorError):
         return False
 
-
 def stage_error(root, config, values, wallet, data_dir, head_epoch, round_id):
     command = f"sh {root}/controls/rejoin.sh --meet-round {round_id} --meet-start --wait-seconds 600"
     if stage_marked(root, values, wallet, data_dir, head_epoch, round_id):
@@ -295,7 +275,6 @@ def stage_error(root, config, values, wallet, data_dir, head_epoch, round_id):
     except (OSError, subprocess.CalledProcessError, ValidatorError) as error:
         return MeetError("stopped", "meet stage restart failed: " + str(error), command)
     return MeetError("restored", "meet stage failed and node restarted", command)
-
 
 def meet_stage(root, config, values, wallet, data_dir, head_epoch, pid, round_id):
     confirmed_node(values, data_dir, pid)
@@ -330,7 +309,6 @@ def meet_stage(root, config, values, wallet, data_dir, head_epoch, pid, round_id
             ) from error
         raise
 
-
 def meet_start(root, config, values, wallet, data_dir, head_epoch, round_id):
     if data_pids(data_dir):
         raise ValidatorError("node process must be stopped before meet start")
@@ -347,7 +325,6 @@ def meet_start(root, config, values, wallet, data_dir, head_epoch, round_id):
             state = "stopped"
             command = f"sh {root}/controls/rejoin.sh --meet-round {round_id} --meet-start --wait-seconds 600"
         raise MeetError(state, "meet start failed: " + str(error), command) from error
-
 
 def data_pids(data_dir):
     root = Path("/proc")
@@ -366,7 +343,6 @@ def data_pids(data_dir):
             found.append(int(entry.name))
     return sorted(found)
 
-
 def node_paused(pid):
     try:
         lines = (Path("/proc") / str(pid) / "status").read_text(
@@ -375,7 +351,6 @@ def node_paused(pid):
     except OSError as error:
         raise ValidatorError("cannot inspect paused node") from error
     return any(line.startswith("State:") and "\tT" in line for line in lines)
-
 
 def pause_node(pid):
     try:
@@ -390,7 +365,6 @@ def pause_node(pid):
     resume_node(pid)
     raise ValidatorError("validator node did not pause")
 
-
 def resume_node(pid):
     try:
         os.kill(pid, signal.SIGCONT)
@@ -398,7 +372,6 @@ def resume_node(pid):
         return
     except OSError as error:
         raise ValidatorError("cannot resume validator node") from error
-
 
 def online_entry(entries, name, data_dir):
     matched = [
@@ -417,7 +390,6 @@ def online_entry(entries, name, data_dir):
         raise ValidatorError("node process has no valid pid")
     return pid
 
-
 def running_binary(pid):
     path = Path("/proc") / str(pid) / "exe"
     try:
@@ -431,7 +403,6 @@ def running_binary(pid):
         raise ValidatorError("running process is not an octra node")
     return actual
 
-
 def number(payload, key):
     try:
         value = int(payload[key])
@@ -440,7 +411,6 @@ def number(payload, key):
     if value < 0:
         raise ValidatorError("node status has negative " + key)
     return value
-
 
 def peer_head(payload):
     if not isinstance(payload, dict):
@@ -460,7 +430,6 @@ def peer_head(payload):
             heads.append(head)
     return max(heads) if heads else None
 
-
 def round_value(row, key):
     if not isinstance(row, dict):
         return None
@@ -469,7 +438,6 @@ def round_value(row, key):
     except (KeyError, TypeError, ValueError):
         return None
     return value if value >= 0 else None
-
 
 def round_alignment(payload):
     if not isinstance(payload, dict):
@@ -546,7 +514,6 @@ def round_alignment(payload):
         "round_agreed": True,
     }
 
-
 def sync_state(local_head, remote_head, round_status):
     if remote_head is None:
         return "waiting_peers"
@@ -555,7 +522,6 @@ def sync_state(local_head, remote_head, round_status):
     if round_status["state"] in {"round_lagging", "waiting_round"}:
         return round_status["state"]
     return "synced"
-
 
 def vote_state(payload):
     if not isinstance(payload, dict):
@@ -566,7 +532,6 @@ def vote_state(payload):
         return None, None
     return voting, reason if isinstance(reason, str) else None
 
-
 def launch(root, config):
     env = os.environ.copy()
     env["OCTRA_OPERATOR_CONFIG"] = str(config)
@@ -576,7 +541,6 @@ def launch(root, config):
         env=env,
         check=True,
     )
-
 
 def stop(root, config):
     subprocess.run(
@@ -589,7 +553,6 @@ def stop(root, config):
         cwd=root,
         check=True,
     )
-
 
 def snapshot(values, data_dir):
     pid = online_entry(
@@ -647,11 +610,9 @@ def snapshot(values, data_dir):
         "state": "synced",
     }
 
-
 def report_wait(snapshot):
     fields = {"event": "rejoin_wait", **snapshot}
     emit(**fields)
-
 
 def report_ready(values, wallet, snapshot):
     try:
@@ -706,7 +667,6 @@ def report_ready(values, wallet, snapshot):
     emit(status="online_not_active", **common)
     return 2
 
-
 def report_meet(values, wallet, snapshot, staged_epoch, round_id):
     local_head = snapshot.get("local_head")
     if not isinstance(local_head, int) or local_head <= staged_epoch:
@@ -726,7 +686,6 @@ def report_meet(values, wallet, snapshot, staged_epoch, round_id):
     )
     return 0
 
-
 def captured_round(snapshot, head_epoch):
     epoch = snapshot.get("round_epoch")
     round_id = snapshot.get("round")
@@ -735,7 +694,6 @@ def captured_round(snapshot, head_epoch):
     if epoch != head_epoch + 1:
         raise ValidatorError("running node round does not match finalized head")
     return round_id + 1
-
 
 def log_round(name, epoch):
     result = subprocess.run(
@@ -760,7 +718,6 @@ def log_round(name, epoch):
     if not rounds:
         raise ValidatorError("validator round is unavailable in local log")
     return max(rounds)
-
 
 def rpc_call(url, method, params):
     body = json.dumps({
@@ -789,7 +746,6 @@ def rpc_call(url, method, params):
         raise ValidatorError("signed round witness is unavailable")
     return result
 
-
 def signed_round(values, wallet):
     try:
         url = values["OCTRA_OPERATOR_RPC_URL"]
@@ -801,7 +757,6 @@ def signed_round(values, wallet):
         raise ValidatorError("signed round witness is invalid")
     return wire
 
-
 def floor_source(snapshot, values, wallet, head_epoch, legacy):
     try:
         return captured_round(snapshot, head_epoch), None
@@ -811,7 +766,6 @@ def floor_source(snapshot, values, wallet, head_epoch, legacy):
         if not legacy:
             raise ValidatorError("legacy handoff requires --legacy-handoff") from error
         return None, signed_round(values, wallet)
-
 
 def legacy_handoff(root, config, values, wallet, data_dir, head_epoch, pid, sync):
     pause_node(pid)
@@ -837,7 +791,6 @@ def legacy_handoff(root, config, values, wallet, data_dir, head_epoch, pid, sync
     except BaseException:
         resume_node(pid)
         raise
-
 
 def rejoin(
     root,
@@ -1129,7 +1082,6 @@ def rejoin(
             return 2
         time.sleep(2.0)
 
-
 def main():
     parser = argparse.ArgumentParser(prog="rejoin.sh")
     parser.add_argument("--root", required=True)
@@ -1161,7 +1113,6 @@ def main():
         args.meet_stage,
         args.meet_start,
     )
-
 
 if __name__ == "__main__":
     try:

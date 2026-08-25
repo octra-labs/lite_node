@@ -10,7 +10,9 @@ import stat
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from urllib.request import Request
 from urllib.request import urlopen
 
@@ -20,7 +22,9 @@ from validator_common import load_network
 from validator_common import load_wallet
 from validator_common import parse_env
 from validator_common import sha256_file
+from validator_common import state_ready
 from validator_common import state_sync_sources
+from validator_common import validate_checkpoint
 from validator_enroll import membership
 from validator_process import entry_data
 from validator_process import process_alive
@@ -30,6 +34,9 @@ from validator_recover import recover
 from validator_rejoin import place_floor
 from validator_status import rpc_method
 from validator_status import rpc_status
+from sync_need import Need
+from sync_need import choose as choose_need
+from sync_need import make
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 ACTIVE = frozenset({"launching", "online", "stopping"})
@@ -41,6 +48,20 @@ SYNC_HEADERS = {
     "Accept": "application/json",
     "User-Agent": "octra-upgrade/1",
 }
+
+@dataclass(frozen=True)
+class DiskState:
+    epoch: int
+    root: str
+    txid: int
+    address: str
+    pubkey: str
+    need: Optional[Need]
+
+@dataclass(frozen=True)
+class Resume:
+    allowed: bool
+    reason: str
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()), flush=True)
@@ -492,8 +513,8 @@ def sync_wait(values, need, wait, interval):
         tip = sync_head(values)
         head = tip["head"] if tip is not None else None
         snapshot = tip["snapshot"] if tip is not None else None
-        required = need["epoch"]
-        target = need.get("target")
+        required = need.epoch
+        target = need.target
         if isinstance(target, int):
             required = max(required, target - sync_limit(values))
         if head is not None:
@@ -533,14 +554,7 @@ def sync_plan(values, state, target):
         or target - head <= sync_limit(values)
     ):
         return None
-    return {
-        "schema": "octra_sync_need_v1",
-        "chain_id": values["OCTRA_CHAIN_ID"],
-        "cause": "range",
-        "epoch": head + 1,
-        "head": head,
-        "target": target,
-    }
+    return make(values["OCTRA_CHAIN_ID"], "range", head + 1, head, target)
 
 def view(values, pid, release):
     status = rpc_status(values["OCTRA_API_PORT"])
@@ -698,6 +712,86 @@ def start(root, sup, config, use_sudo):
     else:
         call(unit_command(sup, "start", use_sudo))
 
+def disk_state(values, config):
+    data = Path(values["OCTRA_DATA_DIR"])
+    if not state_ready(data):
+        raise ValidatorError("restart state is incomplete")
+    head = validate_checkpoint(data, values, allow_progress=True)
+    identity = load_wallet(Path(config).parent / "wallet.json")
+    wallet = load_wallet(data / "wallet.json")
+    if wallet != identity:
+        raise ValidatorError("restart state identity differs")
+    need = read_need(data, values["OCTRA_CHAIN_ID"])
+    return DiskState(
+        head["epoch"],
+        head["state_root"],
+        head["txid_hi"],
+        wallet["address"],
+        wallet["pub"],
+        need,
+    )
+
+def resume_plan(before, after):
+    if before.epoch != after.epoch:
+        return Resume(False, "head_changed")
+    if before.root != after.root:
+        return Resume(False, "root_changed")
+    if before.txid != after.txid:
+        return Resume(False, "txid_changed")
+    if before.address != after.address or before.pubkey != after.pubkey:
+        return Resume(False, "identity_changed")
+    if before.need != after.need:
+        return Resume(False, "marker_changed")
+    return Resume(True, "state_unchanged")
+
+def restore_cycle(root, sup, values, args, before, plan, min_epoch):
+    try:
+        restored = restore_plan(
+            values,
+            sup["config"],
+            plan,
+            min_epoch=min_epoch,
+        )
+    except Exception as error:
+        emit(event="restore_restart", status="check", detail=str(error))
+        try:
+            after = disk_state(values, sup["config"])
+        except Exception as state_error:
+            emit(
+                event="restore_restart",
+                status="held",
+                reason="state_invalid",
+                action="remain_stopped",
+            )
+            raise error from state_error
+        decision = resume_plan(before, after)
+        if not decision.allowed:
+            emit(
+                event="restore_restart",
+                status="held",
+                reason=decision.reason,
+                action="remain_stopped",
+            )
+            raise
+        try:
+            start(root, sup, sup["config"], args.sudo)
+        except Exception as start_error:
+            emit(
+                event="restore_restart",
+                status="held",
+                reason="start_failed",
+                action="operator_start",
+            )
+            raise error from start_error
+        emit(
+            event="restore_restart",
+            status="started",
+            reason=decision.reason,
+        )
+        raise
+    start(root, sup, sup["config"], args.sudo)
+    return restored
+
 def preflight(root, sup, values, use_sudo):
     owners = data_pids(values["OCTRA_DATA_DIR"])
     if owners and owners != ([sup["pid"]] if sup["pid"] else []):
@@ -770,7 +864,11 @@ def release_sync_values(root, values, release):
         release["network_sha256"],
     )
     selected = dict(values)
-    for key in ("OCTRA_STATE_SYNC_SOURCES", "OCTRA_CATCHUP_MAX_LAG"):
+    for key in (
+        "OCTRA_STATE_SYNC_SOURCES",
+        "OCTRA_JOIN_RPC",
+        "OCTRA_CATCHUP_MAX_LAG",
+    ):
         if key in network:
             selected[key] = network[key]
     return selected
@@ -821,7 +919,7 @@ def diagnose(root, sup, values, release):
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
     tip = sync_head(values)
     planned = sync_plan(values, state, sync_target(state, tip))
-    need = marked or planned
+    need = choose_need(marked, planned, values["OCTRA_CHAIN_ID"])
     upgrade = (
         git["repo_head"] != release["public_commit"]
         or state.get("source_match") is not True
@@ -854,9 +952,9 @@ def diagnose(root, sup, values, release):
         emit(
             event="sync_recovery",
             status="required",
-            cause=need["cause"],
-            epoch=need["epoch"],
-            head=need["head"],
+            cause=need.cause,
+            epoch=need.epoch,
+            head=need.head,
             action="apply",
         )
         emit(status="hold", reason="signed_snapshot_required", action="apply_upgrade")
@@ -872,7 +970,7 @@ def restore_need(values, config):
 
 def restore_plan(values, config, plan, min_epoch=None):
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
-    need = marked or plan
+    need = choose_need(marked, plan, values["OCTRA_CHAIN_ID"])
     if need is None:
         return None
     if min_epoch is None:
@@ -895,7 +993,7 @@ def apply(root, sup, values, args, release):
     tip = sync_head(sync_values)
     plan = sync_plan(sync_values, state, sync_target(state, tip))
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
-    need = marked or plan
+    need = choose_need(marked, plan, values["OCTRA_CHAIN_ID"])
     fresh = (
         sync_wait(sync_values, need, args.wait_seconds, args.interval)
         if need is not None
@@ -940,21 +1038,24 @@ def apply(root, sup, values, args, release):
             emit(fault=fault[0], path=fault[1], action="do_not_delete")
         raise ValidatorError("pending WAL is unreadable; node was not stopped")
     stop(sup, args.sudo)
-    restored = restore_plan(
+    before = disk_state(values, sup["config"])
+    restored = restore_cycle(
+        root,
+        sup,
         values,
-        sup["config"],
+        args,
+        before,
         plan,
-        min_epoch=fresh["required"] if fresh is not None else None,
+        fresh["required"] if fresh is not None else None,
     )
     if restored is not None:
         emit(
             event="sync_recovery",
             status="restored",
-            cause=restored["cause"],
-            head=restored["head"],
-            target=restored["target"] or "none",
+            cause=restored.cause,
+            head=restored.head,
+            target=restored.target or "none",
         )
-    start(root, sup, sup["config"], args.sudo)
     deadline = time.monotonic() + args.wait_seconds
     marker = None
     floor_restored = False

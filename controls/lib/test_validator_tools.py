@@ -16,6 +16,8 @@ from unittest import mock
 
 from nacl.signing import SigningKey
 
+from sync_need import make as make_need
+
 from validator_common import ValidatorError
 from validator_common import address_from_pubkey
 from validator_common import ensure_wallet
@@ -56,11 +58,19 @@ from validator_config import validate_advertise
 from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
 from validator_enroll import exact_member
+from validator_enroll import committed_enrollment
+from validator_enroll import Enrollment
+from validator_enroll import EnrollmentState
+from validator_enroll import join_step
+from validator_enroll import JoinStep
+from validator_enroll import membership
 from validator_enroll import next_nonce
 from validator_enroll import require_admission_active
 from validator_enroll import resume_join_transaction
 from validator_enroll import set_validator_mode
+from validator_enroll import submit_bond
 from validator_enroll import wait_active_commit
+from validator_enroll import wait_scheduled
 from validator_guard import require_hashed_file
 from validator_process import process_plan
 from validator_process import process_pids
@@ -492,14 +502,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIsNone(sync_plan(values, state, 5100))
         self.assertEqual(
             sync_plan(values, state, 5101),
-            {
-                "schema": "octra_sync_need_v1",
-                "chain_id": "octra-devnet-9871-cluster",
-                "cause": "range",
-                "epoch": 101,
-                "head": 100,
-                "target": 5101,
-            },
+            make_need("octra-devnet-9871-cluster", "range", 101, 100, 5101),
         )
         self.assertIsNone(sync_plan(values, {**state, "rpc": "unavailable"}, 5101))
 
@@ -617,7 +620,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_upgrade_waits_for_snapshot_boundary(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example"}
-        need = {"epoch": 101}
+        need = make_need("octra-test", "root", 101, 100, None)
         with mock.patch.object(
             upgrade_tool,
             "sync_head",
@@ -633,7 +636,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_upgrade_distinguishes_unavailable_snapshot_metadata(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
-        need = {"epoch": 101}
+        need = make_need("octra-test", "root", 101, 100, None)
         with mock.patch.object(
             upgrade_tool, "sync_head", return_value=None
         ), mock.patch.object(
@@ -644,7 +647,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_upgrade_reports_snapshot_below_boundary(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
-        need = {"epoch": 101}
+        need = make_need("octra-test", "root", 101, 100, None)
         with mock.patch.object(
             upgrade_tool,
             "sync_head",
@@ -660,7 +663,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_CATCHUP_MAX_LAG": "5000",
             "OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example",
         }
-        need = {"epoch": 1337042, "target": 1344077}
+        need = make_need("octra-test", "range", 1337042, 1337041, 1344077)
         with mock.patch.object(
             upgrade_tool,
             "sync_head",
@@ -936,6 +939,7 @@ class ValidatorToolsTest(unittest.TestCase):
     def test_upgrade_uses_signed_snapshot_sources(self):
         network = network_values()
         network["OCTRA_STATE_SYNC_SOURCES"] = "https://fresh.example"
+        network["OCTRA_JOIN_RPC"] = "https://join-a.example,https://join-b.example"
         network["OCTRA_CATCHUP_MAX_LAG"] = "7000"
         bundle = WORK / "config/network.env"
         bundle.parent.mkdir()
@@ -947,6 +951,7 @@ class ValidatorToolsTest(unittest.TestCase):
         local = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_STATE_SYNC_SOURCES": "https://stale.example",
+            "OCTRA_JOIN_RPC": "https://join-stale.example",
             "OCTRA_CATCHUP_MAX_LAG": "5000",
         }
 
@@ -955,6 +960,10 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(
             selected["OCTRA_STATE_SYNC_SOURCES"],
             "https://fresh.example",
+        )
+        self.assertEqual(
+            selected["OCTRA_JOIN_RPC"],
+            "https://join-a.example,https://join-b.example",
         )
         self.assertEqual(selected["OCTRA_CATCHUP_MAX_LAG"], "7000")
         self.assertEqual(selected["OCTRA_DATA_DIR"], str(WORK / "data"))
@@ -983,7 +992,7 @@ class ValidatorToolsTest(unittest.TestCase):
             wait_seconds=1.0,
             interval=0.01,
         )
-        need = {"cause": "root", "epoch": 100, "head": 99, "target": None}
+        need = make_need("octra-devnet-9871-cluster", "root", 100, 99, None)
 
         def update(*_):
             events.append("git")
@@ -1102,6 +1111,12 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool, "stop", side_effect=lambda *_: events.append("stop")
         ) as stop_node, mock.patch.object(
+            upgrade_tool,
+            "disk_state",
+            return_value=upgrade_tool.DiskState(
+                100, "root", 5, "address", "pubkey", None
+            ),
+        ), mock.patch.object(
             upgrade_tool,
             "restore_plan",
             side_effect=lambda *_, **__: events.append("recover"),
@@ -1250,7 +1265,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
         }
-        need = {"cause": "root", "epoch": 100, "head": 99, "target": None}
+        need = make_need("octra-devnet-9871-cluster", "root", 100, 99, None)
         with mock.patch.object(upgrade_tool, "read_need", return_value=need), mock.patch.object(
             upgrade_tool, "recover"
         ) as run:
@@ -1268,6 +1283,72 @@ class ValidatorToolsTest(unittest.TestCase):
         ) as run:
             self.assertIsNone(restore_need(values, config))
         run.assert_not_called()
+
+    def test_restore_plan_refuses_wire_dict_plan(self):
+        config = WORK / "node.env"
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        plan = {"cause": "root", "epoch": 100, "head": 99, "target": None}
+        with mock.patch.object(
+            upgrade_tool, "read_need", return_value=None
+        ), mock.patch.object(upgrade_tool, "recover") as run:
+            with self.assertRaisesRegex(ValidatorError, "recovery plan type is invalid"):
+                upgrade_tool.restore_plan(values, config, plan)
+        run.assert_not_called()
+
+    def test_restore_cycle_starts_once_when_state_returns(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        supervisor = {"config": WORK / "node.env"}
+        args = mock.Mock(sudo=False)
+        before = upgrade_tool.DiskState(100, "3" * 64, 500, "address", "pubkey", None)
+        failure = ValidatorError("restore refused")
+        with mock.patch.object(
+            upgrade_tool, "restore_plan", side_effect=failure
+        ), mock.patch.object(
+            upgrade_tool, "disk_state", return_value=before
+        ), mock.patch.object(upgrade_tool, "start") as start_node:
+            with self.assertRaises(ValidatorError) as caught:
+                upgrade_tool.restore_cycle(
+                    WORK, supervisor, values, args, before, None, None
+                )
+        self.assertIs(caught.exception, failure)
+        start_node.assert_called_once()
+
+    def test_restore_cycle_holds_when_state_differs(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+        }
+        supervisor = {"config": WORK / "node.env"}
+        args = mock.Mock(sudo=False)
+        marker = make_need("octra-devnet-9871-cluster", "root", 100, 99, None)
+        before = upgrade_tool.DiskState(100, "3" * 64, 500, "address", "pubkey", None)
+        drifted = [
+            upgrade_tool.DiskState(101, "3" * 64, 500, "address", "pubkey", None),
+            upgrade_tool.DiskState(100, "4" * 64, 500, "address", "pubkey", None),
+            upgrade_tool.DiskState(100, "3" * 64, 501, "address", "pubkey", None),
+            upgrade_tool.DiskState(100, "3" * 64, 500, "other", "pubkey", None),
+            upgrade_tool.DiskState(100, "3" * 64, 500, "address", "other", None),
+            upgrade_tool.DiskState(100, "3" * 64, 500, "address", "pubkey", marker),
+        ]
+        for after in drifted:
+            failure = ValidatorError("restore refused")
+            with mock.patch.object(
+                upgrade_tool, "restore_plan", side_effect=failure
+            ), mock.patch.object(
+                upgrade_tool, "disk_state", return_value=after
+            ), mock.patch.object(upgrade_tool, "start") as start_node:
+                with self.assertRaises(ValidatorError) as caught:
+                    upgrade_tool.restore_cycle(
+                        WORK, supervisor, values, args, before, None, None
+                    )
+            self.assertIs(caught.exception, failure)
+            start_node.assert_not_called()
 
     def test_validator_reports_resources(self):
         usage = mock.Mock(
@@ -2500,6 +2581,17 @@ class ValidatorToolsTest(unittest.TestCase):
             "https://seed-a.example",
         )
 
+    def test_network_validates_join_sources(self):
+        values = network_values()
+        values["OCTRA_JOIN_RPC"] = "https://join-a.example,https://join-b.example"
+        self.assertEqual(
+            validate_network(values, WORK)["OCTRA_JOIN_RPC"],
+            "https://join-a.example,https://join-b.example",
+        )
+        values["OCTRA_JOIN_RPC"] = "http://203.0.113.1:8080"
+        with self.assertRaises(ValidatorError):
+            validate_network(values, WORK)
+
     def test_advertise_uses_consensus_port(self):
         self.assertEqual(
             validate_advertise("203.0.113.1:19000", 19000),
@@ -2529,6 +2621,114 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(exact_member([], wallet))
         with self.assertRaises(ValidatorError):
             exact_member([{"address": address, "pubkey": identity()[1]}], wallet)
+
+    def test_membership_reports_only_own_activation_epoch(self):
+        address, pubkey = identity()
+        wallet = {"address": address, "pub": pubkey}
+        values = {"OCTRA_API_PORT": "8080", "OCTRA_CHAIN_ID": "octra-test"}
+        proof = {
+            "chain_id": "octra-test",
+            "validators": [],
+            "scheduled": {
+                "activate_epoch": "1372752",
+                "validators": [],
+            },
+            "validator_set_hash": "a" * 64,
+        }
+        with mock.patch("validator_enroll.call", return_value=proof):
+            state = membership(values, wallet)
+        self.assertFalse(state["scheduled"])
+        self.assertIsNone(state["activate_epoch"])
+        self.assertEqual(state["next_set_epoch"], 1372752)
+        proof["scheduled"]["validators"] = [
+            {"address": address, "pubkey": pubkey},
+        ]
+        with mock.patch("validator_enroll.call", return_value=proof):
+            state = membership(values, wallet)
+        self.assertTrue(state["scheduled"])
+        self.assertEqual(state["activate_epoch"], 1372752)
+
+    def test_committed_enrollment_requires_exact_identity(self):
+        address, pubkey = identity()
+        wallet = {"address": address, "pub": pubkey}
+        values = {"OCTRA_API_PORT": "8080"}
+        payload = {
+            "head_epoch": 1372752,
+            "address": address,
+            "consensus_pubkey": pubkey,
+            "identity": "self_reported",
+            "state": "ready",
+            "bond": "1000000",
+            "bonded_epoch": "1300000",
+            "ready_epoch": "1300064",
+            "exit_epoch": None,
+        }
+        node = {"head_epoch": 1372752, "state_root": "a" * 64}
+        with mock.patch(
+            "validator_enroll.call",
+            side_effect=[payload, node],
+        ):
+            enrollment = committed_enrollment(values, wallet)
+        self.assertEqual(enrollment.state, EnrollmentState.READY)
+        self.assertEqual(enrollment.bond, 1000000)
+        with mock.patch(
+            "validator_enroll.call",
+            return_value={**payload, "consensus_pubkey": identity()[1]},
+        ):
+            with self.assertRaises(ValidatorError):
+                committed_enrollment(values, wallet)
+        with mock.patch(
+            "validator_enroll.call",
+            side_effect=[payload, {**node, "head_epoch": 1372753}],
+        ):
+            with self.assertRaises(ValidatorError):
+                committed_enrollment(values, wallet)
+        with mock.patch(
+            "validator_enroll.call",
+            return_value={**payload, "ready_epoch": 1300064.5},
+        ):
+            with self.assertRaises(ValidatorError):
+                committed_enrollment(values, wallet)
+
+    def test_join_step_uses_committed_enrollment(self):
+        member = {"active": False, "scheduled": False}
+        absent = Enrollment(EnrollmentState.ABSENT, 9, None, None, None, None)
+        bonded = Enrollment(EnrollmentState.BONDED, 9, 1000000, 1, None, None)
+        ready = Enrollment(EnrollmentState.READY, 9, 1000000, 1, 8, None)
+        exiting = Enrollment(EnrollmentState.EXITING, 9, 1000000, 1, 8, 9)
+        self.assertEqual(join_step(member, absent), JoinStep.SUBMIT_BOND)
+        self.assertEqual(join_step(member, bonded), JoinStep.SUBMIT_READY)
+        self.assertEqual(join_step(member, ready), JoinStep.WAIT_SELECTION)
+        self.assertEqual(join_step(member, exiting), JoinStep.REFUSE)
+        self.assertEqual(
+            join_step({"active": True, "scheduled": False}, exiting),
+            JoinStep.ACTIVATE,
+        )
+
+    def test_existing_committed_bond_blocks_duplicate(self):
+        enrollment = Enrollment(
+            EnrollmentState.BONDED,
+            9,
+            1000000,
+            1,
+            None,
+            None,
+        )
+        args = mock.Mock()
+        with mock.patch(
+            "validator_enroll.committed_enrollment",
+            return_value=enrollment,
+        ), mock.patch("validator_enroll.control_result") as control:
+            with self.assertRaises(ValidatorError):
+                submit_bond(
+                    WORK / "node.env",
+                    {},
+                    {},
+                    WORK / "wallet.json",
+                    1000000,
+                    args,
+                )
+        control.assert_not_called()
 
     def test_enrollment_nonce_comes_from_local_observer(self):
         wallet = {"address": identity()[0]}
@@ -2602,6 +2802,26 @@ class ValidatorToolsTest(unittest.TestCase):
             )
         pause.assert_not_called()
 
+    def test_selection_timeout_remains_pending(self):
+        values = {"OCTRA_API_PORT": "8080"}
+        wallet = {"address": identity()[0], "pub": identity()[1]}
+        state = {
+            "active": False,
+            "scheduled": False,
+            "activate_epoch": None,
+            "next_set_epoch": 128,
+        }
+        args = mock.Mock(wait_seconds=1, poll_seconds=0.1)
+        with mock.patch(
+            "validator_enroll.membership",
+            return_value=state,
+        ), mock.patch(
+            "validator_enroll.time.monotonic",
+            side_effect=[0.0, 0.0, 1.0],
+        ), mock.patch("validator_enroll.time.sleep") as pause:
+            self.assertIsNone(wait_scheduled(values, wallet, args))
+        pause.assert_called_once_with(0.1)
+
     def test_join_resumes_confirmed_transaction(self):
         config = WORK / "node.env"
         config.write_text("", encoding="utf-8")
@@ -2630,6 +2850,35 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(
             resume_join_transaction(config, values, "ready", args)
         )
+
+    def test_missing_ready_transaction_can_be_resubmitted(self):
+        config = WORK / "node.env"
+        config.write_text("", encoding="utf-8")
+        state = {
+            "version": "octra-validator-enrollment",
+            "transactions": {
+                "ready": {
+                    "tx_hash": "b" * 64,
+                    "submitted_at": 1,
+                },
+            },
+        }
+        (WORK / "enrollment.json").write_text(
+            json.dumps(state),
+            encoding="utf-8",
+        )
+        values = {"OCTRA_API_PORT": "8080"}
+        args = mock.Mock(no_wait=False, wait_seconds=1, poll_seconds=0.1)
+        with mock.patch("validator_enroll.transaction", return_value=None):
+            self.assertFalse(
+                resume_join_transaction(
+                    config,
+                    values,
+                    "ready",
+                    args,
+                    missing_ok=True,
+                )
+            )
 
     def test_operator_pm2_name(self):
         self.assertEqual(operator_pm2_name("val01"), "octra-val01")
@@ -3102,15 +3351,41 @@ class ValidatorToolsTest(unittest.TestCase):
             recover(config)
         inspect.assert_not_called()
 
+    def test_recovery_starts_observer_for_journal_marker(self):
+        data = WORK / "data"
+        (data / "irmin_store").mkdir(parents=True)
+        (data / "chaindata").mkdir()
+        (data / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        marker = write_need(data, "octra-devnet-bft-v1", cause="journal")
+        config = WORK / "node.env"
+        write_env(config, {
+            "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
+            "OCTRA_CHECKPOINT_EPOCH": "99",
+            "OCTRA_CHECKPOINT_STATE_ROOT": "3" * 64,
+            "OCTRA_CHECKPOINT_TXID_HI": "500",
+            "OCTRA_DATA_DIR": str(data),
+        })
+        with mock.patch("validator_recover.pm2_entries") as inspect, mock.patch(
+            "validator_recover.emit"
+        ) as emitted:
+            recover(config)
+        inspect.assert_not_called()
+        self.assertTrue(marker.is_file())
+        reported = emitted.call_args.kwargs
+        self.assertEqual(reported["status"], "verify")
+        self.assertEqual(reported["cause"], "journal")
+        self.assertEqual(reported["action"], "start_observer")
+
     def test_recovery_marker_is_chain_bound(self):
         data = WORK / "data"
         marker = write_need(data, "octra-devnet-bft-v1")
-        self.assertEqual(read_need(data, "octra-devnet-bft-v1"), {
-            "cause": "root",
-            "epoch": 100,
-            "head": 99,
-            "target": None,
-        })
+        self.assertEqual(
+            read_need(data, "octra-devnet-bft-v1"),
+            make_need("octra-devnet-bft-v1", "root", 100, 99, None),
+        )
         with self.assertRaisesRegex(ValidatorError, "binding differs"):
             read_need(data, "other-chain")
         marker.unlink()
@@ -3129,6 +3404,18 @@ class ValidatorToolsTest(unittest.TestCase):
             "extra": True,
         }
         with self.assertRaisesRegex(ValidatorError, "fields are invalid"):
+            need_of(value, "octra-devnet-bft-v1")
+
+    def test_recovery_marker_cause_type_is_checked(self):
+        value = {
+            "schema": "octra_sync_need_v1",
+            "chain_id": "octra-devnet-bft-v1",
+            "cause": [],
+            "epoch": 100,
+            "head": 99,
+            "target": None,
+        }
+        with self.assertRaisesRegex(ValidatorError, "cause is invalid"):
             need_of(value, "octra-devnet-bft-v1")
 
     def test_recovery_refuses_systemd_data_owner(self):

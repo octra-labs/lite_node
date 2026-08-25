@@ -248,7 +248,7 @@ let hex_to_raw32 hh =
   else raw ^ String.make (32 - String.length raw) '\x00'
 
 let check_outcome ~epoch_id receipts txs =
-  match Octra_core.Tx_outcome.decode ~confirmed:txs receipts with
+  match Octra_core.Tx_outcome.decode_final ~confirmed:txs receipts with
   | Error error -> Error ("outcome:" ^ error)
   | Ok partition ->
     Octra_core.Preverify_receipt_policy.check
@@ -265,7 +265,7 @@ let decode_range_txs txs_json =
         try
           match
             Yojson.Safe.from_string tx_json
-            |> Octra_core.Tx_payload.decode
+            |> Octra_core.Tx_payload.decode_final
           with
           | Ok tx -> Ok (tx :: txs)
           | Error error -> Error error

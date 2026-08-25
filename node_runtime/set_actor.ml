@@ -28,6 +28,7 @@ type stats = {
 
 type deps = {
   sample : unit -> sample;
+  peers : unit -> int;
   send : action -> (unit, string) result Lwt.t;
   warn : string -> unit;
 }
@@ -214,6 +215,9 @@ let handle_notice t notice =
   let sample = t.deps.sample () in
   match decide sample t.state with
   | None -> Lwt.return_unit
+  | Some _ when t.deps.peers () <= 0 ->
+    t.deps.warn "validator set fold transport has no peers";
+    Lwt.return_unit
   | Some (key, action) ->
     let* result = t.deps.send action in
     begin
@@ -287,6 +291,9 @@ let notify t ~epoch event =
     Queue.push (make_command t (Notice { epoch; proof })) t.stream;
     Lwt_condition.signal t.ready ();
     Accepted
+
+let wake t ~head =
+  notify t ~epoch:(Int64.succ (Int64.of_int head)) None
 
 let create deps =
   let t = {

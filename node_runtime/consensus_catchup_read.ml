@@ -35,7 +35,10 @@ let parse_txs txs_json =
        | Error _ -> acc
        | Ok txs ->
          try
-           match Yojson.Safe.from_string tx_json |> Octra_core.Tx_payload.decode with
+           match
+             Yojson.Safe.from_string tx_json
+             |> Octra_core.Tx_payload.decode_final
+           with
            | Ok tx -> Ok (tx :: txs)
            | Error e -> Error e
          with exn -> Error (Printexc.to_string exn))
@@ -125,7 +128,11 @@ let build_record deps ~epoch_id ~target_int elog tx_hashes txs_json parsed_txs =
           epoch_id error;
         None
       | Ok _ ->
-        match Octra_core.Tx_outcome.decode ~confirmed:parsed_txs receipts_json with
+        match
+          Octra_core.Tx_outcome.decode_final
+            ~confirmed:parsed_txs
+            receipts_json
+        with
         | Error e ->
           Octra_log.warn "catchup"
             "lookup_catchup_range epoch = %Ld outcome_check_failed = %s"

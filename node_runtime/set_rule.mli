@@ -3,6 +3,8 @@
 
 type policy = {
   ready_mode : Octra_core.Rule_graph.mode;
+  ready_ref_mode : Octra_core.Rule_graph.mode;
+  live_mode : Octra_core.Rule_graph.mode;
   seat_mode : Octra_core.Rule_graph.mode;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }

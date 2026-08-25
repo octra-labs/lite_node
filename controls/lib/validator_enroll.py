@@ -6,6 +6,8 @@ import json
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from validator_common import ValidatorError
@@ -25,6 +27,28 @@ ROOT = SOURCE.parents[2] if SOURCE.parents[1].name == "controls" else SOURCE.par
 DEFAULT_CONFIG = ROOT / ".keys/validator/node.env"
 STATE_VERSION = "octra-validator-enrollment"
 MIN_BOND = 1000000
+
+class EnrollmentState(Enum):
+    ABSENT = "absent"
+    BONDED = "bonded"
+    READY = "ready"
+    EXITING = "exiting"
+
+class JoinStep(Enum):
+    ACTIVATE = "activate"
+    SUBMIT_BOND = "submit_bond"
+    SUBMIT_READY = "submit_ready"
+    WAIT_SELECTION = "wait_selection"
+    REFUSE = "refuse"
+
+@dataclass(frozen=True)
+class Enrollment:
+    state: EnrollmentState
+    head_epoch: int
+    bond: int | None
+    bonded_epoch: int | None
+    ready_epoch: int | None
+    exit_epoch: int | None
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
@@ -123,21 +147,103 @@ def membership(values, wallet):
     if scheduled_value is None:
         scheduled = False
         activate_epoch = None
+        next_set_epoch = None
     elif isinstance(scheduled_value, dict):
         scheduled = exact_member(scheduled_value.get("validators"), wallet)
         activate_raw = scheduled_value.get("activate_epoch")
         try:
-            activate_epoch = int(activate_raw)
+            next_set_epoch = int(activate_raw)
         except (TypeError, ValueError) as error:
             raise ValidatorError("invalid scheduled activation epoch") from error
+        activate_epoch = next_set_epoch if scheduled else None
     else:
         raise ValidatorError("invalid scheduled validator set")
     return {
         "active": active,
         "scheduled": scheduled,
         "activate_epoch": activate_epoch,
+        "next_set_epoch": next_set_epoch,
         "validator_set_hash": proof.get("validator_set_hash", "unknown"),
     }
+
+def optional_nonnegative_integer(value, name):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not (
+        isinstance(value, int)
+        or (
+            isinstance(value, str)
+            and value.isascii()
+            and value.isdecimal()
+        )
+    ):
+        raise ValidatorError(f"invalid committed validator {name}")
+    number = int(value)
+    if number < 0:
+        raise ValidatorError(f"negative committed validator {name}")
+    return number
+
+def optional_epoch(value, name):
+    return optional_nonnegative_integer(value, name)
+
+def committed_enrollment(values, wallet):
+    value = call(local_rpc(values), "octra_validatorEnrollment", [])
+    if not isinstance(value, dict):
+        raise ValidatorError("invalid committed validator enrollment")
+    if value.get("address") != wallet["address"]:
+        raise ValidatorError("committed validator enrollment address differs")
+    if value.get("consensus_pubkey") != wallet["pub"]:
+        raise ValidatorError("committed validator enrollment public key differs")
+    if value.get("identity") != "self_reported":
+        raise ValidatorError("committed validator enrollment identity is invalid")
+    try:
+        state = EnrollmentState(value.get("state"))
+    except (TypeError, ValueError) as error:
+        raise ValidatorError("invalid committed validator enrollment state") from error
+    head_epoch = optional_epoch(value.get("head_epoch"), "head epoch")
+    bond = optional_nonnegative_integer(value.get("bond"), "bond")
+    bonded_epoch = optional_epoch(value.get("bonded_epoch"), "bonded epoch")
+    ready_epoch = optional_epoch(value.get("ready_epoch"), "ready epoch")
+    exit_epoch = optional_epoch(value.get("exit_epoch"), "exit epoch")
+    if head_epoch is None:
+        raise ValidatorError("committed validator head epoch is missing")
+    local_head, _ = node_status(local_rpc(values))
+    if head_epoch != local_head:
+        raise ValidatorError("committed validator enrollment is stale")
+    if state is EnrollmentState.ABSENT:
+        if any(item is not None for item in (bond, bonded_epoch, ready_epoch, exit_epoch)):
+            raise ValidatorError("absent validator enrollment carries state")
+    elif bond is None or bond <= 0 or bonded_epoch is None:
+        raise ValidatorError("bonded validator enrollment is incomplete")
+    elif state is EnrollmentState.BONDED and (
+        ready_epoch is not None or exit_epoch is not None
+    ):
+        raise ValidatorError("bonded validator enrollment has invalid epochs")
+    elif state is EnrollmentState.READY and (
+        ready_epoch is None or exit_epoch is not None
+    ):
+        raise ValidatorError("ready validator enrollment has invalid epochs")
+    elif state is EnrollmentState.EXITING and exit_epoch is None:
+        raise ValidatorError("exiting validator enrollment has no exit epoch")
+    return Enrollment(
+        state=state,
+        head_epoch=head_epoch,
+        bond=bond,
+        bonded_epoch=bonded_epoch,
+        ready_epoch=ready_epoch,
+        exit_epoch=exit_epoch,
+    )
+
+def join_step(member, enrollment):
+    if member["active"] or member["scheduled"]:
+        return JoinStep.ACTIVATE
+    if enrollment.state is EnrollmentState.EXITING:
+        return JoinStep.REFUSE
+    if enrollment.state is EnrollmentState.ABSENT:
+        return JoinStep.SUBMIT_BOND
+    if enrollment.state is EnrollmentState.BONDED:
+        return JoinStep.SUBMIT_READY
+    return JoinStep.WAIT_SELECTION
 
 def control_result(
     values,
@@ -202,7 +308,7 @@ def wait_confirmed(values, tx_hash, args):
         epoch=confirmed["epoch"],
     )
 
-def resume_join_transaction(config, values, operation, args):
+def resume_join_transaction(config, values, operation, args, missing_ok=False):
     record = load_state(config)["transactions"].get(operation)
     if not isinstance(record, dict):
         return False
@@ -211,6 +317,8 @@ def resume_join_transaction(config, values, operation, args):
         raise ValidatorError("invalid saved enrollment transaction")
     value = transaction(local_rpc(values), tx_hash)
     if not isinstance(value, dict):
+        if missing_ok:
+            return False
         raise ValidatorError(f"saved {operation} transaction is unavailable: {tx_hash}")
     status = value.get("status")
     if status == "confirmed":
@@ -231,6 +339,9 @@ def resume_join_transaction(config, values, operation, args):
 def submit_bond(config, values, wallet, wallet_path, amount, args):
     if amount < MIN_BOND:
         raise ValidatorError(f"validator bond must be at least {MIN_BOND}")
+    enrollment = committed_enrollment(values, wallet)
+    if enrollment.state is not EnrollmentState.ABSENT:
+        raise ValidatorError("validator bond already exists in committed state")
     tx_hash = control_result(
         values,
         wallet,
@@ -244,6 +355,18 @@ def submit_bond(config, values, wallet, wallet_path, amount, args):
     return tx_hash
 
 def submit_ready(config, values, wallet, wallet_path, args):
+    enrollment = committed_enrollment(values, wallet)
+    if enrollment.state is EnrollmentState.ABSENT:
+        raise ValidatorError("validator bond is absent from committed state")
+    if enrollment.state is EnrollmentState.EXITING:
+        raise ValidatorError("exiting validator cannot become ready")
+    if enrollment.state is EnrollmentState.READY:
+        emit(
+            event="ready",
+            status="committed",
+            epoch=enrollment.ready_epoch,
+        )
+        return None
     head_epoch, state_root = node_status(local_rpc(values))
     message = {
         "consensus_pubkey": wallet["pub"],
@@ -276,7 +399,7 @@ def wait_scheduled(values, wallet, args):
         if state["active"] or state["scheduled"]:
             return state
         time.sleep(args.poll_seconds)
-    raise ValidatorError("validator selection timed out")
+    return None
 
 def wait_active_commit(values, wallet, state, args):
     if state["scheduled"] or not state["active"]:
@@ -318,6 +441,7 @@ def transaction_status(url, tx_hash):
 
 def show_status(config, values, wallet):
     state = membership(values, wallet)
+    enrollment = committed_enrollment(values, wallet)
     head_epoch, state_root = node_status(local_rpc(values))
     emit(event="identity", address=wallet["address"], role=values["OCTRA_OPERATOR_ROLE"])
     emit(
@@ -331,6 +455,16 @@ def show_status(config, values, wallet):
         active=str(state["active"]).lower(),
         scheduled=str(state["scheduled"]).lower(),
         activate_epoch=state["activate_epoch"],
+        next_set_epoch=state["next_set_epoch"],
+    )
+    emit(
+        event="committed_enrollment",
+        state=enrollment.state.value,
+        head_epoch=enrollment.head_epoch,
+        bond=enrollment.bond,
+        bonded_epoch=enrollment.bonded_epoch,
+        ready_epoch=enrollment.ready_epoch,
+        exit_epoch=enrollment.exit_epoch,
     )
     saved = load_state(config)
     for operation, record in sorted(saved["transactions"].items()):
@@ -419,7 +553,11 @@ def main():
         )
     else:
         state = membership(values, wallet)
-        if not state["active"] and not state["scheduled"]:
+        enrollment = committed_enrollment(values, wallet)
+        step = join_step(state, enrollment)
+        if step is JoinStep.REFUSE:
+            raise ValidatorError("validator exit is already committed")
+        if step is JoinStep.SUBMIT_BOND:
             if not resume_join_transaction(args.config, values, "bond", args):
                 submit_bond(
                     args.config,
@@ -429,9 +567,25 @@ def main():
                     args.amount,
                     args,
                 )
-            if not resume_join_transaction(args.config, values, "ready", args):
+            enrollment = committed_enrollment(values, wallet)
+            step = join_step(state, enrollment)
+            if step is JoinStep.SUBMIT_BOND:
+                raise ValidatorError("confirmed validator bond is absent from committed state")
+        if step is JoinStep.SUBMIT_READY:
+            if not resume_join_transaction(
+                args.config,
+                values,
+                "ready",
+                args,
+                missing_ok=True,
+            ):
                 submit_ready(args.config, values, wallet, wallet_path, args)
+            step = JoinStep.WAIT_SELECTION
+        if step is JoinStep.WAIT_SELECTION:
             state = wait_scheduled(values, wallet, args)
+            if state is None:
+                emit(event="selection", status="pending")
+                return
         state = wait_active_commit(values, wallet, state, args)
         set_validator_mode(
             args.config,

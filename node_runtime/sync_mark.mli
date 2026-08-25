@@ -19,3 +19,23 @@ val write :
   chain:string ->
   Sync_need.t ->
   (write, string) result
+
+val consume_range :
+  data_dir:string ->
+  chain:string ->
+  Sync_need.t ->
+  (unit, string) result
+
+val consume_journal :
+  data_dir:string ->
+  chain:string ->
+  verified_head:int ->
+  Sync_need.t ->
+  (unit, string) result
+
+val consume_root :
+  data_dir:string ->
+  chain:string ->
+  verified_head:int ->
+  Sync_need.t ->
+  (unit, string) result

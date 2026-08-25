@@ -23,6 +23,11 @@ val verify :
   Octra_consensus.C_types.finalize list ->
   ((int * string) list, string) result
 
+val select :
+  stored:string option ->
+  signed:string option ->
+  (string option, string) result
+
 val read :
   string ->
   (Octra_consensus.C_types.finalize list, string) result

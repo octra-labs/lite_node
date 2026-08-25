@@ -4,7 +4,7 @@
 module C_types = Octra_consensus.C_types
 
 type deps = {
-  current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   find_finalized :
@@ -18,7 +18,7 @@ type deps = {
 }
 
 type node_deps = {
-  current_epoch : unit -> int;
+  committed_head_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;

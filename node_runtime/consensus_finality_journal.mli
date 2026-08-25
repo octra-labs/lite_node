@@ -43,6 +43,11 @@ val conflict_label : conflict -> string
 
 val history_limit : int64
 
+val same_block :
+  Octra_consensus.C_types.finalize ->
+  Octra_consensus.C_types.finalize ->
+  bool
+
 val persist_certificate :
   string ->
   validator_set:Octra_consensus.C_types.validator_set ->

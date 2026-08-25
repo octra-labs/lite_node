@@ -203,6 +203,22 @@ let set ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round =
   let* () = Octra_consensus.C_vote_log.set_floor store ~through_epoch in
   Ok marked
 
+let seed ~data_dir ~chain_id ~validator ~pubkey ~through_epoch =
+  let store = Octra_consensus.C_vote_log.disk ~data_dir in
+  let* floor = Octra_consensus.C_vote_log.floor store in
+  match floor with
+  | Some epoch when Int64.compare epoch through_epoch <= 0 -> Ok None
+  | Some _ -> Error "vote floor exceeds local finalized head"
+  | None ->
+    set
+      ~data_dir
+      ~chain_id
+      ~validator
+      ~pubkey
+      ~through_epoch
+      ~round:0
+    |> Result.map Option.some
+
 let sync_round ~chain_id ~validator ~pubkey ~through_epoch ~round_min ~sync =
   if round_min < 0 || round_min > Octra_consensus.C_codec.max_round then
     Error "round minimum is invalid"

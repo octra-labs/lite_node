@@ -28,6 +28,13 @@ val epoch_tags :
   keep_epochs:int ->
   Yojson.Safe.t
 
+val validator_enrollment :
+  head_epoch:int ->
+  address:string ->
+  pubkey:string ->
+  Octra_core.Validator_admission.candidate option ->
+  (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
+
 val consensus_peer_states :
   now:float ->
   diag:Octra_net.P2p_peer_diag.t option ->

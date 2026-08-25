@@ -62,6 +62,11 @@ val transaction_epoch_targets :
   int list ->
   int list
 
+val recent_epochs :
+  last:int ->
+  count:int ->
+  int list
+
 type transactions_query = {
   transactions_epoch_param : int option;
   transactions_limit : int;
