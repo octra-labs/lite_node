@@ -3,6 +3,7 @@
 
 type runtime = {
   driver_config : Consensus_driver_wiring.node_driver_config_runtime;
+  stake_set : Octra_consensus.C_types.validator_set;
   validator_set : Octra_consensus.C_types.validator_set;
   swarm : Octra_net.P2p_swarm.t;
   activate_validator_set :

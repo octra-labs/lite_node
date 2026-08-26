@@ -855,12 +855,19 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
   let fork_repair = fork_repair_runtime deps in
   let gates = driver_gates deps p2p in
   let start_height = durable_start_height deps in
+  let start_set =
+    Octra_consensus.C_types.validator_set_for_epoch
+      ~chain_id:deps.chain_id
+      ~epoch_id:start_height
+      p2p.Startup_p2p_shell.stake_vs
+  in
   ignore (Consensus_driver_launch_shell.run
     Consensus_driver_launch_shell.{
       driver_config =
         driver_config deps p2p_start p2p gates run_catchup_to_target
           finality_runtime;
-      validator_set = p2p.Startup_p2p_shell.active_vs;
+      stake_set = p2p.Startup_p2p_shell.stake_vs;
+      validator_set = start_set;
       swarm = p2p.swarm;
       activate_validator_set = p2p_start.activate_validator_set;
       activate_validator_set_relief =
@@ -876,7 +883,7 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
       health =
         health deps normalize finality_runtime fork_repair
           run_catchup_to_target;
-      pending = pending deps run_catchup_to_target p2p.active_vs;
+      pending = pending deps run_catchup_to_target start_set;
       recovery_pending = (fun () ->
         Consensus_finality_journal.pending deps.data_dir);
       poll_interval = deps.quarantine_poll_sec;

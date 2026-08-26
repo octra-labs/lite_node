@@ -40,7 +40,7 @@ let validate_certificate_with_policy
            ~epoch_id:certificate.epoch_id
     in
     let validator_set =
-      if count_floor then resilient_validator_set validator_set
+      if count_floor then count_capped_set validator_set
       else
         validator_set_for_epoch
           ~chain_id

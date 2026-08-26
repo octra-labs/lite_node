@@ -229,6 +229,7 @@ type t = {
   mutable n_validators : int;
   config : config;
   engine : C_engine.t;
+  mutable stake_vs : C_types.validator_set;
   swarm : Octra_net.P2p_swarm.t;
   seen : C_seen.t;
   historical_replays : C_seen.t;
@@ -365,13 +366,11 @@ let catchup_response_key (rec_ : catchup_range_response_record) =
   else
     None
 
-let catchup_source_validator_set = C_types.resilient_validator_set
-
 let catchup_agreement_validator_set t ~epoch_id =
   C_types.validator_set_for_epoch
     ~chain_id:t.config.chain_id
     ~epoch_id
-    t.engine.vs
+    t.stake_vs
 
 let catchup_agreement_weight t ~epoch_id =
   catchup_agreement_validator_set t ~epoch_id
@@ -427,11 +426,12 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
   let can_vote () =
     config.can_vote () && not !finality_proof_needed
   in
+  let stake_vs = validator_set in
   let validator_set =
     C_types.validator_set_for_epoch
       ~chain_id:config.chain_id
       ~epoch_id:start_height
-      validator_set
+      stake_vs
   in
   let engine = C_engine.create
     ~chain_id:config.chain_id
@@ -439,7 +439,7 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
     ~validator_set
     ~start_height
     ~can_vote in
-  { n_validators = validator_set.C_types.n; config; engine; swarm;
+  { n_validators = validator_set.C_types.n; config; engine; stake_vs; swarm;
     seen = C_seen.create ~capacity:10_000; running = false;
     historical_replays = C_seen.create ~capacity:4_096;
     epoch_start_mono = Mtime_clock.elapsed_ns ();
@@ -2252,7 +2252,7 @@ let validator_set_for_frame t epoch =
     Lwt.return
       (validator_set_at
          ~chain_id:t.config.chain_id
-         ~current:t.engine.vs
+         ~current:t.stake_vs
          ~epoch
          plan)
 
@@ -2290,6 +2290,7 @@ let install_relief t cfg mark target =
       next_round
   in
   clear_relief_work t;
+  t.stake_vs <- cfg.validator_set;
   C_engine.reconfigure_validator_set t.engine ~round target;
   t.n_validators <- target.C_types.n;
   t.relief_plan <- Some cfg;
@@ -2445,10 +2446,14 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
       if String.equal current_hash target_hash then begin
         let relief = Option.is_some t.relief_plan in
         t.relief_plan <- None;
-        if relief then
-          t.on_validator_set_activated validator_set cfg.fingerprint
-        else
-          Lwt.return_unit
+        let* () =
+          if relief then
+            t.on_validator_set_activated validator_set cfg.fingerprint
+          else
+            Lwt.return_unit
+        in
+        t.stake_vs <- cfg.validator_set;
+        Lwt.return_unit
       end
       else if Int64.compare cfg.activate_epoch t.engine.state.height < 0 then begin
         error_node t.config.my_addr
@@ -2463,6 +2468,7 @@ let maybe_activate_scheduled_validator_set_raw t ~target_epoch =
           validator_set
           cfg.fingerprint
       in
+      t.stake_vs <- cfg.validator_set;
       C_engine.replace_validator_set t.engine validator_set;
       Hashtbl.clear t.round_peers;
       t.n_validators <- validator_set.C_types.n;
@@ -2488,7 +2494,7 @@ let maybe_activate_quorum_policy t ~target_epoch =
     C_types.validator_set_for_epoch
       ~chain_id:t.config.chain_id
       ~epoch_id:target_epoch
-      current
+      t.stake_vs
   in
   if String.equal
        (C_config.validator_set_hash current)
@@ -2560,6 +2566,7 @@ let maybe_activate_resource_committee t ~target_epoch =
                         target_epoch;
                       Lwt.return_unit
                   | Some validator_set ->
+                      t.stake_vs <- validator_set;
                       C_engine.replace_validator_set t.engine validator_set;
                       Hashtbl.clear t.round_peers;
                       t.n_validators <- validator_set.C_types.n;
@@ -4550,7 +4557,7 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
   let agreement_validator_set epoch_id =
     validator_set_at
       ~chain_id:t.config.chain_id
-      ~current:t.engine.vs
+      ~current:t.stake_vs
       ~epoch:epoch_id
       validator_set_plan
     |> C_types.validator_set_for_epoch
@@ -4823,7 +4830,7 @@ let epoch_root_consensus_quorum t ~epoch_id ~root records =
   C_types.has_quorum_at
     ~chain_id:t.config.chain_id
     ~epoch_id
-    t.engine.vs
+    t.stake_vs
     validators
 
 let epoch_root_wait_reached t ~epoch_id ~wait_for records =

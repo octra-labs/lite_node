@@ -59,6 +59,7 @@ type startup_config = {
 }
 
 type startup_runtime = {
+  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;

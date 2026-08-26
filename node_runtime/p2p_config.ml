@@ -63,6 +63,7 @@ type startup_config = {
 }
 
 type startup_runtime = {
+  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;
@@ -344,6 +345,7 @@ let install_node_startup_config deps ~current_height startup =
     (fun row -> deps.warn (upgrade_log_message row))
     startup.upgrade_logs;
   {
+    stake_vs = validator.stake_vs;
     active_vs;
     scheduled_driver_config;
     light_scheduled_validator_set;

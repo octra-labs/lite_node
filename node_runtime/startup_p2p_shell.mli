@@ -67,6 +67,7 @@ type persistent_update_deps = {
 
 type node_view = {
   validator_config : Validator_config.t;
+  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_validator_set_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   consensus_config_hash : string;

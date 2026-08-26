@@ -261,14 +261,14 @@ let largest_weight_sum count entries =
      in
      sum count Z.zero weights
 
-let resilient_at_cap ~faults cap entries =
+let count_live_at_cap ~faults cap entries =
   let effective = cap_entries cap entries in
   let total = sum_weights effective in
   let unavailable = largest_weight_sum faults effective in
   let remaining = Z.sub total unavailable in
   Z.geq remaining (quorum_weight total)
 
-let effective_weight_cap (vs : validator_set) =
+let count_weight_cap (vs : validator_set) =
   let entries = weights_of_set vs in
   match entries with
   | [] -> Z.zero
@@ -279,7 +279,7 @@ let effective_weight_cap (vs : validator_set) =
         first
         rest
     in
-    if vs.f <= 0 || resilient_at_cap ~faults:vs.f maximum entries then
+    if vs.f <= 0 || count_live_at_cap ~faults:vs.f maximum entries then
       maximum
     else
       let rec search lower upper =
@@ -288,23 +288,23 @@ let effective_weight_cap (vs : validator_set) =
           let middle =
             Z.div (Z.add (Z.add lower upper) Z.one) (Z.of_int 2)
           in
-          if resilient_at_cap ~faults:vs.f middle entries then
+          if count_live_at_cap ~faults:vs.f middle entries then
             search middle upper
           else
             search lower (Z.sub middle Z.one)
       in
       search Z.one maximum
 
-let resilient_validator_set (vs : validator_set) =
+let count_capped_set (vs : validator_set) =
   if not vs.weighted || vs.n < 4 then vs
   else
     let entries = weights_of_set vs in
-    let cap = effective_weight_cap vs in
+    let cap = count_weight_cap vs in
     build_validator_set ~weighted:true (cap_entries cap entries)
 
 let validator_set_for_epoch ~chain_id ~epoch_id vs =
-  if C_quorum_policy.weight_cap_required ~chain_id ~epoch_id then
-    resilient_validator_set vs
+  if C_quorum_policy.count_cap_required ~chain_id ~epoch_id then
+    count_capped_set vs
   else
     vs
 
