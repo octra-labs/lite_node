@@ -377,16 +377,16 @@ let catchup_agreement_weight t ~epoch_id =
   catchup_agreement_validator_set t ~epoch_id
   |> C_types.round_skip_weight
 
-let catchup_source_agreement_reached ?(count_required=true) validator_set
+let catchup_source_agreement_reached ?(count_floor=true) validator_set
     ~signer_count ~signed_weight =
   Z.geq signed_weight (C_types.round_skip_weight validator_set)
-  && (not count_required || signer_count >= validator_set.C_types.f + 1)
+  && (not count_floor || signer_count >= validator_set.C_types.f + 1)
 
 let catchup_agreement_reached t ~epoch_id ~count ~weight =
   let validator_set = catchup_agreement_validator_set t ~epoch_id in
   catchup_source_agreement_reached
-    ~count_required:
-      (C_quorum_policy.count_required
+    ~count_floor:
+      (C_quorum_policy.count_floor_required
          ~chain_id:t.config.chain_id
          ~epoch_id)
     validator_set
@@ -4572,8 +4572,8 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
   in
   let agreement_reached epoch_id count weight =
     catchup_source_agreement_reached
-      ~count_required:
-        (C_quorum_policy.count_required
+      ~count_floor:
+        (C_quorum_policy.count_floor_required
            ~chain_id:t.config.chain_id
            ~epoch_id)
       (agreement_validator_set epoch_id)
@@ -5206,7 +5206,7 @@ let start t =
     if t.n_validators <= 1 then 0
     else if
       not
-        (C_quorum_policy.count_required
+        (C_quorum_policy.count_floor_required
            ~chain_id:t.config.chain_id
            ~epoch_id:t.engine.state.height)
     then 1

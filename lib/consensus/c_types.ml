@@ -303,7 +303,7 @@ let resilient_validator_set (vs : validator_set) =
     build_validator_set ~weighted:true (cap_entries cap entries)
 
 let validator_set_for_epoch ~chain_id ~epoch_id vs =
-  if C_quorum_policy.count_required ~chain_id ~epoch_id then
+  if C_quorum_policy.weight_cap_required ~chain_id ~epoch_id then
     resilient_validator_set vs
   else
     vs
@@ -360,17 +360,16 @@ let has_quorum vs validators =
       ~signed_weight:weight
 
 let has_quorum_at ~chain_id ~epoch_id vs validators =
-  if C_quorum_policy.count_required ~chain_id ~epoch_id then
-    has_quorum
-      (validator_set_for_epoch ~chain_id ~epoch_id vs)
-      validators
+  let effective = validator_set_for_epoch ~chain_id ~epoch_id vs in
+  if C_quorum_policy.count_floor_required ~chain_id ~epoch_id then
+    has_quorum effective validators
   else
-    has_weight_quorum vs validators
+    has_weight_quorum effective validators
 
 let quorum_reached_at ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
   Z.geq signed_weight vs.quorum_weight
   &&
-  (not (C_quorum_policy.count_required ~chain_id ~epoch_id)
+  (not (C_quorum_policy.count_floor_required ~chain_id ~epoch_id)
    || signer_count >= vs.quorum)
 
 let round_skip_weight vs =
@@ -379,7 +378,7 @@ let round_skip_weight vs =
 let round_skip_reached_at ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
   Z.geq signed_weight (round_skip_weight vs)
   &&
-  (not (C_quorum_policy.count_required ~chain_id ~epoch_id)
+  (not (C_quorum_policy.count_floor_required ~chain_id ~epoch_id)
    || signer_count >= vs.f + 1)
 
 let weighted_leader (vs : validator_set) ~epoch_id ~round =

@@ -1,7 +1,7 @@
 d1ee43a4a8a661388b500d99793a876af691b8c5977b018026a3b068b7aacc44  ./.gitignore
 88ed90f15b3ffef2595a253fdecec4e32ba25ed0d5315f2b401ca016a00118a9  ./LICENSE
 f8468d768e9c3d46c7cf06a85593e64e5a58f9fbc4b31502237b67999679ffcc  ./README.md
-5d9d2ddb0cd7844b07869916fe0d057028c1623c2fe88bed10f71836bc233532  ./SOURCE_COMMIT
+220b35c65333009202b829d863a338d7fef54adaf5434908636ecd4ed2574bbc  ./SOURCE_COMMIT
 cabc8aeab28e74a3dc55db65c26823637cd86ae36fd3cef86f42acd29bc50d98  ./bin/bft_control_tx.ml
 23df8c6cfdb1297fd0b054b945dc566e4b7b9a0771fca64c0a2eefb508c7ccbd  ./bin/dune
 1a93a6166e4e6b823ca8fff62babf9bc1a75ad436474bf6bae6a749e352ea8ea  ./bin/octra_node.ml
@@ -107,7 +107,7 @@ c0acfb2412a11ff668df713ab2616bd65641d9d5203b86ee1a2d141d446de0ec  ./lib/bootstra
 116b6eeee036c7b763d756203cd03f89aaec4ef7e6ff81322fa556c577bbb078  ./lib/consensus/c_catchup.ml
 26a14dc6a4b57f16c5db38c336060df62ac3f43608ee7b88fa579200062399c2  ./lib/consensus/c_codec.ml
 f757ea4ccb4322b86462914566fa5a1bc2eda549cac7b4d9feb1a62eb1cdee82  ./lib/consensus/c_config.ml
-bac895734ebc725c7ac3797ef4f3faefc9d649d5fd5fb365168b97b22c1589a0  ./lib/consensus/c_driver.ml
+45aee19d4bef0492a76bbbba54b4e5f39414d1006264d9c4932a467c4e43e472  ./lib/consensus/c_driver.ml
 f64e42d236003cbde060fa4c1c98fdc054e4fcad7f70c2bad13048f7d677c58e  ./lib/consensus/c_engine.ml
 2c5a54b79359b7987aabe336372bd5bd3053a82e1ddfd8ec63d9a8c317920c46  ./lib/consensus/c_epoch_time_policy.ml
 b3ade3e5473b4cec4748c42f282bdadc7b4c03fc3503a2f16634a6a2612fcf0c  ./lib/consensus/c_epoch_time_policy.mli
@@ -131,9 +131,9 @@ b4ad341f1fae21713a5d1087030ef840a7e42a4990b2aa78ec4b5f2d216458a8  ./lib/consensu
 6233938750b4143ecf16a87abe47523c4d87d5155ff789a333cbdeba9d709cca  ./lib/consensus/c_proposal_work_gate.ml
 b580b28b04cc01af0111cc4a7f0ad71e5219d27b3543fbfee33c4587acd0ccc3  ./lib/consensus/c_proposal_work_gate.mli
 29e9eca729d6cf09572320f9585febda32031ef8b3b4c0cd594612af1437939d  ./lib/consensus/c_protocol.ml
-0f53e39270b15c787439af67c357dd3c028601c58a484e4843b7a0b84fad23e3  ./lib/consensus/c_qc.ml
-b21affb314df060ee6f6467034c59c15942a97cf6bc6ee37c46b3a459b58ff11  ./lib/consensus/c_quorum_policy.ml
-410d2c36002eaf431c9610aef5f21826cc8eb07e88195a57ca878a2394248923  ./lib/consensus/c_quorum_policy.mli
+01fccaaff3817df01d559dd1680485e4ff3ecc4b59684bb1bd5491e4d84a8ebf  ./lib/consensus/c_qc.ml
+f53f2a13149c1b85d0b2bcee0edd3b7170d6cccb379c534bcdda0e593076c023  ./lib/consensus/c_quorum_policy.ml
+c65de57659e0aa62d84d3925b3bcf8f6ca7b5326f509eb234fd3233b316b3cf1  ./lib/consensus/c_quorum_policy.mli
 7202198749a34f58808ff7d4bae29e59b054a9ca0e44a26a64bbd34b766713e2  ./lib/consensus/c_relief.ml
 ffe5fe34f4caf55483f30bab58739b7bff4290a71e0a27a463d12eeac309203b  ./lib/consensus/c_relief.mli
 0a96df6cda2214f13ceed093b17d9ee15c3c4ada578b370704e3007dd6f878d5  ./lib/consensus/c_relief_log.ml
@@ -146,7 +146,7 @@ ad329bf3ec36c522cdd4506a932cb274e265401465980474822261f7c1f87e1c  ./lib/consensu
 7bb70817aeb9fd0297732b8b51d70e5f87ece974e6072752a3d0df65de817863  ./lib/consensus/c_seen.ml
 4befd12cb5d9baf1b7fa7dcbfdd9970365584e1ef33a59b3b343d69bbbd9347d  ./lib/consensus/c_sync_log.ml
 fc9b7282dbf3caa065b9c18f99f12e79eb9eabdf3566c50a33a391eeab2a75ec  ./lib/consensus/c_sync_log.mli
-4f5507b714adfbcdd2f0589e6c1f004950c213821d910ccbb09593a295620560  ./lib/consensus/c_types.ml
+69d96fd2914faab48aa9d27c069aa47858b614da6181e7dd6505cab4c8e5551a  ./lib/consensus/c_types.ml
 d980b81bdebf57e3cd2f1431aaa85ee36b3af577b89b8bc8c991d290e14e85f3  ./lib/consensus/c_vote_log.ml
 bc7d38a4b63782998c19820bb047ea3b4d88887e19b5ffa45b484390aaa3f979  ./lib/consensus/c_vote_log.mli
 0628d6229ee37f87b728a0eeffd870f9face1c7b0592bf3d67788ef4b6641a4d  ./lib/consensus/dune

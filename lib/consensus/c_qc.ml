@@ -33,14 +33,14 @@ let validate_certificate_with_policy
     (certificate : commit_certificate) =
   if certificate.chain_id <> chain_id then invalid "chain_id"
   else
-    let harden_count =
+    let count_floor =
       harden_quorum
-      && C_quorum_policy.count_required
+      && C_quorum_policy.count_floor_required
            ~chain_id
            ~epoch_id:certificate.epoch_id
     in
     let validator_set =
-      if harden_count then resilient_validator_set validator_set
+      if count_floor then resilient_validator_set validator_set
       else
         validator_set_for_epoch
           ~chain_id
@@ -72,7 +72,7 @@ let validate_certificate_with_policy
       in
       if not (unique addrs) then invalid "duplicate_validator"
       else if not
-        (if harden_count then C_types.has_quorum validator_set addrs
+        (if count_floor then C_types.has_quorum validator_set addrs
          else
            C_types.has_quorum_at
              ~chain_id
