@@ -41,7 +41,6 @@ let linear_weight ~chain_id ~epoch_id =
 
 let count_floor_required ~chain_id ~epoch_id =
   active ~chain_id ~epoch_id
-  && not (linear_weight ~chain_id ~epoch_id)
 
 let count_cap_required ~chain_id ~epoch_id =
   active ~chain_id ~epoch_id
