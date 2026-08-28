@@ -79,14 +79,11 @@ let node_backend
                       Octra_core.State_preview.with_preview
                         ~base_store:store
                         ~base_ledger:ledger
+                        ~fold
                         ~epoch_id
                         ~proposal_id
                         ?expected_prev_root
                         (fun backend ->
-                let backend = {
-                  backend with
-                  Octra_core.Epoch_exec.fold = fold;
-                } in
                 let private_transition =
                   Octra_core.Private_transition.create
                     ~preverify:(Some preverify)

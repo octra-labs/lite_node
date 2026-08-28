@@ -126,7 +126,8 @@ def rollback_state(data_path, preserved, epoch):
 def recover(config, replace_state=False, plan=None, min_epoch=None):
     private_mode(config)
     values = parse_env(config)
-    data_path = Path(values["OCTRA_DATA_DIR"])
+    data_ref = Path(values["OCTRA_DATA_DIR"]).expanduser()
+    data_path = data_ref.resolve()
     marked = read_need(data_path, values["OCTRA_CHAIN_ID"])
     need = choose(marked, plan, values["OCTRA_CHAIN_ID"])
     ready = state_ready(data_path)
@@ -149,7 +150,11 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
         return
     if not ready and data_path.exists() and any(data_path.iterdir()):
         raise ValidatorError("nonempty state requires evidence-preserving recovery")
-    owners = active_data_owners(pm2_entries(required=False), str(data_path))
+    entries = pm2_entries(required=False)
+    owners = sorted(set(
+        active_data_owners(entries, str(data_ref))
+        + active_data_owners(entries, str(data_path))
+    ))
     if owners:
         raise ValidatorError("state directory is active: " + ",".join(owners))
     pids = data_pids(data_path)

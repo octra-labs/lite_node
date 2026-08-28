@@ -767,7 +767,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               | Error error -> Lwt.fail_with error
               | Ok () ->
                 Lwt.catch
-                  (fun () -> Store_irmin.begin_epoch_batch store)
+                  (fun () ->
+                    match Rule_graph.account_pack rules ~epoch:!current_epoch with
+                    | Error fault ->
+                      Lwt.fail_with (Rule_graph.fault_message fault)
+                    | Ok mode -> Store_irmin.begin_epoch_batch ~mode store)
                   (fun exn ->
                     ignore (Ledger.abort_journal ledger);
                     Lwt.fail exn));
@@ -1215,6 +1219,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Consensus_circle_cell_preverify.{
         store;
         ledger;
+        rules;
         env = circle_preverify.env;
       }
     in

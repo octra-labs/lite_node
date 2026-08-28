@@ -103,7 +103,7 @@ sh controls/stop.sh
 
 An additional feature that eliminates the need for manual updates and troubleshooting of node management issues is now a single command that monitors the repo, checks packages, helps build a fresh build, restarts the node, and waits until the node is guaranteed to be operational (the upgrade works with pm2 and systemd and never restarts in a loop).
 
-> You can first test the script's mechanics; it doesn't affect anything (a rule of thumb for reliability: check first).
+> You can first test the script's mechanics, it doesn't affect anything (a rule of thumb for reliability: check first).
 
 ```bash
 sudo -iu octra
@@ -149,4 +149,26 @@ opam exec --switch "$SWITCH" -- dune build --profile release \
 sh controls/stop.sh
 sh controls/run.sh --rebind-runtime
 sh controls/stat.sh
+```
+
+## Storage check
+```bash
+sh controls/storage.sh
+```
+
+## Remove preserved states
+```bash
+sh controls/storage.sh
+sh controls/storage.sh --prune-prior --yes
+sh controls/storage.sh
+```
+
+## Recover an oversized store
+```bash
+sh controls/stop.sh
+sh controls/recover.sh --replace-state
+sh controls/run.sh
+sh controls/stat.sh
+sh controls/storage.sh --prune-prior --yes
+sh controls/storage.sh
 ```

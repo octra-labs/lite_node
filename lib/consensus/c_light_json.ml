@@ -307,6 +307,7 @@ let account json =
     }
 
 type account_irmin_proof = {
+  proof_kind : string;
   path : string list;
   ledger_state_root : string;
   exists : bool;
@@ -322,15 +323,25 @@ type account_proof = {
 
 let account_irmin_proof json =
   let* proof_kind = str "proof_kind" json in
-  if proof_kind <> "irmin_account_path_v1" then Error ("proof kind mismatch: " ^ proof_kind)
+  if proof_kind <> "irmin_account_path_v1" && proof_kind <> "irmin_account_tree" then
+    Error ("proof kind mismatch: " ^ proof_kind)
   else
     let* path = list "path" (function
       | `String s -> Ok s
       | _ -> Error "path string expected") json in
-    let* ledger_state_root = str "ledger_state_root" json in
-    let* exists = boolv "exists" json in
-    let* proof = str "proof" json in
-    Ok { path; ledger_state_root; exists; proof }
+    let path_ok =
+      match proof_kind, path with
+      | "irmin_account_path_v1", ["accounts"; address; "data"] ->
+        address <> ""
+      | "irmin_account_tree", ["accounts"; address] -> address <> ""
+      | _ -> false
+    in
+    if not path_ok then Error "account proof path mismatch"
+    else
+      let* ledger_state_root = str "ledger_state_root" json in
+      let* exists = boolv "exists" json in
+      let* proof = str "proof" json in
+      Ok { proof_kind; path; ledger_state_root; exists; proof }
 
 let account_proof json =
   let* version = str "version" json in

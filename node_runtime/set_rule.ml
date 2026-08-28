@@ -12,6 +12,7 @@ type policy = {
   live_mode : Octra_core.Rule_graph.mode;
   seat_mode : Octra_core.Rule_graph.mode;
   open_mode : Octra_core.Rule_graph.mode;
+  account_mode : Octra_core.Rule_graph.mode;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
 
@@ -21,20 +22,31 @@ let policy rules epoch =
     Octra_core.Rule_graph.ready_ref rules ~epoch,
     Octra_core.Rule_graph.set_live rules ~epoch,
     Octra_core.Rule_graph.set_fold_cap rules ~epoch,
-    Octra_core.Rule_graph.set_open rules ~epoch
+    Octra_core.Rule_graph.set_open rules ~epoch,
+    Octra_core.Rule_graph.account_pack rules ~epoch
   with
-  | Error fault, _, _, _, _
-  | _, Error fault, _, _, _
-  | _, _, Error fault, _, _
-  | _, _, _, Error fault, _
-  | _, _, _, _, Error fault -> Error (Octra_core.Rule_graph.fault_message fault)
-  | Ok ready_mode, Ok ready_ref_mode, Ok live_mode, Ok seat_mode, Ok open_mode ->
+  | Error fault, _, _, _, _, _
+  | _, Error fault, _, _, _, _
+  | _, _, Error fault, _, _, _
+  | _, _, _, Error fault, _, _
+  | _, _, _, _, Error fault, _
+  | _, _, _, _, _, Error fault -> Error (Octra_core.Rule_graph.fault_message fault)
+  | Ok ready_mode, Ok ready_ref_mode, Ok live_mode, Ok seat_mode, Ok open_mode,
+    Ok account_mode ->
     let cap_mode =
       match seat_mode with
       | Octra_core.Rule_graph.Prior -> Octra_core.Set_fold.Reject
       | Octra_core.Rule_graph.Active -> Octra_core.Set_fold.Prune
     in
-    Ok { ready_mode; ready_ref_mode; live_mode; seat_mode; open_mode; cap_mode }
+    Ok {
+      ready_mode;
+      ready_ref_mode;
+      live_mode;
+      seat_mode;
+      open_mode;
+      account_mode;
+      cap_mode;
+    }
 
 let resolve rules ~chain_id ~parent epoch =
   match Octra_core.Rule_graph.set_fold rules ~epoch, policy rules epoch with
@@ -48,6 +60,7 @@ let resolve rules ~chain_id ~parent epoch =
       live_mode = policy.live_mode;
       seat_mode = policy.seat_mode;
       open_mode = policy.open_mode;
+      account_mode = policy.account_mode;
       cap_mode = policy.cap_mode;
       ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
       start = start rules;
@@ -70,6 +83,7 @@ let resolve rules ~chain_id ~parent epoch =
               live_mode = policy.live_mode;
               seat_mode = policy.seat_mode;
               open_mode = policy.open_mode;
+              account_mode = policy.account_mode;
               cap_mode = policy.cap_mode;
               ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
               start = start rules;

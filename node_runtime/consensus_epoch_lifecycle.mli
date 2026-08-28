@@ -8,6 +8,7 @@ type deps = {
   save_state_root : unit -> unit Lwt.t;
   get_head_hash : unit -> string option Lwt.t;
   cleanup_old_tags : int -> unit Lwt.t;
+  collect_pack : int -> unit Lwt.t;
 }
 
 type ctx = {
@@ -15,6 +16,8 @@ type ctx = {
 }
 
 val should_cleanup_old_tags : int -> bool
+
+val should_collect_pack : int -> bool
 
 val run : deps -> ctx -> unit Lwt.t
 

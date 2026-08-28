@@ -26,6 +26,9 @@ val epoch_tags :
   min_epoch:int ->
   max_epoch:int ->
   keep_epochs:int ->
+  split_epoch:int option ->
+  gc_enabled:bool ->
+  gc_running:bool ->
   Yojson.Safe.t
 
 val validator_enrollment :

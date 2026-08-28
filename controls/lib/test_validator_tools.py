@@ -119,6 +119,13 @@ from validator_rejoin import sync_state
 from validator_rejoin import vote_state
 from validator_status import promotion_readiness
 from validator_status import round_view
+from validator_store import data_dir
+from validator_store import prior_scan
+from validator_store import pack_bytes
+from validator_store import report
+from validator_store import remove_prior
+from validator_store import suffix_bytes
+from validator_store import tree_bytes
 import release as release_tool
 import upgrade as upgrade_tool
 from upgrade import choose
@@ -228,6 +235,162 @@ class ValidatorToolsTest(unittest.TestCase):
         if WORK.exists():
             shutil.rmtree(WORK)
         WORK.mkdir(parents=True)
+
+    def test_store_report_counts_exact_prior_paths(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        prior_a = WORK / "devnet.prior-10"
+        prior_b = WORK / "devnet.prior-20-1"
+        prior_a.mkdir()
+        prior_b.mkdir()
+        (prior_a / "a").write_bytes(b"abc")
+        (prior_b / "b").write_bytes(b"defg")
+        (WORK / "devnet.prior-x").mkdir()
+        self.assertEqual(prior_scan(data), [(prior_a, None), (prior_b, None)])
+        self.assertEqual(tree_bytes(prior_a), 3)
+        self.assertEqual(tree_bytes(prior_b), 4)
+
+    def test_store_report_skips_prior_link(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        target = WORK / "target"
+        target.mkdir()
+        link = WORK / "devnet.prior-10"
+        link.symlink_to(target, target_is_directory=True)
+        self.assertEqual(prior_scan(data), [(link, "link")])
+
+    def test_store_report_resolves_data_link_and_measures_store(self):
+        target = WORK / "volume/devnet"
+        store = target / "irmin_store"
+        store.mkdir(parents=True)
+        link = WORK / "devnet"
+        link.symlink_to(target, target_is_directory=True)
+        values = {"OCTRA_DATA_DIR": str(link), "OCTRA_API_PORT": "18080"}
+        self.assertEqual(data_dir(values), target.resolve())
+        with mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value=mock.Mock(free=123),
+        ) as disk, mock.patch(
+            "validator_store.rpc_method",
+            return_value=None,
+        ), mock.patch("validator_store.emit"):
+            report(values)
+        disk.assert_called_once_with(store)
+
+    def test_store_report_skips_bad_prior_tree(self):
+        data = WORK / "devnet"
+        store = data / "irmin_store"
+        store.mkdir(parents=True)
+        prior = WORK / "devnet.prior-10"
+        prior.mkdir()
+        (prior / "link").symlink_to(store, target_is_directory=True)
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        with mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value=mock.Mock(free=123),
+        ), mock.patch(
+            "validator_store.rpc_method",
+            return_value=None,
+        ), mock.patch("validator_store.emit") as output:
+            report(values)
+        events = [call.kwargs for call in output.call_args_list]
+        self.assertIn(
+            {"event": "prior_skipped", "path": prior, "reason": "tree"},
+            events,
+        )
+
+    def test_store_report_skips_nested_mount(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        prior = WORK / "devnet.prior-10"
+        nested = prior / "volume"
+        nested.mkdir(parents=True)
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        real_mount = os.path.ismount
+        with mock.patch(
+            "validator_store.os.path.ismount",
+            side_effect=lambda path: Path(path) == nested or real_mount(path),
+        ), mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value=mock.Mock(free=123),
+        ), mock.patch(
+            "validator_store.rpc_method",
+            return_value=None,
+        ), mock.patch("validator_store.emit") as output:
+            report(values)
+        events = [call.kwargs for call in output.call_args_list]
+        self.assertIn(
+            {"event": "prior_skipped", "path": prior, "reason": "tree"},
+            events,
+        )
+
+    def test_store_report_counts_suffix_chunks(self):
+        data = WORK / "devnet"
+        store = data / "irmin_store"
+        store.mkdir(parents=True)
+        (store / "store.0.suffix").write_bytes(b"abc")
+        (store / "store.1.suffix").write_bytes(b"defg")
+        (store / "store.1.prefix").write_bytes(b"ignored")
+        self.assertEqual(suffix_bytes(data), 7)
+        self.assertEqual(pack_bytes(data), 14)
+
+    def test_store_prune_checks_all_states_before_removal(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        identity_path = WORK / "wallet.json"
+        identity = ensure_wallet(identity_path)
+        first = WORK / "devnet.prior-10"
+        second = WORK / "devnet.prior-20"
+        first.mkdir()
+        second.mkdir()
+        (first / "wallet.json").write_bytes(identity_path.read_bytes())
+        os.chmod(first / "wallet.json", 0o600)
+        ensure_wallet(second / "wallet.json")
+        with mock.patch("validator_store.pm2_entries", return_value=[]), \
+             mock.patch("validator_store.active_data_owners", return_value=[]), \
+             mock.patch("validator_store.data_pids", return_value=[]):
+            removed, total, skipped = remove_prior(data, identity)
+        self.assertEqual(removed, 1)
+        self.assertGreater(total, 0)
+        self.assertEqual(skipped, 1)
+        self.assertFalse(first.exists())
+        self.assertTrue(second.is_dir())
+
+    def test_store_prune_removes_checked_states(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        identity_path = WORK / "wallet.json"
+        identity = ensure_wallet(identity_path)
+        prior = WORK / "devnet.prior-10"
+        prior.mkdir()
+        (prior / "wallet.json").write_bytes(identity_path.read_bytes())
+        os.chmod(prior / "wallet.json", 0o600)
+        with mock.patch("validator_store.pm2_entries", return_value=[]), \
+             mock.patch("validator_store.active_data_owners", return_value=[]), \
+             mock.patch("validator_store.data_pids", return_value=[]):
+            removed, total, skipped = remove_prior(data, identity)
+        self.assertEqual(removed, 1)
+        self.assertGreater(total, 0)
+        self.assertEqual(skipped, 0)
+        self.assertFalse(prior.exists())
+
+    def test_store_prune_refuses_active_state(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        identity_path = WORK / "wallet.json"
+        identity = ensure_wallet(identity_path)
+        prior = WORK / "devnet.prior-10"
+        prior.mkdir()
+        (prior / "wallet.json").write_bytes(identity_path.read_bytes())
+        os.chmod(prior / "wallet.json", 0o600)
+        with mock.patch("validator_store.pm2_entries", return_value=[]), \
+             mock.patch("validator_store.active_data_owners", return_value=["pm2:node"]), \
+             mock.patch("validator_store.data_pids", return_value=[]):
+            removed, total, skipped = remove_prior(data, identity)
+        self.assertEqual(removed, 0)
+        self.assertEqual(total, 0)
+        self.assertEqual(skipped, 1)
+        self.assertTrue(prior.is_dir())
 
     def tearDown(self):
         if WORK.exists():
@@ -3433,6 +3596,36 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "pid:41"):
                 recover(config)
 
+    def test_recovery_refuses_link_name_owner(self):
+        target = WORK / "volume/data"
+        data = WORK / "home/data"
+        (target / "irmin_store").mkdir(parents=True)
+        (target / "chaindata").mkdir()
+        (target / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        data.parent.mkdir()
+        data.symlink_to(target, target_is_directory=True)
+        config = WORK / "node.env"
+        write_env(config, {
+            "OCTRA_CHAIN_ID": "octra-devnet-bft-v1",
+            "OCTRA_CHECKPOINT_EPOCH": "99",
+            "OCTRA_CHECKPOINT_STATE_ROOT": "3" * 64,
+            "OCTRA_CHECKPOINT_TXID_HI": "500",
+            "OCTRA_DATA_DIR": str(data),
+        })
+        entries = [{
+            "name": "octra-validator",
+            "pm2_env": {
+                "OCTRA_DATA_DIR": str(data),
+                "status": "online",
+            },
+        }]
+        with mock.patch("validator_recover.pm2_entries", return_value=entries):
+            with self.assertRaisesRegex(ValidatorError, "octra-validator"):
+                recover(config, replace_state=True)
+
     def test_recovery_downloads_verified_state(self):
         data = WORK / "data"
         bundle = WORK / "network.env"
@@ -3531,6 +3724,71 @@ class ValidatorToolsTest(unittest.TestCase):
         preserved = preserved_state_path(data, 99)
         self.assertTrue((preserved / "HEAD.json").is_file())
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
+
+    def test_recovery_preserves_data_link(self):
+        home = WORK / "home"
+        volume = WORK / "volume"
+        target = volume / "data"
+        data = home / "data"
+        (target / "irmin_store").mkdir(parents=True)
+        (target / "chaindata").mkdir()
+        (target / "HEAD.json").write_text(
+            '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
+            encoding="utf-8",
+        )
+        home.mkdir()
+        data.symlink_to(target, target_is_directory=True)
+        config = WORK / "keys" / "node.env"
+        identity_path = config.parent / "wallet.json"
+        wallet = ensure_wallet(identity_path)
+        (target / "wallet.json").write_bytes(identity_path.read_bytes())
+        (target / "wallet.json").chmod(0o600)
+        bundle = WORK / "network.env"
+        sync_binary = WORK / "state_sync_client"
+        sync_binary.write_bytes(b"client")
+        network = network_values()
+        write_env(bundle, network)
+        write_env(config, {
+            **network,
+            "OCTRA_DATA_DIR": str(data),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(bundle),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "OCTRA_OPERATOR_SYNC_BINARY": str(sync_binary),
+            "OCTRA_OPERATOR_SYNC_BINARY_HASH": hashlib.sha256(b"client").hexdigest(),
+            "OCTRA_OPERATOR_SYNC_CONCURRENCY": "4",
+            "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
+            "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
+        })
+
+        def install(*args, **__):
+            selected = args[2]
+            (selected / "irmin_store").mkdir(parents=True)
+            (selected / "chaindata").mkdir()
+            (selected / "HEAD.json").write_text(
+                '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
+                encoding="utf-8",
+            )
+
+        with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
+            "validator_recover.sync_snapshot", side_effect=install
+        ):
+            recover(config, replace_state=True)
+        prior = target.with_name("data.prior-99")
+        self.assertTrue(data.is_symlink())
+        self.assertEqual(data.resolve(), target.resolve())
+        self.assertTrue((prior / "HEAD.json").is_file())
+        self.assertEqual(load_wallet(target / "wallet.json"), wallet)
+        self.assertFalse(home.joinpath("data.prior-99").exists())
+        head_bytes = (target / "HEAD.json").read_bytes()
+        with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
+            "validator_recover.sync_snapshot",
+            side_effect=ValidatorError("source unavailable"),
+        ):
+            with self.assertRaisesRegex(ValidatorError, "source unavailable"):
+                recover(config, replace_state=True)
+        self.assertTrue(data.is_symlink())
+        self.assertEqual((target / "HEAD.json").read_bytes(), head_bytes)
+        self.assertFalse(target.with_name("data.prior-100").exists())
 
     def test_recovery_restores_state_after_sync_failure(self):
         data = WORK / "data"

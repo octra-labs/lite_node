@@ -21,9 +21,12 @@ let view base store =
     Store_irmin.repo = base.Store_irmin.repo;
     store;
     batch_tree = None;
+    account_mode = Rule_graph.Prior;
     stealth_counter = ref !(base.stealth_counter);
     tags = base.tags;
+    split_epoch = base.split_epoch;
     tag_lock = Lwt_mutex.create ();
+    store_path = base.store_path;
     pvac_dir = base.pvac_dir;
     state_root_file = base.state_root_file;
   }
@@ -79,8 +82,8 @@ let with_state ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id:_ ~proposal_
         if unchanged then Lwt.return result
         else Lwt.return_error "preview_state_changed"
 
-let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id ~proposal_id
-    ?(expected_prev_root : string option) f =
+let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~fold ~epoch_id
+    ~proposal_id ?(expected_prev_root : string option) f =
   with_state
     ~base_store
     ?base_ledger
@@ -98,8 +101,8 @@ let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id ~proposal_
         sender_key_activation_epoch =
           Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
         validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
-        fold = Epoch_exec.prior_fold;
-        begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
+        fold;
+        begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
         commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "preview");
         flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
         get_head_hash = (fun () -> Store_irmin.get_head_hash store);

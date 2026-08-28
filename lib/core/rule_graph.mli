@@ -49,6 +49,7 @@ val set_live_activation : t -> activation option
 val set_fold_cap_activation : t -> activation option
 val set_open_activation : t -> activation option
 val object_cost_activation : t -> activation option
+val account_pack_activation : t -> activation option
 val ready_config_hash : t -> string option
 
 val root_after_floor :
@@ -118,6 +119,11 @@ val set_open :
   (mode, fault) result
 
 val object_cost :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val account_pack :
   t ->
   epoch:int ->
   (mode, fault) result

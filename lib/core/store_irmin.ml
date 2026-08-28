@@ -35,6 +35,12 @@ let tag_id branch =
     with _ -> None
   else None
 
+let split_id branch =
+  if String.length branch > 11 && String.sub branch 0 11 = "pack_split_" then
+    try Some (int_of_string (String.sub branch 11 (String.length branch - 11)))
+    with _ -> None
+  else None
+
 let add_tag epoch tags =
   if Int_set.mem epoch tags.ids then tags
   else {
@@ -59,29 +65,38 @@ let drop_tag epoch tags =
 
 let load_tags repo =
   let* branches = Store.Branch.list repo in
-  let rec loop scanned tags = function
-    | [] -> Lwt.return tags
+  let rec loop scanned tags split = function
+    | [] -> Lwt.return (tags, split)
     | branch :: rest ->
       let tags =
         match tag_id branch with
         | Some epoch -> add_tag epoch tags
         | None -> tags
       in
+      let split =
+        match split_id branch, split with
+        | Some epoch, Some prior -> Some (max epoch prior)
+        | Some epoch, None -> Some epoch
+        | None, prior -> prior
+      in
       let scanned = scanned + 1 in
       let* () =
         if scanned mod 256 = 0 then Lwt.pause () else Lwt.return_unit
       in
-      loop scanned tags rest
+      loop scanned tags split rest
   in
-  loop 0 empty_tags branches
+  loop 0 empty_tags None branches
 
 type t = {
   repo : Store.repo;
   mutable store : Store.t;
   mutable batch_tree : Store.tree option;
+  mutable account_mode : Rule_graph.mode;
   stealth_counter : int64 ref;
   mutable tags : tag_index;
+  mutable split_epoch : int option;
   tag_lock : Lwt_mutex.t;
+  store_path : string;
   pvac_dir : string;
   state_root_file : string;
 }
@@ -148,7 +163,7 @@ let open_store ?(fresh=false) ?(readonly=false) path =
   in
   let* repo = Store.Repo.v config in
   let* store = Store.main repo in
-  let* tags = load_tags repo in
+  let* tags, split_epoch = load_tags repo in
   let counter = ref 0L in
   let* v = Store.find store ["index"; "stealth_counter"] in
   (match v with
@@ -167,9 +182,12 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     repo;
     store;
     batch_tree = None;
+    account_mode = Rule_graph.Prior;
     stealth_counter = counter;
     tags;
+    split_epoch;
     tag_lock = Lwt_mutex.create ();
+    store_path = path;
     pvac_dir = pvac_dir_of_store_path path;
     state_root_file = state_root_file_of_store_path path;
   }
@@ -231,12 +249,13 @@ let remove_path t path =
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e);
        Lwt.fail (Irmin_remove_failed errmsg))
 
-let begin_epoch_batch t =
+let begin_epoch_batch ?(mode=Rule_graph.Prior) t =
   match t.batch_tree with
   | Some _ -> Lwt.fail_with "store epoch batch is already active"
   | None ->
     let* tree = Store.get_tree t.store [] in
     t.batch_tree <- Some tree;
+    t.account_mode <- mode;
     Lwt.return_unit
 
 let commit_epoch_batch t msg =
@@ -248,6 +267,7 @@ let commit_epoch_batch t msg =
     (match result with
      | Ok () ->
        t.batch_tree <- None;
+       t.account_mode <- Rule_graph.Prior;
        Lwt.return_unit
      | Error e ->
        let errmsg = Printf.sprintf "Irmin commit_epoch_batch failed msg=%s: %s" msg
@@ -260,7 +280,8 @@ let commit_epoch_batch t msg =
        Lwt.fail (Irmin_write_failed errmsg))
 
 let abort_epoch_batch t =
-  t.batch_tree <- None
+  t.batch_tree <- None;
+  t.account_mode <- Rule_graph.Prior
 
 let save_batch t =
   match t.batch_tree with
@@ -282,15 +303,77 @@ let restore_batch t (savepoint : batch_savepoint) =
 let json_of_account (a : Ledger_types.account) =
   Yojson.Safe.to_string (Ledger_types.account_to_yojson a)
 
-let account_of_json s =
-  match Yojson.Safe.from_string s with
-  | json -> (match Ledger_types.account_of_yojson json with Ok a -> Some a | Error _ -> None)
-  | exception _ -> None
+let account_data_path addr =
+  ["accounts"; addr; "data"]
+
+let account_cipher_path addr =
+  ["accounts"; addr; "cipher"]
+
+let account_meta_path addr =
+  ["accounts"; addr; "cipher"; "meta"]
+
+let account_part_path addr id =
+  ["accounts"; addr; "cipher"; "parts"; id]
+
+let account_from find find_tree addr data =
+  let open Lwt.Syntax in
+  match data with
+  | Account_pack.Old account -> Lwt.return_ok account
+  | Account_pack.Parts _ ->
+    let* cipher_tree = find_tree (account_cipher_path addr) in
+    let* meta = find (account_meta_path addr) in
+    let ids =
+      match cipher_tree, meta with
+      | None, _ -> Error "account cipher storage is missing"
+      | Some _, None -> Error "account cipher metadata is missing"
+      | Some _, Some raw ->
+        Result.map Account_pack.ids (Account_pack.meta raw)
+    in
+    begin
+      match ids with
+      | Error _ as error -> Lwt.return error
+      | Ok ids ->
+        let rec load acc = function
+          | [] -> Lwt.return_ok (List.rev acc)
+          | id :: rest ->
+            let* raw = find (account_part_path addr id) in
+            begin
+              match raw with
+              | None -> Lwt.return_error "account cipher part is missing"
+              | Some raw -> load ((id, raw) :: acc) rest
+            end
+        in
+        let* parts = load [] ids in
+        begin
+          match parts with
+          | Error _ as error -> Lwt.return error
+          | Ok parts ->
+            Lwt.return
+              (Account_pack.read
+                 data
+                 ~meta
+                 ~get:(fun id -> List.assoc_opt id parts))
+        end
+    end
 
 let get_account t addr =
-  let* v = read t ["accounts"; addr; "data"] in
+  let* v = read t (account_data_path addr) in
   match v with
-  | Some s -> Lwt.return (account_of_json s)
+  | Some raw ->
+    begin
+      match Account_pack.data raw with
+      | Error error ->
+        Lwt.fail_with ("account data rejected: " ^ error)
+      | Ok (Account_pack.Old account) -> Lwt.return_some account
+      | Ok data ->
+        let* account = account_from (read t) (read_tree t) addr data in
+        begin
+          match account with
+          | Ok account -> Lwt.return_some account
+          | Error error ->
+            Lwt.fail_with ("account storage rejected: " ^ error)
+        end
+    end
   | None -> Lwt.return_none
 
 type merkle_proof = {
@@ -299,10 +382,16 @@ type merkle_proof = {
   value : string option;
 }
 
-type account_merkle_proof = merkle_proof
+type account_merkle_proof = {
+  ledger_state_root : string;
+  proof : string;
+  value : string option;
+  proof_kind : string;
+  path : string list;
+}
 
 let proof_path addr =
-  ["accounts"; addr; "data"]
+  account_data_path addr
 
 let proof_bin proof =
   let enc = Irmin.Type.unstage (Irmin.Type.to_bin_string Store.Tree.Proof.t) in
@@ -438,8 +527,62 @@ let merkle_proof_at_epoch t epoch_id path =
   | None -> Lwt.return_error "epoch tag is missing"
   | Some commit -> prove_tree t (Store.Commit.tree commit) path
 
+let account_value find find_tree addr =
+  let* raw = find (account_data_path addr) in
+  match raw with
+  | None -> Lwt.return_ok None
+  | Some raw ->
+    begin
+      match Account_pack.data raw with
+      | Error error -> Lwt.return_error error
+      | Ok data ->
+        let* account = account_from find find_tree addr data in
+        Lwt.return (Result.map (fun account -> Some (json_of_account account)) account)
+    end
+
+let prove_account_tree t tree addr =
+  let* key = tree_key t tree in
+  match key with
+  | None -> Lwt.return_error "missing store tree key"
+  | Some key ->
+    let ledger_state_root =
+      Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree)
+    in
+    let* raw = Store.Tree.find tree (account_data_path addr) in
+    let proof_kind, path =
+      match Option.bind raw (fun raw -> Result.to_option (Account_pack.data raw)) with
+      | Some (Account_pack.Parts _) -> "irmin_account_tree", ["accounts"; addr]
+      | Some (Account_pack.Old _)
+      | None -> "irmin_account_path_v1", proof_path addr
+    in
+    let* proof, value =
+      Store.Tree.produce_proof t.repo key (fun view ->
+        let* value =
+          account_value
+            (Store.Tree.find view)
+            (Store.Tree.find_tree view)
+            addr
+        in
+        Lwt.return (view, value))
+    in
+    begin
+      match value with
+      | Error error -> Lwt.return_error error
+      | Ok value ->
+        Lwt.return_ok {
+          ledger_state_root;
+          proof = Base64.encode_exn (proof_bin proof);
+          value;
+          proof_kind;
+          path;
+        }
+    end
+
 let account_merkle_proof t addr =
-  merkle_proof t (proof_path addr)
+  let* key = head_tree_key t in
+  match key with
+  | None -> Lwt.return_error "missing store head"
+  | Some (tree, _) -> prove_account_tree t tree addr
 
 let verify_merkle_proof_lwt ~ledger_state_root ~path ~proof =
   match Base64.decode proof with
@@ -472,16 +615,51 @@ let verify_merkle_proof_det ~ledger_state_root ~path ~proof =
   | Lwt.Sleep -> Error "proof verification did not settle"
 
 let verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof =
-  verify_merkle_proof_lwt
-    ~ledger_state_root
-    ~path:(proof_path addr)
-    ~proof
+  match Base64.decode proof with
+  | Error (`Msg error) ->
+    Lwt.return_error ("invalid proof base64: " ^ error)
+  | Ok raw ->
+    begin
+      match proof_of_bin raw with
+      | Error (`Msg error) ->
+        Lwt.return_error ("invalid proof encoding: " ^ error)
+      | Ok proof ->
+        begin
+          match
+            proof_root (Store.Tree.Proof.before proof),
+            proof_root (Store.Tree.Proof.after proof)
+          with
+          | Some before_root, Some after_root
+            when before_root = ledger_state_root
+                 && after_root = ledger_state_root ->
+            let* result =
+              Store.Tree.verify_proof proof (fun tree ->
+                let* value =
+                  account_value
+                    (Store.Tree.find tree)
+                    (Store.Tree.find_tree tree)
+                    addr
+                in
+                Lwt.return (tree, value))
+            in
+            begin
+              match result with
+              | Error (`Proof_mismatch error) ->
+                Lwt.return_error ("proof mismatch: " ^ error)
+              | Ok (_, Error error) -> Lwt.return_error error
+              | Ok (_, Ok value) -> Lwt.return_ok value
+            end
+          | Some before_root, _ ->
+            Lwt.return_error ("proof root mismatch: " ^ before_root)
+          | None, _ -> Lwt.return_error "proof root is not a node"
+        end
+    end
 
 let verify_account_merkle_proof ~ledger_state_root ~addr ~proof =
   Lwt_main.run (verify_account_merkle_proof_lwt ~ledger_state_root ~addr ~proof)
 
 let load_all_accounts t =
-  let result = ref [] in
+  let rows = ref [] in
   let* tree_opt = read_tree t ["accounts"] in
   let* () = match tree_opt with
    | None -> Lwt.return ()
@@ -492,17 +670,106 @@ let load_all_accounts t =
          let leaf = List.nth_opt path (List.length path - 1) in
          if leaf = Some "data" then begin
            let addr = (match path with a :: _ -> a | _ -> "") in
-           if addr <> "" then
-             match account_of_json value with
-             | Some acc -> result := (addr, acc) :: !result
-             | None -> ()
+           if addr <> "" then rows := (addr, value) :: !rows
          end;
          Lwt.return_unit)
        tree () in
-  Lwt.return !result
+  let rec load result = function
+    | [] -> Lwt.return result
+    | (addr, raw) :: rest ->
+      begin
+        match Account_pack.data raw with
+        | Error error ->
+          Lwt.fail_with ("account data rejected: " ^ error)
+        | Ok (Account_pack.Old account) ->
+          load ((addr, account) :: result) rest
+        | Ok data ->
+          let* account = account_from (read t) (read_tree t) addr data in
+          begin
+            match account with
+            | Ok account -> load ((addr, account) :: result) rest
+            | Error error ->
+              Lwt.fail_with ("account storage rejected: " ^ error)
+          end
+      end
+  in
+  load [] !rows
+
+let set_old t addr account =
+  let* cipher_tree = read_tree t (account_cipher_path addr) in
+  let* () =
+    match cipher_tree with
+    | None -> Lwt.return_unit
+    | Some _ -> remove_path t (account_cipher_path addr)
+  in
+  write t (account_data_path addr) (Account_pack.old account)
+
+let set_parts t addr a data next_id =
+    let* prior_raw = read t (account_data_path addr) in
+    let prior =
+      match prior_raw with
+      | None -> None
+      | Some raw ->
+        begin
+          match Account_pack.data raw with
+          | Ok data -> Some data
+          | Error error -> failwith ("account data rejected: " ^ error)
+        end
+    in
+    let same =
+      match prior with
+      | Some (Account_pack.Parts (_, prior_id)) ->
+        String.equal prior_id next_id
+      | Some (Account_pack.Old _)
+      | None -> false
+    in
+    if same then
+      let* meta = read t (account_meta_path addr) in
+      let* cipher_tree = read_tree t (account_cipher_path addr) in
+      let valid =
+        match cipher_tree, meta with
+        | Some _, Some raw ->
+          begin
+            match Account_pack.meta raw with
+            | Ok meta -> String.equal (Account_pack.key meta) next_id
+            | Error _ -> false
+          end
+        | None, _
+        | Some _, None -> false
+      in
+      if valid then write t (account_data_path addr) data
+      else Lwt.fail_with "account cipher reference is invalid"
+    else
+      let image = Account_pack.image a in
+      let* () = remove_path t (account_cipher_path addr) in
+      let seen = Hashtbl.create (List.length image.parts) in
+      let* () =
+        Lwt_list.iter_s
+          (fun (part : Blob_chunk.part) ->
+            match Hashtbl.find_opt seen part.id with
+            | Some raw when String.equal raw part.raw -> Lwt.return_unit
+            | Some _ -> Lwt.fail_with "account cipher part collision"
+            | None ->
+              Hashtbl.add seen part.id part.raw;
+              write t (account_part_path addr part.id) part.raw)
+          image.parts
+      in
+      let* () =
+        match image.meta with
+        | None -> Lwt.return_unit
+        | Some meta -> write t (account_meta_path addr) meta
+      in
+      write t (account_data_path addr) image.data
 
 let set_account t addr (a : Ledger_types.account) =
-  write t ["accounts"; addr; "data"] (json_of_account a)
+  match t.account_mode with
+  | Rule_graph.Prior -> set_old t addr a
+  | Rule_graph.Active ->
+    begin
+      match Account_pack.head a with
+      | None -> set_old t addr a
+      | Some (data, id) -> set_parts t addr a data id
+    end
 
 let sum_balances t =
   let sum = ref Z.zero in
@@ -515,21 +782,22 @@ let sum_balances t =
       ~contents:(fun path value () ->
         let leaf = List.nth_opt path (List.length path - 1) in
         if leaf = Some "data" then begin
-          match account_of_json value with
-          | Some a -> sum := Z.add !sum a.Ledger_types.balance
-          | None -> ()
+          match Account_pack.balance value with
+          | Ok balance -> sum := Z.add !sum balance
+          | Error error -> failwith ("account data rejected: " ^ error)
         end;
         Lwt.return_unit)
       tree () in
     Lwt.return !sum
 
 let get_encrypted_balance t addr =
-  let* v = read t ["accounts"; addr; "data"] in
-  match v with
-  | Some s ->
-    (match account_of_json s with
-     | Some a -> Lwt.return (Option.value ~default:"0" a.Ledger_types.encrypted_balance)
-     | None -> Lwt.return "0")
+  let* account = get_account t addr in
+  match account with
+  | Some account ->
+    Lwt.return
+      (Option.value
+         ~default:"0"
+         account.Ledger_types.encrypted_balance)
   | None -> Lwt.return "0"
 
 let set_encrypted_balance t addr cipher =
@@ -1750,9 +2018,10 @@ let verify_integrity t =
     Lwt.return { ok = false; head_hash = ""; accounts_sampled = 0;
                  accounts_ok = 0; errors = ["no head commit — store empty or corrupted"] }
   | Some commit ->
+    let head_tree = Store.Commit.tree commit in
     let head_hash =
       Irmin.Type.to_string Store.Hash.t
-        (Store.Tree.hash (Store.Commit.tree commit))
+        (Store.Tree.hash head_tree)
     in
     let* tree_exists = read_tree t ["accounts"] in
     (if tree_exists = None then err "accounts subtree missing");
@@ -1767,18 +2036,37 @@ let verify_integrity t =
             let leaf = List.nth_opt path (List.length path - 1) in
             if leaf = Some "data" then begin
               incr sampled;
-              (try
-                 let j = Yojson.Safe.from_string value in
-                 match Ledger_types.account_of_yojson j with
-                 | Ok _a -> incr ok_count
-                 | Error e ->
-                   let addr = if List.length path >= 2 then List.nth path (List.length path - 2) else "?" in
-                   err (Printf.sprintf "account %s: json decode failed: %s" addr e)
-               with exn ->
-                 let addr = if List.length path >= 2 then List.nth path (List.length path - 2) else "?" in
-                 err (Printf.sprintf "account %s: parse exception: %s" addr (Printexc.to_string exn)))
-            end;
-            Lwt.return_unit)
+              let addr =
+                if List.length path >= 2 then
+                  List.nth path (List.length path - 2)
+                else
+                  "?"
+              in
+              match Account_pack.data value with
+              | Error error ->
+                err (Printf.sprintf "account %s: json decode failed: %s" addr error);
+                Lwt.return_unit
+              | Ok data ->
+                let* account =
+                  account_from
+                    (Store.Tree.find head_tree)
+                    (Store.Tree.find_tree head_tree)
+                    addr
+                    data
+                in
+                begin
+                  match account with
+                  | Ok _ -> incr ok_count
+                  | Error error ->
+                    err
+                      (Printf.sprintf
+                         "account %s: storage decode failed: %s"
+                         addr
+                         error)
+                end;
+                Lwt.return_unit
+            end else
+              Lwt.return_unit)
           tree () in
     let* meta_ok =
       let* v = read t ["meta"; "last_epoch"] in
@@ -2069,26 +2357,142 @@ let epoch_tag_stats t =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
     Lwt.return (t.tags.count, t.tags.min_epoch, t.tags.max_epoch))
 
-let gc_keep_epochs = 50000
+let pack_gc_status t =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    Lwt.return
+      (t.split_epoch, Store.Gc.is_allowed t.repo, not (Store.Gc.is_finished t.repo)))
+
+type gc_start =
+  | Gc_started of { floor : int; removed : int }
+  | Gc_split of int
+  | Gc_wait of int
+  | Gc_space of { free : int64; need : int64 }
+  | Gc_busy
+  | Gc_off
+  | Gc_missing of int
+  | Gc_error of string
+
+let gc_keep_epochs = 8192
+let gc_reserve = Int64.shift_left 1L 33
+
+external disk_free : string -> int64 = "octra_disk_free"
+
+let sat_add left right =
+  if Int64.compare left (Int64.sub Int64.max_int right) > 0 then Int64.max_int
+  else Int64.add left right
+
+let pack_bytes path =
+  Sys.readdir path
+  |> Array.fold_left (fun total name ->
+    let file = Filename.concat path name in
+    match (Unix.LargeFile.lstat file).Unix.LargeFile.st_kind with
+    | Unix.S_REG -> sat_add total (Unix.LargeFile.stat file).Unix.LargeFile.st_size
+    | _ -> total
+  ) 0L
+
+let remove_tags_before t floor =
+  let rec loop removed seq =
+    match seq () with
+    | Seq.Nil -> Lwt.return removed
+    | Seq.Cons (epoch, _) when epoch >= floor -> Lwt.return removed
+    | Seq.Cons (epoch, rest) ->
+      let* () =
+        Store.Branch.remove t.repo (Printf.sprintf "epoch_%d" epoch)
+      in
+      t.tags <- drop_tag epoch t.tags;
+      let removed = removed + 1 in
+      let* () =
+        if removed mod 256 = 0 then Lwt.pause () else Lwt.return_unit
+      in
+      loop removed rest
+  in
+  loop 0 (Int_set.to_seq t.tags.ids)
 
 let cleanup_old_tags t current_epoch =
-  let cutoff = current_epoch - gc_keep_epochs in
-  if cutoff <= 0 then Lwt.return_unit
+  let floor = current_epoch - gc_keep_epochs in
+  if floor <= 0 then Lwt.return_unit
   else
     Lwt_mutex.with_lock t.tag_lock (fun () ->
-      let rec loop removed seq =
-        match seq () with
-        | Seq.Nil -> Lwt.return_unit
-        | Seq.Cons (epoch, _) when epoch >= cutoff -> Lwt.return_unit
-        | Seq.Cons (epoch, rest) ->
-          let* () =
-            Store.Branch.remove t.repo (Printf.sprintf "epoch_%d" epoch)
-          in
-          t.tags <- drop_tag epoch t.tags;
-          let removed = removed + 1 in
-          let* () =
-            if removed mod 256 = 0 then Lwt.pause () else Lwt.return_unit
-          in
-          loop removed rest
-      in
-      loop 0 (Int_set.to_seq t.tags.ids))
+      let* _ = remove_tags_before t floor in
+      Lwt.return_unit)
+
+let gc_done epoch = function
+  | Ok stats ->
+    let seconds = Irmin_pack_unix.Stats.Latest_gc.total_duration stats in
+    Octra_log.info "gc"
+      "event = pack_gc status = complete epoch = %d seconds = %.3f"
+      epoch seconds;
+    Lwt.return_unit
+  | Error (`Msg reason) ->
+    Octra_log.error "gc"
+      "event = pack_gc status = failed epoch = %d reason = %s"
+      epoch reason;
+    Lwt.return_unit
+
+let remove_old_splits t epoch =
+  let* branches = Store.Branch.list t.repo in
+  Lwt_list.iter_s (fun branch ->
+    match split_id branch with
+    | Some value when value <> epoch -> Store.Branch.remove t.repo branch
+    | _ -> Lwt.return_unit
+  ) branches
+
+let set_split t epoch commit =
+  Store.split t.repo;
+  let branch = Printf.sprintf "pack_split_%d" epoch in
+  let* () = Store.Branch.set t.repo branch commit in
+  let* () = remove_old_splits t epoch in
+  t.split_epoch <- Some epoch;
+  Store.flush t.repo;
+  Lwt.return_unit
+
+let collect_pack_at ?free t ~keep current_epoch =
+  Lwt.catch
+    (fun () ->
+      if current_epoch <= 0 then Lwt.return (Gc_missing current_epoch)
+      else if not (Store.Gc.is_allowed t.repo) then Lwt.return Gc_off
+      else if not (Store.Gc.is_finished t.repo) then Lwt.return Gc_busy
+      else
+        Lwt_mutex.with_lock t.tag_lock (fun () ->
+          let* head = Store.Head.find t.store in
+          match head, t.split_epoch with
+          | None, _ -> Lwt.return (Gc_missing current_epoch)
+          | Some head, None ->
+            let* () = set_split t current_epoch head in
+            Lwt.return (Gc_split current_epoch)
+          | Some _, Some floor when current_epoch - floor < keep ->
+            Lwt.return (Gc_wait (floor + keep))
+          | Some head, Some floor ->
+            let branch = Printf.sprintf "pack_split_%d" floor in
+            let* commit = Store.Branch.find t.repo branch in
+            match commit with
+            | None -> Lwt.return (Gc_missing floor)
+            | Some commit ->
+            let need = sat_add (pack_bytes t.store_path) gc_reserve in
+            let free = Option.value ~default:(disk_free t.store_path) free in
+            if Int64.compare free need < 0 then
+              Lwt.return (Gc_space { free; need })
+            else
+              let* () = set_split t current_epoch head in
+              let* removed = remove_tags_before t floor in
+              Store.flush t.repo;
+              let* started =
+                Store.Gc.run
+                  ~finished:(gc_done current_epoch)
+                  t.repo
+                  (Store.Commit.key commit)
+              in
+              match started with
+              | Ok true -> Lwt.return (Gc_started { floor; removed })
+              | Ok false -> Lwt.return Gc_busy
+              | Error (`Msg reason) -> Lwt.return (Gc_error reason)))
+    (fun exn -> Lwt.return (Gc_error (Printexc.to_string exn)))
+
+let collect_pack t current_epoch =
+  collect_pack_at t ~keep:gc_keep_epochs current_epoch
+
+let wait_pack_gc t =
+  let* result = Store.Gc.wait t.repo in
+  match result with
+  | Ok _ -> Lwt.return_ok ()
+  | Error (`Msg reason) -> Lwt.return_error reason

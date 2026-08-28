@@ -7,6 +7,7 @@ type policy = {
   live_mode : Octra_core.Rule_graph.mode;
   seat_mode : Octra_core.Rule_graph.mode;
   open_mode : Octra_core.Rule_graph.mode;
+  account_mode : Octra_core.Rule_graph.mode;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
 

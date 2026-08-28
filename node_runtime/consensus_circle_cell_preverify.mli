@@ -4,6 +4,7 @@
 type runtime = {
   store : Octra_core.Store_irmin.t;
   ledger : Octra_core.Ledger.t;
+  rules : Octra_core.Rule_graph.t;
   env : pre_state_root:string -> Octra_core.Epoch_exec.env;
 }
 

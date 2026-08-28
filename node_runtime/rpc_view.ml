@@ -83,10 +83,10 @@ let account_witness ~inclusion (p : Octra_consensus.C_light_account.t) =
     "account_hash", `String (raw_to_hex p.account_hash);
   ]
 
-let account_irmin_proof ~addr (p : Octra_core.Store_irmin.account_merkle_proof) ~exists =
+let account_irmin_proof ~addr:_ (p : Octra_core.Store_irmin.account_merkle_proof) ~exists =
   `Assoc [
-    "proof_kind", `String "irmin_account_path_v1";
-    "path", `List [`String "accounts"; `String addr; `String "data"];
+    "proof_kind", `String p.proof_kind;
+    "path", `List (List.map (fun value -> `String value) p.path);
     "ledger_state_root", `String p.ledger_state_root;
     "exists", `Bool exists;
     "proof", `String p.proof;
@@ -301,12 +301,16 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
     "validator_address", `String validator_address;
   ]
 
-let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs =
+let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
+    ~gc_enabled ~gc_running =
   `Assoc [
     "count", `Int count;
     "min_epoch", `Int min_epoch;
     "max_epoch", `Int max_epoch;
     "keep_epochs", `Int keep_epochs;
+    "split_epoch", (match split_epoch with Some epoch -> `Int epoch | None -> `Null);
+    "pack_gc_enabled", `Bool gc_enabled;
+    "pack_gc_running", `Bool gc_running;
   ]
 
 let balance ~addr ~account ~pending_nonce =

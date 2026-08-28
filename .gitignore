@@ -15,3 +15,4 @@ runtime_data/
 *.pyc
 *.wasm
 .DS_Store
+.lia.cache

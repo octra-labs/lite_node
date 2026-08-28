@@ -24,8 +24,16 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
     ~validator_view_pub
     ~validator_address
 
-let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs =
-  Rpc_view.epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs
+let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
+    ~gc_enabled ~gc_running =
+  Rpc_view.epoch_tags
+    ~count
+    ~min_epoch
+    ~max_epoch
+    ~keep_epochs
+    ~split_epoch
+    ~gc_enabled
+    ~gc_running
 
 let enrollment_epoch = function
   | None -> `Null

@@ -72,6 +72,7 @@ type fold_ctx = {
   live_mode : Rule_graph.mode;
   seat_mode : Rule_graph.mode;
   open_mode : Rule_graph.mode;
+  account_mode : Rule_graph.mode;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
   start : int64;
@@ -117,7 +118,7 @@ type backend = {
   sender_key_activation_epoch : int option;
   validator_policy : Validator_policy.t;
   fold : int -> (fold_ctx, string) result;
-  begin_batch : unit -> unit Lwt.t;
+  begin_batch : Rule_graph.mode -> unit Lwt.t;
   commit_batch : unit -> unit Lwt.t;
   flush_dirty : unit -> unit Lwt.t;
   get_head_hash : unit -> string option Lwt.t;
@@ -140,6 +141,7 @@ let prior_fold _ =
     live_mode = Rule_graph.Prior;
     seat_mode = Rule_graph.Prior;
     open_mode = Rule_graph.Prior;
+    account_mode = Rule_graph.Prior;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
     start = 0L;
@@ -166,7 +168,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
   fold;
-  begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
+  begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch");
   flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
   get_head_hash = (fun () -> Store_irmin.get_head_hash store);
@@ -192,7 +194,7 @@ let make_overlay_backend ?emission_policy ?emission_schedule
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
   fold;
-  begin_batch = (fun () -> Store_irmin.begin_epoch_batch store);
+  begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch_overlay");
   flush_dirty = (fun () -> Lwt.return_unit);
   get_head_hash = (fun () -> Store_irmin.get_head_hash store);
@@ -3401,7 +3403,8 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
   | Ok () ->
     Lwt.catch
       (fun () ->
-      let* () = backend.begin_batch () in
+      let ctx = fold_at backend env.epoch_id in
+      let* () = backend.begin_batch ctx.account_mode in
       let confirmed = ref [] in
       let rejected = ref [] in
       let confirmed_fees = ref Z.zero in
