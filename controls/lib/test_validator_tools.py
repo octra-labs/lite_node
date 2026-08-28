@@ -277,6 +277,54 @@ class ValidatorToolsTest(unittest.TestCase):
             report(values)
         disk.assert_called_once_with(store)
 
+    def test_store_report_accepts_removed_live_file(self):
+        data = WORK / "devnet"
+        store = data / "irmin_store"
+        store.mkdir(parents=True)
+        transient = data / "epoch_commit_in_progress.json"
+        transient.write_bytes(b"pending")
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        original = Path.lstat
+
+        def vanish(path):
+            if path == transient and path.exists():
+                path.unlink()
+                raise FileNotFoundError(path)
+            return original(path)
+
+        with mock.patch.object(Path, "lstat", vanish), mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value=mock.Mock(free=123),
+        ), mock.patch(
+            "validator_store.rpc_method",
+            return_value=None,
+        ), mock.patch("validator_store.emit"):
+            report(values)
+
+    def test_store_report_accepts_removed_live_dir(self):
+        data = WORK / "devnet"
+        store = data / "irmin_store"
+        store.mkdir(parents=True)
+        transient = data / "pending"
+        transient.mkdir()
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        original = Path.iterdir
+
+        def vanish(path):
+            if path == transient and path.exists():
+                path.rmdir()
+                raise FileNotFoundError(path)
+            return original(path)
+
+        with mock.patch.object(Path, "iterdir", vanish), mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value=mock.Mock(free=123),
+        ), mock.patch(
+            "validator_store.rpc_method",
+            return_value=None,
+        ), mock.patch("validator_store.emit"):
+            report(values)
+
     def test_store_report_skips_bad_prior_tree(self):
         data = WORK / "devnet"
         store = data / "irmin_store"

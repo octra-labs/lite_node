@@ -25,15 +25,26 @@ GC_RESERVE = 8 * 1024 * 1024 * 1024
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
 
-def tree_bytes(path, device=None):
-    meta = path.lstat()
+def tree_bytes(path, device=None, live=False):
+    try:
+        meta = path.lstat()
+    except FileNotFoundError:
+        if live:
+            return 0
+        raise
     if stat.S_ISLNK(meta.st_mode):
         raise ValidatorError(f"symbolic link is not allowed: {path}")
     if device is not None and (meta.st_dev != device or os.path.ismount(path)):
         raise ValidatorError(f"mounted path is not allowed: {path}")
     if stat.S_ISDIR(meta.st_mode):
         device = meta.st_dev if device is None else device
-        return sum(tree_bytes(child, device) for child in path.iterdir())
+        try:
+            children = tuple(path.iterdir())
+        except FileNotFoundError:
+            if live:
+                return 0
+            raise
+        return sum(tree_bytes(child, device, live) for child in children)
     return meta.st_size
 
 def prior_scan(data_path):
@@ -138,7 +149,7 @@ def report(values):
     need = pack + GC_RESERVE
     emit(
         event="storage",
-        data_bytes=tree_bytes(data_path) if data_path.is_dir() else 0,
+        data_bytes=tree_bytes(data_path, live=True) if data_path.is_dir() else 0,
         pack_bytes=pack,
         suffix_bytes=suffix,
         prior_count=len(prior),

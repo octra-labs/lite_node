@@ -1,7 +1,7 @@
 7373e377add5b6e9ef696bc16388844323e55f9ae8590d5490f2d89057779673  ./.gitignore
 88ed90f15b3ffef2595a253fdecec4e32ba25ed0d5315f2b401ca016a00118a9  ./LICENSE
 4664ccb20b4ac392bb42f9b3e59cc4ae9330edd3541839d315e53469826a2a0b  ./README.md
-230b7e51563f75c8ab55be7ee23a785226336dbe742b90b43bfffb29748d492e  ./SOURCE_COMMIT
+60ca6268eecad09f815411ef97d2a634b3592bacd01bd22f6e813acfc463cd3e  ./SOURCE_COMMIT
 cabc8aeab28e74a3dc55db65c26823637cd86ae36fd3cef86f42acd29bc50d98  ./bin/bft_control_tx.ml
 23df8c6cfdb1297fd0b054b945dc566e4b7b9a0771fca64c0a2eefb508c7ccbd  ./bin/dune
 b8428002c5153d73a4cdd7736915f266e6ab3a7379267915c2e33eeb2339a9d9  ./bin/octra_node.ml
@@ -57,7 +57,7 @@ db4bbdd1a73d14180787bc857a2147a37a429d9f0ebef25da0da3d6bad9563dc  ./controls/con
 d9f33ce264273cc648c58d3bc92b0686c7ada7da1b2816c7e83f36cd11fa969f  ./controls/install.sh
 c7c3ee0affbce22c082f4f649464e79dd62c78015e303e48553d3fa12ccda367  ./controls/lib/release.py
 693482dd7ed858fdc5a68f923bc5127a41a6d14c0c4a75cc74f843acff20d1e4  ./controls/lib/sync_need.py
-24bd245d66b562d102cf93e68acef3e2abac15d6ce22a3399533ce3db5dbe9a2  ./controls/lib/test_validator_tools.py
+6b0b3d5e4d7a62e778f67873427d13f9ffd8204e203f5b8837ed059a8397097f  ./controls/lib/test_validator_tools.py
 6386ae63e6ff6dd48f0b0381e01ea7ad1ee16ab8a8a2e0c12ff3fcb7e4450641  ./controls/lib/upgrade.py
 8c55e76baf0e60725500d152da7cec052e8004c2faeeea41be7bf83eaa981d99  ./controls/lib/validator_bundle.py
 e4ffe6700d543846e0c04d5d6cddf1f25de1fcf9e5d5853854a5575aa66b7e61  ./controls/lib/validator_common.py
@@ -69,7 +69,7 @@ f120563b44ece1871ce3db20db82bace9f80571993eb07338ba06e33acccef80  ./controls/lib
 fe212a6cf2abaf1fa5a33ed81b0ae5e205bca28f341f192988d7bf503490f248  ./controls/lib/validator_rejoin.py
 717882ebbf8bc257fd47654ea931611082392b2747eb8356f91f89db8bc72946  ./controls/lib/validator_rpc.py
 da4d90af54324433e10b1d854f8893f7c428c4cdf0828163a6df22b6f8916368  ./controls/lib/validator_status.py
-5ecaa3d558793e80997e99fabe538c9908d57ce84cc9fbd9b86ab1f9fa715c17  ./controls/lib/validator_store.py
+8a4579d69d9b45730fec8f47665419d44bb9b82b028c0350e3fbbe15ac8e01d3  ./controls/lib/validator_store.py
 f7ae9c23fdc61ac60c4b5ac1df3d76cae95e74ef1b6df3a2548cd00536635cd1  ./controls/recover.sh
 e7a11e42090996ad7ea9d260f45def44717f51c5899352bedd5057fbb315e759  ./controls/rejoin.sh
 376b8ae25b240ddb473abb779e0427716cc49e7b7c813d7f7ab6adc803904649  ./controls/run.sh
