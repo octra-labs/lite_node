@@ -124,6 +124,7 @@ from validator_store import prior_scan
 from validator_store import pack_bytes
 from validator_store import report
 from validator_store import remove_prior
+from validator_store import snapshot_stats
 from validator_store import suffix_bytes
 from validator_store import tree_bytes
 import release as release_tool
@@ -381,6 +382,32 @@ class ValidatorToolsTest(unittest.TestCase):
         (store / "store.1.prefix").write_bytes(b"ignored")
         self.assertEqual(suffix_bytes(data), 7)
         self.assertEqual(pack_bytes(data), 14)
+
+    def test_store_reports_snapshot_payload(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        root = WORK / "snapshots"
+        first = root / ("a" * 64)
+        second = root / ("b" * 64)
+        invalid = root / ("c" * 64)
+        first.mkdir(parents=True)
+        second.mkdir()
+        invalid.mkdir()
+        (first / ".certificate.json").write_text(
+            json.dumps({"manifest": {"total_size": "11"}}),
+            encoding="utf-8",
+        )
+        (second / ".certificate.json").write_text(
+            json.dumps({"manifest": {"total_size": 13}}),
+            encoding="utf-8",
+        )
+        (first / "download.lease").write_bytes(b"")
+        (invalid / ".certificate.json").write_text("{}", encoding="utf-8")
+        values = {"OCTRA_STATE_SYNC_SNAPSHOT_DIR": str(root)}
+        self.assertEqual(
+            snapshot_stats(values, data),
+            {"count": 2, "payload": 24, "leased": 1, "skipped": 1},
+        )
 
     def test_store_prune_checks_all_states_before_removal(self):
         data = WORK / "devnet"

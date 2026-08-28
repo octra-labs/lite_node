@@ -208,6 +208,17 @@ let rec remove_tree path =
         Unix.rmdir path
     | _ -> Unix.unlink path
 
+let remove_snapshots root ids =
+  ids
+  |> List.filter_map (fun id ->
+    if not (State_sync.valid_snapshot_id id) then
+      Some (id, "state sync snapshot id is invalid")
+    else
+      try
+        remove_tree (Filename.concat root id);
+        None
+      with exn -> Some (id, Printexc.to_string exn))
+
 let snapshot_entries root =
   if not (Sys.file_exists root) then []
   else
@@ -240,7 +251,8 @@ let active_lease ~now root (id, _) =
 
 let retain data_dir ~retain ~current =
   let root = State_sync.snapshot_root data_dir in
-  if Sys.file_exists root then begin
+  if not (Sys.file_exists root) then []
+  else begin
     let snapshots = snapshot_entries root in
     let leased =
       snapshots
@@ -252,10 +264,13 @@ let retain data_dir ~retain ~current =
       |> retention_plan ~retain ~current
       |> List.filter (fun id -> not (List.mem id leased))
     in
-    List.iter (fun id -> remove_tree (Filename.concat root id)) removed;
-    Sys.readdir root
-    |> Array.iter (fun name ->
-      if staged_snapshot name then remove_tree (Filename.concat root name))
+    let failed = remove_snapshots root removed in
+    let staged =
+      Sys.readdir root
+      |> Array.to_list
+      |> List.filter staged_snapshot
+    in
+    failed @ remove_snapshots root staged
   end
 
 let publisher_count = 2
@@ -622,7 +637,12 @@ let rec perform deps exporter_set state effects =
               (fun () ->
                 Lwt_preemptive.detach
                   (fun () -> retain deps.data_dir ~retain:count ~current)
-                  ())
+                  () >|= List.iter (fun (snapshot, reason) ->
+                    deps.warn
+                      (Printf.sprintf
+                         "event = sync_retention_failed snapshot = %s reason = %s"
+                         snapshot
+                         reason)))
               (fun exn ->
                 deps.warn
                   ("event = sync_retention_failed reason = "
@@ -681,11 +701,13 @@ let run deps =
                   load_published deps exporter_set >>= fun published ->
                   deps.info
                     (Printf.sprintf
-                       "event = sync_cycle_started published = %s interval_epochs = 360 retain = 10"
+                       "event = sync_cycle_started published = %s interval_epochs = %Ld retain = %d"
                        (Option.fold
                           ~none:"none"
                           ~some:Int64.to_string
-                          published));
+                          published)
+                       (Cycle.interval Cycle.default)
+                       (Cycle.retention Cycle.default));
                   run_loop deps exporter_set (Cycle.init ~published)
             end
       end

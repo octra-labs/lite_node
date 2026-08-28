@@ -22,6 +22,8 @@ type t
 
 val policy : interval:int64 -> retain:int -> (policy, string) result
 val default : policy
+val interval : policy -> int64
+val retention : policy -> int
 val init : published:int64 option -> t
 val published : t -> int64 option
 val running : t -> int64 option

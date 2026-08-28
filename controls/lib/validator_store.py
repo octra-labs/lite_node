@@ -95,6 +95,41 @@ def pack_bytes(data_path):
             total += meta.st_size
     return total
 
+def snapshot_stats(values, data_path):
+    selected = values.get("OCTRA_STATE_SYNC_SNAPSHOT_DIR", "").strip()
+    root = (
+        Path(selected).expanduser().resolve()
+        if selected
+        else data_path / "state_sync_snapshots"
+    )
+    if not root.is_dir():
+        return {"count": 0, "payload": 0, "leased": 0, "skipped": 0}
+    count = 0
+    payload = 0
+    leased = 0
+    skipped = 0
+    for path in root.iterdir():
+        try:
+            meta = path.lstat()
+            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
+                skipped += 1
+                continue
+            body = json.loads((path / ".certificate.json").read_text(encoding="utf-8"))
+            size = int(body["manifest"]["total_size"])
+            if size < 0:
+                raise ValueError("negative snapshot size")
+            count += 1
+            payload += size
+            leased += int((path / "download.lease").is_file())
+        except (KeyError, OSError, TypeError, ValueError):
+            skipped += 1
+    return {
+        "count": count,
+        "payload": payload,
+        "leased": leased,
+        "skipped": skipped,
+    }
+
 def data_dir(values):
     return Path(values["OCTRA_DATA_DIR"]).expanduser().resolve()
 
@@ -147,6 +182,7 @@ def report(values):
     suffix = suffix_bytes(data_path)
     pack = pack_bytes(data_path)
     need = pack + GC_RESERVE
+    snapshots = snapshot_stats(values, data_path)
     emit(
         event="storage",
         data_bytes=tree_bytes(data_path, live=True) if data_path.is_dir() else 0,
@@ -158,6 +194,13 @@ def report(values):
         free_bytes=usage.free,
         gc_need_bytes=need,
         gc_ready=str(usage.free >= need).lower(),
+    )
+    emit(
+        event="sync_store",
+        snapshot_count=snapshots["count"],
+        snapshot_payload_bytes=snapshots["payload"],
+        lease_files=snapshots["leased"],
+        snapshot_skipped=snapshots["skipped"],
     )
     for path, size in prior:
         emit(event="prior_state", path=path, bytes=size)

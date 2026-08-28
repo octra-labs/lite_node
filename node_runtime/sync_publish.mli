@@ -60,6 +60,11 @@ val retention_plan :
   (string * int) list ->
   string list
 
+val remove_snapshots :
+  string ->
+  string list ->
+  (string * string) list
+
 val publisher_addresses :
   Octra_consensus.C_types.validator_set ->
   string list
