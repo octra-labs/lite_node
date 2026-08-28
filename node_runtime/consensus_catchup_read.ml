@@ -97,15 +97,8 @@ let log_proposer_divergence ~epoch_id elog =
       (Text.addr_short elog.proposer.creator_addr)
       (Text.addr_short elog.finalized_by)
 
-let build_record deps ~epoch_id ~target_int elog tx_hashes txs_json parsed_txs =
+let build_record deps ~epoch_id ~target_int ~finality elog tx_hashes txs_json parsed_txs =
   let receipts_json = deps.read_receipts target_int in
-  match deps.read_finality target_int with
-  | None ->
-    Octra_log.warn "catchup"
-      "lookup_catchup_range epoch = %Ld finality = missing"
-      epoch_id;
-    None
-  | Some finality ->
   match deps.reward_source target_int elog with
   | Error error ->
     Octra_log.warn "catchup"
@@ -199,17 +192,32 @@ let read_record deps ~epoch_id ~target_int json =
   match Epochlog.epoch_of_json json with
   | None -> None
   | Some elog ->
-    match read_txs deps ~start_txid:elog.start_txid ~tx_count:elog.tx_count with
-    | None -> None
-    | Some (tx_hashes, txs_json) ->
-      match parse_txs txs_json with
-      | Error e ->
-        Octra_log.warn "catchup"
-          "lookup_catchup_range epoch = %Ld tx_parse_failed = %s"
-          epoch_id e;
-        None
-      | Ok parsed_txs ->
-        build_record deps ~epoch_id ~target_int elog tx_hashes txs_json parsed_txs
+    match deps.read_finality target_int with
+    | None ->
+      Octra_log.warn "catchup"
+        "lookup_catchup_range epoch = %Ld finality = missing"
+        epoch_id;
+      None
+    | Some finality ->
+      match read_txs deps ~start_txid:elog.start_txid ~tx_count:elog.tx_count with
+      | None -> None
+      | Some (tx_hashes, txs_json) ->
+        match parse_txs txs_json with
+        | Error e ->
+          Octra_log.warn "catchup"
+            "lookup_catchup_range epoch = %Ld tx_parse_failed = %s"
+            epoch_id e;
+          None
+        | Ok parsed_txs ->
+          build_record
+            deps
+            ~epoch_id
+            ~target_int
+            ~finality
+            elog
+            tx_hashes
+            txs_json
+            parsed_txs
 
 let finish state =
   match List.rev state.records with
