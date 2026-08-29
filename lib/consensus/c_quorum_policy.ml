@@ -16,8 +16,6 @@ let devnet_activation = {
   activation_epoch = 1_306_547;
 }
 
-let devnet_linear_epoch = 1_425_104L
-
 let activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then Some devnet_activation
   else None
@@ -28,9 +26,7 @@ let active ~chain_id ~epoch_id =
   | Some activation ->
     Int64.compare epoch_id (Int64.of_int activation.activation_epoch) >= 0
 
-let linear_epoch ~chain_id =
-  if String.equal chain_id devnet_chain_id then Some devnet_linear_epoch
-  else None
+let linear_epoch ~chain_id:_ = None
 
 let linear_weight ~chain_id ~epoch_id =
   match linear_epoch ~chain_id with
@@ -44,7 +40,6 @@ let count_floor_required ~chain_id ~epoch_id =
 
 let count_cap_required ~chain_id ~epoch_id =
   active ~chain_id ~epoch_id
-  && not (linear_weight ~chain_id ~epoch_id)
 
 let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
   match activation_for_chain chain_id with
@@ -58,7 +53,4 @@ let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
       Int64.compare from_epoch value >= 0
       && Int64.compare to_epoch value < 0
     in
-    not
-      (crosses threshold
-       || (String.equal chain_id devnet_chain_id
-           && crosses devnet_linear_epoch))
+    not (crosses threshold)
