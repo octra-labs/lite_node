@@ -8,6 +8,7 @@ type t = {
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
   handshake_allowed_pubkeys : string list;
   validator_pubkeys : string list;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
 }
 
 type swarm_params = {
@@ -36,6 +37,8 @@ type env = {
   binary_hash_value : string option;
   require_binary_hash : bool;
   allow_dynamic_peers : bool;
+  validator_ready_strict : bool;
+  validator_ready_min_shadow_epochs : int;
 }
 
 type upgrade_log =
@@ -55,16 +58,19 @@ type startup_config = {
   env : env;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
   handshake : t;
+  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
   upgrade_logs : upgrade_log list;
 }
 
 type startup_runtime = {
-  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;
   consensus_config_hash : string;
   handshake : t;
+  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
 }
 
 type node_startup_install_deps = {
@@ -151,6 +157,10 @@ val build_from_env :
   allowed_pubkeys:string list ->
   upgrade_plan:Octra_net.P2p_upgrade_plan.t option ->
   (t, string) result
+
+val readiness_requirements :
+  env ->
+  Octra_core.Validator_ready_policy.requirements
 
 val upgrade_logs :
   Octra_net.P2p_upgrade_plan.t option ->

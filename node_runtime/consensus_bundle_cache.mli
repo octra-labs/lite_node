@@ -150,7 +150,5 @@ val run_preverify_once :
   state_root:string ->
   tx_hashes:string list ->
   txs:Transaction.t list ->
-  (string ->
-   Transaction.t list ->
-   Octra_core.Preverify_worker.batch Lwt.t) ->
+  (Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t) ->
   Octra_core.Preverify_worker.batch Lwt.t

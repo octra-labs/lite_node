@@ -27,10 +27,3 @@ val restore :
   target:string ->
   expected_root:string ->
   (restore_report, string) result Lwt.t
-
-val restore_with :
-  free:(string -> int64) ->
-  source:string ->
-  target:string ->
-  expected_root:string ->
-  (restore_report, string) result Lwt.t

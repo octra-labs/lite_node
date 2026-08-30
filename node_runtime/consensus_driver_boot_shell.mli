@@ -19,12 +19,6 @@ type deps = {
   env_int : string -> int -> int;
   data_dir : string;
   chain_id : string;
-  sync_validators :
-    unit ->
-    (Octra_consensus.C_types.validator_set, string) result;
-  sync_exporters :
-    unit ->
-    (Octra_consensus.C_types.validator_set, string) result;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   consensus_mode : bool;
@@ -97,7 +91,6 @@ type deps = {
   state_readable : unit -> bool;
   sleep : float -> unit Lwt.t;
   now : unit -> float;
-  require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
 }
 

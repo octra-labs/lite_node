@@ -2,9 +2,10 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Log = Octra_log
+module C_codec = Octra_consensus.C_codec
 
 type replay_deps = {
-  committed_head_epoch : unit -> int;
+  current_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;
@@ -51,11 +52,9 @@ type node_deps = {
   read_local_root_raw : unit -> string Lwt.t;
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
-  set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
   bundle_wait_expired : epoch_id:int64 -> unit;
   bundle_wait_recovered : epoch_id:int64 -> unit;
-  require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
@@ -76,11 +75,9 @@ type node_runtime = {
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
   apply_timeout_seconds : float;
-  require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
   runtime_state : Consensus_runtime_state.t;
-  set_state_attested : head:int -> root:string -> unit;
   finality : Consensus_finality_state.callbacks;
 }
 
@@ -98,24 +95,18 @@ let create_with_failure deps on_failure =
   let active_apply = ref None in
   let rec apply_finalized ~validator_set finalize =
     let epoch = finalize.Octra_consensus.C_types.epoch_id in
+    let encoded = C_codec.encode_finalize finalize in
     let validator_set_hash =
       Octra_consensus.C_config.validator_set_hash validator_set
     in
     match !active_apply with
-    | Some (active_finalize, active_set_hash, pending) ->
-      if
-        Consensus_finality_journal.same_block active_finalize finalize
-        && validator_set_hash = active_set_hash
-      then begin
+    | Some (active_epoch, active_encoded, active_set_hash, pending) ->
+      if encoded = active_encoded && validator_set_hash = active_set_hash then begin
         Log.info "consensus"
           "event = finalized_apply_join epoch = %Ld"
           epoch;
         pending
-      end else if
-        Int64.equal
-          epoch
-          active_finalize.Octra_consensus.C_types.epoch_id
-      then
+      end else if Int64.equal epoch active_epoch then
         Lwt.fail_with "conflicting concurrent finalized apply"
       else
         let open Lwt.Syntax in
@@ -123,7 +114,7 @@ let create_with_failure deps on_failure =
         apply_finalized ~validator_set finalize
     | None ->
       let pending, resolver = Lwt.wait () in
-      active_apply := Some (finalize, validator_set_hash, pending);
+      active_apply := Some (epoch, encoded, validator_set_hash, pending);
       let running =
         Lwt.catch
           (fun () ->
@@ -146,7 +137,7 @@ let create_with_failure deps on_failure =
   let replay =
     Consensus_finalized_replay.node_runner
       {
-        committed_head_epoch = deps.replay.committed_head_epoch;
+        current_epoch = deps.replay.current_epoch;
         catchup_active = deps.replay.catchup_active;
         quarantine_active = deps.replay.quarantine_active;
         finality = deps.replay.finality;
@@ -206,7 +197,6 @@ let create_node deps =
                 read_local_root_raw = deps.read_local_root_raw;
                 commit_finality_journal = deps.commit_finality_journal;
                 remove_pending_finalized = deps.remove_pending_finalized;
-                set_state_attested = deps.set_state_attested;
                 apply_timeout_seconds = deps.apply_timeout_seconds;
                 fatal_exit = deps.fatal_exit;
               }
@@ -215,7 +205,7 @@ let create_node deps =
         };
       replay =
         {
-          committed_head_epoch = deps.committed_head_epoch;
+          current_epoch = deps.current_epoch;
           catchup_active = deps.catchup_active;
           quarantine_active = deps.quarantine_active;
           finality = deps.finality;
@@ -223,25 +213,11 @@ let create_node deps =
       };
     }
     (fun finalize exn ->
-      let epoch = finalize.Octra_consensus.C_types.epoch_id in
       Log.fatal "consensus"
         "event = finalized_apply_failure epoch = %Ld reason = %s action = exit"
-        epoch
+        finalize.Octra_consensus.C_types.epoch_id
         (Printexc.to_string exn);
-      begin
-        match Consensus_finality_journal.classify_conflict exn with
-        | Some conflict
-          when Int64.compare epoch 0L >= 0
-               && Int64.compare epoch (Int64.of_int max_int) <= 0 ->
-            Log.fatal "consensus"
-              "event = finality_conflict kind = %s epoch = %Ld action = signed_snapshot"
-              (Consensus_finality_journal.conflict_label conflict)
-              epoch;
-            let epoch = Int64.to_int epoch in
-            deps.require_sync
-              (Sync_need.journal ~epoch ~head:(max 0 (epoch - 1)))
-        | _ -> deps.fatal_exit ()
-      end;
+      deps.fatal_exit ();
       stop_after_fatal ())
 
 let node_deps_of_runtime runtime =
@@ -305,8 +281,6 @@ let node_deps_of_runtime runtime =
              runtime.runtime_state
              ~evidence:(bundle_wait_reason epoch_id)));
     remove_pending_finalized = runtime.finality.remove_finalized;
-    set_state_attested = runtime.set_state_attested;
-    require_sync = runtime.require_sync;
     fatal_exit = runtime.fatal_exit;
     catchup_active = (fun () -> !(runtime.catchup_active));
     quarantine_active = (fun () ->

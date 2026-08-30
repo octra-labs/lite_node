@@ -61,17 +61,17 @@ val epoch_proof_of_header :
   (Octra_consensus.C_light_epoch.t, string) result
 
 val collect_epoch_tx_hashes :
-  (int64 -> (string * int) option) ->
+  (int64 -> (string * int * string) option) ->
   epoch_id:int ->
   start_txid:int64 ->
   tx_count:int ->
-  (string list, string) result Lwt.t
+  string list option
 
 val epoch_proof :
   chain_id:string ->
   Octra_core.Store_chaindata.t ->
   int ->
-  (Octra_consensus.C_light_epoch.t, string) result Lwt.t
+  (Octra_consensus.C_light_epoch.t, string) result
 
 val epoch_proof_params :
   chain_id:string ->
@@ -88,7 +88,7 @@ val tx_inclusion_proof :
   chain_id:string ->
   Octra_core.Store_chaindata.t ->
   string ->
-  (Octra_consensus.C_light_epoch.tx_inclusion * string, string) result Lwt.t
+  (Octra_consensus.C_light_epoch.tx_inclusion * string, string) result
 
 val tx_inclusion_proof_params :
   chain_id:string ->

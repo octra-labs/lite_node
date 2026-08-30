@@ -32,22 +32,3 @@ let is_idle = function
   | Idle -> true
   | Running
   | Requested -> false
-
-let drain ~step ~fail =
-  let open Lwt.Syntax in
-  let turn () =
-    let* result =
-      Lwt.catch
-        (fun () ->
-          let+ completion = step () in
-          Ok completion)
-        (fun exn -> Lwt.return (Error exn))
-    in
-    match result with
-    | Error exn ->
-      fail exn;
-      Lwt.fail exn
-    | Ok Stop -> Lwt.return C_loop.Stop
-    | Ok Continue -> Lwt.return (C_loop.Next ())
-  in
-  C_loop.run turn ()

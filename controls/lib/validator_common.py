@@ -41,7 +41,6 @@ NETWORK_KEYS = frozenset({
     "OCTRA_EMISSION_ACTIVATION_EPOCH",
     "OCTRA_EMISSION_PROFILE",
     "OCTRA_FHE_MAX_PER_EPOCH",
-    "OCTRA_JOIN_RPC",
     "OCTRA_MULTI_EXEC_MAX_CALLS",
     "OCTRA_P2P_REQUIRE_BINARY_HASH",
     "OCTRA_PEERS",
@@ -252,8 +251,8 @@ def private_sync_host(host):
 
 def state_sync_sources(raw):
     sources = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
-    if not sources:
-        raise ValidatorError("at least one state sync source is required")
+    if len(sources) < 2:
+        raise ValidatorError("at least two state sync sources are required")
     if len(sources) != len(set(sources)):
         raise ValidatorError("duplicate state sync source")
     for source in sources:
@@ -369,8 +368,6 @@ def validate_network(values, _bundle_dir):
     validator_entries(values["OCTRA_VALIDATORS"])
     exporter_entries(values["OCTRA_STATE_SYNC_EXPORTERS"])
     state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
-    if "OCTRA_JOIN_RPC" in values:
-        state_sync_sources(values["OCTRA_JOIN_RPC"])
     validate_program_keys(values["OCTRA_PROGRAM_RELEASE_KEYS"])
     bootstraps = endpoint_list(values["OCTRA_BOOTSTRAP_PEERS"])
     if len(bootstraps) < 2:

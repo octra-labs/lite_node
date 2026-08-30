@@ -10,7 +10,7 @@ let marker_name = "download.lease"
 let renew_interval = 60.
 let active_window = 900.
 let max_snapshot_age = 86_400.
-let retained_limit = 8
+let retained_limit = 2
 
 let marker snapshot = Filename.concat snapshot marker_name
 

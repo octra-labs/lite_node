@@ -174,23 +174,10 @@ let transaction ~find_drop chaindata ~params =
       err e
 
 let transactions chaindata ~params =
-  let query = History.transactions_query params in
   let all_epochs =
-    match query.History.transactions_epoch_param with
-    | Some epoch ->
-      if Option.is_some (Store_chaindata.get_epoch_header chaindata epoch) then
-        [epoch]
-      else
-        []
-    | None ->
-      begin
-        match Store_chaindata.get_last_epoch chaindata with
-        | Some header ->
-          History.recent_epochs
-            ~last:header.Octra_core.Epochlog.id
-            ~count:5
-        | None -> []
-      end
+    Store_chaindata.list_epoch_ids chaindata
+    |> List.sort_uniq compare
+    |> List.rev
   in
   let result =
     History.transactions_list_result

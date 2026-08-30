@@ -431,11 +431,21 @@ let prepare ~store ~ledger ~current_epoch tx =
         end
     end
 
+let verify_classified plan =
+  Pvac_verify_worker.classified_result
+    (P.Circle_cell {
+       pubkey = plan.pubkey;
+       cipher = plan.cipher;
+       ciphertext_commitment = plan.ciphertext_commitment;
+       proof_kind = plan.proof_kind;
+       proof = plan.proof;
+       amount_commitment = plan.amount_commitment;
+     })
+
 let verify plan =
-  Pvac_verify_worker.verify_circle_cell
-    ~pubkey:plan.pubkey
-    ~cipher:plan.cipher
-    ~ciphertext_commitment:plan.ciphertext_commitment
-    ~proof_kind:plan.proof_kind
-    ~proof:plan.proof
-    ~amount_commitment:plan.amount_commitment
+  let open Lwt.Syntax in
+  let* result = verify_classified plan in
+  Lwt.return
+    (Result.map_error
+       Pvac_verify_worker.verification_failure_message
+       result)

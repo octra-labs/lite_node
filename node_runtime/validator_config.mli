@@ -21,7 +21,6 @@ type t = {
   current_validator_list : Octra_consensus.C_types.validator_info list;
   next_validator_list : Octra_consensus.C_types.validator_info list;
   active_validator_list : Octra_consensus.C_types.validator_info list;
-  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;
@@ -90,7 +89,6 @@ val fingerprint_of_validator_set :
   string
 
 val light_scheduled_of_driver :
-  chain_id:string ->
   Octra_consensus.C_driver.scheduled_validator_set_config option ->
   Octra_consensus.C_config.scheduled option
 

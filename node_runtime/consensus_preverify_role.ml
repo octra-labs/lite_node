@@ -4,7 +4,7 @@
 module Transaction = Octra_core.Transaction
 
 type runner =
-  string -> Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t
+  Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t
 
 type build = Build of runner
 type validate = Validate of runner

@@ -23,11 +23,6 @@ type ready_payload = {
   consensus_pubkey_b64 : string;
   head_epoch : int64;
   state_root : string;
-  chain_id : string option;
-  binary_hash : string option;
-  config_hash : string option;
-  catchup_head_epoch : int64 option;
-  shadow_epochs : int option;
 }
 
 let meta_key = "bft.validator_registry"
@@ -412,45 +407,6 @@ let parse_int64 label = function
   | `Int value -> Ok (Int64.of_int value)
   | _ -> Error (label ^ " must be string or int")
 
-let optional_string fields name =
-  match List.assoc_opt name fields with
-  | Some (`String value) when value <> "" -> Some value
-  | None
-  | Some _ -> None
-
-let lower_hash value =
-  String.length value = 64
-  && String.for_all
-       (function
-         | '0' .. '9'
-         | 'a' .. 'f' -> true
-         | _ -> false)
-       value
-
-let optional_hash fields name =
-  match optional_string fields name with
-  | Some value when lower_hash value -> Some value
-  | None
-  | Some _ -> None
-
-let optional_int64 fields name =
-  match List.assoc_opt name fields with
-  | Some value ->
-    begin
-      match parse_int64 ("validator ready " ^ name) value with
-      | Ok value when Int64.compare value 0L >= 0 -> Some value
-      | Ok _
-      | Error _ -> None
-    end
-  | None -> None
-
-let optional_int fields name =
-  match optional_int64 fields name with
-  | Some value when Int64.compare value (Int64.of_int max_int) <= 0 ->
-    Some (Int64.to_int value)
-  | None
-  | Some _ -> None
-
 let parse_optional_int64 label = function
   | `Null -> Ok None
   | value -> Result.map Option.some (parse_int64 label value)
@@ -664,17 +620,7 @@ let ready_payload_of_message = function
               Some (`String state_root) ->
               Result.map
                 (fun head_epoch ->
-                  {
-                    consensus_pubkey_b64;
-                    head_epoch;
-                    state_root;
-                    chain_id = optional_string fields "chain_id";
-                    binary_hash = optional_hash fields "binary_hash";
-                    config_hash = optional_hash fields "config_hash";
-                    catchup_head_epoch =
-                      optional_int64 fields "catchup_head_epoch";
-                    shadow_epochs = optional_int fields "shadow_epochs";
-                  })
+                  { consensus_pubkey_b64; head_epoch; state_root })
                 (parse_int64 "validator ready head epoch" head_epoch_json)
             | _ ->
               Error

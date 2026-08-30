@@ -10,9 +10,3 @@ type t = {
 }
 
 val of_inputs : cli_observer:bool -> env_mode:string option -> t
-
-val publisher : t -> t
-
-val recovery : t -> t
-
-val with_need : Sync_need.t option -> t -> t

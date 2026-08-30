@@ -259,7 +259,6 @@ type verify_proposal_deps = {
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
-  head_txid_hi : unit -> int64 option;
   root_to_raw32 : string -> string;
   set_proposal : Transaction.t list -> string list -> unit;
   share_txs : Transaction.t list -> unit;

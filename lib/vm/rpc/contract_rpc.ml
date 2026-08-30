@@ -650,6 +650,36 @@ let verify ~store ~addr ~source ~files_json =
                     (String.sub compiled_hash 0 16))
                  None)
           else
+            let source_json =
+              match files_json with
+              | Some files_json ->
+                Yojson.Safe.to_string (source_files source files_json)
+              | None -> source
+            in
+            let* () =
+              Store_irmin.save_contract_source store addr source_json
+            in
+            let* () =
+              Store_irmin.save_contract_abi store addr result.abi_json
+            in
+            let* () =
+              if String.equal result.verification_json "" then
+                Lwt.return_unit
+              else
+                Store_irmin.save_contract_verification
+                  store
+                  addr
+                  result.verification_json
+            in
+            let* () =
+              if String.equal result.certificate_json "" then
+                Lwt.return_unit
+              else
+                Store_irmin.save_contract_certificate
+                  store
+                  addr
+                  result.certificate_json
+            in
             ok_lwt
               (`Assoc
                  ([

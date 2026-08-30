@@ -30,7 +30,7 @@ let producer_short t =
   String.sub t.producer 0 (min 14 (String.length t.producer))
 
 let tx_of_json tx_json =
-  match Octra_core.Tx_payload.decode_admit (Yojson.Safe.from_string tx_json) with
+  match Octra_core.Transaction.of_yojson (Yojson.Safe.from_string tx_json) with
   | Ok tx -> tx
   | Error e -> failwith (Printf.sprintf "tx decode: %s" e)
 

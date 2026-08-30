@@ -67,11 +67,12 @@ type persistent_update_deps = {
 
 type node_view = {
   validator_config : Validator_config.t;
-  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_validator_set_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   consensus_config_hash : string;
   p2p_config : P2p_config.t;
+  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
   swarm_params : P2p_config.swarm_params;
   swarm : Octra_net.P2p_swarm.t;
 }
@@ -106,10 +107,6 @@ type node_start = {
     unit ->
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
   activate_validator_set :
-    Octra_consensus.C_types.validator_set ->
-    string ->
-    unit Lwt.t;
-  activate_validator_set_relief :
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
@@ -204,11 +201,12 @@ let stack_view (stack : P2p_config.node_stack) =
   let P2p_config.{ startup; runtime; swarm_start } = stack in
   {
     validator_config = startup.validator;
-    stake_vs = runtime.stake_vs;
     active_vs = runtime.active_vs;
     scheduled_validator_set_config = runtime.scheduled_driver_config;
     consensus_config_hash = runtime.consensus_config_hash;
     p2p_config = runtime.handshake;
+    readiness_requirements = runtime.readiness_requirements;
+    readiness_runtime = runtime.readiness_runtime;
     swarm_params = swarm_start.params;
     swarm = swarm_start.swarm;
   }
@@ -284,7 +282,20 @@ let persistent_update_deps_of_runtime runtime =
   }
 
 let load_runtime_persistent_update runtime =
-  load_persistent_update (persistent_update_deps_of_runtime runtime)
+  let open Lwt.Syntax in
+  let* config =
+    load_persistent_update (persistent_update_deps_of_runtime runtime)
+  in
+  match config with
+  | None -> Lwt.return_none
+  | Some config ->
+    let validator_set =
+      Octra_consensus.C_types.validator_set_for_epoch
+        ~chain_id:runtime.chain_id
+        ~epoch_id:config.activate_epoch
+        config.validator_set
+    in
+    Lwt.return_some { config with validator_set }
 
 let validator_pubkeys validator_set =
   validator_set.Octra_consensus.C_types.validators
@@ -351,9 +362,7 @@ let start_node runtime =
     let scheduled = ref view.scheduled_validator_set_config in
     let install scheduled_driver =
       let light =
-        Validator_config.light_scheduled_of_driver
-          ~chain_id:runtime.chain_id
-          scheduled_driver
+        Validator_config.light_scheduled_of_driver scheduled_driver
       in
       let open Lwt.Syntax in
       let* () =
@@ -374,14 +383,8 @@ let start_node runtime =
         match loaded with
         | None -> Lwt.return_none
         | Some config ->
-          let effective =
-            Octra_consensus.C_types.validator_set_for_epoch
-              ~chain_id:runtime.chain_id
-              ~epoch_id:(runtime.current_height ())
-              config.validator_set
-          in
           let next =
-            if same_validator_set !active effective
+            if same_validator_set !active config.validator_set
                && Int64.compare config.activate_epoch (runtime.current_height ()) <= 0 then
               None
             else
@@ -408,7 +411,4 @@ let start_node runtime =
         in
         active := validator_set;
         install next);
-      activate_validator_set_relief = (fun validator_set _ ->
-        active := validator_set;
-        install !scheduled);
     }

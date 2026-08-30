@@ -17,22 +17,26 @@ type entry = {
   hash : string;
 }
 
-module Index_key = struct
-  type t = string * int * string
+let compare_entry_rate a b =
+  Z.compare
+    (Z.mul b.tx.Transaction.ou a.ou)
+    (Z.mul a.tx.Transaction.ou b.ou)
 
-  let compare (af, an, ah) (bf, bn, bh) =
-    let sender = String.compare af bf in
-    if sender <> 0 then sender
+module Sender_queue = Map.Make(String)
+
+module Selection_head = Set.Make(struct
+  type t = string * entry
+
+  let compare (sender_a, a) (sender_b, b) =
+    let rate = compare_entry_rate a b in
+    if rate <> 0 then rate
     else
-      let nonce = Int.compare an bn in
-      if nonce <> 0 then nonce else String.compare ah bh
-end
-
-module Index = Map.Make(Index_key)
+      let hash = String.compare a.hash b.hash in
+      if hash <> 0 then hash else String.compare sender_a sender_b
+end)
 
 let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
 let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
-let view_index = ref Index.empty
 let total_ou = ref Z.zero
 
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
@@ -111,40 +115,8 @@ let all () =
   Hashtbl.fold (fun _ e acc -> e.tx :: acc) staging []
   |> Transaction.consensus_order
 
-let rec first limit seq acc =
-  if limit <= 0 then List.rev acc
-  else
-    match seq () with
-    | Seq.Nil -> List.rev acc
-    | Seq.Cons (value, rest) -> first (limit - 1) rest (value :: acc)
-
-let index_key entry =
-  entry.tx.Transaction.from, entry.tx.Transaction.nonce, entry.hash
-
-let sender_entries sender =
-  let rec collect sequence entries =
-    match sequence () with
-    | Seq.Nil -> List.rev entries
-    | Seq.Cons (((entry_sender, _, _), entry), rest) ->
-      if String.equal entry_sender sender then collect rest (entry :: entries)
-      else List.rev entries
-  in
-  Index.to_seq_from (sender, min_int, "") !view_index
-  |> fun sequence -> collect sequence []
-
-let sender_has_pending sender =
-  match Index.to_seq_from (sender, min_int, "") !view_index () with
-  | Seq.Cons (((entry_sender, _, _), _), _) ->
-    String.equal entry_sender sender
-  | Seq.Nil -> false
-
-let sample limit =
-  first (max 0 limit) (Index.to_seq !view_index) []
-  |> List.map (fun (_, entry) -> entry.hash, entry.tx)
-
 let clear () =
   List.iter Hashtbl.clear [staging; hash_index];
-  view_index := Index.empty;
   Hashtbl.clear virtual_balances;
   Hashtbl.clear virtual_nonces;
   total_ou := Z.zero
@@ -159,7 +131,6 @@ let insert tx =
   let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash } in
   Hashtbl.add staging key entry;
   Hashtbl.add hash_index hash entry;
-  view_index := Index.add (index_key entry) entry !view_index;
   total_ou := Z.add !total_ou ou;
   Hashtbl.replace virtual_balances tx.from
     (Z.sub (Hashtbl.find virtual_balances tx.from) (public_balance_cost tx));
@@ -169,34 +140,43 @@ let insert tx =
 let evict entry =
   Hashtbl.remove staging entry.key;
   Hashtbl.remove hash_index entry.hash;
-  view_index := Index.remove (index_key entry) !view_index;
   total_ou := Z.sub !total_ou entry.ou;
   Hashtbl.replace virtual_balances entry.tx.from
     (Z.add (Hashtbl.find virtual_balances entry.tx.from)
        (public_balance_cost entry.tx))
 
 let evict_nonce_dependents sender nonce =
-  sender_entries sender
-  |> List.filter (fun entry -> entry.tx.Transaction.nonce > nonce)
-  |> List.map (fun e ->
+  let dependents = Hashtbl.fold (fun _ e acc ->
+    if e.tx.Transaction.from = sender && e.tx.Transaction.nonce > nonce then e :: acc else acc
+  ) staging [] in
+  let sorted = List.sort (fun a b -> compare a.tx.Transaction.nonce b.tx.Transaction.nonce) dependents in
+  List.map (fun e ->
     evict e;
     record_drop e.hash e.tx Evicted "nonce gap from eviction"
-  )
+  ) sorted
 
 let init_virtual_state ~lookup addr =
-  if not (sender_has_pending addr) then begin
+  let has_pending = Hashtbl.fold (fun _ e found ->
+    found || e.tx.Transaction.from = addr) staging false in
+
+  if not (Hashtbl.mem virtual_balances addr) || not has_pending then begin
     let balance, nonce = match lookup addr with
       | Some (b, n) -> (b, n)
       | None -> (Z.zero, 0)
     in
     Hashtbl.replace virtual_balances addr balance;
     Hashtbl.replace virtual_nonces addr nonce;
-    Ok ()
-  end else if Hashtbl.mem virtual_balances addr
-              && Hashtbl.mem virtual_nonces addr then
-    Ok ()
-  else
-    Error "staging sender state is inconsistent"
+
+    if has_pending then
+      Hashtbl.iter (fun _ e ->
+        if e.tx.Transaction.from = addr then begin
+          Hashtbl.replace virtual_balances addr
+            (Z.sub (Hashtbl.find virtual_balances addr) (public_balance_cost e.tx));
+          Hashtbl.replace virtual_nonces addr
+            (max (Hashtbl.find virtual_nonces addr) e.tx.Transaction.nonce)
+        end
+      ) staging
+  end
 
 let check_virtual_balance addr amount =
   match Hashtbl.find_opt virtual_balances addr with
@@ -217,19 +197,19 @@ let rbf_bump_ok new_tx old_tx =
   Z.geq (Z.mul (Z.mul new_tx.Transaction.ou co) (Z.of_int 100))
         (Z.mul (Z.mul old_tx.Transaction.ou cn) (Z.of_int 110))
 
-let add_smart ~lookup tx =
+let add_smart ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
   let ou = Transaction.ou_cost tx in
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let total_cost = public_balance_cost tx in
-  match init_virtual_state ~lookup tx.from with
-  | Error _ as error -> error
-  | Ok () ->
+  init_virtual_state ~lookup tx.from;
   let base_nonce = match lookup tx.from with
     | Some (_, n) -> n | None -> 0
   in
-  if tx.nonce <= base_nonce then Error "nonce too low (already used)"
+  if Z.sign ou_limit <= 0 || tx_limit <= 0 then
+    Error "staging limits must be positive"
+  else if tx.nonce <= base_nonce then Error "nonce too low (already used)"
   else if tx.nonce > base_nonce + 1000 then Error "nonce too far ahead"
-  else if Z.gt ou max_ou then
+  else if Z.gt ou ou_limit then
     Error "transaction too large for staging capacity"
   else
     match Hashtbl.find_opt staging key with
@@ -257,7 +237,7 @@ let add_smart ~lookup tx =
         Error "insufficient balance (including pending)"
       else
         let needs_eviction =
-          Z.gt (Z.add !total_ou ou) max_ou || Hashtbl.length staging >= max_staging_txs in
+          Z.gt (Z.add !total_ou ou) ou_limit || Hashtbl.length staging >= tx_limit in
         if needs_eviction then begin
           let evictable_ou = Hashtbl.fold (fun _ e acc ->
             if Transaction.better_fee_rate tx e.tx then Z.add acc e.ou else acc
@@ -265,19 +245,21 @@ let add_smart ~lookup tx =
           let evictable_count = Hashtbl.fold (fun _ e acc ->
             if Transaction.better_fee_rate tx e.tx then acc + 1 else acc
           ) staging 0 in
-          let ou_deficit = Z.max Z.zero (Z.sub (Z.add !total_ou ou) max_ou) in
-          let count_deficit = max 0 (Hashtbl.length staging + 1 - max_staging_txs) in
+          let ou_deficit = Z.max Z.zero (Z.sub (Z.add !total_ou ou) ou_limit) in
+          let count_deficit = max 0 (Hashtbl.length staging + 1 - tx_limit) in
           if Z.lt evictable_ou ou_deficit || evictable_count < count_deficit then
             Error "staging full (insufficient evictable capacity)"
           else
             let sorted_by_rate = Hashtbl.fold (fun _ e acc -> e :: acc) staging []
-              |> List.sort (fun a b -> Transaction.cmp_fee_rate_desc a.tx b.tx |> ( * ) (-1)) in
+              |> List.sort (fun a b ->
+                let rate = -(Transaction.cmp_fee_rate_desc a.tx b.tx) in
+                if rate <> 0 then rate else String.compare a.hash b.hash) in
             let rec evict_loop evicted_list = function
               | [] -> evicted_list
               | candidate :: rest ->
                 if not (Hashtbl.mem staging candidate.key) then
                   evict_loop evicted_list rest
-                else if Z.leq (Z.add !total_ou ou) max_ou && Hashtbl.length staging < max_staging_txs then
+                else if Z.leq (Z.add !total_ou ou) ou_limit && Hashtbl.length staging < tx_limit then
                   evicted_list
                 else if not (Transaction.better_fee_rate tx candidate.tx) then
                   evicted_list
@@ -317,65 +299,67 @@ let get_ordered_txs () =
 
 let max_ou_per_epoch = Z.of_int 10_000_000_000
 
+let compare_sender_entry a b =
+  let nonce = Int.compare a.tx.Transaction.nonce b.tx.Transaction.nonce in
+  if nonce <> 0 then nonce else String.compare a.hash b.hash
+
+let sender_queues () =
+  Hashtbl.fold
+    (fun _ entry queues ->
+      Sender_queue.update
+        entry.tx.Transaction.from
+        (function
+          | None -> Some [entry]
+          | Some queue -> Some (entry :: queue))
+        queues)
+    staging
+    Sender_queue.empty
+  |> Sender_queue.map (List.sort compare_sender_entry)
+
+let add_selection_head sender queue heads =
+  match queue with
+  | entry :: _ -> Selection_head.add (sender, entry) heads
+  | [] -> heads
+
+let selection_heads queues =
+  Sender_queue.fold add_selection_head queues Selection_head.empty
+
+let rec select_epoch_txs capacity queues heads used batch =
+  match Selection_head.min_elt_opt heads with
+  | None -> List.rev batch
+  | Some (sender, entry) ->
+    let heads = Selection_head.remove (sender, entry) heads in
+    match Sender_queue.find_opt sender queues with
+    | Some (current :: rest) when String.equal current.hash entry.hash ->
+      if Z.gt (Z.add used entry.ou) capacity then
+        select_epoch_txs
+          capacity
+          (Sender_queue.remove sender queues)
+          heads
+          used
+          batch
+      else
+        let queues =
+          match rest with
+          | [] -> Sender_queue.remove sender queues
+          | _ -> Sender_queue.add sender rest queues
+        in
+        select_epoch_txs
+          capacity
+          queues
+          (add_selection_head sender rest heads)
+          (Z.add used entry.ou)
+          (entry.tx :: batch)
+    | _ -> invalid_arg "staging selection state"
+
 let get_epoch_txs ~capacity =
-  let by_sender = Hashtbl.create 50 in
-  List.iter (fun (tx : Transaction.t) ->
-    let prev = match Hashtbl.find_opt by_sender tx.from with
-      | Some l -> l | None -> [] in
-    Hashtbl.replace by_sender tx.from (tx :: prev)
-  ) (all ());
-  let queues = Hashtbl.create 50 in
-  let sorted_senders = Hashtbl.fold (fun k _ acc -> k :: acc) by_sender []
-    |> List.sort String.compare in
-  List.iter (fun sender ->
-    match Hashtbl.find_opt by_sender sender with
-    | Some txs ->
-      let sorted = List.sort (fun (a : Transaction.t) b -> compare a.nonce b.nonce) txs in
-      Hashtbl.add queues sender sorted
-    | None -> ()
-  ) sorted_senders;
-  let next_tx () =
-    let best = ref None in
-    let senders = Hashtbl.fold (fun k _ acc -> k :: acc) queues []
-      |> List.sort String.compare in
-    List.iter (fun sender ->
-      match Hashtbl.find_opt queues sender with
-      | None | Some [] -> ()
-      | Some ((tx : Transaction.t) :: _) ->
-        (match !best with
-         | None -> best := Some (sender, tx)
-         | Some (_, btx) ->
-           if Transaction.better_fee_rate tx btx then best := Some (sender, tx)
-           else if Transaction.cmp_fee_rate_desc tx btx = 0
-                   && String.compare (Transaction.hash tx) (Transaction.hash btx) < 0 then
-             best := Some (sender, tx))
-    ) senders;
-    !best
-  in
-  let consume sender =
-    let rest = match Hashtbl.find queues sender with
-      | _ :: tl -> tl | [] -> [] in
-    if rest = [] then Hashtbl.remove queues sender
-    else Hashtbl.replace queues sender rest
-  in
-  let batch = ref [] in
-  let used = ref Z.zero in
-  let continue = ref true in
-  while !continue do
-    match next_tx () with
-    | None -> continue := false
-    | Some (sender, tx) ->
-      let cost = Transaction.ou_cost tx in
-      if Z.gt (Z.add !used cost) capacity then begin
-        Hashtbl.remove queues sender;
-        if Hashtbl.length queues = 0 then continue := false
-      end else begin
-        consume sender;
-        batch := tx :: !batch;
-        used := Z.add !used cost
-      end
-  done;
-  List.rev !batch
+  let queues = sender_queues () in
+  select_epoch_txs
+    capacity
+    queues
+    (selection_heads queues)
+    Z.zero
+    []
 
 let remove_by_hash h =
   match Hashtbl.find_opt hash_index h with
@@ -384,7 +368,9 @@ let remove_by_hash h =
 
 let clear_virtual_state touched =
   Hashtbl.iter (fun addr () ->
-    if not (sender_has_pending addr) then begin
+    let has_pending = Hashtbl.fold (fun _ e found ->
+      found || e.tx.Transaction.from = addr) staging false in
+    if not has_pending then begin
       Hashtbl.remove virtual_balances addr;
       Hashtbl.remove virtual_nonces addr
     end
@@ -434,7 +420,8 @@ let min_relay_fee tx =
   else if usage < 95 then Z.mul base (Z.of_int 2)
   else Z.mul base (Z.of_int 5)
 
-let stats_of txs =
+let get_stats () =
+  let txs = all () in
   let by_sender = Hashtbl.create 50 in
   List.iter (fun (tx : Transaction.t) ->
     let cost = public_balance_cost tx in
@@ -444,8 +431,4 @@ let stats_of txs =
     in
     Hashtbl.replace by_sender tx.from (count, total)
   ) txs;
-  by_sender
-
-let get_stats () =
-  let txs = all () in
-  txs, stats_of txs
+  (txs, by_sender)

@@ -6,7 +6,6 @@
   octra_consensus
   unix
   yojson
-  base64
   digestif
   digestif.c
   lwt.unix

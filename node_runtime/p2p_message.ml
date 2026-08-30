@@ -13,7 +13,6 @@ let consensus_types = [
   Octra_net.P2p_frame.msg_cons_vote;
   Octra_net.P2p_frame.msg_cons_finalize;
   Octra_net.P2p_frame.msg_cons_round_sync;
-  Octra_net.P2p_frame.msg_cons_round_fetch;
   Octra_net.P2p_frame.msg_query_epoch_root;
   Octra_net.P2p_frame.msg_epoch_root_response;
   Octra_net.P2p_frame.msg_query_bundle;

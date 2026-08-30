@@ -79,8 +79,6 @@ val start :
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->
   epoch_visibility:Epoch_visibility.t ->
   resource_compute:Resource_compute_service.t ->
-  validator_enrollment:(unit ->
-    (Status_read_rpc.enrollment_snapshot, string) result) ->
   unit Lwt.t
 
 val start_task :
@@ -106,7 +104,5 @@ val start_task :
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->
   epoch_visibility:Epoch_visibility.t ->
   resource_compute:Resource_compute_service.t ->
-  validator_enrollment:(unit ->
-    (Status_read_rpc.enrollment_snapshot, string) result) ->
   unit ->
   unit Lwt.t

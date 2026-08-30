@@ -6,9 +6,13 @@ let start rules =
   | None -> 0L
   | Some activation -> Int64.of_int activation.Octra_core.Rule_graph.activation_epoch
 
+let profile_start rules =
+  match Octra_core.Rule_graph.set_live_activation rules with
+  | None -> start rules
+  | Some activation ->
+    Int64.of_int activation.Octra_core.Rule_graph.activation_epoch
+
 type policy = {
-  ready_mode : Octra_core.Rule_graph.mode;
-  ready_ref_mode : Octra_core.Rule_graph.mode;
   live_mode : Octra_core.Rule_graph.mode;
   seat_mode : Octra_core.Rule_graph.mode;
   open_mode : Octra_core.Rule_graph.mode;
@@ -18,35 +22,23 @@ type policy = {
 
 let policy rules epoch =
   match
-    Octra_core.Rule_graph.validator_ready rules ~epoch,
-    Octra_core.Rule_graph.ready_ref rules ~epoch,
     Octra_core.Rule_graph.set_live rules ~epoch,
     Octra_core.Rule_graph.set_fold_cap rules ~epoch,
     Octra_core.Rule_graph.set_open rules ~epoch,
     Octra_core.Rule_graph.account_pack rules ~epoch
   with
-  | Error fault, _, _, _, _, _
-  | _, Error fault, _, _, _, _
-  | _, _, Error fault, _, _, _
-  | _, _, _, Error fault, _, _
-  | _, _, _, _, Error fault, _
-  | _, _, _, _, _, Error fault -> Error (Octra_core.Rule_graph.fault_message fault)
-  | Ok ready_mode, Ok ready_ref_mode, Ok live_mode, Ok seat_mode, Ok open_mode,
-    Ok account_mode ->
+  | Error fault, _, _, _
+  | _, Error fault, _, _
+  | _, _, Error fault, _
+  | _, _, _, Error fault ->
+    Error (Octra_core.Rule_graph.fault_message fault)
+  | Ok live_mode, Ok seat_mode, Ok open_mode, Ok account_mode ->
     let cap_mode =
       match seat_mode with
       | Octra_core.Rule_graph.Prior -> Octra_core.Set_fold.Reject
       | Octra_core.Rule_graph.Active -> Octra_core.Set_fold.Prune
     in
-    Ok {
-      ready_mode;
-      ready_ref_mode;
-      live_mode;
-      seat_mode;
-      open_mode;
-      account_mode;
-      cap_mode;
-    }
+    Ok { live_mode; seat_mode; open_mode; account_mode; cap_mode }
 
 let resolve rules ~chain_id ~parent epoch =
   match Octra_core.Rule_graph.set_fold rules ~epoch, policy rules epoch with
@@ -55,15 +47,13 @@ let resolve rules ~chain_id ~parent epoch =
   | Ok Octra_core.Rule_graph.Prior, Ok policy ->
     Ok Octra_core.Epoch_exec.{
       mode = Octra_core.Rule_graph.Prior;
-      ready_mode = policy.ready_mode;
-      ready_ref_mode = policy.ready_ref_mode;
       live_mode = policy.live_mode;
       seat_mode = policy.seat_mode;
       open_mode = policy.open_mode;
       account_mode = policy.account_mode;
       cap_mode = policy.cap_mode;
-      ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
       start = start rules;
+      profile_start = profile_start rules;
       parent;
       members = [];
     }
@@ -78,15 +68,13 @@ let resolve rules ~chain_id ~parent epoch =
           | Ok (_, _, members) ->
             Ok Octra_core.Epoch_exec.{
               mode = Octra_core.Rule_graph.Active;
-              ready_mode = policy.ready_mode;
-              ready_ref_mode = policy.ready_ref_mode;
               live_mode = policy.live_mode;
               seat_mode = policy.seat_mode;
               open_mode = policy.open_mode;
               account_mode = policy.account_mode;
               cap_mode = policy.cap_mode;
-              ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
               start = start rules;
+              profile_start = profile_start rules;
               parent;
               members;
             }

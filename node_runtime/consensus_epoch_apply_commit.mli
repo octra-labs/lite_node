@@ -15,7 +15,6 @@ type effects = {
     rollback:(unit -> bool) ->
     Consensus_epoch_commit.failure_effects;
   log_boundary : Consensus_epoch_commit.boundary_log -> unit;
-  refuse : epoch_id:int -> head_epoch:int -> unit Lwt.t;
 }
 
 type input = {
@@ -63,7 +62,6 @@ type node_effects = {
   chaindata : Octra_core.Store_chaindata.t;
   finality_state : Consensus_finality_state.t;
   irmin_last_epoch : unit -> int;
-  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 

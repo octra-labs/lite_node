@@ -2,14 +2,15 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type policy = {
-  ready_mode : Octra_core.Rule_graph.mode;
-  ready_ref_mode : Octra_core.Rule_graph.mode;
   live_mode : Octra_core.Rule_graph.mode;
   seat_mode : Octra_core.Rule_graph.mode;
   open_mode : Octra_core.Rule_graph.mode;
   account_mode : Octra_core.Rule_graph.mode;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
+
+val start : Octra_core.Rule_graph.t -> int64
+val profile_start : Octra_core.Rule_graph.t -> int64
 
 val policy :
   Octra_core.Rule_graph.t ->

@@ -106,7 +106,7 @@ let fatal_lines ~epoch_id = function
     ]
 
 let selected ?(effects = []) txs receipts_json =
-  match Octra_core.Tx_outcome.split_admit receipts_json with
+  match Octra_core.Tx_outcome.split receipts_json with
   | Error error -> Error (Outcome_invalid error)
   | Ok partition ->
     match

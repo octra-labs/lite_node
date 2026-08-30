@@ -215,15 +215,8 @@ let initialize_crypto exit_fatal =
     Octra_log.fatal "init" "crypto = failed error = %s" (Printexc.to_string e);
     exit_fatal ()
 
-let set_async_exception_hook report =
-  Lwt.async_exception_hook := report
-
 let configure_process ~exit_fatal =
   Octra_log.init_from_env ();
-  set_async_exception_hook (fun error ->
-    Octra_log.error "runtime"
-      "event = async_exception status = contained error = %s"
-      (Printexc.to_string error));
   Octra_log.info "init" "starting_node backend = irmin-pack";
   configure_lwt_engine ();
   initialize_crypto exit_fatal;

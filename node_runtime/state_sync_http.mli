@@ -32,14 +32,6 @@ val handle_manifest :
   validator_set:Octra_consensus.C_types.validator_set ->
   (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
 
-val handle_head :
-  data_dir:string ->
-  chain_id:string ->
-  config_hash:string ->
-  validator_set:Octra_consensus.C_types.validator_set ->
-  current_epoch:int ref ->
-  (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
-
 val handle_chunk :
   data_dir:string ->
   chain_id:string ->

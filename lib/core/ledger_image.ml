@@ -41,21 +41,6 @@ let max_part_bytes = 4_096
 let max_value_bytes = Transaction.circle_asset_max_encrypted_data_len
 let drain_bytes = 4 * 1_024 * 1_024
 let import_batch = 4_096
-let import_reserve = Int64.mul 1_024L 1_024L |> Int64.mul 1_024L
-
-external disk_free : string -> int64 = "octra_disk_free"
-
-let space_need bytes =
-  if Int64.compare bytes (Int64.div (Int64.sub Int64.max_int import_reserve) 2L) > 0
-  then Int64.max_int
-  else Int64.add (Int64.mul bytes 2L) import_reserve
-
-let close_store store =
-  Lwt.catch
-    (fun () ->
-      let* () = Irmin_store.close store in
-      Lwt.return_none)
-    (fun exn -> Lwt.return_some (Printexc.to_string exn))
 
 let rec remove_tree path =
   if Sys.file_exists path then
@@ -385,23 +370,15 @@ let verify_existing target expected_root =
         (fun () -> Irmin_store.close store))
     (fun exn -> Lwt.return_error (Printexc.to_string exn))
 
-let build ~free source stage expected_root =
+let build source stage expected_root =
   let source_stat = Unix.LargeFile.lstat source in
   if source_stat.Unix.LargeFile.st_kind <> Unix.S_REG then
     Lwt.return_error "ledger image source is not a regular file"
   else
   let size = source_stat.Unix.LargeFile.st_size in
-  let needed = space_need size in
-  let available = free (Filename.dirname stage) in
-  if Int64.compare available needed < 0 then
-    Lwt.return_error
-      (Printf.sprintf
-         "ledger restore space is insufficient: need=%Ld available=%Ld"
-         needed
-         available)
-  else
-    let* store = Irmin_store.open_store ~fresh:true stage in
-    let run () =
+  let* store = Irmin_store.open_store ~fresh:true stage in
+  Lwt.finalize
+    (fun () ->
       let* records = restore_records store source in
       let* committed_root = Irmin_store.get_head_hash store in
       let* commit = Irmin_store.get_commit_hash store in
@@ -410,21 +387,10 @@ let build ~free source stage expected_root =
           Lwt.return_ok { commit; root = committed_root; records; bytes = size }
       | Some _, Some _ ->
           Lwt.return_error "ledger image root differs from checkpoint"
-      | _ -> Lwt.return_error "restored ledger commit is missing"
-    in
-    Lwt.try_bind
-      run
-      (fun result ->
-        let* close_error = close_store store in
-        match result, close_error with
-        | Error _, _ | Ok _, None -> Lwt.return result
-        | Ok _, Some reason ->
-            Lwt.return_error ("restored ledger close failed: " ^ reason))
-      (fun exn ->
-        let* _ = close_store store in
-        Lwt.fail exn)
+      | _ -> Lwt.return_error "restored ledger commit is missing")
+    (fun () -> Irmin_store.close store)
 
-let restore_with ~free ~source ~target ~expected_root =
+let restore ~source ~target ~expected_root =
   let stage = target ^ ".next" in
   Lwt.catch
     (fun () ->
@@ -439,7 +405,7 @@ let restore_with ~free ~source ~target ~expected_root =
         end
       else begin
         remove_tree stage;
-        let* result = build ~free source stage expected_root in
+        let* result = build source stage expected_root in
         match result with
         | Error _ as error ->
             remove_tree stage;
@@ -452,6 +418,3 @@ let restore_with ~free ~source ~target ~expected_root =
     (fun exn ->
       (try remove_tree stage with _ -> ());
       Lwt.return_error (Printexc.to_string exn))
-
-let restore ~source ~target ~expected_root =
-  restore_with ~free:disk_free ~source ~target ~expected_root

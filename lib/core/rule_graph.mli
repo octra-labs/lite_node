@@ -29,6 +29,7 @@ val create :
   chain_id:string ->
   root_at:(int -> root_read) ->
   t
+val consensus_id : chain_id:string -> string
 
 val create_ready :
   ready_config_hash:string ->

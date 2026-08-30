@@ -12,7 +12,7 @@ type t = Epoch_exec.reward_attribution = {
   validators : Epoch_exec.reward_validator list;
 }
 
-let fallback ~proposer_addr ~validator_pubkeys =
+let full_set ~proposer_addr ~validator_pubkeys =
   {
     proposer_addr;
     proposer_public_key = List.assoc_opt proposer_addr validator_pubkeys;
@@ -165,7 +165,7 @@ let epoch_source ~validator_activation_epoch ~validator_pubkeys header =
     else if
       protocol = Octra_consensus.C_types.proto_version_parent_legacy
     then
-      fallback ~proposer_addr ~validator_pubkeys
+      full_set ~proposer_addr ~validator_pubkeys
       |> to_source
     else
       legacy_current_reward ~proposer_addr ~validator_pubkeys header
@@ -197,33 +197,54 @@ let legacy_finality_reward ~validator_set finalize =
         Base64.encode_exn validator.pubkey)
       validator_set.C_types.validators
   in
-  fallback
+  full_set
     ~proposer_addr:finalize.C_types.header.creator_addr
     ~validator_pubkeys
   |> to_source
   |> fun source -> Result.bind source of_source
 
+let require_reward label expected supplied =
+  Result.bind expected (fun expected ->
+    if expected = supplied then Ok expected
+    else Error ("reward source does not match " ^ label))
+
 let bind_finality ~validator_set finalize supplied =
   match finalize.C_types.header.proto_version with
   | version when version = C_types.proto_version_parent_legacy ->
     legacy_finality_reward ~validator_set finalize
-    |> fun expected ->
-    Result.bind expected (fun expected ->
-      if expected = supplied then Ok expected
-      else Error "reward source does not match legacy finality")
+    |> fun expected -> require_reward "legacy finality" expected supplied
   | version when version = C_types.proto_version_current ->
     begin
-      match finalize.C_types.parent_commit with
-      | None -> Ok supplied
-      | Some parent ->
+      match finalize.C_types.epoch_id, finalize.C_types.parent_commit with
+      | 0L, None ->
+        legacy_finality_reward ~validator_set finalize
+        |> fun expected -> require_reward "current genesis" expected supplied
+      | 0L, Some _ -> Error "genesis reward parent commit is unexpected"
+      | _, None -> Error "current reward parent commit is missing"
+      | _, Some parent ->
         of_parent_commit parent
-        |> fun expected ->
-        Result.bind expected (fun expected ->
-          if expected = supplied then Ok expected
-          else Error "reward source does not match parent commit")
+        |> fun expected -> require_reward "parent commit" expected supplied
     end
   | _ -> Error "reward finality protocol is unsupported"
 
-let resolve ~proposer_addr ~validator_pubkeys = function
-  | None -> Ok (fallback ~proposer_addr ~validator_pubkeys)
-  | Some parent -> of_parent_commit parent
+let resolve_for_epoch ~epoch_id ~proposer_addr ~validator_pubkeys parent =
+  match
+    Octra_consensus.C_protocol.version_for_epoch epoch_id,
+    epoch_id,
+    parent
+  with
+  | version, _, None
+    when version = C_types.proto_version_parent_legacy ->
+    Ok (full_set ~proposer_addr ~validator_pubkeys)
+  | version, _, Some _
+    when version = C_types.proto_version_parent_legacy ->
+    Error "legacy reward parent commit is unexpected"
+  | version, 0L, None when version = C_types.proto_version_current ->
+    Ok (full_set ~proposer_addr ~validator_pubkeys)
+  | version, 0L, Some _ when version = C_types.proto_version_current ->
+    Error "genesis reward parent commit is unexpected"
+  | version, _, None when version = C_types.proto_version_current ->
+    Error "current reward parent commit is missing"
+  | version, _, Some parent when version = C_types.proto_version_current ->
+    of_parent_commit parent
+  | _ -> Error "reward protocol is unsupported"

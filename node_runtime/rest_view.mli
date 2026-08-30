@@ -111,7 +111,6 @@ val search_result_of_query :
   search_result
 
 val staging_view_response :
-  total:int ->
   tx_rows:Yojson.Safe.t list ->
   Yojson.Safe.t
 
@@ -144,7 +143,6 @@ val send_tx_accepted_response :
 
 val staging_stats_response :
   tx_count:int ->
-  sample_count:int ->
   total_ou:Z.t ->
   max_ou:Z.t ->
   by_sender:(string, int * Z.t) Hashtbl.t ->
@@ -196,7 +194,6 @@ val legacy_rest_path :
   bool
 
 val staging_ou_rpc_response :
-  staging_size:int ->
   ou_values:Z.t list ->
   staging_ou:Z.t ->
   capacity:Z.t ->
@@ -205,7 +202,6 @@ val staging_ou_rpc_response :
 val staging_ou_rpc_response_of_txs :
   tx_ou:('a -> Z.t) ->
   txs:'a list ->
-  staging_size:int ->
   staging_ou:Z.t ->
   capacity:Z.t ->
   Yojson.Safe.t

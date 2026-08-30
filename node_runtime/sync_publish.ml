@@ -11,7 +11,6 @@ module Cycle = Octra_bootstrap.Sync_cycle
 module Epochlog = Octra_core.Epochlog
 module Head = Octra_core.Head_manifest
 module Manifest = Octra_bootstrap.State_sync_manifest
-module Roots = Octra_bootstrap.Root_win
 module State_sync = Octra_bootstrap.State_sync
 module C_config = Octra_consensus.C_config
 module C_types = Octra_consensus.C_types
@@ -24,7 +23,6 @@ type prepared = {
   checkpoint_hash : string;
   anchor : Anchor.t;
   trusted_validator_set : C_types.validator_set;
-  roots : C_types.finalize list;
 }
 
 type deps = {
@@ -37,7 +35,6 @@ type deps = {
   trusted_validator_set : unit -> (C_types.validator_set, string) result;
   head : unit -> Head.t option;
   read_finality : int64 -> Consensus_finality_journal.read_result;
-  read_root : int64 -> Consensus_finality_journal.read_result;
   exporter_set : unit -> (C_types.validator_set, string) result;
   certificate_path : unit -> string;
   now : unit -> float;
@@ -175,7 +172,6 @@ let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
           checkpoint_hash;
           anchor;
           trusted_validator_set;
-          roots = [];
         }
 
 let retention_plan ~retain ~current snapshots =
@@ -207,17 +203,6 @@ let rec remove_tree path =
             remove_tree (Filename.concat path name));
         Unix.rmdir path
     | _ -> Unix.unlink path
-
-let remove_snapshots root ids =
-  ids
-  |> List.filter_map (fun id ->
-    if not (State_sync.valid_snapshot_id id) then
-      Some (id, "state sync snapshot id is invalid")
-    else
-      try
-        remove_tree (Filename.concat root id);
-        None
-      with exn -> Some (id, Printexc.to_string exn))
 
 let snapshot_entries root =
   if not (Sys.file_exists root) then []
@@ -251,8 +236,7 @@ let active_lease ~now root (id, _) =
 
 let retain data_dir ~retain ~current =
   let root = State_sync.snapshot_root data_dir in
-  if not (Sys.file_exists root) then []
-  else begin
+  if Sys.file_exists root then begin
     let snapshots = snapshot_entries root in
     let leased =
       snapshots
@@ -264,13 +248,10 @@ let retain data_dir ~retain ~current =
       |> retention_plan ~retain ~current
       |> List.filter (fun id -> not (List.mem id leased))
     in
-    let failed = remove_snapshots root removed in
-    let staged =
-      Sys.readdir root
-      |> Array.to_list
-      |> List.filter staged_snapshot
-    in
-    failed @ remove_snapshots root staged
+    List.iter (fun id -> remove_tree (Filename.concat root id)) removed;
+    Sys.readdir root
+    |> Array.iter (fun name ->
+      if staged_snapshot name then remove_tree (Filename.concat root name))
   end
 
 let publisher_count = 2
@@ -281,17 +262,11 @@ let publisher_addresses exporter_set =
   |> List.sort_uniq String.compare
   |> List.filteri (fun index _ -> index < publisher_count)
 
-let publisher_override = function
-  | None | Some "" | Some "0" -> Ok false
-  | Some "1" -> Ok true
-  | Some _ -> Error "state sync publisher override must be 0 or 1"
-
-let exporter_wallet ~force exporter_set wallet =
+let exporter_wallet exporter_set wallet =
   match C_types.pubkey_of_addr exporter_set wallet.Octra_core.Crypto.Wallet.address with
   | Some public_key
     when public_key = wallet.pub
-         && (force
-             || List.mem wallet.address (publisher_addresses exporter_set)) ->
+         && List.mem wallet.address (publisher_addresses exporter_set) ->
       Ok ()
   | Some public_key when public_key = wallet.pub ->
       Error "state sync publisher is not selected"
@@ -371,12 +346,7 @@ let publish deps exporter_set prepared =
       let fresh () =
         clear_stage target >>= fun () ->
         Capture.build
-          Capture.{
-            data_dir = deps.data_dir;
-            head = prepared.head;
-            store = deps.store;
-            roots = prepared.roots;
-          }
+          Capture.{ data_dir = deps.data_dir; head = prepared.head; store = deps.store }
           ~target >>= function
         | Error reason -> Lwt.return_error reason
         | Ok report ->
@@ -523,81 +493,21 @@ let read_prepared deps epoch =
                       validator_set >>= function
                     | Error reason -> Lwt.return_error reason
                     | Ok steps ->
-                        begin
-                          match
-                            prepare
-                              ~chain_id:deps.chain_id
-                              ~config_hash
-                              ~trusted_validator_set
-                              ~validator_set
-                              ~steps
-                              ~head
-                              record
-                          with
-                          | Error _ as error -> Lwt.return error
-                          | Ok prepared ->
-                              let rec collect current left acc =
-                                if left = 0
-                                   || Int64.compare current.C_types.epoch_id 0L = 0 then
-                                  Lwt.return_ok (List.rev acc)
-                                else
-                                  let prior = Int64.pred current.epoch_id in
-                                  Lwt_preemptive.detach
-                                    (fun () -> deps.read_root prior)
-                                    () >>= function
-                                  | Consensus_finality_journal.Missing ->
-                                      Lwt.return_error
-                                        "ready root finality is missing"
-                                  | Consensus_finality_journal.Invalid reason ->
-                                      Lwt.return_error
-                                        ("ready root finality is invalid: " ^ reason)
-                                  | Consensus_finality_journal.Valid item ->
-                                      begin
-                                        match
-                                          Roots.bind
-                                            ~current
-                                            ~validator_set:item.validator_set
-                                            item.finalize
-                                        with
-                                        | Error _ as error -> Lwt.return error
-                                        | Ok next ->
-                                            begin
-                                              match Roots.verify ~anchor:current [next] with
-                                              | Error _ as error -> Lwt.return error
-                                              | Ok _ ->
-                                                  collect
-                                                    next
-                                                    (left - 1)
-                                                    (next :: acc)
-                                            end
-                                      end
-                              in
-                              collect
-                                (Anchor.finality prepared.anchor)
-                                Roots.width
-                                [] >>= function
-                              | Error _ as error -> Lwt.return error
-                              | Ok roots -> Lwt.return_ok { prepared with roots }
-                        end
+                        Lwt.return
+                          (prepare
+                             ~chain_id:deps.chain_id
+                             ~config_hash
+                             ~trusted_validator_set
+                             ~validator_set
+                             ~steps
+                             ~head
+                             record)
           end
 
-let capture_epochs ~target = function
-  | Some head ->
-      let latest = Int64.of_int head.Head.epoch_id in
-      if Int64.compare latest target > 0 then [latest; target] else [target]
-  | None -> [target]
-
-let capture deps exporter_set target =
-  let rec loop last = function
-    | [] ->
-        Lwt.return_error
-          (Option.value ~default:"state sync HEAD is missing" last)
-    | epoch :: rest ->
-        read_prepared deps epoch >>= function
-        | Ok prepared -> publish deps exporter_set prepared
-        | Error reason -> loop (Some reason) rest
-  in
-  loop None (capture_epochs ~target (deps.head ()))
+let capture deps exporter_set epoch =
+  read_prepared deps epoch >>= function
+  | Error _ as error -> Lwt.return error
+  | Ok prepared -> publish deps exporter_set prepared
 
 let rec perform deps exporter_set state effects =
   match effects with
@@ -637,12 +547,7 @@ let rec perform deps exporter_set state effects =
               (fun () ->
                 Lwt_preemptive.detach
                   (fun () -> retain deps.data_dir ~retain:count ~current)
-                  () >|= List.iter (fun (snapshot, reason) ->
-                    deps.warn
-                      (Printf.sprintf
-                         "event = sync_retention_failed snapshot = %s reason = %s"
-                         snapshot
-                         reason)))
+                  ())
               (fun exn ->
                 deps.warn
                   ("event = sync_retention_failed reason = "
@@ -681,33 +586,24 @@ let run_loop deps exporter_set initial =
   loop initial
 
 let run deps =
-  match publisher_override (Sys.getenv_opt "OCTRA_STATE_SYNC_FORCE_PUBLISH") with
+  match deps.exporter_set () with
   | Error reason ->
       deps.warn ("event = sync_disabled reason = " ^ reason);
       dormant deps
-  | Ok force ->
+  | Ok exporter_set ->
       begin
-        match deps.exporter_set () with
+        match exporter_wallet exporter_set deps.wallet with
         | Error reason ->
-            deps.warn ("event = sync_disabled reason = " ^ reason);
+            deps.info ("event = sync_cycle_dormant reason = " ^ reason);
             dormant deps
-        | Ok exporter_set ->
-            begin
-              match exporter_wallet ~force exporter_set deps.wallet with
-              | Error reason ->
-                  deps.info ("event = sync_cycle_dormant reason = " ^ reason);
-                  dormant deps
-              | Ok () ->
-                  load_published deps exporter_set >>= fun published ->
-                  deps.info
-                    (Printf.sprintf
-                       "event = sync_cycle_started published = %s interval_epochs = %Ld retain = %d"
-                       (Option.fold
-                          ~none:"none"
-                          ~some:Int64.to_string
-                          published)
-                       (Cycle.interval Cycle.default)
-                       (Cycle.retention Cycle.default));
-                  run_loop deps exporter_set (Cycle.init ~published)
-            end
+        | Ok () ->
+            load_published deps exporter_set >>= fun published ->
+            deps.info
+              (Printf.sprintf
+                 "event = sync_cycle_started published = %s interval_epochs = 360 retain = 10"
+                 (Option.fold
+                    ~none:"none"
+                    ~some:Int64.to_string
+                    published));
+            run_loop deps exporter_set (Cycle.init ~published)
       end

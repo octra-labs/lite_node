@@ -67,11 +67,12 @@ type persistent_update_deps = {
 
 type node_view = {
   validator_config : Validator_config.t;
-  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_validator_set_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   consensus_config_hash : string;
   p2p_config : P2p_config.t;
+  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
   swarm_params : P2p_config.swarm_params;
   swarm : Octra_net.P2p_swarm.t;
 }
@@ -106,10 +107,6 @@ type node_start = {
     unit ->
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
   activate_validator_set :
-    Octra_consensus.C_types.validator_set ->
-    string ->
-    unit Lwt.t;
-  activate_validator_set_relief :
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;

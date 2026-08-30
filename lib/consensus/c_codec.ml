@@ -26,13 +26,6 @@ type round_sync = {
   signature : string;
 }
 
-type round_fetch = {
-  chain_id : string;
-  epoch_id : int64;
-  after_round : int;
-  through_round : int;
-}
-
 let get_string max c = O.get_string_bounded ~max c
 
 let get_exact_bytes len c =
@@ -160,21 +153,6 @@ let decode_round_sync payload =
     let validator = get_string max_addr_bytes c in
     let signature = get_exact_bytes max_signature_bytes c in
     { chain_id; epoch_id; round; step; request; validator; signature }) payload
-
-let encode_round_fetch (fetch : round_fetch) =
-  O.encode (fun buf ->
-    O.put_string buf fetch.chain_id;
-    O.put_u64 buf fetch.epoch_id;
-    O.put_u32_int buf fetch.after_round;
-    O.put_u32_int buf fetch.through_round)
-
-let decode_round_fetch payload =
-  O.decode (fun c ->
-    let chain_id = get_string max_chain_id_bytes c in
-    let epoch_id = O.get_u64 c in
-    let after_round = get_round c in
-    let through_round = get_round c in
-    { chain_id; epoch_id; after_round; through_round }) payload
 
 let encode_validator_set validator_set =
   O.encode (fun buf ->

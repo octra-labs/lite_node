@@ -13,7 +13,6 @@ type deps = {
   read_local_root_raw : unit -> string Lwt.t;
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
-  set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
   fatal_exit : unit -> unit;
 }
@@ -83,8 +82,6 @@ let run deps ~epoch_id ~proposed_root =
   if verify_root ~epoch_id ~proposed_root ~actual_root then begin
     deps.commit_finality_journal ();
     deps.remove_pending_finalized ~epoch:target_epoch;
-    if proposed_root <> zero_root then
-      deps.set_state_attested ~head:target_epoch ~root:actual_root;
     Lwt.return_unit
   end else begin
     deps.fatal_exit ();

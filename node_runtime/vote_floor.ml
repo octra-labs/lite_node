@@ -4,6 +4,10 @@
 let ( let* ) result next =
   Result.bind result next
 
+let vote_hash value =
+  Digestif.SHA256.digest_string value
+  |> Digestif.SHA256.to_hex
+
 let matching_head data_dir through_epoch =
   match Octra_core.Head_manifest.load_result data_dir with
   | Octra_core.Head_manifest.Present head
@@ -88,9 +92,7 @@ let current_vote ~chain_id ~validator ~pubkey ~epoch_id entry =
         Error "pending vote round does not match"
       else if vote.vote_type <> Octra_consensus.C_types.Precommit then
         Error "pending vote type is invalid"
-      else if not
-        (String.equal (Text.hash32_hex vote.proposal_id) entry.proposal_id)
-      then
+      else if not (String.equal (vote_hash vote.proposal_id) entry.proposal_id) then
         Error "pending vote proposal does not match"
       else if not (Octra_consensus.C_hash.verify_vote ~pubkey_raw:pubkey vote) then
         Error "pending vote signature is invalid"
@@ -161,30 +163,6 @@ let check ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round =
   in
   Ok marked
 
-let prepared ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round =
-  let* (store, _, epoch_id, marked) =
-    plan ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round
-  in
-  if marked <> round then
-    Error "vote floor round does not match staged round"
-  else
-    let* mark = Octra_consensus.C_vote_log.round_mark store in
-    match mark with
-    | Some (marked_epoch, marked_round)
-      when Int64.equal marked_epoch epoch_id && marked_round = round ->
-      Ok round
-    | _ -> Error "vote floor round is not prepared"
-
-let staged ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round =
-  let* marked =
-    prepared ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round
-  in
-  let store = Octra_consensus.C_vote_log.disk ~data_dir in
-  let* floor = Octra_consensus.C_vote_log.floor store in
-  match floor with
-  | Some value when Int64.equal value through_epoch -> Ok marked
-  | _ -> Error "vote floor is not staged"
-
 let set ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round =
   let* (store, votes, epoch_id, marked) =
     plan ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round
@@ -202,22 +180,6 @@ let set ~data_dir ~chain_id ~validator ~pubkey ~through_epoch ~round =
   in
   let* () = Octra_consensus.C_vote_log.set_floor store ~through_epoch in
   Ok marked
-
-let seed ~data_dir ~chain_id ~validator ~pubkey ~through_epoch =
-  let store = Octra_consensus.C_vote_log.disk ~data_dir in
-  let* floor = Octra_consensus.C_vote_log.floor store in
-  match floor with
-  | Some epoch when Int64.compare epoch through_epoch <= 0 -> Ok None
-  | Some _ -> Error "vote floor exceeds local finalized head"
-  | None ->
-    set
-      ~data_dir
-      ~chain_id
-      ~validator
-      ~pubkey
-      ~through_epoch
-      ~round:0
-    |> Result.map Option.some
 
 let sync_round ~chain_id ~validator ~pubkey ~through_epoch ~round_min ~sync =
   if round_min < 0 || round_min > Octra_consensus.C_codec.max_round then

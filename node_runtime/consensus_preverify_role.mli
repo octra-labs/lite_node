@@ -2,7 +2,6 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type runner =
-  string ->
   Octra_core.Transaction.t list ->
   Octra_core.Preverify_worker.batch Lwt.t
 

@@ -81,7 +81,6 @@ type node_deps = {
   log_epoch : string -> unit;
   fatal_epoch : string -> unit;
   short : string -> string;
-  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 

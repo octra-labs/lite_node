@@ -73,11 +73,7 @@ let expected_set source ~epoch =
           match config.scheduled_driver_config with
           | Some scheduled
             when Int64.compare epoch scheduled.activate_epoch >= 0 ->
-            Ok
-              (Octra_consensus.C_types.validator_set_for_epoch
-                 ~chain_id:source.chain_id
-                 ~epoch_id:epoch
-                 scheduled.validator_set)
+            Ok scheduled.validator_set
           | _ ->
             if config.active_vs.Octra_consensus.C_types.n = 0 then
               Error "trusted validator set is empty"

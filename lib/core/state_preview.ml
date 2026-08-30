@@ -3,112 +3,97 @@
 
 open Lwt.Syntax
 
-let root_hex value =
-  if String.length value = 32 then
-    String.concat "" (List.init 32 (fun i ->
-      Printf.sprintf "%02x" (Char.code value.[i])))
-  else
-    value
+let preview_counter = ref 0
 
-let root_matches expected actual =
-  let expected = root_hex expected in
-  let n = String.length expected in
-  String.length actual >= n
-  && String.equal expected (String.sub actual 0 n)
-
-let view base store =
-  {
-    Store_irmin.repo = base.Store_irmin.repo;
-    store;
-    batch_tree = None;
-    account_mode = Rule_graph.Prior;
-    stealth_counter = ref !(base.stealth_counter);
-    tags = base.tags;
-    split_epoch = base.split_epoch;
-    tag_lock = Lwt_mutex.create ();
-    store_path = base.store_path;
-    pvac_dir = base.pvac_dir;
-    state_root_file = base.state_root_file;
-  }
-
-let with_state ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id:_ ~proposal_id:_
-    ?(expected_prev_root : string option) f =
-  let* head = Store_irmin.Store.Head.find base_store.store in
-  match head with
-  | None -> Lwt.return_error "preview_head_missing"
-  | Some head ->
-    let tree = Store_irmin.Store.Commit.tree head in
-    let root =
-      Store_irmin.Store.Tree.hash tree
-      |> Irmin.Type.to_string Store_irmin.Store.Hash.t
-    in
-    let matches =
-      match expected_prev_root with
-      | Some expected -> root_matches expected root
-      | None -> true
-    in
-    if not matches then
-      Lwt.return_error "preview_state_changed"
-    else
-      let snap =
-        match base_ledger with
-        | Some ledger -> Result.map Option.some (Ledger.freeze ledger)
-        | None -> Ok None
-      in
-      match snap with
-      | Error error -> Lwt.return_error error
-      | Ok snap ->
-        let base =
-          Store_irmin.Store.Commit.hash head
-          |> Irmin.Type.to_string Store_irmin.Store.Hash.t
-        in
-        let* store = Store_irmin.Store.of_commit head in
-        let store = view base_store store in
-        let ledger =
-          match snap with
-          | Some snap -> Ledger.thaw store snap
-          | None -> Ledger.create store
-        in
-        let* result = f store ledger in
-        let* live = Store_irmin.Store.Head.find base_store.store in
-        let unchanged =
-          match live with
-          | Some live ->
-            Store_irmin.Store.Commit.hash live
-            |> Irmin.Type.to_string Store_irmin.Store.Hash.t
-            |> String.equal base
-          | None -> false
-        in
-        if unchanged then Lwt.return result
-        else Lwt.return_error "preview_state_changed"
+let preview_branch_name ~epoch_id ~proposal_id =
+  incr preview_counter;
+  let pid_short =
+    if String.length proposal_id > 12 then String.sub proposal_id 0 12 else proposal_id in
+  Printf.sprintf "preview_%d_%s_%d_%d" epoch_id pid_short (Unix.getpid ()) !preview_counter
 
 let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~fold ~epoch_id
     ~proposal_id ?(expected_prev_root : string option) f =
-  with_state
-    ~base_store
-    ?base_ledger
-    ~epoch_id
-    ~proposal_id
-    ?expected_prev_root
-    (fun store ledger ->
-      let backend = Epoch_exec.{
-        store;
-        ledger;
-        ops = Epoch_exec.ledger_ops ledger;
-        emission_policy = Emission_policy.of_env Sys.getenv_opt;
-        emission_schedule = Emission_schedule.of_env_exn Sys.getenv_opt;
-        legacy_total_supply = Emission_policy.legacy_total Sys.getenv_opt;
-        sender_key_activation_epoch =
-          Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
-        validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
-        fold;
-        begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
-        commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "preview");
-        flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
-        get_head_hash = (fun () -> Store_irmin.get_head_hash store);
-        set_meta = (fun key value -> Store_irmin.set_meta store key value);
-      } in
-      f backend)
+  let branch_name = preview_branch_name ~epoch_id ~proposal_id in
+
+  let* head_opt = Store_irmin.Store.Head.find base_store.store in
+  match head_opt with
+  | None -> Lwt.return (Error "no head commit for preview")
+  | Some head_commit ->
+
+  let head_tree = Store_irmin.Store.Commit.tree head_commit in
+  let head_hash = Irmin.Type.to_string Store_irmin.Store.Hash.t
+    (Store_irmin.Store.Tree.hash head_tree) in
+  let race_ok = match expected_prev_root with
+    | Some expected ->
+      let expected_hex =
+        if String.length expected = 32 then
+          String.concat "" (List.init 32 (fun i ->
+            Printf.sprintf "%02x" (Char.code expected.[i])))
+        else expected in
+      let head_hash_truncated =
+        let n_expected = String.length expected_hex in
+        if String.length head_hash >= n_expected
+        then String.sub head_hash 0 n_expected
+        else head_hash in
+      head_hash_truncated = expected_hex
+    | None -> true
+  in
+  if not race_ok then
+    Lwt.return (Error (Printf.sprintf "preview race: HEAD moved (head=%s)" (String.sub head_hash 0 16)))
+  else
+
+  let* () = Store_irmin.Store.Branch.set base_store.repo branch_name head_commit in
+
+  let* preview_store = Store_irmin.Store.of_branch base_store.repo branch_name in
+
+  let preview_t = {
+    Store_irmin.repo = base_store.repo;
+    store = preview_store;
+    batch_tree = None;
+    account_mode = Rule_graph.Prior;
+    stealth_counter = ref !(base_store.stealth_counter);
+    tags = base_store.tags;
+    split_epoch = base_store.split_epoch;
+    tag_lock = Lwt_mutex.create ();
+    store_path = base_store.store_path;
+    pvac_dir = base_store.pvac_dir;
+    state_root_file = base_store.state_root_file;
+  } in
+
+  Lwt.finalize
+    (fun () ->
+      let preview_ledger =
+        match base_ledger with
+        | Some source -> Ledger.clone_clean preview_t source
+        | None -> Ok (Ledger.create preview_t)
+      in
+      match preview_ledger with
+      | Error error -> Lwt.return (Error error)
+      | Ok preview_ledger ->
+        let backend = Epoch_exec.{
+          store = preview_t;
+          ledger = preview_ledger;
+          ops = Epoch_exec.ledger_ops preview_ledger;
+          emission_policy = Emission_policy.of_env Sys.getenv_opt;
+          emission_schedule = Emission_schedule.of_env_exn Sys.getenv_opt;
+          legacy_total_supply = Emission_policy.legacy_total Sys.getenv_opt;
+          sender_key_activation_epoch =
+            Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
+          validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
+          fold;
+          begin_batch = (fun mode ->
+            Store_irmin.begin_epoch_batch ~mode preview_t);
+          commit_batch = (fun () ->
+            Store_irmin.commit_epoch_batch preview_t "preview");
+          flush_dirty = (fun () -> Ledger.flush_dirty_lwt preview_ledger);
+          get_head_hash = (fun () -> Store_irmin.get_head_hash preview_t);
+          set_meta = (fun k v -> Store_irmin.set_meta preview_t k v);
+        } in
+        f backend)
+    (fun () ->
+
+      let* () = Store_irmin.Store.Branch.remove base_store.repo branch_name in
+      Lwt.return_unit)
 
 let cleanup_stale_previews ~(base_store : Store_irmin.t) =
   let* branches = Store_irmin.Store.Branch.list base_store.repo in

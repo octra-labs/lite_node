@@ -20,7 +20,7 @@ let parse_txs txs_json =
        | Ok lst ->
          try
            let json = Yojson.Safe.from_string tx_json in
-           match Octra_core.Tx_payload.decode_admit json with
+           match Transaction.of_yojson json with
            | Ok tx -> Ok (tx :: lst)
            | Error e -> Error ("of_yojson: " ^ e)
          with exn ->
@@ -39,7 +39,7 @@ let tx_list_hash_matches header tx_hashes =
   tx_list_hash = header.C_types.tx_list_hash
 
 let artifacts receipts_json txs =
-  match Octra_core.Tx_outcome.split_admit receipts_json with
+  match Octra_core.Tx_outcome.split receipts_json with
   | Error error -> Error ("bundle outcome: " ^ error)
   | Ok artifacts ->
     begin

@@ -6,7 +6,6 @@ type deps = {
   rpc : unit -> unit Lwt.t;
   services : (unit -> unit Lwt.t) list;
   observer : bool;
-  follow : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
   guard : Octra_net.P2p_tx_gossip_guard.t;

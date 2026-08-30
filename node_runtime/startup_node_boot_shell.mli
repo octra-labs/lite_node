@@ -49,11 +49,6 @@ val recovery_override_error :
   skip_reconcile:bool ->
   string option
 
-val run_s :
-  ?timeout:float ->
-  'a Lwt.t ->
-  'a
-
 val run_store :
   store_deps ->
   unit

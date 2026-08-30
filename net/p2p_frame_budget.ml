@@ -110,7 +110,6 @@ let lane msg_type =
        || msg_type = P2p_frame.msg_cons_finalize
        || msg_type = P2p_frame.msg_cons_timeout
        || msg_type = P2p_frame.msg_cons_round_sync
-       || msg_type = P2p_frame.msg_cons_round_fetch
        || msg_type = P2p_frame.msg_query_epoch_root
        || msg_type = P2p_frame.msg_epoch_root_response
        || msg_type = P2p_frame.msg_vote_evidence then Consensus

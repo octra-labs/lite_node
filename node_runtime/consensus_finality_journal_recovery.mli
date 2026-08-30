@@ -40,7 +40,6 @@ type deps = {
   clear_state_attested : unit -> unit;
   commit_journal : epoch:int64 -> state_root:string -> unit;
   mark_quarantine : string -> unit;
-  require_sync : Sync_need.t -> unit;
 }
 
 val run :

@@ -8,7 +8,10 @@ type cfg = {
   challenge : int64;
   rejoin_span : int64;
   pulse_gap : int64;
+  cadence : int64;
+  delay : int64;
   max_members : int;
+  minimum : Validator_participation.minimum;
 }
 
 type final = {
@@ -32,8 +35,11 @@ type cap_mode = Reject | Prune
 
 val meta_key : string
 val standard : cfg
+val participating : cfg
 val empty : t
 val validate_cfg : cfg -> (unit, string) result
+val consensus_id : cfg -> string
+val replacement_limit : cfg -> int64
 val note_set :
   cfg ->
   epoch:int64 ->

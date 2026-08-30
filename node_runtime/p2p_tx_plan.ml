@@ -37,7 +37,7 @@ let plan ?cfg ~has payload =
   with _ -> Legacy
 
 let check_tx ~hash ~tx_json =
-  match Octra_core.Tx_payload.decode_admit (Yojson.Safe.from_string tx_json) with
+  match Octra_core.Transaction.of_yojson (Yojson.Safe.from_string tx_json) with
   | Error e -> Decode_error e
   | Ok tx ->
     let actual = Octra_core.Transaction.hash tx in

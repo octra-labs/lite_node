@@ -20,9 +20,6 @@ type deps = {
     limit:int ->
     offset:int ->
     Octra_core.Tx_drop.row list;
-  validator_enrollment :
-    unit ->
-    (Status_read_rpc.enrollment_snapshot, string) result;
 }
 
 type config = {

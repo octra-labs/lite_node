@@ -10,13 +10,6 @@ type deps = {
   certificate_path : unit -> string;
 }
 
-val bridge_range :
-  head_epoch:int64 ->
-  after_epoch:int64 ->
-  through_epoch:int64 ->
-  activate_epoch:int64 ->
-  (int64 * int64) option
-
 val build :
   deps ->
   head_epoch:int64 ->

@@ -14,7 +14,6 @@ module Head = Octra_core.Head_manifest
 module Image = Octra_core.Ledger_image
 module Migration = Octra_core.Pvac_migration_entitlement
 module Anchor = Sync_anchor
-module Roots = Root_win
 module Floor = Octra_core.History_floor
 module C_types = Octra_consensus.C_types
 module String_map = Map.Make (String)
@@ -642,32 +641,6 @@ let remove_ledger data_dir =
       (fun () -> Unix.fsync descriptor)
   end
 
-let verify_roots certificate data_dir =
-  match Manifest.finality certificate with
-  | None -> Error "ready root finality is missing"
-  | Some encoded ->
-      begin
-        match Anchor.decode encoded with
-        | Error _ as error -> error
-        | Ok anchor ->
-            let path = Filename.concat data_dir Roots.name in
-            begin
-              match Roots.read path with
-              | Error _ as error -> error
-              | Ok values ->
-                  let epoch = certificate.Manifest.checkpoint.epoch in
-                  let expected =
-                    if Int64.compare epoch (Int64.of_int Roots.width) < 0 then
-                      Int64.to_int epoch
-                    else Roots.width
-                  in
-                  if List.length values <> expected then
-                    Error "ready root window length differs"
-                  else Roots.verify ~anchor:(Anchor.finality anchor) values
-                    |> Result.map (fun _ -> ())
-            end
-      end
-
 let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let body = certificate.Manifest.manifest in
   let checkpoint = certificate.checkpoint in
@@ -863,11 +836,6 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
     body.file_count;
   begin
     if Manifest.is_reference certificate then begin
-      begin
-        match verify_roots certificate data_dir with
-        | Ok () -> ()
-        | Error reason -> fail reason
-      end;
       begin
         match head_file certificate with
         | Some file ->

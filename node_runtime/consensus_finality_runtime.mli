@@ -2,7 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type replay_deps = {
-  committed_head_epoch : unit -> int;
+  current_epoch : unit -> int;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
   finality : Consensus_finality_state.callbacks;
@@ -49,11 +49,9 @@ type node_deps = {
   read_local_root_raw : unit -> string Lwt.t;
   commit_finality_journal : unit -> unit;
   remove_pending_finalized : epoch:int -> unit;
-  set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
   bundle_wait_expired : epoch_id:int64 -> unit;
   bundle_wait_recovered : epoch_id:int64 -> unit;
-  require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
   quarantine_active : unit -> bool;
@@ -74,11 +72,9 @@ type node_runtime = {
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
   apply_timeout_seconds : float;
-  require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
   runtime_state : Consensus_runtime_state.t;
-  set_state_attested : head:int -> root:string -> unit;
   finality : Consensus_finality_state.callbacks;
 }
 

@@ -8,6 +8,7 @@ type t = {
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
   handshake_allowed_pubkeys : string list;
   validator_pubkeys : string list;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
 }
 
 type swarm_params = {
@@ -36,6 +37,8 @@ type env = {
   binary_hash_value : string option;
   require_binary_hash : bool;
   allow_dynamic_peers : bool;
+  validator_ready_strict : bool;
+  validator_ready_min_shadow_epochs : int;
 }
 
 type upgrade_log =
@@ -59,16 +62,19 @@ type startup_config = {
   env : env;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
   handshake : t;
+  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
   upgrade_logs : upgrade_log list;
 }
 
 type startup_runtime = {
-  stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;
   consensus_config_hash : string;
   handshake : t;
+  readiness_requirements : Octra_core.Validator_ready_policy.requirements;
+  readiness_runtime : Octra_core.Validator_ready_policy.runtime;
 }
 
 type node_startup_install_deps = {
@@ -128,11 +134,20 @@ let first32 raw =
 let env_bool getenv name =
   getenv name = Some "1"
 
+let env_int getenv name default =
+  match getenv name with
+  | None -> default
+  | Some raw ->
+    try int_of_string raw with _ -> default
+
 let env_of_getenv getenv =
   {
     binary_hash_value = getenv "OCTRA_BINARY_HASH";
     require_binary_hash = env_bool getenv "OCTRA_P2P_REQUIRE_BINARY_HASH";
     allow_dynamic_peers = env_bool getenv "OCTRA_CONSENSUS_ALLOW_DYNAMIC_PEERS";
+    validator_ready_strict = env_bool getenv "OCTRA_VALIDATOR_READY_STRICT";
+    validator_ready_min_shadow_epochs =
+      env_int getenv "OCTRA_VALIDATOR_READY_MIN_SHADOW_EPOCHS" 0;
   }
 
 let identity ~priv_b64 ~pub_b64 =
@@ -155,7 +170,7 @@ let normalize_binary_hash = function
 let handshake_allowed_pubkeys ~allow_dynamic_peers allowed_pubkeys =
   if allow_dynamic_peers then [] else allowed_pubkeys
 
-let build ~chain_id:_ ~consensus_config_hash ~allowed_pubkeys
+let build ~chain_id ~consensus_config_hash ~allowed_pubkeys
     ~binary_hash_value ~require_binary_hash ~allow_dynamic_peers ~upgrade_plan =
   match normalize_binary_hash binary_hash_value with
   | Error e -> Error e
@@ -163,6 +178,11 @@ let build ~chain_id:_ ~consensus_config_hash ~allowed_pubkeys
     let handshake_allowed_pubkeys =
       handshake_allowed_pubkeys ~allow_dynamic_peers allowed_pubkeys
     in
+    let readiness_runtime = Octra_core.Validator_ready_policy.{
+      chain_id;
+      binary_hash = Text.raw_to_hex binary_hash;
+      config_hash = Text.raw_to_hex consensus_config_hash;
+    } in
     Ok {
       config_hash = consensus_config_hash;
       binary_hash;
@@ -170,6 +190,7 @@ let build ~chain_id:_ ~consensus_config_hash ~allowed_pubkeys
       upgrade_plan;
       handshake_allowed_pubkeys;
       validator_pubkeys = allowed_pubkeys;
+      readiness_runtime;
     }
 
 let build_from_env env ~chain_id ~consensus_config_hash ~allowed_pubkeys
@@ -182,6 +203,13 @@ let build_from_env env ~chain_id ~consensus_config_hash ~allowed_pubkeys
     ~require_binary_hash:env.require_binary_hash
     ~allow_dynamic_peers:env.allow_dynamic_peers
     ~upgrade_plan
+
+let readiness_requirements env =
+  if env.validator_ready_strict then
+    Octra_core.Validator_ready_policy.strict
+      ~min_shadow_epochs:(max 0 env.validator_ready_min_shadow_epochs)
+      ()
+  else Octra_core.Validator_ready_policy.relaxed
 
 let upgrade_logs = function
   | None -> []
@@ -281,11 +309,14 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height
               validator.Octra_consensus.C_types.pubkey)
             validator.active_vs.validators;
       } in
+      let readiness_requirements = readiness_requirements env in
       Ok {
         validator;
         env;
         upgrade_plan;
         handshake;
+        readiness_requirements;
+        readiness_runtime = handshake.readiness_runtime;
         upgrade_logs = upgrade_logs upgrade_plan;
       }
 
@@ -345,12 +376,13 @@ let install_node_startup_config deps ~current_height startup =
     (fun row -> deps.warn (upgrade_log_message row))
     startup.upgrade_logs;
   {
-    stake_vs = validator.stake_vs;
     active_vs;
     scheduled_driver_config;
     light_scheduled_validator_set;
     consensus_config_hash;
     handshake = startup.handshake;
+    readiness_requirements = startup.readiness_requirements;
+    readiness_runtime = startup.readiness_runtime;
   }
 
 let upgrade_readiness_state = {

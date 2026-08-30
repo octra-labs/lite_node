@@ -21,6 +21,10 @@ type failure = {
   user_reason : string;
 }
 
+exception Worker_retry of string
+
+type failure_action = Reject | Retry
+
 type field_policy =
   | First_field
   | Unique_fields
@@ -345,6 +349,15 @@ let key_switch_failure_retryable failure =
 
 let private_failure_retryable failure =
   String.equal failure.tag private_worker_retry_tag
+
+let failure_action failure =
+  if
+    key_switch_failure_retryable failure
+    || private_failure_retryable failure
+  then
+    Retry
+  else
+    Reject
 
 let private_reject ?preverify_reason private_error =
   {
@@ -1710,13 +1723,6 @@ let key_switch_plan
     ledger
     tx =
   let open Lwt.Syntax in
-  let legacy = key_switch_requests_legacy_audit ~field_policy tx in
-  let* cache_key =
-    if legacy then Lwt.return_none
-    else
-      let* key = key_switch_cache_key field_policy ledger tx in
-      Lwt.return_some key
-  in
   let* result =
     verify_key_switch_plan
       ~field_policy
@@ -1726,15 +1732,12 @@ let key_switch_plan
   in
   match result with
   | Error _ -> Lwt.return result
+  | Ok _ when key_switch_requests_legacy_audit ~field_policy tx ->
+    Lwt.return result
   | Ok plan ->
-    begin
-      match cache_key with
-      | None -> Lwt.return result
-      | Some key ->
-        let* current = key_switch_cache_key field_policy ledger tx in
-        if String.equal key current then remember_key_switch_plan key plan;
-        Lwt.return result
-    end
+    let* key = key_switch_cache_key field_policy ledger tx in
+    remember_key_switch_plan key plan;
+    Lwt.return result
 
 let preverify_key_switch_artifact
     ~field_policy
@@ -2411,52 +2414,3 @@ let bind_private_artifact
         Lwt.return
           (Private_artifact_invalid rejected.private_rejection)
     end
-
-let balance_current ledger tx plan =
-  match current_plan ledger tx.T.from "preverify_state_changed" plan with
-  | Ok () -> true
-  | Error _ -> false
-
-let key_switch_current ledger tx (plan : key_switch_plan) =
-  let open Lwt.Syntax in
-  let* source = load_key_switch_snapshot ledger tx in
-  Lwt.return
-    (match source with
-     | Error _ -> false
-     | Ok source ->
-       String.equal source.snapshot_cipher plan.source_cipher
-       && String.equal
-            (key_hash_of_pubkey source.snapshot_pubkey)
-            plan.old_key_hash)
-
-let claim_current ~field_policy ledger tx claim balance =
-  let open Lwt.Syntax in
-  if not (balance_current ledger tx balance) then Lwt.return_false
-  else
-    let* current = prepare_claim_plan ~field_policy ledger tx in
-    Lwt.return
-      (match current with
-       | Error _ -> false
-       | Ok current ->
-         current.claim_output_id = claim.claim_output_id
-         && String.equal current.claim_cipher claim.claim_cipher)
-
-let prepared_current ~field_policy ledger tx = function
-  | Prepared_encrypt plan when tx.T.op_type = T.EncryptOp ->
-    Lwt.return (balance_current ledger tx plan)
-  | Prepared_decrypt plan when tx.T.op_type = T.DecryptOp ->
-    Lwt.return (balance_current ledger tx plan)
-  | Prepared_key_switch plan when tx.T.op_type = T.KeySwitch ->
-    key_switch_current ledger tx plan
-  | Prepared_stealth plan when tx.T.op_type = T.StealthOp ->
-    Lwt.return
-      (match current_cipher ledger tx.T.from "preverify_state_changed" with
-       | Ok current -> String.equal current plan.stealth_current_cipher
-       | Error _ -> false)
-  | Prepared_claim (claim, balance) when tx.T.op_type = T.ClaimOp ->
-    claim_current ~field_policy ledger tx claim balance
-  | Prepared_encrypt _
-  | Prepared_decrypt _
-  | Prepared_key_switch _
-  | Prepared_stealth _
-  | Prepared_claim _ -> Lwt.return_false

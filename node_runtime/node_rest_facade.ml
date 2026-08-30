@@ -47,7 +47,7 @@ let encrypted_supply_aggregate store ledger () =
   | Ok hidden -> hidden
   | Error error -> failwith error
 
-let notify_staging_update ?(total_txs = Staging.staging_size ())
+let notify_staging_update ?(total_txs = List.length (Staging.all ()))
     ?(total_ou = !Staging.total_ou) ?(max_ou = Staging.max_ou) () =
   WSServer.notify_staging_update ~total_txs ~total_ou ~max_ou
 
@@ -111,7 +111,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
               Tx_view.staging_submit_effects
                 ~relay
                 ~peer_count
-                ~total_txs:(Staging.staging_size ())
+                ~total_txs:(List.length (Staging.all ()))
                 ~total_ou:!Staging.total_ou
                 ~max_ou:Staging.max_ou
                 ~tx_hash
@@ -197,7 +197,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
     ~program_trust ~migration_entitlements ~rules ~chaindata
     ~consensus_driver_ref
-    ~epoch_visibility ~resource_compute ~validator_enrollment =
+    ~epoch_visibility ~resource_compute =
   let deps = Node_rpc_server.{
     validate = validate_and_submit_tx runtime ledger;
     encrypted_supply = encrypted_supply_aggregate store ledger;
@@ -207,7 +207,6 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     swarm = (fun () -> !(runtime.swarm_ref));
     find_drop = runtime.find_drop;
     drops_by_addr = runtime.drops_by_addr;
-    validator_enrollment;
   } in
   Node_rpc_server.start Node_rpc_server.{
     port;
@@ -239,8 +238,7 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
     ~validator_view_sk ~validator_view_pub ~program_trust
     ~migration_entitlements ~rules ~chaindata
-    ~consensus_driver_ref ~epoch_visibility ~resource_compute
-    ~validator_enrollment () =
+    ~consensus_driver_ref ~epoch_visibility ~resource_compute () =
   start
     runtime
     ~port
@@ -264,4 +262,3 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~consensus_driver_ref
     ~epoch_visibility
     ~resource_compute
-    ~validator_enrollment

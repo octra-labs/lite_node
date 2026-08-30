@@ -138,7 +138,8 @@ let clear_allowed ~reason ~evidence =
   String.equal reason evidence
   || String.equal evidence "fork_empty_rollback"
   || (catchup_recovers reason
-      && starts_with "catchup_complete:root_verified:" evidence)
+      && starts_with "catchup_complete:" evidence
+      && not (starts_with "catchup_complete:already_in_sync:" evidence))
   || (root_attestation_recovers reason && root_evidence evidence)
   || (root_attestation_recovers reason
       && starts_with "direct_finalized_apply:" evidence)

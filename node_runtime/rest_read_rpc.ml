@@ -32,34 +32,6 @@ let err error =
 let tx_display_fields =
   Tx_view.tx_fields ~decode_message:Text.decode_message_if_hex
 
-let view_limit = 64
-let sample_limit = 256
-let message_limit = 4096
-
-let staging_fields tx =
-  let message_size =
-    match tx.Transaction.message with
-    | Some value -> String.length value
-    | None -> 0
-  in
-  let truncated = message_size > message_limit in
-  let decode_message value =
-    if truncated then "" else Text.decode_message_if_hex value
-  in
-  let fields = Tx_view.tx_fields ~decode_message tx in
-  let fields =
-    if truncated then
-      List.map
-        (function
-          | "message", _ -> "message", `Null
-          | field -> field)
-        fields
-    else fields
-  in
-  ("message_size", `Int message_size)
-  :: ("message_truncated", `Bool truncated)
-  :: fields
-
 let search ledger chaindata ~params =
   match Rpc.require_string params 0 "query" with
   | Error e ->
@@ -114,33 +86,26 @@ let epoch_summaries chaindata ~params =
        (Rest_view.epoch_summary_ids params))
 
 let staging_view () =
-  let total = Staging.staging_size () in
-  let tx_rows =
-    Staging.sample view_limit
-    |> List.map (fun (hash, tx) ->
-      Rest_view.staging_tx_row ~hash ~fields:(staging_fields tx))
-  in
   ok
-    (Rest_view.staging_view_response ~total ~tx_rows)
+    (Rest_view.staging_view_response_of_txs
+       ~tx_hash:Transaction.hash
+       ~tx_fields:tx_display_fields
+       (Staging.all ()))
 
 let staging_stats () =
-  let txs = Staging.sample sample_limit |> List.map snd in
-  let by_sender = Staging.stats_of txs in
+  let txs, by_sender = Staging.get_stats () in
   ok
     (Rest_view.staging_stats_response
-       ~tx_count:(Staging.staging_size ())
-       ~sample_count:(List.length txs)
+       ~tx_count:(List.length txs)
        ~total_ou:!Staging.total_ou
        ~max_ou:Staging.max_ou
        ~by_sender)
 
 let staging_estimate_ou () =
-  let txs = Staging.sample sample_limit |> List.map snd in
   ok
     (Rest_view.staging_ou_rpc_response_of_txs
        ~tx_ou:(fun tx -> tx.Transaction.ou)
-       ~txs
-       ~staging_size:(Staging.staging_size ())
+       ~txs:(Staging.all ())
        ~staging_ou:(Staging.staging_total_ou ())
        ~capacity:Staging.max_ou_per_epoch)
 

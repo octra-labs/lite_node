@@ -3,11 +3,6 @@
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
-type enrollment_snapshot = {
-  head_epoch : int;
-  candidate : Octra_core.Validator_admission.candidate option;
-}
-
 type read_ctx = {
   ledger : Octra_core.Ledger.t;
   store : Octra_core.Store_irmin.t;
@@ -27,7 +22,6 @@ type read_ctx = {
   encrypted : unit -> Z.t;
   swarm : unit -> Octra_net.P2p_swarm.t option;
   driver_ref : Octra_consensus.C_driver.t option ref;
-  validator_enrollment : unit -> (enrollment_snapshot, string) result;
 }
 
 type 'handler dispatch_adapters = {
@@ -75,18 +69,6 @@ val validator_set_proof :
   runtime_profile_hash:string option ->
   validator_set_ref:Octra_consensus.C_types.validator_set ref ->
   scheduled_validator_set_ref:Octra_consensus.C_config.scheduled option ref ->
-  rpc_result
-
-val load_validator_enrollment :
-  store:Octra_core.Store_irmin.t ->
-  head:Octra_core.Head_manifest.t option ->
-  validator_address:string ->
-  (enrollment_snapshot, string) result Lwt.t
-
-val validator_enrollment :
-  snapshot:(enrollment_snapshot, string) result ->
-  validator_address:string ->
-  validator_pubkey:string ->
   rpc_result
 
 val consensus_peer_states :
@@ -138,11 +120,6 @@ val account_proof_params :
   rpc_result
 
 val validator_set_proof_params :
-  Yojson.Safe.t ->
-  read_ctx ->
-  rpc_result
-
-val validator_enrollment_params :
   Yojson.Safe.t ->
   read_ctx ->
   rpc_result

@@ -11,7 +11,6 @@ module Manifest = Octra_bootstrap.State_sync_manifest
 module State_sync = Octra_bootstrap.State_sync
 module Store = Octra_core.Store_chaindata
 module Update = Octra_core.Validator_set_update
-module S = Set.Make(String)
 
 type deps = {
   data_dir : string;
@@ -23,7 +22,7 @@ type deps = {
 }
 
 type t = {
-  rev_steps : Anchor.step list;
+  steps : Anchor.step list;
   validator_set : C_types.validator_set;
   epoch : int64;
 }
@@ -49,7 +48,7 @@ let of_certificate trusted certificate =
       encoded
   in
   Ok {
-    rev_steps = List.rev (Anchor.steps anchor);
+    steps = Anchor.steps anchor;
     validator_set = Anchor.validator_set anchor;
     epoch = certificate.Manifest.checkpoint.epoch;
   }
@@ -214,20 +213,6 @@ type bridge_failure =
   | Bridge_unavailable
   | Bridge_invalid of string
 
-let bridge_range ~head_epoch ~after_epoch ~through_epoch ~activate_epoch =
-  if Int64.compare head_epoch 0L <= 0
-     || Int64.equal after_epoch Int64.max_int then
-    None
-  else
-    let span = Int64.pred Consensus_finality_journal.history_limit in
-    let floor =
-      Int64.max
-        (Int64.succ after_epoch)
-        (Int64.max activate_epoch (Int64.sub head_epoch span))
-    in
-    let ceiling = Int64.min through_epoch (Int64.pred head_epoch) in
-    if Int64.compare ceiling floor < 0 then None else Some (floor, ceiling)
-
 let bridge_step_at deps ~validator_set raw epoch =
   Lwt_preemptive.detach
     (fun () -> bridge_record deps validator_set epoch)
@@ -252,34 +237,32 @@ let bridge_step_at deps ~validator_set raw epoch =
               proof = proof.proof;
             })
 
-let bridge_step deps ~head_epoch ~after_epoch ~through_epoch ~validator_set raw
-    update =
+let bridge_step deps ~head_epoch ~after_epoch ~validator_set raw update =
+  let span = Int64.pred Consensus_finality_journal.history_limit in
   if Int64.equal after_epoch Int64.max_int then
     Lwt.return_error
       (Bridge_invalid "state sync validator bridge order overflows")
-  else if Int64.compare head_epoch 0L <= 0 then
-    Lwt.return_error
-      (Bridge_invalid "state sync validator bridge head is invalid")
   else
-    match
-      bridge_range
-        ~head_epoch
-        ~after_epoch
-        ~through_epoch
-        ~activate_epoch:update.Update.activate_epoch
-    with
-    | None -> Lwt.return_error Bridge_unavailable
-    | Some (floor, ceiling) ->
-        let rec scan epoch =
-          if Int64.compare epoch floor < 0 then
-            Lwt.return_error Bridge_unavailable
-          else
-            bridge_step_at deps ~validator_set raw epoch >>= function
-            | Error _ as error -> Lwt.return error
-            | Ok (Some step) -> Lwt.return_ok step
-            | Ok None -> scan (Int64.pred epoch)
-        in
-        scan ceiling
+    let floor =
+      Int64.max
+        (Int64.succ after_epoch)
+        (Int64.max
+           update.Update.activate_epoch
+           (Int64.sub head_epoch span))
+    in
+    let rec scan epoch =
+      if Int64.compare epoch floor < 0 then
+        Lwt.return_error Bridge_unavailable
+      else
+        bridge_step_at deps ~validator_set raw epoch >>= function
+        | Error _ as error -> Lwt.return error
+        | Ok (Some step) -> Lwt.return_ok step
+        | Ok None -> scan (Int64.pred epoch)
+    in
+    if Int64.compare head_epoch floor <= 0 then
+      Lwt.return_error Bridge_unavailable
+    else
+      scan (Int64.pred head_epoch)
 
 let prior_update deps update =
   match transition_epoch update with
@@ -292,12 +275,12 @@ let prior_update deps update =
       Lwt.return_ok value
 
 let walk deps ~head_epoch ~base ~stop raw =
-  let rec loop depth seen through_epoch raw =
-    if depth >= 1_024 then
+  let rec loop seen raw =
+    if List.length seen >= 1_024 then
       Lwt.return_error "state sync validator transition chain is too long"
     else
       let digest = Digestif.SHA256.(digest_string raw |> to_hex) in
-      if S.mem digest seen then
+      if List.mem digest seen then
         Lwt.return_error "state sync validator transition chain has a cycle"
       else
         match update ~chain_id:deps.chain_id raw with
@@ -307,13 +290,13 @@ let walk deps ~head_epoch ~base ~stop raw =
         | Ok (item, next_set) ->
             let append prior (step : Anchor.step) =
               Lwt.return_ok {
-                rev_steps = step :: prior.rev_steps;
+                steps = prior.steps @ [step];
                 validator_set = next_set;
                 epoch =
                   Int64.max item.activate_epoch step.finalize.epoch_id;
               }
             in
-            let history () =
+            let historical () =
               prior_update deps item >>= function
               | Error reason -> Lwt.return_error reason
               | Ok prior ->
@@ -331,99 +314,65 @@ let walk deps ~head_epoch ~base ~stop raw =
                           | Ok (_, prior_set)
                             when same_set prior_set stop.validator_set ->
                               Lwt.return_ok stop
-                          | Ok _ ->
-                              begin
-                                match transition_epoch item with
-                                | Error reason -> Lwt.return_error reason
-                                | Ok (prior_through, _) ->
-                                    loop
-                                      (depth + 1)
-                                      (S.add digest seen)
-                                      prior_through
-                                      prior_raw
-                              end
+                          | Ok _ -> loop (digest :: seen) prior_raw
                         end
                   in
                   prior_chain >>= function
                   | Error reason -> Lwt.return_error reason
-                  | Ok prior -> Lwt.return_ok prior
+                  | Ok prior when same_set prior.validator_set next_set ->
+                      Lwt.return_ok prior
+                  | Ok prior ->
+                      transition_step deps raw item >>= function
+                      | Ok step -> append prior step
+                      | Error (Transition_invalid reason) ->
+                          Lwt.return_error reason
+                      | Error Finality_missing ->
+                          bridge_step
+                            deps
+                            ~head_epoch
+                            ~after_epoch:prior.epoch
+                            ~validator_set:prior.validator_set
+                            raw
+                            item >>= function
+                          | Error Bridge_unavailable ->
+                              Lwt.return_error
+                                "state sync validator bridge is unavailable"
+                          | Error (Bridge_invalid reason) ->
+                              Lwt.return_error reason
+                          | Ok step -> append prior step
             in
-            let append_history step =
-              history () >>= function
-              | Error reason -> Lwt.return_error reason
-              | Ok prior when same_set prior.validator_set next_set ->
-                  Lwt.return_ok prior
-              | Ok prior -> append prior step
-            in
-            let bridge_history () =
-              history () >>= function
-              | Error reason -> Lwt.return_error reason
-              | Ok prior when same_set prior.validator_set next_set ->
-                  Lwt.return_ok prior
-              | Ok prior ->
-                  bridge_step
-                    deps
-                    ~head_epoch
-                    ~after_epoch:prior.epoch
-                    ~through_epoch
-                    ~validator_set:prior.validator_set
-                    raw
-                    item >>= function
-                  | Error Bridge_unavailable ->
-                      Lwt.return_error
-                        (Printf.sprintf
-                           "state sync validator bridge is unavailable activate_epoch = %Ld after_epoch = %Ld head_epoch = %Ld"
-                           item.activate_epoch
-                           prior.epoch
-                           head_epoch)
-                  | Error (Bridge_invalid reason) -> Lwt.return_error reason
-                  | Ok step -> append prior step
-            in
-            transition_step deps raw item >>= function
-            | Ok step -> append_history step
-            | Error (Transition_invalid reason) -> Lwt.return_error reason
-            | Error Finality_missing ->
-                bridge_step
-                  deps
-                  ~head_epoch
-                  ~after_epoch:stop.epoch
-                  ~through_epoch
-                  ~validator_set:stop.validator_set
-                  raw
-                  item >>= function
-                | Ok step -> append stop step
-                | Error (Bridge_invalid reason) -> Lwt.return_error reason
-                | Error Bridge_unavailable -> bridge_history ()
+            bridge_step
+              deps
+              ~head_epoch
+              ~after_epoch:stop.epoch
+              ~validator_set:stop.validator_set
+              raw
+              item >>= function
+            | Ok step -> append stop step
+            | Error (Bridge_invalid reason) -> Lwt.return_error reason
+            | Error Bridge_unavailable -> historical ()
   in
-  if Int64.compare head_epoch 0L <= 0 then
-    Lwt.return_error "state sync checkpoint epoch is invalid"
-  else
-    loop 0 S.empty (Int64.pred head_epoch) raw
+  loop [] raw
 
 let build deps ~head_epoch trusted active =
   match Anchor.raw_validator_set trusted with
   | Error reason -> Lwt.return_error reason
   | Ok trusted_raw ->
       let base = {
-        rev_steps = [];
+        steps = [];
         validator_set = trusted_raw;
         epoch = -1L;
       } in
       if same_set trusted_raw active then Lwt.return_ok []
-      else if Int64.compare head_epoch (Int64.of_int max_int) > 0 then
-        Lwt.return_error "state sync checkpoint epoch exceeds platform limit"
       else
-        Irmin.read_at_epoch
-          deps.store
-          (Int64.to_int head_epoch)
-          ["meta"; Update.active_meta_key] >>= function
+        Irmin.get_meta deps.store Update.active_meta_key >>= function
         | None -> Lwt.return_error "state sync active validator update is missing"
         | Some raw ->
             let run stop =
               walk deps ~head_epoch ~base ~stop raw >>= function
               | Error _ as error -> Lwt.return error
               | Ok chain when same_set chain.validator_set active ->
-                  Lwt.return_ok (List.rev chain.rev_steps)
+                  Lwt.return_ok chain.steps
               | Ok _ ->
                   Lwt.return_error
                     "state sync active validator set differs from history"
@@ -434,12 +383,7 @@ let build deps ~head_epoch trusted active =
                   begin
                     run stop >>= function
                     | Ok _ as result -> Lwt.return result
-                    | Error stored_reason ->
-                        run base >|= Result.map_error (fun base_reason ->
-                          Printf.sprintf
-                            "state sync validator chain failed stored = %s base = %s"
-                            stored_reason
-                            base_reason)
+                    | Error _ -> run base
                   end
               | Some _
               | None -> run base

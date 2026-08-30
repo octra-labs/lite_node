@@ -50,7 +50,6 @@ type node_effects = {
   chaindata : Octra_core.Store_chaindata.t;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   irmin_last_epoch : unit -> int;
-  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 

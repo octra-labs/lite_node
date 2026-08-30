@@ -48,7 +48,6 @@ type node_launch_deps = {
   rpc : unit -> unit Lwt.t;
   services : (unit -> unit Lwt.t) list;
   observer : bool;
-  follow : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
   swarm_deps : P2p_swarm_lifecycle.node_deps;
@@ -59,7 +58,6 @@ type node_launch_runtime = {
   rpc : unit -> unit Lwt.t;
   services : (unit -> unit Lwt.t) list;
   observer : bool;
-  follow : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
   guard : Octra_net.P2p_tx_gossip_guard.t;
@@ -96,7 +94,6 @@ val make_node_launch_deps :
   rpc:(unit -> unit Lwt.t) ->
   services:(unit -> unit Lwt.t) list ->
   observer:bool ->
-  follow:bool ->
   tick_loop:(unit -> unit Lwt.t) ->
   swarm:Octra_net.P2p_swarm.t option ->
   swarm_deps:P2p_swarm_lifecycle.node_deps ->
@@ -107,7 +104,6 @@ val make_node_launch_deps_with_swarm :
   rpc:(unit -> unit Lwt.t) ->
   services:(unit -> unit Lwt.t) list ->
   observer:bool ->
-  follow:bool ->
   tick_loop:(unit -> unit Lwt.t) ->
   swarm:Octra_net.P2p_swarm.t option ->
   guard:Octra_net.P2p_tx_gossip_guard.t ->
@@ -154,11 +150,6 @@ val node_launch_tasks :
 val observer_loop :
   unit ->
   unit Lwt.t
-
-val idle :
-  observer:bool ->
-  follow:bool ->
-  bool
 
 val default_join_log :
   join_log

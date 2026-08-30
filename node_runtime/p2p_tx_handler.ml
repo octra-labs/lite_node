@@ -51,7 +51,7 @@ let handle_tx io tx =
 let handle_legacy io =
   let c = Octra_net.Oce1.make_cursor io.payload in
   let tx_json = Octra_net.Oce1.get_string c in
-  match Octra_core.Tx_payload.decode_admit (Yojson.Safe.from_string tx_json) with
+  match Octra_core.Transaction.of_yojson (Yojson.Safe.from_string tx_json) with
   | Ok tx -> handle_tx io tx
   | Error e -> Log.warn "p2p" "tx_gossip decode failed: %s" e
 

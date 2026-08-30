@@ -3,13 +3,32 @@
 
 type runtime = {
   chain_id : string;
+  binary_hash : string;
   config_hash : string;
 }
 
-type claim = {
-  chain_id : string option;
-  config_hash : string option;
-  catchup_head_epoch : int64 option;
+type requirements = {
+  require_chain_id : bool;
+  require_binary_hash : bool;
+  require_config_hash : bool;
+  require_catchup : bool;
+  min_shadow_epochs : int;
+}
+
+let relaxed = {
+  require_chain_id = false;
+  require_binary_hash = false;
+  require_config_hash = false;
+  require_catchup = false;
+  min_shadow_epochs = 0;
+}
+
+let strict ?(min_shadow_epochs = 0) () = {
+  require_chain_id = true;
+  require_binary_hash = false;
+  require_config_hash = true;
+  require_catchup = true;
+  min_shadow_epochs;
 }
 
 let bind f result =
@@ -17,36 +36,50 @@ let bind f result =
   | Error e -> Error e
   | Ok v -> f v
 
-let check_match ~label ~expected = function
+let check_match ~required ~label ~expected = function
   | Some value when value = expected -> Ok ()
   | Some _ -> Error (label ^ " mismatch")
-  | None -> Error (label ^ " missing")
+  | None when required -> Error (label ^ " missing")
+  | None -> Ok ()
 
-let check_catchup ~head_epoch = function
-  | Some epoch when Int64.equal epoch head_epoch -> Ok ()
-  | Some _ -> Error "catchup_head_epoch mismatch"
-  | None -> Error "catchup_head_epoch missing"
-
-let check_prior_catchup ~head_epoch = function
+let check_catchup ~required ~head_epoch = function
   | Some epoch when Int64.compare epoch head_epoch >= 0 -> Ok ()
   | Some _ -> Error "catchup_head_epoch too low"
-  | None -> Error "catchup_head_epoch missing"
+  | None when required -> Error "catchup_head_epoch missing"
+  | None -> Ok ()
 
-let validate_with check ~(runtime : runtime) ~head_epoch (claim : claim) =
+let check_shadow ~min_epochs = function
+  | Some epochs when epochs >= min_epochs -> Ok ()
+  | Some _ -> Error "shadow_epochs too low"
+  | None when min_epochs > 0 -> Error "shadow_epochs missing"
+  | None -> Ok ()
+
+let validate ~runtime ~requirements marker =
+  let ready = marker.Validator_set_update.ready in
+  let extra = marker.Validator_set_update.extra in
   check_match
+    ~required:requirements.require_chain_id
     ~label:"chain_id"
     ~expected:runtime.chain_id
-    claim.chain_id
+    extra.chain_id
   |> bind (fun () ->
     check_match
+      ~required:requirements.require_binary_hash
+      ~label:"binary_hash"
+      ~expected:runtime.binary_hash
+      extra.binary_hash)
+  |> bind (fun () ->
+    check_match
+      ~required:requirements.require_config_hash
       ~label:"config_hash"
       ~expected:runtime.config_hash
-      claim.config_hash)
+      extra.config_hash)
   |> bind (fun () ->
-    check ~head_epoch claim.catchup_head_epoch)
-
-let validate ~(runtime : runtime) ~head_epoch (claim : claim) =
-  validate_with check_catchup ~runtime ~head_epoch claim
-
-let validate_prior ~(runtime : runtime) ~head_epoch (claim : claim) =
-  validate_with check_prior_catchup ~runtime ~head_epoch claim
+    check_catchup
+      ~required:requirements.require_catchup
+      ~head_epoch:ready.head_epoch
+      extra.catchup_head_epoch)
+  |> bind (fun () ->
+    check_shadow
+      ~min_epochs:requirements.min_shadow_epochs
+      extra.shadow_epochs)

@@ -6,13 +6,6 @@ type queued = {
   reason : string;
 }
 
-type finish = private {
-  tag : string;
-  root_verified : bool;
-}
-
-val finish_unverified : string -> finish
-
 type queue_event = {
   queued_target_epoch : int64;
   queued_reason : string;
@@ -51,7 +44,7 @@ type deps = {
 type run_one =
   target_epoch:int64 ->
   reason:string ->
-  finish_success:(finish -> unit Lwt.t) ->
+  finish_success:(string -> unit Lwt.t) ->
   fail_catchup:(string -> unit Lwt.t) ->
   unit Lwt.t
 
@@ -69,10 +62,6 @@ type query_deps = {
     max_epochs:int ->
     timeout_seconds:float ->
     validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
-    Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
-  http_range :
-    from_epoch:int64 ->
-    max_epochs:int ->
     Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -155,7 +144,6 @@ type record_apply_deps = {
   apply_record :
     validated_record ->
     unit Lwt.t;
-  advance_height : int64 -> unit Lwt.t;
 }
 
 type chunk_apply_deps = {
@@ -198,7 +186,6 @@ type target_wiring = {
   apply_record :
     validated_record ->
     unit Lwt.t;
-  advance_height : int64 -> unit Lwt.t;
   read_local_root : unit -> string Lwt.t;
   base_eic : unit -> string;
   current_head : unit -> int64;
@@ -240,14 +227,12 @@ type node_target_wiring = {
   apply_record :
     validated_record ->
     unit Lwt.t;
-  advance_height : int64 -> unit Lwt.t;
   base_eic : unit -> string;
   current_head : unit -> int64;
 }
 
 type driver_io = {
   start_height : int64 -> unit Lwt.t;
-  advance_height : int64 -> unit Lwt.t;
   wake_ready : unit -> unit Lwt.t;
   range_query : query_deps;
 }
@@ -280,10 +265,6 @@ type driver_runner_wiring = {
   mark_quarantine : string -> unit;
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
-  http_range :
-    from_epoch:int64 ->
-    max_epochs:int ->
-    Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
 }
 
 type driver_runner_node_wiring = {
@@ -313,10 +294,6 @@ type driver_runner_node_wiring = {
   mark_quarantine : string -> unit;
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
-  http_range :
-    from_epoch:int64 ->
-    max_epochs:int ->
-    Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
 }
 
 val range_plan :
@@ -429,7 +406,7 @@ val run_target :
   target_deps ->
   target_epoch:int64 ->
   reason:string ->
-  finish_success:(finish -> unit Lwt.t) ->
+  finish_success:(string -> unit Lwt.t) ->
   fail_catchup:(string -> unit Lwt.t) ->
   unit Lwt.t
 

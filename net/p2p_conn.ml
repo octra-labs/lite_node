@@ -7,10 +7,6 @@ type direction =
   | Inbound
   | Outbound
 
-type loop =
-  | Again
-  | Done
-
 type t = {
   fd : Lwt_unix.file_descr;
   peer_id : peer_id;
@@ -90,28 +86,19 @@ let send t (frame : P2p_frame.frame) =
   else
     Lwt.return_unit
 
-let rec repeat step =
-  let open Lwt.Syntax in
-  let* state = step () in
-  match state with
-  | Done -> Lwt.return_unit
-  | Again ->
-    let* () = Lwt.pause () in
-    repeat step
-
 let write_loop t =
   let open Lwt.Syntax in
-  let step () =
-    if not t.connected then Lwt.return Done
+  let rec loop () =
+    if not t.connected then Lwt.return_unit
     else
       let* frame = Lwt_mvar.take t.write_queue in
-      if not t.connected then Lwt.return Done
+      if not t.connected then Lwt.return_unit
       else
         Lwt.catch
           (fun () ->
             let* () = P2p_frame.write_frame t.fd frame in
             t.msg_count_out <- t.msg_count_out + 1;
-            Lwt.return Again)
+            loop ())
           (fun exn ->
             let error = Printexc.to_string exn in
             if expected_disconnect exn then
@@ -119,14 +106,14 @@ let write_loop t =
             else
               err_conn t.addr "event = write_loop_error error = %s" error;
             let* () = close t in
-            Lwt.return Done)
+            Lwt.return_unit)
   in
-  repeat step
+  loop ()
 
 let read_loop t ~on_message =
   let open Lwt.Syntax in
-  let step () =
-    if not t.connected then Lwt.return Done
+  let rec loop () =
+    if not t.connected then Lwt.return_unit
     else
       Lwt.catch
         (fun () ->
@@ -147,15 +134,13 @@ let read_loop t ~on_message =
               rejection.max_frames
               rejection.max_bytes;
             (match rejection.action with
-             | P2p_frame_budget.Close ->
-               let* () = close t in
-               Lwt.return Done
-             | P2p_frame_budget.Discard -> Lwt.return Again)
+             | P2p_frame_budget.Close -> close t
+             | P2p_frame_budget.Discard -> loop ())
           | P2p_frame_budget.Accept ->
             t.msg_count_in <- t.msg_count_in + 1;
             t.last_seen <- Unix.gettimeofday ();
             let* () = on_message t frame in
-            Lwt.return Again)
+            loop ())
         (fun exn ->
           let error = Printexc.to_string exn in
           if expected_disconnect exn then
@@ -163,9 +148,9 @@ let read_loop t ~on_message =
           else
             err_conn t.addr "event = read_loop_error error = %s" error;
           let* () = close t in
-          Lwt.return Done)
+          Lwt.return_unit)
   in
-  repeat step
+  loop ()
 
 let start t ~on_message =
   log_conn t.addr "event = start_loops";

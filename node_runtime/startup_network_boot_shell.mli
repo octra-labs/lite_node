@@ -25,7 +25,6 @@ type deps = {
   set_proposal : Octra_core.Transaction.t list -> string list -> unit;
   apply_finalized : Consensus_startup_sync.apply_finalized;
   consensus_role : string;
-  recovery : bool;
   wallet : wallet;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
@@ -45,11 +44,6 @@ type t = {
 val create_refs :
   unit ->
   refs
-
-val sync :
-  recovery:bool ->
-  (unit -> unit Lwt.t) ->
-  unit
 
 val run :
   deps ->

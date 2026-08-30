@@ -94,6 +94,7 @@ let run_stashed_plan deps validator_set finalize (header : C_types.epoch_header)
           ~header_epoch
           ~current_epoch:(deps.current_epoch ())
           ~prev_root_matches
+          ~state_attested:(deps.state_attested ())
           ~catchup_active:(deps.catchup_active ()) with
   | Flow.Direct_apply_stashed { clear_reason } ->
     Log.warn "consensus"
