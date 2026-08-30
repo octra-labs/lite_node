@@ -476,13 +476,23 @@ let wasm_view_method_timing_enabled method_name =
 
 let vm_value_of_wasm_response = function
   | Octra_core.Circle_wasm_codec.Resp_null ->
-    ContractVM.VString ""
+    Ok (ContractVM.VString "")
   | Octra_core.Circle_wasm_codec.Resp_bool b ->
-    ContractVM.VBool b
+    Ok (ContractVM.VBool b)
   | Octra_core.Circle_wasm_codec.Resp_int value ->
-    ContractVM.VInt (Z.of_string value)
+    (try Ok (ContractVM.VInt (Z.of_string value)) with
+     | Invalid_argument _
+     | Failure _ ->
+       Error "wasm response integer is invalid")
   | Octra_core.Circle_wasm_codec.Resp_string value ->
-    ContractVM.VString value
+    Ok (ContractVM.VString value)
+
+let vm_response_value = function
+  | None -> Ok None
+  | Some response ->
+    match vm_value_of_wasm_response response with
+    | Ok value -> Ok (Some value)
+    | Error _ as error -> error
 
 let load_slot_policy store circle_id path_key =
   let* delivery_key_id =
@@ -1026,6 +1036,19 @@ let execute_wasm_view
       ~public_reads
       ~fuel_limit:(wasm_compute_fuel_limit fuel_limit)
 
+let run_preview_prefetch ~clear task =
+  Lwt.finalize
+    (fun () ->
+      Lwt.catch
+        task
+        (fun _ ->
+          Octra_log.warn "circle"
+            "event = preview_prefetch status = rejected reason = task_exception";
+          Lwt.return_unit))
+    (fun () ->
+      clear ();
+      Lwt.return_unit)
+
 let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
     store circle_id method_name params caller =
   let timing_enabled = wasm_view_method_timing_enabled method_name in
@@ -1210,26 +1233,30 @@ let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractV
                           | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
                             finish (failed_receipt e)
                           | Ok result ->
-                            let events =
-                              List.map
-                                (fun event ->
-                                  {
-                                    ContractVM.contract = circle_id;
-                                    depth;
-                                    event = event.Octra_core.Circle_wasm_host.topic;
-                                    values = [ContractVM.VString event.data];
-                                  })
-                                result.events in
-                            finish {
-                              Contract.success = result.success;
-                              return_value = Option.map vm_value_of_wasm_response result.response_value;
-                              effort_used = public_reads.effort_used + result.effort_used;
-                              events;
-                              error =
-                                if result.success then None
-                                else Some (Option.value ~default:"execution reverted" result.error);
-                              storage_writes = 0;
-                            }
+                            match vm_response_value result.response_value with
+                            | Error e ->
+                              finish (failed_receipt e)
+                            | Ok return_value ->
+                              let events =
+                                List.map
+                                  (fun event ->
+                                    {
+                                      ContractVM.contract = circle_id;
+                                      depth;
+                                      event = event.Octra_core.Circle_wasm_host.topic;
+                                      values = [ContractVM.VString event.data];
+                                    })
+                                  result.events in
+                              finish {
+                                Contract.success = result.success;
+                                return_value;
+                                effort_used = public_reads.effort_used + result.effort_used;
+                                events;
+                                error =
+                                  if result.success then None
+                                  else Some (Option.value ~default:"execution reverted" result.error);
+                                storage_writes = 0;
+                              }
                         end
                   end
             end
@@ -1258,27 +1285,29 @@ and maybe_prefetch_preview ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_00
       else begin
         Hashtbl.replace preview_session_inflight next_key ();
         Lwt.async (fun () ->
-          let params = [`String next_prompt_csv; `Int prefetch_n] in
-          let* receipt =
-            execute_view_call_with_execution
-              Circle_program.Standard
-              ~ctx
-              ~depth
-              ~limit
-              store
-              circle_id
-              "complete_preview"
-              params
-              caller in
-          begin
-            match preview_result_csv receipt with
-            | Some result_csv ->
-              preview_cache_store next_key result_csv
-            | None ->
-              ()
-          end;
-          Hashtbl.remove preview_session_inflight next_key;
-          Lwt.return_unit)
+          run_preview_prefetch
+            ~clear:(fun () -> Hashtbl.remove preview_session_inflight next_key)
+            (fun () ->
+              let params = [`String next_prompt_csv; `Int prefetch_n] in
+              let* receipt =
+                execute_view_call_with_execution
+                  Circle_program.Standard
+                  ~ctx
+                  ~depth
+                  ~limit
+                  store
+                  circle_id
+                  "complete_preview"
+                  params
+                  caller in
+              begin
+                match preview_result_csv receipt with
+                | Some result_csv ->
+                  preview_cache_store next_key result_csv
+                | None ->
+                  ()
+              end;
+              Lwt.return_unit))
       end
 
 and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
@@ -1544,46 +1573,50 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
                             | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
                               Lwt.fail (Execution_unavailable e)
                             | Ok result ->
-                              let events =
-                                List.map
-                                  (fun event ->
-                                    {
-                                      ContractVM.contract = circle_id;
-                                      depth;
-                                      event = event.Octra_core.Circle_wasm_host.topic;
-                                      values = [ContractVM.VString event.data];
-                                    })
-                                  result.events in
-                              let receipt = {
-                                Contract.success = result.success;
-                                return_value = Option.map vm_value_of_wasm_response result.response_value;
-                                effort_used = public_reads.effort_used + result.effort_used;
-                                events;
-                                error =
-                                  if result.success then None
-                                  else Some (Option.value ~default:"execution reverted" result.error);
-                                storage_writes = 0;
-                              } in
-                              Lwt.return {
-                                receipt;
-                                storage_tbl = result.storage_tbl;
-                                baseline_storage_tbl;
-                                spawns = result.spawns;
-                                assets = result.assets;
-                                encrypted_assets = result.encrypted_assets;
-                                caller;
-                                tx_hash = runtime_hfhe.exec_ctx.tx_hash;
-                                hfhe_binding =
-                                  hfhe_binding
-                                    loaded
-                                    circle_id
-                                    (public_reads_hash public_reads.snapshots)
-                                    (hfhe_context_hash
-                                       hfhe_caps
-                                       hfhe_pubkeys
-                                       hfhe_active_key)
-                                    result.hfhe_transcript;
-                              }
+                              match vm_response_value result.response_value with
+                              | Error e ->
+                                Lwt.return (failed_call_result e)
+                              | Ok return_value ->
+                                let events =
+                                  List.map
+                                    (fun event ->
+                                      {
+                                        ContractVM.contract = circle_id;
+                                        depth;
+                                        event = event.Octra_core.Circle_wasm_host.topic;
+                                        values = [ContractVM.VString event.data];
+                                      })
+                                    result.events in
+                                let receipt = {
+                                  Contract.success = result.success;
+                                  return_value;
+                                  effort_used = public_reads.effort_used + result.effort_used;
+                                  events;
+                                  error =
+                                    if result.success then None
+                                    else Some (Option.value ~default:"execution reverted" result.error);
+                                  storage_writes = 0;
+                                } in
+                                Lwt.return {
+                                  receipt;
+                                  storage_tbl = result.storage_tbl;
+                                  baseline_storage_tbl;
+                                  spawns = result.spawns;
+                                  assets = result.assets;
+                                  encrypted_assets = result.encrypted_assets;
+                                  caller;
+                                  tx_hash = runtime_hfhe.exec_ctx.tx_hash;
+                                  hfhe_binding =
+                                    hfhe_binding
+                                      loaded
+                                      circle_id
+                                      (public_reads_hash public_reads.snapshots)
+                                      (hfhe_context_hash
+                                         hfhe_caps
+                                         hfhe_pubkeys
+                                         hfhe_active_key)
+                                      result.hfhe_transcript;
+                                }
                           end
                     end
               end

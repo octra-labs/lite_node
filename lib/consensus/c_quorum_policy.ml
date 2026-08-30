@@ -26,16 +26,20 @@ let active ~chain_id ~epoch_id =
   | Some activation ->
     Int64.compare epoch_id (Int64.of_int activation.activation_epoch) >= 0
 
-let consensus_id ~chain_id =
-  match activation_for_chain chain_id with
-  | None -> "resilient:genesis"
-  | Some activation ->
-    String.concat ":" [
-      "resilient";
-      string_of_int activation.anchor_epoch;
-      activation.anchor_state_root;
-      string_of_int activation.activation_epoch;
-    ]
+let linear_epoch ~chain_id:_ = None
+
+let linear_weight ~chain_id ~epoch_id =
+  match linear_epoch ~chain_id with
+  | None -> false
+  | Some threshold ->
+    active ~chain_id ~epoch_id
+    && Int64.compare epoch_id threshold >= 0
+
+let count_floor_required ~chain_id ~epoch_id =
+  active ~chain_id ~epoch_id
+
+let count_cap_required ~chain_id ~epoch_id =
+  active ~chain_id ~epoch_id
 
 let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
   match activation_for_chain chain_id with
@@ -44,7 +48,9 @@ let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
       (Int64.compare from_epoch 0L >= 0
        && Int64.compare to_epoch 0L < 0)
   | Some activation ->
-    let boundary = Int64.of_int activation.activation_epoch in
-    not
-      (Int64.compare from_epoch boundary >= 0
-       && Int64.compare to_epoch boundary < 0)
+    let threshold = Int64.of_int activation.activation_epoch in
+    let crosses value =
+      Int64.compare from_epoch value >= 0
+      && Int64.compare to_epoch value < 0
+    in
+    not (crosses threshold)

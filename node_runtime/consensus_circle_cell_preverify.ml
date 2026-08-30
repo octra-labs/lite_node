@@ -57,18 +57,24 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
                 match plan with
                 | Error error -> Lwt.return_error error
                 | Ok plan ->
-                  let* applied =
-                    Epoch_exec.process_circle_operation_tx
-                      ~expected_transition_hash:plan.transition_hash
-                      ~backend
-                      ~current_epoch:env.epoch_id
-                      tx
-                  in
+                  let* verified = Transition.verify plan in
                   begin
-                    match applied with
-                    | Ok _ -> Lwt.return_ok plan.transition_hash
-                    | Error (error_type, reason) ->
-                      Lwt.return_error (error_type ^ ":" ^ reason)
+                    match verified with
+                    | Error error -> Lwt.return_error error
+                    | Ok () ->
+                      let* applied =
+                        Epoch_exec.process_circle_operation_tx
+                          ~expected_transition_hash:plan.transition_hash
+                          ~backend
+                          ~current_epoch:env.epoch_id
+                          tx
+                      in
+                      begin
+                        match applied with
+                        | Ok _ -> Lwt.return_ok plan.transition_hash
+                        | Error (error_type, reason) ->
+                          Lwt.return_error (error_type ^ ":" ^ reason)
+                      end
                   end)
               (fun () ->
                 Store_irmin.abort_epoch_batch backend.store;

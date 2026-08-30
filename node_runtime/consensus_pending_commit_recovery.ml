@@ -313,12 +313,21 @@ let deps_of_driver_runtime (runtime : 'driver driver_runtime) driver =
   }
 
 let unresolved (deps : deps) =
-  let head = deps.head_epoch () in
-  let pending =
-    deps.read_pending_commits ()
-    |> List.filter (fun p -> p.Wal.epoch_id > head)
-  in
-  head, pending
+  try
+    let head = deps.head_epoch () in
+    let pending =
+      deps.read_pending_commits ()
+      |> List.filter (fun p -> p.Wal.epoch_id > head)
+    in
+    Ok (head, pending)
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let hold_unreadable error =
+  Octra_log.error "consensus"
+    "event = pending_commit_recovery action = hold reason = store_unreadable error = %s"
+    error;
+  Lwt.return_false
 
 let delete (deps : deps) p =
   deps.delete_pending_commit ~epoch_id:p.Wal.epoch_id ~round:p.round
@@ -372,9 +381,10 @@ let run_pending (deps : deps) ~validator_count ~peer_quorum p =
     run_inconclusive p ~agreed ~peers ~responses ~quorum
 
 let run_once (deps : deps) ~validator_count ~peer_quorum =
-  let head, pending = unresolved deps in
-  if pending = [] then Lwt.return_true
-  else
+  match unresolved deps with
+  | Error error -> hold_unreadable error
+  | Ok (_, pending) when pending = [] -> Lwt.return_true
+  | Ok (head, pending) ->
     let expected_epoch = head + 1 in
     let future =
       List.filter
@@ -424,8 +434,9 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
             (run_pending deps ~validator_count ~peer_quorum)
             pending
         in
-        let _, remaining = unresolved deps in
-        Lwt.return (remaining = [])
+        (match unresolved deps with
+         | Error error -> hold_unreadable error
+         | Ok (_, remaining) -> Lwt.return (remaining = []))
 
 let run_with_driver runtime driver =
   run_once

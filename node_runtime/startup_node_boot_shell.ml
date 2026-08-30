@@ -38,7 +38,11 @@ type deps = {
   exit_fatal : unit -> unit;
 }
 
-let run_s = Ledger.run_s
+let run_s ?(timeout = 300.0) promise =
+  try
+    Lwt_main.run (Lwt_unix.with_timeout timeout (fun () -> promise))
+  with Lwt_unix.Timeout ->
+    failwith "startup: irmin I/O timeout"
 
 let meta_int ~default = function
   | Some raw -> Startup_process_shell.parse_int ~default raw
@@ -183,6 +187,25 @@ let run_epoch_tags (deps : store_deps) =
       run_s (Store_irmin.tag_epoch deps.store epoch));
   }
 
+let run_fork_store (deps : store_deps) =
+  match
+    run_s
+      (Octra_core.Fork_head_repair.resume_store
+         ~data_dir:deps.data_dir
+         ~store:deps.store)
+  with
+  | Ok Octra_core.Fork_head_repair.Idle -> ()
+  | Ok (Octra_core.Fork_head_repair.Resumed epoch) ->
+    Octra_log.warn "init"
+      "event = fork_repair phase = store status = resumed epoch = %d"
+      epoch
+  | Error reason ->
+    Octra_log.fatal "init"
+      "event = fork_repair phase = store status = refused reason = %s"
+      reason;
+    deps.exit_fatal ();
+    failwith "fork repair store resume failed"
+
 let run_recovery deps =
   Startup_recovery_shell.run_atomic_recovery {
     skip_recovery = (fun () -> deps.env "OCTRA_SKIP_RECOVERY" = Some "1");
@@ -195,6 +218,24 @@ let run_recovery deps =
     tx_count = (fun () -> Store_chaindata.tx_count deps.chaindata);
     set_total_tx_count = (fun n -> deps.total_tx_count := n);
   }
+
+let run_fork_chain deps =
+  match
+    Octra_core.Fork_head_repair.resume_chain
+      ~data_dir:deps.data_dir
+      ~chaindata:deps.chaindata
+  with
+  | Ok Octra_core.Fork_head_repair.Idle -> ()
+  | Ok (Octra_core.Fork_head_repair.Resumed epoch) ->
+    Octra_log.warn "init"
+      "event = fork_repair phase = chaindata status = resumed epoch = %d"
+      epoch
+  | Error reason ->
+    Octra_log.fatal "init"
+      "event = fork_repair phase = chaindata status = refused reason = %s"
+      reason;
+    deps.exit_fatal ();
+    failwith "fork repair chaindata resume failed"
 
 let run_reconciliation deps =
   Startup_recovery_shell.run_reconciliation {
@@ -251,6 +292,7 @@ let run_epoch deps =
   }
 
 let run_store deps =
+  run_fork_store deps;
   run_store_integrity deps;
   run_epoch_tags deps
 
@@ -266,6 +308,7 @@ let run_node deps =
     deps.exit_fatal ();
     -1
   | None ->
+    run_fork_chain deps;
     run_recovery deps;
     run_reconciliation deps;
     run_history deps;

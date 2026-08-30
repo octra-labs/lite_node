@@ -14,6 +14,7 @@ let max_wire_bytes = 512
 let max_epoch_files = 4_096
 let max_floor_bytes = 32
 let max_round_mark_bytes = 64
+let staged_serial = ref 0
 
 let disk ~data_dir =
   Disk (Filename.concat data_dir "vote_log")
@@ -53,8 +54,41 @@ let name (vote : vote) =
     vote.round
     (digest vote)
 
-let prefix epoch_id =
-  Printf.sprintf "%020Ld_" epoch_id
+type record_position = {
+  epoch_id : int64;
+  round : int;
+}
+
+let lowercase_hex value =
+  String.length value = 64
+  && String.for_all
+       (function
+         | '0' .. '9'
+         | 'a' .. 'f' -> true
+         | _ -> false)
+       value
+
+let record_position entry =
+  try
+    if not (Filename.check_suffix entry ".vote") then None
+    else
+      let body = Filename.remove_extension entry in
+      match String.split_on_char '_' body with
+      | [raw_epoch; raw_round; raw_digest] ->
+        let epoch_id = Int64.of_string raw_epoch in
+        let round = int_of_string raw_round in
+        if Int64.compare epoch_id 0L >= 0
+           && Int64.compare epoch_id Int64.max_int < 0
+           && round >= 0
+           && round <= C_codec.max_round
+           && String.equal raw_epoch (Printf.sprintf "%020Ld" epoch_id)
+           && String.equal raw_round (Printf.sprintf "%08d" round)
+           && lowercase_hex raw_digest
+        then Some { epoch_id; round }
+        else None
+      | _ -> None
+  with _ ->
+    None
 
 let floor_path path =
   Filename.concat path "floor"
@@ -212,48 +246,71 @@ let rec write_all fd wire offset =
     write_all fd wire (offset + written)
   end
 
-let write_floor path value =
-  let record = floor_path path in
-  let staged = record ^ "." ^ Int64.to_string value ^ ".staged" in
-  let wire = Int64.to_string value ^ "\n" in
-  try
-    let fd =
-      Unix.openfile staged
-        [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
-        0o600
+let rec open_staged record attempt =
+  if attempt >= 1024 then
+    Error "vote log staged record limit exceeded"
+  else
+    let serial = !staged_serial in
+    incr staged_serial;
+    let staged =
+      record ^ "." ^ string_of_int (Unix.getpid ()) ^ "."
+      ^ string_of_int serial ^ ".staged"
     in
+    try
+      Ok (staged,
+          Unix.openfile staged
+            [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
+            0o600)
+    with
+    | Unix.Unix_error (Unix.EEXIST, _, _) ->
+      open_staged record (attempt + 1)
+    | exn -> Error (error exn)
+
+let publish_record path record wire =
+  let* staged, fd = open_staged record 0 in
+  let renamed = ref false in
+  try
     Fun.protect
       ~finally:(fun () -> Unix.close fd)
       (fun () ->
         write_all fd wire 0;
         Unix.fsync fd);
     Unix.rename staged record;
+    renamed := true;
     sync_directory path
   with exn ->
+    if not !renamed then (try Unix.unlink staged with _ -> ());
     Error (error exn)
 
-let write_round_mark path epoch_id round =
-  let record = round_mark_path path in
-  let staged =
-    record ^ "." ^ Int64.to_string epoch_id ^ "." ^ string_of_int round
-    ^ ".staged"
-  in
-  let wire = round_mark_wire epoch_id round in
+let publish_new_record path record wire =
+  let* staged, fd = open_staged record 0 in
   try
-    let fd =
-      Unix.openfile staged
-        [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
-        0o600
-    in
     Fun.protect
       ~finally:(fun () -> Unix.close fd)
       (fun () ->
         write_all fd wire 0;
         Unix.fsync fd);
-    Unix.rename staged record;
-    sync_directory path
+    let result =
+      try
+        Unix.link staged record;
+        Ok `Published
+      with
+      | Unix.Unix_error (Unix.EEXIST, _, _) -> Ok `Existing
+      | exn -> Error (error exn)
+    in
+    (try Unix.unlink staged with _ -> ());
+    let* result = result in
+    let* () = sync_directory path in
+    Ok result
   with exn ->
+    (try Unix.unlink staged with _ -> ());
     Error (error exn)
+
+let write_floor path value =
+  publish_record path (floor_path path) (Int64.to_string value ^ "\n")
+
+let write_round_mark path epoch_id round =
+  publish_record path (round_mark_path path) (round_mark_wire epoch_id round)
 
 let set_floor store ~through_epoch =
   match store with
@@ -294,18 +351,6 @@ let set_round_mark store ~epoch_id ~round =
       | _ ->
         write_round_mark path epoch_id round
 
-let write path wire =
-  let fd =
-    Unix.openfile path
-      [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL]
-      0o600
-  in
-  Fun.protect
-    ~finally:(fun () -> Unix.close fd)
-    (fun () ->
-      write_all fd wire 0;
-      Unix.fsync fd)
-
 let check_existing path (vote : vote) =
   match read path with
   | Error reason -> Error reason
@@ -336,20 +381,13 @@ let keep_disk path (vote : vote) =
   | Ok () ->
     let record = Filename.concat path (name vote) in
     let wire = C_codec.encode_vote vote in
-    let result =
-      try
-        write record wire;
-        Ok vote
-      with
-      | Unix.Unix_error (Unix.EEXIST, _, _) -> check_existing record vote
-      | exn -> Error (error exn)
-    in
-    (match result with
-     | Error _ -> result
-     | Ok stored ->
-       match sync_directory path with
-       | Ok () -> Ok stored
-       | Error reason -> Error reason)
+    if Sys.file_exists record then
+      check_existing record vote
+    else
+      match publish_new_record path record wire with
+      | Error reason -> Error reason
+      | Ok `Published -> Ok vote
+      | Ok `Existing -> check_existing record vote
 
 let keep store (vote : vote) =
   match store with
@@ -362,33 +400,6 @@ let keep store (vote : vote) =
      | Some stored when same_statement stored vote -> Ok stored
      | Some _ -> Error "local vote conflicts with stored vote")
   | Disk path -> keep_disk path vote
-
-let find_statement store ~chain_id ~validator ~epoch_id ~round ~vote_type
-    ~proposal_id =
-  let expected = {
-    chain_id;
-    epoch_id;
-    round;
-    vote_type;
-    proposal_id;
-    validator;
-    signature = "";
-  } in
-  let exact = function
-    | Some stored when same_statement stored expected -> Some stored
-    | Some _
-    | None -> None
-  in
-  match store with
-  | Memory records ->
-    Ok (Hashtbl.find_opt records (key expected) |> exact)
-  | Disk path ->
-    if not (Sys.file_exists path) then Ok None
-    else
-      let* () = directory path in
-      let record = Filename.concat path (name expected) in
-      if not (Sys.file_exists record) then Ok None
-      else read record |> Result.map (fun stored -> exact (Some stored))
 
 let belongs ~chain_id ~validator ~epoch_id (vote : vote) =
   String.equal vote.chain_id chain_id
@@ -433,30 +444,35 @@ let max_round store ~chain_id ~validator ~epoch_id =
              let entries =
                Sys.readdir path
                |> Array.to_list
-               |> List.filter (fun entry ->
-                 Filename.check_suffix entry ".vote"
-                 && String.starts_with ~prefix:(prefix epoch_id) entry)
+               |> List.filter_map (fun entry ->
+                 match record_position entry with
+                 | Some position when Int64.equal position.epoch_id epoch_id ->
+                   Some (entry, position)
+                 | _ -> None)
              in
              if List.length entries > max_epoch_files then
                Error "vote log epoch record limit exceeded"
              else
                let votes =
                  List.fold_left
-                   (fun result entry ->
+                   (fun result (entry, position) ->
                      let* values = result in
-                     let* vote = read (Filename.concat path entry) in
-                     if Int64.equal vote.epoch_id epoch_id then
-                       Ok (vote :: values)
-                     else
-                       Error "vote log epoch does not match file")
+                     match read (Filename.concat path entry) with
+                     | Ok vote when Int64.equal vote.epoch_id epoch_id ->
+                       if belongs ~chain_id ~validator ~epoch_id vote then
+                         Ok (vote.round :: values)
+                       else
+                         Ok values
+                     | Ok _ ->
+                       Error "vote log epoch does not match file"
+                     | Error _ ->
+                       Ok (position.round :: values))
                    (Ok [])
                    entries
                in
-               let* votes = votes in
+               let* rounds = votes in
                let* mark = round_mark store in
-               votes
-               |> List.filter (belongs ~chain_id ~validator ~epoch_id)
-               |> List.map (fun (vote : vote) -> vote.round)
+               rounds
                |> with_round_mark epoch_id mark
                |> max_value
                |> fun value -> Ok value
@@ -481,12 +497,18 @@ let prune_disk path through_epoch =
             (fun result entry ->
               let* removed = result in
               let record = Filename.concat path entry in
-              let* vote = read record in
-              if Int64.compare vote.epoch_id through_epoch <= 0 then begin
+              let epoch_id =
+                match read record, record_position entry with
+                | Ok vote, _ -> Some vote.epoch_id
+                | Error _, Some position -> Some position.epoch_id
+                | Error _, None -> None
+              in
+              match epoch_id with
+              | Some value when Int64.compare value through_epoch <= 0 ->
                 Unix.unlink record;
                 Ok true
-              end else
-                Ok removed)
+              | Some _
+              | None -> Ok removed)
             (Ok false)
             entries
         in

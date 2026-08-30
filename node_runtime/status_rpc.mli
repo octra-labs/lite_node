@@ -8,11 +8,8 @@ val node_version :
 val runtime_version :
   source_commit:string option ->
   binary_hash:string option ->
-  consensus_standard:string ->
-  consensus_standard_hash:string ->
-  activation_graph_hash:string ->
-  compat_wire_profile:int ->
-  compat_wire_rules_id:string ->
+  consensus_profile:int ->
+  consensus_rules_id:string ->
   runtime_profile_hash:string option ->
   config_hash:string ->
   chain_id:string ->
@@ -34,6 +31,13 @@ val epoch_tags :
   gc_running:bool ->
   Yojson.Safe.t
 
+val validator_enrollment :
+  head_epoch:int ->
+  address:string ->
+  pubkey:string ->
+  Octra_core.Validator_admission.candidate option ->
+  (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
+
 val consensus_peer_states :
   now:float ->
   diag:Octra_net.P2p_peer_diag.t option ->
@@ -42,6 +46,7 @@ val consensus_peer_states :
   voting_reason:string option ->
   round_state:Octra_consensus.C_driver.round_state option ->
   round_peers:Yojson.Safe.t list ->
+  round_votes:Octra_consensus.C_driver.round_votes option ->
   round_agreed:bool ->
   Yojson.Safe.t
 

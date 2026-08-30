@@ -77,7 +77,7 @@ let private_transfer ~validate params =
   | None ->
     err_lwt (Rpc.malformed_tx "expected [tx_json]")
   | Some tx_json ->
-    match Transaction.of_yojson tx_json with
+    match Octra_core.Tx_payload.decode_admit tx_json with
     | Error e ->
       err_lwt (Rpc.malformed_tx e)
     | Ok tx ->

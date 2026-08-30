@@ -8,7 +8,7 @@ type head = {
 
 type kind =
   | Aligned
-  | Direct_head_write
+  | Root_mismatch
   | Missing_head
   | Unexpected_head
 
@@ -20,7 +20,7 @@ type plan = {
 
 let string_of_kind = function
   | Aligned -> "aligned"
-  | Direct_head_write -> "direct_head_write"
+  | Root_mismatch -> "root_mismatch"
   | Missing_head -> "missing_head"
   | Unexpected_head -> "unexpected_head"
 
@@ -34,9 +34,9 @@ let plan ~commit_epoch ~pre_root ~meta_epoch head =
     }
   | Some h when h.epoch_id = commit_epoch - 1 ->
     {
-      kind = Direct_head_write;
+      kind = Root_mismatch;
       irmin_last_before = h.epoch_id;
-      rollback_to_head = true;
+      rollback_to_head = false;
     }
   | Some _ ->
     {

@@ -10,6 +10,7 @@ module Metrics = Octra_core.Metrics
 module Request = Cohttp.Request
 module Server = Cohttp_lwt_unix.Server
 module State_sync = Octra_bootstrap.State_sync
+module Range_part = Octra_bootstrap.Range_part
 module Manifest = Octra_bootstrap.State_sync_manifest
 module Tree = Octra_core.Tree
 
@@ -374,11 +375,16 @@ let field_list_len name json =
       end
   | _ -> 0
 
-let handle_head ~current_epoch =
+let handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
-    respond_json (State_sync.head_json ~current_epoch)
+    let snapshot_epoch =
+      match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
+      | Ok cached -> Some cached.certificate.Manifest.checkpoint.epoch
+      | Error _ -> None
+    in
+    respond_json (State_sync.head_json ~current_epoch ~snapshot_epoch)
 
 let handle_client_progress body =
   if not (state_sync_enabled ()) then
@@ -421,11 +427,21 @@ let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
       | Some s -> (try int_of_string s with _ -> 16)
       | None -> 16
     in
-    if Int64.compare from_epoch 0L < 0 || max_epochs <= 0 then
+    let part =
+      match query_param query "part" with
+      | None -> None
+      | Some s -> Some (try int_of_string s with _ -> -1)
+    in
+    let part_valid =
+      match part with
+      | None -> true
+      | Some index -> index >= 0
+    in
+    if Int64.compare from_epoch 0L < 0 || max_epochs <= 0 || not part_valid then
       respond_error
         ~error_type:"state_sync_bad_range_request"
         `Bad_request
-        "invalid from_epoch/max_epochs"
+        "invalid from_epoch/max_epochs/part"
     else
       let validator_pubkeys =
         List.map
@@ -442,6 +458,11 @@ let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
           ~chain_id
           ~data_dir:(Some data_dir)
           ~chaindata
+          ~on_stop:(fun ~epoch ~reason ->
+            Log.warn "state_sync"
+              "event = catchup_range_stop epoch = %Ld reason = %s"
+              epoch
+              reason)
           ~reward_source:
             (fun _ header ->
               Consensus_reward_attribution.epoch_source
@@ -477,9 +498,17 @@ let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
       let status = field_string ~default:"unknown" "status" json in
       let records = field_list_len "records" json in
       Log.info "state_sync"
-        "range from_epoch = %Ld max_epochs = %d status = %s records = %d"
-        from_epoch max_epochs status records;
-      respond_json json
+        "range from_epoch = %Ld max_epochs = %d part = %d status = %s records = %d"
+        from_epoch max_epochs (Option.value ~default:(-1) part) status records;
+      begin
+        match Range_part.reply ?index:part json with
+        | Ok reply -> respond_json reply
+        | Error reason ->
+          respond_error
+            ~error_type:"state_sync_range_part"
+            `Bad_request
+            reason
+      end
 
 let int_query_param query name default_value =
   match query_param query name with
@@ -635,7 +664,7 @@ let handle
   | `GET, "/state-sync/manifest" ->
       handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set
   | `GET, "/state-sync/head" ->
-      handle_head ~current_epoch
+      handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch
   | `POST, "/state-sync/client-progress" ->
       handle_client_progress body
   | `GET, "/state-sync/readiness" ->

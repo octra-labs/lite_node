@@ -96,18 +96,3 @@ let snapshot_activation policy ~source_epoch =
         None
       else
         Some (Int64.add source_epoch value.parameters.activation_delay)
-
-let snapshot_at policy ~source_epoch ~cadence ~delay =
-  match policy with
-  | Inactive -> None
-  | Bonded value ->
-    let activation = Int64.of_int value.activation_epoch in
-    let first_source = Int64.sub activation delay in
-    if Int64.compare source_epoch first_source < 0 then
-      None
-    else
-      let elapsed = Int64.sub source_epoch first_source in
-      if Int64.rem elapsed cadence <> 0L then
-        None
-      else
-        Some (Int64.add source_epoch delay)

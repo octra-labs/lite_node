@@ -56,7 +56,6 @@ let public_stealth_record output =
     "enc_amount", `String output.enc_amount;
     "epoch_id", `Int output.epoch_id;
     "tx_hash", `String output.tx_hash;
-    "sender_addr", `String output.sender_addr;
     "claimed", `Int output.claimed;
     "claim_pub", `String output.claim_pub;
     "delta_cipher_stored", `String (public_cipher output.delta_cipher_stored);
@@ -116,7 +115,7 @@ let total_transactions ~confirmed =
   ok
     (Account_rpc.total_transactions
        ~confirmed
-       ~staging:(List.length (Staging.all ())))
+       ~staging:(Staging.staging_size ()))
 
 let pvac_pubkey store ~addr =
   let open Lwt.Syntax in

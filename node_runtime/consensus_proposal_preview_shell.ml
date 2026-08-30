@@ -48,20 +48,15 @@ let node_backend
           | Ok wasm_compute_mode ->
             begin
               match
-                Octra_core.Rule_graph.object_cost rules ~epoch:epoch_id
-              with
-              | Error fault ->
-                Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
-              | Ok object_cost_mode ->
-                let object_cost =
-                  object_cost_mode = Octra_core.Rule_graph.Active in
-            begin
-              match
+                Octra_core.Rule_graph.object_cost rules ~epoch:epoch_id,
                 Octra_core.Rule_graph.owner_migration rules ~epoch:epoch_id
               with
-              | Error fault ->
+              | Error fault, _
+              | _, Error fault ->
                 Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
-              | Ok owner_migration_mode ->
+              | Ok object_cost_mode, Ok owner_migration_mode ->
+                let object_cost =
+                  object_cost_mode = Octra_core.Rule_graph.Active in
                 begin
                   match
                     Octra_core.Rule_graph.private_payload
@@ -140,7 +135,6 @@ let node_backend
                   ~txs
                   ~process_tx)
                 end
-            end
             end
         end);
   }

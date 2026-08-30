@@ -102,12 +102,6 @@ let devnet_set_open_activation = {
   activation_epoch = 1_425_040;
 }
 
-let circle_activation_for_chain chain_id =
-  if String.equal chain_id devnet_chain_id then
-    Some devnet_circle_activation
-  else
-    None
-
 let owner_migration_activation_for_chain chain_id =
   if String.equal chain_id devnet_chain_id then
     Some devnet_owner_migration_activation
@@ -194,40 +188,17 @@ let epoch_time_activation_for_chain chain_id : activation option =
       activation_epoch = source.activation_epoch;
     }
 
-let activation_id = function
-  | None -> "none"
-  | Some value ->
-    String.concat ":" [
-      string_of_int value.anchor_epoch;
-      value.anchor_state_root;
-      string_of_int value.activation_epoch;
-    ]
-
-let consensus_id ~chain_id =
-  [
-    circle_activation_for_chain chain_id;
-    wasm_compute_activation_for_chain chain_id;
-    validator_quorum_activation_for_chain chain_id;
-    epoch_time_activation_for_chain chain_id;
-    owner_migration_activation_for_chain chain_id;
-    private_payload_activation_for_chain chain_id;
-    set_fold_activation_for_chain chain_id;
-    validator_ready_activation_for_chain chain_id;
-    ready_ref_activation_for_chain chain_id;
-    set_live_activation_for_chain chain_id;
-    set_fold_cap_activation_for_chain chain_id;
-    set_open_activation_for_chain chain_id;
-    object_cost_activation_for_chain chain_id;
-    account_pack_activation_for_chain chain_id;
-  ]
-  |> List.map activation_id
-  |> String.concat "|"
-
 let make ~ready_config_hash ~chain_id ~root_at =
+  let circle_activation =
+    if String.equal chain_id devnet_chain_id then
+      Some devnet_circle_activation
+    else
+      None
+  in
   {
     chain_id;
     ready_config_hash;
-    circle_activation = circle_activation_for_chain chain_id;
+    circle_activation;
     wasm_compute_activation = wasm_compute_activation_for_chain chain_id;
     validator_quorum_activation =
       validator_quorum_activation_for_chain chain_id;

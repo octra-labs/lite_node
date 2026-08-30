@@ -21,6 +21,7 @@ type deps = {
   validator : string;
   validator_pubkey : string;
   priv_b64 : string;
+  seed_floor : epoch:int64 -> (int option, string) result;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
 }
@@ -31,6 +32,7 @@ type apply_finalized =
   ?override_proposer_info:Octra_core.Epochlog.proposer_info ->
   ?override_reward:Consensus_reward_attribution.t ->
   ?override_epoch_ts:float ->
+  ?override_validator_set:Octra_consensus.C_types.validator_set ->
   ?override_parent_commit:Octra_consensus.C_types.parent_commit ->
   now:float ->
   elapsed:float ->
@@ -45,6 +47,7 @@ type apply_callbacks = {
     proposer_info:Octra_core.Epochlog.proposer_info option ->
     reward:Consensus_reward_attribution.t ->
     epoch_ts:float ->
+    validator_set:Octra_consensus.C_types.validator_set ->
     parent_commit:Octra_consensus.C_types.parent_commit option ->
     unit Lwt.t;
 }
@@ -87,7 +90,12 @@ val join_wiring : deps -> Consensus_join_rpc.node_runtime_wiring
 
 val run_replay : deps -> unit Lwt.t
 
-val run_join : deps -> unit Lwt.t
+val run_join : deps -> Consensus_join_rpc.outcome option Lwt.t
+
+val seed_epoch :
+  validator:bool ->
+  Consensus_join_rpc.outcome option ->
+  int64 option
 
 val run : deps -> unit Lwt.t
 

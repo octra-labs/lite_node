@@ -123,6 +123,12 @@ let transaction_epoch_targets ?epoch_param all_epochs =
   | Some _ -> []
   | None -> take 5 all_epochs
 
+let recent_epochs ~last ~count =
+  if last < 0 || count <= 0 then []
+  else
+    let count = if last < count then last + 1 else count in
+    List.init count (fun offset -> last - offset)
+
 type transactions_query = {
   transactions_epoch_param : int option;
   transactions_limit : int;

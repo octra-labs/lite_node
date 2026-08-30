@@ -106,6 +106,16 @@ val stealth_outputs :
   params:Yojson.Safe.t ->
   rpc_result Lwt.t
 
+val stealth_outputs_page :
+  Octra_core.Store_irmin.t ->
+  params:Yojson.Safe.t ->
+  rpc_result Lwt.t
+
+val stealth_outputs_by_id :
+  Octra_core.Store_irmin.t ->
+  params:Yojson.Safe.t ->
+  rpc_result Lwt.t
+
 val account :
   Octra_core.Store_chaindata.t ->
   params:Yojson.Safe.t ->

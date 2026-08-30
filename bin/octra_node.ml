@@ -37,6 +37,7 @@ module Consensus_proposal_state = Octra_node_runtime.Consensus_proposal_state
 module Consensus_runtime_boot_shell = Octra_node_runtime.Consensus_runtime_boot_shell
 module Consensus_tick_loop = Octra_node_runtime.Consensus_tick_loop
 module Set_actor = Octra_node_runtime.Set_actor
+module Set_post = Octra_node_runtime.Set_post
 module Set_rule = Octra_node_runtime.Set_rule
 module Epoch_atomic = Octra_node_runtime.Epoch_atomic
 module Epoch_visibility = Octra_node_runtime.Epoch_visibility
@@ -57,7 +58,15 @@ module Startup_private_profile = Octra_node_runtime.Startup_private_profile
 module Startup_runtime_limits = Octra_node_runtime.Startup_runtime_limits
 module Startup_store_shell = Octra_node_runtime.Startup_store_shell
 module State_sync_http = Octra_node_runtime.State_sync_http
+module Status_read_rpc = Octra_node_runtime.Status_read_rpc
 module Sync_publish = Octra_node_runtime.Sync_publish
+module Sync_mark = Octra_node_runtime.Sync_mark
+module Sync_need = Octra_node_runtime.Sync_need
+module Root_win = Octra_bootstrap.Root_win
+module Sync_anchor = Octra_bootstrap.Sync_anchor
+module Sync_manifest = Octra_bootstrap.State_sync_manifest
+module State_sync = Octra_bootstrap.State_sync
+module Parent_commit = Octra_consensus.C_parent_commit
 module Program_trust = Octra_vm.Program_trust
 
 let addr_short = Octra_node_runtime.Text.addr_short
@@ -96,10 +105,78 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     end;
 
     let init_mode = cli_has_flag "--init" in
-    let role =
+    let publisher_mode = cli_has_flag "--state-sync-publisher" in
+    let base_role =
       Octra_node_runtime.Consensus_mode.of_inputs
-        ~cli_observer:(cli_has_flag "--observer")
+        ~cli_observer:(cli_has_flag "--observer" || publisher_mode)
         ~env_mode:(env_opt "OCTRA_CONSENSUS_MODE")
+    in
+    let data_dir = Startup_process_shell.data_dir ~env:env_opt in
+    Startup_process_shell.ensure_data_dir
+      ~init_mode
+      ~data_dir
+      ~exit_fatal:exit_error;
+    let startup_network =
+      Startup_process_shell.network_config ~env:env_opt
+    in
+    let recovery_need =
+      match
+        Sync_mark.read
+          ~data_dir
+          ~chain:startup_network.chain_id
+        |> Sync_mark.need
+      with
+      | Ok value -> value
+      | Error reason ->
+          Log.fatal "init"
+            "event = sync_recovery status = rejected reason = %s"
+            reason;
+          exit_error ()
+    in
+    let recovery_mode = Option.is_some recovery_need in
+    let role =
+      let selected =
+        if publisher_mode then
+          Octra_node_runtime.Consensus_mode.publisher base_role
+        else
+          base_role
+      in
+      Octra_node_runtime.Consensus_mode.with_need recovery_need selected
+    in
+    Option.iter
+      (fun need ->
+        Log.warn "init"
+          "event = sync_recovery status = required cause = %s epoch = %d head = %d target = %s"
+          (Sync_need.label need.Sync_need.cause)
+          need.epoch
+          need.head
+          (match need.target with
+           | Some target -> Int64.to_string target
+           | None -> "-"))
+      recovery_need;
+    let require_sync need =
+      let status, stored =
+        match
+          Sync_mark.write
+            ~data_dir
+            ~chain:startup_network.chain_id
+            need
+        with
+        | Ok Sync_mark.Stored -> "stored", need
+        | Ok (Sync_mark.Present prior) -> "present", prior
+        | Error reason ->
+            Log.fatal "consensus"
+              "event = sync_recovery status = rejected reason = %s"
+              reason;
+            exit_error ()
+      in
+      Log.fatal "consensus"
+        "event = sync_recovery status = %s cause = %s epoch = %d head = %d action = exit"
+        status
+        (Sync_need.label stored.Sync_need.cause)
+        stored.epoch
+        stored.head;
+      exit_error ()
     in
     let consensus_role = role.role in
     let consensus_mode = role.consensus_enabled in
@@ -115,12 +192,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           error;
         exit_error ()
     in
-
-    let data_dir = Startup_process_shell.data_dir ~env:env_opt in
-    Startup_process_shell.ensure_data_dir
-      ~init_mode
-      ~data_dir
-      ~exit_fatal:exit_error;
     let drop_db = Tx_drop.open_db data_dir in
     let save_drops drops =
       match Tx_drop.save_many drop_db (List.map Staging.drop_row drops) with
@@ -129,10 +200,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Log.warn "staging"
           "event = drop_persist_failed reason = %s"
           reason
-    in
-
-    let startup_network =
-      Startup_process_shell.network_config ~env:env_opt
     in
     let private_result_activation_epoch =
       match Octra_core.Private_result_policy.activation_epoch_of env_opt with
@@ -270,8 +337,78 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 exit_error ()
           end
     in
+    let ready_roots =
+      let path = Filename.concat data_dir Root_win.name in
+      if not (Sys.file_exists path) then []
+      else
+        let reject reason =
+          Log.fatal "init"
+            "event = ready_roots status = rejected reason = %s"
+            reason;
+          exit_error ()
+        in
+        match history_floor with
+        | None -> reject "history floor is missing"
+        | Some floor ->
+            begin
+              match
+                Sync_manifest.load_certificate
+                  (State_sync.anchor_path data_dir)
+              with
+              | Error reason -> reject reason
+              | Ok certificate ->
+                  begin
+                    match Sync_manifest.finality certificate with
+                    | None -> reject "finality anchor is missing"
+                    | Some encoded ->
+                        begin
+                          match Sync_anchor.decode encoded with
+                          | Error reason -> reject reason
+                          | Ok anchor ->
+                              let anchor_parent = Octra_consensus.C_types.{
+                                certificate =
+                                  certificate_of_finalize
+                                    (Sync_anchor.finality anchor);
+                                validator_set = Sync_anchor.validator_set anchor;
+                              }
+                              in
+                              if
+                                Parent_commit.encode anchor_parent
+                                <> Parent_commit.encode
+                                     (History_floor.parent_commit floor)
+                              then
+                                reject "finality anchor differs from history floor"
+                              else
+                                begin
+                                  match Root_win.read path with
+                                  | Error reason -> reject reason
+                                  | Ok values ->
+                                      begin
+                                        match
+                                          Root_win.verify
+                                            ~anchor:(Sync_anchor.finality anchor)
+                                            values
+                                        with
+                                        | Error reason -> reject reason
+                                        | Ok roots -> roots
+                                      end
+                                end
+                        end
+                  end
+            end
+    in
+    let ready_config_hash =
+      Octra_consensus.C_config.network_hash
+        ~chain_id:startup_network.chain_id
+        ?program_trust_hash:(Program_trust.config_hash program_trust)
+        ~runtime_profile_hash:
+          (Octra_node_runtime.Consensus_profile.hash env_opt)
+        ()
+      |> raw_to_hex
+    in
     let rules =
-      Rule_graph.create
+      Rule_graph.create_ready
+        ~ready_config_hash
         ~chain_id:startup_network.chain_id
         ~root_at:(fun epoch ->
           match Store_chaindata.get_bound_epoch_header chaindata epoch with
@@ -451,6 +588,22 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "set_fold"
       (Rule_graph.set_fold_activation rules)
       (fun epoch -> Rule_graph.set_fold rules ~epoch);
+    bind_rule
+      "validator_ready"
+      (Rule_graph.validator_ready_activation rules)
+      (fun epoch -> Rule_graph.validator_ready rules ~epoch);
+    bind_rule
+      "ready_ref"
+      (Rule_graph.ready_ref_activation rules)
+      (fun epoch -> Rule_graph.ready_ref rules ~epoch);
+    bind_rule
+      "set_fold_cap"
+      (Rule_graph.set_fold_cap_activation rules)
+      (fun epoch -> Rule_graph.set_fold_cap rules ~epoch);
+    bind_rule
+      "object_cost"
+      (Rule_graph.object_cost_activation rules)
+      (fun epoch -> Rule_graph.object_cost rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -458,10 +611,21 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let ready_state_root_at epoch_id =
       if epoch_id < 0 then Lwt.return_none
       else
-        match Store_chaindata.get_epoch_header chaindata epoch_id with
-        | Some h when String.length h.Epochlog.state_root > 0 ->
-          Lwt.return_some h.Epochlog.state_root
-        | _ -> Lwt.return_none
+        let stored =
+          match Store_chaindata.get_epoch_header chaindata epoch_id with
+          | Some h when String.length h.Epochlog.state_root > 0 ->
+              Some h.Epochlog.state_root
+          | _ -> None
+        in
+        let signed = List.assoc_opt epoch_id ready_roots in
+        match Root_win.select ~stored ~signed with
+        | Ok root -> Lwt.return root
+        | Error reason ->
+            Log.fatal "consensus"
+              "event = ready_root status = rejected epoch = %d reason = %s"
+              epoch_id
+              reason;
+            exit_error ()
     in
 
     let runtime_env = Startup_runtime_limits.{
@@ -505,6 +669,56 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           now = Unix.gettimeofday;
         }
     in
+    let fold_wake = ref (fun ~head:_ -> ()) in
+    let mark_state_attested =
+      match recovery_need with
+      | Some need when need.Sync_need.cause = Sync_need.Journal ->
+        (fun ~head ~root ->
+          set_state_attested ~head ~root;
+          match
+            Sync_mark.consume_journal
+              ~data_dir
+              ~chain:startup_network.chain_id
+              ~verified_head:head
+              need
+          with
+          | Ok () ->
+            Log.warn "init"
+              "event = sync_recovery status = consumed cause = journal head = %d action = restart"
+              head;
+            exit_success ()
+          | Error reason ->
+            Log.fatal "init"
+              "event = sync_recovery status = rejected cause = journal reason = %s"
+              reason;
+            exit_error ())
+      | Some need when need.Sync_need.cause = Sync_need.Root ->
+        (fun ~head ~root ->
+          set_state_attested ~head ~root;
+          if head >= need.epoch then
+            match
+              Sync_mark.consume_root
+                ~data_dir
+                ~chain:startup_network.chain_id
+                ~verified_head:head
+                need
+            with
+            | Ok () ->
+              Log.warn "init"
+                "event = sync_recovery status = consumed cause = root head = %d action = restart"
+                head;
+              exit_success ()
+            | Error reason ->
+              Log.fatal "init"
+                "event = sync_recovery status = rejected cause = root reason = %s"
+                reason;
+              exit_error ())
+      | _ -> set_state_attested
+    in
+    let set_state_attested ~head ~root =
+      mark_state_attested ~head ~root;
+      (!fold_wake) ~head
+    in
     let epoch_visibility = Epoch_visibility.create () in
     let Startup_runtime_limits.{
       max_stealth_defer;
@@ -526,6 +740,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
   let apply_finalized_epoch ?override_ordered_txs ?override_receipts_json
       ?override_proposer_info ?override_reward ?override_epoch_ts
+      ?override_validator_set
       ~parent_commit
       ~now ~elapsed () =
     let open Lwt.Syntax in
@@ -569,6 +784,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 let header = finalize.Octra_consensus.C_types.header in
                 header.Octra_consensus.C_types.prev_state_root));
             fatal = Log.fatal "epoch" "%s";
+            require_sync;
             exit = exit_error;
           };
           epoch_env = Consensus_epoch_apply_env.{
@@ -647,7 +863,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           wallet_addr = wallet.address;
           pre_state_hash;
           standard_env = (fun () ->
-            Consensus_epoch_apply_env.standard_for_proposer epoch_env
+            let validator_pubkeys =
+              Option.map
+                (fun set ->
+                  List.map
+                    (fun validator ->
+                      validator.Octra_consensus.C_types.address,
+                      Base64.encode_exn validator.pubkey)
+                    set.Octra_consensus.C_types.validators)
+                override_validator_set
+            in
+            Consensus_epoch_apply_env.standard_for_proposer
+              ?validator_pubkeys
+              epoch_env
               ~proposer_addr:wallet.address
               ~prev_state_root:pre_consensus_root);
           current_epoch = (fun () -> !current_epoch);
@@ -728,6 +956,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           log_epoch = Log.info "epoch" "%s";
           fatal_epoch = Log.fatal "epoch" "%s";
           short = addr_short;
+          require_sync;
           exit = exit_error;
         }
         Consensus_epoch_apply_finish_shell.{
@@ -764,7 +993,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
   let apply_finalized_epoch_checked ?override_ordered_txs
       ?override_receipts_json ?override_proposer_info ?override_reward
-      ?override_epoch_ts ~parent_commit ~now ~elapsed () =
+      ?override_epoch_ts ?override_validator_set ~parent_commit ~now ~elapsed () =
     Consensus_epoch_apply_checked.run_node
       ~consensus_mode
       ~current_epoch
@@ -805,6 +1034,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 ?override_proposer_info
                 ?override_reward
                 ?override_epoch_ts
+                ?override_validator_set
                 ~parent_commit
                 ~now
                 ~elapsed
@@ -868,7 +1098,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           set_proposal = Consensus_proposal_state.set proposal_state;
           apply_finalized = (fun ?override_ordered_txs
               ?override_receipts_json ?override_proposer_info
-              ?override_reward ?override_epoch_ts ?override_parent_commit
+              ?override_reward ?override_epoch_ts ?override_validator_set
+              ?override_parent_commit
               ~now ~elapsed () ->
             apply_finalized_epoch_checked
               ?override_ordered_txs
@@ -876,11 +1107,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               ?override_proposer_info
               ?override_reward
               ?override_epoch_ts
+              ?override_validator_set
               ~parent_commit:override_parent_commit
               ~now
               ~elapsed
               ());
           consensus_role = Octra_consensus.C_role.label consensus_role;
+          recovery = recovery_mode;
           wallet = {
             address = wallet.address;
             pub = wallet.pub;
@@ -938,12 +1171,18 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           (fun finality ->
             finality.Octra_consensus.C_codec.finalize.parent_commit)
       in
+      let validator_set =
+        match validated.record.Octra_consensus.C_codec.finality with
+        | Some finality -> finality.validator_set
+        | None -> failwith "catchup finality validator set is missing"
+      in
       apply_finalized_epoch_checked
         ~override_ordered_txs:validated.parsed_txs
         ~override_receipts_json:record.receipts_json
         ?override_proposer_info
         ~override_reward:validated.reward
         ~override_epoch_ts:record.epoch_ts
+        ~override_validator_set:validator_set
         ~parent_commit
         ~now
         ~elapsed:0.0
@@ -1064,31 +1303,36 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok Rule_graph.Prior
       | Error _ -> false
     in
-    let fold_bonded () =
-      match
-        irmin_get_meta store Octra_core.Validator_registry.meta_key
-      with
-      | None -> false
-      | Some raw ->
-        begin
-          match Octra_core.Validator_registry.of_string raw with
-          | Error _ -> false
-          | Ok registry ->
-            begin
-              match
-                Octra_core.Validator_registry.find wallet.address registry
-              with
-              | Some candidate ->
-                candidate.Octra_core.Validator_admission.exit_epoch = None
-              | None -> false
-            end
-        end
+    let enrollment_ref =
+      ref (Error "committed validator enrollment unavailable")
     in
+    let refresh_enrollment () =
+      let result =
+        Rest.run_s
+          (Status_read_rpc.load_validator_enrollment
+             ~store
+             ~head:(Octra_core.Head_manifest.get_cached ())
+             ~validator_address:wallet.address)
+      in
+      enrollment_ref := result;
+      result
+    in
+    let fold_bonded () =
+      match refresh_enrollment () with
+      | Error _ -> false
+      | Ok { candidate = None; _ } -> false
+      | Ok { candidate = Some candidate; _ } ->
+        candidate.Octra_core.Validator_admission.exit_epoch = None
+    in
+    ignore (refresh_enrollment ());
     let fold_message action ~head_epoch ~state_root =
       let fields = [
         "consensus_pubkey", `String wallet.pub;
         "head_epoch", `String (Int64.to_string head_epoch);
         "state_root", `String state_root;
+        "chain_id", `String chain_id;
+        "config_hash", `String ready_config_hash;
+        "catchup_head_epoch", `String (Int64.to_string head_epoch);
       ] in
       let fields =
         match action with
@@ -1106,6 +1350,126 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           ]
       in
       Yojson.Safe.to_string (`Assoc fields)
+    in
+    let fold_tx = ref None in
+    let read_fold_body body =
+      let stream = Cohttp_lwt.Body.to_stream body in
+      let buffer = Buffer.create 4096 in
+      let limit = 65_536 in
+      let rec read total =
+        let open Lwt.Syntax in
+        let* chunk = Lwt_stream.get stream in
+        match chunk with
+        | None -> Lwt.return_ok (Buffer.contents buffer)
+        | Some value ->
+          let length = String.length value in
+          if length > limit - total then
+            Lwt.return_error "validator duty RPC response exceeds limit"
+          else begin
+            Buffer.add_string buffer value;
+            read (total + length)
+          end
+      in
+      read 0
+    in
+    let post_fold tx =
+      match Sys.getenv_opt "OCTRA_OPERATOR_RPC_URL" with
+      | None -> Lwt.return_error "validator duty RPC is not configured"
+      | Some url ->
+        let body =
+          `Assoc [
+            "jsonrpc", `String "2.0";
+            "id", `Int 1;
+            "method", `String "octra_submit";
+            "params", `List [Transaction.to_yojson tx];
+          ]
+          |> Yojson.Safe.to_string
+          |> Cohttp_lwt.Body.of_string
+        in
+        let headers =
+          Cohttp.Header.init ()
+          |> fun value ->
+            Cohttp.Header.add value "content-type" "application/json"
+          |> fun value ->
+            Cohttp.Header.add value "user-agent" "octra-validator-duty/1"
+        in
+        Lwt.catch
+          (fun () ->
+            Lwt_unix.with_timeout 5.0 (fun () ->
+              let open Lwt.Syntax in
+              let* response, response_body =
+                Cohttp_lwt_unix.Client.post
+                  ~headers
+                  ~body
+                  (Uri.of_string url)
+              in
+              let* raw = read_fold_body response_body in
+              match raw with
+              | Error _ as error -> Lwt.return error
+              | Ok raw ->
+                let code =
+                  Cohttp.Response.status response
+                  |> Cohttp.Code.code_of_status
+                in
+                if code < 200 || code >= 300 then
+                  Lwt.return_error
+                    (Printf.sprintf "validator duty RPC returned HTTP %d" code)
+                else
+                  match Yojson.Safe.from_string raw with
+                  | `Assoc fields when List.assoc_opt "result" fields <> None ->
+                    Lwt.return_ok ()
+                  | `Assoc fields ->
+                    begin
+                      match List.assoc_opt "error" fields with
+                      | Some error ->
+                        Lwt.return_error
+                          ("validator duty RPC refused transaction: "
+                           ^ Yojson.Safe.to_string error)
+                      | None ->
+                        Lwt.return_error "validator duty RPC result is absent"
+                    end
+                  | _ ->
+                    Lwt.return_error "validator duty RPC response is invalid"))
+          (fun exn -> Lwt.return_error (Printexc.to_string exn))
+    in
+    let fold_post =
+      Set_post.create Set_post.{
+        now = Unix.gettimeofday;
+        wait = Lwt_unix.sleep;
+        staged = (fun hash -> Staging.find_by_hash hash <> None);
+        landed = (fun tx ->
+          match Ledger.find_opt ledger tx.Transaction.from with
+          | Some account -> account.Ledger.nonce >= tx.nonce
+          | None -> false);
+        post = post_fold;
+        warn = (fun reason ->
+          Log.warn "validator"
+            "event = set_post_failed reason = %s"
+            reason);
+      }
+    in
+    let send_fold_tx conn =
+      match !fold_tx with
+      | None -> ()
+      | Some (hash, tx) ->
+        begin
+          match Staging.find_by_hash hash with
+          | None -> fold_tx := None
+          | Some _ ->
+            let tx_json =
+              Yojson.Safe.to_string (Transaction.to_yojson tx)
+            in
+            let payload =
+              Octra_net.P2p_tx_gossip.encode
+                (Octra_net.P2p_tx_gossip.Tx { hash; tx_json })
+            in
+            Lwt.async (fun () ->
+              Octra_net.P2p_conn.send conn
+                Octra_net.P2p_frame.{
+                  msg_type = msg_tx_gossip;
+                  payload;
+                })
+        end
     in
     let send_fold action =
       let open Lwt.Syntax in
@@ -1145,7 +1509,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 ledger
                 tx
             with
-            | Ok _ -> Lwt.return_ok ()
+            | Ok hash ->
+              fold_tx := Some (hash, tx);
+              Set_post.put fold_post ~hash tx;
+              Lwt.return_ok ()
             | Error error -> Lwt.return_error error
           end
     in
@@ -1161,6 +1528,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 wallet.address;
             bonded = fold_enabled epoch && fold_bonded ();
           });
+        peers = (fun () ->
+          match !swarm_ref with
+          | Some swarm -> Octra_net.P2p_swarm.connected_count swarm
+          | None -> 0);
         send = send_fold;
         warn = (fun reason ->
           Log.warn "validator"
@@ -1168,6 +1539,17 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             reason);
       }
     in
+    fold_wake := (fun ~head ->
+      match Set_actor.wake fold_actor ~head with
+      | Set_actor.Accepted -> ()
+      | Set_actor.Busy ->
+        Log.warn "validator"
+          "event = set_actor_overload head = %d"
+          head
+      | Set_actor.Stopped ->
+        Log.warn "validator"
+          "event = set_actor_stopped head = %d"
+          head);
     let bind_fold driver =
       Octra_consensus.C_driver.set_fold_handler
         driver
@@ -1183,22 +1565,52 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               "event = set_actor_stopped epoch = %Ld"
               next_epoch)
     in
-    let run_preverify prepared txs =
-      Octra_core.Preverify_worker.run_many
-        ~field_policy:(private_field_policy !current_epoch)
-        ~ledger
-        ~result_policy:(private_result_policy !current_epoch)
-        ~circle_preverify:
-          (Consensus_circle_preverify.run circle_preverify)
-        ~circle_cell_preverify:
-          (Consensus_circle_cell_preverify.run circle_cell_preverify)
-        ~legacy_replay:(fun ~address ~cipher ->
-          legacy_replay
-            ~epoch:!current_epoch
-            ~address
-            ~cipher)
-        ~prepared
+    let run_preverify prepared root txs =
+      let open Lwt.Syntax in
+      let id =
         txs
+        |> List.map Octra_core.Transaction.hash
+        |> String.concat ""
+        |> Digestif.SHA256.digest_string
+        |> Digestif.SHA256.to_hex
+      in
+      let* result =
+        Octra_core.State_preview.with_state
+          ~base_store:store
+          ~base_ledger:ledger
+          ~epoch_id:!current_epoch
+          ~proposal_id:("pv-" ^ String.sub id 0 12)
+          ~expected_prev_root:root
+          (fun _ ledger ->
+            let* batch =
+              Octra_core.Preverify_worker.run_many
+                ~field_policy:(private_field_policy !current_epoch)
+                ~ledger
+                ~result_policy:(private_result_policy !current_epoch)
+                ~circle_preverify:
+                  (Consensus_circle_preverify.run circle_preverify)
+                ~circle_cell_preverify:
+                  (Consensus_circle_cell_preverify.run circle_cell_preverify)
+                ~legacy_replay:(fun ~address ~cipher ->
+                  legacy_replay
+                    ~epoch:!current_epoch
+                    ~address
+                    ~cipher)
+                ~prepared
+                txs
+            in
+            Lwt.return_ok batch)
+      in
+      match result with
+      | Ok batch -> Lwt.return batch
+      | Error reason ->
+        Log.info "consensus"
+          "event = preverify_deferred reason = %s"
+          reason;
+        Lwt.return
+          (Octra_core.Preverify_worker.defer
+             "preverify_state_changed"
+             txs)
     in
     let prepared_lookup private_lookup key_switch_lookup tx =
       let open Lwt.Syntax in
@@ -1229,6 +1641,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         env_int;
         data_dir;
         chain_id;
+        sync_validators = State_sync_http.configured_validator_set;
+        sync_exporters = State_sync_http.exporter_set;
         store;
         chaindata;
         consensus_mode;
@@ -1248,7 +1662,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           scheduled_validator_set = scheduled_validator_set_ref;
           set_swarm = (fun swarm ->
             swarm_opt := Some swarm;
-            swarm_ref := Some swarm);
+            swarm_ref := Some swarm;
+            Octra_net.P2p_swarm.set_peer_hook swarm (fun conn ->
+              send_fold_tx conn;
+              Set_post.tick fold_post;
+              (!fold_wake) ~head:(max 0 (!current_epoch - 1))));
         };
         current_epoch;
         consensus_finalized;
@@ -1308,6 +1726,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           not (Epoch_visibility.is_applying epoch_visibility));
         sleep = Lwt_unix.sleep;
         now = Unix.gettimeofday;
+        require_sync;
         exit_error;
       };
 
@@ -1323,6 +1742,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           trusted_validator_set = State_sync_http.configured_validator_set;
           head = Octra_core.Head_manifest.get_cached;
           read_finality = (fun epoch ->
+            Consensus_finality_journal.read_committed_epoch
+              ~chain_id
+              ~epoch
+              data_dir);
+          read_root = (fun epoch ->
             Consensus_finality_journal.read_committed_epoch
               ~chain_id
               ~epoch
@@ -1429,13 +1853,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~consensus_driver_ref:driver_ref
         ~epoch_visibility
         ~resource_compute
+        ~validator_enrollment:(fun () -> !enrollment_ref)
     in
     Startup_node_launch_shell.run
       Startup_node_launch_shell.{
         p2p_port;
         rpc = rpc_task;
-        services = [sync_task];
+        services = if recovery_mode then [] else [sync_task];
         observer = observer_mode;
+        follow = consensus_mode;
         tick_loop;
         swarm = !swarm_opt;
         guard = tx_gossip_guard;

@@ -1955,31 +1955,41 @@ let take_actor_command t =
   | Some _ as command -> command
   | None -> Queue.take_opt t.data_channel
 
-let rec actor_loop t =
+let actor_turn t () =
   match take_actor_command t with
   | Some (Command command) ->
     Lwt_condition.broadcast t.channel_space ();
     if command.generation <> t.actor_generation then begin
       Lwt.wakeup_later_exn command.reply
         (Failure "resource compute actor generation changed");
-      actor_loop t
+      Lwt.return (Octra_consensus.C_loop.Next ())
     end else
-      Lwt.catch
-        (fun () ->
-          let* value = handle_actor_message t command.message in
-          Lwt.wakeup_later command.reply value;
-          actor_loop t)
-        (fun error ->
+      let* result =
+        Lwt.catch
+          (fun () ->
+            let+ value = handle_actor_message t command.message in
+            Ok value)
+          (fun error -> Lwt.return (Error error))
+      in
+      begin
+        match result with
+        | Ok value -> Lwt.wakeup_later command.reply value
+        | Error error ->
           Log.warn "compute"
             "event = actor_message status = failed kind = %s reason = %s"
             (actor_message_name command.message)
             (Printexc.to_string error);
-          Lwt.wakeup_later_exn command.reply error;
-          actor_loop t)
-  | None when not t.channel_open -> Lwt.return_unit
+          Lwt.wakeup_later_exn command.reply error
+      end;
+      Lwt.return (Octra_consensus.C_loop.Next ())
+  | None when not t.channel_open ->
+    Lwt.return Octra_consensus.C_loop.Stop
   | None ->
     let* () = Lwt_condition.wait t.channel_ready in
-    actor_loop t
+    Lwt.return (Octra_consensus.C_loop.Next ())
+
+let actor_loop t =
+  Octra_consensus.C_loop.run (actor_turn t) ()
 
 let create ~deps ~provider =
   let t = {

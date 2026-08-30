@@ -3,9 +3,14 @@
 
 type runtime = {
   driver_config : Consensus_driver_wiring.node_driver_config_runtime;
+  stake_set : Octra_consensus.C_types.validator_set;
   validator_set : Octra_consensus.C_types.validator_set;
   swarm : Octra_net.P2p_swarm.t;
   activate_validator_set :
+    Octra_consensus.C_types.validator_set ->
+    string ->
+    unit Lwt.t;
+  activate_validator_set_relief :
     Octra_consensus.C_types.validator_set ->
     string ->
     unit Lwt.t;
@@ -57,10 +62,33 @@ val health_runtime_of_node :
   runtime ->
   Consensus_health_wiring.node_consensus_driver_runtime
 
+type pending_error =
+  | Store_unreadable of string
+  | Record_invalid of string
+
+type vote_plan =
+  | Observe
+  | Hold
+
+val vote_plan :
+  observer:bool ->
+  bootstrap:bool ->
+  vote_plan
+
+val pending_vote_wires_of_entries :
+  epoch_id:int64 ->
+  Octra_core.Wal.pending_commit list ->
+  (string list, pending_error) result
+
 val pending_vote_wires :
   data_dir:string ->
   epoch_id:int64 ->
-  (string list, string) result
+  (string list, pending_error) result
+
+val prepare_votes :
+  runtime ->
+  Octra_consensus.C_driver.t ->
+  bool
 
 val create_driver :
   runtime ->

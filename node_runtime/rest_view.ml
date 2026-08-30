@@ -248,9 +248,12 @@ let search_result_of_query
 let staging_tx_row ~hash ~fields =
   `Assoc (("hash", `String hash) :: fields)
 
-let staging_view_response ~tx_rows =
+let staging_view_response ~total ~tx_rows =
+  let count = List.length tx_rows in
   `Assoc [
-    "count", `Int (List.length tx_rows);
+    "count", `Int count;
+    "total", `Int total;
+    "truncated", `Bool (count < total);
     "transactions", `List tx_rows;
   ]
 
@@ -260,7 +263,7 @@ let staging_view_response_of_txs ~tx_hash ~tx_fields txs =
       (fun tx -> staging_tx_row ~hash:(tx_hash tx) ~fields:(tx_fields tx))
       txs
   in
-  staging_view_response ~tx_rows
+  staging_view_response ~total:(List.length tx_rows) ~tx_rows
 
 let staging_removed_response ~tx_hash =
   `Assoc [
@@ -308,9 +311,11 @@ let by_sender_rows by_sender =
     by_sender
     []
 
-let staging_stats_response ~tx_count ~total_ou ~max_ou ~by_sender =
+let staging_stats_response ~tx_count ~sample_count ~total_ou ~max_ou ~by_sender =
   `Assoc [
     "total_transactions", `Int tx_count;
+    "sample_size", `Int sample_count;
+    "sample_truncated", `Bool (sample_count < tx_count);
     "total_ou", `String (Z.to_string total_ou);
     "max_ou", `String (Z.to_string max_ou);
     "ou_remaining", `String (Z.to_string (Z.sub max_ou total_ou));
@@ -455,11 +460,13 @@ let recommended_ou len sorted =
   if len < 10 then "1000"
   else Z.to_string (percentile 60 sorted)
 
-let staging_ou_rpc_response ~ou_values ~staging_ou ~capacity =
+let staging_ou_rpc_response ~staging_size ~ou_values ~staging_ou ~capacity =
   let sorted = sorted_ou ou_values in
   let len = List.length ou_values in
   `Assoc [
-    "staging_size", `Int len;
+    "staging_size", `Int staging_size;
+    "sample_size", `Int len;
+    "sample_truncated", `Bool (len < staging_size);
     "p50", `String (Z.to_string (percentile 50 sorted));
     "p75", `String (Z.to_string (percentile 75 sorted));
     "p95", `String (Z.to_string (percentile 95 sorted));
@@ -468,8 +475,10 @@ let staging_ou_rpc_response ~ou_values ~staging_ou ~capacity =
     "epoch_capacity", `String (Z.to_string capacity);
   ]
 
-let staging_ou_rpc_response_of_txs ~tx_ou ~txs ~staging_ou ~capacity =
+let staging_ou_rpc_response_of_txs ~tx_ou ~txs ~staging_size ~staging_ou
+    ~capacity =
   staging_ou_rpc_response
+    ~staging_size
     ~ou_values:(List.map tx_ou txs)
     ~staging_ou
     ~capacity

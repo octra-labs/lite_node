@@ -5,6 +5,7 @@ module Head = Octra_core.Head_manifest
 module Irmin = Octra_core.Store_irmin
 module Image = Octra_core.Ledger_image
 module Migration = Octra_core.Pvac_migration_entitlement
+module Roots = Root_win
 module Txlog = Octra_core.Txlog
 module Epochlog = Octra_core.Epochlog
 
@@ -14,6 +15,7 @@ type source = {
   data_dir : string;
   head : Head.t;
   store : Irmin.t;
+  roots : Octra_consensus.C_types.finalize list;
 }
 
 type report = {
@@ -198,6 +200,9 @@ let build source ~target =
                     write_file
                       (Filename.concat stage "state_root")
                       reference.state_root;
+                    write_file
+                      (Filename.concat stage Roots.name)
+                      (Roots.encode source.roots);
                     State_sync.write_ready stage reference;
                     let files, bytes = snapshot_shape stage in
                     fsync_dir stage;

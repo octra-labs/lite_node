@@ -35,16 +35,6 @@ val keep :
   C_types.vote ->
   (C_types.vote, string) result
 
-val find_statement :
-  t ->
-  chain_id:string ->
-  validator:string ->
-  epoch_id:int64 ->
-  round:int ->
-  vote_type:C_types.vote_type ->
-  proposal_id:string ->
-  (C_types.vote option, string) result
-
 val max_round :
   t ->
   chain_id:string ->

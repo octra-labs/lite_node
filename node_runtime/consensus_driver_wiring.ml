@@ -414,7 +414,7 @@ let node_standard_adapters runtime =
     staging_txs = Staging.all;
     staging_epoch_txs = (fun () ->
       Staging.get_epoch_txs ~capacity:runtime.staging_epoch_capacity);
-    staging_total = (fun () -> List.length (Staging.all ()));
+    staging_total = Staging.staging_size;
     proposer = (fun () -> runtime.wallet_addr);
     head_txid_hi = (fun () ->
       match runtime.cached_head () with
@@ -448,8 +448,7 @@ let node_proposal_preview
   let run () =
     let reward =
       match
-        Consensus_reward_attribution.resolve_for_epoch
-          ~epoch_id:request.epoch_id
+        Consensus_reward_attribution.resolve
           ~proposer_addr:request.proposer
           ~validator_pubkeys:request.validator_pubkeys
           request.parent_commit
@@ -607,6 +606,7 @@ let verify_proposal_deps (deps : deps) =
     preview = deps.proposal_preview;
     prev_eic_root = deps.prev_eic_root;
     next_txid = deps.next_txid;
+    head_txid_hi = deps.head_txid_hi;
     root_to_raw32 = deps.root_to_raw32;
     set_proposal = deps.set_proposal;
     share_txs = share_txs deps;

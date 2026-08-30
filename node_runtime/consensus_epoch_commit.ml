@@ -253,12 +253,12 @@ let boundary_log ~pre_state_hash ~irmin_last_before_meta
   match boundary.Epoch_boundary.kind, head_before_commit with
   | Epoch_boundary.Aligned, _ ->
     None
-  | Epoch_boundary.Direct_head_write, Some h ->
+  | Epoch_boundary.Root_mismatch, Some h ->
     Some {
-      level = `Info;
+      level = `Warn;
       line =
         Printf.sprintf
-          "event = wal_boundary action = direct_head_write head_epoch = %d ledger_root = %s pre_state = %s irmin_meta = %d"
+          "event = wal_boundary action = refuse reason = head_root_mismatch head_epoch = %d head_root = %s live_root = %s irmin_meta = %d"
           h.Head_manifest.epoch_id
           (head_ledger_root h)
           pre_state

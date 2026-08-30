@@ -158,17 +158,34 @@ let account_proof_params signer ~store ~head params =
       | Ok proof ->
         ok_lwt proof
 
-let collect_epoch_tx_hashes read_tx ~epoch_id ~start_txid ~tx_count =
-  let rec collect i acc =
-    if i >= tx_count then Some (List.rev acc)
-    else
-      let txid = Int64.add start_txid (Int64.of_int i) in
-      match read_tx txid with
-      | Some (tx_hash, stored_epoch_id, _) when stored_epoch_id = epoch_id ->
-        collect (i + 1) (String.lowercase_ascii tx_hash :: acc)
-      | Some _ | None -> None
-  in
-  collect 0 []
+let collect_epoch_tx_hashes read_hash ~epoch_id ~start_txid ~tx_count =
+  if tx_count < 0 || tx_count > Octra_consensus.C_codec.max_proposal_txs then
+    Lwt.return (Error "epoch transaction count is invalid")
+  else if Int64.compare start_txid 0L < 0 then
+    Lwt.return (Error "epoch start transaction id is invalid")
+  else if
+    tx_count > 0
+    && Int64.compare
+         start_txid
+         (Int64.sub Int64.max_int (Int64.of_int (tx_count - 1))) > 0
+  then
+    Lwt.return (Error "epoch transaction range overflows")
+  else
+    let rec collect i acc =
+      if i >= tx_count then Lwt.return (Ok (List.rev acc))
+      else
+        let txid = Int64.add start_txid (Int64.of_int i) in
+        match read_hash txid with
+        | Some (tx_hash, stored_epoch_id) when stored_epoch_id = epoch_id ->
+          let next = i + 1 in
+          let open Lwt.Syntax in
+          let* () =
+            if next mod 32 = 0 then Lwt.pause () else Lwt.return_unit
+          in
+          collect next (String.lowercase_ascii tx_hash :: acc)
+        | Some _ | None -> Lwt.return (Error "epoch tx list incomplete")
+    in
+    collect 0 []
 
 let epoch_proof_of_header
     ~chain_id
@@ -190,7 +207,7 @@ let epoch_proof_of_header
 
 let epoch_proof ~chain_id chaindata eid =
   match Octra_core.Store_chaindata.get_bound_epoch_header chaindata eid with
-  | Error e -> Error e
+  | Error e -> Lwt.return (Error e)
   | Ok h ->
     let _, epoch_index_root =
       Octra_core.Store_chaindata.get_epoch_index_commitment chaindata eid in
@@ -203,25 +220,27 @@ let epoch_proof ~chain_id chaindata eid =
     in
     begin
       match prev_epoch_index_root, epoch_index_root with
-      | None, _ -> Error "previous epoch index root missing"
-      | _, None -> Error "epoch index root missing"
+      | None, _ -> Lwt.return (Error "previous epoch index root missing")
+      | _, None -> Lwt.return (Error "epoch index root missing")
       | Some prev_epoch_index_root, Some epoch_index_root ->
-        let tx_hashes =
+        let open Lwt.Syntax in
+        let* tx_hashes =
           collect_epoch_tx_hashes
-            (Octra_core.Store_chaindata.read_tx_at_txid chaindata)
+            (Octra_core.Store_chaindata.read_tx_hash_at_txid chaindata)
             ~epoch_id:eid
             ~start_txid:h.start_txid
             ~tx_count:h.tx_count
         in
         match tx_hashes with
-        | None -> Error "epoch tx list incomplete"
-        | Some tx_hashes ->
-          epoch_proof_of_header
-            ~chain_id
-            ~prev_epoch_index_root
-            ~epoch_index_root
-            h
-            tx_hashes
+        | Error _ as error -> Lwt.return error
+        | Ok tx_hashes ->
+          Lwt.return
+            (epoch_proof_of_header
+               ~chain_id
+               ~prev_epoch_index_root
+               ~epoch_index_root
+               h
+               tx_hashes)
     end
 
 let epoch_proof_params ~chain_id chaindata params =
@@ -229,7 +248,9 @@ let epoch_proof_params ~chain_id chaindata params =
   | Error e ->
     err_lwt e
   | Ok eid ->
-    match epoch_proof ~chain_id chaindata eid with
+    let open Lwt.Syntax in
+    let* proof = epoch_proof ~chain_id chaindata eid in
+    match proof with
     | Error e ->
       err_lwt (Rpc.err (-32000) e None)
     | Ok proof ->
@@ -253,21 +274,25 @@ let tx_inclusion_of_epoch ~tx_hash epoch =
 let tx_inclusion_proof ~chain_id chaindata tx_hash =
   let tx_hash = String.lowercase_ascii tx_hash in
   match Octra_core.Store_chaindata.get_tx_by_hash chaindata tx_hash with
-  | None -> Error "transaction not found"
+  | None -> Lwt.return (Error "transaction not found")
   | Some (epoch_id, tx_json) ->
-    match epoch_proof ~chain_id chaindata epoch_id with
-    | Error e -> Error e
+    let open Lwt.Syntax in
+    let* epoch = epoch_proof ~chain_id chaindata epoch_id in
+    match epoch with
+    | Error e -> Lwt.return (Error e)
     | Ok epoch ->
       match tx_inclusion_of_epoch ~tx_hash epoch with
-      | Error e -> Error e
-      | Ok proof -> Ok (proof, tx_json)
+      | Error e -> Lwt.return (Error e)
+      | Ok proof -> Lwt.return (Ok (proof, tx_json))
 
 let tx_inclusion_proof_params ~chain_id chaindata params =
   match tx_inclusion_hash params with
   | Error e ->
     err_lwt e
   | Ok tx_hash ->
-    match tx_inclusion_proof ~chain_id chaindata tx_hash with
+    let open Lwt.Syntax in
+    let* proof = tx_inclusion_proof ~chain_id chaindata tx_hash in
+    match proof with
     | Error "transaction not found" ->
       err_lwt (Rpc.not_found "transaction not found")
     | Error e ->

@@ -59,6 +59,17 @@ type 'driver driver_deps = {
   log_started : unit -> unit;
 }
 
+type fork_repair_runtime = {
+  committed_head_epoch : unit -> int;
+  rewind_allowed : target:int -> head:int -> bool;
+  target_matches : target:int -> root:string -> bool;
+  empty_after : target:int -> head:int -> bool;
+  finality_target_ready : target:int -> root:string -> (unit, string) result;
+  stage_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
+  mark_quarantine : string -> unit;
+  stop : string -> unit;
+}
+
 type driver_probe_deps = {
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -83,28 +94,13 @@ type driver_probe_deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
+  require_sync : Sync_need.t -> unit;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-}
-
-type fork_repair_runtime = {
-  committed_head_epoch : unit -> int;
-  rewind_allowed : target:int -> head:int -> bool;
-  target_matches : target:int -> root:string -> bool;
-  empty_after : target:int -> head:int -> bool;
-  finality_target_ready : int -> (unit, string) result;
-  run_empty : target:int -> root:string -> Octra_core.Fork_head_repair.result Lwt.t;
-  rewind_finality : int -> (unit, string) result;
-  drop_finality_after : int -> int;
-  prune_after_epoch : int -> unit;
-  set_current_epoch : int -> unit;
-  set_state_attested : head:int -> root:string -> unit;
-  set_catchup_in_progress : bool -> unit;
-  clear_quarantine : string -> unit;
-  mark_quarantine : string -> unit;
+  fork_repair : fork_repair_runtime;
 }
 
 type node_fork_repair_runtime = {
@@ -113,12 +109,8 @@ type node_fork_repair_runtime = {
   data_dir : string;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
-  finality : Consensus_finality_state.callbacks;
-  current_epoch : int ref;
-  catchup_active : bool ref;
-  set_state_attested : head:int -> root:string -> unit;
-  clear_quarantine : string -> unit;
   mark_quarantine : string -> unit;
+  exit_error : unit -> unit;
 }
 
 type node_driver_probe_runtime = {
@@ -140,6 +132,7 @@ type node_driver_probe_runtime = {
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   fork_repair : fork_repair_runtime;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
@@ -200,6 +193,7 @@ type node_driver_health_runtime = {
   read_local_root_raw : unit -> string Lwt.t;
   committed_epoch_root_raw : int -> string option;
   drain_pending_finalized : unit -> unit Lwt.t;
+  require_sync : Sync_need.t -> unit;
   fork_repair : fork_repair_runtime;
   run_catchup_to_target :
     Octra_consensus.C_driver.t ->
@@ -291,12 +285,10 @@ val node_fork_repair_runtime :
 
 val fork_repair_deps :
   fork_repair_runtime ->
-  Octra_consensus.C_driver.t ->
   Consensus_health_shell.fork_repair_deps
 
-val repair_empty_fork_with_driver :
+val repair_empty_fork :
   fork_repair_runtime ->
-  Octra_consensus.C_driver.t ->
   target_epoch:int64 ->
   target_root:string ->
   required:int ->
@@ -384,12 +376,20 @@ val node_consensus_driver_runtime :
   node_consensus_driver_runtime ->
   consensus_driver_runtime
 
+val prepared_start :
+  ('driver -> unit) ->
+  ('driver -> 'result) ->
+  'driver ->
+  'result
+
 val launch_consensus_driver :
+  ?prepare:(Octra_consensus.C_driver.t -> unit) ->
   consensus_driver_runtime ->
   Octra_consensus.C_driver.t ->
   unit
 
 val launch_node_consensus_driver :
+  ?prepare:(Octra_consensus.C_driver.t -> unit) ->
   node_consensus_driver_runtime ->
   Octra_consensus.C_driver.t ->
   unit

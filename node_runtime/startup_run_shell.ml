@@ -43,6 +43,7 @@ type node_launch_deps = {
   rpc : unit -> unit Lwt.t;
   services : (unit -> unit Lwt.t) list;
   observer : bool;
+  follow : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
   swarm_deps : P2p_swarm_lifecycle.node_deps;
@@ -53,6 +54,7 @@ type node_launch_runtime = {
   rpc : unit -> unit Lwt.t;
   services : (unit -> unit Lwt.t) list;
   observer : bool;
+  follow : bool;
   tick_loop : unit -> unit Lwt.t;
   swarm : Octra_net.P2p_swarm.t option;
   guard : Octra_net.P2p_tx_gossip_guard.t;
@@ -86,11 +88,11 @@ let make_node_swarm_deps ~observer ~guard ~find_tx ~find_account ~add_tx
     resource_compute;
   }
 
-let make_node_launch_deps ~p2p ~rpc ~services ~observer ~tick_loop ~swarm
+let make_node_launch_deps ~p2p ~rpc ~services ~observer ~follow ~tick_loop ~swarm
     ~swarm_deps =
-  { p2p; rpc; services; observer; tick_loop; swarm; swarm_deps }
+  { p2p; rpc; services; observer; follow; tick_loop; swarm; swarm_deps }
 
-let make_node_launch_deps_with_swarm ~p2p ~rpc ~services ~observer ~tick_loop
+let make_node_launch_deps_with_swarm ~p2p ~rpc ~services ~observer ~follow ~tick_loop
     ~swarm ~guard ~find_tx ~find_account ~add_tx ~now ~max_drift ~driver_ref
     ~resource_compute =
   make_node_launch_deps
@@ -98,6 +100,7 @@ let make_node_launch_deps_with_swarm ~p2p ~rpc ~services ~observer ~tick_loop
     ~rpc
     ~services
     ~observer
+    ~follow
     ~tick_loop
     ~swarm
     ~swarm_deps:
@@ -142,13 +145,16 @@ let observer_loop () =
   in
   loop ()
 
+let idle ~observer ~follow =
+  observer && not follow
+
 let node_launch_tasks (deps : node_launch_deps) =
   let swarm_task = node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps in
   task_plan
     ~base_tasks:
       (transport_tasks ~p2p:deps.p2p ~rpc:deps.rpc ~swarm:swarm_task
        @ List.map (fun service -> service ()) deps.services)
-    ~observer:deps.observer
+    ~observer:(idle ~observer:deps.observer ~follow:deps.follow)
     ~observer_loop
     ~tick_loop:deps.tick_loop
     ~optional:swarm_task
@@ -198,6 +204,7 @@ let run_node_runtime (runtime : node_launch_runtime) =
        ~rpc:runtime.rpc
        ~services:runtime.services
        ~observer:runtime.observer
+       ~follow:runtime.follow
        ~tick_loop:runtime.tick_loop
        ~swarm:runtime.swarm
        ~guard:runtime.guard

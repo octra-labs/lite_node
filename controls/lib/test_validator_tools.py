@@ -1176,9 +1176,8 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_upgrade_uses_signed_snapshot_sources(self):
         network = network_values()
-        network["OCTRA_STATE_SYNC_SOURCES"] = (
-            "https://fresh-a.example,https://fresh-b.example"
-        )
+        network["OCTRA_STATE_SYNC_SOURCES"] = "https://fresh.example"
+        network["OCTRA_JOIN_RPC"] = "https://join-a.example,https://join-b.example"
         network["OCTRA_CATCHUP_MAX_LAG"] = "7000"
         bundle = WORK / "config/network.env"
         bundle.parent.mkdir()
@@ -1189,9 +1188,8 @@ class ValidatorToolsTest(unittest.TestCase):
         }
         local = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
-            "OCTRA_STATE_SYNC_SOURCES": (
-                "https://stale-a.example,https://stale-b.example"
-            ),
+            "OCTRA_STATE_SYNC_SOURCES": "https://stale.example",
+            "OCTRA_JOIN_RPC": "https://join-stale.example",
             "OCTRA_CATCHUP_MAX_LAG": "5000",
         }
 
@@ -1199,7 +1197,11 @@ class ValidatorToolsTest(unittest.TestCase):
 
         self.assertEqual(
             selected["OCTRA_STATE_SYNC_SOURCES"],
-            "https://fresh-a.example,https://fresh-b.example",
+            "https://fresh.example",
+        )
+        self.assertEqual(
+            selected["OCTRA_JOIN_RPC"],
+            "https://join-a.example,https://join-b.example",
         )
         self.assertEqual(selected["OCTRA_CATCHUP_MAX_LAG"], "7000")
         self.assertEqual(selected["OCTRA_DATA_DIR"], str(WORK / "data"))
@@ -2809,15 +2811,22 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_requires_two_signed_state_sync_sources(self):
+    def test_network_allows_one_signed_state_sync_source(self):
         values = network_values()
         values["OCTRA_STATE_SYNC_SOURCES"] = "https://seed-a.example"
-        with self.assertRaises(ValidatorError):
-            validate_network(values, WORK)
+        self.assertEqual(
+            validate_network(values, WORK)["OCTRA_STATE_SYNC_SOURCES"],
+            "https://seed-a.example",
+        )
 
-    def test_network_rejects_legacy_join_sources(self):
+    def test_network_validates_join_sources(self):
         values = network_values()
         values["OCTRA_JOIN_RPC"] = "https://join-a.example,https://join-b.example"
+        self.assertEqual(
+            validate_network(values, WORK)["OCTRA_JOIN_RPC"],
+            "https://join-a.example,https://join-b.example",
+        )
+        values["OCTRA_JOIN_RPC"] = "http://203.0.113.1:8080"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 

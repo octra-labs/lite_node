@@ -30,6 +30,12 @@ let args () =
     | "--check" :: rest ->
       if List.mem_assoc "--check" fields then Error "duplicate --check"
       else pairs (("--check", "true") :: fields) rest
+    | "--staged" :: rest ->
+      if List.mem_assoc "--staged" fields then Error "duplicate --staged"
+      else pairs (("--staged", "true") :: fields) rest
+    | "--prepared" :: rest ->
+      if List.mem_assoc "--prepared" fields then Error "duplicate --prepared"
+      else pairs (("--prepared", "true") :: fields) rest
     | key :: value :: rest when List.mem key allowed ->
       if List.mem_assoc key fields then Error ("duplicate " ^ key)
       else pairs ((key, value) :: fields) rest
@@ -74,8 +80,12 @@ let args () =
   try
     let head_epoch = Int64.of_string raw_epoch in
     let pubkey = Base64.decode_exn validator_pub in
-    Ok (data_dir, chain_id, validator, pubkey, head_epoch, source, round_min,
-        List.mem_assoc "--check" fields)
+    let staged = List.mem_assoc "--staged" fields in
+    let prepared = List.mem_assoc "--prepared" fields in
+    if staged && prepared then Error "staged and prepared checks are exclusive"
+    else
+      Ok (data_dir, chain_id, validator, pubkey, head_epoch, source, round_min,
+          List.mem_assoc "--check" fields, staged, prepared)
   with Failure _ ->
     Error "vote floor arguments are invalid"
 
@@ -83,10 +93,39 @@ let () =
   match args () with
   | Error reason -> fail reason
   | Ok (data_dir, chain_id, validator, pubkey, head_epoch, source, round_min,
-        checking) ->
+        checking, staged, prepared) ->
     let result =
-      match checking, source with
-      | true, `Round raw_round ->
+      match checking, staged, prepared, source with
+      | _, true, true, _ -> Error "staged and prepared checks are exclusive"
+      | true, true, false, `Round raw_round ->
+        begin
+          try
+            Octra_node_runtime.Vote_floor.staged
+              ~data_dir
+              ~chain_id
+              ~validator
+              ~pubkey
+              ~through_epoch:head_epoch
+              ~round:(int_of_string raw_round)
+          with Failure _ -> Error "vote floor arguments are invalid"
+        end
+      | true, false, true, `Round raw_round ->
+        begin
+          try
+            Octra_node_runtime.Vote_floor.prepared
+              ~data_dir
+              ~chain_id
+              ~validator
+              ~pubkey
+              ~through_epoch:head_epoch
+              ~round:(int_of_string raw_round)
+          with Failure _ -> Error "vote floor arguments are invalid"
+        end
+      | true, true, false, `Sync _ -> Error "staged check requires round"
+      | true, false, true, `Sync _ -> Error "prepared check requires round"
+      | false, true, false, _ -> Error "staged check requires --check"
+      | false, false, true, _ -> Error "prepared check requires --check"
+      | true, false, false, `Round raw_round ->
         begin
           try
             Octra_node_runtime.Vote_floor.check
@@ -98,7 +137,7 @@ let () =
               ~round:(int_of_string raw_round)
           with Failure _ -> Error "vote floor arguments are invalid"
         end
-      | false, `Round raw_round ->
+      | false, false, false, `Round raw_round ->
         begin
           try
             Octra_node_runtime.Vote_floor.set
@@ -110,7 +149,7 @@ let () =
               ~round:(int_of_string raw_round)
           with Failure _ -> Error "vote floor arguments are invalid"
         end
-      | true, `Sync sync ->
+      | true, false, false, `Sync sync ->
         Octra_node_runtime.Vote_floor.check_sync
           ~data_dir
           ~chain_id
@@ -119,7 +158,7 @@ let () =
           ~through_epoch:head_epoch
           ~round_min
           ~sync
-      | false, `Sync sync ->
+      | false, false, false, `Sync sync ->
         Octra_node_runtime.Vote_floor.set_sync
           ~data_dir
           ~chain_id

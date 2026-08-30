@@ -75,13 +75,18 @@ let standard
     ready_max_lag;
   }
 
-let standard_for_proposer env ~proposer_addr ~prev_state_root =
+let standard_for_proposer ?validator_pubkeys env ~proposer_addr ~prev_state_root =
   let epoch_id = env.current_epoch () in
+  let validator_pubkeys =
+    match validator_pubkeys with
+    | Some values -> values
+    | None -> current_validator_pubkeys env
+  in
   standard
     ~chain_id:env.chain_id
     ~epoch_id
     ~proposer_addr
-    ~validator_pubkeys:(current_validator_pubkeys env)
+    ~validator_pubkeys
     ~prev_state_root
     ~ready_state_root_at:env.ready_state_root_at
     ~ready_max_lag:env.ready_max_lag

@@ -53,6 +53,7 @@ val standard :
   Epoch_exec.env
 
 val standard_for_proposer :
+  ?validator_pubkeys:(string * string) list ->
   node_env ->
   proposer_addr:string ->
   prev_state_root:string ->

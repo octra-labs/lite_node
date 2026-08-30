@@ -27,6 +27,7 @@ type deps = {
   set_proposal : Octra_core.Transaction.t list -> string list -> unit;
   apply_finalized : Consensus_startup_sync.apply_finalized;
   consensus_role : string;
+  recovery : bool;
   wallet : wallet;
   exit_error : unit -> unit;
   exit_success : unit -> unit;
@@ -50,6 +51,9 @@ let create_refs () =
       ref (Octra_consensus.C_engine.make_validator_set []);
     scheduled_validator_set = ref None;
   }
+
+let sync ~recovery run =
+  if recovery then () else Lwt_main.run (run ())
 
 let run deps =
   let network_config = Startup_process_shell.network_config ~env:deps.env in
@@ -76,7 +80,7 @@ let run deps =
     ~storage:"irmin+chaindata"
     ~store_path:deps.store_path
     network_config;
-  Lwt_main.run (
+  sync ~recovery:deps.recovery (fun () ->
     Consensus_startup_sync.run_node
       Consensus_startup_sync.{
         env = deps.env;

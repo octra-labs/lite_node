@@ -166,10 +166,9 @@ let crypto_engine () =
 
 let circle_hfhe_abi = "bound_range_commitment_v2"
 let program_fhe_abi = "proof_verify_view_only_v1"
-let standard = "octra_consensus"
-let compat_wire_domain = "octra:consensus_profile:v16"
-let compat_wire_profile = 16
-let compat_wire_rules_id = "finalized_rejection_commitment"
+let consensus_rules_id = "finalized_rejection_commitment"
+let version = 16
+let rules_id = consensus_rules_id
 
 let runtime_env getenv = Startup_runtime_limits.{
   int_value = (fun name default -> int_value getenv name default);
@@ -187,13 +186,6 @@ let put_budget buf lane =
 let put_int buf value =
   Octra_net.Oce1.put_string buf (string_of_int value)
 
-let activation_graph_hash ~chain_id =
-  Octra_net.Hash_domain.hash_encoded "octra:consensus_activations" (fun buf ->
-    Octra_net.Oce1.put_string buf standard;
-    Octra_net.Oce1.put_string buf chain_id;
-    Octra_net.Oce1.put_string buf
-      (Octra_core.Rule_graph.consensus_id ~chain_id))
-
 let hash getenv =
   let env = runtime_env getenv in
   let schedule = emission_schedule getenv in
@@ -204,7 +196,7 @@ let hash getenv =
   let epoch_min_ms = Epoch_cadence.minimum_ms in
   let proposal_limits = Startup_runtime_limits.proposal_limits env
     ~default_max_ou:Octra_core.Tx_staging.max_ou_per_epoch in
-  Octra_net.Hash_domain.hash_encoded compat_wire_domain (fun buf ->
+  Octra_net.Hash_domain.hash_encoded "octra:consensus_profile:v16" (fun buf ->
     put_int buf proposal_limits.max_txs;
     put_int buf epoch_min_ms;
     put_int buf proposal_limits.max_bytes;
@@ -240,36 +232,8 @@ let hash getenv =
     Octra_net.Oce1.put_string buf (crypto_engine ());
     Octra_net.Oce1.put_string buf circle_hfhe_abi;
     Octra_net.Oce1.put_string buf program_fhe_abi;
-    Octra_net.Oce1.put_string buf compat_wire_rules_id;
+    Octra_net.Oce1.put_string buf consensus_rules_id;
     Octra_net.Oce1.put_string buf Octra_vm.Program_package.compiler_profile_id;
     Octra_net.Oce1.put_string buf (migration_root getenv);
     Octra_net.Oce1.put_list Octra_net.Oce1.put_string buf (admit_ops getenv);
     List.iter (put_budget buf) Octra_core.Resource_lanes.all)
-
-let put_standard_component buf name value =
-  Octra_net.Oce1.put_string buf name;
-  Octra_net.Oce1.put_string buf value
-
-let standard_hash ~chain_id getenv =
-  let validator_policy = Octra_core.Validator_policy.of_env_exn getenv in
-  let schedule = emission_schedule getenv in
-  Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
-    Octra_net.Oce1.put_string buf standard;
-    Octra_net.Oce1.put_string buf chain_id;
-    put_standard_component buf "runtime_compatibility" (hash getenv);
-    put_standard_component buf "activation_graph"
-      (Octra_core.Rule_graph.consensus_id ~chain_id);
-    put_standard_component buf "quorum"
-      (Octra_consensus.C_quorum_policy.consensus_id ~chain_id);
-    put_standard_component buf "set_fold_bootstrap"
-      (Octra_core.Set_fold.consensus_id Octra_core.Set_fold.standard);
-    put_standard_component buf "set_fold_participating"
-      (Octra_core.Set_fold.consensus_id Octra_core.Set_fold.participating);
-    put_standard_component buf "validator_admission"
-      (Octra_core.Validator_policy.consensus_id validator_policy);
-    put_standard_component buf "emission"
-      (Octra_core.Emission_schedule.consensus_id schedule);
-    put_standard_component buf "reward" Octra_core.Reward_policy.consensus_id;
-    put_standard_component buf "fee" Octra_core.Fee_policy.consensus_id;
-    put_standard_component buf "proposal_protocol"
-      (Octra_consensus.C_protocol.consensus_id getenv))

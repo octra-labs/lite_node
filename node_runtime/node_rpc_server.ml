@@ -22,6 +22,9 @@ type deps = {
     limit:int ->
     offset:int ->
     Octra_core.Tx_drop.row list;
+  validator_enrollment :
+    unit ->
+    (Status_read_rpc.enrollment_snapshot, string) result;
 }
 
 type config = {
@@ -124,6 +127,7 @@ let status_read_ctx (ctx : ctx) =
     encrypted = ctx.deps.encrypted_supply;
     swarm = ctx.deps.swarm;
     driver_ref = ctx.consensus_driver_ref;
+    validator_enrollment = ctx.deps.validator_enrollment;
   }
 
 let status_read f params ctx =

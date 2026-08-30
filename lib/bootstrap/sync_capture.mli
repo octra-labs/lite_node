@@ -5,6 +5,7 @@ type source = {
   data_dir : string;
   head : Octra_core.Head_manifest.t;
   store : Octra_core.Store_irmin.t;
+  roots : Octra_consensus.C_types.finalize list;
 }
 
 type report = {

@@ -7,8 +7,11 @@ type apply =
   proposer_info:Octra_core.Epochlog.proposer_info option ->
   reward:Consensus_reward_attribution.t ->
   epoch_ts:float ->
+  validator_set:Octra_consensus.C_types.validator_set ->
   parent_commit:Octra_consensus.C_types.parent_commit option ->
   unit Lwt.t
+
+exception Fetch_retry of string
 
 type head = {
   epoch : int64;
@@ -33,7 +36,25 @@ type record = {
 
 type range =
   | Retry
+  | Missing
   | Records of record list
+
+type synced = {
+  epoch : int64;
+  root : string;
+  count : int;
+}
+
+type outcome =
+  | Synced of synced
+  | Leader_stale of {
+      local_head : int64;
+      leader_head : int64;
+    }
+  | Source_unavailable of {
+      phase : string;
+      error : string;
+    }
 
 type sync_plan =
   | Fetch_range of int64
@@ -70,7 +91,7 @@ type prepared = {
 
 type ready_marker = {
   path : string;
-  tmp_path : string;
+  staged_path : string;
   payload : Yojson.Safe.t;
   ready_epoch : int64;
   state_root : string;
@@ -90,6 +111,7 @@ type ready_marker_config = {
 type ready_marker_write_deps = {
   write_text : path:string -> contents:string -> unit;
   rename : src:string -> dst:string -> unit;
+  sync_dir : path:string -> unit;
   log_written : ready_marker -> unit;
 }
 
@@ -126,6 +148,7 @@ type run_deps = {
   sleep : float -> unit Lwt.t;
   log_start : base:string -> unit;
   log_applied : applied:int -> unit;
+  log_retry : phase:string -> delay:float -> error:string -> unit;
 }
 
 type node_deps = {
@@ -197,6 +220,22 @@ val configured_base :
   string option ->
   string option
 
+val first_source :
+  string option ->
+  string option
+
+val source_list :
+  string option ->
+  string list
+
+val configured_sources :
+  (string -> string option) ->
+  string list
+
+val configured_join :
+  (string -> string option) ->
+  string option
+
 val normalize_base : string -> string
 
 val root_hex64 : string -> string
@@ -216,18 +255,48 @@ val local_eic_from_head :
 val head_url : string -> string
 
 val range_url :
+  ?part:int ->
   string ->
   from_epoch:int64 ->
   max_epochs:int ->
   string
 
+val fetch_range_json :
+  (string -> Yojson.Safe.t Lwt.t) ->
+  string ->
+  from_epoch:int64 ->
+  max_epochs:int ->
+  Yojson.Safe.t Lwt.t
+
 val http_get_json :
+  ?timeout:float ->
   string ->
   Yojson.Safe.t Lwt.t
+
+val retry_delay : int -> float
 
 val parse_head : Yojson.Safe.t -> head
 
 val parse_range : from_epoch:int64 -> Yojson.Safe.t -> range
+
+val range_response :
+  source:string ->
+  from_epoch:int64 ->
+  max_epochs:int ->
+  range ->
+  Octra_consensus.C_driver.catchup_range_response_record option
+
+val http_range :
+  ?fetch_json:(string -> Yojson.Safe.t Lwt.t) ->
+  (string -> string option) ->
+  from_epoch:int64 ->
+  max_epochs:int ->
+  Octra_consensus.C_driver.catchup_range_response_record option Lwt.t
+
+val http_head :
+  ?fetch_json:(string -> Yojson.Safe.t Lwt.t) ->
+  (string -> string option) ->
+  int64 option Lwt.t
 
 val sync_plan :
   local_next:int64 ->
@@ -256,12 +325,12 @@ val apply_records :
 val run_catchup :
   run_deps ->
   string ->
-  unit Lwt.t
+  outcome Lwt.t
 
 val run_node_catchup :
   node_deps ->
   string ->
-  unit Lwt.t
+  outcome Lwt.t
 
 val node_deps_of_runtime :
   node_runtime_deps ->
@@ -273,11 +342,11 @@ val node_runtime_deps :
 
 val run_configured_node_catchup :
   node_runtime_deps ->
-  unit Lwt.t
+  outcome option Lwt.t
 
 val run_configured_node_wiring :
   node_runtime_wiring ->
-  unit Lwt.t
+  outcome option Lwt.t
 
 val ready_marker :
   data_dir:string ->

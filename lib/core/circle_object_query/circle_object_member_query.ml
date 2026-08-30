@@ -10,7 +10,10 @@ let member_ref_of_key object_ref raw_key =
   let prefix = member_prefix object_ref in
   let prefix_len = String.length prefix in
   let suffix_len = String.length state_ref_key_suffix in
-  if String.starts_with ~prefix raw_key && String.ends_with ~suffix:state_ref_key_suffix raw_key then
+  if
+    String.starts_with ~prefix raw_key
+    && String.ends_with ~suffix:state_ref_key_suffix raw_key
+  then
     let member_len = String.length raw_key - prefix_len - suffix_len in
     if member_len > 0 then
       Some (String.sub raw_key prefix_len member_len)

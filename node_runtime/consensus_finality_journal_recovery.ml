@@ -45,6 +45,7 @@ type deps = {
   clear_state_attested : unit -> unit;
   commit_journal : epoch:int64 -> state_root:string -> unit;
   mark_quarantine : string -> unit;
+  require_sync : Sync_need.t -> unit;
 }
 
 let short value =
@@ -52,11 +53,29 @@ let short value =
     (List.init (min 8 (String.length value)) (fun index ->
       Printf.sprintf "%02x" (Char.code value.[index])))
 
+let sync deps =
+  try
+    let head = deps.head_epoch () in
+    if head >= 0 && head < max_int then
+      Some (Sync_need.journal ~epoch:(head + 1) ~head)
+    else begin
+      Log.warn "finality"
+        "event = finality_journal_recovery action = sync_marker_refused reason = invalid_head head = %d"
+        head;
+      None
+    end
+  with exn ->
+    Log.warn "finality"
+      "event = finality_journal_recovery action = sync_marker_refused reason = head_unavailable detail = %s"
+      (Printexc.to_string exn);
+    None
+
 let block deps reason =
   deps.mark_quarantine reason;
   Log.fatal "finality"
     "event = finality_journal_recovery action = block reason = %s"
     reason;
+  Option.iter deps.require_sync (sync deps);
   Blocked
 
 let classify_invalid ~head_epoch = function

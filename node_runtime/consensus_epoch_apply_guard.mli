@@ -14,6 +14,7 @@ type prev_root_result =
 
 type prev_root_effects = {
   fatal : string -> unit;
+  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 
@@ -97,6 +98,7 @@ type post_root_effects = {
   warn : string -> unit;
   error : string -> unit;
   fatal : string -> unit;
+  require_sync : Sync_need.t -> unit;
   remove_expected_root : int -> unit;
   prune_expected_roots_before : int -> unit;
   exit : unit -> unit;

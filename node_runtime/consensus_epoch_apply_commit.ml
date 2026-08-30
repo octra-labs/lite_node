@@ -15,6 +15,7 @@ type effects = {
     rollback:(unit -> bool) ->
     Consensus_epoch_commit.failure_effects;
   log_boundary : Consensus_epoch_commit.boundary_log -> unit;
+  refuse : epoch_id:int -> head_epoch:int -> unit Lwt.t;
 }
 
 type input = {
@@ -62,6 +63,7 @@ type node_effects = {
   chaindata : Octra_core.Store_chaindata.t;
   finality_state : Consensus_finality_state.t;
   irmin_last_epoch : unit -> int;
+  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 
@@ -99,6 +101,7 @@ let node_effects (deps : node_effects) =
       warn = Log.warn "epoch" "%s";
       error = Log.error "epoch" "%s";
       fatal = Log.fatal "epoch" "%s";
+      require_sync = deps.require_sync;
       remove_expected_root =
         Consensus_finality_state.remove_expected_root deps.finality_state;
       prune_expected_roots_before =
@@ -117,6 +120,14 @@ let node_effects (deps : node_effects) =
       match entry.level with
       | `Info -> Log.info "epoch" "%s" entry.line
       | `Warn -> Log.warn "epoch" "%s" entry.line);
+    refuse = (fun ~epoch_id ~head_epoch ->
+      Log.fatal "epoch"
+        "event = wal_boundary action = refuse reason = head_root_mismatch epoch = %d head_epoch = %d"
+        epoch_id
+        head_epoch;
+      deps.require_sync (Sync_need.root ~epoch:epoch_id ~head:head_epoch);
+      deps.exit ();
+      Lwt.fail_with "epoch commit head root mismatch");
   }
 
 let run effects input =
@@ -133,6 +144,14 @@ let run effects input =
       }
   in
   Option.iter effects.log_boundary prepared.log;
+  let* () =
+    match prepared.boundary.Octra_core.Epoch_boundary.kind with
+    | Octra_core.Epoch_boundary.Root_mismatch ->
+      effects.refuse
+        ~epoch_id:input.epoch_id
+        ~head_epoch:prepared.irmin_last_before
+    | _ -> Lwt.return_unit
+  in
   let index = prepared.index in
   let* stage =
     Consensus_epoch_apply_guard.run_stage_batch

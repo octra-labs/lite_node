@@ -6,18 +6,14 @@ module Rpc = Octra_core.Rpc
 let node_version () =
   Rpc_view.node_version ()
 
-let runtime_version ~source_commit ~binary_hash ~consensus_standard
-    ~consensus_standard_hash ~activation_graph_hash ~compat_wire_profile
-    ~compat_wire_rules_id ~runtime_profile_hash ~config_hash ~chain_id
+let runtime_version ~source_commit ~binary_hash ~consensus_profile
+    ~consensus_rules_id ~runtime_profile_hash ~config_hash ~chain_id
     ~validator =
   Rpc_view.runtime_version
     ~source_commit
     ~binary_hash
-    ~consensus_standard
-    ~consensus_standard_hash
-    ~activation_graph_hash
-    ~compat_wire_profile
-    ~compat_wire_rules_id
+    ~consensus_profile
+    ~consensus_rules_id
     ~runtime_profile_hash
     ~config_hash
     ~chain_id
@@ -39,9 +35,55 @@ let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
     ~gc_enabled
     ~gc_running
 
+let enrollment_epoch = function
+  | None -> `Null
+  | Some epoch -> `String (Int64.to_string epoch)
+
+let validator_enrollment ~head_epoch ~address ~pubkey
+    (candidate : Octra_core.Validator_admission.candidate option) =
+  match candidate with
+  | None ->
+    Ok
+      (`Assoc [
+        "head_epoch", `Int head_epoch;
+        "address", `String address;
+        "consensus_pubkey", `String pubkey;
+        "identity", `String "self_reported";
+        "state", `String "absent";
+        "bond", `Null;
+        "bonded_epoch", `Null;
+        "ready_epoch", `Null;
+        "exit_epoch", `Null;
+      ])
+  | Some candidate ->
+    let candidate_pubkey = Base64.encode_exn candidate.pubkey in
+    if not (String.equal candidate.address address) then
+      Error (Rpc.err (-32000) "validator enrollment address differs" None)
+    else if not (String.equal candidate_pubkey pubkey) then
+      Error (Rpc.err (-32000) "validator enrollment public key differs" None)
+    else
+      let state =
+        match candidate.exit_epoch, candidate.ready_epoch with
+        | Some _, _ -> "exiting"
+        | None, Some _ -> "ready"
+        | None, None -> "bonded"
+      in
+      Ok
+        (`Assoc [
+          "head_epoch", `Int head_epoch;
+          "address", `String address;
+          "consensus_pubkey", `String pubkey;
+          "identity", `String "self_reported";
+          "state", `String state;
+          "bond", `String (Z.to_string candidate.bond);
+          "bonded_epoch", `String (Int64.to_string candidate.bonded_epoch);
+          "ready_epoch", enrollment_epoch candidate.ready_epoch;
+          "exit_epoch", enrollment_epoch candidate.exit_epoch;
+        ])
+
 let consensus_peer_states
     ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers
-    ~round_agreed =
+    ~round_votes ~round_agreed =
   let diag_json, score_rows = Rpc_view.peer_diag diag ~now in
   match peer_records with
   | None ->
@@ -51,6 +93,7 @@ let consensus_peer_states
       ~voting_reason
       ~round_state
       ~round_peers
+      ~round_votes
       ~round_agreed
       ~peers:[]
       ~scores:score_rows
@@ -69,6 +112,7 @@ let consensus_peer_states
       ~voting_reason
       ~round_state
       ~round_peers
+      ~round_votes
       ~round_agreed
       ~peers
       ~scores:score_rows

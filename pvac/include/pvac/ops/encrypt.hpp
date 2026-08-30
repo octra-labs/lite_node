@@ -20,6 +20,7 @@
 #include "../core/types.hpp"
 #include "../core/hash.hpp"
 #include "../crypto/lpn.hpp"
+#include "../crypto/lpn_v2.hpp"
 #include "../crypto/matrix.hpp"
 #include "../crypto/circuit_prf_profile.hpp"
 #include "../core/ct_safe.hpp"
@@ -334,7 +335,7 @@ struct Gen {
         s.nonce.hi ^= dd << 32;
         s.ztag ^= dd << 48;
 
-        return prf_R_noise(pk, sk, s);
+        return lpn_v2::noise(pk, sk, s);
     }
 
     Fp operator()(uint32_t i, uint8_t d) const {

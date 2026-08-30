@@ -41,6 +41,7 @@ type t = {
   mutable relayed_record_rejected : int;
   mutable validator_pubkeys : string list option;
   mutable on_message : (P2p_conn.t -> P2p_frame.frame -> unit Lwt.t);
+  mutable on_peer : (P2p_conn.t -> unit);
   mutable running : bool;
 }
 
@@ -73,11 +74,18 @@ let create config =
       if config.allowed_pubkeys = [] then None
       else Some config.allowed_pubkeys;
     on_message = (fun _ _ -> Lwt.return_unit);
+    on_peer = (fun _ -> ());
     running = false;
   }
 
 let set_handler t handler =
   t.on_message <- handler
+
+let set_peer_hook t hook =
+  t.on_peer <- hook
+
+let note_peer t conn =
+  try t.on_peer conn with _ -> ()
 
 let peer_count t = Hashtbl.length t.peers
 
@@ -275,10 +283,12 @@ let add_peer t (conn : P2p_conn.t) =
       end else begin
         Lwt.async (fun () -> P2p_conn.close existing);
         Hashtbl.replace t.peers peer_id conn;
+        note_peer t conn;
         true
       end
     | Some _dead ->
       Hashtbl.replace t.peers peer_id conn;
+      note_peer t conn;
       true
     | None ->
       let role = peer_role t peer_id in
@@ -290,6 +300,7 @@ let add_peer t (conn : P2p_conn.t) =
         false
       end else begin
         Hashtbl.replace t.peers peer_id conn;
+        note_peer t conn;
         true
       end
 
@@ -550,7 +561,8 @@ let accept_relayed_records t records =
       t.relayed_record_accepted <- t.relayed_record_accepted + 1;
       maybe_dial_record t r
     | Ok false ->
-      t.relayed_record_unchanged <- t.relayed_record_unchanged + 1
+      t.relayed_record_unchanged <- t.relayed_record_unchanged + 1;
+      maybe_dial_record t r
     | Error reason ->
       t.relayed_record_rejected <- t.relayed_record_rejected + 1;
       let count =
@@ -662,6 +674,7 @@ let listen t =
     else
       let* (client_fd, client_addr) = Lwt_unix.accept fd in
       accept t client_fd client_addr;
+      let* () = Lwt.pause () in
       accept_loop ()
   in
   accept_loop ()

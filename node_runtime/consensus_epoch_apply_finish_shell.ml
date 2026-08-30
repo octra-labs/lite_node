@@ -82,6 +82,7 @@ type node_deps = {
   log_epoch : string -> unit;
   fatal_epoch : string -> unit;
   short : string -> string;
+  require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
 }
 
@@ -231,15 +232,17 @@ let run_node (deps : node_deps) request =
             epoch_id
         with
         | Some finalize ->
-          Reward.resolve_for_epoch
-            ~epoch_id:(Int64.of_int epoch_id)
+          Reward.resolve
             ~proposer_addr
             ~validator_pubkeys
             finalize.Octra_consensus.C_types.parent_commit
         | None when consensus_mode ->
           Error "finalized reward source is missing"
         | None ->
-          Ok (Reward.full_set ~proposer_addr ~validator_pubkeys));
+          Reward.resolve
+            ~proposer_addr
+            ~validator_pubkeys
+            None);
       trace = (fun () -> Footer.trace ~env:deps.env);
       emit_replay_proposer = (fun trace ~epoch_id ~proposer_source ~proposer ~validators_sha ->
         Footer.emit_replay_proposer
@@ -278,6 +281,7 @@ let run_node (deps : node_deps) request =
               match deps.get_meta "last_epoch" with
               | Some s -> Startup_process_shell.parse_int ~default:(-1) s
               | None -> -1);
+            require_sync = deps.require_sync;
             exit = deps.exit;
           }
           input);

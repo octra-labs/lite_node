@@ -51,11 +51,11 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok object_cost_mode ->
-    let object_cost = object_cost_mode = Rule_graph.Active in
     match Rule_graph.account_pack runtime.rules ~epoch:env.epoch_id with
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok account_mode ->
+    let object_cost = object_cost_mode = Rule_graph.Active in
     let proposal_id = "circle-" ^ Transaction.hash tx in
     let open Lwt.Syntax in
     let* result = Lwt.catch

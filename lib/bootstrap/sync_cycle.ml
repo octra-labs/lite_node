@@ -36,9 +36,12 @@ let policy ~interval ~retain =
     Ok { interval; retain }
 
 let default =
-  match policy ~interval:360L ~retain:10 with
+  match policy ~interval:360L ~retain:2 with
   | Ok value -> value
   | Error reason -> invalid_arg reason
+
+let interval policy = policy.interval
+let retention policy = policy.retain
 
 let init ~published = {
   published;
