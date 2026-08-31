@@ -31,6 +31,12 @@ type hello_finish = {
   signature : string;
 }
 
+type profile = {
+  epoch : int64;
+  config_hash : string;
+  signature : string;
+}
+
 let proto_version_current = 3
 
 let max_chain_id_bytes = 128
@@ -165,6 +171,38 @@ let decode_hello_finish payload =
     { chain_id; consensus_config_hash; initiator_node_id; responder_node_id;
       initiator_nonce; responder_nonce; signature }) payload
 
+let profile_sign_bytes ~chain_id ~node_id profile =
+  Hash_domain.hash_encoded "octra:p2p_profile:v1" (fun buf ->
+    Oce1.put_string buf chain_id;
+    Oce1.put_string buf node_id;
+    Oce1.put_u64 buf profile.epoch;
+    Oce1.put_hash32 buf profile.config_hash)
+
+let make_profile ~chain_id ~node_id ~epoch ~config_hash ~sign_fn =
+  if String.length node_id <> max_node_id_bytes then
+    invalid_arg "invalid profile node id";
+  if String.length config_hash <> 32 then
+    invalid_arg "invalid profile config hash";
+  let profile = {
+    epoch;
+    config_hash;
+    signature = String.make signature_bytes '\x00';
+  } in
+  { profile with signature = sign_fn (profile_sign_bytes ~chain_id ~node_id profile) }
+
+let encode_profile profile =
+  Oce1.encode (fun buf ->
+    Oce1.put_u64 buf profile.epoch;
+    Oce1.put_hash32 buf profile.config_hash;
+    Oce1.put_sig64 buf profile.signature)
+
+let decode_profile payload =
+  Oce1.decode (fun c ->
+    let epoch = Oce1.get_u64 c in
+    let config_hash = Oce1.get_hash32 c in
+    let signature = Oce1.get_sig64 c in
+    { epoch; config_hash; signature }) payload
+
 let random_nonce () =
   Mirage_crypto_rng.generate 32
 
@@ -179,6 +217,26 @@ let verify_hello_signature (h : hello) : bool =
 
 let verify_signature ~pubkey ~message ~signature =
   Octra_ed25519.verify ~pub:pubkey ~msg:message signature
+
+let validate_profile ~chain_id ~node_id ~pubkey profile =
+  if String.length node_id <> max_node_id_bytes then
+    Error "profile node id is invalid"
+  else if String.length pubkey <> 32 then
+    Error "profile public key is invalid"
+  else if String.length profile.config_hash <> 32 then
+    Error "profile config hash is invalid"
+  else if String.length profile.signature <> signature_bytes then
+    Error "profile signature is invalid"
+  else if
+    not
+      (verify_signature
+         ~pubkey
+         ~message:(profile_sign_bytes ~chain_id ~node_id profile)
+         ~signature:profile.signature)
+  then
+    Error "profile signature is invalid"
+  else
+    Ok ()
 
 let verify_node_id (h : hello) : bool =
   h.node_id = node_id_of_pubkey h.pubkey

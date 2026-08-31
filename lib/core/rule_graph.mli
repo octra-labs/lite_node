@@ -50,6 +50,7 @@ val set_fold_cap_activation : t -> activation option
 val set_open_activation : t -> activation option
 val object_cost_activation : t -> activation option
 val account_pack_activation : t -> activation option
+val standard_activation : t -> activation option
 val ready_config_hash : t -> string option
 
 val consensus_id : chain_id:string -> string
@@ -129,5 +130,15 @@ val account_pack :
   t ->
   epoch:int ->
   (mode, fault) result
+
+val standard :
+  t ->
+  epoch:int ->
+  (mode, fault) result
+
+val standard_at :
+  chain_id:string ->
+  epoch:int ->
+  mode
 
 val fault_message : fault -> string

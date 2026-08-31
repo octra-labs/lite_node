@@ -4,6 +4,10 @@
 module Admission = Consensus_epoch_apply_admission
 module Catchup = Consensus_catchup_shell
 
+type apply_result =
+  | Apply_done
+  | Apply_busy
+
 type deps = {
   head : unit -> int;
   set_current_epoch : int -> unit;
@@ -14,7 +18,8 @@ type deps = {
   log_defer : Admission.catchup -> Catchup.queue_event -> unit;
   preflight : unit -> (unit, string) result;
   defer : string -> unit;
-  apply : unit -> unit Lwt.t;
+  apply : unit -> apply_result Lwt.t;
+  retry : unit -> unit Lwt.t;
 }
 
 let run deps ~consensus_mode ~current_epoch =
@@ -35,13 +40,22 @@ let run deps ~consensus_mode ~current_epoch =
     Lwt.return_unit
   | Admission.Apply_now ->
     (match deps.preflight () with
-     | Ok () -> deps.apply ()
+     | Ok () ->
+       let open Lwt.Syntax in
+       let* result = deps.apply () in
+       begin
+         match result with
+         | Apply_done -> Lwt.return_unit
+         | Apply_busy when deps.head () = current_epoch -> Lwt.return_unit
+         | Apply_busy -> deps.retry ()
+       end
      | Error reason ->
        deps.defer reason;
        Lwt.return_unit)
 
 let run_node ~consensus_mode ~current_epoch ~head ~catchup_queue
-    ~catchup_in_progress ~clear_state_attested ~preflight ~defer ~apply =
+    ~catchup_in_progress ~clear_state_attested ~preflight ~defer ~apply
+    ~retry =
   run
     {
       head;
@@ -64,6 +78,7 @@ let run_node ~consensus_mode ~current_epoch ~head ~catchup_queue
       preflight;
       defer;
       apply;
+      retry;
     }
     ~consensus_mode
     ~current_epoch:!current_epoch

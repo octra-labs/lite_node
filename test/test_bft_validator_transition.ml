@@ -96,6 +96,7 @@ let make_swarm ~chain_id ~addr =
     binary_hash = String.make 32 '\x00';
     require_binary_hash = false;
     upgrade_plan = None;
+    profile = None;
     allowed_pubkeys = [];
     bootstrap_peers = [];
     max_peers = 0;
@@ -104,6 +105,168 @@ let make_swarm ~chain_id ~addr =
     best_root_fn = (fun () -> String.make 32 '\x00');
   } in
   Octra_net.P2p_swarm.create swarm_config
+
+let check_profile_offer () =
+  Mirage_crypto_rng_unix.use_default ();
+  let priv, pub = Mirage_crypto_ec.Ed25519.generate () in
+  let pubkey = Mirage_crypto_ec.Ed25519.pub_to_octets pub in
+  let node_id = Octra_net.P2p_handshake.node_id_of_pubkey pubkey in
+  let sign value = Mirage_crypto_ec.Ed25519.sign ~key:priv value in
+  let offer =
+    Octra_net.P2p_handshake.make_profile
+      ~chain_id:"profile-test"
+      ~node_id
+      ~epoch:20L
+      ~config_hash:(String.make 32 '\x0a')
+      ~sign_fn:sign
+  in
+  let decoded =
+    offer
+    |> Octra_net.P2p_handshake.encode_profile
+    |> Octra_net.P2p_handshake.decode_profile
+  in
+  assert_msg
+    (Octra_net.P2p_handshake.validate_profile
+       ~chain_id:"profile-test"
+       ~node_id
+       ~pubkey
+       decoded
+     = Ok ())
+    "signed profile offer is valid";
+  let changed = { decoded with config_hash = String.make 32 '\x0b' } in
+  assert_msg
+    (Result.is_error
+       (Octra_net.P2p_handshake.validate_profile
+          ~chain_id:"profile-test"
+          ~node_id
+          ~pubkey
+          changed))
+    "changed profile offer is rejected";
+  assert_msg
+    (Result.is_error
+       (Octra_net.P2p_handshake.validate_profile
+          ~chain_id:"other-chain"
+          ~node_id
+          ~pubkey
+          decoded))
+    "cross-chain profile offer is rejected";
+  let changed_epoch = { decoded with epoch = 21L } in
+  assert_msg
+    (Result.is_error
+       (Octra_net.P2p_handshake.validate_profile
+          ~chain_id:"profile-test"
+          ~node_id
+          ~pubkey
+          changed_epoch))
+    "changed profile epoch is rejected"
+
+let check_profile_switch () =
+  let old_hash = String.make 32 '\x0c' in
+  let new_hash = String.make 32 '\x0d' in
+  let binary_hash = String.make 32 '\x10' in
+  let plan = Some Octra_net.P2p_upgrade_plan.{
+    activate_epoch = 20L;
+    target_binary_hash = binary_hash;
+    target_config_hash = new_hash;
+    rollback = None;
+  } in
+  assert_msg
+    (Octra_net.P2p_swarm.keep_profile
+       ~target:new_hash
+       ~current:old_hash
+       ~offered:(Some new_hash))
+    "offered target keeps an existing session";
+  assert_msg
+    (Octra_net.P2p_swarm.keep_profile
+       ~target:new_hash
+       ~current:new_hash
+       ~offered:None)
+    "target handshake keeps a new session";
+  assert_msg
+    (not
+       (Octra_net.P2p_swarm.keep_profile
+          ~target:new_hash
+          ~current:old_hash
+          ~offered:None))
+    "old session without an offer is removed";
+  let pubkey_raw = String.make 32 '\x0e' in
+  let swarm =
+    Octra_net.P2p_swarm.create
+      Octra_net.P2p_swarm.{
+        listen_port = 1;
+        chain_id = "profile-switch-test";
+        node_id = Octra_net.P2p_handshake.node_id_of_pubkey pubkey_raw;
+        node_addr = "oct-profile";
+        pubkey_raw;
+        consensus_config_hash = old_hash;
+        binary_hash;
+        require_binary_hash = true;
+        upgrade_plan = plan;
+        profile = Some {
+          epoch = 20L;
+          config_hash = new_hash;
+          profile_hash = String.make 32 '\x0f';
+        };
+        allowed_pubkeys = [];
+        bootstrap_peers = [];
+        max_peers = 0;
+        sign_fn = (fun _ -> String.make 64 '\x00');
+        best_epoch_fn = (fun () -> 19L);
+        best_root_fn = (fun () -> String.make 32 '\x00');
+      }
+  in
+  let before = Octra_net.P2p_swarm.make_my_hello swarm in
+  assert_msg
+    (Octra_net.P2p_swarm.hello_current swarm before)
+    "current handshake is accepted before activation";
+  let scheduled =
+    Octra_net.P2p_upgrade_plan.handshake_hash
+      ~epoch:19L
+      ~config_hash:old_hash
+      ~binary_hash
+      ~require_binary_hash:true
+      plan
+  in
+  assert_msg
+    (String.equal before.consensus_config_hash scheduled)
+    "profile switch preserves the scheduled handshake before activation";
+  let first =
+    Octra_net.P2p_swarm.switch_profile swarm ~epoch:20L
+    |> Lwt_main.run
+    |> Result.get_ok
+  in
+  assert_msg
+    (String.equal first (String.make 32 '\x0f'))
+    "profile switch returns the runtime profile";
+  assert_msg
+    (String.equal (Octra_net.P2p_swarm.config_hash swarm) new_hash)
+    "profile switch changes the handshake hash";
+  assert_msg
+    (not (Octra_net.P2p_swarm.hello_current swarm before))
+    "crossing handshake is rejected after activation";
+  let after = Octra_net.P2p_swarm.make_my_hello swarm in
+  assert_msg
+    (Octra_net.P2p_swarm.hello_current swarm after)
+    "current handshake is accepted after activation";
+  let active =
+    Octra_net.P2p_upgrade_plan.handshake_hash
+      ~epoch:20L
+      ~config_hash:new_hash
+      ~binary_hash
+      ~require_binary_hash:true
+      plan
+  in
+  assert_msg
+    (String.equal after.consensus_config_hash active)
+    "profile switch advances the wire epoch at a shared boundary";
+  let repeated =
+    Octra_net.P2p_swarm.switch_profile swarm ~epoch:20L
+    |> Lwt_main.run
+    |> Result.get_ok
+  in
+  assert_msg
+    (String.equal repeated first)
+    "profile switch is idempotent"
 
 let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch =
   let cfg = Driver.{
@@ -413,6 +576,8 @@ let check_fold_event_binds_finalized_parent () =
 
 let () =
   check_future_validator_engine_boundary ();
+  check_profile_offer ();
+  check_profile_switch ();
   check_scheduled_activation_restart_boundaries ();
   check_live_plan ();
   check_start_height_activates_target_set ();

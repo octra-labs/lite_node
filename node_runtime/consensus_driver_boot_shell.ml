@@ -565,12 +565,12 @@ let run_catchup_to_target (deps : deps) normalize finality_runtime =
           deps.env;
     }
 
-let driver_gates (deps : deps) p2p =
+let driver_gates (deps : deps) (p2p : Startup_p2p_shell.node_view) =
   Consensus_driver_wiring.node_gates_of_runtime
     {
       consensus_mode = deps.consensus_mode;
       voting = deps.voting;
-      consensus_config_hash = p2p.Startup_p2p_shell.consensus_config_hash;
+      consensus_config_hash = deps.p2p_refs.consensus_config_hash;
       p2p_config = p2p.p2p_config;
       current_epoch = (fun () -> !(deps.current_epoch));
       log_blocked = (fun reason epoch ->

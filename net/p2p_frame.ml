@@ -11,6 +11,7 @@ let msg_pong = 0x04
 let msg_hello_finish = 0x05
 let msg_get_peers = 0x10
 let msg_peers = 0x11
+let msg_profile = 0x12
 let msg_tx_gossip = 0x20
 let msg_proofcert_gossip = 0x21
 let msg_cons_propose = 0x30
@@ -53,6 +54,7 @@ let known_msg_types = [
   msg_hello_finish;
   msg_get_peers;
   msg_peers;
+  msg_profile;
   msg_tx_gossip;
   msg_proofcert_gossip;
   msg_cons_propose;
@@ -128,6 +130,7 @@ let msg_type_name = function
   | 0x05 -> "HELLO_FINISH"
   | 0x10 -> "GET_PEERS"
   | 0x11 -> "PEERS"
+  | 0x12 -> "PROFILE"
   | 0x20 -> "TX_GOSSIP"
   | 0x21 -> "PROOFCERT_GOSSIP"
   | 0x30 -> "CONS_PROPOSE"

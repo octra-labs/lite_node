@@ -12,12 +12,28 @@ module C = Octra_consensus.C_types
 module H = Octra_consensus.C_hash
 module R = Octra_node_runtime.Consensus_reward_attribution
 module P = Octra_node_runtime.Consensus_profile
+module F = Octra_node_runtime.Consensus_epoch_apply_finish_shell
+module PC = Octra_node_runtime.P2p_config
+module A = Octra_node_runtime.Consensus_epoch_apply_shared
+module AC = Octra_node_runtime.Consensus_epoch_apply_checked
+module V = Octra_node_runtime.Epoch_visibility
 
 let fail msg =
   failwith ("test_epoch_exec_reward_atomic: " ^ msg)
 
 let expect label condition =
   if not condition then fail label
+
+let raw_hex raw =
+  let hex = "0123456789abcdef" in
+  let out = Bytes.create (String.length raw * 2) in
+  String.iteri
+    (fun i value ->
+      let code = Char.code value in
+      Bytes.set out (i * 2) hex.[code lsr 4];
+      Bytes.set out ((i * 2) + 1) hex.[code land 15])
+    raw;
+  Bytes.unsafe_to_string out
 
 let expect_ok label = function
   | Ok value -> value
@@ -74,6 +90,38 @@ let env =
     ready_state_root_at = None;
     ready_max_lag = -1;
   }
+
+let fold standard_mode =
+  X.{
+    mode = Octra_core.Rule_graph.Active;
+    ready_mode = Octra_core.Rule_graph.Active;
+    ready_ref_mode = Octra_core.Rule_graph.Active;
+    live_mode = Octra_core.Rule_graph.Active;
+    seat_mode = Octra_core.Rule_graph.Active;
+    open_mode = Octra_core.Rule_graph.Active;
+    account_mode = Octra_core.Rule_graph.Active;
+    standard_mode;
+    cap_mode = Octra_core.Set_fold.Prune;
+    ready_config_hash = Some "ready";
+    start = 1_334_000L;
+    profile_start = 1_500_000L;
+    parent = None;
+    members = ["octNew"];
+  }
+
+let test_standard_gate () =
+  let prior = fold Octra_core.Rule_graph.Prior in
+  let active = fold Octra_core.Rule_graph.Active in
+  expect "prior fold config"
+    (X.set_fold_cfg prior = Octra_core.Set_fold.standard);
+  expect "active fold config"
+    (X.set_fold_cfg active = Octra_core.Set_fold.participating);
+  expect "prior fold start" (X.set_fold_start prior = 1_334_000L);
+  expect "active fold start" (X.set_fold_start active = 1_500_000L);
+  expect "prior member source"
+    (X.std_value prior ["octOld"] ["octNew"] = ["octOld"]);
+  expect "active member source"
+    (X.std_value active ["octOld"] ["octNew"] = ["octNew"])
 
 let plan () =
   X.build_reward_plan
@@ -163,7 +211,7 @@ let test_reward_plan () =
 
 let test_reward_env () =
   let implicit = X.default_reward env in
-  expect "single validator fallback"
+  expect "single validator reserve"
     (List.map
        (fun (validator : X.reward_validator) -> validator.address)
        implicit.X.validators
@@ -219,6 +267,7 @@ let test_weighted_reward_credits () =
     (not second.proposer && second.validator && second.amount = Z.of_int 7)
 
 let test_reward_finality_binding () =
+  let standard_epoch = 1_500_000L in
   let validator address byte =
     C.{ address; pubkey = String.make 32 byte }
   in
@@ -226,8 +275,8 @@ let test_reward_finality_binding () =
   let validator_set = C.make_validator_set validators in
   let header = C.{
     proto_version = proto_version_current;
-    chain_id = "reward-bind";
-    epoch_id = 8L;
+    chain_id = "octra-devnet-9871-cluster";
+    epoch_id = Int64.pred standard_epoch;
     prev_state_root = String.make 32 '\x03';
     tx_list_hash = String.make 32 '\x04';
     receipt_root = H.receipt_root [];
@@ -261,15 +310,21 @@ let test_reward_finality_binding () =
   let supplied = R.of_parent_commit parent |> expect_ok "reward source" in
   let finalize = C.{
     chain_id = header.chain_id;
-    epoch_id = Int64.succ header.epoch_id;
+    epoch_id = standard_epoch;
     commit_round = 1;
-    header = { header with epoch_id = Int64.succ header.epoch_id };
+    header = { header with epoch_id = standard_epoch };
     proposal_id;
     precommits = [];
     parent_commit = Some parent;
   } in
-  expect "bound reward source accepted"
+  expect "linked reward source accepted"
     (R.bind_finality ~validator_set finalize supplied = Ok supplied);
+  expect "prior missing reward parent accepted"
+    (R.bind_finality
+       ~validator_set
+       { finalize with epoch_id = header.epoch_id; header; parent_commit = None }
+       supplied
+     = Ok supplied);
   expect "missing reward parent rejected"
     (Result.is_error
        (R.bind_finality
@@ -346,11 +401,16 @@ let test_validator_unbond () =
 
 let test_consensus_standard () =
   let getenv _ = None in
+  let compat = P.compat_hash getenv in
   let first = P.standard_hash ~chain_id:"standard-a" getenv in
   let repeated = P.standard_hash ~chain_id:"standard-a" getenv in
   let other = P.standard_hash ~chain_id:"standard-b" getenv in
   expect "consensus standard name"
     (String.equal P.standard "octra_consensus");
+  expect "compat hash golden"
+    (String.equal
+       (raw_hex compat)
+       "cf3813dc7d75a9df5b696817677f7aafc94cbbb737cef9f9a64edb1b2d04006b");
   expect "consensus standard hash is stable" (String.equal first repeated);
   expect "consensus standard binds chain" (not (String.equal first other));
   expect "activation graph binds chain"
@@ -358,6 +418,159 @@ let test_consensus_standard () =
        (String.equal
           (P.activation_graph_hash ~chain_id:"standard-a")
           (P.activation_graph_hash ~chain_id:"standard-b")))
+
+let test_consensus_cutover () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let getenv _ = None in
+  let compat = P.compat_hash getenv in
+  let full = P.standard_hash ~chain_id getenv in
+  expect "wire hashes differ" (not (String.equal compat full));
+  expect "wire hash stays compatible before activation"
+    (String.equal
+       compat
+       (P.hash ~chain_id ~epoch:1_499_999 getenv));
+  expect "wire hash changes at activation"
+    (String.equal
+       full
+       (P.hash ~chain_id ~epoch:1_500_000 getenv));
+  expect "wire hash stays full after activation"
+    (String.equal
+       full
+       (P.hash ~chain_id ~epoch:1_500_001 getenv));
+  expect "wire switch waits for final prior epoch"
+    (not (P.switch_after ~chain_id ~applied_epoch:1_499_998));
+  expect "wire switch follows final prior epoch"
+    (P.switch_after ~chain_id ~applied_epoch:1_499_999);
+  expect "wire switch runs once"
+    (not (P.switch_after ~chain_id ~applied_epoch:1_500_000));
+  let no_swarm =
+    F.switch_profile
+      ~swarm:None
+      ~chain_id
+      ~epoch:1_500_000
+      ~env:getenv
+    |> Lwt_main.run
+    |> Result.get_ok
+  in
+  expect "wire switch without swarm installs full profile"
+    (String.equal no_swarm full);
+  expect "unrelated chain stays compatible"
+    (String.equal
+       compat
+       (P.hash ~chain_id:"octra-mainnet" ~epoch:max_int getenv));
+  let switched = ref [] in
+  let run applied_epoch =
+    F.cutover
+      ~switch:(fun epoch ->
+        switched := epoch :: !switched;
+        Lwt.return_unit)
+      ~chain_id
+      ~applied_epoch
+    |> Lwt_main.run
+  in
+  run 1_499_998;
+  run 1_499_999;
+  run 1_500_000;
+  expect "cutover switches only the activation epoch"
+    (!switched = [1_500_000])
+
+let test_epoch_serialization () =
+  let visibility = V.create () in
+  let release, wake = Lwt.wait () in
+  let events = ref [] in
+  let add event = events := event :: !events in
+  let first =
+    V.try_apply visibility (fun () ->
+      let open Lwt.Syntax in
+      add "first-start";
+      let* () = release in
+      add "first-end";
+      Lwt.return_unit)
+  in
+  let second =
+    V.try_apply visibility (fun () ->
+      add "second";
+      Lwt.return_unit)
+  in
+  expect "second epoch apply waits" (List.rev !events = ["first-start"]);
+  Lwt.wakeup_later wake ();
+  let first_result, second_result = Lwt_main.run (Lwt.both first second) in
+  expect "first epoch apply completes"
+    (match first_result with V.Applied () -> true | V.Busy -> false);
+  expect "waiting epoch apply is stale"
+    (match second_result with V.Busy -> true | V.Applied () -> false);
+  expect "stale epoch payload is discarded"
+    (List.rev !events = ["first-start"; "first-end"]);
+  expect "epoch visibility reopens" (not (V.is_applying visibility));
+  let third =
+    V.try_apply visibility (fun () ->
+      add "third";
+      Lwt.return_unit)
+    |> Lwt_main.run
+  in
+  expect "fresh epoch apply completes"
+    (match third with V.Applied () -> true | V.Busy -> false);
+  expect "fresh epoch payload runs"
+    (List.rev !events = ["first-start"; "first-end"; "third"])
+
+let busy_case next =
+  let reads = ref 0 in
+  let retried = ref false in
+  let deps = AC.{
+    head = (fun () ->
+      incr reads;
+      if !reads = 1 then 10 else next);
+    set_current_epoch = (fun _ -> ());
+    catchup_active = (fun () -> false);
+    queue_gap = (fun ~active:_ ~target_epoch:_ ~reason:_ -> fail "busy gap");
+    clear_state_attested = (fun () -> ());
+    log_already = (fun ~current_epoch:_ ~head:_ -> ());
+    log_defer = (fun _ _ -> ());
+    preflight = (fun () -> Ok ());
+    defer = (fun _ -> ());
+    apply = (fun () -> Lwt.return AC.Apply_busy);
+    retry = (fun () ->
+      retried := true;
+      Lwt.return_unit);
+  } in
+  AC.run deps ~consensus_mode:true ~current_epoch:11 |> Lwt_main.run;
+  !retried
+
+let test_epoch_busy_gate () =
+  expect "applied epoch needs no retry" (not (busy_case 11));
+  expect "unchanged head retries" (busy_case 10);
+  expect "advanced head retries" (busy_case 12)
+
+let test_upgrade_ready_refresh () =
+  let old_hash = String.make 32 '\x01' in
+  let new_hash = String.make 32 '\x02' in
+  let binary_hash = String.make 32 '\x03' in
+  let config_hash = ref old_hash in
+  let plan = Octra_net.P2p_upgrade_plan.{
+    activate_epoch = 20L;
+    target_binary_hash = binary_hash;
+    target_config_hash = new_hash;
+    rollback = None;
+  } in
+  let config = PC.{
+    config_hash = old_hash;
+    binary_hash;
+    require_binary_hash = true;
+    upgrade_plan = Some plan;
+    profile = None;
+    handshake_allowed_pubkeys = [];
+    validator_pubkeys = [];
+  } in
+  let ready =
+    PC.upgrade_ready_checker
+      ~log_blocked:(fun _ -> ())
+      ~epoch:(fun () -> 20L)
+      ~consensus_config_hash:(fun () -> !config_hash)
+      config
+  in
+  expect "upgrade readiness rejects the startup hash" (not (ready ()));
+  config_hash := new_hash;
+  expect "upgrade readiness reads the switched hash" (ready ())
 
 let test_reward_properties () =
   let max = Octra_core.Denomination.max_supply in
@@ -397,7 +610,7 @@ let test_reward_properties () =
               |> expect_ok "reward property plan"
             in
             expect "base reward nonnegative" (Z.sign plan.base_reward >= 0);
-            expect "base reward bounded"
+            expect "base reward within limit"
               (Z.leq plan.base_reward remaining);
             expect "positive pool mints"
               (Z.equal remaining Z.zero || Z.gt plan.base_reward Z.zero);
@@ -460,7 +673,7 @@ let test_fee_burn_epoch_accounting () =
          (Z.of_int 95));
     expect "public supply accounting"
       (Z.equal (L.get_total_supply ledger) (Z.of_int 95));
-    expect "canonical supply accounting"
+    expect "exact supply accounting"
       (Lwt_main.run (S.get_meta store "total_supply") = Some "95");
     expect "retired supply accounting"
       (Lwt_main.run (S.get_meta store ES.retired_key)
@@ -603,9 +816,9 @@ let test_legacy_zero_epoch () =
       ((L.find ledger env.X.proposer_addr).L.balance = Z.of_int 70);
     expect "legacy supply unchanged"
       (Lwt_main.run (S.get_meta store "total_supply") = Some "70");
-    expect "legacy reserve canonicalized"
+    expect "legacy reserve normalized"
       (Lwt_main.run (S.get_meta store "emission_remaining") = Some "0");
-    expect "legacy supply canonicalized"
+    expect "legacy supply normalized"
       (Lwt_main.run (S.get_meta store "total_supply") = Some "70");
     expect "legacy epoch advanced"
       (Lwt_main.run (S.get_meta store "current_epoch") = Some "5"))
@@ -1013,7 +1226,77 @@ let test_tx_exception_rollback () =
       ((L.find ledger env.X.proposer_addr).L.nonce = 0);
     expect "exception journal closed" (not (L.journal_active ledger)))
 
+let test_worker_retry_rollback () =
+  with_store (fun store ->
+    let ledger = L.create store in
+    expect "retry account added"
+      (L.add_account ledger env.X.proposer_addr (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let backend = atomic_backend store ledger in
+    let tx = atomic_tx 1 in
+    let first =
+      X.run
+        ~backend
+        ~env
+        ~txs:[tx]
+        ~process_tx:(fun ~backend:_ ~env:_ _ ->
+          match L.debit ledger tx.from (Z.of_int 40) tx.nonce with
+          | Error error -> Lwt.fail_with error
+          | Ok () ->
+            Lwt.fail
+              (Octra_core.Private_ledger.Worker_retry "worker unavailable"))
+      |> Lwt_main.run
+    in
+    expect "retry rejected epoch" (Result.is_error first);
+    expect "retry debit rolled back"
+      (Z.equal (L.find ledger env.X.proposer_addr).L.balance (Z.of_int 100));
+    expect "retry nonce rolled back"
+      ((L.find ledger env.X.proposer_addr).L.nonce = 0);
+    expect "retry journal closed" (not (L.journal_active ledger));
+    let second =
+      X.run
+        ~backend
+        ~env
+        ~txs:[tx]
+        ~process_tx:X.process_standard_tx
+      |> Lwt_main.run
+    in
+    expect "retry epoch reapplied" (Result.is_ok second);
+    expect "retry transaction committed"
+      ((L.find ledger env.X.proposer_addr).L.nonce = 1))
+
+let test_worker_retry_loop () =
+  let calls = ref 0 in
+  let waits = ref [] in
+  let wait delay =
+    waits := delay :: !waits;
+    Lwt.return_unit
+  in
+  let apply () =
+    incr calls;
+    if !calls < 3 then
+      Lwt.fail (Octra_core.Private_ledger.Worker_retry "worker unavailable")
+    else
+      Lwt.return 7
+  in
+  let value = A.worker_retry ~wait apply |> Lwt_main.run in
+  expect "worker retry result" (value = 7);
+  expect "worker retry count" (!calls = 3);
+  expect "worker retry waits" (List.rev !waits = [0.25; 0.5]);
+  let failed =
+    try
+      A.worker_retry ~wait (fun () -> Lwt.fail (Failure "fatal"))
+      |> Lwt_main.run
+      |> ignore;
+      false
+    with
+    | Failure reason -> String.equal reason "fatal"
+    | _ -> false
+  in
+  expect "worker retry preserves failure" failed
+
 let () =
+  test_standard_gate ();
   test_policy ();
   test_reward_plan ();
   test_reward_env ();
@@ -1021,6 +1304,10 @@ let () =
   test_reward_finality_binding ();
   test_validator_unbond ();
   test_consensus_standard ();
+  test_consensus_cutover ();
+  test_epoch_serialization ();
+  test_epoch_busy_gate ();
+  test_upgrade_ready_refresh ();
   test_reward_properties ();
   test_fee_burn_parity ();
   test_fee_burn_epoch_accounting ();
@@ -1037,4 +1324,6 @@ let () =
   test_tx_reject_rollback ();
   test_sender_key_rejected_after_fee ();
   test_tx_exception_rollback ();
+  test_worker_retry_rollback ();
+  test_worker_retry_loop ();
   print_endline "status = pass test = epoch_exec_reward_atomic"

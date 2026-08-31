@@ -6,13 +6,15 @@ module Parent = Octra_consensus.C_parent_commit
 module Reward_source = Octra_consensus.C_reward_source
 module C_types = Octra_consensus.C_types
 
+let consensus_id = "reward_source:finalized_parent"
+
 type t = Epoch_exec.reward_attribution = {
   proposer_addr : string;
   proposer_public_key : string option;
   validators : Epoch_exec.reward_validator list;
 }
 
-let fallback ~proposer_addr ~validator_pubkeys =
+let full_set ~proposer_addr ~validator_pubkeys =
   {
     proposer_addr;
     proposer_public_key = List.assoc_opt proposer_addr validator_pubkeys;
@@ -165,7 +167,7 @@ let epoch_source ~validator_activation_epoch ~validator_pubkeys header =
     else if
       protocol = Octra_consensus.C_types.proto_version_parent_legacy
     then
-      fallback ~proposer_addr ~validator_pubkeys
+      full_set ~proposer_addr ~validator_pubkeys
       |> to_source
     else
       legacy_current_reward ~proposer_addr ~validator_pubkeys header
@@ -197,33 +199,82 @@ let legacy_finality_reward ~validator_set finalize =
         Base64.encode_exn validator.pubkey)
       validator_set.C_types.validators
   in
-  fallback
+  full_set
     ~proposer_addr:finalize.C_types.header.creator_addr
     ~validator_pubkeys
   |> to_source
   |> fun source -> Result.bind source of_source
 
+let require_reward label expected supplied =
+  Result.bind expected (fun expected ->
+    if expected = supplied then Ok expected
+    else Error ("reward source does not match " ^ label))
+
+let standard_mode ~chain_id epoch_id =
+  if Int64.compare epoch_id 0L < 0
+     || Int64.compare epoch_id (Int64.of_int max_int) > 0 then
+    Octra_core.Rule_graph.Active
+  else
+    Octra_core.Rule_graph.standard_at
+      ~chain_id
+      ~epoch:(Int64.to_int epoch_id)
+
 let bind_finality ~validator_set finalize supplied =
   match finalize.C_types.header.proto_version with
   | version when version = C_types.proto_version_parent_legacy ->
     legacy_finality_reward ~validator_set finalize
-    |> fun expected ->
-    Result.bind expected (fun expected ->
-      if expected = supplied then Ok expected
-      else Error "reward source does not match legacy finality")
+    |> fun expected -> require_reward "legacy finality" expected supplied
   | version when version = C_types.proto_version_current ->
     begin
-      match finalize.C_types.parent_commit with
-      | None -> Error "reward parent commit is missing"
-      | Some parent ->
+      match
+        standard_mode
+          ~chain_id:finalize.C_types.chain_id
+          finalize.C_types.epoch_id,
+        finalize.C_types.epoch_id,
+        finalize.C_types.parent_commit
+      with
+      | Octra_core.Rule_graph.Prior, _, None -> Ok supplied
+      | Octra_core.Rule_graph.Prior, _, Some parent ->
         of_parent_commit parent
-        |> fun expected ->
-        Result.bind expected (fun expected ->
-          if expected = supplied then Ok expected
-          else Error "reward source does not match parent commit")
+        |> fun expected -> require_reward "parent commit" expected supplied
+      | Octra_core.Rule_graph.Active, 0L, None ->
+        legacy_finality_reward ~validator_set finalize
+        |> fun expected -> require_reward "current genesis" expected supplied
+      | Octra_core.Rule_graph.Active, 0L, Some _ ->
+        Error "genesis reward parent commit is unexpected"
+      | Octra_core.Rule_graph.Active, _, None ->
+        Error "current reward parent commit is missing"
+      | Octra_core.Rule_graph.Active, _, Some parent ->
+        of_parent_commit parent
+        |> fun expected -> require_reward "parent commit" expected supplied
     end
   | _ -> Error "reward finality protocol is unsupported"
 
-let resolve ~proposer_addr ~validator_pubkeys = function
-  | None -> Ok (fallback ~proposer_addr ~validator_pubkeys)
-  | Some parent -> of_parent_commit parent
+let resolve_for_epoch ~chain_id ~epoch_id ~proposer_addr ~validator_pubkeys
+    parent =
+  match
+    Octra_consensus.C_protocol.version_for_epoch epoch_id,
+    epoch_id,
+    parent
+  with
+  | version, _, None
+    when version = C_types.proto_version_parent_legacy ->
+    Ok (full_set ~proposer_addr ~validator_pubkeys)
+  | version, _, Some _
+    when version = C_types.proto_version_parent_legacy ->
+    Error "legacy reward parent commit is unexpected"
+  | version, 0L, None when version = C_types.proto_version_current ->
+    Ok (full_set ~proposer_addr ~validator_pubkeys)
+  | version, 0L, Some _ when version = C_types.proto_version_current ->
+    Error "genesis reward parent commit is unexpected"
+  | version, _, None when version = C_types.proto_version_current ->
+    begin
+      match standard_mode ~chain_id epoch_id with
+      | Octra_core.Rule_graph.Prior ->
+        Ok (full_set ~proposer_addr ~validator_pubkeys)
+      | Octra_core.Rule_graph.Active ->
+        Error "current reward parent commit is missing"
+    end
+  | version, _, Some parent when version = C_types.proto_version_current ->
+    of_parent_commit parent
+  | _ -> Error "reward protocol is unsupported"

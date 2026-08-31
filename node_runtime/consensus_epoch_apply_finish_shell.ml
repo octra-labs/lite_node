@@ -30,6 +30,7 @@ type deps = {
     unit;
   finalize : Finalize.input -> Finalize.result Lwt.t;
   post : Post.node_input -> Post.result Lwt.t;
+  after_post : chain_id:string -> applied_epoch:int -> unit Lwt.t;
 }
 
 type request = {
@@ -84,6 +85,7 @@ type node_deps = {
   short : string -> string;
   require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
+  set_profile : string -> unit;
 }
 
 let run (deps : deps) (request : request) =
@@ -193,7 +195,52 @@ let run (deps : deps) (request : request) =
       finalized
   in
   let* post = deps.post post_input in
+  let* () =
+    deps.after_post
+      ~chain_id:request.epoch_env.chain_id
+      ~applied_epoch:post.Post.applied_epoch_id
+  in
   Lwt.return { proposer_source; proposer_addr; post }
+
+let cutover ~switch ~chain_id ~applied_epoch =
+  if
+    not
+      (Consensus_profile.switch_after
+         ~chain_id
+         ~applied_epoch)
+  then
+    Lwt.return_unit
+  else
+    switch (applied_epoch + 1)
+
+let switch_profile ~swarm ~chain_id ~epoch ~env =
+  match swarm with
+  | None ->
+    Octra_log.warn "consensus"
+      "event = profile_switch status = no_swarm epoch = %d"
+      epoch;
+    Lwt.return_ok (Consensus_profile.hash ~chain_id ~epoch env)
+  | Some swarm ->
+    Octra_net.P2p_swarm.switch_profile swarm ~epoch:(Int64.of_int epoch)
+
+let after_post deps ~chain_id ~applied_epoch =
+  cutover
+    ~switch:(fun epoch ->
+      let open Lwt.Syntax in
+      let* result =
+        switch_profile
+          ~swarm:!(deps.swarm_opt)
+          ~chain_id
+          ~epoch
+          ~env:deps.env
+      in
+      match result with
+      | Error reason -> Lwt.fail_with reason
+      | Ok profile ->
+        deps.set_profile profile;
+        Lwt.return_unit)
+    ~chain_id
+    ~applied_epoch
 
 let run_node (deps : node_deps) request =
   run
@@ -232,17 +279,16 @@ let run_node (deps : node_deps) request =
             epoch_id
         with
         | Some finalize ->
-          Reward.resolve
+          Reward.resolve_for_epoch
+            ~chain_id:request.epoch_env.chain_id
+            ~epoch_id:(Int64.of_int epoch_id)
             ~proposer_addr
             ~validator_pubkeys
             finalize.Octra_consensus.C_types.parent_commit
         | None when consensus_mode ->
           Error "finalized reward source is missing"
         | None ->
-          Reward.resolve
-            ~proposer_addr
-            ~validator_pubkeys
-            None);
+          Ok (Reward.full_set ~proposer_addr ~validator_pubkeys));
       trace = (fun () -> Footer.trace ~env:deps.env);
       emit_replay_proposer = (fun trace ~epoch_id ~proposer_source ~proposer ~validators_sha ->
         Footer.emit_replay_proposer
@@ -285,5 +331,6 @@ let run_node (deps : node_deps) request =
             exit = deps.exit;
           }
           input);
+      after_post = after_post deps;
     }
     request

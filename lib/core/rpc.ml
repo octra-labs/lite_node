@@ -55,6 +55,7 @@ let max_method_len = 64
 let max_param_depth = 8
 let max_string_param_len = 100_000_000
 let max_batch_size = 100
+let max_admits = 100
 
 let valid_method_char = function
   | 'a'..'z' | 'A'..'Z' | '0'..'9' | '_' -> true
@@ -90,6 +91,32 @@ let parse_single (json : Yojson.Safe.t) : (request, rpc_error) result =
       else Ok { jsonrpc; method_; params; id }
   | _ -> Error invalid_request
 
+let admit_count req =
+  match req.method_, req.params with
+  | "octra_submit", _ -> 1
+  | "octra_privateTransfer", _ -> 1
+  | "octra_submitBatch", `List (`List txs :: _) -> List.length txs
+  | _ -> 0
+
+let admit_error count =
+  invalid_params
+    (Printf.sprintf
+       "admission attempts = %d limit = %d"
+       count
+       max_admits)
+
+let check_admits requests =
+  let count =
+    List.fold_left
+      (fun total -> function
+        | Ok req -> total + admit_count req
+        | Error _ -> total)
+      0
+      requests
+  in
+  if count > max_admits then Error (admit_error count)
+  else Ok requests
+
 let parse_body body =
   if String.length body > max_body_size then
     Error parse_error
@@ -100,10 +127,17 @@ let parse_body body =
         if List.length batch > max_batch_size then
           Error (invalid_params (Printf.sprintf "batch size %d exceeds limit %d" (List.length batch) max_batch_size))
         else
-          Ok (`Batch (List.map (fun j -> parse_single j) batch))
+          let requests = List.map parse_single batch in
+          (match check_admits requests with
+           | Error error -> Error error
+           | Ok checked -> Ok (`Batch checked))
     | Some json ->
         (match parse_single json with
-         | Ok req -> Ok (`Single req)
+         | Ok req ->
+           let count = admit_count req in
+           if count > max_admits then
+             Error (admit_error count)
+           else Ok (`Single req)
          | Error e -> Error e)
 
 let param_string params idx =

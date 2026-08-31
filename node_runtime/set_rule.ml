@@ -1,13 +1,15 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+let consensus_id = "set_fold:standard_then_participating"
+
 let start rules =
   match Octra_core.Rule_graph.set_fold_activation rules with
   | None -> 0L
   | Some activation -> Int64.of_int activation.Octra_core.Rule_graph.activation_epoch
 
 let profile_start rules =
-  match Octra_core.Rule_graph.set_live_activation rules with
+  match Octra_core.Rule_graph.standard_activation rules with
   | None -> start rules
   | Some activation ->
     Int64.of_int activation.Octra_core.Rule_graph.activation_epoch
@@ -19,6 +21,7 @@ type policy = {
   seat_mode : Octra_core.Rule_graph.mode;
   open_mode : Octra_core.Rule_graph.mode;
   account_mode : Octra_core.Rule_graph.mode;
+  standard_mode : Octra_core.Rule_graph.mode;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
 
@@ -29,16 +32,19 @@ let policy rules epoch =
     Octra_core.Rule_graph.set_live rules ~epoch,
     Octra_core.Rule_graph.set_fold_cap rules ~epoch,
     Octra_core.Rule_graph.set_open rules ~epoch,
-    Octra_core.Rule_graph.account_pack rules ~epoch
+    Octra_core.Rule_graph.account_pack rules ~epoch,
+    Octra_core.Rule_graph.standard rules ~epoch
   with
-  | Error fault, _, _, _, _, _
-  | _, Error fault, _, _, _, _
-  | _, _, Error fault, _, _, _
-  | _, _, _, Error fault, _, _
-  | _, _, _, _, Error fault, _
-  | _, _, _, _, _, Error fault -> Error (Octra_core.Rule_graph.fault_message fault)
+  | Error fault, _, _, _, _, _, _
+  | _, Error fault, _, _, _, _, _
+  | _, _, Error fault, _, _, _, _
+  | _, _, _, Error fault, _, _, _
+  | _, _, _, _, Error fault, _, _
+  | _, _, _, _, _, Error fault, _
+  | _, _, _, _, _, _, Error fault ->
+    Error (Octra_core.Rule_graph.fault_message fault)
   | Ok ready_mode, Ok ready_ref_mode, Ok live_mode, Ok seat_mode, Ok open_mode,
-    Ok account_mode ->
+    Ok account_mode, Ok standard_mode ->
     let cap_mode =
       match seat_mode with
       | Octra_core.Rule_graph.Prior -> Octra_core.Set_fold.Reject
@@ -51,6 +57,7 @@ let policy rules epoch =
       seat_mode;
       open_mode;
       account_mode;
+      standard_mode;
       cap_mode;
     }
 
@@ -67,6 +74,7 @@ let resolve rules ~chain_id ~parent epoch =
       seat_mode = policy.seat_mode;
       open_mode = policy.open_mode;
       account_mode = policy.account_mode;
+      standard_mode = policy.standard_mode;
       cap_mode = policy.cap_mode;
       ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
       start = start rules;
@@ -91,6 +99,7 @@ let resolve rules ~chain_id ~parent epoch =
               seat_mode = policy.seat_mode;
               open_mode = policy.open_mode;
               account_mode = policy.account_mode;
+              standard_mode = policy.standard_mode;
               cap_mode = policy.cap_mode;
               ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
               start = start rules;

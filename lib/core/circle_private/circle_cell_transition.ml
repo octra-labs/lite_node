@@ -3,6 +3,8 @@
 
 module P = Pvac_verify_protocol
 
+let consensus_id = "circle_receipt:verify_apply:retry_tx"
+
 type cell =
   | Balance of Circle_balance_cell.write_request
   | Register of Circle_register_cell.write_request

@@ -326,8 +326,8 @@ let recover ~data_dir ~chaindata ~store =
       None
     | Head_manifest.Corrupt err ->
       pf "FATAL: HEAD.json present but unparseable: %s" err;
-      pf "  Operator: restore HEAD.json from backup (the canonical visibility";
-      pf "  pointer cannot be silently ignored once written). Refusing to start.";
+      pf "op: restore HEAD.json from backup (the canonical visibility";
+      pf "pointer cannot be silently ignored once written) >>> REFUSING to start";
       exit 1
     | Head_manifest.Present h ->
       Head_manifest.set_cached h;
@@ -338,8 +338,8 @@ let recover ~data_dir ~chaindata ~store =
       if h.epoch_id > irmin_last_epoch_before then begin
         pf "FATAL: HEAD ahead of Irmin: HEAD.epoch=%d > irmin_last=%d"
           h.epoch_id irmin_last_epoch_before;
-        pf "  Visibility pointer references state not in Irmin.";
-        pf "  Operator: investigate epochlog/Irmin tags, or restore HEAD from backup.";
+        pf "Visibility pointer references state not in Irmin.";
+        pf "Operator: investigate epochlog/Irmin tags, or restore HEAD from backup.";
         exit 1
       end;
       Some h
@@ -471,8 +471,8 @@ let recover ~data_dir ~chaindata ~store =
           p.epoch_id p.round
           (String.sub p.proposal_id 0 (min 16 (String.length p.proposal_id)))
           p.txid_hi p.validator_addr p.ts;
-        pf "  → no quorum cert local, peer-query not yet implemented (Phase 8.0.1b)";
-        pf "  → keeping record; on next quorum or operator action it will be cleared"
+        pf "> no quorum cert local";
+        pf "> keeping record"
       end
     ) pending_commits
   end;

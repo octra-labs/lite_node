@@ -49,6 +49,7 @@ type runtime = {
   wasm_compute_mode : Octra_core.Rule_graph.mode;
   object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
+  proof_mode : Octra_core.Rule_graph.mode;
   private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :
     epoch:int ->
@@ -119,6 +120,27 @@ let first_disabled_bft_tx txs =
 let consensus_order txs =
   Transaction.consensus_order txs
 
+let worker_waits = [| 0.25; 0.5; 1.; 2.; 4.; 5. |]
+
+let worker_retry ?(wait=Lwt_unix.sleep) apply =
+  let rec loop step =
+    Lwt.catch
+      apply
+      (function
+        | Octra_core.Private_ledger.Worker_retry reason ->
+          let pos = min step (Array.length worker_waits - 1) in
+          let delay = worker_waits.(pos) in
+          Log.warn "epoch"
+            "event = proof_worker_retry delay = %.2f reason = %s"
+            delay
+            reason;
+          let open Lwt.Syntax in
+          let* () = wait delay in
+          loop (min (pos + 1) (Array.length worker_waits - 1))
+        | error -> Lwt.fail error)
+  in
+  loop 0
+
 let private_field_policy_at rules epoch =
   Octra_core.Rule_graph.private_payload rules ~epoch
   |> Result.map Octra_core.Private_ledger.field_policy_of_mode
@@ -172,6 +194,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
         ~ledger:(Lazy.force backend).Epoch_exec.ledger
         ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id
         ~owner_migration_mode:runtime.owner_migration_mode
+        ~proof_mode:runtime.proof_mode
         ~field_policy:runtime.private_field_policy
         ~result_policy:
           (runtime.private_result_policy
@@ -186,10 +209,11 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
     process = (fun tx ->
       let open Lwt.Syntax in
       let* result =
-        Octra_core.Tx_savepoint.run
-          ~ledger:(Lazy.force backend).Epoch_exec.ledger
-          ~store:(Lazy.force backend).Epoch_exec.store
-          (fun () ->
+        worker_retry (fun () ->
+          Octra_core.Tx_savepoint.run
+            ~ledger:(Lazy.force backend).Epoch_exec.ledger
+            ~store:(Lazy.force backend).Epoch_exec.store
+            (fun () ->
             let* result =
               if Transaction.bft_crypto_active ()
                 && Transaction.bft_crypto_op tx.Transaction.op_type
@@ -226,7 +250,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
               | Ok (Epoch_exec.Rejected_after_fee _)
               | Error _ -> ()
             end;
-            Lwt.return result)
+            Lwt.return result))
       in
       Lwt.return result);
     confirm = (fun tx ->
@@ -398,6 +422,11 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
       | Ok fold -> fold
       | Error error -> failwith error
     in
+    let proof_mode =
+      match fold epoch_id with
+      | Ok ctx -> ctx.Octra_core.Epoch_exec.standard_mode
+      | Error error -> failwith error
+    in
     let* () =
       run_runtime
         ?preverify
@@ -415,6 +444,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         exit = runtime.exit;
         backend = (fun () ->
           Epoch_exec.make_live_backend
+            ~proof_mode
             ~fold
             runtime.store
             runtime.ledger);
@@ -432,6 +462,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         wasm_compute_mode;
         object_cost;
         owner_migration_mode;
+        proof_mode;
         private_field_policy;
         legacy_replay = runtime.legacy_replay;
         private_result_policy = runtime.private_result_policy;
@@ -440,6 +471,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         advance_validator_set = (fun () ->
           let backend =
             Epoch_exec.make_live_backend
+              ~proof_mode
               ~fold
               runtime.store
               runtime.ledger

@@ -40,6 +40,7 @@ type t = {
   set_open_activation : activation option;
   object_cost_activation : activation option;
   account_pack_activation : activation option;
+  standard_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -93,6 +94,13 @@ let devnet_account_pack_activation = {
   anchor_state_root =
     "20de716a0d578300de77508718d213db14c4164e229a5850eb0595324566c90e";
   activation_epoch = 1_480_000;
+}
+
+let devnet_standard_activation = {
+  anchor_epoch = 1_380_960;
+  anchor_state_root =
+    "20de716a0d578300de77508718d213db14c4164e229a5850eb0595324566c90e";
+  activation_epoch = 1_500_000;
 }
 
 let devnet_set_open_activation = {
@@ -174,6 +182,12 @@ let account_pack_activation_for_chain chain_id =
   else
     None
 
+let standard_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_standard_activation
+  else
+    None
+
 let validator_quorum_activation_for_chain chain_id : activation option =
   match Octra_consensus.C_quorum_policy.activation_for_chain chain_id with
   | None -> None
@@ -219,6 +233,7 @@ let consensus_id ~chain_id =
     set_open_activation_for_chain chain_id;
     object_cost_activation_for_chain chain_id;
     account_pack_activation_for_chain chain_id;
+    standard_activation_for_chain chain_id;
   ]
   |> List.map activation_id
   |> String.concat "|"
@@ -242,6 +257,7 @@ let make ~ready_config_hash ~chain_id ~root_at =
     set_open_activation = set_open_activation_for_chain chain_id;
     object_cost_activation = object_cost_activation_for_chain chain_id;
     account_pack_activation = account_pack_activation_for_chain chain_id;
+    standard_activation = standard_activation_for_chain chain_id;
     root_at;
   }
 
@@ -265,6 +281,7 @@ let set_fold_cap_activation t = t.set_fold_cap_activation
 let set_open_activation t = t.set_open_activation
 let object_cost_activation t = t.object_cost_activation
 let account_pack_activation t = t.account_pack_activation
+let standard_activation t = t.standard_activation
 let ready_config_hash t = t.ready_config_hash
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
@@ -287,6 +304,7 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       set_open_activation_for_chain chain_id;
       object_cost_activation_for_chain chain_id;
       account_pack_activation_for_chain chain_id;
+      standard_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -385,11 +403,20 @@ let set_fold_cap t ~epoch =
 let set_open t ~epoch =
   mode t t.set_open_activation ~epoch
 
+let standard t ~epoch =
+  mode t t.standard_activation ~epoch
+
 let object_cost t ~epoch =
   mode t t.object_cost_activation ~epoch
 
 let account_pack t ~epoch =
   mode t t.account_pack_activation ~epoch
+
+let standard_at ~chain_id ~epoch =
+  match standard_activation_for_chain chain_id with
+  | Some activation when epoch >= activation.activation_epoch -> Active
+  | Some _
+  | None -> Prior
 
 let fault_message = function
   | Anchor_missing epoch ->

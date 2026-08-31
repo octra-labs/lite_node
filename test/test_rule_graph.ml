@@ -58,6 +58,11 @@ let account_pack_activation graph =
   | Some value -> value
   | None -> fail "devnet account pack activation missing"
 
+let standard_activation graph =
+  match Graph.standard_activation graph with
+  | Some value -> value
+  | None -> fail "devnet standard activation missing"
+
 let graph root_at =
   Graph.create ~chain_id:"octra-devnet-9871-cluster" ~root_at
 
@@ -406,6 +411,7 @@ let () =
      = Some 104L)
     "validator snapshot delay changed";
   let object_cost_plan = object_cost_activation seed in
+  let standard_plan = standard_activation seed in
   let object_cost_graph =
     graph (fun epoch ->
       if epoch = object_cost_plan.anchor_epoch then
@@ -424,13 +430,63 @@ let () =
        object_cost_graph
        ~epoch:object_cost_plan.activation_epoch
      = Ok Graph.Active)
-    "object cost rule inactive at activation";
+    "object cost inactive at activation";
+  require
+    (Graph.object_cost
+       object_cost_graph
+       ~epoch:(standard_plan.activation_epoch - 1)
+     = Ok Graph.Active)
+    "object cost inactive before standard activation";
   require
     (Graph.object_cost unrelated ~epoch:max_int = Ok Graph.Prior)
     "unrelated network activated devnet object cost";
   let pack_plan = account_pack_activation seed in
   require (pack_plan.activation_epoch = 1_480_000)
     "account pack activation epoch changed";
+  require (standard_plan.activation_epoch = 1_500_000)
+    "standard activation epoch changed";
+  let standard_graph =
+    graph (fun epoch ->
+      if epoch = standard_plan.anchor_epoch then
+        Graph.Root standard_plan.anchor_state_root
+      else if epoch = object_cost_plan.anchor_epoch then
+        Graph.Root object_cost_plan.anchor_state_root
+      else
+        Graph.Missing)
+  in
+  require
+    (Graph.standard
+       standard_graph
+       ~epoch:(standard_plan.activation_epoch - 1)
+     = Ok Graph.Prior)
+    "standard changed before activation";
+  require
+    (Graph.standard
+       standard_graph
+       ~epoch:standard_plan.activation_epoch
+     = Ok Graph.Active)
+    "standard inactive at activation";
+  require
+    (Graph.object_cost
+       standard_graph
+       ~epoch:standard_plan.activation_epoch
+     = Ok Graph.Active)
+    "object cost inactive with standard";
+  require
+    (match Graph.standard missing ~epoch:standard_plan.activation_epoch with
+     | Error (Graph.Anchor_missing epoch) -> epoch = standard_plan.anchor_epoch
+     | _ -> false)
+    "standard accepted without anchor";
+  require
+    (Graph.standard unrelated ~epoch:max_int = Ok Graph.Prior)
+    "unrelated network activated devnet standard";
+  require
+    (Graph.root_after_floor
+       ~chain_id:"octra-devnet-9871-cluster"
+       ~floor_epoch:standard_plan.activation_epoch
+       ~epoch:standard_plan.anchor_epoch
+     = Some standard_plan.anchor_state_root)
+    "standard anchor is absent from floor graph";
   let fold_graph =
     graph (fun epoch ->
       if epoch = fold_plan.anchor_epoch then

@@ -76,9 +76,14 @@ let node_backend
                     with
                     | Error error -> Lwt.return_error error
                     | Ok fold ->
+                      begin
+                        match fold epoch_id with
+                        | Error error -> Lwt.return_error error
+                        | Ok fold_ctx ->
                       Octra_core.State_preview.with_preview
                         ~base_store:store
                         ~base_ledger:ledger
+                        ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
                         ~fold
                         ~epoch_id
                         ~proposal_id
@@ -90,6 +95,7 @@ let node_backend
                     ~ledger:backend.Octra_core.Epoch_exec.ledger
                     ~epoch_id
                     ~owner_migration_mode
+                    ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
                     ~field_policy:
                       (Octra_core.Private_ledger.field_policy_of_mode
                          private_payload_mode)
@@ -134,6 +140,7 @@ let node_backend
                   ~env
                   ~txs
                   ~process_tx)
+                      end
                 end
             end
         end);

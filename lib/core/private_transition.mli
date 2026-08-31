@@ -8,6 +8,8 @@ type limits = {
 
 type t
 
+val consensus_id : string
+
 val create :
   preverify:Preverify_commit.t option ->
   legacy_replay:
@@ -18,6 +20,7 @@ val create :
   ledger:Ledger.t ->
   epoch_id:int ->
   owner_migration_mode:Rule_graph.mode ->
+  proof_mode:Rule_graph.mode ->
   field_policy:Private_ledger.field_policy ->
   result_policy:Private_result_policy.t ->
   limits:limits ->

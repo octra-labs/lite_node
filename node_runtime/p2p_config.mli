@@ -6,6 +6,7 @@ type t = {
   binary_hash : string;
   require_binary_hash : bool;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
+  profile : Octra_net.P2p_swarm.profile option;
   handshake_allowed_pubkeys : string list;
   validator_pubkeys : string list;
 }
@@ -165,6 +166,7 @@ val startup_config :
   chain_id:string ->
   consensus_mode:bool ->
   current_height:int64 ->
+  profile:Octra_net.P2p_swarm.profile option ->
   current_entries:string list ->
   next_entries:string list ->
   chain_pending_entries:string list ->
@@ -205,7 +207,7 @@ val upgrade_ready :
 val upgrade_ready_checker :
   log_blocked:(string -> unit) ->
   epoch:(unit -> int64) ->
-  consensus_config_hash:string ->
+  consensus_config_hash:(unit -> string) ->
   t ->
   unit ->
   bool

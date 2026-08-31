@@ -402,7 +402,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~chain_id:startup_network.chain_id
         ?program_trust_hash:(Program_trust.config_hash program_trust)
         ~runtime_profile_hash:
-          (Octra_node_runtime.Consensus_profile.hash env_opt)
+          (Octra_node_runtime.Consensus_profile.compat_hash env_opt)
         ()
       |> raw_to_hex
     in
@@ -670,6 +670,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         }
     in
     let fold_wake = ref (fun ~head:_ -> ()) in
+    let profile_set =
+      ref (fun _ -> failwith "profile switch is unavailable")
+    in
     let mark_state_attested =
       match recovery_need with
       | Some need when need.Sync_need.cause = Sync_need.Journal ->
@@ -958,6 +961,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           short = addr_short;
           require_sync;
           exit = exit_error;
+          set_profile = (fun hash -> (!profile_set) hash);
         }
         Consensus_epoch_apply_finish_shell.{
           now;
@@ -991,9 +995,14 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     | None -> !current_epoch - 1
   in
 
+  let retry_busy () =
+    Lwt.fail_with "epoch apply busy"
+  in
+
   let apply_finalized_epoch_checked ?override_ordered_txs
       ?override_receipts_json ?override_proposer_info ?override_reward
-      ?override_epoch_ts ?override_validator_set ~parent_commit ~now ~elapsed () =
+      ?override_epoch_ts ?override_validator_set ~retry ~parent_commit ~now
+      ~elapsed () =
     Consensus_epoch_apply_checked.run_node
       ~consensus_mode
       ~current_epoch
@@ -1015,30 +1024,39 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           ~target_epoch:(Int64.of_int !current_epoch)
           ~reason)
       ~apply:(fun () ->
-        Epoch_visibility.with_apply epoch_visibility (fun () ->
-          Epoch_atomic.run
-            {
-              abort_ledger = (fun () ->
-                match Ledger.abort_journal ledger with
-                | Ok () -> ()
-                | Error error -> failwith error);
-              abort_store = (fun () -> Store_irmin.abort_epoch_batch store);
-              abort_history = (fun () -> Store_chaindata.abort_batch chaindata);
-              fatal = Log.fatal "epoch" "%s";
-              exit = exit_error;
-            }
-            (fun () ->
-              apply_finalized_epoch
-                ?override_ordered_txs
-                ?override_receipts_json
-                ?override_proposer_info
-                ?override_reward
-                ?override_epoch_ts
-                ?override_validator_set
-                ~parent_commit
-                ~now
-                ~elapsed
-                ())))
+        let open Lwt.Syntax in
+        let* attempt =
+          Epoch_visibility.try_apply epoch_visibility (fun () ->
+            Epoch_atomic.run
+              {
+                abort_ledger = (fun () ->
+                  match Ledger.abort_journal ledger with
+                  | Ok () -> ()
+                  | Error error -> failwith error);
+                abort_store = (fun () -> Store_irmin.abort_epoch_batch store);
+                abort_history = (fun () -> Store_chaindata.abort_batch chaindata);
+                fatal = Log.fatal "epoch" "%s";
+                exit = exit_error;
+              }
+              (fun () ->
+                apply_finalized_epoch
+                  ?override_ordered_txs
+                  ?override_receipts_json
+                  ?override_proposer_info
+                  ?override_reward
+                  ?override_epoch_ts
+                  ?override_validator_set
+                  ~parent_commit
+                  ~now
+                  ~elapsed
+                  ()))
+        in
+        match attempt with
+        | Epoch_visibility.Applied () ->
+          Lwt.return Consensus_epoch_apply_checked.Apply_done
+        | Epoch_visibility.Busy ->
+          Lwt.return Consensus_epoch_apply_checked.Apply_busy)
+      ~retry
   in
 
   let tick_loop () =
@@ -1060,6 +1078,14 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               (fun value -> value.Octra_consensus.C_types.parent_commit)
           in
           apply_finalized_epoch_checked
+            ~retry:(fun () ->
+              if consensus_mode then
+                consensus_finalized :=
+                  Consensus_finality_state.find_finalized
+                    finality_state
+                    !current_epoch
+                  |> Option.is_some;
+              Lwt.return_unit)
             ~parent_commit
             ~now
             ~elapsed
@@ -1108,6 +1134,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               ?override_reward
               ?override_epoch_ts
               ?override_validator_set
+              ~retry:retry_busy
               ~parent_commit:override_parent_commit
               ~now
               ~elapsed
@@ -1123,6 +1150,20 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           exit_success;
         }
     in
+    profile_set := (fun runtime_profile_hash ->
+      let config_hash =
+        Octra_consensus.C_config.hash
+          ~chain_id
+          ~validator_set:!consensus_validator_set_ref
+          ?scheduled:!scheduled_validator_set_ref
+          ?program_trust_hash:(Program_trust.config_hash program_trust)
+          ~runtime_profile_hash
+          ()
+      in
+      consensus_config_hash_ref := config_hash;
+      Log.info "consensus"
+        "event = profile_switch config = %s"
+        (Octra_consensus.C_config.short config_hash));
     let catchup_base_eic_root () =
       Consensus_join_rpc.base_eic_root_from_head
         (Octra_core.Head_manifest.get_cached ()) in
@@ -1183,6 +1224,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~override_reward:validated.reward
         ~override_epoch_ts:record.epoch_ts
         ~override_validator_set:validator_set
+        ~retry:retry_busy
         ~parent_commit
         ~now
         ~elapsed:0.0

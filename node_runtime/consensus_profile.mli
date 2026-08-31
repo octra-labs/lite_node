@@ -12,9 +12,20 @@ val standard_hash :
   (string -> string option) ->
   string
 
+val hash :
+  chain_id:string ->
+  epoch:int ->
+  (string -> string option) ->
+  string
+
+val switch_after :
+  chain_id:string ->
+  applied_epoch:int ->
+  bool
+
 val activation_graph_hash : chain_id:string -> string
 
-val hash :
+val compat_hash :
   (string -> string option) ->
   string
 

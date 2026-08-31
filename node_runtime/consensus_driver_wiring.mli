@@ -36,7 +36,7 @@ type node_gates_input = {
 type node_gates_runtime = {
   consensus_mode : bool;
   voting : bool;
-  consensus_config_hash : string;
+  consensus_config_hash : string ref;
   p2p_config : P2p_config.t;
   current_epoch : unit -> int;
   log_blocked : string -> int -> unit;

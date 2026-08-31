@@ -308,6 +308,17 @@ let same_scheduled
   | None, Some _
   | Some _, None -> false
 
+let runtime_profile_hash runtime =
+  let head = runtime.current_height () in
+  let epoch =
+    if Int64.compare head (Int64.of_int (max_int - 1)) >= 0 then max_int
+    else Int64.to_int (Int64.succ head)
+  in
+  Consensus_profile.hash
+    ~chain_id:runtime.chain_id
+    ~epoch
+    runtime.getenv
+
 let runtime_config_hash runtime view active scheduled =
   if runtime.consensus_mode then
     Octra_consensus.C_config.hash
@@ -315,7 +326,7 @@ let runtime_config_hash runtime view active scheduled =
       ~validator_set:active
       ?scheduled
       ?program_trust_hash:view.validator_config.program_trust_hash
-      ?runtime_profile_hash:view.validator_config.runtime_profile_hash
+      ~runtime_profile_hash:(runtime_profile_hash runtime)
       ()
   else
     raw32_zero

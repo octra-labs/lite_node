@@ -5,6 +5,10 @@ type phase =
   | Stable of int
   | Applying of int
 
+type 'a attempt =
+  | Applied of 'a
+  | Busy
+
 type t = {
   mutable phase : phase;
   changed : unit Lwt_condition.t;
@@ -30,17 +34,6 @@ let finish_apply t =
     Lwt_condition.broadcast t.changed ();
     Ok ()
 
-let with_apply t apply =
-  match begin_apply t with
-  | Error error -> Lwt.fail_with error
-  | Ok () ->
-    Lwt.finalize
-      apply
-      (fun () ->
-        match finish_apply t with
-        | Ok () -> Lwt.return_unit
-        | Error error -> Lwt.fail_with error)
-
 let rec await_stable t =
   match t.phase with
   | Stable generation -> Lwt.return generation
@@ -48,6 +41,23 @@ let rec await_stable t =
     let open Lwt.Syntax in
     let* () = Lwt_condition.wait t.changed in
     await_stable t
+
+let try_apply t apply =
+  match begin_apply t with
+  | Error _ ->
+    let open Lwt.Syntax in
+    let+ _ = await_stable t in
+    Busy
+  | Ok () ->
+    Lwt.finalize
+      (fun () ->
+        let open Lwt.Syntax in
+        let+ value = apply () in
+        Applied value)
+      (fun () ->
+        match finish_apply t with
+        | Ok () -> Lwt.return_unit
+        | Error error -> Lwt.fail_with error)
 
 let same_generation t generation =
   match t.phase with

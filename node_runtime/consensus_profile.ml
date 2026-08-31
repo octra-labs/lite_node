@@ -194,7 +194,7 @@ let activation_graph_hash ~chain_id =
     Octra_net.Oce1.put_string buf
       (Octra_core.Rule_graph.consensus_id ~chain_id))
 
-let hash getenv =
+let compat_hash getenv =
   let env = runtime_env getenv in
   let schedule = emission_schedule getenv in
   let validator_policy =
@@ -256,7 +256,7 @@ let standard_hash ~chain_id getenv =
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
     Octra_net.Oce1.put_string buf standard;
     Octra_net.Oce1.put_string buf chain_id;
-    put_standard_component buf "runtime_compatibility" (hash getenv);
+    put_standard_component buf "runtime_compatibility" (compat_hash getenv);
     put_standard_component buf "activation_graph"
       (Octra_core.Rule_graph.consensus_id ~chain_id);
     put_standard_component buf "quorum"
@@ -265,11 +265,32 @@ let standard_hash ~chain_id getenv =
       (Octra_core.Set_fold.consensus_id Octra_core.Set_fold.standard);
     put_standard_component buf "set_fold_participating"
       (Octra_core.Set_fold.consensus_id Octra_core.Set_fold.participating);
+    put_standard_component buf "set_fold_rule" Set_rule.consensus_id;
     put_standard_component buf "validator_admission"
       (Octra_core.Validator_policy.consensus_id validator_policy);
     put_standard_component buf "emission"
       (Octra_core.Emission_schedule.consensus_id schedule);
     put_standard_component buf "reward" Octra_core.Reward_policy.consensus_id;
+    put_standard_component buf "reward_source"
+      Consensus_reward_attribution.consensus_id;
     put_standard_component buf "fee" Octra_core.Fee_policy.consensus_id;
+    put_standard_component buf "private_receipt"
+      Octra_core.Private_transition.consensus_id;
+    put_standard_component buf "circle_receipt"
+      Octra_core.Circle_cell_transition.consensus_id;
     put_standard_component buf "proposal_protocol"
       (Octra_consensus.C_protocol.consensus_id getenv))
+
+let hash ~chain_id ~epoch getenv =
+  match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with
+  | Octra_core.Rule_graph.Prior -> compat_hash getenv
+  | Octra_core.Rule_graph.Active -> standard_hash ~chain_id getenv
+
+let switch_after ~chain_id ~applied_epoch =
+  applied_epoch < max_int
+  && Octra_core.Rule_graph.standard_at ~chain_id ~epoch:applied_epoch
+     = Octra_core.Rule_graph.Prior
+  && Octra_core.Rule_graph.standard_at
+       ~chain_id
+       ~epoch:(applied_epoch + 1)
+     = Octra_core.Rule_graph.Active

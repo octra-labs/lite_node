@@ -3,6 +3,10 @@
 
 type t
 
+type 'a attempt =
+  | Applied of 'a
+  | Busy
+
 val create :
   unit ->
   t
@@ -15,10 +19,10 @@ val finish_apply :
   t ->
   (unit, string) result
 
-val with_apply :
+val try_apply :
   t ->
   (unit -> 'a Lwt.t) ->
-  'a Lwt.t
+  'a attempt Lwt.t
 
 val read :
   ?retries:int ->

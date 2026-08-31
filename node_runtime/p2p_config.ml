@@ -6,6 +6,7 @@ type t = {
   binary_hash : string;
   require_binary_hash : bool;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
+  profile : Octra_net.P2p_swarm.profile option;
   handshake_allowed_pubkeys : string list;
   validator_pubkeys : string list;
 }
@@ -168,6 +169,7 @@ let build ~chain_id:_ ~consensus_config_hash ~allowed_pubkeys
       binary_hash;
       require_binary_hash;
       upgrade_plan;
+      profile = None;
       handshake_allowed_pubkeys;
       validator_pubkeys = allowed_pubkeys;
     }
@@ -221,12 +223,35 @@ let upgrade_log_message = function
       (Octra_consensus.C_config.short row.binary_hash)
       (Octra_consensus.C_config.short row.config_hash)
 
-let startup_config ~env ~chain_id ~consensus_mode ~current_height
+let standard_profile ~chain_id ?program_trust_hash getenv =
+  let graph =
+    Octra_core.Rule_graph.create
+      ~chain_id
+      ~root_at:(fun _ -> Octra_core.Rule_graph.Missing)
+  in
+  match Octra_core.Rule_graph.standard_activation graph with
+  | None -> None
+  | Some activation ->
+    let profile_hash = Consensus_profile.standard_hash ~chain_id getenv in
+    let wire_hash =
+      Octra_consensus.C_config.network_hash
+        ~chain_id
+        ?program_trust_hash
+        ~runtime_profile_hash:profile_hash
+        ()
+    in
+    Some Octra_net.P2p_swarm.{
+      epoch = Int64.of_int activation.activation_epoch;
+      config_hash = wire_hash;
+      profile_hash;
+    }
+
+let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile
     ~current_entries ~next_entries ~chain_pending_entries
     ~next_activation_epoch ?program_trust_hash
     ?runtime_profile_hash ?active_raw ?pending_raw () =
   let base_validator =
-    Validator_config.build_bound
+    Validator_config.build_full
       ~chain_id
       ~consensus_mode
       ~current_height
@@ -275,6 +300,7 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height
     | Ok handshake ->
       let handshake = {
         handshake with
+        profile;
         validator_pubkeys =
           List.map
             (fun validator ->
@@ -291,12 +317,18 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height
 
 let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
     ~chain_active_raw ~chain_pending_raw ~chain_pending_entries =
+  let max_head = Int64.of_int (max_int - 1) in
+  if Int64.compare current_height (-1L) < 0
+     || Int64.compare current_height max_head > 0 then
+    Error "current height is outside the supported epoch range"
+  else
   match Consensus_profile.validate getenv with
   | Error error -> Error error
   | Ok () ->
     match Octra_vm.Program_trust.of_env getenv with
     | Error error -> Error (Octra_vm.Program_trust.error_message error)
     | Ok trust ->
+      let program_trust_hash = Octra_vm.Program_trust.config_hash trust in
       let validator_policy =
         Octra_core.Validator_policy.of_env_exn getenv
       in
@@ -307,7 +339,18 @@ let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
         else
           env
       in
-      let runtime_profile_hash = Consensus_profile.hash getenv in
+      let runtime_profile_hash =
+        Consensus_profile.hash
+          ~chain_id
+          ~epoch:(Int64.to_int (Int64.succ current_height))
+          getenv
+      in
+      let profile =
+        standard_profile
+          ~chain_id
+          ?program_trust_hash
+          getenv
+      in
       startup_config
         ~env
         ~chain_id
@@ -317,8 +360,9 @@ let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
         ~next_entries:(Validators.entries_of_env_name "OCTRA_VALIDATORS_NEXT")
         ~chain_pending_entries
         ~next_activation_epoch:(Validators.activation_epoch_int64 ())
-        ?program_trust_hash:(Octra_vm.Program_trust.config_hash trust)
+        ?program_trust_hash
         ~runtime_profile_hash
+        ~profile
         ?active_raw:chain_active_raw
         ?pending_raw:chain_pending_raw
         ()
@@ -378,7 +422,13 @@ let upgrade_ready state ~epoch ~consensus_config_hash cfg =
 let upgrade_ready_checker ~log_blocked ~epoch ~consensus_config_hash cfg =
   let state = ref upgrade_readiness_state in
   fun () ->
-    match upgrade_ready !state ~epoch:(epoch ()) ~consensus_config_hash cfg with
+    match
+      upgrade_ready
+        !state
+        ~epoch:(epoch ())
+        ~consensus_config_hash:(consensus_config_hash ())
+        cfg
+    with
     | Upgrade_ready next ->
       state := next;
       true
@@ -444,6 +494,7 @@ let swarm_config (params : swarm_params) =
     binary_hash = params.handshake.binary_hash;
     require_binary_hash = params.handshake.require_binary_hash;
     upgrade_plan = params.handshake.upgrade_plan;
+    profile = params.handshake.profile;
     allowed_pubkeys = params.handshake.handshake_allowed_pubkeys;
     bootstrap_peers = params.bootstrap_peers;
     max_peers = params.max_peers;

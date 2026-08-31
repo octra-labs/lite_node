@@ -1,6 +1,12 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type profile = {
+  epoch : int64;
+  config_hash : string;
+  profile_hash : string;
+}
+
 type config = {
   listen_port : int;
   chain_id : string;
@@ -11,6 +17,7 @@ type config = {
   binary_hash : string;
   require_binary_hash : bool;
   upgrade_plan : P2p_upgrade_plan.t option;
+  profile : profile option;
   allowed_pubkeys : string list;
   bootstrap_peers : string list;
   max_peers : int;
@@ -27,9 +34,17 @@ type dial_plan =
   | Hold
   | Start of float
 
+type peer_profile = {
+  pubkey : string;
+  current : string;
+  mutable offered : string option;
+}
+
 type t = {
   config : config;
+  mutable active_hash : string;
   peers : (string, P2p_conn.t) Hashtbl.t;
+  profiles : (string, peer_profile) Hashtbl.t;
   dialing : (string, unit) Hashtbl.t;
   record_dialing : (string, unit) Hashtbl.t;
   record_due : (string, float) Hashtbl.t;
@@ -60,7 +75,9 @@ let record_dial_plan ~now ~due ~active =
 let create config =
   {
     config;
+    active_hash = config.consensus_config_hash;
     peers = Hashtbl.create 16;
+    profiles = Hashtbl.create 16;
     dialing = Hashtbl.create 16;
     record_dialing = Hashtbl.create 8;
     record_due = Hashtbl.create 32;
@@ -77,6 +94,15 @@ let create config =
     on_peer = (fun _ -> ());
     running = false;
   }
+
+let config_hash t = t.active_hash
+
+let keep_profile ~target ~current ~offered =
+  String.equal current target
+  || Option.fold
+       ~none:false
+       ~some:(String.equal target)
+       offered
 
 let set_handler t handler =
   t.on_message <- handler
@@ -269,9 +295,47 @@ let preferred_direction t peer_id =
 let is_preferred t (conn : P2p_conn.t) =
   conn.direction = preferred_direction t conn.peer_id
 
-let add_peer t (conn : P2p_conn.t) =
+let wire_epoch t =
+  let current = t.config.best_epoch_fn () in
+  match t.config.profile with
+  | Some profile when String.equal t.active_hash profile.config_hash ->
+    Int64.max current profile.epoch
+  | Some _
+  | None -> current
+
+let config_hash_at t epoch =
+  P2p_upgrade_plan.handshake_hash
+    ~epoch
+    ~config_hash:t.active_hash
+    ~binary_hash:t.config.binary_hash
+    ~require_binary_hash:t.config.require_binary_hash
+    t.config.upgrade_plan
+
+let hello_current t (hello : P2p_handshake.hello) =
+  String.equal
+    hello.P2p_handshake.consensus_config_hash
+    (config_hash_at t (wire_epoch t))
+
+let set_profile t hello =
+  Hashtbl.replace
+    t.profiles
+    hello.P2p_handshake.node_id
+    {
+      pubkey = hello.pubkey;
+      current = hello.consensus_config_hash;
+      offered = None;
+    }
+
+let add_peer t (conn : P2p_conn.t) hello =
   let peer_id = conn.peer_id in
   if peer_id = t.config.node_id then begin
+    Lwt.async (fun () -> P2p_conn.close conn);
+    false
+  end
+  else if not (hello_current t hello) then begin
+    err_node t.config.node_addr
+      "event = peer_rejected peer = %s reason = profile_changed"
+      peer_id;
     Lwt.async (fun () -> P2p_conn.close conn);
     false
   end
@@ -283,11 +347,13 @@ let add_peer t (conn : P2p_conn.t) =
       end else begin
         Lwt.async (fun () -> P2p_conn.close existing);
         Hashtbl.replace t.peers peer_id conn;
+        set_profile t hello;
         note_peer t conn;
         true
       end
     | Some _dead ->
       Hashtbl.replace t.peers peer_id conn;
+      set_profile t hello;
       note_peer t conn;
       true
     | None ->
@@ -300,6 +366,7 @@ let add_peer t (conn : P2p_conn.t) =
         false
       end else begin
         Hashtbl.replace t.peers peer_id conn;
+        set_profile t hello;
         note_peer t conn;
         true
       end
@@ -308,7 +375,8 @@ let remove_peer t peer_id =
   (match Hashtbl.find_opt t.peers peer_id with
    | Some conn ->
      Lwt.async (fun () -> P2p_conn.close conn);
-     Hashtbl.remove t.peers peer_id
+     Hashtbl.remove t.peers peer_id;
+     Hashtbl.remove t.profiles peer_id
    | None -> ())
 
 let send_with_timeout conn frame timeout_s =
@@ -356,15 +424,8 @@ let send_to t ~peer_id (frame : P2p_frame.frame) =
   | _ -> Lwt.return_unit
 
 let make_my_hello t =
-  let best_epoch = t.config.best_epoch_fn () in
-  let consensus_config_hash =
-    P2p_upgrade_plan.handshake_hash
-      ~epoch:best_epoch
-      ~config_hash:t.config.consensus_config_hash
-      ~binary_hash:t.config.binary_hash
-      ~require_binary_hash:t.config.require_binary_hash
-      t.config.upgrade_plan
-  in
+  let best_epoch = wire_epoch t in
+  let consensus_config_hash = config_hash_at t best_epoch in
   P2p_handshake.make_hello
     ~chain_id:t.config.chain_id
     ~node_addr:t.config.node_addr
@@ -382,7 +443,7 @@ let make_my_record t =
     ~node_addr:t.config.node_addr
     ~pubkey:t.config.pubkey_raw
     ~binary_hash:t.config.binary_hash
-    ~config_hash:t.config.consensus_config_hash
+    ~config_hash:t.active_hash
     ~host:endpoint.host
     ~port:endpoint.port
     ~features:["bft"; "pex"]
@@ -408,8 +469,33 @@ let exchange_peers t conn =
   let* () = send_peers t conn in
   send_get_peers conn
 
+let target_hash t profile =
+  P2p_upgrade_plan.handshake_hash
+    ~epoch:profile.epoch
+    ~config_hash:profile.config_hash
+    ~binary_hash:t.config.binary_hash
+    ~require_binary_hash:t.config.require_binary_hash
+    t.config.upgrade_plan
+
+let send_profile t conn =
+  match t.config.profile with
+  | None -> Lwt.return_unit
+  | Some profile ->
+    let value =
+      P2p_handshake.make_profile
+        ~chain_id:t.config.chain_id
+        ~node_id:t.config.node_id
+        ~epoch:profile.epoch
+        ~config_hash:(target_hash t profile)
+        ~sign_fn:t.config.sign_fn
+    in
+    P2p_conn.send conn {
+      msg_type = P2p_frame.msg_profile;
+      payload = P2p_handshake.encode_profile value;
+    }
+
 let accept_record t r =
-  let epoch = t.config.best_epoch_fn () in
+  let epoch = wire_epoch t in
   let binary_hash =
     if P2p_upgrade_plan.binary_required
       ~epoch
@@ -425,7 +511,7 @@ let accept_record t r =
   match P2p_peer_record.validate
     ?binary_hash
     ~chain_id:t.config.chain_id
-    ~config_hash:t.config.consensus_config_hash
+    ~config_hash:t.active_hash
     ~allowed_pubkeys:t.config.allowed_pubkeys
     r
   with
@@ -481,12 +567,13 @@ let dial t host port =
               peer_id;
             let* () = P2p_conn.close conn in
             Lwt.return_none
-          end else if add_peer t conn then begin
+          end else if add_peer t conn peer_hello then begin
             log_node t.config.node_addr
               "event = connected peer = %s addr = %s"
               peer_id addr_str;
             Lwt.async (fun () -> P2p_conn.start conn ~on_message:t.on_message);
             Lwt.async (fun () -> exchange_peers t conn);
+            Lwt.async (fun () -> send_profile t conn);
             Lwt.return_some conn
           end else begin
             let existing = Hashtbl.find_opt t.peers peer_id in
@@ -589,11 +676,39 @@ let handle_peers t conn payload =
       report_bad_peer t conn ~reason:"invalid_frame_peers";
       Lwt.return_unit)
 
+let handle_profile t conn payload =
+  match t.config.profile, Hashtbl.find_opt t.profiles conn.P2p_conn.peer_id with
+  | None, _
+  | _, None -> Lwt.return_unit
+  | Some expected, Some peer ->
+    Lwt.catch
+      (fun () ->
+        let value = P2p_handshake.decode_profile payload in
+        match
+          P2p_handshake.validate_profile
+            ~chain_id:t.config.chain_id
+            ~node_id:conn.peer_id
+            ~pubkey:peer.pubkey
+            value
+        with
+        | Error reason ->
+          report_bad_peer t conn ~reason;
+          Lwt.return_unit
+        | Ok () ->
+          if Int64.equal value.epoch expected.epoch then
+            peer.offered <- Some value.config_hash;
+          Lwt.return_unit)
+      (fun _ ->
+        report_bad_peer t conn ~reason:"invalid_frame_profile";
+        Lwt.return_unit)
+
 let handle_frame t user_handler conn frame =
   if frame.P2p_frame.msg_type = P2p_frame.msg_get_peers then
     send_peers t conn
   else if frame.msg_type = P2p_frame.msg_peers then
     handle_peers t conn frame.payload
+  else if frame.msg_type = P2p_frame.msg_profile then
+    handle_profile t conn frame.payload
   else
     user_handler conn frame
 
@@ -651,9 +766,10 @@ let accept t fd addr =
               peer_id;
             let* () = P2p_conn.close conn in
             Lwt.return_unit
-          end else if add_peer t conn then begin
+          end else if add_peer t conn peer_hello then begin
             Lwt.async (fun () -> P2p_conn.start conn ~on_message:t.on_message);
             Lwt.async (fun () -> exchange_peers t conn);
+            Lwt.async (fun () -> send_profile t conn);
             Lwt.return_unit
           end else begin
             let* () = P2p_conn.close conn in
@@ -720,7 +836,11 @@ let reconnect_loop t =
       let dead = Hashtbl.fold (fun id conn acc ->
         if not (P2p_conn.is_connected conn) then id :: acc else acc
       ) t.peers [] in
-      List.iter (fun id -> Hashtbl.remove t.peers id) dead;
+      List.iter
+        (fun id ->
+          Hashtbl.remove t.peers id;
+          Hashtbl.remove t.profiles id)
+        dead;
       if validator_count t < List.length (bootstrap_endpoints t) then
         Lwt.async (fun () -> dial_bootstrap t);
       retry_records t;
@@ -750,6 +870,52 @@ let start t ~on_message =
     reconnect_loop t;
     peer_exchange_loop t;
   ]
+
+let switch_profile t ~epoch =
+  match t.config.profile with
+  | None -> Lwt.return_error "profile switch is absent"
+  | Some profile when not (Int64.equal epoch profile.epoch) ->
+    Lwt.return_error "profile switch epoch differs"
+  | Some profile ->
+    let target = target_hash t profile in
+    if String.equal t.active_hash profile.config_hash then
+      Lwt.return_ok profile.profile_hash
+    else
+      let stale =
+        Hashtbl.fold
+          (fun peer_id _ acc ->
+            match Hashtbl.find_opt t.profiles peer_id with
+            | Some peer when
+                keep_profile
+                  ~target
+                  ~current:peer.current
+                  ~offered:peer.offered -> acc
+            | _ -> peer_id :: acc)
+          t.peers
+          []
+        |> List.sort String.compare
+      in
+      t.active_hash <- profile.config_hash;
+      P2p_peer_registry.clear t.registry;
+      Hashtbl.clear t.record_due;
+      let open Lwt.Syntax in
+      let* () =
+        Lwt_list.iter_p
+          (fun peer_id ->
+            match Hashtbl.find_opt t.peers peer_id with
+            | None -> Lwt.return_unit
+            | Some conn ->
+              Hashtbl.remove t.peers peer_id;
+              Hashtbl.remove t.profiles peer_id;
+              P2p_conn.close conn)
+          stale
+      in
+      log_node t.config.node_addr
+        "event = profile_switch epoch = %Ld kept = %d dropped = %d"
+        epoch
+        (Hashtbl.length t.peers)
+        (List.length stale);
+      Lwt.return_ok profile.profile_hash
 
 let stop t =
   t.running <- false;

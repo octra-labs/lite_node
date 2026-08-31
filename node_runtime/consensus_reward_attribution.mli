@@ -7,12 +7,16 @@ type t = Octra_core.Epoch_exec.reward_attribution = {
   validators : Octra_core.Epoch_exec.reward_validator list;
 }
 
-val fallback :
+val consensus_id : string
+
+val full_set :
   proposer_addr:string ->
   validator_pubkeys:(string * string) list ->
   t
 
-val resolve :
+val resolve_for_epoch :
+  chain_id:string ->
+  epoch_id:int64 ->
   proposer_addr:string ->
   validator_pubkeys:(string * string) list ->
   Octra_consensus.C_types.parent_commit option ->

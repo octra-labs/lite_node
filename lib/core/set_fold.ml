@@ -270,7 +270,7 @@ let prune_table cfg ~epoch table =
     |> List.sort compare_shadow
     |> remove_oldest overflow table
 
-let bound_table cfg ~cap_mode ~epoch table =
+let limit_table cfg ~cap_mode ~epoch table =
   match cap_mode with
   | Reject when String_map.cardinal table > member_cap cfg ->
     Error "validator duty state exceeds member limit"
@@ -333,12 +333,12 @@ let lock cfg ~active state =
     begin
       match state.seats with
       | Some seats when seats < 4 || seats > cfg.max_members ->
-        Error "validator seat limit is outside bounds"
+        Error "validator seat limit is outside limits"
       | Some _ -> Ok (state, false)
       | None ->
         let seats = active |> List.sort_uniq String.compare |> List.length in
         if seats < 4 || seats > cfg.max_members then
-          Error "validator seat limit is outside bounds"
+          Error "validator seat limit is outside limits"
         else
           Ok ({ state with seats = Some seats }, true)
     end
@@ -395,7 +395,7 @@ let note_final_step ~cap_mode cfg ~at ~active ~final ~signers state =
             signers
         in
         begin
-          match bound_table cfg ~cap_mode ~epoch:at table with
+          match limit_table cfg ~cap_mode ~epoch:at table with
           | Error error -> Final_held (state, error)
           | Ok table ->
             let state = {
@@ -461,7 +461,7 @@ let note_pulse ?(cap_mode=Reject) cfg ~epoch ~active ~address state =
           marks = prune_marks cfg epoch member.marks;
         } in
         let table = String_map.add address member table in
-        bound_table cfg ~cap_mode ~epoch table
+        limit_table cfg ~cap_mode ~epoch table
         |> Result.map (fun table ->
           { state with members = String_map.bindings table |> List.map snd })
     end
@@ -618,13 +618,13 @@ let apply_proof ?(cap_mode=Reject) cfg ~chain_id ~epoch ~active ~address proof s
     in
     let marks = add_mark cfg proof.vote.epoch_id member.marks in
     let table = String_map.add address { member with marks } table in
-    bound_table cfg ~cap_mode ~epoch table
+    limit_table cfg ~cap_mode ~epoch table
     |> Result.map (fun table ->
       { state with members = String_map.bindings table |> List.map snd })
 
 let warm_end cfg start = Int64.add start (Int64.add cfg.window cfg.challenge)
 
-let evidence_bounds cfg source =
+let evidence_range cfg source =
   let high = Int64.sub source cfg.challenge in
   let low = Int64.sub (Int64.succ high) cfg.window in
   low, high
@@ -655,7 +655,7 @@ let member_allows cfg ~start ~source ~safe_after member =
   | Live _ when Int64.compare source safe_after < 0 -> true
   | Live _ when Int64.compare source (warm_end cfg start) < 0 -> true
   | Live since ->
-    let low, high = evidence_bounds cfg source in
+    let low, high = evidence_range cfg source in
     Int64.compare since low > 0 || participated cfg ~low ~high member.marks
   | Shadow None -> false
   | Shadow (Some pulse) -> pulse_ready cfg ~source pulse
@@ -863,7 +863,7 @@ let optional_seats fields =
     int_json "validator duty seats" json
     |> bind (fun seats ->
       if seats < 4 || seats > standard.max_members then
-        Error "validator duty seats are outside bounds"
+        Error "validator duty seats are outside limits"
       else Ok (Some seats))
 
 let pulse_of_json json =
@@ -909,7 +909,7 @@ let marks_of_json json =
               match List.rev epochs with
               | [] -> Ok empty_marks
               | last :: _ when Int64.compare (Int64.sub last floor) 255L > 0 ->
-                Error "validator duty marks exceed bounds"
+                Error "validator duty marks exceed range"
               | _ ->
                 let bits =
                   List.fold_left

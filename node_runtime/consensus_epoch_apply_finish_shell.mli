@@ -29,6 +29,7 @@ type deps = {
     unit;
   finalize : Finalize.input -> Finalize.result Lwt.t;
   post : Post.node_input -> Post.result Lwt.t;
+  after_post : chain_id:string -> applied_epoch:int -> unit Lwt.t;
 }
 
 type request = {
@@ -83,7 +84,21 @@ type node_deps = {
   short : string -> string;
   require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
+  set_profile : string -> unit;
 }
+
+val cutover :
+  switch:(int -> unit Lwt.t) ->
+  chain_id:string ->
+  applied_epoch:int ->
+  unit Lwt.t
+
+val switch_profile :
+  swarm:Octra_net.P2p_swarm.t option ->
+  chain_id:string ->
+  epoch:int ->
+  env:(string -> string option) ->
+  (string, string) Stdlib.result Lwt.t
 
 val run : deps -> request -> result Lwt.t
 val run_node : node_deps -> request -> result Lwt.t

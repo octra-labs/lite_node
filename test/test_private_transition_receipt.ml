@@ -211,7 +211,7 @@ let env =
     ready_max_lag = 0;
   }
 
-let process store ledger transaction receipt =
+let process proof_mode store ledger transaction receipt =
   let gate =
     Octra_core.Preverify_commit.create [receipt]
   in
@@ -232,6 +232,7 @@ let process store ledger transaction receipt =
       ~ledger
       ~epoch_id:env.epoch_id
       ~owner_migration_mode:Octra_core.Rule_graph.Active
+      ~proof_mode
       ~field_policy:Octra_core.Private_ledger.Unique_fields
       ~result_policy:Octra_core.Private_result_policy.Recoverable
       ~legacy_replay
@@ -271,7 +272,14 @@ let valid_case () =
       in
       let receipt = receipt ledger transaction transition_hash in
       begin
-        match process store ledger transaction receipt with
+        match
+          process
+            Octra_core.Rule_graph.Active
+            store
+            ledger
+            transaction
+            receipt
+        with
         | Ok fee -> expect (Z.equal fee Z.one) "certified fee"
         | Error (_, reason) -> fail reason
       end;
@@ -295,7 +303,14 @@ let mismatch_case () =
         receipt ledger transaction (String.make 64 'f')
       in
       begin
-        match process store ledger transaction receipt with
+        match
+          process
+            Octra_core.Rule_graph.Active
+            store
+            ledger
+            transaction
+            receipt
+        with
         | Error ("preverify_transition_mismatch", _) -> ()
         | Error (_, reason) -> fail ("unexpected mismatch: " ^ reason)
         | Ok _ -> fail "mismatched transition accepted"
@@ -332,7 +347,14 @@ let forged_case () =
       in
       let receipt = receipt ledger transaction transition_hash in
       begin
-        match process store ledger transaction receipt with
+        match
+          process
+            Octra_core.Rule_graph.Active
+            store
+            ledger
+            transaction
+            receipt
+        with
         | Error ("bad_zero_proof", _) -> ()
         | Error (tag, _) -> fail ("unexpected forged result: " ^ tag)
         | Ok _ -> fail "forged proof accepted"
@@ -342,6 +364,42 @@ let forged_case () =
         expect (account.Octra_core.Ledger_types.nonce = 0) "forged nonce";
         expect (account.encrypted_balance = None) "forged cipher"
       | None -> fail "forged account missing")
+
+let prior_receipt_case () =
+  let path, store, ledger, pk, sk = setup "prior_receipt" in
+  Fun.protect
+    ~finally:(fun () ->
+      Lwt_main.run (Octra_core.Store_irmin.close store);
+      clear_case path)
+    (fun () ->
+      let transaction = tx (payload pk sk false) in
+      let plan =
+        match
+          Lwt_main.run
+            (PL.prepare_encrypt_plan
+               ~field_policy:PL.Unique_fields
+               ledger
+               transaction)
+        with
+        | Ok plan -> plan
+        | Error e -> fail e.PL.reason
+      in
+      let receipt =
+        receipt
+          ledger
+          transaction
+          (PL.hash_prepared (PL.Prepared_encrypt plan))
+      in
+      match
+        process
+          Octra_core.Rule_graph.Prior
+          store
+          ledger
+          transaction
+          receipt
+      with
+      | Ok fee -> expect (Z.equal fee Z.one) "prior receipt fee"
+      | Error (tag, _) -> fail ("prior receipt rejected: " ^ tag))
 
 let worker_retry_case () =
   let path, store, ledger, pk, sk = setup "worker_retry" in
@@ -379,7 +437,13 @@ let worker_retry_case () =
               "OCTRA_PVAC_VERIFY_WORKER"
               "runtime_data/private_transition_receipt/absent_worker";
             try
-              ignore (process store ledger transaction receipt);
+              ignore
+                (process
+                   Octra_core.Rule_graph.Active
+                   store
+                   ledger
+                   transaction
+                   receipt);
               false
             with
             | PL.Worker_retry _ -> true)
@@ -566,7 +630,14 @@ let recovery_case () =
       in
       let recovered_ledger = Octra_core.Ledger.create reopened in
       begin
-        match process reopened recovered_ledger recovered_tx recovered_receipt with
+        match
+          process
+            Octra_core.Rule_graph.Active
+            reopened
+            recovered_ledger
+            recovered_tx
+            recovered_receipt
+        with
         | Ok fee -> expect (Z.equal fee Z.one) "recovered fee"
         | Error (_, reason) -> fail reason
       end;
@@ -606,6 +677,7 @@ let () =
     Unix.mkdir "runtime_data/private_transition_receipt" 0o755;
   Unix.putenv "OCTRA_BFT_CRYPTO_PROFILE" "private_v1";
   pending_case ();
+  prior_receipt_case ();
   forged_case ();
   valid_case ();
   mismatch_case ();

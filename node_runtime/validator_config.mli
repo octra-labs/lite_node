@@ -162,7 +162,7 @@ val build :
   program_trust_hash:string option ->
   t
 
-val build_bound :
+val build_full :
   chain_id:string ->
   consensus_mode:bool ->
   current_height:int64 ->

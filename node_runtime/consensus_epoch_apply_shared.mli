@@ -47,6 +47,7 @@ type runtime = {
   wasm_compute_mode : Octra_core.Rule_graph.mode;
   object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
+  proof_mode : Octra_core.Rule_graph.mode;
   private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :
     epoch:int ->
@@ -108,6 +109,11 @@ val is_shared_bft_tx : Transaction.t -> bool
 val all_shared_bft : Transaction.t list -> bool
 
 val consensus_order : Transaction.t list -> Transaction.t list
+
+val worker_retry :
+  ?wait:(float -> unit Lwt.t) ->
+  (unit -> 'a Lwt.t) ->
+  'a Lwt.t
 
 val private_field_policy_at :
   Octra_core.Rule_graph.t ->

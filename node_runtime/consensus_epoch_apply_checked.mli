@@ -1,6 +1,10 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type apply_result =
+  | Apply_done
+  | Apply_busy
+
 type deps = {
   head : unit -> int;
   set_current_epoch : int -> unit;
@@ -18,7 +22,8 @@ type deps = {
     unit;
   preflight : unit -> (unit, string) result;
   defer : string -> unit;
-  apply : unit -> unit Lwt.t;
+  apply : unit -> apply_result Lwt.t;
+  retry : unit -> unit Lwt.t;
 }
 
 val run :
@@ -36,5 +41,6 @@ val run_node :
   clear_state_attested:(unit -> unit) ->
   preflight:(unit -> (unit, string) result) ->
   defer:(string -> unit) ->
-  apply:(unit -> unit Lwt.t) ->
+  apply:(unit -> apply_result Lwt.t) ->
+  retry:(unit -> unit Lwt.t) ->
   unit Lwt.t

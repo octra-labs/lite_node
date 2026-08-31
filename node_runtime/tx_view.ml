@@ -352,8 +352,14 @@ let submit_batch_params params =
   match Rpc.param_json params 0 with
   | None ->
     Error (Rpc.invalid_params "missing transactions array")
-  | Some (`List txs_json) when List.length txs_json > Rpc.max_batch_size ->
-    Error (Rpc.invalid_params (Printf.sprintf "batch exceeds %d limit" Rpc.max_batch_size))
+  | Some (`List txs_json)
+    when List.length txs_json > Rpc.max_admits ->
+    Error
+      (Rpc.invalid_params
+         (Printf.sprintf
+            "batch entries = %d limit = %d"
+            (List.length txs_json)
+            Rpc.max_admits))
   | Some (`List txs_json) ->
     Ok txs_json
   | Some _ ->

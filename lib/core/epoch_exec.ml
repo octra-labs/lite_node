@@ -73,6 +73,7 @@ type fold_ctx = {
   seat_mode : Rule_graph.mode;
   open_mode : Rule_graph.mode;
   account_mode : Rule_graph.mode;
+  standard_mode : Rule_graph.mode;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
   start : int64;
@@ -118,6 +119,7 @@ type backend = {
   legacy_total_supply : string option;
   sender_key_activation_epoch : int option;
   validator_policy : Validator_policy.t;
+  proof_mode : Rule_graph.mode;
   fold : int -> (fold_ctx, string) result;
   begin_batch : Rule_graph.mode -> unit Lwt.t;
   commit_batch : unit -> unit Lwt.t;
@@ -143,6 +145,7 @@ let prior_fold _ =
     seat_mode = Rule_graph.Prior;
     open_mode = Rule_graph.Prior;
     account_mode = Rule_graph.Prior;
+    standard_mode = Rule_graph.Prior;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
     start = 0L;
@@ -152,7 +155,8 @@ let prior_fold _ =
   }
 
 let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
-    ?sender_key_activation_epoch ?validator_policy ?(fold=prior_fold)
+    ?sender_key_activation_epoch ?validator_policy
+    ?(proof_mode=Rule_graph.Active) ?(fold=prior_fold)
     store ledger = {
   store;
   ledger;
@@ -169,6 +173,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
     Option.value
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
+  proof_mode;
   fold;
   begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch");
@@ -179,7 +184,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
 
 let make_overlay_backend ?emission_policy ?emission_schedule
     ?legacy_total_supply ?sender_key_activation_epoch ?validator_policy
-    ?(fold=prior_fold) store ledger overlay = {
+    ?(proof_mode=Rule_graph.Active) ?(fold=prior_fold) store ledger overlay = {
   store;
   ledger;
   ops = overlay_ops overlay;
@@ -195,6 +200,7 @@ let make_overlay_backend ?emission_policy ?emission_schedule
     Option.value
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
+  proof_mode;
   fold;
   begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch_overlay");
@@ -1582,6 +1588,8 @@ let circle_cell_plan ~backend ~current_epoch ~expected_transition_hash tx =
       | Error error -> Lwt.return_error error
       | Ok plan when plan.Circle_cell_transition.transition_hash <> expected ->
         Lwt.return_error "circle cell transition hash mismatch"
+      | Ok plan when backend.proof_mode = Rule_graph.Prior ->
+        Lwt.return_ok plan
       | Ok plan ->
         let* verified = Circle_cell_transition.verify_classified plan in
         begin
@@ -2312,10 +2320,16 @@ let fold_at backend epoch =
   | Ok ctx -> ctx
   | Error error -> failwith ("validator set fold rule rejected: " ^ error)
 
+let std_value ctx prior active =
+  match ctx.standard_mode with
+  | Rule_graph.Prior -> prior
+  | Rule_graph.Active -> active
+
 let set_fold_cfg ctx =
-  match ctx.live_mode with
-  | Rule_graph.Prior -> Set_fold.standard
-  | Rule_graph.Active -> Set_fold.participating
+  std_value ctx Set_fold.standard Set_fold.participating
+
+let set_fold_start ctx =
+  std_value ctx ctx.start ctx.profile_start
 
 let apply_set_fold ~backend ~env =
   let open Lwt.Syntax in
@@ -2337,7 +2351,7 @@ let apply_set_fold ~backend ~env =
           ~cap_mode:ctx.cap_mode
           cfg
           ~chain_id:env.chain_id
-          ~start:ctx.start
+          ~start:(set_fold_start ctx)
           ~at
           ~parent:ctx.parent
           state
@@ -2348,8 +2362,9 @@ let apply_set_fold ~backend ~env =
           match ctx.seat_mode with
           | Rule_graph.Prior -> next, false
           | Rule_graph.Active ->
+            let active = std_value ctx env.validator_addrs ctx.members in
             begin
-              match Set_fold.lock cfg ~active:ctx.members next with
+              match Set_fold.lock cfg ~active next with
               | Ok result -> result
               | Error error ->
                 failwith ("validator seat lock rejected: " ^ error)
@@ -2511,6 +2526,8 @@ let process_validator_withdraw_tx ~backend ~env tx =
            ("validator_withdraw_rejected",
             "validator withdrawal must be self-directed"))
     else
+      let ctx = fold_at backend env.epoch_id in
+      let active_addresses = std_value ctx env.validator_addrs ctx.members in
       let* registry_result = load_validator_registry backend in
       begin
         match registry_result with
@@ -2522,7 +2539,7 @@ let process_validator_withdraw_tx ~backend ~env tx =
               Validator_registry.withdraw
                 policy.parameters
                 ~current_epoch:(Int64.of_int env.epoch_id)
-                ~active_addresses:env.validator_addrs
+                ~active_addresses
                 ~address:tx.from
                 registry
             with
@@ -2951,8 +2968,12 @@ let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
                         let next =
                           ready_mark
                             ~cfg:(set_fold_cfg ctx)
-                            ~mode:ctx.live_mode
-                            ~start:ctx.profile_start
+                            ~mode:
+                              (std_value
+                                 ctx
+                                 ctx.ready_ref_mode
+                                 ctx.live_mode)
+                            ~start:(set_fold_start ctx)
                             ~source:(Int64.of_int env.epoch_id)
                             ~address:tx.from
                             ~prior:registry
@@ -3248,7 +3269,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
     let candidates, counts =
       Set_fold.filter
         cfg
-        ~start:ctx.profile_start
+        ~start:(set_fold_start ctx)
         ~source
         (Validator_registry.candidates registry)
         state
@@ -3275,25 +3296,35 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
           | None -> failwith "validator seat limit is missing"
         end
     in
+    let activation_delay =
+      std_value ctx policy.parameters.activation_delay cfg.delay
+    in
     let parameters = {
       policy.parameters with
       Validator_admission.max_validators;
-      activation_delay = cfg.delay;
-    }
-    in
+      activation_delay;
+    } in
     Lwt.return (parameters, candidates, incumbents)
 
 let schedule_validator_snapshot ?active ~backend ~env () =
   let open Lwt.Syntax in
   let source_epoch = Int64.of_int env.epoch_id in
-  let cfg = fold_at backend env.epoch_id |> set_fold_cfg in
-  match
-    Validator_policy.snapshot_at
-      backend.validator_policy
-      ~source_epoch
-      ~cadence:cfg.Set_fold.cadence
-      ~delay:cfg.Set_fold.delay
-  with
+  let ctx = fold_at backend env.epoch_id in
+  let cfg = set_fold_cfg ctx in
+  let activate_epoch =
+    match ctx.standard_mode with
+    | Rule_graph.Prior ->
+      Validator_policy.snapshot_activation
+        backend.validator_policy
+        ~source_epoch
+    | Rule_graph.Active ->
+      Validator_policy.snapshot_at
+        backend.validator_policy
+        ~source_epoch
+        ~cadence:cfg.Set_fold.cadence
+        ~delay:cfg.Set_fold.delay
+  in
+  match activate_epoch with
   | None -> Lwt.return_unit
   | Some activate_epoch ->
     let* registry_result = load_validator_registry backend in

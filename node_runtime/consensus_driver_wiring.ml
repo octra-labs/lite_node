@@ -38,7 +38,7 @@ type node_gates_input = {
 type node_gates_runtime = {
   consensus_mode : bool;
   voting : bool;
-  consensus_config_hash : string;
+  consensus_config_hash : string ref;
   p2p_config : P2p_config.t;
   current_epoch : unit -> int;
   log_blocked : string -> int -> unit;
@@ -358,7 +358,7 @@ let p2p_upgrade_ready_of_runtime runtime =
     ~log_blocked:(fun reason ->
       runtime.log_blocked reason (runtime.current_epoch ()))
     ~epoch:(fun () -> Int64.of_int (runtime.current_epoch ()))
-    ~consensus_config_hash:runtime.consensus_config_hash
+    ~consensus_config_hash:(fun () -> !(runtime.consensus_config_hash))
     runtime.p2p_config
 
 let node_gates_of_runtime runtime =
@@ -448,7 +448,9 @@ let node_proposal_preview
   let run () =
     let reward =
       match
-        Consensus_reward_attribution.resolve
+        Consensus_reward_attribution.resolve_for_epoch
+          ~chain_id:runtime.chain_id
+          ~epoch_id:request.epoch_id
           ~proposer_addr:request.proposer
           ~validator_pubkeys:request.validator_pubkeys
           request.parent_commit

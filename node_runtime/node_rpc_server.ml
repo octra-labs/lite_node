@@ -106,7 +106,12 @@ let with_account =
 let status_read_ctx (ctx : ctx) =
   let runtime_profile_hash =
     if !(ctx.consensus_config_hash_ref) = String.make 32 '\x00' then None
-    else Some (Consensus_profile.hash Sys.getenv_opt)
+    else
+      Some
+        (Consensus_profile.hash
+           ~chain_id:ctx.chain_id
+           ~epoch:!(ctx.current_epoch)
+           Sys.getenv_opt)
   in
   Status_read_rpc.{
     ledger = ctx.ledger;

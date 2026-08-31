@@ -12,12 +12,18 @@
 (test
  (name test_bft_validator_transition)
  (modules test_bft_validator_transition)
- (libraries octra_consensus octra_net lwt lwt.unix))
+ (libraries octra_consensus octra_net lwt lwt.unix mirage-crypto-ec
+  mirage-crypto-rng.unix))
 
 (test
  (name test_tx_staging_selection)
  (modules test_tx_staging_selection)
  (libraries octra_core zarith unix))
+
+(test
+ (name test_admit)
+ (modules test_admit)
+ (libraries octra_core octra_node_runtime zarith unix yojson lwt.unix))
 
 (test
  (name test_rule_graph)

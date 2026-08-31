@@ -454,7 +454,7 @@ let emit_startup_events deps =
       | Startup_warn message -> deps.warn message
       | Startup_refuse messages -> deps.refuse messages)
 
-let build_bound ~chain_id ~consensus_mode ~current_height ~current_entries
+let build_full ~chain_id ~consensus_mode ~current_height ~current_entries
     ~next_entries ~chain_pending_entries ~next_activation_epoch
     ~program_trust_hash ~runtime_profile_hash =
   let identity_errors =
@@ -533,7 +533,7 @@ let build_bound ~chain_id ~consensus_mode ~current_height ~current_entries
 let build ~chain_id ~consensus_mode ~current_height ~current_entries
     ~next_entries ~chain_pending_entries ~next_activation_epoch
     ~program_trust_hash =
-  build_bound
+  build_full
     ~chain_id
     ~consensus_mode
     ~current_height

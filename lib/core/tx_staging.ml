@@ -48,9 +48,21 @@ module Selection_head = Set.Make(struct
       if hash <> 0 then hash else String.compare sender_a sender_b
 end)
 
+module Evict_index = Set.Make(struct
+  type t = entry
+
+  let compare a b =
+    let rate = compare_entry_rate b a in
+    if rate <> 0 then rate
+    else
+      let hash = String.compare a.hash b.hash in
+      if hash <> 0 then hash else String.compare a.key b.key
+end)
+
 let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
 let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
 let view_index = ref Index.empty
+let evict_index = ref Evict_index.empty
 let total_ou = ref Z.zero
 
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
@@ -163,6 +175,7 @@ let sample limit =
 let clear () =
   List.iter Hashtbl.clear [staging; hash_index];
   view_index := Index.empty;
+  evict_index := Evict_index.empty;
   Hashtbl.clear virtual_balances;
   Hashtbl.clear virtual_nonces;
   total_ou := Z.zero
@@ -170,14 +183,14 @@ let clear () =
 let find_by_hash h =
   Hashtbl.find_opt hash_index h |> Option.map (fun e -> e.tx)
 
-let insert tx =
-  let ou = Transaction.ou_cost tx in
+let insert tx ou =
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let hash = Transaction.hash tx in
   let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash } in
   Hashtbl.add staging key entry;
   Hashtbl.add hash_index hash entry;
   view_index := Index.add (index_key entry) entry !view_index;
+  evict_index := Evict_index.add entry !evict_index;
   total_ou := Z.add !total_ou ou;
   Hashtbl.replace virtual_balances tx.from
     (Z.sub (Hashtbl.find virtual_balances tx.from) (public_balance_cost tx));
@@ -188,6 +201,7 @@ let evict entry =
   Hashtbl.remove staging entry.key;
   Hashtbl.remove hash_index entry.hash;
   view_index := Index.remove (index_key entry) !view_index;
+  evict_index := Evict_index.remove entry !evict_index;
   total_ou := Z.sub !total_ou entry.ou;
   Hashtbl.replace virtual_balances entry.tx.from
     (Z.add (Hashtbl.find virtual_balances entry.tx.from)
@@ -229,11 +243,15 @@ let pending_nonce addr confirmed =
   match Hashtbl.find_opt virtual_nonces addr with
   | Some n -> n | None -> confirmed
 
-let rbf_bump_ok new_tx old_tx =
-  let cn = Transaction.ou_cost new_tx in
-  let co = Transaction.ou_cost old_tx in
-  Z.geq (Z.mul (Z.mul new_tx.Transaction.ou co) (Z.of_int 100))
-        (Z.mul (Z.mul old_tx.Transaction.ou cn) (Z.of_int 110))
+let better_rate fee cost entry =
+  Z.gt
+    (Z.mul fee entry.ou)
+    (Z.mul entry.tx.Transaction.ou cost)
+
+let rbf_bump_ok new_tx new_ou old =
+  Z.geq
+    (Z.mul (Z.mul new_tx.Transaction.ou old.ou) (Z.of_int 100))
+    (Z.mul (Z.mul old.tx.Transaction.ou new_ou) (Z.of_int 110))
 
 let add_smart ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
   let ou = Transaction.ou_cost tx in
@@ -254,11 +272,14 @@ let add_smart ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
   else
     match Hashtbl.find_opt staging key with
     | Some existing ->
-      if not (rbf_bump_ok tx existing.tx) then
+      if not (rbf_bump_ok tx ou existing) then
         Error "duplicate nonce (fee rate bump < 10%)"
       else
+        let next_ou = Z.add (Z.sub !total_ou existing.ou) ou in
         let delta = Z.sub total_cost (public_balance_cost existing.tx) in
-        if Z.gt delta Z.zero && not (check_virtual_balance tx.from delta) then
+        if Z.gt next_ou ou_limit || Hashtbl.length staging > tx_limit then
+          Error "staging full (insufficient evictable capacity)"
+        else if Z.gt delta Z.zero && not (check_virtual_balance tx.from delta) then
           Error "insufficient balance for replacement"
         else begin
           evict existing;
@@ -269,7 +290,7 @@ let add_smart ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
               Evicted
               "replaced by higher fee-rate"
           in
-          insert tx;
+          insert tx ou;
           Ok [dropped]
         end
     | None ->
@@ -279,51 +300,32 @@ let add_smart ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
         let needs_eviction =
           Z.gt (Z.add !total_ou ou) ou_limit || Hashtbl.length staging >= tx_limit in
         if needs_eviction then begin
-          let evictable_ou = Hashtbl.fold (fun _ e acc ->
-            if Transaction.better_fee_rate tx e.tx then Z.add acc e.ou else acc
-          ) staging Z.zero in
-          let evictable_count = Hashtbl.fold (fun _ e acc ->
-            if Transaction.better_fee_rate tx e.tx then acc + 1 else acc
-          ) staging 0 in
           let ou_deficit = Z.max Z.zero (Z.sub (Z.add !total_ou ou) ou_limit) in
           let count_deficit = max 0 (Hashtbl.length staging + 1 - tx_limit) in
-          if Z.lt evictable_ou ou_deficit || evictable_count < count_deficit then
-            Error "staging full (insufficient evictable capacity)"
-          else
-            let sorted_by_rate = Hashtbl.fold (fun _ e acc -> e :: acc) staging []
-              |> List.sort (fun a b ->
-                let rate = -(Transaction.cmp_fee_rate_desc a.tx b.tx) in
-                if rate <> 0 then rate else String.compare a.hash b.hash) in
-            let rec evict_loop evicted_list = function
-              | [] -> evicted_list
-              | candidate :: rest ->
-                if not (Hashtbl.mem staging candidate.key) then
-                  evict_loop evicted_list rest
-                else if
-                  Z.leq (Z.add !total_ou ou) ou_limit
-                  && Hashtbl.length staging < tx_limit
-                then
-                  evicted_list
-                else if not (Transaction.better_fee_rate tx candidate.tx) then
-                  evicted_list
-                else begin
-                  evict candidate;
-                  let dropped =
-                    record_drop
-                      candidate.hash
-                      candidate.tx
-                      Evicted
-                      "outbid by higher fee-rate"
-                  in
-                  let deps = evict_nonce_dependents candidate.tx.Transaction.from candidate.tx.Transaction.nonce in
-                  evict_loop (dropped :: deps @ evicted_list) rest
-                end
+          match Evict_index.min_elt_opt !evict_index with
+          | Some candidate
+            when count_deficit <= 1
+                 && Z.geq candidate.ou ou_deficit
+                 && better_rate tx.Transaction.ou ou candidate ->
+            evict candidate;
+            let dropped =
+              record_drop
+                candidate.hash
+                candidate.tx
+                Evicted
+                "outbid by higher fee-rate"
             in
-            let evicted_list = evict_loop [] sorted_by_rate in
-            insert tx;
-            Ok evicted_list
+            let deps =
+              evict_nonce_dependents
+                candidate.tx.Transaction.from
+                candidate.tx.Transaction.nonce
+            in
+            insert tx ou;
+            Ok (dropped :: deps)
+          | _ ->
+            Error "staging full (insufficient evictable capacity)"
         end
-        else begin insert tx; Ok [] end
+        else begin insert tx ou; Ok [] end
 
 let get_ordered_txs () =
   let by_sender = Hashtbl.create 50 in
