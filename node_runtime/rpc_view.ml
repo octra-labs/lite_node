@@ -271,8 +271,9 @@ let node_version () =
     "protocol", `String "json-rpc-2.0";
   ]
 
-let runtime_version ~source_commit ~binary_hash ~consensus_profile
-    ~consensus_rules_id ~runtime_profile_hash ~config_hash ~chain_id
+let runtime_version ~source_commit ~binary_hash ~consensus_standard
+    ~consensus_standard_hash ~activation_graph_hash ~compat_wire_profile
+    ~compat_wire_rules_id ~runtime_profile_hash ~config_hash ~chain_id
     ~validator =
   let runtime_profile_hash =
     match runtime_profile_hash with
@@ -286,8 +287,11 @@ let runtime_version ~source_commit ~binary_hash ~consensus_profile
     "node_version", `String "3.0.0";
     "source_commit", opt_string source_commit;
     "binary_hash", opt_string binary_hash;
-    "consensus_profile", `Int consensus_profile;
-    "consensus_rules_id", `String consensus_rules_id;
+    "consensus_standard", `String consensus_standard;
+    "consensus_standard_hash", `String (raw_to_hex consensus_standard_hash);
+    "activation_graph_hash", `String (raw_to_hex activation_graph_hash);
+    "consensus_profile", `Int compat_wire_profile;
+    "consensus_rules_id", `String compat_wire_rules_id;
     "runtime_profile_hash", runtime_profile_hash;
     "config_hash", `String (raw_to_hex config_hash);
     "chain_id", `String chain_id;

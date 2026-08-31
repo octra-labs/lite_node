@@ -8,8 +8,11 @@ val node_version :
 val runtime_version :
   source_commit:string option ->
   binary_hash:string option ->
-  consensus_profile:int ->
-  consensus_rules_id:string ->
+  consensus_standard:string ->
+  consensus_standard_hash:string ->
+  activation_graph_hash:string ->
+  compat_wire_profile:int ->
+  compat_wire_rules_id:string ->
   runtime_profile_hash:string option ->
   config_hash:string ->
   chain_id:string ->

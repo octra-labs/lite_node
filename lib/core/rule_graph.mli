@@ -52,6 +52,8 @@ val object_cost_activation : t -> activation option
 val account_pack_activation : t -> activation option
 val ready_config_hash : t -> string option
 
+val consensus_id : chain_id:string -> string
+
 val root_after_floor :
   chain_id:string ->
   floor_epoch:int ->

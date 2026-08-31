@@ -1,0 +1,43 @@
+(test
+ (name test_set_fold)
+ (modules test_set_fold)
+ (libraries octra_core octra_consensus octra_net zarith
+  mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
+ (name test_vote_log)
+ (modules test_vote_log)
+ (libraries octra_consensus unix))
+
+(test
+ (name test_bft_validator_transition)
+ (modules test_bft_validator_transition)
+ (libraries octra_consensus octra_net lwt lwt.unix))
+
+(test
+ (name test_tx_staging_selection)
+ (modules test_tx_staging_selection)
+ (libraries octra_core zarith unix))
+
+(test
+ (name test_rule_graph)
+ (modules test_rule_graph)
+ (libraries octra_core))
+
+(test
+ (name test_epoch_exec_reward_atomic)
+ (modules test_epoch_exec_reward_atomic)
+ (libraries octra_core octra_consensus octra_net octra_node_runtime
+  base64 yojson zarith lwt.unix))
+
+(test
+ (name test_private_transition_receipt)
+ (modules test_private_transition_receipt)
+ (libraries octra_core octra_consensus octra_node_runtime pvac_ffi
+  lwt lwt.unix unix base64 yojson zarith
+  mirage-crypto-ec mirage-crypto-rng.unix)
+ (action
+  (setenv
+   OCTRA_PVAC_VERIFY_WORKER
+   %{exe:../bin/octra_pvac_worker.exe}
+   (run %{test}))))

@@ -12,6 +12,10 @@ type failure = {
   user_reason : string;
 }
 
+exception Worker_retry of string
+
+type failure_action = Reject | Retry
+
 type field_policy =
   | First_field
   | Unique_fields
@@ -186,6 +190,8 @@ val preverify_key_switch_artifact :
 val key_switch_failure_retryable : failure -> bool
 
 val private_failure_retryable : failure -> bool
+
+val failure_action : failure -> failure_action
 
 val bind_key_switch_artifact :
   field_policy:field_policy ->

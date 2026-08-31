@@ -45,7 +45,10 @@ type cfg = {
   challenge : int64;
   rejoin_span : int64;
   pulse_gap : int64;
+  cadence : int64;
+  delay : int64;
   max_members : int;
+  minimum : Validator_participation.minimum;
 }
 
 type proof = {
@@ -72,7 +75,24 @@ let standard = {
   challenge = 16L;
   rejoin_span = 64L;
   pulse_gap = 8L;
+  cadence = 64L;
+  delay = 64L;
   max_members = 200;
+  minimum = Validator_participation.Any;
+}
+
+let participating = {
+  window = 32L;
+  challenge = 16L;
+  rejoin_span = 64L;
+  pulse_gap = 8L;
+  cadence = 4L;
+  delay = 8L;
+  max_members = 200;
+  minimum = Validator_participation.Share {
+    numerator = 1;
+    denominator = 2;
+  };
 }
 
 let empty = {
@@ -84,22 +104,45 @@ let empty = {
 }
 
 let validate_cfg cfg =
-  if Int64.compare cfg.window 64L < 0 || Int64.compare cfg.window 128L > 0 then
-    Error "validator duty window is outside bounds"
+  if Int64.compare cfg.window 8L < 0 || Int64.compare cfg.window 128L > 0 then
+    Error "validator duty window is outside limits"
   else if Int64.compare cfg.challenge 1L < 0 then
     Error "validator duty challenge is not positive"
   else if Int64.compare cfg.challenge cfg.window >= 0 then
     Error "validator duty challenge is not below window"
-  else if Int64.compare cfg.rejoin_span cfg.window > 0 then
-    Error "validator duty rejoin span exceeds window"
+  else if Int64.compare cfg.rejoin_span 128L > 0 then
+    Error "validator duty rejoin span exceeds limit"
   else if Int64.compare cfg.pulse_gap 1L < 0 then
     Error "validator duty pulse gap is not positive"
   else if Int64.compare cfg.pulse_gap cfg.rejoin_span > 0 then
     Error "validator duty pulse gap exceeds rejoin span"
+  else if Int64.compare cfg.cadence 1L < 0 then
+    Error "validator duty cadence is not positive"
+  else if Int64.compare cfg.delay 1L < 0 then
+    Error "validator duty activation delay is not positive"
   else if cfg.max_members < 4 || cfg.max_members > 200 then
-    Error "validator duty member limit is outside bounds"
+    Error "validator duty member limit is outside limits"
   else
-    Ok ()
+    Validator_participation.validate cfg.minimum
+
+let consensus_id cfg =
+  String.concat ":" [
+    Int64.to_string cfg.window;
+    Int64.to_string cfg.challenge;
+    Int64.to_string cfg.rejoin_span;
+    Int64.to_string cfg.pulse_gap;
+    Int64.to_string cfg.cadence;
+    Int64.to_string cfg.delay;
+    string_of_int cfg.max_members;
+    Validator_participation.consensus_id cfg.minimum;
+  ]
+
+let replacement_limit cfg =
+  Int64.add
+    cfg.window
+    (Int64.add
+       cfg.challenge
+       (Int64.add (Int64.pred cfg.cadence) cfg.delay))
 
 let member_cap cfg = cfg.max_members * 4
 
@@ -586,16 +629,21 @@ let evidence_bounds cfg source =
   let low = Int64.sub (Int64.succ high) cfg.window in
   low, high
 
-let marked ~low ~high marks =
+let mark_count ~low ~high marks =
   let low = Int64.max low marks.floor in
-  let rec loop epoch =
-    if Int64.compare epoch high > 0 then false
+  let rec loop total epoch =
+    if Int64.compare epoch high > 0 then total
     else
       let index = Int64.sub epoch marks.floor |> Int64.to_int in
-      if Z.testbit marks.bits index then true
-      else loop (Int64.succ epoch)
+      let total = if Z.testbit marks.bits index then total + 1 else total in
+      loop total (Int64.succ epoch)
   in
-  Int64.compare low high <= 0 && loop low
+  if Int64.compare low high > 0 then 0 else loop 0 low
+
+let participated cfg ~low ~high marks =
+  let epochs = Int64.sub high low |> Int64.succ |> Int64.to_int in
+  let signed = mark_count ~low ~high marks in
+  Validator_participation.admits cfg.minimum ~epochs ~signed
 
 let pulse_ready cfg ~source pulse =
   Int64.compare pulse.last source <= 0
@@ -608,7 +656,7 @@ let member_allows cfg ~start ~source ~safe_after member =
   | Live _ when Int64.compare source (warm_end cfg start) < 0 -> true
   | Live since ->
     let low, high = evidence_bounds cfg source in
-    Int64.compare since low > 0 || marked ~low ~high member.marks
+    Int64.compare since low > 0 || participated cfg ~low ~high member.marks
   | Shadow None -> false
   | Shadow (Some pulse) -> pulse_ready cfg ~source pulse
 

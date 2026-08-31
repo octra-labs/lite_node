@@ -54,6 +54,9 @@ let name (vote : vote) =
     vote.round
     (digest vote)
 
+let epoch_prefix epoch_id =
+  Printf.sprintf "%020Ld_" epoch_id
+
 type record_position = {
   epoch_id : int64;
   round : int;
@@ -401,6 +404,33 @@ let keep store (vote : vote) =
      | Some _ -> Error "local vote conflicts with stored vote")
   | Disk path -> keep_disk path vote
 
+let find_statement store ~chain_id ~validator ~epoch_id ~round ~vote_type
+    ~proposal_id =
+  let expected = {
+    chain_id;
+    epoch_id;
+    round;
+    vote_type;
+    proposal_id;
+    validator;
+    signature = "";
+  } in
+  let exact = function
+    | Some stored when same_statement stored expected -> Some stored
+    | Some _
+    | None -> None
+  in
+  match store with
+  | Memory records ->
+    Ok (Hashtbl.find_opt records (key expected) |> exact)
+  | Disk path ->
+    if not (Sys.file_exists path) then Ok None
+    else
+      let* () = directory path in
+      let record = Filename.concat path (name expected) in
+      if not (Sys.file_exists record) then Ok None
+      else read record |> Result.map (fun stored -> exact (Some stored))
+
 let belongs ~chain_id ~validator ~epoch_id (vote : vote) =
   String.equal vote.chain_id chain_id
   && String.equal vote.validator validator
@@ -441,14 +471,23 @@ let max_round store ~chain_id ~validator ~epoch_id =
          | Error reason -> Error reason
          | Ok () ->
            try
-             let entries =
+             let raw_entries =
                Sys.readdir path
                |> Array.to_list
-               |> List.filter_map (fun entry ->
-                 match record_position entry with
-                 | Some position when Int64.equal position.epoch_id epoch_id ->
-                   Some (entry, position)
-                 | _ -> None)
+               |> List.filter (fun entry ->
+                 Filename.check_suffix entry ".vote"
+                 && String.starts_with ~prefix:(epoch_prefix epoch_id) entry)
+             in
+             let* entries =
+               List.fold_left
+                 (fun result entry ->
+                   let* items = result in
+                   match record_position entry with
+                   | Some position when Int64.equal position.epoch_id epoch_id ->
+                     Ok ((entry, position) :: items)
+                   | _ -> Error "vote log record name is invalid")
+                 (Ok [])
+                 raw_entries
              in
              if List.length entries > max_epoch_files then
                Error "vote log epoch record limit exceeded"

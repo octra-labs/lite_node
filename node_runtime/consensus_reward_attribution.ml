@@ -214,7 +214,7 @@ let bind_finality ~validator_set finalize supplied =
   | version when version = C_types.proto_version_current ->
     begin
       match finalize.C_types.parent_commit with
-      | None -> Ok supplied
+      | None -> Error "reward parent commit is missing"
       | Some parent ->
         of_parent_commit parent
         |> fun expected ->

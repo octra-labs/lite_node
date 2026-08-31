@@ -76,6 +76,7 @@ type fold_ctx = {
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
   start : int64;
+  profile_start : int64;
   parent : Octra_consensus.C_types.parent_commit option;
   members : string list;
 }
@@ -145,6 +146,7 @@ let prior_fold _ =
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
     start = 0L;
+    profile_start = 0L;
     parent = None;
     members = [];
   }
@@ -201,15 +203,11 @@ let make_overlay_backend ?emission_policy ?emission_schedule
   set_meta = (fun k v -> Store_irmin.set_meta store k v);
 }
 
-let emission_divisor = Z.of_int 18_198_732
-let emission_tail = Z.of_int 10_000
+let emission_divisor = Reward_policy.emission_divisor
+let emission_tail = Reward_policy.emission_tail
 
 let compute_base_reward ~emission_remaining =
-  if Z.leq emission_remaining Z.zero then Z.zero
-  else
-    let raw = Z.div emission_remaining emission_divisor in
-    let reward = Z.max raw emission_tail in
-    Z.min reward emission_remaining
+  Reward_policy.compute_base ~emission_remaining
 
 type reward_plan = {
   base_reward : Z.t;
@@ -250,43 +248,45 @@ let build_reward_plan_with_base ~fee_burn_active ~supply_retired
       else
         let total_reward = Z.add base_reward fee_split.rewarded in
         let n = Z.of_int validator_count in
-        let proposer_cut =
-          Z.div (Z.mul total_reward (Z.of_int 7000)) (Z.of_int 10000) in
-        let validator_pool = Z.sub total_reward proposer_cut in
-        let each_validator = Z.div validator_pool n in
-        let remainder = Z.sub validator_pool (Z.mul each_validator n) in
-        let proposer_total = Z.add proposer_cut remainder in
-        let new_emission_remaining = Z.sub emission_remaining base_reward in
-        let new_total_supply =
-          Z.sub
-            (Z.add prev_supply base_reward)
-            fee_split.burned
-        in
-        let new_supply_retired = Z.add supply_retired fee_split.burned in
-        if Z.sign new_total_supply < 0 then
-          Error "fee burn exceeds total supply"
-        else if fee_burn_active
-                && not
-                  (Z.equal
-                     (Z.add
-                        new_total_supply
-                        (Z.add new_emission_remaining new_supply_retired))
-                     Denomination.max_supply) then
-          Error "supply envelope transition mismatch"
-        else
-        Ok {
-          base_reward;
-          fees_burned = fee_split.burned;
-          fees_rewarded = fee_split.rewarded;
-          total_reward;
-          proposer_total;
-          each_validator;
-          remainder;
-          new_emission_remaining;
-          new_total_supply;
-          new_supply_retired;
-          supply_tracking_active = fee_burn_active;
-        }
+        begin
+          match Reward_policy.split total_reward with
+          | Error error -> Error error
+          | Ok (proposer_cut, validator_pool) ->
+            let each_validator = Z.div validator_pool n in
+            let remainder = Z.sub validator_pool (Z.mul each_validator n) in
+            let proposer_total = Z.add proposer_cut remainder in
+            let new_emission_remaining = Z.sub emission_remaining base_reward in
+            let new_total_supply =
+              Z.sub
+                (Z.add prev_supply base_reward)
+                fee_split.burned
+            in
+            let new_supply_retired = Z.add supply_retired fee_split.burned in
+            if Z.sign new_total_supply < 0 then
+              Error "fee burn exceeds total supply"
+            else if fee_burn_active
+                    && not
+                      (Z.equal
+                         (Z.add
+                            new_total_supply
+                            (Z.add new_emission_remaining new_supply_retired))
+                         Denomination.max_supply) then
+              Error "supply envelope transition mismatch"
+            else
+              Ok {
+                base_reward;
+                fees_burned = fee_split.burned;
+                fees_rewarded = fee_split.rewarded;
+                total_reward;
+                proposer_total;
+                each_validator;
+                remainder;
+                new_emission_remaining;
+                new_total_supply;
+                new_supply_retired;
+                supply_tracking_active = fee_burn_active;
+              }
+        end
 
 let build_reward_plan ~fee_burn_active ~supply_retired ~validator_count
     ~emission_remaining ~confirmed_fees ~prev_supply =
@@ -1580,9 +1580,20 @@ let circle_cell_plan ~backend ~current_epoch ~expected_transition_hash tx =
     begin
       match plan with
       | Error error -> Lwt.return_error error
-      | Ok plan when plan.Circle_cell_transition.transition_hash = expected ->
-        Lwt.return_ok plan
-      | Ok _ -> Lwt.return_error "circle cell transition hash mismatch"
+      | Ok plan when plan.Circle_cell_transition.transition_hash <> expected ->
+        Lwt.return_error "circle cell transition hash mismatch"
+      | Ok plan ->
+        let* verified = Circle_cell_transition.verify_classified plan in
+        begin
+          match verified with
+          | Ok () -> Lwt.return_ok plan
+          | Error (Pvac_verify_worker.Proof_rejected reason) ->
+            Lwt.return_error reason
+          | Error failure ->
+            Lwt.fail
+              (Private_ledger.Worker_retry
+                 (Pvac_verify_worker.verification_failure_message failure))
+        end
     end
 
 let process_circle_balance_cell_put_tx
@@ -2301,12 +2312,18 @@ let fold_at backend epoch =
   | Ok ctx -> ctx
   | Error error -> failwith ("validator set fold rule rejected: " ^ error)
 
+let set_fold_cfg ctx =
+  match ctx.live_mode with
+  | Rule_graph.Prior -> Set_fold.standard
+  | Rule_graph.Active -> Set_fold.participating
+
 let apply_set_fold ~backend ~env =
   let open Lwt.Syntax in
   let ctx = fold_at backend env.epoch_id in
   match ctx.mode with
   | Rule_graph.Prior -> Lwt.return_unit
   | Rule_graph.Active ->
+    let cfg = set_fold_cfg ctx in
     let at = Int64.of_int env.epoch_id in
     let* stored = load_set_fold backend in
     let state =
@@ -2318,7 +2335,7 @@ let apply_set_fold ~backend ~env =
       match
         Set_fold.advance
           ~cap_mode:ctx.cap_mode
-          Set_fold.standard
+          cfg
           ~chain_id:env.chain_id
           ~start:ctx.start
           ~at
@@ -2332,7 +2349,7 @@ let apply_set_fold ~backend ~env =
           | Rule_graph.Prior -> next, false
           | Rule_graph.Active ->
             begin
-              match Set_fold.lock Set_fold.standard ~active:env.validator_addrs next with
+              match Set_fold.lock cfg ~active:ctx.members next with
               | Ok result -> result
               | Error error ->
                 failwith ("validator seat lock rejected: " ^ error)
@@ -2831,6 +2848,7 @@ let update_ready_fold ~backend ~env ~address proof =
   match ctx.mode with
   | Rule_graph.Prior -> Lwt.return (Ok None)
   | Rule_graph.Active ->
+    let cfg = set_fold_cfg ctx in
     let* stored = load_set_fold backend in
     begin
       match stored with
@@ -2842,7 +2860,7 @@ let update_ready_fold ~backend ~env ~address proof =
           | None ->
             Set_fold.note_pulse
               ~cap_mode:ctx.cap_mode
-              Set_fold.standard
+              cfg
               ~epoch:(Int64.of_int env.epoch_id)
               ~active
               ~address
@@ -2850,7 +2868,7 @@ let update_ready_fold ~backend ~env ~address proof =
           | Some proof ->
             Set_fold.apply_proof
               ~cap_mode:ctx.cap_mode
-              Set_fold.standard
+              cfg
               ~chain_id:env.chain_id
               ~epoch:(Int64.of_int env.epoch_id)
               ~active
@@ -2861,12 +2879,12 @@ let update_ready_fold ~backend ~env ~address proof =
         Lwt.return (Result.map Option.some result)
     end
 
-let ready_mark ~mode ~start ~source ~address ~prior ~marked fold =
+let ready_mark ~cfg ~mode ~start ~source ~address ~prior ~marked fold =
   match mode, fold with
   | Rule_graph.Prior, _ -> marked
   | Rule_graph.Active, None -> marked
   | Rule_graph.Active, Some state
-    when Set_fold.allows Set_fold.standard ~start ~source ~address state ->
+    when Set_fold.allows cfg ~start ~source ~address state ->
     marked
   | Rule_graph.Active, Some _ -> prior
 
@@ -2932,8 +2950,9 @@ let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
                       | Ok fold ->
                         let next =
                           ready_mark
-                            ~mode:ctx.ready_ref_mode
-                            ~start:ctx.start
+                            ~cfg:(set_fold_cfg ctx)
+                            ~mode:ctx.live_mode
+                            ~start:ctx.profile_start
                             ~source:(Int64.of_int env.epoch_id)
                             ~address:tx.from
                             ~prior:registry
@@ -3186,11 +3205,11 @@ let process_standard_tx ~(backend : backend) ~(env : env) tx =
     ~env
     tx
 
-let fold_set ~mode ~source ~active state =
+let fold_set ~cfg ~mode ~source ~active state =
   match mode with
   | Rule_graph.Prior -> Ok (state, false)
   | Rule_graph.Active ->
-    Set_fold.note_set Set_fold.standard ~epoch:source ~active state
+    Set_fold.note_set cfg ~epoch:source ~active state
     |> Result.map (fun next -> next, next <> state)
 
 let validator_snapshot_input ?active ~backend ~env policy registry =
@@ -3210,6 +3229,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
        Validator_registry.candidates registry,
        [])
   | Rule_graph.Active ->
+    let cfg = set_fold_cfg ctx in
     let* stored = load_set_fold backend in
     let state =
       match stored with
@@ -3217,7 +3237,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
       | Error error -> failwith ("validator set fold state corrupt: " ^ error)
     in
     let state, changed =
-      match fold_set ~mode:ctx.live_mode ~source ~active state with
+      match fold_set ~cfg ~mode:ctx.live_mode ~source ~active state with
       | Ok result -> result
       | Error error -> failwith ("validator set fold active set rejected: " ^ error)
     in
@@ -3227,8 +3247,8 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
     in
     let candidates, counts =
       Set_fold.filter
-        Set_fold.standard
-        ~start:ctx.start
+        cfg
+        ~start:ctx.profile_start
         ~source
         (Validator_registry.candidates registry)
         state
@@ -3242,7 +3262,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
       counts.allowed;
     let max_validators, incumbents =
       match ctx.seat_mode with
-      | Rule_graph.Prior -> Set_fold.standard.max_members, []
+      | Rule_graph.Prior -> cfg.max_members, []
       | Rule_graph.Active ->
         begin
           match Set_fold.seats state with
@@ -3250,7 +3270,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
             begin
               match ctx.open_mode with
               | Rule_graph.Prior -> seats, active
-              | Rule_graph.Active -> Set_fold.standard.max_members, []
+              | Rule_graph.Active -> cfg.max_members, []
             end
           | None -> failwith "validator seat limit is missing"
         end
@@ -3258,6 +3278,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
     let parameters = {
       policy.parameters with
       Validator_admission.max_validators;
+      activation_delay = cfg.delay;
     }
     in
     Lwt.return (parameters, candidates, incumbents)
@@ -3265,10 +3286,13 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
 let schedule_validator_snapshot ?active ~backend ~env () =
   let open Lwt.Syntax in
   let source_epoch = Int64.of_int env.epoch_id in
+  let cfg = fold_at backend env.epoch_id |> set_fold_cfg in
   match
-    Validator_policy.snapshot_activation
+    Validator_policy.snapshot_at
       backend.validator_policy
       ~source_epoch
+      ~cadence:cfg.Set_fold.cadence
+      ~delay:cfg.Set_fold.delay
   with
   | None -> Lwt.return_unit
   | Some activate_epoch ->

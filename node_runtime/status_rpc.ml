@@ -6,14 +6,18 @@ module Rpc = Octra_core.Rpc
 let node_version () =
   Rpc_view.node_version ()
 
-let runtime_version ~source_commit ~binary_hash ~consensus_profile
-    ~consensus_rules_id ~runtime_profile_hash ~config_hash ~chain_id
+let runtime_version ~source_commit ~binary_hash ~consensus_standard
+    ~consensus_standard_hash ~activation_graph_hash ~compat_wire_profile
+    ~compat_wire_rules_id ~runtime_profile_hash ~config_hash ~chain_id
     ~validator =
   Rpc_view.runtime_version
     ~source_commit
     ~binary_hash
-    ~consensus_profile
-    ~consensus_rules_id
+    ~consensus_standard
+    ~consensus_standard_hash
+    ~activation_graph_hash
+    ~compat_wire_profile
+    ~compat_wire_rules_id
     ~runtime_profile_hash
     ~config_hash
     ~chain_id

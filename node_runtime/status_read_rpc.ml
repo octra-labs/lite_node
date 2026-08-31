@@ -212,8 +212,13 @@ let runtime_version ~chain_id ~validator_address ~program_trust_hash
     (Status_rpc.runtime_version
        ~source_commit:(release_hash "OCTRA_SOURCE_COMMIT" 40)
        ~binary_hash:(release_hash "OCTRA_BINARY_HASH" 64)
-       ~consensus_profile:Consensus_profile.version
-       ~consensus_rules_id:Consensus_profile.rules_id
+       ~consensus_standard:Consensus_profile.standard
+       ~consensus_standard_hash:
+         (Consensus_profile.standard_hash ~chain_id Sys.getenv_opt)
+       ~activation_graph_hash:
+         (Consensus_profile.activation_graph_hash ~chain_id)
+       ~compat_wire_profile:Consensus_profile.compat_wire_profile
+       ~compat_wire_rules_id:Consensus_profile.compat_wire_rules_id
        ~runtime_profile_hash
        ~config_hash
        ~chain_id

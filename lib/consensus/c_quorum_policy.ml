@@ -26,6 +26,17 @@ let active ~chain_id ~epoch_id =
   | Some activation ->
     Int64.compare epoch_id (Int64.of_int activation.activation_epoch) >= 0
 
+let consensus_id ~chain_id =
+  match activation_for_chain chain_id with
+  | None -> "resilient:genesis"
+  | Some activation ->
+    String.concat ":" [
+      "resilient";
+      string_of_int activation.anchor_epoch;
+      activation.anchor_state_root;
+      string_of_int activation.activation_epoch;
+    ]
+
 let linear_epoch ~chain_id:_ = None
 
 let linear_weight ~chain_id ~epoch_id =

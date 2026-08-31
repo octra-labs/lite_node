@@ -21,6 +21,10 @@ type failure = {
   user_reason : string;
 }
 
+exception Worker_retry of string
+
+type failure_action = Reject | Retry
+
 type field_policy =
   | First_field
   | Unique_fields
@@ -345,6 +349,15 @@ let key_switch_failure_retryable failure =
 
 let private_failure_retryable failure =
   String.equal failure.tag private_worker_retry_tag
+
+let failure_action failure =
+  if
+    key_switch_failure_retryable failure
+    || private_failure_retryable failure
+  then
+    Retry
+  else
+    Reject
 
 let private_reject ?preverify_reason private_error =
   {

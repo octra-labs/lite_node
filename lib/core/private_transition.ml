@@ -27,10 +27,6 @@ type t = {
   debits : (string, unit) Hashtbl.t;
 }
 
-type verification =
-  | Verify_proof
-  | Apply_receipt of string
-
 let create
     ~preverify
     ~legacy_replay
@@ -55,7 +51,9 @@ let create
   }
 
 let failure e =
-  Error (e.P.tag, e.reason)
+  match P.failure_action e with
+  | P.Reject -> Error (e.P.tag, e.reason)
+  | P.Retry -> raise (P.Worker_retry e.reason)
 
 let cap tag count max =
   if count >= max then
@@ -94,7 +92,7 @@ let mark_debit t addr =
 
 let verification t tx =
   match t.preverify with
-  | None -> Ok Verify_proof
+  | None -> Ok None
   | Some gate ->
     begin
       match Preverify_commit.receipt_for_tx gate tx with
@@ -102,10 +100,7 @@ let verification t tx =
       | Ok receipt ->
         begin
           match receipt.Preverify_receipt.state with
-          | Some { transition_hash = Some hash; _ } ->
-            Ok (Apply_receipt hash)
-          | Some { transition_hash = None; _ } ->
-            Ok Verify_proof
+          | Some { transition_hash; _ } -> Ok transition_hash
           | None ->
             Error
               ("preverify_transition_missing",
@@ -113,14 +108,17 @@ let verification t tx =
         end
     end
 
-let prepared expected prepared =
-  let actual = P.hash_prepared prepared in
-  if String.equal actual expected then
-    Ok ()
-  else
-    Error
-      ("preverify_transition_mismatch",
-       "private transition does not match the certified receipt")
+let receipt_matches expected prepared =
+  match expected with
+  | None -> Ok ()
+  | Some expected ->
+    let actual = P.hash_prepared prepared in
+    if String.equal actual expected then
+      Ok ()
+    else
+      Error
+        ("preverify_transition_mismatch",
+         "private transition does not match the certified receipt")
 
 let encrypt t tx =
   let open Lwt.Syntax in
@@ -136,7 +134,7 @@ let encrypt t tx =
         let* plan =
           match verification t tx with
           | Error e -> Lwt.return_error e
-          | Ok Verify_proof ->
+          | Ok expected ->
             let* result =
               P.encrypt_plan
                 ~field_policy:t.field_policy
@@ -144,20 +142,11 @@ let encrypt t tx =
                 t.ledger
                 tx
             in
-            Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
-          | Ok (Apply_receipt expected) ->
-            let* result =
-              P.prepare_encrypt_plan
-                ~field_policy:t.field_policy
-                ~result_policy:t.result_policy
-                t.ledger
-                tx
-            in
             begin
               match result with
-              | Error e -> Lwt.return_error (e.P.tag, e.reason)
+              | Error e -> Lwt.return (failure e)
               | Ok plan ->
-                match prepared expected (P.Prepared_encrypt plan) with
+                match receipt_matches expected (P.Prepared_encrypt plan) with
                 | Error e -> Lwt.return_error e
                 | Ok () -> Lwt.return_ok plan
             end
@@ -167,7 +156,11 @@ let encrypt t tx =
           | Error _ as result -> Lwt.return result
           | Ok plan ->
             let* result = P.apply_encrypt_plan t.ledger tx plan in
-            Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
+            begin
+              match result with
+              | Ok value -> Lwt.return_ok value
+              | Error e -> Lwt.return (failure e)
+            end
         in
         begin
           match applied with
@@ -195,7 +188,7 @@ let decrypt t tx =
         let* plan =
           match verification t tx with
           | Error e -> Lwt.return_error e
-          | Ok Verify_proof ->
+          | Ok expected ->
             let* result =
               P.decrypt_plan
                 ~field_policy:t.field_policy
@@ -203,20 +196,11 @@ let decrypt t tx =
                 t.ledger
                 tx
             in
-            Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
-          | Ok (Apply_receipt expected) ->
-            let* result =
-              P.prepare_decrypt_plan
-                ~field_policy:t.field_policy
-                ~result_policy:t.result_policy
-                t.ledger
-                tx
-            in
             begin
               match result with
-              | Error e -> Lwt.return_error (e.P.tag, e.reason)
+              | Error e -> Lwt.return (failure e)
               | Ok plan ->
-                match prepared expected (P.Prepared_decrypt plan) with
+                match receipt_matches expected (P.Prepared_decrypt plan) with
                 | Error e -> Lwt.return_error e
                 | Ok () -> Lwt.return_ok plan
             end
@@ -226,7 +210,11 @@ let decrypt t tx =
           | Error _ as result -> Lwt.return result
           | Ok plan ->
             let* result = P.apply_decrypt_plan t.ledger tx plan in
-            Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
+            begin
+              match result with
+              | Ok value -> Lwt.return_ok value
+              | Error e -> Lwt.return (failure e)
+            end
         in
         begin
           match applied with
@@ -274,7 +262,7 @@ let key_switch t tx =
     let* plan =
       match verification t tx with
       | Error e -> Lwt.return_error e
-      | Ok Verify_proof ->
+      | Ok expected ->
         let* result =
           P.key_switch_plan
             ~field_policy:t.field_policy
@@ -282,16 +270,11 @@ let key_switch t tx =
             t.ledger
             tx
         in
-        Lwt.return (Result.map_error (fun e -> e.P.tag, e.reason) result)
-      | Ok (Apply_receipt expected) ->
-        let* result =
-          P.prepare_key_switch_plan ~field_policy:t.field_policy t.ledger tx
-        in
         begin
           match result with
-          | Error e -> Lwt.return_error (e.P.tag, e.reason)
+          | Error e -> Lwt.return (failure e)
           | Ok plan ->
-            match prepared expected (P.Prepared_key_switch plan) with
+            match receipt_matches expected (P.Prepared_key_switch plan) with
             | Error e -> Lwt.return_error e
             | Ok () -> Lwt.return_ok plan
         end
@@ -319,25 +302,7 @@ let verified_stealth_plan t tx =
   let open Lwt.Syntax in
   match verification t tx with
   | Error e -> Lwt.return_error e
-  | Ok (Apply_receipt expected) ->
-    let* result =
-      P.prepare_stealth_plan
-        ~field_policy:t.field_policy
-        ~result_policy:t.result_policy
-        t.ledger
-        tx
-    in
-    begin
-      match result with
-      | Error e -> Lwt.return_error (e.P.tag, e.reason)
-      | Ok plan ->
-        begin
-          match prepared expected (P.Prepared_stealth plan) with
-          | Error e -> Lwt.return_error e
-          | Ok () -> Lwt.return_ok plan
-        end
-    end
-  | Ok Verify_proof ->
+  | Ok expected ->
     let* result =
       P.stealth_plan
         ~field_policy:t.field_policy
@@ -347,16 +312,16 @@ let verified_stealth_plan t tx =
     in
     begin
       match result with
-      | Error e -> Lwt.return_error (e.P.tag, e.reason)
+      | Error e -> Lwt.return (failure e)
       | Ok plan ->
         let* range = P.stealth_inline_range t.ledger tx plan in
         begin
           match range with
-          | Error e -> Lwt.return_error (e.P.tag, e.reason)
+          | Error e -> Lwt.return (failure e)
           | Ok range ->
             begin
               match P.stealth_accept_range range with
-              | Error e -> Lwt.return_error (e.P.tag, e.reason)
+              | Error e -> Lwt.return (failure e)
               | Ok () ->
                 let* binding =
                   P.stealth_binding
@@ -365,11 +330,16 @@ let verified_stealth_plan t tx =
                     tx
                     plan
                 in
-                Lwt.return
-                  (Result.map_error
-                     (fun e -> e.P.tag, e.reason)
-                     binding
-                  |> Result.map (fun () -> plan))
+                begin
+                  match binding with
+                  | Error e -> Lwt.return (failure e)
+                  | Ok () ->
+                    match
+                      receipt_matches expected (P.Prepared_stealth plan)
+                    with
+                    | Error e -> Lwt.return_error e
+                    | Ok () -> Lwt.return_ok plan
+                end
             end
         end
     end
@@ -447,44 +417,25 @@ let verified_claim_plan t tx =
   let open Lwt.Syntax in
   match verification t tx with
   | Error e -> Lwt.return_error e
-  | Ok (Apply_receipt expected) ->
-    let* claim =
-      P.prepare_claim_plan ~field_policy:t.field_policy t.ledger tx
-    in
+  | Ok expected ->
+    let* claim = P.claim_plan ~field_policy:t.field_policy t.ledger tx in
     begin
       match claim with
-      | Error e -> Lwt.return_error (e.P.tag, e.reason)
+      | Error e -> Lwt.return (failure e)
       | Ok claim ->
         let* balance =
           P.claim_balance_plan ~result_policy:t.result_policy t.ledger tx claim
         in
         begin
           match balance with
-          | Error e -> Lwt.return_error (e.P.tag, e.reason)
+          | Error e -> Lwt.return (failure e)
           | Ok balance ->
-            begin
-              match
-                prepared expected (P.Prepared_claim (claim, balance))
-              with
-              | Error e -> Lwt.return_error e
-              | Ok () -> Lwt.return_ok (claim, balance)
-            end
+            match
+              receipt_matches expected (P.Prepared_claim (claim, balance))
+            with
+            | Error e -> Lwt.return_error e
+            | Ok () -> Lwt.return_ok (claim, balance)
         end
-    end
-  | Ok Verify_proof ->
-    let* claim = P.claim_plan ~field_policy:t.field_policy t.ledger tx in
-    begin
-      match claim with
-      | Error e -> Lwt.return_error (e.P.tag, e.reason)
-      | Ok claim ->
-        let* balance =
-          P.claim_balance_plan ~result_policy:t.result_policy t.ledger tx claim
-        in
-        Lwt.return
-          (Result.map_error
-             (fun e -> e.P.tag, e.reason)
-             balance
-          |> Result.map (fun balance -> claim, balance))
     end
 
 let claim t tx =

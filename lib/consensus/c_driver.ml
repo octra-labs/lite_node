@@ -2934,35 +2934,33 @@ let replay_future_votes t =
   evidence
 
 let fold_event t (finalize : C_types.finalize) =
-  let signed =
-    List.exists
-      (fun (vote : C_types.vote) ->
-        String.equal vote.validator t.config.my_addr)
-      finalize.precommits
-  in
-  if signed then None
-  else
-    let votes =
-      Hashtbl.to_seq_values t.durable_votes
-      |> List.of_seq
-      |> List.filter (fun (vote : C_types.vote) ->
-        vote.vote_type = C_types.Precommit
-        && String.equal vote.validator t.config.my_addr
-        && Int64.equal vote.epoch_id finalize.epoch_id
-        && vote.round = finalize.commit_round
-        && String.equal vote.proposal_id finalize.proposal_id)
-      |> List.sort (fun left right ->
-        String.compare (vote_key left) (vote_key right))
+  match finalize.parent_commit with
+  | None -> None
+  | Some commit ->
+    let certificate = commit.C_types.certificate in
+    let signed =
+      List.exists
+        (fun (vote : C_types.vote) ->
+          String.equal vote.validator t.config.my_addr)
+        certificate.precommits
     in
-    match votes with
-    | [] -> None
-    | vote :: _ ->
-      Some
-        (vote,
-         C_types.{
-           certificate = C_types.certificate_of_finalize finalize;
-           validator_set = t.engine.vs;
-         })
+    if signed then None
+    else
+      match
+        C_vote_log.find_statement
+          t.vote_log
+          ~chain_id:t.config.chain_id
+          ~validator:t.config.my_addr
+          ~epoch_id:certificate.epoch_id
+          ~round:certificate.commit_round
+          ~vote_type:C_types.Precommit
+          ~proposal_id:certificate.proposal_id
+      with
+      | Ok None -> None
+      | Ok (Some vote) -> Some (vote, commit)
+      | Error reason ->
+        hold_vote_log t ("finalized parent vote lookup failed: " ^ reason);
+        None
 
 let notify_fold t ~next_epoch event =
   try t.on_fold ~next_epoch event

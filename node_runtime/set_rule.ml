@@ -6,6 +6,12 @@ let start rules =
   | None -> 0L
   | Some activation -> Int64.of_int activation.Octra_core.Rule_graph.activation_epoch
 
+let profile_start rules =
+  match Octra_core.Rule_graph.set_live_activation rules with
+  | None -> start rules
+  | Some activation ->
+    Int64.of_int activation.Octra_core.Rule_graph.activation_epoch
+
 type policy = {
   ready_mode : Octra_core.Rule_graph.mode;
   ready_ref_mode : Octra_core.Rule_graph.mode;
@@ -64,6 +70,7 @@ let resolve rules ~chain_id ~parent epoch =
       cap_mode = policy.cap_mode;
       ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
       start = start rules;
+      profile_start = profile_start rules;
       parent;
       members = [];
     }
@@ -87,6 +94,7 @@ let resolve rules ~chain_id ~parent epoch =
               cap_mode = policy.cap_mode;
               ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
               start = start rules;
+              profile_start = profile_start rules;
               parent;
               members;
             }

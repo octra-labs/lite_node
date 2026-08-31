@@ -27,3 +27,9 @@ val activation_epoch : t -> int option
 val consensus_id : t -> string
 val lifecycle_enabled : t -> bool
 val snapshot_activation : t -> source_epoch:int64 -> int64 option
+val snapshot_at :
+  t ->
+  source_epoch:int64 ->
+  cadence:int64 ->
+  delay:int64 ->
+  int64 option
