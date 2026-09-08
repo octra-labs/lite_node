@@ -8,6 +8,7 @@ module Transaction = Octra_core.Transaction
 type deps = {
   fee : Z.t;
   nonce : int;
+  strict : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -22,6 +23,7 @@ type deps = {
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
+    strict:bool ->
     sender_enc_snapshot:string ->
     Preverify_cache.result option;
   log_cap_defer : count:int -> max:int -> tx:string -> unit;
@@ -50,6 +52,7 @@ type deps = {
 }
 
 type tx_deps = {
+  strict : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -63,6 +66,7 @@ type tx_deps = {
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
+    strict:bool ->
     sender_enc_snapshot:string ->
     Preverify_cache.result option;
   log_cap_defer : count:int -> max:int -> tx:string -> unit;
@@ -109,6 +113,7 @@ type gate_deps = {
 }
 
 type live_tx_args = {
+  strict : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -154,6 +159,7 @@ type live_tx_args = {
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
   field_policy : Private_ledger.field_policy;
+  strict : bool;
   current_epoch : unit -> int;
   private_result_policy :
     int ->
@@ -250,6 +256,7 @@ let live_tx_deps (args : live_tx_args) : tx_deps =
     fhe_gate = args.fhe_gate;
   } in
   {
+    strict = args.strict;
     stealth_count = args.stealth_count;
     max_stealth_per_epoch = args.max_stealth_per_epoch;
     max_stealth_defer = args.max_stealth_defer;
@@ -287,6 +294,7 @@ let live_tx_deps (args : live_tx_args) : tx_deps =
 
 let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
   live_tx_deps {
+    strict = args.strict;
     stealth_count = args.stealth_count;
     max_stealth_per_epoch = args.max_stealth_per_epoch;
     max_stealth_defer = args.max_stealth_defer;
@@ -307,15 +315,20 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
     plan = (fun tx ->
       Octra_core.Private_ledger.stealth_plan
         ~field_policy:args.field_policy
+        ~cap:args.strict
         ~result_policy:(args.private_result_policy (args.current_epoch ()))
         args.ledger
         tx);
     trace_cipher = args.trace_cipher;
-    inline_range = Octra_core.Private_ledger.stealth_inline_range args.ledger;
+    inline_range =
+      Octra_core.Private_ledger.stealth_inline_range
+        ~strict:args.strict
+        args.ledger;
     accept_range = Octra_core.Private_ledger.stealth_accept_range;
     binding =
       Octra_core.Private_ledger.stealth_binding
         ~field_policy:args.field_policy
+        ~strict:args.strict
         args.ledger;
     debit = (fun tx fee nonce ->
       Octra_core.Ledger.debit args.ledger tx.Transaction.from fee nonce);
@@ -359,6 +372,7 @@ let run_ready (deps : deps) =
     let cached =
       deps.preverify_ready
         tx_hash
+        ~strict:deps.strict
         ~sender_enc_snapshot:plan.stealth_current_cipher
     in
     if cached = None && not deps.inline_verify_allowed then begin
@@ -461,6 +475,7 @@ let run_tx (deps : tx_deps) tx =
   run {
     fee = tx.Transaction.ou;
     nonce = tx.nonce;
+    strict = deps.strict;
     stealth_count = deps.stealth_count;
     max_stealth_per_epoch = deps.max_stealth_per_epoch;
     max_stealth_defer = deps.max_stealth_defer;

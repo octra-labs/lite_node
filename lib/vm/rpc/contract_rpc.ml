@@ -31,38 +31,77 @@ let decode_real_abi = function
     with _ ->
       None
 
-let abi ~store ~addr =
-  let open Lwt.Syntax in
-  let* stored = Store_irmin.get_contract_abi store addr in
-  match decode_real_abi stored with
+let abi_result addr = function
   | Some abi_json ->
     ok_lwt (`Assoc [
       "address", `String addr;
       "abi", abi_json;
     ])
   | None ->
-    match Contract.load_bytecode store addr with
-    | None ->
-      err_lwt (Rpc.not_found "contract not found")
-    | Some bytecode ->
-      let methods = Contract.extract_methods bytecode in
-      let method_list =
-        List.map
-          (fun (name, view) -> `Assoc ["name", `String name; "view", `Bool view])
-          methods
-      in
-      ok_lwt (`Assoc [
-        "address", `String addr;
-        "methods", `List method_list;
-        "instruction_count", `Int (Array.length bytecode);
-      ])
+    err_lwt (Rpc.not_found "program ABI not found")
 
-let abi_params ~store params =
+let derived_abi ~store ~addr =
+  match Contract.load_bytecode store addr with
+  | None ->
+    err_lwt (Rpc.not_found "contract not found")
+  | Some bytecode ->
+    let methods = Contract.extract_methods bytecode in
+    let method_list =
+      List.map
+        (fun (name, view) -> `Assoc ["name", `String name; "view", `Bool view])
+        methods
+    in
+    ok_lwt (`Assoc [
+      "address", `String addr;
+      "methods", `List method_list;
+      "instruction_count", `Int (Array.length bytecode);
+    ])
+
+let current_program_record ~store ~chaindata ~addr =
+  let open Lwt.Syntax in
+  let* info = Store_irmin.get_contract_info store addr in
+  match info with
+  | None -> Lwt.return_ok None
+  | Some (_, code_hash, _, _) ->
+    begin
+      match
+        Store_chaindata.get_program_record
+          chaindata
+          ~address:addr
+          ~code_hash
+      with
+      | Error _ as error -> Lwt.return error
+      | Ok record ->
+        let* current = Store_irmin.get_contract_info store addr in
+        begin
+          match current with
+          | Some (_, current_hash, _, _)
+            when String.equal code_hash current_hash ->
+            Lwt.return_ok record
+          | Some _ -> Lwt.return_error "program changed during metadata read"
+          | None -> Lwt.return_error "program disappeared during metadata read"
+        end
+    end
+
+let abi ~store ~chaindata ~addr =
+  let open Lwt.Syntax in
+  let* record = current_program_record ~store ~chaindata ~addr in
+  match record with
+  | Error reason -> err_lwt (Rpc.err (-32000) reason None)
+  | Ok (Some record) ->
+    begin
+      match decode_real_abi (Some record.Store_chaindata.abi) with
+      | Some abi_json -> abi_result addr (Some abi_json)
+      | None -> derived_abi ~store ~addr
+    end
+  | Ok None -> derived_abi ~store ~addr
+
+let abi_params ~store ~chaindata params =
   match Rpc.require_address params 0 "address" with
   | Error e ->
     err_lwt e
   | Ok addr ->
-    abi ~store ~addr
+    abi ~store ~chaindata ~addr
 
 let file_source item =
   match item with
@@ -149,6 +188,71 @@ let parse_certificate_json raw =
     try ["certificate", Yojson.Safe.from_string raw]
     with _ -> []
 
+let aml_compile_result ~source_mode ~source_material compiled =
+  let declaration =
+    Oct_lang.declaration_to_string compiled.Aml_source.declaration
+  in
+  let bytecode = compiled.octb in
+  let verification_json = Oct_compile.verification_json compiled.ast in
+  let certificate_json =
+    Oct_compile.certificate_json
+      ~declaration
+      ~source_mode
+      ~source_material
+      ~bytecode
+      ~verification_json
+  in
+  let program_facts = Oct_compile.facts_of_ast compiled.ast compiled.code in
+  {
+    Oct_compile.bytecode;
+    abi_json = Oct_gen.to_abi compiled.ast |> Oct_compile.abi_json declaration;
+    instructions = Array.length compiled.code;
+    error = None;
+    version = Oct_compile.lang_version;
+    verification_json;
+    certificate_json;
+    program_envelope = None;
+    program_facts = Some program_facts;
+  }
+
+let aml_result source =
+  match Aml_source.compile source with
+  | Error error -> Error error
+  | Ok compiled ->
+    Ok
+      (aml_compile_result
+         ~source_mode:"single"
+         ~source_material:source
+         compiled)
+
+let aml_multi_result resolver main_path sources =
+  match Aml_source.compile_multi resolver main_path with
+  | Error error -> Error error
+  | Ok compiled ->
+    Ok
+      (aml_compile_result
+         ~source_mode:"multi"
+         ~source_material:(Oct_compile.ordered_sources sources)
+         compiled)
+
+let aml_source_result source files_json =
+  match files_json with
+  | None -> aml_result source
+  | Some files_json ->
+    let file_map = Hashtbl.create 16 in
+    List.iter
+      (fun item ->
+        match file_source item with
+        | Some (path, item_source) -> Hashtbl.replace file_map path item_source
+        | None -> ())
+      files_json;
+    Hashtbl.replace file_map "main.aml" source;
+    let resolver path = Hashtbl.find_opt file_map path in
+    let sources =
+      Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
+    in
+    aml_multi_result resolver "main.aml" sources
+
 let compile_assembly_response ~bytecode_b64 ~bytecode_size ~instructions =
   `Assoc [
     "bytecode", `String bytecode_b64;
@@ -212,38 +316,46 @@ let compile_assembly_params params =
   | Ok source ->
     compile_assembly ~source
 
-let compile_aml_request ~program ~source =
+let source_is_program source =
+  try
+    let ast = Oct_parse.parse source in
+    ast.Oct_lang.declaration = Oct_lang.ProgramDecl
+  with _ ->
+    false
+
+let compile_program_source ~point_ops source =
+  match
+    Program_package.compile_for
+      ~point_ops
+      ~main:"main.aml"
+      ~sources:[Program_package.{ path = "main.aml"; body = source }]
+  with
+  | Error error ->
+    err_lwt
+      (Rpc.err
+         (-32000)
+         (Program_package.error_message error)
+         None)
+  | Ok compiled ->
+    ok_lwt
+      (compile_result_response
+         ~deploy_payload:compiled.package
+         compiled.result)
+
+let compile_aml_request ~point_ops ~program:_ ~source =
   match validate_compile_input source None with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
-  | Ok () when program ->
-    begin
-      match
-        Program_package.compile
-          ~main:"main.aml"
-          ~sources:[Program_package.{ path = "main.aml"; body = source }]
-      with
-      | Error error ->
-        err_lwt
-          (Rpc.err
-             (-32000)
-             (Program_package.error_message error)
-             None)
-      | Ok compiled ->
-        ok_lwt
-          (compile_result_response
-             ~deploy_payload:compiled.package
-             compiled.result)
-    end
+  | Ok () when source_is_program source -> compile_program_source ~point_ops source
   | Ok () ->
-    let result = Oct_compile.compile source in
-    match result.error with
-    | Some msg ->
-      err_lwt (Rpc.err (-32000) msg None)
-    | None ->
+    begin
+      match aml_result source with
+      | Error msg -> err_lwt (Rpc.err (-32000) msg None)
+      | Ok result ->
       ok_lwt (compile_result_response result)
+    end
 
 let compile_aml ~source =
-  compile_aml_request ~program:false ~source
+  compile_aml_request ~point_ops:true ~program:false ~source
 
 let compile_file_map files_json =
   let file_map = Hashtbl.create 16 in
@@ -261,7 +373,7 @@ let compile_file_map files_json =
   end;
   file_map
 
-let compile_aml_multi ~json =
+let compile_aml_multi_for ~point_ops ~json =
   match json with
   | None ->
     err_lwt (Rpc.invalid_params "expected {files, main}")
@@ -288,22 +400,28 @@ let compile_aml_multi ~json =
       | _ ->
         "main.aml"
     in
-    let program_only =
+    let program_field =
       match obj with
       | `Assoc fields ->
         (match List.assoc_opt "program" fields with
-         | None -> Ok false
-         | Some (`Bool value) -> Ok value
+         | None
+         | Some (`Bool _) -> Ok ()
          | Some _ -> Error "program must be boolean")
       | _ -> Error "expected object"
     in
-    match program_only, validate_compile_input "" (Some (match files_json with
+    match program_field, validate_compile_input "" (Some (match files_json with
       | `List items -> items
       | _ -> [])) with
     | Error msg, _ -> err_lwt (Rpc.invalid_params msg)
     | _, Error msg -> err_lwt (Rpc.invalid_params msg)
-    | Ok program_only, Ok () ->
-      if program_only then
+    | Ok (), Ok () ->
+      let file_map = compile_file_map files_json in
+      let resolver path = Hashtbl.find_opt file_map path in
+      if
+        match resolver main_path with
+        | Some source -> source_is_program source
+        | None -> false
+      then
         let sources =
           match files_json with
           | `List items ->
@@ -316,7 +434,7 @@ let compile_aml_multi ~json =
           | _ -> []
         in
         begin
-          match Program_package.compile ~main:main_path ~sources with
+          match Program_package.compile_for ~point_ops ~main:main_path ~sources with
           | Error error ->
             err_lwt
               (Rpc.err
@@ -330,16 +448,19 @@ let compile_aml_multi ~json =
                  compiled.result)
         end
       else
-        let file_map = compile_file_map files_json in
-        let resolver path = Hashtbl.find_opt file_map path in
-        let result = Oct_compile.compile_multi resolver main_path in
-        match result.error with
-        | Some msg ->
-          err_lwt (Rpc.err (-32000) msg None)
-        | None ->
-          ok_lwt (compile_result_response result)
+        let sources =
+          Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
+        in
+        begin
+          match aml_multi_result resolver main_path sources with
+          | Error msg -> err_lwt (Rpc.err (-32000) msg None)
+          | Ok result -> ok_lwt (compile_result_response result)
+        end
 
-let compile_aml_params params =
+let compile_aml_multi ~json =
+  compile_aml_multi_for ~point_ops:true ~json
+
+let compile_aml_params ?(point_ops = true) params =
   match Rpc.require_string params 0 "source" with
   | Error e ->
     err_lwt e
@@ -353,7 +474,7 @@ let compile_aml_params params =
     begin
       match program with
       | Error error -> err_lwt error
-      | Ok program -> compile_aml_request ~program ~source
+      | Ok program -> compile_aml_request ~point_ops ~program ~source
     end
 
 let compute_address ~bytecode_b64 ~deployer ~nonce =
@@ -422,9 +543,12 @@ let program_info_params ~store ~ledger params =
   | Ok addr ->
     program_info ~store ~ledger ~addr
 
-let list_contracts ~store ~ledger =
+let token_page_int params index default_value =
+  Option.value ~default:default_value (Rpc.param_int params index)
+
+let list_contracts ~store ~ledger ~offset ~limit =
   let open Lwt.Syntax in
-  let* addrs = Store_irmin.list_contracts store in
+  let* page = Store_irmin.list_contracts_page store ~offset ~limit in
   let* contracts =
     Lwt_list.filter_map_s
       (fun addr ->
@@ -434,12 +558,27 @@ let list_contracts ~store ~ledger =
           Lwt.return_some (contract_row ~ledger ~addr ~code_hash ~version ~owner)
         | None ->
           Lwt.return_none)
-      addrs
+      page.addresses
   in
   ok_lwt (`Assoc [
     "contracts", `List contracts;
     "count", `Int (List.length contracts);
+    "offset", `Int offset;
+    "limit", `Int limit;
+    "next_offset",
+      (if page.more then `Int (offset + List.length contracts) else `Null);
+    "more", `Bool page.more;
   ])
+
+let list_contracts_params ~store ~ledger params =
+  let offset = token_page_int params 0 0 in
+  let limit = token_page_int params 1 Token_rpc_policy.max_page_rows in
+  if offset < 0 || offset > Token_rpc_policy.max_scan_programs then
+    err_lwt (Rpc.invalid_params "program offset outside read limit")
+  else if limit <= 0 || limit > Token_rpc_policy.max_page_rows then
+    err_lwt (Rpc.invalid_params "program page size outside read limit")
+  else
+    list_contracts ~store ~ledger ~offset ~limit
 
 let max_storage_display_len = 4096
 
@@ -477,14 +616,6 @@ let storage_missing ~key =
     "truncated", `Bool false;
   ]
 
-let storage_dump ~address storage_pairs =
-  `Assoc [
-    "address", `String address;
-    "storage", `Assoc (List.map (fun (key, value) -> key, `String value) storage_pairs);
-    "storage_sizes", `Assoc (List.map (fun (key, value) -> key, `Int (String.length value)) storage_pairs);
-    "count", `Int (List.length storage_pairs);
-  ]
-
 let contract_storage ~store ~addr ~key ~limit_json =
   let open Lwt.Syntax in
   let limit = storage_read_limit limit_json in
@@ -506,11 +637,6 @@ let contract_storage_params ~store params =
       ~addr
       ~key
       ~limit_json:(Rpc.param_json params 2)
-
-let contract_storage_dump ~store ~addr =
-  let open Lwt.Syntax in
-  let* storage_pairs = Store_irmin.list_contract_storage store addr in
-  ok_lwt (storage_dump ~address:addr storage_pairs)
 
 let contract_storage_dump_params ~store:_ _params =
   err_lwt
@@ -546,9 +672,6 @@ let program_bytecode_params ~store params =
   | Ok addr ->
     program_bytecode ~store ~addr
 
-let token_page_int params index default_value =
-  Option.value ~default:default_value (Rpc.param_int params index)
-
 let token_actor_error = function
   | Token_rpc_actor.Busy ->
     Rpc.err (-32005) "Program token read busy" None
@@ -576,7 +699,7 @@ let tokens_by_address_params ~actor params =
       | Ok payload -> ok_lwt payload
       | Error error -> err_lwt (token_actor_error error)
 
-let verify ~store ~addr ~source ~files_json =
+let verify ~store ~chaindata ~addr ~source ~files_json =
   let open Lwt.Syntax in
   match validate_compile_input source files_json with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
@@ -612,18 +735,43 @@ let verify ~store ~addr ~source ~files_json =
                  | None -> None))
             in
             begin
-              match Program_package.compile ~main:"main.aml" ~sources with
-              | Ok compiled -> Ok (compiled.envelope, compiled.result)
-              | Error error ->
-                Error (Program_package.error_message error)
+              let current = Program_package.compile ~main:"main.aml" ~sources in
+              let prior = Program_package.compile_for ~point_ops:false
+                ~main:"main.aml" ~sources in
+              let results = List.filter_map (function
+                | Ok (compiled : Program_package.compiled) ->
+                  Some (compiled.envelope, compiled.result)
+                | Error _ -> None
+              ) [current; prior] in
+              match results, current with
+              | [], Error error -> Error (Program_package.error_message error)
+              | _ -> Ok results
             end
           | Some _
           | None ->
-            let result = compile_source source files_json in
+            let current = aml_source_result source files_json in
+            let prior = compile_source source files_json in
+            let results =
+              match current with
+              | Ok result -> [result.bytecode, result]
+              | Error _ -> []
+            in
+            let results =
+              match prior.error with
+              | None when
+                  not
+                    (List.exists
+                       (fun (code, _) -> String.equal code prior.bytecode)
+                       results) ->
+                results @ [prior.bytecode, prior]
+              | None | Some _ -> results
+            in
             begin
-              match result.error with
-              | Some msg -> Error msg
-              | None -> Ok (result.bytecode, result)
+              match results, current, prior.error with
+              | _ :: _, _, _ -> Ok results
+              | [], Error msg, _ -> Error msg
+              | [], Ok _, Some msg -> Error msg
+              | [], Ok _, None -> Error "compiler result is absent"
             end
         in
         match compilation with
@@ -633,14 +781,27 @@ let verify ~store ~addr ~source ~files_json =
                (-32000)
                (Printf.sprintf "compile error: %s" msg)
                None)
-        | Ok (compiled, result) ->
+        | Ok compilations ->
           let stored_hash =
             Digestif.SHA256.(digest_string stored |> to_hex)
           in
-          let compiled_hash =
-            Digestif.SHA256.(digest_string compiled |> to_hex)
+          let matching =
+            List.find_opt
+              (fun (compiled, _) ->
+                String.equal
+                  stored_hash
+                  Digestif.SHA256.(digest_string compiled |> to_hex))
+              compilations
           in
-          if not (String.equal stored_hash compiled_hash) then
+          begin
+            match matching with
+            | None ->
+              let compiled_hash =
+                match compilations with
+                | (compiled, _) :: _ ->
+                  Digestif.SHA256.(digest_string compiled |> to_hex)
+                | [] -> ""
+              in
             err_lwt
               (Rpc.err
                  (-32000)
@@ -649,17 +810,62 @@ let verify ~store ~addr ~source ~files_json =
                     (String.sub stored_hash 0 16)
                     (String.sub compiled_hash 0 16))
                  None)
-          else
-            ok_lwt
-              (`Assoc
-                 ([
-                    "verified", `Bool true;
-                    "code_hash", `String stored_hash;
-                  ]
-                  @ parse_optional_json result.verification_json
-                  @ parse_certificate_json result.certificate_json))
+            | Some (_, result) ->
+              let source_json =
+                match files_json with
+                | Some files -> Yojson.Safe.to_string (source_files source files)
+                | None -> source
+              in
+              let record = Store_chaindata.{
+                source = source_json;
+                abi = result.abi_json;
+                report =
+                  (if String.equal result.verification_json "" then None
+                   else Some result.verification_json);
+                certificate =
+                  (if String.equal result.certificate_json "" then None
+                   else Some result.certificate_json);
+                code_hash = stored_hash;
+              } in
+              let* current = Store_irmin.get_contract_info store addr in
+              begin
+                match current with
+                | Some (_, code_hash, _, _)
+                  when String.equal code_hash stored_hash ->
+                  begin
+                    let* saved =
+                      Lwt_preemptive.detach
+                        (fun () ->
+                          Store_chaindata.save_program_record
+                            chaindata
+                            addr
+                            record)
+                        ()
+                    in
+                    match saved with
+                    | Error reason ->
+                      err_lwt (Rpc.err (-32000) reason None)
+                    | Ok () ->
+                      ok_lwt
+                        (`Assoc
+                           ([
+                              "verified", `Bool true;
+                              "code_hash", `String stored_hash;
+                            ]
+                            @ parse_optional_json result.verification_json
+                            @ parse_certificate_json result.certificate_json))
+                  end
+                | Some _ ->
+                  err_lwt
+                    (Rpc.err
+                       (-32000)
+                       "program changed during verification"
+                       None)
+                | None -> err_lwt (Rpc.not_found "program not found")
+              end
+          end
 
-let verify_params ~store params =
+let verify_params ~store ~chaindata params =
   match Rpc.require_address params 0 "address",
         Rpc.require_string params 1 "source" with
   | Error e, _ | _, Error e ->
@@ -670,7 +876,7 @@ let verify_params ~store params =
       | Some (`List files) -> Some files
       | _ -> None
     in
-    verify ~store ~addr ~source ~files_json
+    verify ~store ~chaindata ~addr ~source ~files_json
 
 let source_meta_fields ~verification ~certificate =
   let verification_fields =
@@ -717,20 +923,26 @@ let source_response source meta_fields =
     with _ ->
       `Assoc (["source", `String raw] @ meta_fields)
 
-let source ~store ~addr =
+let source ~store ~chaindata ~addr =
   let open Lwt.Syntax in
-  let* raw_source = Store_irmin.get_contract_source store addr in
-  let* verification = Store_irmin.get_contract_verification store addr in
-  let* certificate = Store_irmin.get_contract_certificate store addr in
-  let meta_fields = source_meta_fields ~verification ~certificate in
-  ok_lwt (source_response raw_source meta_fields)
+  let* record = current_program_record ~store ~chaindata ~addr in
+  match record with
+  | Error reason -> err_lwt (Rpc.err (-32000) reason None)
+  | Ok (Some record) ->
+    let meta_fields =
+      source_meta_fields
+        ~verification:record.Store_chaindata.report
+        ~certificate:record.certificate
+    in
+    ok_lwt (source_response (Some record.source) meta_fields)
+  | Ok None -> ok_lwt (source_response None [])
 
-let source_params ~store params =
+let source_params ~store ~chaindata params =
   match Rpc.require_address params 0 "address" with
   | Error e ->
     err_lwt e
   | Ok addr ->
-    source ~store ~addr
+    source ~store ~chaindata ~addr
 
 let receipt ~chaindata ~tx_hash =
   match Store_chaindata.get_contract_receipt_raw chaindata ~tx_hash with
@@ -792,6 +1004,7 @@ let make_view_ctx ~store ~ledger ~current_epoch ~get_fhe_pubkey =
     get_balance;
     get_fhe_pubkey;
     allow_fhe_capability;
+    int_work = Int_work.Active;
     current_epoch;
     do_transfer = (fun _ _ _ -> false);
     deploy_contract = (fun _ _ _ _ _ -> Error "deploy in view context");
@@ -820,13 +1033,24 @@ let make_view_ctx ~store ~ledger ~current_epoch ~get_fhe_pubkey =
   } in
   view_ctx
 
+let view_storage_key_limit = 64
+let view_storage_value_limit = 4096
+
 let call_result ~store ~addr ~include_storage ~storage_json value =
   let open Lwt.Syntax in
   if include_storage then
-    let* storage_pairs = Store_irmin.list_contract_storage store addr in
+    let* page =
+      Store_irmin.list_contract_storage_page
+        store
+        addr
+        ~limit:view_storage_key_limit
+        ~value_limit:view_storage_value_limit
+    in
     ok_lwt (`Assoc [
       "result", value;
-      "storage", storage_json storage_pairs;
+      "storage", storage_json page.entries;
+      "storage_more", `Bool page.more;
+      "storage_limit", `Int view_storage_key_limit;
     ])
   else
     ok_lwt (`Assoc ["result", value])

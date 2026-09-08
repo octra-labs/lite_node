@@ -196,17 +196,22 @@ let source_binding ledger pre_state_hash tx =
         transition_hash = None;
       }
 
-let verify_private field_policy result_policy ledger tx =
+let verify_private strict field_policy result_policy ledger tx =
   let open Lwt.Syntax in
   let* result =
-    Private_ledger.verify_private ~field_policy ~result_policy ledger tx
+    Private_ledger.verify_private
+      ~field_policy
+      ~strict
+      ~result_policy
+      ledger
+      tx
   in
   Lwt.return
     (Result.map_error
        (fun rejection -> rejection.Private_ledger.private_preverify_reason)
        result)
 
-let verify_key_switch field_policy ?legacy_replay ledger tx =
+let verify_key_switch strict field_policy ?legacy_replay ledger tx =
   let open Lwt.Syntax in
   let replay =
     if
@@ -223,6 +228,7 @@ let verify_key_switch field_policy ?legacy_replay ledger tx =
   let* plan =
     Private_ledger.key_switch_plan
       ~field_policy
+      ~strict
       ?legacy_public_replay:replay
       ledger
       tx
@@ -241,7 +247,7 @@ let prepared_matches tx prepared =
   | T.ClaimOp, Private_ledger.Prepared_claim _ -> true
   | _ -> false
 
-let prepared_operation ~field_policy ~ledger verify prepared tx =
+let prepared_operation ~field_policy ~ledger ~cap verify prepared tx =
   let open Lwt.Syntax in
   match prepared with
   | None ->
@@ -262,6 +268,7 @@ let prepared_operation ~field_policy ~ledger verify prepared tx =
         let* current =
           Private_ledger.prepared_current
             ~field_policy
+            ~cap
             ledger
             tx
             value
@@ -280,6 +287,7 @@ let prepared_operation ~field_policy ~ledger verify prepared tx =
 
 let run_heavy
     ~field_policy
+    ~strict
     ?ledger
     ?legacy_replay
     ?prepared
@@ -292,7 +300,7 @@ let run_heavy
       Private_ledger.key_switch_requests_legacy_audit ~field_policy tx
     then
       let* result =
-        verify_key_switch field_policy ?legacy_replay ledger tx
+        verify_key_switch strict field_policy ?legacy_replay ledger tx
       in
       Lwt.return
         (Result.fold
@@ -303,16 +311,18 @@ let run_heavy
       prepared_operation
         ~field_policy
         ~ledger
-        (verify_key_switch field_policy ledger)
+        ~cap:strict
+        (verify_key_switch strict field_policy ledger)
         prepared
         tx
   | (T.EncryptOp | T.DecryptOp | T.StealthOp | T.ClaimOp), Some ledger ->
     prepared_operation
-      (verify_private field_policy result_policy ledger)
+      (verify_private strict field_policy result_policy ledger)
       prepared
       tx
       ~field_policy
       ~ledger
+      ~cap:strict
   | T.PrivateOp, _ -> Lwt.return (A.Invalid "private_disabled")
   | T.RecryptOp, _ -> Lwt.return (A.Invalid "recrypt_disabled")
   | T.CircleBalanceCellPut, _ ->
@@ -324,6 +334,7 @@ let run_heavy
 
 let run
     ~field_policy
+    ~strict
     ?ledger
     ?circle_preverify
     ?circle_cell_preverify
@@ -397,6 +408,7 @@ let run
       let* v =
         run_heavy
           ~field_policy
+          ~strict
           ?ledger
           ?legacy_replay
           ?prepared
@@ -603,6 +615,7 @@ let checked_of_single_batch tx batch =
 
 let run_many
     ~field_policy
+    ~strict
     ?ledger
     ?circle_preverify
     ?circle_cell_preverify
@@ -625,6 +638,7 @@ let run_many
       let* verdict =
         run
           ~field_policy
+          ~strict
           ?ledger
           ?circle_preverify
           ?circle_cell_preverify

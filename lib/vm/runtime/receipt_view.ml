@@ -32,6 +32,7 @@ let result_json = function
   | Contract_vm.VU64 z -> `String (Z.to_string z)
   | Contract_vm.VU128 z -> `String (Z.to_string z)
   | Contract_vm.VU256 z -> `String (Z.to_string z)
+  | Contract_vm.VCap _ -> `Null
   | Contract_vm.VCipher _ -> `String "<cipher>"
   | Contract_vm.VPubKey _ -> `String "<pubkey>"
 

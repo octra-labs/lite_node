@@ -37,6 +37,16 @@ def require_hashed_file(values, path_key, hash_key):
         raise ValidatorError(f"file hash mismatch: {path_key}")
     return path
 
+def validate_gc_keep(values):
+    raw = values.get("OCTRA_GC_KEEP_EPOCHS", "8192")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValidatorError("invalid GC keep epochs") from error
+    if str(value) != raw or value < 4096 or value > 65536:
+        raise ValidatorError("invalid GC keep epochs")
+    return value
+
 def validate_ready_marker(data_dir, values, wallet):
     path = data_dir / "ready_to_vote.json"
     try:
@@ -78,6 +88,7 @@ def validate(values):
         raise ValidatorError("invalid operator role")
     if mode != ("bft" if role == "validator" else "observer"):
         raise ValidatorError("operator role and consensus mode mismatch")
+    validate_gc_keep(values)
     data_dir = Path(values.get("OCTRA_DATA_DIR", ""))
     if not state_ready(data_dir):
         raise ValidatorError("checkpoint is not ready")

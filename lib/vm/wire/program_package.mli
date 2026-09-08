@@ -22,6 +22,13 @@ type error
 val error_message : error -> string
 
 val compiler_profile_id : string
+val standard_id : string
+
+val compile_for :
+  point_ops:bool ->
+  main:string ->
+  sources:source list ->
+  (compiled, error) result
 
 val compile :
   main:string ->
@@ -33,5 +40,6 @@ val validate_base64 :
   (unit, error) result
 
 val admit_base64 :
+  ?point_ops:bool ->
   string ->
   (admitted, error) result

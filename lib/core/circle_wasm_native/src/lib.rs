@@ -224,6 +224,7 @@ struct Payload {
     hfhe_caps: Option<Vec<String>>,
     hfhe_pubkeys: Option<Vec<HfhePubkeyJson>>,
     hfhe_active_key: Option<HfheActiveKey>,
+    hfhe_strict: Option<bool>,
     hfhe_receipt_mode: Option<String>,
     hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
     public_reads: Option<Vec<PublicReadJson>>,
@@ -341,6 +342,7 @@ struct HostState {
     hfhe_caps: BTreeSet<String>,
     hfhe_pubkeys: HashMap<String, String>,
     hfhe_active_key: Option<HfheActiveKey>,
+    hfhe_strict: bool,
     hfhe_receipt_mode: String,
     hfhe_receipt_expected: Vec<HfheReceiptEntryJson>,
     hfhe_receipt_entries: Vec<HfheReceiptEntryJson>,
@@ -1212,7 +1214,10 @@ impl Runtime {
             return Err(format!("unsupported wasm import: {name}"));
         }
 
-        let mut store = Store::new(shared_engine(), HostState::from_payload(payload)?);
+        let mut store = Store::new(
+            shared_engine(),
+            HostState::from_payload(payload, description_only)?,
+        );
         if profile == ExecutionProfile::Compute {
             if let Some(scope) = payload.compute_session_scope.as_deref() {
                 normalize_hex64(scope, "compute session scope")?;
@@ -1352,7 +1357,17 @@ fn validate_hfhe_receipt_input(mode: &str, entries: &[HfheReceiptEntryJson]) -> 
 }
 
 impl HostState {
-    fn from_payload(payload: &Payload) -> Result<Self, String> {
+    fn from_payload(payload: &Payload, description_only: bool) -> Result<Self, String> {
+        let (hfhe_strict, is_view) = if description_only {
+            (false, true)
+        } else {
+            (
+                payload
+                    .hfhe_strict
+                    .ok_or_else(|| "missing hfhe_strict".to_owned())?,
+                payload.is_view.ok_or_else(|| "missing is_view".to_owned())?,
+            )
+        };
         let execution_profile = ExecutionProfile::of_payload(payload)?;
         let storage = build_storage_from_payload(payload, execution_profile)?;
         let hfhe_caps = payload
@@ -1389,6 +1404,7 @@ impl HostState {
             hfhe_caps,
             hfhe_pubkeys,
             hfhe_active_key: payload.hfhe_active_key.clone(),
+            hfhe_strict,
             hfhe_receipt_mode,
             hfhe_receipt_expected,
             hfhe_receipt_entries: Vec::new(),
@@ -1399,7 +1415,7 @@ impl HostState {
             self_bytes: payload.address.clone().unwrap_or_default().into_bytes(),
             tx_hash_bytes: payload.tx_hash.clone().unwrap_or_default().into_bytes(),
             current_epoch: payload.current_epoch.unwrap_or(0),
-            is_view: payload.is_view.unwrap_or(false),
+            is_view,
             response_bytes: Vec::new(),
             response_status: 0,
             events: Vec::new(),
@@ -5863,6 +5879,22 @@ fn hfhe_receipt_hash(domain: &[u8], value: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn hfhe_request_domain(strict: bool) -> &'static [u8] {
+    if strict {
+        b"octra:circle_hfhe_request:standard:v1"
+    } else {
+        b"octra:circle_hfhe_request:v1"
+    }
+}
+
+fn hfhe_response_domain(strict: bool) -> &'static [u8] {
+    if strict {
+        b"octra:circle_hfhe_response:standard:v1"
+    } else {
+        b"octra:circle_hfhe_response:v1"
+    }
+}
+
 fn hfhe_response_bool(response: &[u8]) -> Option<bool> {
     if response == frame_bool(false) {
         Some(false)
@@ -5874,6 +5906,7 @@ fn hfhe_response_bool(response: &[u8]) -> Option<bool> {
 }
 
 fn hfhe_receipt_entry(
+    strict: bool,
     method: &str,
     request: &[u8],
     response: &[u8],
@@ -5888,8 +5921,8 @@ fn hfhe_receipt_entry(
     };
     Ok(HfheReceiptEntryJson {
         method: method.to_owned(),
-        request_hash: hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", request),
-        response_hash: hfhe_receipt_hash(b"octra:circle_hfhe_response:v1", response),
+        request_hash: hfhe_receipt_hash(hfhe_request_domain(strict), request),
+        response_hash: hfhe_receipt_hash(hfhe_response_domain(strict), response),
         result,
     })
 }
@@ -5957,6 +5990,7 @@ fn execute_hfhe_invoke(
     }
     let method = request.method.clone();
     let mode = caller.data().hfhe_receipt_mode.clone();
+    let strict = caller.data().hfhe_strict;
     let is_verify = is_hfhe_verify_method(&method);
     if mode == "capture" && caller.data().hfhe_receipt_entries.len() >= MAX_HFHE_RECEIPT_ENTRIES {
         return Err(HostFailure::Rejected(
@@ -5979,7 +6013,7 @@ fn execute_hfhe_invoke(
     }
     if mode == "consume" {
         let expected = rejected(expected_hfhe_receipt_entry(caller))?;
-        let request_hash = hfhe_receipt_hash(b"octra:circle_hfhe_request:v1", req_bytes);
+        let request_hash = hfhe_receipt_hash(hfhe_request_domain(strict), req_bytes);
         rejected(match_hfhe_receipt_request(
             &expected,
             &method,
@@ -5992,7 +6026,7 @@ fn execute_hfhe_invoke(
                     .ok_or_else(|| "hfhe verifier result missing".to_owned()),
             )?;
             let response = frame_bool(result);
-            let entry = rejected(hfhe_receipt_entry(&method, req_bytes, &response))?;
+            let entry = rejected(hfhe_receipt_entry(strict, &method, req_bytes, &response))?;
             rejected(consume_hfhe_receipt_entry(caller, entry))?;
             return Ok(response);
         }
@@ -6003,7 +6037,7 @@ fn execute_hfhe_invoke(
         )));
     }
     let response = execute_hfhe_direct(caller, req_bytes)?;
-    let entry = rejected(hfhe_receipt_entry(&method, req_bytes, &response))?;
+    let entry = rejected(hfhe_receipt_entry(strict, &method, req_bytes, &response))?;
     match mode.as_str() {
         "capture" => caller.data_mut().hfhe_receipt_entries.push(entry),
         "consume" => rejected(consume_hfhe_receipt_entry(caller, entry))?,
@@ -6032,6 +6066,8 @@ fn execute_hfhe_direct(
             request.method
         )));
     }
+    let strict = caller.data().hfhe_strict;
+    let cap = caller.data().is_view || strict;
     let params = request.params;
     match request.method.as_str() {
         "fhe_load_pk" => {
@@ -6062,6 +6098,7 @@ fn execute_hfhe_direct(
                 "seckey_b64": active.seckey_b64,
                 "amount": amount,
                 "seed_b64": seed_b64,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6079,6 +6116,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": active.pubkey_b64,
                 "seckey_b64": active.seckey_b64,
                 "seed_b64": seed_b64,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6096,6 +6134,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": active.pubkey_b64,
                 "seckey_b64": active.seckey_b64,
                 "ciphertext": ciphertext,
+                "cap": cap,
             }))?;
             Ok(frame_int(expect_backend_string(value)?))
         }
@@ -6108,6 +6147,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "lhs_ciphertext": lhs_ciphertext,
                 "rhs_ciphertext": rhs_ciphertext,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6120,6 +6160,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "lhs_ciphertext": lhs_ciphertext,
                 "rhs_ciphertext": rhs_ciphertext,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6132,6 +6173,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "factor": factor,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6144,6 +6186,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "amount": amount,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6156,6 +6199,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "amount": amount,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6166,6 +6210,7 @@ fn execute_hfhe_direct(
                 "action": "pedersen_commit",
                 "amount": amount,
                 "blinding_b64": blinding_b64,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6176,6 +6221,7 @@ fn execute_hfhe_direct(
                 "action": "commit_cipher",
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6188,6 +6234,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "amount": amount,
+                "cap": cap,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6200,6 +6247,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "proof": proof,
+                "cap": cap,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -6214,6 +6262,8 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "proof": proof,
                 "amount_commitment": amount_commitment,
+                "strict": strict,
+                "cap": cap,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -6228,6 +6278,8 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "proof": proof,
                 "amount_commitment": amount_commitment,
+                "strict": strict,
+                "cap": cap,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -6461,6 +6513,32 @@ unsafe fn write_owned_bytes(bytes: Vec<u8>, ptr_out: *mut *mut u8, len_out: *mut
 mod tests {
     use super::*;
 
+    #[test]
+    fn execution_mode_is_explicit() {
+        for fields in [
+            json!({}),
+            json!({"is_view": true}),
+            json!({"hfhe_strict": true}),
+        ] {
+            let payload: Payload = serde_json::from_value(fields).unwrap();
+            assert!(HostState::from_payload(&payload, false).is_err());
+            let state = HostState::from_payload(&payload, true).unwrap();
+            assert!(state.is_view);
+            assert!(!state.hfhe_strict);
+        }
+        for strict in [false, true] {
+            for view in [false, true] {
+                let payload: Payload = serde_json::from_value(json!({
+                    "hfhe_strict": strict,
+                    "is_view": view
+                }))
+                .unwrap();
+                let state = HostState::from_payload(&payload, false).unwrap();
+                assert_eq!((state.hfhe_strict, state.is_view), (strict, view));
+            }
+        }
+    }
+
     fn entry(
         method: &str,
         request: u8,
@@ -6574,6 +6652,23 @@ mod tests {
         assert!(
             match_hfhe_receipt_entry(&expected, &entry("fhe_verify_zero", 1, 2, Some(false)))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_domains_separate_strict_mode() {
+        let prior = hfhe_receipt_entry(false, "fhe_verify_bound", &[1], &frame_bool(true))
+            .expect("prior receipt failed");
+        let active = hfhe_receipt_entry(true, "fhe_verify_bound", &[1], &frame_bool(true))
+            .expect("active receipt failed");
+        assert_eq!(
+            prior.request_hash,
+            "a8624ddf6ccf2769976891fdf5102bdf43a6d8c6aff2f6140804d7a40168f213"
+        );
+        assert_ne!(prior.request_hash, active.request_hash);
+        assert_ne!(prior.response_hash, active.response_hash);
+        assert!(
+            match_hfhe_receipt_request(&prior, "fhe_verify_bound", &active.request_hash).is_err()
         );
     }
 

@@ -207,20 +207,36 @@ let verify_finalize ~chain_id ~validator_set finalize =
     | C_qc.Valid -> Ok ()
     | C_qc.Invalid reason -> Error ("finality qc " ^ reason)
 
+let verify_anchor_finalize ~chain_id ~validator_set finalize =
+  let* () = verify_finalize ~chain_id ~validator_set finalize in
+  let vote_set =
+    C_types.validator_set_for_epoch
+      ~chain_id
+      ~epoch_id:finalize.C_types.epoch_id
+      validator_set
+  in
+  let signers =
+    List.map (fun (vote : C_types.vote) -> vote.C_types.validator) finalize.C_types.precommits
+  in
+  if C_types.has_quorum vote_set signers then Ok ()
+  else Error "finality qc signer quorum"
+
 let verify_step ~chain_id ~prior_epoch validator_set (step : step) =
   let epoch = step.finalize.C_types.epoch_id in
-  if Option.fold
-       ~none:false
-       ~some:(fun prior -> Int64.compare epoch prior <= 0)
-       prior_epoch then
-    Error "validator transition order is invalid"
-  else if Int64.compare epoch Int64.max_int = 0 then
+  match prior_epoch with
+  | Some prior when Int64.compare epoch prior <= 0 ->
+      Error
+        (Printf.sprintf
+           "validator transition order is invalid epoch = %Ld prior_epoch = %Ld"
+           epoch
+           prior)
+  | _ when Int64.compare epoch Int64.max_int = 0 ->
     Error "validator transition epoch overflows"
-  else if not (lower_hex [64; 128] step.ledger_state_root) then
+  | _ when not (lower_hex [64; 128] step.ledger_state_root) ->
     Error "validator transition ledger root is invalid"
-  else if not (lower_hex [64] step.epoch_index_root) then
+  | _ when not (lower_hex [64] step.epoch_index_root) ->
     Error "validator transition index root is invalid"
-  else
+  | _ ->
     let* update = Update.of_string step.update in
     if Update.to_string update <> step.update then
       Error "validator transition update is not exact"
@@ -241,7 +257,7 @@ let verify_step ~chain_id ~prior_epoch validator_set (step : step) =
       if not activation_valid then
         Error "validator transition activation epoch mismatch"
       else
-      let* () = verify_finalize ~chain_id ~validator_set step.finalize in
+      let* () = verify_anchor_finalize ~chain_id ~validator_set step.finalize in
       let folded =
         Eic.folded_state_root
           ~ledger_state_root:step.ledger_state_root
@@ -329,7 +345,7 @@ let verify_checkpoint checkpoint value =
   then
     Error "finality certificate hash mismatch"
   else
-    verify_finalize
+    verify_anchor_finalize
       ~chain_id:checkpoint.chain_id
       ~validator_set:value.validator_set
       finalize

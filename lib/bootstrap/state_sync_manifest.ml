@@ -502,7 +502,7 @@ let reference_file path =
   || path = "state_root"
   || path = Root_win.name
   || path = "ledger.dat"
-  || path = Octra_core.Pvac_migration_entitlement.state_relative_path
+  || path = Octra_core.Pvac_migration_admission.state_relative_path
   || pvac_file path
 
 let validate_reference_body body =

@@ -23,6 +23,9 @@ let should_cleanup_old_tags epoch =
 let should_collect_pack epoch =
   should_cleanup_old_tags epoch
 
+let schedule_collect deps epoch =
+  Lwt.async (fun () -> deps.collect_pack epoch)
+
 let run deps ctx =
   let open Lwt.Syntax in
   deps.trace "step:save_state_root";
@@ -31,9 +34,10 @@ let run deps ctx =
   let* head = deps.get_head_hash () in
   Option.iter deps.log_head head;
   let* () =
-    if should_collect_pack ctx.current_epoch then
-      deps.collect_pack ctx.current_epoch
-    else
+    if should_collect_pack ctx.current_epoch then begin
+      schedule_collect deps ctx.current_epoch;
+      Lwt.return_unit
+    end else
       Lwt.return_unit
   in
   let* () =

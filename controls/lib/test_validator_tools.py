@@ -72,6 +72,7 @@ from validator_enroll import submit_bond
 from validator_enroll import wait_active_commit
 from validator_enroll import wait_scheduled
 from validator_guard import require_hashed_file
+from validator_guard import validate_gc_keep
 from validator_process import process_plan
 from validator_process import process_pids
 from validator_process import remaining_owners
@@ -263,20 +264,59 @@ class ValidatorToolsTest(unittest.TestCase):
     def test_store_report_resolves_data_link_and_measures_store(self):
         target = WORK / "volume/devnet"
         store = target / "irmin_store"
-        store.mkdir(parents=True)
+        store.mkdir(parents = True)
         link = WORK / "devnet"
-        link.symlink_to(target, target_is_directory=True)
+        link.symlink_to(target, target_is_directory = True)
         values = {"OCTRA_DATA_DIR": str(link), "OCTRA_API_PORT": "18080"}
         self.assertEqual(data_dir(values), target.resolve())
         with mock.patch(
             "validator_store.shutil.disk_usage",
-            return_value=mock.Mock(free=123),
+            return_value = mock.Mock(free = 123),
         ) as disk, mock.patch(
             "validator_store.rpc_method",
-            return_value=None,
+            return_value = None,
         ), mock.patch("validator_store.emit"):
             report(values)
         disk.assert_called_once_with(store)
+
+    def test_store_report_uses_node_collection_estimate(self):
+        data = WORK / "devnet"
+        store = data / "irmin_store"
+        store.mkdir(parents = True)
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        gc = {
+            "pack_gc_need_bytes": "100",
+            "pack_gc_enabled": True,
+            "pack_gc_running": False,
+        }
+        with mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value = mock.Mock(free = 123),
+        ), mock.patch(
+            "validator_store.rpc_method",
+            return_value = gc,
+        ), mock.patch("validator_store.emit") as output:
+            report(values)
+        storage = output.call_args_list[0].kwargs
+        self.assertEqual(storage["gc_need_bytes"], 100)
+        self.assertEqual(storage["gc_ready"], "true")
+
+    def test_store_report_does_not_guess_collection_estimate(self):
+        data = WORK / "devnet"
+        store = data / "irmin_store"
+        store.mkdir(parents = True)
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        with mock.patch(
+            "validator_store.shutil.disk_usage",
+            return_value = mock.Mock(free = 123),
+        ), mock.patch(
+            "validator_store.rpc_method",
+            return_value = None,
+        ), mock.patch("validator_store.emit") as output:
+            report(values)
+        storage = output.call_args_list[0].kwargs
+        self.assertEqual(storage["gc_need_bytes"], "unknown")
+        self.assertEqual(storage["gc_ready"], "unknown")
 
     def test_store_report_accepts_removed_live_file(self):
         data = WORK / "devnet"
@@ -298,7 +338,7 @@ class ValidatorToolsTest(unittest.TestCase):
             return_value=mock.Mock(free=123),
         ), mock.patch(
             "validator_store.rpc_method",
-            return_value=None,
+            return_value = None,
         ), mock.patch("validator_store.emit"):
             report(values)
 
@@ -4199,6 +4239,16 @@ class ValidatorToolsTest(unittest.TestCase):
                 "OCTRA_PVAC_VERIFY_WORKER",
                 "OCTRA_PVAC_VERIFY_WORKER_HASH",
             )
+
+    def test_gc_keep_validation(self):
+        self.assertEqual(validate_gc_keep({}), 8192)
+        self.assertEqual(
+            validate_gc_keep({"OCTRA_GC_KEEP_EPOCHS": "4096"}),
+            4096,
+        )
+        for value in ["4095", "65537", "4_096", "many"]:
+            with self.assertRaises(ValidatorError):
+                validate_gc_keep({"OCTRA_GC_KEEP_EPOCHS": value})
 
     def test_control_builder_creates_deterministic_bond_proof(self):
         built = CONFIG_ROOT / "_build/default/bin/bft_control_tx.exe"

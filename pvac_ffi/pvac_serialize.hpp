@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -28,6 +29,9 @@ static constexpr uint8_t TAG_AGG_RANGE_PROOF = 5;
 static constexpr uint8_t TAG_ZERO_PROOF = 6;
 static constexpr uint8_t TAG_BOUND_RANGE_PROOF = 7;
 static constexpr uint64_t MAX_BITVEC_BITS = 1ULL << 20;
+static constexpr uint64_t MAX_CIPHER_SLOTS = 1ULL << 16;
+static constexpr uint64_t MAX_PUBLIC_CIPHER_SLOTS = 8;
+static constexpr uint64_t MAX_PUBLIC_CIPHER_CELLS = 1ULL << 12;
 
 struct Writer {
     std::vector<uint8_t> buf;
@@ -64,8 +68,7 @@ struct Writer {
     }
 
     void fp(const pvac::Fp& x) {
-        if ((x.hi & ~pvac::MASK63) != 0
-            || (x.lo == UINT64_MAX && x.hi == pvac::MASK63))
+        if (!pvac::fp_is_reduced(x))
             throw std::runtime_error("pvac_ser: noncanonical field element");
         u64(x.lo);
         u64(x.hi);
@@ -161,8 +164,7 @@ struct Reader {
         uint64_t lo = u64();
         uint64_t hi = u64();
         if (failed) return {};
-        if ((hi & ~pvac::MASK63) != 0
-            || (lo == UINT64_MAX && hi == pvac::MASK63)) {
+        if (!pvac::fp_is_reduced(pvac::Fp{lo, hi})) {
             fail("pvac_ser: noncanonical field element");
             return {};
         }
@@ -233,6 +235,51 @@ struct Reader {
         return ver;
     }
 };
+
+inline bool read_cipher_slots(
+    Reader& r,
+    uint8_t ver,
+    size_t& slots,
+    bool strict = true,
+    bool cap = true
+) {
+    uint64_t value = r.u64();
+    if (r.failed)
+        return false;
+    if (value == 0 && (strict || cap)) {
+        r.fail("pvac_ser: cipher slots must be positive");
+        return false;
+    }
+    if (value > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        (cap && value > MAX_CIPHER_SLOTS) ||
+        (strict && ver >= VERSION_V4 && value > MAX_PUBLIC_CIPHER_SLOTS)) {
+        r.fail("pvac_ser: cipher slots exceed maximum");
+        return false;
+    }
+    slots = static_cast<size_t>(value);
+    return true;
+}
+
+inline bool check_public_cells(
+    Reader& r,
+    uint8_t ver,
+    size_t slots,
+    size_t layers,
+    bool strict = true,
+    bool cap = true
+) {
+    if (r.failed || slots == 0)
+        return false;
+    if (
+        (strict || cap) && ver >= VERSION_V4 &&
+        (slots > MAX_PUBLIC_CIPHER_CELLS ||
+         layers > MAX_PUBLIC_CIPHER_CELLS / slots)
+    ) {
+        r.fail("pvac_ser: public cipher size exceeds maximum");
+        return false;
+    }
+    return true;
+}
 
 inline const char* cipher_structure_error(const pvac::Cipher& cipher) {
     if (cipher.slots == 0)
@@ -412,6 +459,8 @@ inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2, size_t slots 
             L.PC[i] = r.rist_point();
     }
 
+    if (r.failed) return L;
+
     if (ver >= VERSION_V4)
         mark_public_base_layer(L, slots);
 
@@ -463,14 +512,17 @@ inline bool deserialize_cipher_checked(
     const uint8_t* data,
     size_t len,
     pvac::Cipher& cipher,
-    std::string& error) {
+    std::string& error,
+    bool strict = true,
+    bool cap = true) {
     Reader r(data, len);
     uint8_t ver = r.header(TAG_CIPHER);
     cipher = pvac::Cipher();
     if (!r.failed) {
-        cipher.slots = r.u64();
+        read_cipher_slots(r, ver, cipher.slots, strict, cap);
         size_t nL = r.u64();
         r.check_count(nL, 8);
+        check_public_cells(r, ver, cipher.slots, nL, strict, cap);
         if (!r.failed) {
             cipher.L.resize(nL);
             for (size_t i = 0; i < nL; ++i)
@@ -505,10 +557,15 @@ inline bool deserialize_cipher_checked(
     return true;
 }
 
-inline pvac::Cipher deserialize_cipher(const uint8_t* data, size_t len) {
+inline pvac::Cipher deserialize_cipher(
+    const uint8_t* data,
+    size_t len,
+    bool strict = true,
+    bool cap = true
+) {
     pvac::Cipher cipher;
     std::string error;
-    if (!deserialize_cipher_checked(data, len, cipher, error))
+    if (!deserialize_cipher_checked(data, len, cipher, error, strict, cap))
         throw std::runtime_error(error);
     return cipher;
 }
@@ -789,11 +846,17 @@ inline void write_cipher_raw(Writer& w, const pvac::Cipher& C) {
     for (const auto& e : C.E) write_edge(w, e);
 }
 
-inline pvac::Cipher read_cipher_raw(Reader& r, uint8_t ver = VERSION_V2) {
+inline pvac::Cipher read_cipher_raw(
+    Reader& r,
+    uint8_t ver = VERSION_V2,
+    bool strict = true,
+    bool cap = true
+) {
     pvac::Cipher C;
-    C.slots = r.u64();
+    read_cipher_slots(r, ver, C.slots, strict, cap);
     size_t nL = r.u64();
     r.check_count(nL, 8);
+    check_public_cells(r, ver, C.slots, nL, strict, cap);
     if (!r.failed) {
         C.L.resize(nL);
         for (size_t i = 0; i < nL; ++i) C.L[i] = read_layer(r, ver, C.slots);
@@ -810,9 +873,10 @@ inline pvac::Cipher read_cipher_raw(Reader& r, uint8_t ver = VERSION_V2) {
         C.E.resize(nE);
         for (size_t i = 0; i < nE; ++i) C.E[i] = read_edge(r);
     }
-    if (r.failed)
-        throw std::runtime_error(r.error);
-    validate_cipher_structure(C);
+    if (!r.failed) {
+        if (const char* error = cipher_structure_error(C))
+            r.fail(error);
+    }
     return C;
 }
 
@@ -831,12 +895,14 @@ inline std::vector<uint8_t> serialize_range_proof(const pvac::RangeProof& rp) {
     return std::move(w.buf);
 }
 
-inline pvac::RangeProof deserialize_range_proof(const uint8_t* data, size_t len) {
+inline bool deserialize_range_proof_checked(
+    const uint8_t* data,
+    size_t len,
+    pvac::RangeProof& proof,
+    std::string& error) {
     Reader r(data, len);
     uint8_t ver = r.header(TAG_RANGE_PROOF);
-    if (r.failed) throw std::runtime_error(r.error);
-
-    pvac::RangeProof rp;
+    proof = pvac::RangeProof();
     size_t nbits = r.u64();
     if (nbits != pvac::RANGE_BITS)
         r.fail("pvac_ser: unexpected range proof bit length");
@@ -844,23 +910,38 @@ inline pvac::RangeProof deserialize_range_proof(const uint8_t* data, size_t len)
         r.check_count(nbits, 8);
 
     if (!r.failed) {
-        rp.ct_bit.resize(nbits);
+        proof.ct_bit.resize(nbits);
         for (size_t i = 0; i < nbits && !r.failed; ++i)
-            rp.ct_bit[i] = read_cipher_raw(r, ver);
+            proof.ct_bit[i] = read_cipher_raw(r, ver);
     }
 
     if (!r.failed) {
-        rp.bit_proofs.resize(nbits);
+        proof.bit_proofs.resize(nbits);
         for (size_t i = 0; i < nbits && !r.failed; ++i)
-            rp.bit_proofs[i] = read_zero_proof_raw(r);
+            proof.bit_proofs[i] = read_zero_proof_raw(r);
     }
 
     if (!r.failed)
-        rp.lc_proof = read_zero_proof_raw(r);
+        proof.lc_proof = read_zero_proof_raw(r);
 
-    if (r.failed) throw std::runtime_error(r.error);
-    if (r.remaining() != 0) throw std::runtime_error("pvac_ser: trailing range proof bytes");
-    return rp;
+    if (r.failed) {
+        error = r.error;
+        return false;
+    }
+    if (r.remaining() != 0) {
+        error = "pvac_ser: trailing range proof bytes";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+inline pvac::RangeProof deserialize_range_proof(const uint8_t* data, size_t len) {
+    pvac::RangeProof proof;
+    std::string error;
+    if (!deserialize_range_proof_checked(data, len, proof, error))
+        throw std::runtime_error(error);
+    return proof;
 }
 
 inline std::vector<uint8_t> serialize_bound_range_proof(const pvac::ZeroProof& proof) {

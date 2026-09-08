@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let max_parser_depth = 128
+let max_ast_int = 1_073_741_823
 let max_imports = 256
 let max_import_names = 256
 let max_interfaces = 256

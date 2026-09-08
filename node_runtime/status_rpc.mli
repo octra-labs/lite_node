@@ -32,6 +32,7 @@ val epoch_tags :
   split_epoch:int option ->
   gc_enabled:bool ->
   gc_running:bool ->
+  gc_need:int64 option ->
   Yojson.Safe.t
 
 val validator_enrollment :

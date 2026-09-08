@@ -43,6 +43,7 @@ val commit_ct : pubkey -> cipher -> bytes
 val cipher_has_key_bound_material : cipher -> bool
 val cipher_base_layers : cipher -> int
 val cipher_shape : cipher -> cipher_shape
+val cipher_mul_depth : cipher -> int
 val cipher_is_wrapped_scalar : cipher -> bool
 val pubkey_is_key_bound_extension : pubkey -> pubkey -> bool
 val pubkey_supports_alias_rejection : pubkey -> bool
@@ -56,13 +57,21 @@ val make_zero_proof_bound : pubkey -> seckey -> cipher -> int64 -> bytes -> zero
 
 val verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
 
+val verify_zero_amount_prior : pubkey -> cipher -> zero_proof -> bytes -> bool
+
 val verify_zero_bound_key_switch :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
+
+val verify_zero_amount_key_switch_prior :
   pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val make_zero_proof_bound_historical_migration :
   pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
 
 val verify_zero_bound_historical_migration :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
+
+val verify_zero_amount_historical_prior :
   pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
@@ -80,13 +89,16 @@ type agg_range_proof
 val make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> agg_range_proof
 val serialize_agg_range_proof : agg_range_proof -> bytes
 
-val verify_range_any : pubkey -> cipher -> bytes -> bool
+val verify_range_any : pubkey -> cipher -> bytes -> bool -> bool
 val verify_range_bound : pubkey -> cipher -> bytes -> bytes -> bool
+val verify_range_amount_prior : pubkey -> cipher -> bytes -> bytes -> bool
 
 val serialize_cipher : cipher -> bytes
 val serialize_cipher_public : cipher -> bytes
-val deserialize_cipher : bytes -> cipher
+val deserialize_cipher : ?strict:bool -> ?cap:bool -> bytes -> cipher
 val deserialize_cipher_result : bytes -> (cipher, string) result
+val deserialize_cipher_prior_result : bytes -> (cipher, string) result
+val deserialize_cipher_cap_result : bytes -> (cipher, string) result
 val serialize_pubkey : pubkey -> bytes
 val serialize_pubkey_legacy_v2 : pubkey -> bytes
 val deserialize_pubkey : bytes -> pubkey

@@ -95,6 +95,10 @@ let unop_to_string = function
   | Neg -> "-"
   | Not -> "!"
 
+let mult_to_string = function
+  | Once -> "once"
+  | Many -> "many"
+
 let rec expr_to_string = function
   | EInt value -> Z.to_string value
   | EBool true -> "true"
@@ -126,6 +130,33 @@ let rec expr_to_string = function
   | EEnumVariant (enum_name, variant) -> enum_name ^ "." ^ variant
   | ETernary (cond, yes_value, no_value) ->
     expr_to_string cond ^ " ? " ^ expr_to_string yes_value ^ " : " ^ expr_to_string no_value
+  | EEqual (typ, left, right) ->
+    "equal[" ^ typ_to_string typ ^ "](" ^ expr_to_string left ^ ","
+    ^ expr_to_string right ^ ")"
+  | ELet (name, mult, typ, value, body) ->
+    "let " ^ mult_to_string mult ^ " " ^ name ^ ": " ^ typ_to_string typ
+    ^ " = " ^ expr_to_string value ^ " in " ^ expr_to_string body
+  | ESplit (value, (left, left_mult, left_typ),
+      (right, right_mult, right_typ), body) ->
+    "split " ^ expr_to_string value ^ " as " ^ mult_to_string left_mult
+    ^ " " ^ left ^ ": " ^ typ_to_string left_typ ^ ", "
+    ^ mult_to_string right_mult ^ " " ^ right ^ ": "
+    ^ typ_to_string right_typ ^ " in " ^ expr_to_string body
+  | EOrbit (count, turns, seed, (name, mult, typ), body) ->
+    let turns =
+      Option.fold ~none:""
+        ~some:(fun value -> "," ^ expr_to_string value)
+        turns
+    in
+    "orbit[" ^ string_of_int (C_nat.to_int count) ^ turns ^ "] from "
+    ^ expr_to_string seed ^ " with " ^ mult_to_string mult ^ " " ^ name
+    ^ ": " ^ typ_to_string typ ^ " => " ^ expr_to_string body
+  | EAction (atom, value) ->
+    "action[" ^ C_eff.atom_text atom ^ "](" ^ expr_to_string value ^ ")"
+  | EUse use ->
+    let args = use.ux_caps @ [use.ux_arg] in
+    "use " ^ use.ux_name ^ "(" ^ String.concat "," (List.map expr_to_string args)
+    ^ ") in " ^ expr_to_string use.ux_body
 
 let lowercase value =
   String.lowercase_ascii value
@@ -231,6 +262,23 @@ let rec expr_mentions name = function
     field = name || prop = name || List.exists (expr_mentions name) indexes
   | ETernary (cond, yes_value, no_value) ->
     expr_mentions name cond || expr_mentions name yes_value || expr_mentions name no_value
+  | EEqual (_, left, right) ->
+    expr_mentions name left || expr_mentions name right
+  | ELet (bind, _, _, value, body) ->
+    expr_mentions name value
+    || not (String.equal bind name) && expr_mentions name body
+  | ESplit (value, (left, _, _), (right, _, _), body) ->
+    expr_mentions name value
+    || not (String.equal left name || String.equal right name)
+       && expr_mentions name body
+  | EOrbit (_, turns, seed, (bind, _, _), body) ->
+    Option.fold ~none:false ~some:(expr_mentions name) turns
+    || expr_mentions name seed
+    || not (String.equal bind name) && expr_mentions name body
+  | EAction (_, value) -> expr_mentions name value
+  | EUse use ->
+    List.exists (expr_mentions name) (use.ux_arg :: use.ux_caps)
+    || (not (String.equal use.ux_bind name) && expr_mentions name use.ux_body)
   | EField value -> value = name
   | EBalance value -> expr_mentions name value
   | EInt _ | EBool _ | EString _ | ECaller | EOrigin | ESelfAddr | EEpoch | EEpochTime | EValue
@@ -242,6 +290,7 @@ let rec expr_is_positive_guard name = function
   | _ -> false
 
 let rec stmt_has_positive_guard name = function
+  | SLocated (_, _, value) -> stmt_has_positive_guard name value
   | SRequire (expr, _) | SAssert expr -> expr_is_positive_guard name expr
   | SIf (_, then_body, else_body) ->
     List.exists (stmt_has_positive_guard name) then_body
@@ -250,14 +299,16 @@ let rec stmt_has_positive_guard name = function
     List.exists (stmt_has_positive_guard name) body
   | SMatch (_, branches) ->
     List.exists (fun (_, _, body) -> List.exists (stmt_has_positive_guard name) body) branches
-  | SLet _ | SAssign _ | SFieldSet _ | SIndexSet _ | SReturn _ | SEmit _
-  | SFieldCall _ | SStoragePathSet _ | SIndexFieldSet _ | SLetTuple _
+  | SLet _ | SAssign _ | SFieldSet _ | SIndexSet _ | SIndexUpdate _
+  | SReturn _ | SEmit _ | SFieldCall _ | SStoragePathSet _
+  | SStoragePathUpdate _ | SIndexFieldSet _ | SLetTuple _
   | SExpr _ | SRevertError _ -> false
 
 let function_has_positive_guard name body =
   List.exists (stmt_has_positive_guard name) body
 
 let rec stmt_requires_var name = function
+  | SLocated (_, _, value) -> stmt_requires_var name value
   | SRequire (expr, _) | SAssert expr -> expr_mentions name expr
   | SIf (_, then_body, else_body) ->
     List.exists (stmt_requires_var name) then_body
@@ -266,8 +317,9 @@ let rec stmt_requires_var name = function
     List.exists (stmt_requires_var name) body
   | SMatch (_, branches) ->
     List.exists (fun (_, _, body) -> List.exists (stmt_requires_var name) body) branches
-  | SLet _ | SAssign _ | SFieldSet _ | SIndexSet _ | SReturn _ | SEmit _
-  | SFieldCall _ | SStoragePathSet _ | SIndexFieldSet _ | SLetTuple _
+  | SLet _ | SAssign _ | SFieldSet _ | SIndexSet _ | SIndexUpdate _
+  | SReturn _ | SEmit _ | SFieldCall _ | SStoragePathSet _
+  | SStoragePathUpdate _ | SIndexFieldSet _ | SLetTuple _
   | SExpr _ | SRevertError _ -> false
 
 let function_checks_var name body =
@@ -297,6 +349,14 @@ let rec expr_typ fields env = function
       | _, Some typ -> Some typ
       | _ -> None
     end
+  | EEqual _ -> Some TBool
+  | ELet (name, _, declared, _, body) ->
+    expr_typ fields ((name, declared) :: env) body
+  | ESplit (_, (left, _, left_typ), (right, _, right_typ), body) ->
+    expr_typ fields ((right, right_typ) :: (left, left_typ) :: env) body
+  | EOrbit (_, _, _, (_, _, declared), _) -> Some declared
+  | EAction (_, value) -> expr_typ fields env value
+  | EUse use -> Some use.ux_typ
   | EBool _ -> Some TBool
   | EString _ -> Some TString
   | ECaller | EOrigin | ESelfAddr -> Some TAddress
@@ -340,6 +400,19 @@ let rec expr_signed_source fields env = function
   | ECall (_, args) | EArray args | ETuple args -> first_signed_source fields env args
   | ETernary (cond, yes_value, no_value) ->
     first_signed_source fields env [cond; yes_value; no_value]
+  | EEqual _ -> None
+  | ELet (name, _, declared, _, body) ->
+    expr_signed_source fields ((name, declared) :: env) body
+  | ESplit (_, (left, _, left_typ), (right, _, right_typ), body) ->
+    expr_signed_source
+      fields
+      ((right, right_typ) :: (left, left_typ) :: env)
+      body
+  | EOrbit (_, _, _, (name, _, declared), body) ->
+    expr_signed_source fields ((name, declared) :: env) body
+  | EAction (_, value) -> expr_signed_source fields env value
+  | EUse use ->
+    first_signed_source fields env (use.ux_arg :: use.ux_caps @ [use.ux_body])
   | EInt _ | EBool _ | EString _ | ECaller | EOrigin | ESelfAddr | EEpoch | EEpochTime | EValue
   | ETreeHash | ENodeId | ETxHash | EEnumVariant _ -> None
 
@@ -369,6 +442,7 @@ let rec expr_proves_sub_guard left right = function
   | _ -> false
 
 let rec stmt_proves_sub_guard left right = function
+  | SLocated (_, _, value) -> stmt_proves_sub_guard left right value
   | SRequire (expr, _) | SAssert expr -> expr_proves_sub_guard left right expr
   | SIf (_, then_body, else_body) ->
     List.exists (stmt_proves_sub_guard left right) then_body
@@ -377,8 +451,9 @@ let rec stmt_proves_sub_guard left right = function
     List.exists (stmt_proves_sub_guard left right) body
   | SMatch (_, branches) ->
     List.exists (fun (_, _, body) -> List.exists (stmt_proves_sub_guard left right) body) branches
-  | SLet _ | SAssign _ | SFieldSet _ | SIndexSet _ | SReturn _ | SEmit _
-  | SFieldCall _ | SStoragePathSet _ | SIndexFieldSet _ | SLetTuple _
+  | SLet _ | SAssign _ | SFieldSet _ | SIndexSet _ | SIndexUpdate _
+  | SReturn _ | SEmit _ | SFieldCall _ | SStoragePathSet _
+  | SStoragePathUpdate _ | SIndexFieldSet _ | SLetTuple _
   | SExpr _ | SRevertError _ -> false
 
 let function_proves_sub_guard left right body =
@@ -411,6 +486,34 @@ let rec expr_has_unproven_unsigned_arithmetic fields env body = function
     List.exists (expr_has_unproven_unsigned_arithmetic fields env body) indexes
   | ETernary (cond, yes_value, no_value) ->
     List.exists (expr_has_unproven_unsigned_arithmetic fields env body) [cond; yes_value; no_value]
+  | EEqual (_, left, right) ->
+    expr_has_unproven_unsigned_arithmetic fields env body left
+    || expr_has_unproven_unsigned_arithmetic fields env body right
+  | ELet (name, _, declared, value, next) ->
+    expr_has_unproven_unsigned_arithmetic fields env body value
+    || expr_has_unproven_unsigned_arithmetic
+         fields ((name, declared) :: env) body next
+  | ESplit (value, (left, _, left_typ), (right, _, right_typ), next) ->
+    expr_has_unproven_unsigned_arithmetic fields env body value
+    || expr_has_unproven_unsigned_arithmetic
+         fields
+         ((right, right_typ) :: (left, left_typ) :: env)
+         body
+         next
+  | EOrbit (_, turns, seed, (name, _, declared), next) ->
+    Option.fold
+      ~none:false
+      ~some:(expr_has_unproven_unsigned_arithmetic fields env body)
+      turns
+    || expr_has_unproven_unsigned_arithmetic fields env body seed
+    || expr_has_unproven_unsigned_arithmetic
+         fields ((name, declared) :: env) body next
+  | EAction (_, value) ->
+    expr_has_unproven_unsigned_arithmetic fields env body value
+  | EUse use ->
+    List.exists
+      (expr_has_unproven_unsigned_arithmetic fields env body)
+      (use.ux_arg :: use.ux_caps @ [use.ux_body])
   | EInt _ | EBool _ | EString _ | EVar _ | EField _ | ECaller | EOrigin | ESelfAddr
   | EEpoch | EEpochTime | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _ | EEnumVariant _ -> false
 
@@ -430,15 +533,30 @@ let rec expr_calls = function
   | EUnop (_, value) | EBalance value -> expr_calls value
   | EStoragePath (_, indexes, _) | EIndexField (_, indexes, _) -> List.concat_map expr_calls indexes
   | ETernary (cond, yes_value, no_value) -> expr_calls cond @ expr_calls yes_value @ expr_calls no_value
+  | EEqual (_, left, right) -> expr_calls left @ expr_calls right
+  | ELet (_, _, _, value, body) -> expr_calls value @ expr_calls body
+  | ESplit (value, _, _, body) -> expr_calls value @ expr_calls body
+  | EOrbit (_, turns, seed, _, body) ->
+    Option.fold ~none:[] ~some:expr_calls turns
+    @ expr_calls seed
+    @ expr_calls body
+  | EAction (_, value) -> expr_calls value
+  | EUse use ->
+    use.ux_name
+    :: List.concat_map expr_calls (use.ux_arg :: use.ux_caps @ [use.ux_body])
   | EInt _ | EBool _ | EString _ | EVar _ | EField _ | ECaller | EOrigin | ESelfAddr
   | EEpoch | EEpochTime | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _ | EEnumVariant _ -> []
 
 let rec stmt_direct_calls = function
+  | SLocated (_, _, value) -> stmt_direct_calls value
   | SLet (_, _, expr) | SAssign (_, expr) | SFieldSet (_, expr)
   | SIndexSet (_, _, expr) | SReturn (Some expr) | SAssert expr
   | SRequire (expr, _) | SStoragePathSet (_, _, _, expr)
   | SIndexFieldSet (_, _, _, expr) | SLetTuple (_, expr) | SExpr expr ->
     expr_calls expr
+  | SIndexUpdate (_, keys, _, expr)
+  | SStoragePathUpdate (_, keys, _, _, expr) ->
+    List.concat_map expr_calls (expr :: keys)
   | SReturn None -> []
   | SEmit (_, args) | SFieldCall (_, _, args) | SRevertError (_, args) ->
     List.concat_map expr_calls args
@@ -458,8 +576,11 @@ and block_direct_calls body =
   List.concat_map stmt_direct_calls body
 
 let rec stmt_direct_writes = function
+  | SLocated (_, _, value) -> stmt_direct_writes value
   | SFieldSet (field, _) | SIndexSet (field, _, _)
-  | SStoragePathSet (field, _, _, _) | SIndexFieldSet (field, _, _, _) -> [field]
+  | SIndexUpdate (field, _, _, _) | SStoragePathSet (field, _, _, _)
+  | SStoragePathUpdate (field, _, _, _, _)
+  | SIndexFieldSet (field, _, _, _) -> [field]
   | SIf (_, then_body, else_body) ->
     block_direct_writes then_body
     @ Option.value ~default:[] (Option.map block_direct_writes else_body)
@@ -507,8 +628,9 @@ let param_findings program_name fn param =
   else
     []
 
-let stmt_findings program_name fn stmt =
+let rec stmt_findings program_name fn stmt =
   match stmt with
+  | SLocated (_, _, value) -> stmt_findings program_name fn value
   | SExpr (ECall ("transfer", _)) ->
     [finding Warning "unchecked_transfer_result"
       "transfer result is not checked"
@@ -549,6 +671,8 @@ let rec flow_stmt_findings program_name fields fn env stmt =
     signed @ unsigned_arith
   in
   match stmt with
+  | SLocated (_, _, value) ->
+    flow_stmt_findings program_name fields fn env value
   | SLet (name, typ_opt, expr) ->
     let env =
       match typ_opt with
@@ -568,6 +692,9 @@ let rec flow_stmt_findings program_name fields fn env stmt =
     ([], env)
   | SFieldSet (field, expr) | SIndexSet (field, _, expr)
   | SStoragePathSet (field, _, _, expr) | SIndexFieldSet (field, _, _, expr) ->
+    (write_findings field expr, env)
+  | SIndexUpdate (field, _, _, expr)
+  | SStoragePathUpdate (field, _, _, _, expr) ->
     (write_findings field expr, env)
   | SIf (_, then_body, else_body) ->
     let then_findings = flow_block_findings program_name fields fn env then_body in

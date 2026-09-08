@@ -8,6 +8,7 @@
   pvac_ffi
   zk_ffi
   zarith
+  threads
   lwt
   sqlite3
   base64

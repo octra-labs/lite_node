@@ -24,8 +24,8 @@ let of_inputs ~cli_observer ~env_mode =
 let publisher _ =
   {
     role = Octra_consensus.C_role.Observer;
-    label = "observer";
-    consensus_enabled = false;
+    label = "publisher";
+    consensus_enabled = true;
     voting_enabled = false;
     observer_enabled = true;
   }

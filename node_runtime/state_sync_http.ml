@@ -10,6 +10,7 @@ module Metrics = Octra_core.Metrics
 module Request = Cohttp.Request
 module Server = Cohttp_lwt_unix.Server
 module State_sync = Octra_bootstrap.State_sync
+module Cycle = Octra_bootstrap.Sync_cycle
 module Range_part = Octra_bootstrap.Range_part
 module Manifest = Octra_bootstrap.State_sync_manifest
 module Tree = Octra_core.Tree
@@ -37,6 +38,17 @@ let respond_error ?(error_type = "unknown") status msg =
   Server.respond_string
     ~status
     ~headers:cors_headers
+    ~body:(Yojson.Safe.to_string json)
+    ()
+
+let respond_error_after ~seconds ?(error_type = "unknown") status msg =
+  let json = Rest_view.error_response ~error_type ~reason:msg in
+  let headers =
+    Header.add cors_headers "Retry-After" (string_of_int seconds)
+  in
+  Server.respond_string
+    ~status
+    ~headers
     ~body:(Yojson.Safe.to_string json)
     ()
 
@@ -89,6 +101,25 @@ let state_sync_enabled () =
        ~none:false
        ~some:(fun value -> String.trim value <> "")
        (Sys.getenv_opt "OCTRA_STATE_SYNC_EXPORTERS")
+
+let manifest_epoch_limit =
+  Int64.mul 2L (Cycle.interval Cycle.default)
+
+let snapshot_epoch_state ~current_epoch ~snapshot_epoch =
+  let lag = Int64.max 0L (Int64.sub current_epoch snapshot_epoch) in
+  if Int64.compare lag manifest_epoch_limit > 0 then `Old_epoch lag
+  else `Ready lag
+
+let committed_epoch current_epoch =
+  Int64.max 0L (Int64.pred (Int64.of_int !current_epoch))
+
+let snapshot_epoch_reason ~current_epoch ~snapshot_epoch lag =
+  Printf.sprintf
+    "state sync snapshot is behind live head snapshot_epoch = %Ld head_epoch = %Ld lag = %Ld limit = %Ld"
+    snapshot_epoch
+    current_epoch
+    lag
+    manifest_epoch_limit
 
 let respond_state_sync_disabled () =
   respond_error
@@ -341,7 +372,7 @@ let respond_certificate cached =
     ~body:cached.raw
     ()
 
-let handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set =
+let handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
@@ -353,7 +384,21 @@ let handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set =
           `Service_unavailable
           reason
     | Ok cached ->
-        respond_certificate cached
+        let head_epoch = committed_epoch current_epoch in
+        let snapshot_epoch = cached.certificate.Manifest.checkpoint.epoch in
+        begin
+          match snapshot_epoch_state ~current_epoch:head_epoch ~snapshot_epoch with
+          | `Ready _ -> respond_certificate cached
+          | `Old_epoch lag ->
+              let reason =
+                snapshot_epoch_reason ~current_epoch:head_epoch ~snapshot_epoch lag
+              in
+              warn_manifest_unavailable reason;
+              respond_error
+                ~error_type:"state_sync_old_epoch"
+                `Service_unavailable
+                reason
+        end
 
 let field_string ~default name json =
   match json with
@@ -384,7 +429,28 @@ let handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch =
       | Ok cached -> Some cached.certificate.Manifest.checkpoint.epoch
       | Error _ -> None
     in
-    respond_json (State_sync.head_json ~current_epoch ~snapshot_epoch)
+    let head_epoch = committed_epoch current_epoch in
+    let snapshot_status, snapshot_lag =
+      match snapshot_epoch with
+      | None -> "missing", `Null
+      | Some epoch ->
+          begin
+            match snapshot_epoch_state ~current_epoch:head_epoch ~snapshot_epoch:epoch with
+            | `Ready lag -> "ready", `Intlit (Int64.to_string lag)
+            | `Old_epoch lag -> "old_epoch", `Intlit (Int64.to_string lag)
+          end
+    in
+    let response =
+      match State_sync.head_json ~current_epoch ~snapshot_epoch with
+      | `Assoc fields ->
+          `Assoc (fields @ [
+            "snapshot_status", `String snapshot_status;
+            "snapshot_lag", snapshot_lag;
+            "snapshot_lag_limit", `Intlit (Int64.to_string manifest_epoch_limit);
+          ])
+      | other -> other
+    in
+    respond_json response
 
 let handle_client_progress body =
   if not (state_sync_enabled ()) then
@@ -581,7 +647,8 @@ let handle_chunk ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ query =
                   ~size:chunk.size
                   ~sha256:chunk.sha256 >>= function
                 | Error Chunk_busy ->
-                    respond_error
+                    respond_error_after
+                      ~seconds:3
                       ~error_type:"state_sync_busy"
                       `Too_many_requests
                       "state sync source is busy"
@@ -662,7 +729,12 @@ let handle
         ~active_accounts:(Ledger.active_count ledger)
         ~head:(Octra_core.Head_manifest.get_cached ()))
   | `GET, "/state-sync/manifest" ->
-      handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set
+      handle_manifest
+        ~data_dir
+        ~chain_id
+        ~config_hash
+        ~validator_set
+        ~current_epoch
   | `GET, "/state-sync/head" ->
       handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch
   | `POST, "/state-sync/client-progress" ->

@@ -351,6 +351,7 @@ val run_preverify_compute :
   ('a, preverify_unavailable) result Lwt.t
 
 val preverify_stealth_ranges :
+  strict:bool ->
   pubkey_blob:string ->
   sender_enc:string ->
   Octra_core.Crypto.PrivateTransferV4.t ->

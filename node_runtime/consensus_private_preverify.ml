@@ -16,7 +16,7 @@ let eligible tx =
   | Transaction.ClaimOp -> true
   | _ -> false
 
-let create ~field_policy ~result_policy ledger =
+let create ~field_policy ~strict ~result_policy ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
@@ -31,6 +31,7 @@ let create ~field_policy ~result_policy ledger =
         let* result =
           Private_ledger.preverify_private_artifact
             ~field_policy:fields
+            ~strict:(strict ())
             ~worker_priority:priority
             ~result_policy:policy
             ledger
@@ -43,6 +44,7 @@ let create ~field_policy ~result_policy ledger =
             let* binding =
               Private_ledger.bind_private_artifact
                 ~field_policy:(field_policy ())
+                ~strict:(strict ())
                 ~result_policy:(result_policy ())
                 ledger
                 tx
@@ -64,6 +66,7 @@ let create ~field_policy ~result_policy ledger =
         let* binding =
           Private_ledger.bind_private_artifact
             ~field_policy:(field_policy ())
+            ~strict:(strict ())
             ~result_policy:(result_policy ())
             ledger
             tx

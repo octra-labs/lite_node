@@ -60,19 +60,22 @@ let loaded_cache_key circle_id (info : Octra_core.Circles.circle_info) =
 
 let prune_loaded_cache () =
   let now = Unix.gettimeofday () in
-  let stale = ref [] in
+  let expired = ref [] in
   Hashtbl.iter
     (fun key entry ->
       if now -. entry.updated_at > loaded_cache_ttl_secs then
-        stale := key :: !stale)
+        expired := key :: !expired)
     loaded_cache;
-  List.iter (fun key -> Hashtbl.remove loaded_cache key) !stale;
+  List.iter (fun key -> Hashtbl.remove loaded_cache key) !expired;
   if Hashtbl.length loaded_cache > loaded_cache_limit then
     Hashtbl.reset loaded_cache
 
-let decode_bytecode ?(trusted = []) code_b64 =
+let decode_bytecode ?(trusted = []) ?(point_ops = false) code_b64 =
   try
-    match Octra_vm.Admission.decode_deploy ~trusted (Base64.decode_exn code_b64) with
+    match
+      Octra_vm.Admission.decode_deploy
+        ~trusted ~point_ops (Base64.decode_exn code_b64)
+    with
     | Ok admitted ->
       Ok {
         bytecode = Octra_vm.Admission.code admitted;
@@ -86,7 +89,7 @@ let decode_descriptor_bytecode code_b64 =
   try
     let raw = Base64.decode_exn code_b64 in
     if Octra_vm.Program_envelope.is_program raw then
-      match Octra_vm.Admission.decode_program_source raw with
+      match Octra_vm.Admission.decode_program_source ~point_ops:true raw with
       | Ok admitted ->
         Ok {
           bytecode = Octra_vm.Admission.code admitted;
@@ -94,7 +97,7 @@ let decode_descriptor_bytecode code_b64 =
         }
       | Error e -> Error (Octra_vm.Admission.error_message e)
     else
-      decode_bytecode code_b64
+      decode_bytecode ~point_ops:true code_b64
   with e ->
     Error (Printexc.to_string e)
 
@@ -299,6 +302,7 @@ let describe
 
 let load
     ?(trusted = [])
+    ?(point_ops = false)
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     store
     circle_id =
@@ -342,7 +346,7 @@ let load
               match info.runtime with
               | Octra_core.Circles.Octb ->
                 begin
-                  match decode_bytecode ~trusted code_b64 with
+                  match decode_bytecode ~trusted ~point_ops code_b64 with
                   | Ok admitted ->
                     Lwt.return (Ok {
                       circle_id;

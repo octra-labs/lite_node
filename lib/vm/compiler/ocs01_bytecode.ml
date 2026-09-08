@@ -28,7 +28,7 @@ let constructor_code ti =
     STOP;
   |]
 
-let dispatch_code =
+let dispatch_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 100;
@@ -69,7 +69,7 @@ let dispatch_code =
     REVERT;
   |]
 
-let view_code =
+let view_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 200;
@@ -102,7 +102,7 @@ let view_code =
     STOP;
   |]
 
-let transfer_code =
+let transfer_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 300;
@@ -134,7 +134,7 @@ let transfer_code =
     STOP;
   |]
 
-let grant_code =
+let grant_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 400;
@@ -152,7 +152,7 @@ let grant_code =
     STOP;
   |]
 
-let pull_code =
+let pull_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 500;
@@ -196,7 +196,7 @@ let pull_code =
     STOP;
   |]
 
-let mint_code =
+let mint_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 600;
@@ -223,7 +223,7 @@ let mint_code =
     STOP;
   |]
 
-let burn_code =
+let burn_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 700;

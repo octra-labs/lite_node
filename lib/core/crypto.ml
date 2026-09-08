@@ -111,12 +111,12 @@ module FheBalance = struct
     let blob = Pvac_ffi.serialize_cipher_public ct in
     prefix ^ Base64.encode_exn (Bytes.to_string blob)
 
-  let decode_cipher s =
+  let decode_cipher ?(strict = false) ?(cap = true) s =
     if not (is_fhe_cipher s) then Error "not FHE cipher"
     else try
       let b64 = String.sub s prefix_len (String.length s - prefix_len) in
       let raw = Base64.decode_exn b64 in
-      Ok (Pvac_ffi.deserialize_cipher (Bytes.of_string raw))
+      Ok (Pvac_ffi.deserialize_cipher ~strict ~cap (Bytes.of_string raw))
     with e -> Error (Printexc.to_string e)
 
   let public_cipher s =
@@ -126,8 +126,8 @@ module FheBalance = struct
       | Ok ct -> encode_cipher_public ct
       | Error _ -> "0"
 
-  let cipher_has_key_bound_material s =
-    match decode_cipher s with
+  let cipher_has_key_bound_material ?(cap = true) s =
+    match decode_cipher ~cap s with
     | Error e -> Error e
     | Ok ct -> Ok (Pvac_ffi.cipher_has_key_bound_material ct)
 
@@ -199,17 +199,17 @@ module FheBalance = struct
   let blob_supports_alias_rejection blob =
     Result.map pubkey_supports_alias_rejection (load_pubkey_result blob)
 
-  let cipher_base_layers cipher_str =
+  let cipher_base_layers ?(cap = true) cipher_str =
     if cipher_str = "0" || cipher_str = "" then Ok 0
     else
-      match decode_cipher cipher_str with
+      match decode_cipher ~cap cipher_str with
       | Error e -> Error e
       | Ok cipher ->
         (try Ok (Pvac_ffi.cipher_base_layers cipher)
          with e -> Error (Printexc.to_string e))
 
-  let cipher_is_wrapped_scalar cipher_str =
-    match decode_cipher cipher_str with
+  let cipher_is_wrapped_scalar ?(strict = false) ?(cap = true) cipher_str =
+    match decode_cipher ~strict ~cap cipher_str with
     | Error _ -> false
     | Ok cipher -> Pvac_ffi.cipher_is_wrapped_scalar cipher
 
@@ -232,25 +232,27 @@ module FheBalance = struct
       with e ->
         Error ("encrypted balance result shape failed: " ^ Printexc.to_string e)
 
-  let check_private_input cipher_str =
-    match cipher_base_layers cipher_str with
+  let check_private_input ?(cap = true) cipher_str =
+    match cipher_base_layers ~cap cipher_str with
     | Error e -> Error e
-    | Ok layers when layers > private_input_base_limit ->
+    | Ok layers ->
+      if layers > private_input_base_limit then
       Error
         (Printf.sprintf
           "encrypted balance compact refresh required (%d base layers)"
           layers)
-    | Ok _ -> Ok ()
+      else Ok ()
 
-  let check_refresh_source cipher_str =
-    match cipher_base_layers cipher_str with
+  let check_refresh_source ?(cap = true) cipher_str =
+    match cipher_base_layers ~cap cipher_str with
     | Error e -> Error e
-    | Ok layers when layers > refresh_source_base_limit ->
+    | Ok layers ->
+      if layers > refresh_source_base_limit then
       Error
         (Printf.sprintf
           "encrypted balance refresh source exceeds %d base layers"
           refresh_source_base_limit)
-    | Ok _ -> Ok ()
+      else Ok ()
 
   let pubkey_is_key_bound_extension legacy_blob bound_blob =
     match load_pubkey_result legacy_blob, load_pubkey_result bound_blob with
@@ -258,6 +260,7 @@ module FheBalance = struct
     | Error e, _ | _, Error e -> Error e
 
   let deposit_with_pubkey
+      ?(cap = true)
       ?(result_policy = Private_result_policy.Recoverable)
       pk
       ~current_cipher
@@ -269,7 +272,7 @@ module FheBalance = struct
       Error (Printf.sprintf "legacy cipher format (not hfhe_v1): %s"
                (if String.length s > 20 then String.sub s 0 20 ^ "..." else s))
     | Some s ->
-      (match decode_cipher s with
+      (match decode_cipher ~cap s with
        | Error e -> Error ("decode current: " ^ e)
        | Ok curr ->
          encode_private_result
@@ -277,6 +280,7 @@ module FheBalance = struct
            (Pvac_ffi.ct_add pk curr delta_cipher))
 
   let withdraw_with_pubkey
+      ?(cap = true)
       ?(result_policy = Private_result_policy.Recoverable)
       pk
       ~current_cipher
@@ -287,23 +291,23 @@ module FheBalance = struct
       Error (Printf.sprintf "legacy cipher format (not hfhe_v1): %s"
                (if String.length s > 20 then String.sub s 0 20 ^ "..." else s))
     | Some s ->
-      (match decode_cipher s with
+      (match decode_cipher ~cap s with
        | Error e -> Error ("decode current: " ^ e)
        | Ok curr ->
          encode_private_result
            result_policy
            (Pvac_ffi.ct_sub pk curr delta_cipher))
 
-  let verify_commitment pk cipher_str expected_b64 =
-    match decode_cipher cipher_str with
+  let verify_commitment ?(cap = true) pk cipher_str expected_b64 =
+    match decode_cipher ~cap cipher_str with
     | Error _ -> false
     | Ok ct ->
       let hash = Pvac_ffi.commit_ct pk ct in
       let actual = Base64.encode_exn (Bytes.to_string hash) in
       String.equal actual expected_b64
 
-  let compute_bound_commitment pk cipher_str amount =
-    match decode_cipher cipher_str with
+  let compute_bound_commitment ?(cap = true) pk cipher_str amount =
+    match decode_cipher ~cap cipher_str with
     | Error _ -> None
     | Ok ct ->
       let ct_hash = Pvac_ffi.commit_ct pk ct in
@@ -314,16 +318,16 @@ module FheBalance = struct
       let bound = Digestif.SHA256.(digest_string buf |> to_raw_string) in
       Some (Base64.encode_exn bound)
 
-  let verify_bound_commitment pk cipher_str amount expected_b64 =
-    match compute_bound_commitment pk cipher_str amount with
+  let verify_bound_commitment ?(cap = true) pk cipher_str amount expected_b64 =
+    match compute_bound_commitment ~cap pk cipher_str amount with
     | None -> false
     | Some actual -> String.equal actual expected_b64
 
   let cipher_valid s =
     s = "0" || s = "" || is_fhe_cipher s
 
-  let commit pk cipher_str =
-    match decode_cipher cipher_str with
+  let commit ?(cap = true) pk cipher_str =
+    match decode_cipher ~cap cipher_str with
     | Error _ -> None
     | Ok ct ->
       let hash = Pvac_ffi.commit_ct pk ct in
@@ -377,7 +381,7 @@ module FheBalance = struct
     let blob = Pvac_ffi.serialize_bound_range_proof proof in
     range_proof_prefix ^ Base64.encode_exn (Bytes.to_string blob)
 
-  let verify_range_any pk cipher_str range_proof_str =
+  let verify_range_any ~strict pk cipher_str range_proof_str =
     if String.length range_proof_str <= range_proof_prefix_len
        || String.sub range_proof_str 0 range_proof_prefix_len <> range_proof_prefix
     then false
@@ -385,21 +389,28 @@ module FheBalance = struct
       let b64 = String.sub range_proof_str range_proof_prefix_len
                   (String.length range_proof_str - range_proof_prefix_len) in
       let raw = Base64.decode_exn b64 in
-      match decode_cipher cipher_str with
-      | Ok ct -> Pvac_ffi.verify_range_any pk ct (Bytes.of_string raw)
+      match decode_cipher ~strict ~cap:strict cipher_str with
+      | Ok ct -> Pvac_ffi.verify_range_any pk ct (Bytes.of_string raw) strict
       | Error _ -> false
     with _ -> false
 
-  let verify_range pk cipher_str range_proof_str =
-    verify_range_any pk cipher_str range_proof_str
+  let verify_range ~strict pk cipher_str range_proof_str =
+    verify_range_any ~strict pk cipher_str range_proof_str
 
-  let ct_sub_encoded pk cipher_a_str cipher_b_str =
-    match decode_cipher cipher_a_str, decode_cipher cipher_b_str with
+  let ct_sub_encoded ?(cap = true) pk cipher_a_str cipher_b_str =
+    match decode_cipher ~cap cipher_a_str, decode_cipher ~cap cipher_b_str with
     | Ok a, Ok b -> Ok (encode_cipher (Pvac_ffi.ct_sub pk a b))
     | Error e, _ | _, Error e -> Error e
 
-  let verify_claim_amount_with verifier pk claim_cipher_str zero_proof_str amount_commitment_b64 =
-    match decode_cipher claim_cipher_str, decode_zero_proof zero_proof_str with
+  let verify_claim_amount_with
+      ~strict
+      verifier
+      pk
+      claim_cipher_str
+      zero_proof_str
+      amount_commitment_b64 =
+    match decode_cipher ~strict ~cap:strict claim_cipher_str,
+          decode_zero_proof zero_proof_str with
     | Ok ct, Ok zp ->
       (try
          let commitment_bytes = Bytes.of_string (Base64.decode_exn amount_commitment_b64) in
@@ -411,13 +422,26 @@ module FheBalance = struct
     | Error e, _ -> Error ("bad claim cipher: " ^ e)
     | _, Error e -> Error ("bad zero proof: " ^ e)
 
-  let verify_claim_amount_v5 =
-    verify_claim_amount_with Pvac_ffi.verify_zero_bound
+  let verify_claim_amount_v5 ~strict =
+    verify_claim_amount_with
+      ~strict
+      (if strict then Pvac_ffi.verify_zero_bound
+       else Pvac_ffi.verify_zero_amount_prior)
 
-  let verify_key_switch_claim_amount =
-    verify_claim_amount_with Pvac_ffi.verify_zero_bound_key_switch
+  let verify_key_switch_claim_amount ~strict =
+    verify_claim_amount_with
+      ~strict
+      (if strict then Pvac_ffi.verify_zero_bound_key_switch
+       else Pvac_ffi.verify_zero_amount_key_switch_prior)
 
-  let verify_encrypt_proof pk cipher_str amount zero_proof_str amount_commitment_b64 blinding_b64 =
+  let verify_encrypt_proof
+      ~strict
+      pk
+      cipher_str
+      amount
+      zero_proof_str
+      amount_commitment_b64
+      blinding_b64 =
     try
       if Z.sign amount < 0 || Z.compare amount (Z.of_string "9223372036854775807") > 0 then
         Error "amount out of int64 range"
@@ -433,11 +457,19 @@ module FheBalance = struct
         else if not (Bytes.equal expected_commitment actual_commitment) then
           Error "amount commitment mismatch: pedersen_commit(amount, blinding) != amount_commitment"
         else
-          match decode_cipher cipher_str, decode_zero_proof zero_proof_str with
+          match decode_cipher ~strict ~cap:strict cipher_str,
+                decode_zero_proof zero_proof_str with
           | Ok ct, Ok zp ->
             if not (Pvac_ffi.cipher_is_wrapped_scalar ct) then
               Error "amount cipher must be a wrapped scalar"
-            else if Pvac_ffi.verify_zero_bound pk ct zp actual_commitment then Ok ()
+            else if
+              (if strict then Pvac_ffi.verify_zero_bound
+               else Pvac_ffi.verify_zero_amount_prior)
+                pk
+                ct
+                zp
+                actual_commitment
+            then Ok ()
             else Error "bound zero proof verification failed"
           | Error e, _ -> Error ("bad cipher: " ^ e)
           | _, Error e -> Error ("bad zero proof: " ^ e)

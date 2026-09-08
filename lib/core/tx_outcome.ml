@@ -126,6 +126,9 @@ let parse_with decode_tx raw =
   with exn ->
     Error ("outcome_json_invalid:" ^ Printexc.to_string exn)
 
+let parse raw =
+  parse_with Transaction.of_yojson raw
+
 let strictly_ordered rejections =
   let rec loop prior = function
     | [] -> true
@@ -167,6 +170,9 @@ let split_with decode_tx raws =
       end
   in
   loop false [] [] raws
+
+let split raws =
+  split_with Transaction.of_yojson raws
 
 let split_admit raws =
   split_with Tx_payload.decode_admit raws
@@ -257,6 +263,9 @@ let decode_with decode_tx ~confirmed raws =
     match merge ~confirmed ~rejections:partition.rejections with
     | Error _ as error -> error
     | Ok _ -> Ok partition
+
+let decode ~confirmed raws =
+  decode_with Transaction.of_yojson ~confirmed raws
 
 let decode_admit ~confirmed raws =
   decode_with Tx_payload.decode_admit ~confirmed raws

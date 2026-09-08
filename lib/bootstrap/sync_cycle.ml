@@ -7,7 +7,7 @@ type policy = {
 }
 
 type outcome =
-  | Published
+  | Published of int64
   | Failed
 
 type event =
@@ -86,11 +86,14 @@ let completed policy t epoch outcome =
       begin
         match outcome with
         | Failed -> Ok ({ t with running = None }, [])
-        | Published ->
+        | Published published_epoch ->
+            if Int64.compare published_epoch epoch < 0 then
+              Error "sync published epoch precedes capture target"
+            else
             let published =
               match t.published with
-              | None -> epoch
-              | Some prior -> Int64.max prior epoch
+              | None -> published_epoch
+              | Some prior -> Int64.max prior published_epoch
             in
             Ok ({ t with published = Some published; running = None }, [Retain policy.retain])
       end

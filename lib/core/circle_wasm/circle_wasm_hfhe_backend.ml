@@ -42,15 +42,17 @@ let verification_value = function
 let verify_zero_worker ~pubkey ~cipher ~proof =
   VW.try_verify_zero_sync_classified ~pubkey ~cipher ~proof
 
-let verify_range_worker ~pubkey ~cipher ~proof ~commitment =
+let verify_range_worker ~strict ~pubkey ~cipher ~proof ~commitment =
   VW.try_verify_range_bound_sync_classified
+    ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment
 
-let verify_bound_worker ~pubkey ~cipher ~proof ~commitment =
+let verify_bound_worker ~strict ~pubkey ~cipher ~proof ~commitment =
   VW.try_verify_claim_sync_classified
+    ~strict
     ~pubkey
     ~cipher
     ~proof
@@ -63,7 +65,19 @@ let require_string fields key =
   | _ ->
     Error ("missing " ^ key)
 
-let decode_b64_bounded
+let require_strict fields =
+  match List.assoc_opt "strict" fields with
+  | None -> Ok false
+  | Some (`Bool value) -> Ok value
+  | Some _ -> Error "invalid strict"
+
+let require_cap fields =
+  match List.assoc_opt "cap" fields with
+  | None -> Error "missing cap"
+  | Some (`Bool value) -> Ok value
+  | Some _ -> Error "invalid cap"
+
+let decode_b64_cap
     ~encoded_allowed
     ~raw_allowed
     ~label
@@ -85,7 +99,7 @@ let require_pubkey fields key =
   | Ok value ->
     begin
       match
-        decode_b64_bounded
+        decode_b64_cap
           ~encoded_allowed:Hfhe_policy.pubkey_encoded_allowed
           ~raw_allowed:Hfhe_policy.pubkey_raw_allowed
           ~label:key
@@ -104,7 +118,7 @@ let require_seckey fields key =
   | Ok value ->
     begin
       match
-        decode_b64_bounded
+        decode_b64_cap
           ~encoded_allowed:Hfhe_policy.seckey_encoded_allowed
           ~raw_allowed:Hfhe_policy.seckey_raw_allowed
           ~label:key
@@ -178,16 +192,16 @@ let require_seed fields key =
     else
       require_blinding fields key
 
-let decode_cipher_bounded value =
+let decode_cipher_cap ~cap value =
   if not (Hfhe_policy.ciphertext_allowed value) then
     Error "ciphertext exceeds resource policy"
   else
-    Crypto.FheBalance.decode_cipher value
+    Crypto.FheBalance.decode_cipher ~cap value
 
-let decode_verifier_cipher value =
+let decode_verifier_cipher ~cap value =
   if not (Hfhe_policy.verifier_ciphertext_allowed value) then
     Error "ciphertext exceeds verifier resource policy"
-  else match decode_cipher_bounded value with
+  else match decode_cipher_cap ~cap value with
   | Error _ as e ->
     e
   | Ok cipher ->
@@ -201,13 +215,13 @@ let decode_verifier_cipher value =
         Error "ciphertext exceeds verifier resource policy"
     end
 
-let decode_zero_proof_bounded value =
+let decode_zero_proof_cap value =
   if not (Hfhe_policy.proof_allowed value) then
     Error "proof exceeds resource policy"
   else
     Crypto.FheBalance.decode_zero_proof value
 
-let decode_range_proof_bounded value =
+let decode_range_proof_cap value =
   let open Crypto.FheBalance in
   if not (Hfhe_policy.proof_allowed value) then
     Error "proof exceeds resource policy"
@@ -226,8 +240,8 @@ let decode_range_proof_bounded value =
     with _ ->
       Error "invalid range proof"
 
-let verify_zero_bounded pk ciphertext proof =
-  match decode_verifier_cipher ciphertext, decode_zero_proof_bounded proof with
+let verify_zero_cap ~cap pk ciphertext proof =
+  match decode_verifier_cipher ~cap ciphertext, decode_zero_proof_cap proof with
   | Ok cipher, Ok _ ->
     verify_zero_worker
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
@@ -237,14 +251,15 @@ let verify_zero_bounded pk ciphertext proof =
   | _ ->
     Ok false
 
-let verify_range_bounded pk ciphertext proof amount_commitment =
+let verify_range_cap ~strict ~cap pk ciphertext proof amount_commitment =
   match
-    decode_verifier_cipher ciphertext,
-    decode_range_proof_bounded proof,
+    decode_verifier_cipher ~cap ciphertext,
+    decode_range_proof_cap proof,
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok range_proof, Ok commitment ->
     verify_range_worker
+      ~strict
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof:
@@ -255,14 +270,15 @@ let verify_range_bounded pk ciphertext proof amount_commitment =
   | _ ->
     Ok false
 
-let verify_bound_bounded pk ciphertext proof amount_commitment =
+let verify_bound_cap ~strict ~cap pk ciphertext proof amount_commitment =
   match
-    decode_verifier_cipher ciphertext,
-    decode_zero_proof_bounded proof,
+    decode_verifier_cipher ~cap ciphertext,
+    decode_zero_proof_cap proof,
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok _, Ok commitment ->
     verify_bound_worker
+      ~strict
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof
@@ -271,7 +287,7 @@ let verify_bound_bounded pk ciphertext proof amount_commitment =
   | _ ->
     Ok false
 
-let run_action fields =
+let run_action_cap ~cap fields =
   let open Crypto.FheBalance in
   match List.assoc_opt "action" fields with
   | Some (`String "encrypt_value_seeded") ->
@@ -300,7 +316,7 @@ let run_action fields =
       match require_pubkey fields "pubkey_b64", require_seckey fields "seckey_b64", require_string fields "ciphertext" with
       | Ok pk, Ok sk, Ok ciphertext ->
         begin
-          match decode_cipher_bounded ciphertext with
+          match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
             value_json (`String (Int64.to_string (Pvac_ffi.dec_value pk sk ct)))
           | Error e ->
@@ -316,7 +332,7 @@ let run_action fields =
       match require_pubkey fields "pubkey_b64", require_string fields "lhs_ciphertext", require_string fields "rhs_ciphertext" with
       | Ok pk, Ok lhs_ciphertext, Ok rhs_ciphertext ->
         begin
-          match decode_cipher_bounded lhs_ciphertext, decode_cipher_bounded rhs_ciphertext with
+          match decode_cipher_cap ~cap lhs_ciphertext, decode_cipher_cap ~cap rhs_ciphertext with
           | Ok lhs, Ok rhs ->
             value_json (`String (encode_cipher (Pvac_ffi.ct_add pk lhs rhs)))
           | Error e, _
@@ -333,7 +349,7 @@ let run_action fields =
       match require_pubkey fields "pubkey_b64", require_string fields "lhs_ciphertext", require_string fields "rhs_ciphertext" with
       | Ok pk, Ok lhs_ciphertext, Ok rhs_ciphertext ->
         begin
-          match decode_cipher_bounded lhs_ciphertext, decode_cipher_bounded rhs_ciphertext with
+          match decode_cipher_cap ~cap lhs_ciphertext, decode_cipher_cap ~cap rhs_ciphertext with
           | Ok lhs, Ok rhs ->
             value_json (`String (encode_cipher (Pvac_ffi.ct_sub pk lhs rhs)))
           | Error e, _
@@ -350,7 +366,7 @@ let run_action fields =
       match require_pubkey fields "pubkey_b64", require_string fields "ciphertext", require_int64 fields "factor" with
       | Ok pk, Ok ciphertext, Ok factor ->
         begin
-          match decode_cipher_bounded ciphertext with
+          match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
             value_json (`String (encode_cipher (Pvac_ffi.ct_scale pk ct factor)))
           | Error e ->
@@ -366,7 +382,7 @@ let run_action fields =
       match require_pubkey fields "pubkey_b64", require_string fields "ciphertext", require_int64 fields "amount" with
       | Ok pk, Ok ciphertext, Ok amount ->
         begin
-          match decode_cipher_bounded ciphertext with
+          match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
             value_json (`String (encode_cipher (Pvac_ffi.ct_add_const pk ct amount 0L)))
           | Error e ->
@@ -382,7 +398,7 @@ let run_action fields =
       match require_pubkey fields "pubkey_b64", require_string fields "ciphertext", require_int64 fields "amount" with
       | Ok pk, Ok ciphertext, Ok amount ->
         begin
-          match decode_cipher_bounded ciphertext with
+          match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
             value_json (`String (encode_cipher (Pvac_ffi.ct_sub_const pk ct amount)))
           | Error e ->
@@ -410,7 +426,7 @@ let run_action fields =
         if not (Hfhe_policy.ciphertext_allowed ciphertext) then
           error_json "ciphertext exceeds resource policy"
         else begin
-          match commit pk ciphertext with
+          match commit ~cap pk ciphertext with
           | Some value -> value_json (`String value)
           | None -> error_json "commit failed"
         end
@@ -425,7 +441,7 @@ let run_action fields =
         if not (Hfhe_policy.ciphertext_allowed ciphertext) then
           error_json "ciphertext exceeds resource policy"
         else begin
-          match compute_bound_commitment pk ciphertext amount with
+          match compute_bound_commitment ~cap pk ciphertext amount with
           | Some value -> value_json (`String value)
           | None -> error_json "bound commitment failed"
         end
@@ -445,7 +461,7 @@ let run_action fields =
         begin
           match
             with_verifier_lane
-              (fun () -> verify_zero_bounded pk ciphertext proof)
+              (fun () -> verify_zero_cap ~cap pk ciphertext proof)
           with
           | Ok value -> value_json (`Bool value)
           | Error e -> unavailable_json e
@@ -461,14 +477,17 @@ let run_action fields =
         require_pubkey fields "pubkey_b64",
         require_string fields "ciphertext",
         require_string fields "proof",
-        require_string fields "amount_commitment"
+        require_string fields "amount_commitment",
+        require_strict fields
       with
-      | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment ->
+      | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment, Ok strict ->
         begin
           match
             with_verifier_lane
               (fun () ->
-                verify_range_bounded
+                verify_range_cap
+                  ~strict
+                  ~cap
                   pk
                   ciphertext
                   proof
@@ -477,10 +496,11 @@ let run_action fields =
           | Ok value -> value_json (`Bool value)
           | Error e -> unavailable_json e
         end
-      | Error e, _, _, _
-      | _, Error e, _, _
-      | _, _, Error e, _
-      | _, _, _, Error e ->
+      | Error e, _, _, _, _
+      | _, Error e, _, _, _
+      | _, _, Error e, _, _
+      | _, _, _, Error e, _
+      | _, _, _, _, Error e ->
         error_json e
     end
   | Some (`String "verify_bound") ->
@@ -489,14 +509,17 @@ let run_action fields =
         require_pubkey fields "pubkey_b64",
         require_string fields "ciphertext",
         require_string fields "proof",
-        require_string fields "amount_commitment"
+        require_string fields "amount_commitment",
+        require_strict fields
       with
-      | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment ->
+      | Ok pk, Ok ciphertext, Ok proof, Ok amount_commitment, Ok strict ->
         begin
           match
             with_verifier_lane
               (fun () ->
-                verify_bound_bounded
+                verify_bound_cap
+                  ~strict
+                  ~cap
                   pk
                   ciphertext
                   proof
@@ -505,16 +528,22 @@ let run_action fields =
           | Ok value -> value_json (`Bool value)
           | Error e -> unavailable_json e
         end
-      | Error e, _, _, _
-      | _, Error e, _, _
-      | _, _, Error e, _
-      | _, _, _, Error e ->
+      | Error e, _, _, _, _
+      | _, Error e, _, _, _
+      | _, _, Error e, _, _
+      | _, _, _, Error e, _
+      | _, _, _, _, Error e ->
         error_json e
     end
   | Some (`String action) ->
     error_json ("unsupported action: " ^ action)
   | _ ->
     error_json "missing action"
+
+let run_action fields =
+  match require_cap fields with
+  | Ok cap -> run_action_cap ~cap fields
+  | Error e -> error_json e
 
 let call_json input_json =
   let output_json =

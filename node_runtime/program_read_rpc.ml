@@ -7,6 +7,12 @@ type 'handler dispatch_adapters = {
   store_label_read :
     (store:Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result) ->
     'handler;
+  store_chaindata_read :
+    (store:Octra_core.Store_irmin.t ->
+     chaindata:Octra_core.Store_chaindata.t ->
+     Yojson.Safe.t ->
+     rpc_result) ->
+    'handler;
   chaindata_read :
     (chaindata:Octra_core.Store_chaindata.t -> Yojson.Safe.t -> rpc_result) ->
     'handler;
@@ -15,6 +21,9 @@ type 'handler dispatch_adapters = {
     'handler;
   json0_read :
     (json:Yojson.Safe.t option -> rpc_result) ->
+    'handler;
+  compile_read :
+    (point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
     'handler;
   program_info : 'handler;
   program_list : 'handler;
@@ -63,9 +72,9 @@ let compile_rpc handler input =
 
 let dispatch adapters =
   let store_label_read = adapters.store_label_read in
+  let store_chaindata_read = adapters.store_chaindata_read in
   let chaindata_read = adapters.chaindata_read in
   let no_ctx = adapters.no_ctx in
-  let json0_read = adapters.json0_read in
   Rpc_dispatch.program_routes Rpc_dispatch.{
     program_info = adapters.program_info;
     program_receipt =
@@ -79,22 +88,24 @@ let dispatch adapters =
     program_storage_dump =
       store_label_read Octra_vm.Contract_rpc.contract_storage_dump_params;
     program_abi =
-      store_label_read Octra_vm.Contract_rpc.abi_params;
+      store_chaindata_read Octra_vm.Contract_rpc.abi_params;
     program_verify =
-      store_label_read Octra_vm.Contract_rpc.verify_params;
+      store_chaindata_read Octra_vm.Contract_rpc.verify_params;
     program_save_abi = adapters.program_save_abi;
     program_source =
-      store_label_read Octra_vm.Contract_rpc.source_params;
+      store_chaindata_read Octra_vm.Contract_rpc.source_params;
     program_bytecode =
       store_label_read Octra_vm.Contract_rpc.program_bytecode_params;
     program_compile_assembly =
       no_ctx (compile_rpc Octra_vm.Contract_rpc.compile_assembly_params);
     program_compile_aml =
-      no_ctx (compile_rpc Octra_vm.Contract_rpc.compile_aml_params);
+      adapters.compile_read (fun ~point_ops params ->
+        compile_rpc (Octra_vm.Contract_rpc.compile_aml_params ~point_ops) params);
     program_compile_aml_multi =
-      json0_read (fun ~json ->
+      adapters.compile_read (fun ~point_ops params ->
         compile_rpc
-          (fun value -> Octra_vm.Contract_rpc.compile_aml_multi ~json:value)
-          json);
+          (fun value -> Octra_vm.Contract_rpc.compile_aml_multi_for
+            ~point_ops ~json:(Octra_core.Rpc.param_json value 0))
+          params);
     program_tokens_by_address = adapters.program_tokens_by_address;
   }

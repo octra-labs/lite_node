@@ -60,7 +60,7 @@ let open_index_map readonly card ~key ~value ~name env =
   else
     Lmdb.Map.create card ~key ~value ~name env
 
-let open_index ?(readonly=false) path =
+let open_index ?(readonly = false) path =
   if not (Sys.file_exists path) && readonly then
     failwith "chaindata index: read-only directory is missing"
   else if not (Sys.file_exists path) then begin
@@ -141,6 +141,10 @@ let close t =
     Lmdb.Env.close t.env;
     t.closed <- true
   end
+
+let sync t =
+  if t.readonly then invalid_arg "chaindata index is read-only"
+  else Lmdb.Env.sync t.env
 
 let encode_tx_loc ~seg_id ~offset ~len ~epoch_id =
   let buf = Bytes.create 20 in

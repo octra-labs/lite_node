@@ -23,6 +23,12 @@ struct Fp {
     uint64_t hi;
 };
 
+inline bool fp_is_reduced(const Fp& value) {
+    return
+        (value.hi & ~MASK63) == 0 &&
+        (value.lo != UINT64_MAX || value.hi != MASK63);
+}
+
 inline bool fp_to_i64(const Fp& value, int64_t& out) {
     u128 p = (u128(1) << 127) - 1;
     u128 raw = (u128(value.hi) << 64) | value.lo;

@@ -119,6 +119,7 @@ val backfill_kat : Ledger.t -> string -> unit
 
 val encrypt_plan :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
@@ -127,6 +128,7 @@ val encrypt_plan :
 
 val prepare_encrypt_plan :
   field_policy:field_policy ->
+  ?cap:bool ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -134,6 +136,7 @@ val prepare_encrypt_plan :
 
 val decrypt_plan :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
@@ -142,6 +145,7 @@ val decrypt_plan :
 
 val prepare_decrypt_plan :
   field_policy:field_policy ->
+  ?cap:bool ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -161,6 +165,7 @@ val apply_decrypt_plan :
 
 val apply_encrypt :
   field_policy:field_policy ->
+  strict:bool ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -168,6 +173,7 @@ val apply_encrypt :
 
 val apply_decrypt :
   field_policy:field_policy ->
+  strict:bool ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -175,6 +181,7 @@ val apply_decrypt :
 
 val key_switch_plan :
   field_policy:field_policy ->
+  strict:bool ->
   ?legacy_public_replay:Pvac_legacy_public_replay.decision ->
   Ledger.t ->
   Transaction.t ->
@@ -182,6 +189,7 @@ val key_switch_plan :
 
 val preverify_key_switch_artifact :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
@@ -195,6 +203,7 @@ val failure_action : failure -> failure_action
 
 val bind_key_switch_artifact :
   field_policy:field_policy ->
+  strict:bool ->
   Ledger.t ->
   Transaction.t ->
   key_switch_artifact ->
@@ -202,6 +211,7 @@ val bind_key_switch_artifact :
 
 val preverify_private_artifact :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
@@ -210,6 +220,7 @@ val preverify_private_artifact :
 
 val verify_private :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
@@ -218,6 +229,7 @@ val verify_private :
 
 val bind_private_artifact :
   field_policy:field_policy ->
+  strict:bool ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
   Transaction.t ->
@@ -226,13 +238,22 @@ val bind_private_artifact :
 
 val prepared_current :
   field_policy:field_policy ->
+  ?cap:bool ->
   Ledger.t ->
   Transaction.t ->
   prepared ->
   bool Lwt.t
 
+val key_switch_cache_key :
+  field_policy ->
+  bool ->
+  Ledger.t ->
+  Transaction.t ->
+  string Lwt.t
+
 val prepare_key_switch_plan :
   field_policy:field_policy ->
+  ?cap:bool ->
   Ledger.t ->
   Transaction.t ->
   (key_switch_plan, failure) result Lwt.t
@@ -254,6 +275,7 @@ val key_switch_requests_legacy_audit :
 
 val apply_key_switch :
   field_policy:field_policy ->
+  strict:bool ->
   ?legacy_public_replay:Pvac_legacy_public_replay.decision ->
   Ledger.t ->
   Transaction.t ->
@@ -267,6 +289,7 @@ val apply_key_switch_plan :
 
 val stealth_plan :
   field_policy:field_policy ->
+  ?cap:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
@@ -275,6 +298,7 @@ val stealth_plan :
 
 val prepare_stealth_plan :
   field_policy:field_policy ->
+  ?cap:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->
@@ -282,6 +306,7 @@ val prepare_stealth_plan :
   (stealth_plan, failure) result Lwt.t
 
 val stealth_inline_range :
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
@@ -294,6 +319,7 @@ val stealth_accept_range :
 
 val stealth_binding :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
@@ -302,6 +328,7 @@ val stealth_binding :
 
 val claim_plan :
   field_policy:field_policy ->
+  strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
   Transaction.t ->
@@ -309,11 +336,13 @@ val claim_plan :
 
 val prepare_claim_plan :
   field_policy:field_policy ->
+  ?cap:bool ->
   Ledger.t ->
   Transaction.t ->
   (claim_plan, failure) result Lwt.t
 
 val claim_balance_plan :
+  ?cap:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->
   Ledger.t ->

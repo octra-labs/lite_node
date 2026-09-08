@@ -12,13 +12,14 @@ type error =
   | Verify_error of string
   | Unsafe_error of string
 
-val of_code : Contract_vm.instr array -> (t, error) result
-val of_program : ?facts:Program_type_flow.facts -> Contract_vm.instr array -> (t, error) result
-val decode : string -> (t, error) result
-val decode_deploy : ?trusted:Program_attestation.key list -> string -> (t, error) result
-val decode_program : ?trusted:Program_attestation.key list -> string -> (t, error) result
-val decode_program_source : string -> (t, error) result
+val of_code : ?point_ops:bool -> Contract_vm.instr array -> (t, error) result
+val of_program : ?point_ops:bool -> ?facts:Program_type_flow.facts -> Contract_vm.instr array -> (t, error) result
+val decode : ?point_ops:bool -> string -> (t, error) result
+val decode_deploy : ?trusted:Program_attestation.key list -> ?point_ops:bool -> string -> (t, error) result
+val decode_program : ?trusted:Program_attestation.key list -> ?point_ops:bool -> string -> (t, error) result
+val decode_program_source : ?point_ops:bool -> string -> (t, error) result
 val code : t -> Contract_vm.instr array
 val effects : t -> Program_effects.t
 val profile : t -> profile
+val check_standard : point_ops:bool -> t -> (unit, error) result
 val error_message : error -> string

@@ -218,8 +218,8 @@ lib/core/pvac_legacy_public_replay.ml
 lib/core/pvac_legacy_public_replay.mli
 lib/core/pvac_migration.ml
 lib/core/pvac_migration.mli
-lib/core/pvac_migration_entitlement.ml
-lib/core/pvac_migration_entitlement.mli
+lib/core/pvac_migration_admission.ml
+lib/core/pvac_migration_admission.mli
 lib/core/pvac_registry.ml
 lib/core/pvac_registry.mli
 lib/core/pvac_verify_direct.ml

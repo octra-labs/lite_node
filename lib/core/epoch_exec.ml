@@ -1591,7 +1591,9 @@ let circle_cell_plan ~backend ~current_epoch ~expected_transition_hash tx =
       | Ok plan when backend.proof_mode = Rule_graph.Prior ->
         Lwt.return_ok plan
       | Ok plan ->
-        let* verified = Circle_cell_transition.verify_classified plan in
+        let* verified =
+          Circle_cell_transition.verify_classified ~strict:true plan
+        in
         begin
           match verified with
           | Ok () -> Lwt.return_ok plan

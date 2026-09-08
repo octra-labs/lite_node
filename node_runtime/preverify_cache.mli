@@ -4,6 +4,7 @@
 type result = Preverify_submit.result = {
   delta_ok : bool;
   balance_ok : bool;
+  strict : bool;
   sender_enc_snapshot : string;
 }
 
@@ -77,6 +78,7 @@ val gate :
 
 val ready_result :
   string ->
+  strict:bool ->
   sender_enc_snapshot:string ->
   result option
 

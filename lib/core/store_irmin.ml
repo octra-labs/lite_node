@@ -95,6 +95,8 @@ type t = {
   stealth_counter : int64 ref;
   mutable tags : tag_index;
   mutable split_epoch : int option;
+  mutable gc_planning : bool;
+  mutable gc_need : int64 option;
   tag_lock : Lwt_mutex.t;
   store_path : string;
   pvac_dir : string;
@@ -150,6 +152,45 @@ let make_info msg =
   let date = Int64.of_float (Unix.gettimeofday ()) in
   fun () -> Store.Info.v ~author:"octra" ~message:msg date
 
+let sync_branches path =
+  List.iter (fun file ->
+    let fd = Unix.openfile file [Unix.O_RDONLY] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd)
+      (fun () -> Unix.fsync fd)
+  ) [Filename.concat path "store.branches"; path]
+
+let clear_splits repo path =
+  let* branches = Store.Branch.list repo in
+  let* () = Lwt_list.iter_s (fun branch ->
+    match split_id branch with
+    | Some _ -> Store.Branch.remove repo branch
+    | None -> Lwt.return_unit
+  ) branches in
+  sync_branches path;
+  Lwt.return_unit
+
+let check_split repo store split =
+  match split with
+  | None -> Lwt.return_none
+  | Some epoch ->
+    let* commit = Store.Branch.find repo (Printf.sprintf "pack_split_%d" epoch) in
+    match commit with
+    | None -> Lwt.return_none
+    | Some commit ->
+      Lwt.catch
+        (fun () ->
+          let* roots = Store.lcas_with_commit store ~max_depth:65_536 ~n:1 commit in
+          match roots with
+          | Ok [root] when Store.Commit.hash root = Store.Commit.hash commit ->
+            Lwt.return_some epoch
+          | Ok _ | Error _ -> Lwt.return_none)
+        (function
+          | Lwt.Canceled as error -> Lwt.fail error
+          | error ->
+            Octra_log.warn "gc" "event = split_check error = %s"
+              (Printexc.to_string error);
+            Lwt.return_none)
+
 let open_store ?(fresh=false) ?(readonly=false) path =
   let path = absolute_path path in
   let config = Irmin_pack.Conf.init
@@ -164,6 +205,11 @@ let open_store ?(fresh=false) ?(readonly=false) path =
   let* repo = Store.Repo.v config in
   let* store = Store.main repo in
   let* tags, split_epoch = load_tags repo in
+  let* checked_split = check_split repo store split_epoch in
+  let* () =
+    if not readonly && checked_split <> split_epoch then clear_splits repo path
+    else Lwt.return_unit
+  in
   let counter = ref 0L in
   let* v = Store.find store ["index"; "stealth_counter"] in
   (match v with
@@ -185,7 +231,9 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     account_mode = Rule_graph.Prior;
     stealth_counter = counter;
     tags;
-    split_epoch;
+    split_epoch = checked_split;
+    gc_planning = false;
+    gc_need = None;
     tag_lock = Lwt_mutex.create ();
     store_path = path;
     pvac_dir = pvac_dir_of_store_path path;
@@ -1385,22 +1433,69 @@ let list_contracts t =
     ) entries in
     Lwt.return addrs
 
+type contract_page = {
+  addresses : string list;
+  more : bool;
+}
+
+let list_contracts_page t ~offset ~limit =
+  let* tree_opt = read_tree t ["contracts"] in
+  match tree_opt with
+  | None -> Lwt.return { addresses = []; more = false }
+  | Some tree ->
+    let offset = max 0 offset in
+    let limit = max 0 limit in
+    let read_limit = if limit = max_int then max_int else limit + 1 in
+    let* rows = Store.Tree.list tree ~offset ~length:read_limit [] in
+    let addresses = List.filter_map (fun (name, _) ->
+      if Crypto.is_octra_address name then Some name
+      else None
+    ) rows in
+    let more = List.length addresses > limit in
+    let rec first count acc = function
+      | _ when count = 0 -> List.rev acc
+      | [] -> List.rev acc
+      | address :: rest -> first (count - 1) (address :: acc) rest
+    in
+    Lwt.return { addresses = first limit [] addresses; more }
+
 let read_contract_storage_key t addr key =
   read t ["contracts"; addr; "storage"; key]
 
-let list_contract_storage t addr =
+type contract_storage_page = {
+  entries : (string * string) list;
+  more : bool;
+}
+
+let list_contract_storage_page t addr ~limit ~value_limit =
   let* tree_opt = read_tree t ["contracts"; addr; "storage"] in
   match tree_opt with
-  | None -> Lwt.return []
+  | None -> Lwt.return { entries = []; more = false }
   | Some tree ->
-    let* entries = Store.Tree.list tree [] in
-    let* pairs = Lwt_list.filter_map_s (fun (key, _) ->
-      let* v = read t ["contracts"; addr; "storage"; key] in
+    let limit = max 0 limit in
+    let value_limit = max 0 value_limit in
+    let read_limit = if limit = max_int then max_int else limit + 1 in
+    let* rows = Store.Tree.list tree ~length:read_limit [] in
+    let more = List.length rows > limit in
+    let rec first count acc = function
+      | _ when count = 0 -> List.rev acc
+      | [] -> List.rev acc
+      | row :: rest -> first (count - 1) (row :: acc) rest
+    in
+    let* entries = Lwt_list.filter_map_s (fun (key, _) ->
+      let* v = Store.Tree.find tree [key] in
       match v with
-      | Some value -> Lwt.return (Some (key, value))
+      | Some value ->
+        let value =
+          if String.length value > value_limit then
+            String.sub value 0 value_limit
+          else
+            value
+        in
+        Lwt.return (Some (key, value))
       | None -> Lwt.return_none
-    ) entries in
-    Lwt.return pairs
+    ) (first limit [] rows) in
+    Lwt.return { entries; more }
 
 let set_optional_string t path value_opt =
   match value_opt with
@@ -2300,13 +2395,24 @@ let tag_epoch t epoch_id =
     | None -> Lwt.return_unit)
 
 let rollback_to_epoch t epoch_id =
-  let branch = Printf.sprintf "epoch_%d" epoch_id in
-  let* commit_opt = Store.Branch.find t.repo branch in
-  match commit_opt with
-  | None -> Lwt.return (Error (Printf.sprintf "epoch %d tag not found" epoch_id))
-  | Some commit ->
-    let* () = Store.Head.set t.store commit in
-    Lwt.return (Ok ())
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    if t.gc_planning || not (Store.Gc.is_finished t.repo) then
+      Lwt.return_error "epoch rollback blocked by pack collection"
+    else if Option.is_some t.batch_tree then
+      Lwt.return_error "epoch rollback blocked by active batch"
+    else
+      let branch = Printf.sprintf "epoch_%d" epoch_id in
+      let* commit_opt = Store.Branch.find t.repo branch in
+      match commit_opt with
+      | None -> Lwt.return_error (Printf.sprintf "epoch %d tag not found" epoch_id)
+      | Some commit ->
+        t.split_epoch <- None;
+        t.gc_need <- None;
+        let* () = clear_splits t.repo t.store_path in
+        let* () = Store.Head.set t.store commit in
+        Store.flush t.repo;
+        sync_branches t.store_path;
+        Lwt.return_ok ())
 
 let drop_epoch_tags_after t epoch_id =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
@@ -2360,7 +2466,8 @@ let epoch_tag_stats t =
 let pack_gc_status t =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
     Lwt.return
-      (t.split_epoch, Store.Gc.is_allowed t.repo, not (Store.Gc.is_finished t.repo)))
+      (t.split_epoch, Store.Gc.is_allowed t.repo,
+       t.gc_planning || not (Store.Gc.is_finished t.repo), t.gc_need))
 
 type gc_start =
   | Gc_started of { floor : int; removed : int }
@@ -2372,7 +2479,31 @@ type gc_start =
   | Gc_missing of int
   | Gc_error of string
 
-let gc_keep_epochs = 8192
+let gc_keep_default = 8192
+let gc_keep_min = 4096
+let gc_keep_max = 65_536
+
+let gc_keep_epochs_of env =
+  match env "OCTRA_GC_KEEP_EPOCHS" with
+  | None -> Ok gc_keep_default
+  | Some raw ->
+    begin
+      match int_of_string_opt (String.trim raw) with
+      | Some value when value >= gc_keep_min && value <= gc_keep_max ->
+        Ok value
+      | _ ->
+        Error
+          (Printf.sprintf
+             "OCTRA_GC_KEEP_EPOCHS must be in %d..%d"
+             gc_keep_min
+             gc_keep_max)
+    end
+
+let gc_keep_epochs =
+  match gc_keep_epochs_of Sys.getenv_opt with
+  | Ok value -> value
+  | Error reason -> invalid_arg reason
+
 let gc_reserve = Int64.shift_left 1L 33
 
 external disk_free : string -> int64 = "octra_disk_free"
@@ -2381,14 +2512,48 @@ let sat_add left right =
   if Int64.compare left (Int64.sub Int64.max_int right) > 0 then Int64.max_int
   else Int64.add left right
 
-let pack_bytes path =
-  Sys.readdir path
-  |> Array.fold_left (fun total name ->
-    let file = Filename.concat path name in
-    match (Unix.LargeFile.lstat file).Unix.LargeFile.st_kind with
-    | Unix.S_REG -> sat_add total (Unix.LargeFile.stat file).Unix.LargeFile.st_size
-    | _ -> total
-  ) 0L
+let sat_mul left right =
+  if left = 0L || right = 0L then 0L
+  else if Int64.compare left (Int64.div Int64.max_int right) > 0 then
+    Int64.max_int
+  else
+    Int64.mul left right
+
+type gc_measure = {
+  records : int64;
+  bytes : int64;
+}
+
+let path_measure path =
+  List.fold_left (fun total part ->
+    sat_add total (Int64.of_int (String.length part + 4))
+  ) 5L path
+
+let measure_tree tree =
+  let records = ref 1L in
+  let bytes = ref 512L in
+  let add path value_bytes =
+    records := sat_add !records 1L;
+    bytes := sat_add !bytes (sat_add (path_measure path) value_bytes);
+    if Int64.rem !records 4096L = 0L then Lwt.pause ()
+    else Lwt.return_unit
+  in
+  let* () =
+    Store.Tree.fold
+      ~tree:(fun path _ () -> add path 0L)
+      ~contents:(fun path value () ->
+        add path (Int64.of_int (String.length value + 4)))
+      tree
+      ()
+  in
+  Lwt.return { records = !records; bytes = !bytes }
+
+let gc_space_need measure =
+  sat_add
+    gc_reserve
+    (sat_add
+       (sat_mul measure.bytes 2L)
+       (sat_mul measure.records 512L))
 
 let remove_tags_before t floor =
   let rec loop removed seq =
@@ -2443,8 +2608,81 @@ let set_split t epoch commit =
   let* () = Store.Branch.set t.repo branch commit in
   let* () = remove_old_splits t epoch in
   t.split_epoch <- Some epoch;
+  t.gc_need <- None;
   Store.flush t.repo;
+  sync_branches t.store_path;
   Lwt.return_unit
+
+let collect_plan t ~keep current_epoch =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    if t.gc_planning || not (Store.Gc.is_finished t.repo) then
+      Lwt.return (`Done Gc_busy)
+    else
+      let* head = Store.Head.find t.store in
+      match head, t.split_epoch with
+      | None, _ -> Lwt.return (`Done (Gc_missing current_epoch))
+      | Some head, None ->
+        let* () = set_split t current_epoch head in
+        Lwt.return (`Done (Gc_split current_epoch))
+      | Some _, Some floor when current_epoch - floor < keep ->
+        Lwt.return (`Done (Gc_wait (floor + keep)))
+      | Some _, Some floor ->
+        let branch = Printf.sprintf "pack_split_%d" floor in
+        let* commit = Store.Branch.find t.repo branch in
+        match commit with
+        | None -> Lwt.return (`Done (Gc_missing floor))
+        | Some commit ->
+          t.gc_planning <- true;
+          Lwt.return (`Measure (floor, commit)))
+
+let clear_gc_plan t =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    t.gc_planning <- false;
+    Lwt.return_unit)
+
+let save_gc_need t need =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    t.gc_need <- Some need;
+    Lwt.return_unit)
+
+let start_pack_gc t ~keep ~floor ~commit current_epoch =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    if not t.gc_planning || not (Store.Gc.is_finished t.repo) then
+      Lwt.return Gc_busy
+    else match t.split_epoch with
+    | Some selected when selected = floor ->
+      let* selected_commit =
+        Store.Branch.find t.repo (Printf.sprintf "pack_split_%d" floor)
+      in
+      if not (Option.fold ~none:false ~some:(fun selected ->
+        Store.Commit.hash selected = Store.Commit.hash commit) selected_commit)
+      then Lwt.return (Gc_missing floor)
+      else
+      let* head = Store.Head.find t.store in
+      begin
+        match head with
+        | None -> Lwt.return (Gc_missing current_epoch)
+        | Some head ->
+          let* removed = remove_tags_before t floor in
+          Store.flush t.repo;
+          let* started =
+            Store.Gc.run
+              ~finished:(gc_done current_epoch)
+              t.repo
+              (Store.Commit.key commit)
+          in
+          begin
+            match started with
+            | Ok true ->
+              let split_epoch = max current_epoch t.tags.max_epoch in
+              let* () = set_split t split_epoch head in
+              Lwt.return (Gc_started { floor; removed })
+            | Ok false -> Lwt.return Gc_busy
+            | Error (`Msg reason) -> Lwt.return (Gc_error reason)
+          end
+      end
+    | Some selected -> Lwt.return (Gc_wait (selected + keep))
+    | None -> Lwt.return (Gc_missing floor))
 
 let collect_pack_at ?free t ~keep current_epoch =
   Lwt.catch
@@ -2453,40 +2691,23 @@ let collect_pack_at ?free t ~keep current_epoch =
       else if not (Store.Gc.is_allowed t.repo) then Lwt.return Gc_off
       else if not (Store.Gc.is_finished t.repo) then Lwt.return Gc_busy
       else
-        Lwt_mutex.with_lock t.tag_lock (fun () ->
-          let* head = Store.Head.find t.store in
-          match head, t.split_epoch with
-          | None, _ -> Lwt.return (Gc_missing current_epoch)
-          | Some head, None ->
-            let* () = set_split t current_epoch head in
-            Lwt.return (Gc_split current_epoch)
-          | Some _, Some floor when current_epoch - floor < keep ->
-            Lwt.return (Gc_wait (floor + keep))
-          | Some head, Some floor ->
-            let branch = Printf.sprintf "pack_split_%d" floor in
-            let* commit = Store.Branch.find t.repo branch in
-            match commit with
-            | None -> Lwt.return (Gc_missing floor)
-            | Some commit ->
-            let need = sat_add (pack_bytes t.store_path) gc_reserve in
-            let free = Option.value ~default:(disk_free t.store_path) free in
-            if Int64.compare free need < 0 then
-              Lwt.return (Gc_space { free; need })
-            else
-              let* () = set_split t current_epoch head in
-              let* removed = remove_tags_before t floor in
-              Store.flush t.repo;
-              let* started =
-                Store.Gc.run
-                  ~finished:(gc_done current_epoch)
-                  t.repo
-                  (Store.Commit.key commit)
-              in
-              match started with
-              | Ok true -> Lwt.return (Gc_started { floor; removed })
-              | Ok false -> Lwt.return Gc_busy
-              | Error (`Msg reason) -> Lwt.return (Gc_error reason)))
-    (fun exn -> Lwt.return (Gc_error (Printexc.to_string exn)))
+        let* plan = collect_plan t ~keep current_epoch in
+        match plan with
+        | `Done result -> Lwt.return result
+        | `Measure (floor, commit) ->
+          Lwt.finalize
+            (fun () ->
+              let* measure = measure_tree (Store.Commit.tree commit) in
+              let need = gc_space_need measure in
+              let* () = save_gc_need t need in
+              let free = Option.value ~default:(disk_free t.store_path) free in
+              if Int64.compare free need < 0 then
+                Lwt.return (Gc_space { free; need })
+              else
+                start_pack_gc t ~keep ~floor ~commit current_epoch)
+            (fun () -> clear_gc_plan t))
+    (fun exn ->
+      Lwt.return (Gc_error (Printexc.to_string exn)))
 
 let collect_pack t current_epoch =
   collect_pack_at t ~keep:gc_keep_epochs current_epoch

@@ -44,7 +44,9 @@ type ('value_snapshot, 'program_snapshot) deps = {
     nonce:int ->
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  point_ops : bool;
   object_cost : bool;
+  int_work : Octra_vm.Int_work.mode;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -228,6 +230,7 @@ type vm_tx_deps = {
   save_receipt_raw : tx_hash:string -> json:string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
+  proof_mode : Octra_core.Rule_graph.mode;
   epoch : int;
   now : unit -> float;
 }
@@ -244,6 +247,7 @@ type live_vm_tx_args = {
   ensure_account : string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
+  proof_mode : Octra_core.Rule_graph.mode;
   epoch : int;
   now : unit -> float;
 }
@@ -267,6 +271,7 @@ type live_contract_ctx_args = {
   trusted_program_keys : Program_trust.t;
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  proof_mode : Octra_core.Rule_graph.mode;
   object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
@@ -301,6 +306,7 @@ type live_sender_vm_tx_args = {
   chaindata : Store_chaindata.t;
   tx : Transaction.t;
   object_cost : bool;
+  proof_mode : Octra_core.Rule_graph.mode;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
   pre_state_hash : string;
@@ -428,7 +434,9 @@ let make_contract_ctx deps =
       get_fhe_pubkey = deps.get_fhe_pubkey;
       get_fhe_keypair = (fun _ -> None);
       allow_fhe_capability = (fun _ -> true);
+      point_ops = deps.point_ops;
       object_cost = deps.object_cost;
+      int_work = deps.int_work;
       current_epoch = deps.current_epoch;
       epoch_time_ms = deps.epoch_time_ms;
       tree_hash = deps.tree_hash;
@@ -464,7 +472,15 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
           ~journal:args.program_journal ~ctx ~depth
           ~params args.store ~deployer ~bytecode_raw ~nonce);
       get_fhe_pubkey = args.get_fhe_pubkey;
+      point_ops =
+        (match args.proof_mode with
+         | Octra_core.Rule_graph.Prior -> false
+         | Octra_core.Rule_graph.Active -> true);
       object_cost = args.object_cost;
+      int_work =
+        (match args.proof_mode with
+         | Octra_core.Rule_graph.Prior -> Octra_vm.Int_work.Prior
+         | Octra_core.Rule_graph.Active -> Octra_vm.Int_work.Active);
       current_epoch = args.current_epoch;
       epoch_time_ms = args.epoch_time_ms;
       tree_hash = args.tree_hash;
@@ -617,6 +633,7 @@ let run_program_upgrade_tx (runtime : call_runtime) ~trusted_program_keys
           Contract.upgrade
             ~journal:program_journal
             ~trusted:(Program_trust.keys trusted_program_keys)
+            ~ctx:(runtime.make_ctx (Transaction.hash tx))
             store
             ~address:tx.to_
             ~caller:tx.from
@@ -636,7 +653,8 @@ let run_program_upgrade_tx (runtime : call_runtime) ~trusted_program_keys
           runtime.confirm ()
       end)
 
-let run_contract_deploy ~trusted_program_keys ~fee ~balance ~bytecode_b64_opt ~deployer ~nonce
+let run_contract_deploy ~trusted_program_keys ~point_ops ~fee ~balance
+    ~bytecode_b64_opt ~deployer ~nonce
     ~target ~message ~handle_reject ~with_debited_fee ~reject_after_fee
     ~deploy_and_save ~ensure_account ~commit_effects ~log_deployed
     ~log_constructor_failed ~confirm =
@@ -648,6 +666,7 @@ let run_contract_deploy ~trusted_program_keys ~fee ~balance ~bytecode_b64_opt ~d
       match
         Call_plan.plan_deploy_input_with_keys
           ~trusted:(Program_trust.keys trusted_program_keys)
+          ~point_ops
           ~bytecode_b64_opt
           ~deployer
           ~nonce
@@ -679,11 +698,13 @@ let run_contract_deploy ~trusted_program_keys ~fee ~balance ~bytecode_b64_opt ~d
           log_constructor_failed result.contract_addr err;
           reject_after_fee fee "constructor_failed" err)
 
-let run_deploy_tx ~trusted_program_keys ~balance (tx : Transaction.t) ~handle_reject
+let run_deploy_tx ~trusted_program_keys ~point_ops ~balance (tx : Transaction.t)
+    ~handle_reject
     ~with_debited_fee ~reject_after_fee ~deploy_and_save ~ensure_account
     ~commit_effects ~log_deployed ~log_constructor_failed ~confirm =
   run_contract_deploy
     ~trusted_program_keys
+    ~point_ops
     ~fee:tx.ou
     ~balance
     ~bytecode_b64_opt:tx.encrypted_data
@@ -701,10 +722,12 @@ let run_deploy_tx ~trusted_program_keys ~balance (tx : Transaction.t) ~handle_re
     ~log_constructor_failed
     ~confirm
 
-let run_deploy_tx_runtime ~trusted_program_keys (runtime : call_runtime) ~balance tx ~deploy_and_save
+let run_deploy_tx_runtime ~trusted_program_keys ~point_ops
+    (runtime : call_runtime) ~balance tx ~deploy_and_save
     ~ensure_account =
   run_deploy_tx
     ~trusted_program_keys
+    ~point_ops
     ~balance
     tx
     ~handle_reject:runtime.handle_deploy_reject
@@ -766,13 +789,13 @@ let run_program_deploy_tx (deps : vm_tx_deps) tx =
             runtime.log_constructor_failed result.contract_addr reason;
             runtime.reject_after_fee tx.ou "constructor_failed" reason)
 
-let prepare_program_package (tx : Transaction.t) =
+let prepare_program_package ~point_ops (tx : Transaction.t) =
   match tx.encrypted_data with
   | None -> Lwt.return_error "Program package missing"
   | Some encoded ->
     Lwt_preemptive.detach
       (fun () ->
-        match Program_package.admit_base64 encoded with
+        match Program_package.admit_base64 ~point_ops encoded with
         | Ok package -> Ok package
         | Error error -> Error (Program_package.error_message error))
       ()
@@ -973,19 +996,30 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
       in
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       { contract_addr; receipt });
-    program_prepare = prepare_program_package;
+    program_prepare = prepare_program_package
+      ~point_ops:
+        (match args.proof_mode with
+         | Octra_core.Rule_graph.Prior -> false
+         | Octra_core.Rule_graph.Active -> true);
     ensure_account = args.ensure_account;
     circle_exec = (fun tx ~ctx call ->
       let ctx = { ctx with ContractVM.node_id = tx.to_ } in
       Circle_exec.execute_call
         ~trusted:(Program_trust.keys args.trusted_program_keys)
-        ~ctx ~limit:call.effort_limit args.store tx.to_
+        ~ctx
+        ~limit:call.effort_limit
+        ~hfhe_strict:(args.proof_mode = Octra_core.Rule_graph.Active)
+        args.store tx.to_
         call.method_name call.params tx.from tx.amount);
     circle_save = (fun tx ~tx_hash call call_result ->
       save_receipt ~tx_hash ~contract_addr:tx.to_
         ~method_name:call.method_name call_result.receipt);
     circle_commit = (fun tx call_result ->
-      Circle_exec.commit_call_result args.store tx.to_ call_result);
+      Circle_exec.commit_call_result
+        ~proof_mode:args.proof_mode
+        args.store
+        tx.to_
+        call_result);
     circle_log_ok = (fun tx -> log_circle_call_ok tx.to_);
     program_exec = (fun tx ~ctx call ->
       Lwt.return
@@ -1007,6 +1041,7 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
     save_receipt_raw = Store_chaindata.save_receipt_raw args.chaindata;
     reject_malformed = args.reject_malformed;
     max_multi_exec_calls = args.max_multi_exec_calls;
+    proof_mode = args.proof_mode;
     epoch = args.epoch;
     now = args.now;
   }
@@ -1018,6 +1053,10 @@ let run_vm_tx (deps : vm_tx_deps) tx =
   | Transaction.ContractDeploy ->
     run_deploy_tx_runtime
       ~trusted_program_keys:deps.trusted_program_keys
+      ~point_ops:
+        (match deps.proof_mode with
+         | Octra_core.Rule_graph.Prior -> false
+         | Octra_core.Rule_graph.Active -> true)
       deps.runtime
       ~balance:(deps.deploy_balance tx)
       tx
@@ -1064,10 +1103,10 @@ let run_vm_tx (deps : vm_tx_deps) tx =
 
 let max_multi_exec_calls ~env =
   Startup_runtime_limits.multi_exec_max {
-    int_value = (fun name fallback ->
+    int_value = (fun name default ->
       match env name with
-      | Some raw -> (try int_of_string raw with _ -> fallback)
-      | None -> fallback);
+      | Some raw -> (try int_of_string raw with _ -> default)
+      | None -> default);
     opt = env;
   }
 
@@ -1080,6 +1119,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         trusted_program_keys = args.trusted_program_keys;
         store = args.store;
         get_fhe_pubkey = live_fhe_pubkey args.store;
+        proof_mode = args.proof_mode;
         object_cost = args.object_cost;
         current_epoch = args.current_epoch ();
         epoch_time_ms = args.epoch_time_ms;
@@ -1115,6 +1155,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
     reject_malformed = (fun reason ->
       args.reject "malformed_transaction" reason);
     max_multi_exec_calls = max_multi_exec_calls ~env:Sys.getenv_opt;
+    proof_mode = args.proof_mode;
     epoch = args.current_epoch ();
     now = Unix.gettimeofday;
   }

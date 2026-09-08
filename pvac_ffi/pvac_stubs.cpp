@@ -59,8 +59,8 @@ extern "C" CAMLprim value caml_pvac_worker_isolate(value v_unit) {
 }
 
 #ifdef PVAC_DEBUG
-#define DBG_ENTER(name) fprintf(stderr, "[pvac_ffi] >> %s (RSS=%zuMB)\n", name, get_rss_mb())
-#define DBG_EXIT(name)  fprintf(stderr, "[pvac_ffi] << %s (RSS=%zuMB)\n", name, get_rss_mb())
+#define DBG_ENTER(name) fprintf(stderr, "[pvac_ffi] >> %s rss = %zu MB\n", name, get_rss_mb())
+#define DBG_EXIT(name) fprintf(stderr, "[pvac_ffi] << %s rss = %zu MB\n", name, get_rss_mb())
 #define DBG_SIZE(name, val) fprintf(stderr, "[pvac_ffi]    %s = %zu\n", name, (size_t)(val))
 #else
 #define DBG_ENTER(name) ((void)0)
@@ -255,16 +255,26 @@ static bool read_layer_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Layer& layer
                 return false;
         }
     }
+    if (r.failed)
+        return false;
     if (ver >= pvac_ser::VERSION_V4)
         pvac_ser::mark_public_base_layer(layer, slots);
     return !r.failed;
 }
 
-static bool read_cipher_safe(pvac_ser::Reader& r, uint8_t ver, pvac::Cipher& cipher) {
+static bool read_cipher_safe(
+    pvac_ser::Reader& r,
+    uint8_t ver,
+    pvac::Cipher& cipher,
+    bool strict = true,
+    bool cap = true
+) {
     cipher = pvac::Cipher{};
-    cipher.slots = r.u64();
+    if (!pvac_ser::read_cipher_slots(r, ver, cipher.slots, strict, cap))
+        return false;
     size_t n_l = r.u64();
     r.check_count(n_l, 8);
+    pvac_ser::check_public_cells(r, ver, cipher.slots, n_l, strict, cap);
     if (r.failed)
         return false;
     cipher.L.resize(n_l);
@@ -358,11 +368,17 @@ static bool parse_range_any_safe(const uint8_t* data, size_t len, pvac_ser::Rang
     }
 }
 
-static bool verify_range_any_safe(pvac::PubKey& pk, pvac::Cipher& ct, const pvac_ser::RangeProofAny& proof) {
+static bool verify_range_any_safe(
+    pvac::PubKey& pk,
+    pvac::Cipher& ct,
+    const pvac_ser::RangeProofAny& proof,
+    bool strict) {
     try {
         if (proof.format != pvac_ser::RP_BOUND)
             return false;
-        return pvac::verify_zero_bound_range(pk, ct, proof.bound_proof);
+        return strict
+            ? pvac::verify_zero_bound_range(pk, ct, proof.bound_proof)
+            : pvac::verify_range_amount_prior(pk, ct, proof.bound_proof);
     } catch (const std::exception& e) {
         return false;
     } catch (...) {
@@ -422,6 +438,14 @@ static uint64_t nonnegative_u64(value v, const char* context) {
     int64_t raw = Int64_val(v);
     if (raw < 0) caml_failwith(context);
     return static_cast<uint64_t>(raw);
+}
+
+static pvac::Cipher* copy_cipher(const pvac::Cipher& cipher) {
+    try {
+        return new pvac::Cipher(cipher);
+    } catch (...) {
+        caml_failwith("pvac: cipher copy failed");
+    }
 }
 
 extern "C" {
@@ -797,7 +821,7 @@ CAMLprim value caml_pvac_ct_add_const(value v_pk, value v_ct, value v_lo, value 
     k.lo = lo;
     k.hi = hi;
 
-    pvac::Cipher* result = new pvac::Cipher(ct);
+    pvac::Cipher* result = copy_cipher(ct);
     for (size_t j = 0; j < result->c0.size(); ++j)
         result->c0[j] = pvac::fp_add(result->c0[j], k);
 
@@ -812,7 +836,7 @@ CAMLprim value caml_pvac_ct_sub_const(value v_pk, value v_ct, value v_k) {
 
     pvac::Fp neg_k = pvac::fp_neg(pvac::fp_from_u64(k));
 
-    pvac::Cipher* result = new pvac::Cipher(ct);
+    pvac::Cipher* result = copy_cipher(ct);
     for (size_t j = 0; j < result->c0.size(); ++j)
         result->c0[j] = pvac::fp_add(result->c0[j], neg_k);
 
@@ -967,6 +991,17 @@ CAMLprim value caml_pvac_cipher_shape(value v_ct) {
     Store_field(v_shape, 3, Val_long(ct.c0.size()));
     Store_field(v_shape, 4, Val_long(base_layers));
     CAMLreturn(v_shape);
+}
+
+CAMLprim value caml_pvac_cipher_mul_depth(value v_ct) {
+    CAMLparam1(v_ct);
+    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    size_t depth = 0;
+    if (!pvac::cipher_mul_depth(ct, depth))
+        caml_failwith("cipher structure rejected");
+    if (depth > static_cast<size_t>(Max_long))
+        caml_failwith("cipher multiplication depth overflow");
+    CAMLreturn(Val_long(depth));
 }
 
 CAMLprim value caml_pvac_cipher_is_wrapped_scalar(value v_ct) {
@@ -1183,23 +1218,57 @@ CAMLprim value caml_pvac_serialize_cipher_public(value v_ct) {
 static pvac::Cipher* deserialize_cipher_safe(
     const std::vector<uint8_t>& input,
     char* error,
-    size_t error_size) {
-    pvac::Cipher* cipher = new (std::nothrow) pvac::Cipher();
-    if (!cipher) {
-        snprintf(error, error_size, "deserialize_cipher allocation failed");
-        return nullptr;
-    }
-    std::string reason;
-    if (!pvac_ser::deserialize_cipher_checked(
-            input.data(),
-            input.size(),
-            *cipher,
-            reason)) {
+    size_t error_size,
+    bool strict,
+    bool cap) {
+    pvac::Cipher* cipher = nullptr;
+    try {
+        cipher = new pvac::Cipher();
+        std::string reason;
+        if (pvac_ser::deserialize_cipher_checked(
+                input.data(),
+                input.size(),
+                *cipher,
+                reason,
+                strict,
+                cap))
+            return cipher;
         snprintf(error, error_size, "%s", reason.c_str());
         delete cipher;
         return nullptr;
+    } catch (const std::exception& e) {
+        delete cipher;
+        snprintf(error, error_size, "%s", e.what());
+        return nullptr;
+    } catch (...) {
+        delete cipher;
+        snprintf(error, error_size, "deserialize_cipher failed: unknown error");
+        return nullptr;
     }
-    return cipher;
+}
+
+static bool copy_input(
+    value v_bytes,
+    std::vector<uint8_t>& input,
+    char* error,
+    size_t error_size,
+    const char* operation) {
+    try {
+        input.assign(
+            bytes_data(v_bytes),
+            bytes_data(v_bytes) + bytes_len(v_bytes));
+        return true;
+    } catch (const std::exception& e) {
+        snprintf(error, error_size, "%s", e.what());
+        return false;
+    } catch (...) {
+        snprintf(
+            error,
+            error_size,
+            "%s input failed: unknown error",
+            operation);
+        return false;
+    }
 }
 
 CAMLprim value caml_pvac_deserialize_cipher(value v_bytes) {
@@ -1208,28 +1277,44 @@ CAMLprim value caml_pvac_deserialize_cipher(value v_bytes) {
     char err_buf[256] = {0};
     pvac::Cipher* cipher = nullptr;
     {
-        std::vector<uint8_t> input(
-            bytes_data(v_bytes),
-            bytes_data(v_bytes) + bytes_len(v_bytes));
-        cipher =
-            deserialize_cipher_safe(input, err_buf, sizeof(err_buf));
+        std::vector<uint8_t> input;
+        if (copy_input(
+                v_bytes,
+                input,
+                err_buf,
+                sizeof(err_buf),
+                "deserialize_cipher"))
+            cipher =
+                deserialize_cipher_safe(input, err_buf, sizeof(err_buf), true, true);
     }
     if (err_buf[0]) caml_failwith(err_buf);
     CAMLreturn(wrap_cipher(cipher));
 }
 
-CAMLprim value caml_pvac_deserialize_cipher_result(value v_bytes) {
+static value deserialize_cipher_result(value v_bytes, bool strict, bool cap) {
     CAMLparam1(v_bytes);
     CAMLlocal3(v_result, v_payload, v_cipher);
 
-    std::vector<uint8_t> input(
-        bytes_data(v_bytes),
-        bytes_data(v_bytes) + bytes_len(v_bytes));
     char err_buf[256] = {0};
-    caml_release_runtime_system();
-    pvac::Cipher* cipher =
-        deserialize_cipher_safe(input, err_buf, sizeof(err_buf));
-    caml_acquire_runtime_system();
+    pvac::Cipher* cipher = nullptr;
+    {
+        std::vector<uint8_t> input;
+        if (copy_input(
+                v_bytes,
+                input,
+                err_buf,
+                sizeof(err_buf),
+                "deserialize_cipher")) {
+            caml_release_runtime_system();
+            cipher = deserialize_cipher_safe(
+                input,
+                err_buf,
+                sizeof(err_buf),
+                strict,
+                cap);
+            caml_acquire_runtime_system();
+        }
+    }
     if (err_buf[0]) {
         v_payload = caml_copy_string(err_buf);
         v_result = caml_alloc(1, 1);
@@ -1240,6 +1325,18 @@ CAMLprim value caml_pvac_deserialize_cipher_result(value v_bytes) {
         Store_field(v_result, 0, v_cipher);
     }
     CAMLreturn(v_result);
+}
+
+CAMLprim value caml_pvac_deserialize_cipher_result(value v_bytes) {
+    return deserialize_cipher_result(v_bytes, true, true);
+}
+
+CAMLprim value caml_pvac_deserialize_cipher_prior_result(value v_bytes) {
+    return deserialize_cipher_result(v_bytes, false, false);
+}
+
+CAMLprim value caml_pvac_deserialize_cipher_cap_result(value v_bytes) {
+    return deserialize_cipher_result(v_bytes, false, true);
 }
 
 CAMLprim value caml_pvac_serialize_pubkey(value v_pk) {
@@ -1314,22 +1411,28 @@ static pvac::PubKey* deserialize_pubkey_safe(
     const std::vector<uint8_t>& input,
     char* error,
     size_t error_size) {
-    pvac::PubKey* pubkey = new (std::nothrow) pvac::PubKey();
-    if (!pubkey) {
-        snprintf(error, error_size, "deserialize_pubkey allocation failed");
-        return nullptr;
-    }
-    std::string reason;
-    if (!pvac_ser::deserialize_pubkey_checked(
-            input.data(),
-            input.size(),
-            *pubkey,
-            reason)) {
+    pvac::PubKey* pubkey = nullptr;
+    try {
+        pubkey = new pvac::PubKey();
+        std::string reason;
+        if (pvac_ser::deserialize_pubkey_checked(
+                input.data(),
+                input.size(),
+                *pubkey,
+                reason))
+            return pubkey;
         snprintf(error, error_size, "%s", reason.c_str());
         delete pubkey;
         return nullptr;
+    } catch (const std::exception& e) {
+        delete pubkey;
+        snprintf(error, error_size, "%s", e.what());
+        return nullptr;
+    } catch (...) {
+        delete pubkey;
+        snprintf(error, error_size, "deserialize_pubkey failed: unknown error");
+        return nullptr;
     }
-    return pubkey;
 }
 
 CAMLprim value caml_pvac_deserialize_pubkey(value v_bytes) {
@@ -1338,10 +1441,14 @@ CAMLprim value caml_pvac_deserialize_pubkey(value v_bytes) {
     char err_buf[256] = {0};
     pvac::PubKey* pk = nullptr;
     {
-        std::vector<uint8_t> input(
-            bytes_data(v_bytes),
-            bytes_data(v_bytes) + bytes_len(v_bytes));
-        pk = deserialize_pubkey_safe(input, err_buf, sizeof(err_buf));
+        std::vector<uint8_t> input;
+        if (copy_input(
+                v_bytes,
+                input,
+                err_buf,
+                sizeof(err_buf),
+                "deserialize_pubkey"))
+            pk = deserialize_pubkey_safe(input, err_buf, sizeof(err_buf));
     }
     if (err_buf[0]) caml_failwith(err_buf);
 
@@ -1352,14 +1459,21 @@ CAMLprim value caml_pvac_deserialize_pubkey_result(value v_bytes) {
     CAMLparam1(v_bytes);
     CAMLlocal3(v_result, v_payload, v_key);
 
-    std::vector<uint8_t> input(
-        bytes_data(v_bytes),
-        bytes_data(v_bytes) + bytes_len(v_bytes));
     char err_buf[256] = {0};
-    caml_release_runtime_system();
-    pvac::PubKey* pk =
-        deserialize_pubkey_safe(input, err_buf, sizeof(err_buf));
-    caml_acquire_runtime_system();
+    pvac::PubKey* pk = nullptr;
+    {
+        std::vector<uint8_t> input;
+        if (copy_input(
+                v_bytes,
+                input,
+                err_buf,
+                sizeof(err_buf),
+                "deserialize_pubkey")) {
+            caml_release_runtime_system();
+            pk = deserialize_pubkey_safe(input, err_buf, sizeof(err_buf));
+            caml_acquire_runtime_system();
+        }
+    }
     if (err_buf[0]) {
         v_payload = caml_copy_string(err_buf);
         v_result = caml_alloc(1, 1);
@@ -1519,6 +1633,53 @@ CAMLprim value caml_pvac_verify_zero_bound(value v_pk, value v_ct, value v_proof
     CAMLreturn(Val_bool(ok));
 }
 
+static value caml_pvac_verify_zero_amount_prior_impl(
+    value v_pk,
+    value v_ct,
+    value v_proof,
+    value v_commitment,
+    bool (*verify)(
+        const pvac::PubKey&,
+        const pvac::Cipher&,
+        const pvac::ZeroProof&,
+        const pvac::RistrettoPoint&)
+) {
+    CAMLparam4(v_pk, v_ct, v_proof, v_commitment);
+    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    pvac::ZeroProof& proof = *Handle_val(pvac::ZeroProof, v_proof);
+    if (bytes_len(v_commitment) != 32)
+        CAMLreturn(Val_bool(false));
+    pvac::RistrettoPoint commitment;
+    std::memcpy(commitment.data(), bytes_data(v_commitment), 32);
+    pvac::ExtPoint decoded;
+    if (!pvac::rist_decode(decoded, commitment))
+        CAMLreturn(Val_bool(false));
+    bool ok = false;
+    caml_release_runtime_system();
+    try {
+        ok = verify(pk, ct, proof, commitment);
+    } catch (...) {
+        ok = false;
+    }
+    caml_acquire_runtime_system();
+    CAMLreturn(Val_bool(ok));
+}
+
+CAMLprim value caml_pvac_verify_zero_amount_prior(
+    value v_pk,
+    value v_ct,
+    value v_proof,
+    value v_commitment
+) {
+    return caml_pvac_verify_zero_amount_prior_impl(
+        v_pk,
+        v_ct,
+        v_proof,
+        v_commitment,
+        pvac::verify_zero_amount_prior);
+}
+
 CAMLprim value caml_pvac_verify_zero_bound_key_switch(
     value v_pk,
     value v_ct,
@@ -1552,6 +1713,20 @@ CAMLprim value caml_pvac_verify_zero_bound_key_switch(
 
     DBG_EXIT("verify_zero_bound_key_switch");
     CAMLreturn(Val_bool(ok));
+}
+
+CAMLprim value caml_pvac_verify_zero_amount_key_switch_prior(
+    value v_pk,
+    value v_ct,
+    value v_proof,
+    value v_commitment
+) {
+    return caml_pvac_verify_zero_amount_prior_impl(
+        v_pk,
+        v_ct,
+        v_proof,
+        v_commitment,
+        pvac::verify_zero_amount_key_switch_prior);
 }
 
 CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration(
@@ -1617,6 +1792,20 @@ CAMLprim value caml_pvac_verify_zero_bound_historical_migration(
     }
     caml_acquire_runtime_system();
     CAMLreturn(Val_bool(ok));
+}
+
+CAMLprim value caml_pvac_verify_zero_amount_historical_prior(
+    value v_pk,
+    value v_ct,
+    value v_proof,
+    value v_commitment
+) {
+    return caml_pvac_verify_zero_amount_prior_impl(
+        v_pk,
+        v_ct,
+        v_proof,
+        v_commitment,
+        pvac::verify_zero_amount_historical_prior);
 }
 
 CAMLprim value caml_pvac_make_zero_proof_bound_range(value v_pk, value v_sk, value v_ct,
@@ -1720,8 +1909,6 @@ CAMLprim value caml_pvac_make_range_proof(value v_pk, value v_sk, value v_ct, va
     uint64_t val = nonnegative_u64(v_value, "make_range_proof: negative value");
     DBG_SIZE("ct.layers", ct.L.size());
     DBG_SIZE("ct.edges", ct.E.size());
-    fprintf(stderr, "[pvac_ffi]    value = %llu\n", (unsigned long long)val);
-
     pvac::RangeProof* rp = new pvac::RangeProof();
     try {
         *rp = pvac::make_range_proof(pk, sk, ct, val);
@@ -1875,7 +2062,16 @@ CAMLprim value caml_pvac_deserialize_range_proof(value v_bytes) {
     char err_buf[256] = {0};
     try {
         rp = new pvac::RangeProof();
-        *rp = pvac_ser::deserialize_range_proof(bytes_data(v_bytes), bytes_len(v_bytes));
+        std::string reason;
+        if (!pvac_ser::deserialize_range_proof_checked(
+                bytes_data(v_bytes),
+                bytes_len(v_bytes),
+                *rp,
+                reason)) {
+            snprintf(err_buf, sizeof(err_buf), "%s", reason.c_str());
+            delete rp;
+            rp = nullptr;
+        }
     } catch (const std::exception& e) {
         if (rp) { delete rp; rp = nullptr; }
         snprintf(err_buf, sizeof(err_buf), "%s", e.what());
@@ -1935,12 +2131,17 @@ CAMLprim value caml_pvac_serialize_agg_range_proof(value v_arp) {
     CAMLreturn(v_bytes);
 }
 
-CAMLprim value caml_pvac_verify_range_any(value v_pk, value v_ct, value v_proof_bytes) {
-    CAMLparam3(v_pk, v_ct, v_proof_bytes);
+CAMLprim value caml_pvac_verify_range_any(
+    value v_pk,
+    value v_ct,
+    value v_proof_bytes,
+    value v_strict) {
+    CAMLparam4(v_pk, v_ct, v_proof_bytes, v_strict);
     DBG_ENTER("verify_range_any");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    bool strict = Bool_val(v_strict);
     std::vector<uint8_t> input(
         bytes_data(v_proof_bytes),
         bytes_data(v_proof_bytes) + bytes_len(v_proof_bytes));
@@ -1949,7 +2150,7 @@ CAMLprim value caml_pvac_verify_range_any(value v_pk, value v_ct, value v_proof_
     bool ok = false;
     caml_release_runtime_system();
     if (parse_range_any_safe(input.data(), input.size(), proof)) {
-        ok = verify_range_any_safe(pk, ct, proof);
+        ok = verify_range_any_safe(pk, ct, proof, strict);
     }
     caml_acquire_runtime_system();
 
@@ -1985,6 +2186,46 @@ CAMLprim value caml_pvac_verify_range_bound(
         try {
             ok = proof.format == pvac_ser::RP_BOUND &&
                 pvac::verify_zero_bound_range(
+                    pk,
+                    ct,
+                    proof.bound_proof,
+                    commitment);
+        } catch (...) {
+            ok = false;
+        }
+    }
+    caml_acquire_runtime_system();
+    CAMLreturn(Val_bool(ok));
+}
+
+CAMLprim value caml_pvac_verify_range_amount_prior(
+    value v_pk,
+    value v_ct,
+    value v_proof_bytes,
+    value v_commitment
+) {
+    CAMLparam4(v_pk, v_ct, v_proof_bytes, v_commitment);
+    if (bytes_len(v_commitment) != 32)
+        CAMLreturn(Val_bool(false));
+
+    pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    std::vector<uint8_t> input(
+        bytes_data(v_proof_bytes),
+        bytes_data(v_proof_bytes) + bytes_len(v_proof_bytes));
+    pvac::RistrettoPoint commitment;
+    std::memcpy(commitment.data(), bytes_data(v_commitment), 32);
+    pvac::ExtPoint decoded;
+    if (!pvac::rist_decode(decoded, commitment))
+        CAMLreturn(Val_bool(false));
+
+    pvac_ser::RangeProofAny proof;
+    bool ok = false;
+    caml_release_runtime_system();
+    if (parse_range_any_safe(input.data(), input.size(), proof)) {
+        try {
+            ok = proof.format == pvac_ser::RP_BOUND &&
+                pvac::verify_range_amount_prior(
                     pk,
                     ct,
                     proof.bound_proof,

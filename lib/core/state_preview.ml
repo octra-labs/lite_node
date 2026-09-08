@@ -25,6 +25,8 @@ let view base store =
     stealth_counter = ref !(base.stealth_counter);
     tags = base.tags;
     split_epoch = base.split_epoch;
+    gc_planning = true;
+    gc_need = None;
     tag_lock = Lwt_mutex.create ();
     store_path = base.store_path;
     pvac_dir = base.pvac_dir;
@@ -82,8 +84,8 @@ let with_state ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id:_ ~proposal_
         if unchanged then Lwt.return result
         else Lwt.return_error "preview_state_changed"
 
-let with_preview ~(base_store : Store_irmin.t) ?base_ledger
-    ?(proof_mode=Rule_graph.Active) ~fold ~epoch_id ~proposal_id
+let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode
+    ~fold ~epoch_id ~proposal_id
     ?(expected_prev_root : string option) f =
   with_state
     ~base_store
@@ -112,7 +114,7 @@ let with_preview ~(base_store : Store_irmin.t) ?base_ledger
       } in
       f backend)
 
-let cleanup_stale_previews ~(base_store : Store_irmin.t) =
+let cleanup_old_previews ~(base_store : Store_irmin.t) =
   let* branches = Store_irmin.Store.Branch.list base_store.repo in
   let preview_branches = List.filter (fun b ->
     String.length b > 8 && String.sub b 0 8 = "preview_"

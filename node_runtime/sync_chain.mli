@@ -13,7 +13,7 @@ type deps = {
 val bridge_range :
   head_epoch:int64 ->
   after_epoch:int64 ->
-  through_epoch:int64 ->
+  before_epoch:int64 ->
   activate_epoch:int64 ->
   (int64 * int64) option
 

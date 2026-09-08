@@ -328,44 +328,84 @@ let abi_json declaration abi =
   in
   Printf.sprintf "{\"declaration\":%S,\"functions\":[%s],\"events\":[%s]}" declaration fns events
 
-let compile_ast_ready ~source_mode ~source_material ast =
-  let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
+let compile_form_ast ~source_mode ~source_material ast =
+  match Aml_source.compile_ast ast with
+  | Error reason -> error_result reason
+  | Ok compiled ->
+    let declaration =
+      Oct_lang.declaration_to_string compiled.Aml_source.declaration
+    in
+    let bytecode = compiled.octb in
+    let verification_json = verification_json compiled.ast in
+    let certificate_json =
+      certificate_json
+        ~declaration
+        ~source_mode
+        ~source_material
+        ~bytecode
+        ~verification_json
+    in
+    let program_facts = facts_of_ast compiled.ast compiled.code in
+    {
+      bytecode;
+      abi_json = Oct_gen.to_abi compiled.ast |> abi_json declaration;
+      instructions = Array.length compiled.code;
+      error = None;
+      version = lang_version;
+      verification_json;
+      certificate_json;
+      program_envelope = None;
+      program_facts = Some program_facts;
+    }
+
+let compile_ast_ready ~checked ~source_mode ~source_material ast =
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
+  let emit () =
+    if ast.Oct_lang.forms <> [] then
+      compile_form_ast ~source_mode ~source_material ast
+    else
+      let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
+      let code = Oct_emit.generate ~checked ast in
+      if program && Array.length code > Program_limits.max_instructions then
+        error_result "Program instruction limit exceeded"
+      else
+        let abi_json = Oct_emit.to_abi ast |> abi_json declaration in
+        let bytecode = Bytecode.encode code in
+        let verification_json = verification_json ast in
+        let certificate_json =
+          certificate_json
+            ~declaration
+            ~source_mode
+            ~source_material
+            ~bytecode
+            ~verification_json
+        in
+        let program_facts = facts_of_ast ast code in
+        {
+          (ok_result
+             ~bytecode
+             ~abi_json
+             ~instructions:(Array.length code)
+             ~verification_json
+             ~certificate_json)
+          with
+          program_facts = Some program_facts;
+        }
+  in
   if program
      && List.length ast.Oct_lang.funcs > Program_limits.max_functions then
     error_result "Program function limit exceeded"
+  else if program && checked && ast.Oct_lang.forms = [] then
+    match Oct_check.check ast with
+    | Error error -> error_result ("Program source type: " ^ error)
+    | Ok () -> emit ()
   else
-    let code = Oct_gen.generate ast in
-    if program && Array.length code > Program_limits.max_instructions then
-      error_result "Program instruction limit exceeded"
-    else
-      let abi_json = Oct_gen.to_abi ast |> abi_json declaration in
-      let bytecode = Bytecode.encode code in
-      let verification_json = verification_json ast in
-      let certificate_json =
-        certificate_json
-          ~declaration
-          ~source_mode
-          ~source_material
-          ~bytecode
-          ~verification_json
-      in
-      let program_facts = facts_of_ast ast code in
-      {
-        (ok_result
-           ~bytecode
-           ~abi_json
-           ~instructions:(Array.length code)
-           ~verification_json
-           ~certificate_json)
-        with
-        program_facts = Some program_facts;
-      }
+    emit ()
 
-let compile_ast ~source_mode ~source_material ast =
+let compile_ast ?(checked = false) ~source_mode ~source_material ast =
   require_ast_shape ast;
   ignore (interface_index ast);
-  compile_ast_ready ~source_mode ~source_material ast
+  compile_ast_ready ~checked ~source_mode ~source_material ast
 
 let first_interfaces interfaces =
   interfaces
@@ -378,8 +418,9 @@ let first_interfaces interfaces =
   |> snd
   |> List.rev
 
-let compile_ast_first ~source_mode ~source_material ast =
+let compile_ast_first ?(checked = false) ~source_mode ~source_material ast =
   compile_ast_ready
+    ~checked
     ~source_mode
     ~source_material
     { ast with Oct_lang.interfaces = first_interfaces ast.Oct_lang.interfaces }
@@ -464,9 +505,11 @@ let compile source =
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_parse.ParseError (msg, line) ->
+  | Oct_parse.ParseError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_gen.GenError (msg, line) ->
+  | Oct_emit.GenError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | Oct_gen.GenError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
   | error -> compile_exception error
 
@@ -520,9 +563,11 @@ let compile_multi_with
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_parse.ParseError (msg, line) ->
+  | Oct_parse.ParseError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_gen.GenError (msg, line) ->
+  | Oct_emit.GenError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | Oct_gen.GenError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
   | error -> compile_exception error
 
@@ -530,21 +575,21 @@ let check_ast ast =
   require_ast_shape ast;
   ignore (interface_index ast)
 
-let compile_multi_mode ~program_only resolver main_path =
+let compile_multi_mode ?(checked = false) ~program_only resolver main_path =
   compile_multi_with
     ~program_only
     ~check_ast
     ~select_interfaces:imported_interfaces
-    ~compile_ast
+    ~compile_ast:(compile_ast ~checked)
     resolver
     main_path
 
-let compile_multi_first_mode ~program_only resolver main_path =
+let compile_multi_first_mode ?(checked = false) ~program_only resolver main_path =
   compile_multi_with
     ~program_only
     ~check_ast:(fun _ -> ())
     ~select_interfaces:imported_interfaces_first
-    ~compile_ast:compile_ast_first
+    ~compile_ast:(compile_ast_first ~checked)
     resolver
     main_path
 
@@ -592,7 +637,7 @@ let emit_program_with_facts result facts =
           (match Program_policy.effects code facts with
            | Error error -> error_result ("Program effect policy: " ^ error)
            | Ok effects ->
-             match Admission.of_program ~facts code with
+             match Admission.of_program ~point_ops:true ~facts code with
              | Error error -> error_result ("Program admission: " ^ Admission.error_message error)
              | Ok _ ->
                (match program_certificate result.certificate_json effects facts with
@@ -603,9 +648,10 @@ let emit_program_with_facts result facts =
                   | Ok envelope -> { result with certificate_json = cert; program_envelope = Some envelope }))))
 
 let emit_program result =
-  match result.program_facts with
-  | None -> error_result "Program facts missing"
-  | Some facts -> emit_program_with_facts result facts
+  match result.error, result.program_facts with
+  | Some _, _ -> result
+  | None, None -> error_result "Program facts missing"
+  | None, Some facts -> emit_program_with_facts result facts
 
 let attest_program ~key_id ~private_key result =
   match result.error, result.program_envelope with
@@ -619,22 +665,28 @@ let attest_program ~key_id ~private_key result =
         | Error error -> error_result ("Program envelope: " ^ Program_envelope.error_message error)
         | Ok program_envelope -> { result with certificate_json; program_envelope = Some program_envelope }))
 
-let compile_program source =
+let compile_program_mode ~checked source =
   try
     let ast = Oct_parse.parse source in
     if ast.Oct_lang.declaration <> Oct_lang.ProgramDecl then
       error_result "Program declaration required"
     else
       emit_program
-        (compile_ast ~source_mode:"single" ~source_material:source ast)
+        (compile_ast ~checked ~source_mode:"single" ~source_material:source ast)
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_parse.ParseError (msg, line) ->
+  | Oct_parse.ParseError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_gen.GenError (msg, line) ->
+  | Oct_emit.GenError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | Oct_gen.GenError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
   | error -> compile_exception error
+
+let compile_program = compile_program_mode ~checked:false
+
+let compile_program_checked = compile_program_mode ~checked:true
 
 let compile_program_with_xcalls source specs =
   try
@@ -658,9 +710,11 @@ let compile_program_with_xcalls source specs =
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_parse.ParseError (msg, line) ->
+  | Oct_parse.ParseError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
-  | Oct_gen.GenError (msg, line) ->
+  | Oct_emit.GenError (msg, line) ->
+    error_result (Printf.sprintf "line %d: %s" line msg)
+  | Oct_gen.GenError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
   | error -> compile_exception error
 
@@ -672,7 +726,7 @@ let admit_program_source source raw =
   | None, Some expected when not (String.equal expected raw) ->
     Error "Program source does not match envelope"
   | None, Some _ ->
-    (match Admission.decode_program_source raw with
+    (match Admission.decode_program_source ~point_ops:true raw with
      | Ok admitted -> Ok admitted
      | Error error -> Error (Admission.error_message error))
 
@@ -681,3 +735,11 @@ let compile_program_multi resolver main_path =
 
 let compile_program_multi_first resolver main_path =
   emit_program (compile_multi_first_mode ~program_only:true resolver main_path)
+
+let compile_program_multi_checked resolver main_path =
+  emit_program
+    (compile_multi_mode ~checked:true ~program_only:true resolver main_path)
+
+let compile_program_multi_first_checked resolver main_path =
+  emit_program
+    (compile_multi_first_mode ~checked:true ~program_only:true resolver main_path)

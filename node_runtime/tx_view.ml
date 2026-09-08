@@ -773,13 +773,13 @@ let range_proof_payload_ok encoded_proof =
   with _ -> false
 
 let cipher_payload_ok encoded_cipher =
-  match Crypto.FheBalance.decode_cipher encoded_cipher with
+  match Crypto.FheBalance.decode_cipher ~strict:true encoded_cipher with
   | Ok _ -> true
   | Error _ -> false
 
 let stealth_delta_cipher_allowed encoded_cipher =
   Octra_core.Pvac_verify_policy.ciphertext_allowed encoded_cipher
-  && Crypto.FheBalance.cipher_is_wrapped_scalar encoded_cipher
+  && Crypto.FheBalance.cipher_is_wrapped_scalar ~strict:true encoded_cipher
 
 let zero_proof_payload_ok encoded_proof =
   match Crypto.FheBalance.decode_zero_proof encoded_proof with
@@ -877,12 +877,13 @@ let max_proof_queue_waits = 40
 
 let max_proof_worker_retries = 1
 
-let preverify_range ~pubkey ~cipher ~proof =
+let preverify_range ~strict ~pubkey ~cipher ~proof =
   let rec verify queue_waits worker_retries =
     let open Lwt.Syntax in
     let* result =
       Octra_core.Pvac_verify_worker.verify_range_classified_with_priority
         Octra_core.Compute_pool.Speculative
+        ~strict
         ~pubkey
         ~cipher
         ~proof
@@ -912,7 +913,7 @@ let preverify_range ~pubkey ~cipher ~proof =
   in
   verify 0 0
 
-let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
+let preverify_stealth_ranges ~strict ~pubkey_blob ~sender_enc ptd =
   let open Lwt.Syntax in
   let delta_cipher = ptd.Crypto.PrivateTransferV4.delta_cipher in
   if not (stealth_delta_cipher_allowed delta_cipher) then
@@ -932,6 +933,7 @@ let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
     | Ok (Ok new_enc) ->
       let* delta =
         preverify_range
+          ~strict
           ~pubkey:pubkey_blob
           ~cipher:delta_cipher
           ~proof:ptd.Crypto.PrivateTransferV4.range_proof_delta
@@ -942,6 +944,7 @@ let preverify_stealth_ranges ~pubkey_blob ~sender_enc ptd =
         | Ok delta ->
           let* balance =
             preverify_range
+              ~strict
               ~pubkey:pubkey_blob
               ~cipher:new_enc
               ~proof:ptd.Crypto.PrivateTransferV4.range_proof_balance

@@ -27,7 +27,7 @@ type status = {
   reason : string;
 }
 
-val classify_cipher : string -> cipher_class
+val classify_cipher : ?cap:bool -> string -> cipher_class
 
 val classify_key : string option -> key_class
 
@@ -37,6 +37,7 @@ val status_of_classes :
   status
 
 val status_of_state :
+  cap:bool ->
   cipher:string ->
   pubkey:string option ->
   status

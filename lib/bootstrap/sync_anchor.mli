@@ -16,6 +16,8 @@ type step = {
 
 type t
 
+val max_steps : int
+
 val make :
   steps:step list ->
   finalize:Octra_consensus.C_types.finalize ->

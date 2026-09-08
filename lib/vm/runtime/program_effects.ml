@@ -52,6 +52,9 @@ let of_instr = function
   | Contract_vm.GROTH16_VERIFY_BN254 _
   | Contract_vm.FHE_COMMIT _
   | Contract_vm.FHE_PEDERSEN _
+  | Contract_vm.FHE_PEDERSEN_ADD _
+  | Contract_vm.FHE_PEDERSEN_SUB _
+  | Contract_vm.FHE_PEDERSEN_IDENTITY _
   | Contract_vm.FHE_SER _
   | Contract_vm.FHE_DESER _
   | Contract_vm.FHE_SER_PK _

@@ -187,6 +187,7 @@ val parse_deploy_payload :
 
 val parse_deploy_payload_with_keys :
   trusted:Program_attestation.key list ->
+  point_ops:bool ->
   bytecode_b64:string ->
   deployer:string ->
   nonce:int ->
@@ -214,6 +215,7 @@ val plan_deploy_input :
 
 val plan_deploy_input_with_keys :
   trusted:Program_attestation.key list ->
+  point_ops:bool ->
   bytecode_b64_opt:string option ->
   deployer:string ->
   nonce:int ->

@@ -205,7 +205,10 @@ let write_all fd s =
   in
   loop 0
 
-let read_frame ?(timeout_s=default_read_timeout_s) fd =
+let read_frame
+    ?(timeout_s=default_read_timeout_s)
+    ?(payload_cap=max_frame_size - 1)
+    fd =
   Lwt_unix.with_timeout timeout_s (fun () ->
     let open Lwt.Syntax in
     let* header = read_exact_raw fd 4 in
@@ -221,11 +224,20 @@ let read_frame ?(timeout_s=default_read_timeout_s) fd =
       let* type_data = read_exact_raw fd 1 in
       let msg_type = Char.code type_data.[0] in
       let payload_len = frame_len - 1 in
-      match payload_error msg_type payload_len with
+      if payload_len > payload_cap then
+        Lwt.fail
+          (Failure
+             (Printf.sprintf
+                "frame_payload_limit size = %d max = %d"
+                payload_len payload_cap))
+      else match payload_error msg_type payload_len with
       | Some error -> Lwt.fail (Failure error)
       | None ->
         let* payload = read_exact_raw fd payload_len in
         Lwt.return { msg_type; payload })
+
+let read_handshake_frame ?timeout_s fd =
+  read_frame ?timeout_s ~payload_cap:handshake_payload_max fd
 
 let write_frame fd (f : frame) =
   write_all fd (encode_frame f)

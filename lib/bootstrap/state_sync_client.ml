@@ -12,7 +12,7 @@ module Verify = State_sync_verify
 module Store = Octra_core.Store_chaindata
 module Head = Octra_core.Head_manifest
 module Image = Octra_core.Ledger_image
-module Migration = Octra_core.Pvac_migration_entitlement
+module Migration = Octra_core.Pvac_migration_admission
 module Anchor = Sync_anchor
 module Roots = Root_win
 module Floor = Octra_core.History_floor
@@ -58,7 +58,7 @@ let options = [
   "--chain-id", Arg.Set_string chain_id, "expected chain identifier";
   "--config-hash", Arg.Set_string config_hash, "expected consensus config hash";
   "--migration-root", Arg.String (fun value -> migration_root := Some value),
-    "expected PVAC migration entitlement root";
+    "expected PVAC migration admission root";
   "--concurrency", Arg.Set_int concurrency, "global concurrent chunks";
   "--source-concurrency", Arg.Set_int source_concurrency, "concurrent chunks per source";
   "--retries", Arg.Set_int retries, "chunk attempts";
@@ -72,6 +72,7 @@ let options = [
 
 exception Sync_error of string
 exception Snapshot_expired of string
+exception Source_busy of float
 
 let fail message =
   raise (Sync_error message)
@@ -123,6 +124,22 @@ let snapshot_expired_reason payload =
   with _ ->
     "state sync snapshot expired"
 
+let source_wait_seconds response =
+  let raw =
+    Cohttp.Response.headers response
+    |> fun headers -> Cohttp.Header.get headers "retry-after"
+  in
+  Option.bind raw int_of_string_opt
+  |> Option.fold
+       ~none:3.0
+       ~some:(fun value -> float_of_int (min 30 (max 1 value)))
+
+let busy_budget () =
+  max 60. (!timeout_seconds *. float_of_int (max 1 !retries))
+
+let busy_delay ~now ~deadline wait_seconds =
+  if now +. wait_seconds > deadline then None else Some wait_seconds
+
 let get_limited ~timeout ~limit url =
   Lwt_unix.with_timeout timeout (fun () ->
     Cohttp_lwt_unix.Client.get (Uri.of_string url) >>= fun (response, body) ->
@@ -131,6 +148,8 @@ let get_limited ~timeout ~limit url =
     read_body_limited body body_limit >>= fun payload ->
     if code = 410 then
       Lwt.fail (Snapshot_expired (snapshot_expired_reason payload))
+    else if code = 429 then
+      Lwt.fail (Source_busy (source_wait_seconds response))
     else if code < 200 || code >= 300 then
       Lwt.fail_with (Printf.sprintf "HTTP %d" code)
     else
@@ -138,7 +157,7 @@ let get_limited ~timeout ~limit url =
 
 let fetch_manifest validator_set exporter_set source =
   let url = source.Source.url ^ "/state-sync/manifest" in
-  let rec loop attempt =
+  let rec loop attempt busy_deadline =
     let started = Unix.gettimeofday () in
     Lwt.catch
       (fun () ->
@@ -180,14 +199,24 @@ let fetch_manifest validator_set exporter_set source =
                       Lwt.return (source, certificate)
               end
         end)
-      (fun exn ->
-        Source.record_failure source (Unix.gettimeofday ());
-        if attempt >= 2 then Lwt.fail exn
-        else
-          Lwt_unix.sleep (float_of_int (attempt + 1)) >>= fun () ->
-          loop (attempt + 1))
+      (function
+        | Source_busy wait_seconds ->
+            let now = Unix.gettimeofday () in
+            begin
+              match busy_delay ~now ~deadline:busy_deadline wait_seconds with
+              | None -> Lwt.fail_with "manifest source busy wait budget exhausted"
+              | Some delay ->
+                  Lwt_unix.sleep delay >>= fun () ->
+                  loop attempt busy_deadline
+            end
+        | exn ->
+            Source.record_failure source (Unix.gettimeofday ());
+            if attempt >= 2 then Lwt.fail exn
+            else
+              Lwt_unix.sleep (float_of_int (attempt + 1)) >>= fun () ->
+              loop (attempt + 1) busy_deadline)
   in
-  loop 0
+  loop 0 (Unix.gettimeofday () +. busy_budget ())
 
 let select_manifests (results : (Source.t * Manifest.certificate) list) =
   let ordered =
@@ -358,6 +387,23 @@ let check_manifest_chunk certificate sources =
   match check_task certificate with
   | None -> Lwt.fail_with "state sync manifest has no chunk"
   | Some task ->
+      let busy_deadline = Unix.gettimeofday () +. busy_budget () in
+      let rec probe source =
+        Lwt.catch
+          (fun () -> fetch_chunk source certificate task >|= fun _ -> ())
+          (function
+            | Source_busy wait_seconds ->
+                let now = Unix.gettimeofday () in
+                begin
+                  match busy_delay ~now ~deadline:busy_deadline wait_seconds with
+                  | None ->
+                      Lwt.fail_with
+                        "manifest chunk source busy wait budget exhausted"
+                  | Some delay ->
+                      Lwt_unix.sleep delay >>= fun () -> probe source
+                end
+            | exn -> Lwt.fail exn)
+      in
       let rec loop last_error = function
         | [] ->
             begin
@@ -367,7 +413,7 @@ let check_manifest_chunk certificate sources =
             end
         | source :: rest ->
             Lwt.catch
-              (fun () -> fetch_chunk source certificate task >|= fun _ -> ())
+              (fun () -> probe source)
               (fun exn -> loop (Some exn) rest)
       in
       loop None sources
@@ -418,7 +464,7 @@ let verify_migration_state checkpoint data_dir =
   let path = Filename.concat data_dir Migration.state_relative_path in
   match !migration_root with
   | None ->
-      if Sys.file_exists path then Error "unexpected migration entitlement state"
+      if Sys.file_exists path then Error "unexpected migration admission state"
       else Ok ()
   | Some expected_root ->
       let getenv = function
@@ -433,12 +479,12 @@ let verify_migration_state checkpoint data_dir =
             ~getenv
         with
         | Error _ as error -> error
-        | Ok entitlements ->
+        | Ok admissions ->
             if Int64.compare checkpoint.epoch (Int64.of_int max_int) > 0 then
               Error "migration floor epoch exceeds platform limit"
             else
               Migration.bind_floor
-                entitlements
+                admissions
                 ~config_hash:checkpoint.config_hash
                 ~floor_config_hash:checkpoint.config_hash
                 ~floor_epoch:(Int64.to_int checkpoint.epoch)
@@ -786,7 +832,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
           Lwt_unix.sleep (min 5.0 wake) >>= fun () ->
           choose_source task attempted
   in
-  let rec download_task task attempt attempted =
+  let rec download_task task attempt attempted busy_deadline =
     if attempt >= !retries then
       Lwt.fail_with
         (Printf.sprintf "chunk retry budget exhausted path = %s index = %d"
@@ -809,6 +855,30 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
               Source.record_success source ((Unix.gettimeofday () -. started) *. 1000.0);
               report_progress task source)
         (function
+          | Source_busy wait_seconds ->
+              let now = Unix.gettimeofday () in
+              begin
+                match busy_delay ~now ~deadline:busy_deadline wait_seconds with
+                | None ->
+                    Lwt.fail_with
+                      (Printf.sprintf
+                         "source busy wait budget exhausted path = %s index = %d"
+                         task.file.path
+                         task.chunk.index)
+                | Some delay ->
+                    Printf.eprintf
+                      "event = chunk_wait source = %s path = %s index = %d wait_seconds = %.1f\n%!"
+                      source.url
+                      task.file.path
+                      task.chunk.index
+                      delay;
+                    Lwt_unix.sleep delay >>= fun () ->
+                    download_task
+                      task
+                      attempt
+                      (source.url :: attempted)
+                      busy_deadline
+              end
           | Snapshot_expired reason as exn ->
               Hashtbl.replace expired_sources source.url reason;
               Printf.eprintf
@@ -819,7 +889,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
               if Hashtbl.length expired_sources >= List.length sources then
                 Lwt.fail exn
               else
-                download_task task attempt attempted
+                download_task task attempt attempted busy_deadline
           | exn ->
               Source.record_failure source (Unix.gettimeofday ());
               Printf.eprintf
@@ -829,13 +899,21 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
                 task.chunk.index
                 (attempt + 1)
                 (Printexc.to_string exn);
-              download_task task (attempt + 1) (source.url :: attempted))
+              download_task
+                task
+                (attempt + 1)
+                (source.url :: attempted)
+                busy_deadline)
   in
   let rec worker () =
     if Queue.is_empty pending then Lwt.return_unit
     else
       let task = Queue.take pending in
-      download_task task 0 [] >>= worker
+      download_task
+        task
+        0
+        []
+        (Unix.gettimeofday () +. busy_budget ()) >>= worker
   in
   Printf.printf
     "event = sync_start hash = %s epoch = %Ld files = %d chunks = %d sources = %d pending = %d bytes = %Ld resumed = %Ld\n%!"

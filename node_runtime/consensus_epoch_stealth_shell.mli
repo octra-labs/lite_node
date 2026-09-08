@@ -8,6 +8,7 @@ module Transaction = Octra_core.Transaction
 type deps = {
   fee : Z.t;
   nonce : int;
+  strict : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -22,6 +23,7 @@ type deps = {
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
+    strict:bool ->
     sender_enc_snapshot:string ->
     Preverify_cache.result option;
   log_cap_defer : count:int -> max:int -> tx:string -> unit;
@@ -50,6 +52,7 @@ type deps = {
 }
 
 type tx_deps = {
+  strict : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -63,6 +66,7 @@ type tx_deps = {
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
+    strict:bool ->
     sender_enc_snapshot:string ->
     Preverify_cache.result option;
   log_cap_defer : count:int -> max:int -> tx:string -> unit;
@@ -109,6 +113,7 @@ type gate_deps = {
 }
 
 type live_tx_args = {
+  strict : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -154,6 +159,7 @@ type live_tx_args = {
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
   field_policy : Private_ledger.field_policy;
+  strict : bool;
   current_epoch : unit -> int;
   private_result_policy :
     int ->

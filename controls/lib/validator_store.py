@@ -20,8 +20,6 @@ from validator_process import active_data_owners
 from validator_process import data_pids
 from validator_process import pm2_entries
 
-GC_RESERVE = 8 * 1024 * 1024 * 1024
-
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
 
@@ -181,8 +179,13 @@ def report(values):
     usage = shutil.disk_usage(store_path if store_path.exists() else data_path)
     suffix = suffix_bytes(data_path)
     pack = pack_bytes(data_path)
-    need = pack + GC_RESERVE
     snapshots = snapshot_stats(values, data_path)
+    gc = rpc_method(values["OCTRA_API_PORT"], "octra_epochTags")
+    raw_need = gc.get("pack_gc_need_bytes") if isinstance(gc, dict) else None
+    try:
+        need = int(raw_need) if raw_need is not None else None
+    except (TypeError, ValueError):
+        need = None
     emit(
         event="storage",
         data_bytes=tree_bytes(data_path, live=True) if data_path.is_dir() else 0,
@@ -192,8 +195,8 @@ def report(values):
         prior_bytes=sum(size for _, size in prior),
         prior_skipped=len(skipped),
         free_bytes=usage.free,
-        gc_need_bytes=need,
-        gc_ready=str(usage.free >= need).lower(),
+        gc_need_bytes = need if need is not None else "unknown",
+        gc_ready = str(usage.free >= need).lower() if need is not None else "unknown",
     )
     emit(
         event="sync_store",
@@ -206,7 +209,6 @@ def report(values):
         emit(event="prior_state", path=path, bytes=size)
     for path, reason in skipped:
         emit(event="prior_skipped", path=path, reason=reason)
-    gc = rpc_method(values["OCTRA_API_PORT"], "octra_epochTags")
     if isinstance(gc, dict):
         emit(
             event="pack_gc",

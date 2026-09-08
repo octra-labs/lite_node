@@ -25,10 +25,14 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     Lwt.return_error "circle_cell_preverify_state_hash_mismatch"
   else
     let env = runtime.env ~pre_state_root in
-    match Rule_graph.account_pack runtime.rules ~epoch:env.epoch_id with
-    | Error fault ->
+    match
+      Rule_graph.account_pack runtime.rules ~epoch:env.epoch_id,
+      Rule_graph.standard runtime.rules ~epoch:env.epoch_id
+    with
+    | Error fault, _
+    | _, Error fault ->
       Lwt.return_error (Rule_graph.fault_message fault)
-    | Ok account_mode ->
+    | Ok account_mode, Ok proof_mode ->
     let proposal_id = "circle-cell-" ^ Transaction.hash tx in
     let open Lwt.Syntax in
     Lwt.catch
@@ -36,6 +40,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
         State_preview.with_preview
           ~base_store:runtime.store
           ~base_ledger:runtime.ledger
+          ~proof_mode
           ~fold:(fun epoch ->
             Result.map
               (fun ctx -> { ctx with Epoch_exec.account_mode })
@@ -57,7 +62,11 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
                 match plan with
                 | Error error -> Lwt.return_error error
                 | Ok plan ->
-                  let* verified = Transition.verify plan in
+                  let* verified =
+                    Transition.verify
+                      ~strict:(proof_mode = Rule_graph.Active)
+                      plan
+                  in
                   begin
                     match verified with
                     | Error error -> Lwt.return_error error

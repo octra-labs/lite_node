@@ -238,21 +238,19 @@ let bool_json ~default = function
 let default_readonly_caller =
   "oct00000000000000000000000000000000000000000000"
 
-let readonly_storage_default method_name =
-  not (String.equal method_name "balance_of")
-
 let plan_readonly_call ~method_name ~params ~caller_addr ~include_storage =
   {
     readonly_method_name = method_name;
     readonly_params = params_json params;
     readonly_caller_addr = Option.value caller_addr ~default:default_readonly_caller;
     readonly_include_storage =
-      bool_json ~default:(readonly_storage_default method_name) include_storage;
+      bool_json ~default:false include_storage;
   }
 
-let parse_deploy_payload_with_keys ~trusted ~bytecode_b64 ~deployer ~nonce ~target =
+let parse_deploy_payload_with_keys ~trusted ~point_ops ~bytecode_b64 ~deployer
+    ~nonce ~target =
   let bytecode_raw = Base64.decode_exn bytecode_b64 in
-  match Admission.decode_deploy ~trusted bytecode_raw with
+  match Admission.decode_deploy ~trusted ~point_ops bytecode_raw with
   | Error err -> Deploy_invalid_bytecode (Admission.error_message err)
   | Ok admitted ->
     let bytecode = Admission.code admitted in
@@ -265,6 +263,7 @@ let parse_deploy_payload_with_keys ~trusted ~bytecode_b64 ~deployer ~nonce ~targ
 let parse_deploy_payload ~bytecode_b64 ~deployer ~nonce ~target =
   parse_deploy_payload_with_keys
     ~trusted:[]
+    ~point_ops:false
     ~bytecode_b64
     ~deployer
     ~nonce
@@ -318,14 +317,15 @@ let deploy_payload_reject = function
       deploy_consume_nonce = false;
     }
 
-let plan_deploy_input_with_keys ~trusted ~bytecode_b64_opt ~deployer ~nonce ~target =
+let plan_deploy_input_with_keys ~trusted ~point_ops ~bytecode_b64_opt ~deployer
+    ~nonce ~target =
   match bytecode_b64_opt with
   | None ->
     Deploy_input_rejected deploy_missing_bytecode_reject
   | Some bytecode_b64 ->
     try
       match parse_deploy_payload_with_keys
-        ~trusted ~bytecode_b64 ~deployer ~nonce ~target with
+        ~trusted ~point_ops ~bytecode_b64 ~deployer ~nonce ~target with
       | Deploy_ready deploy ->
         Deploy_input_ready {
           bytecode_raw = deploy.bytecode_raw;
@@ -339,6 +339,7 @@ let plan_deploy_input_with_keys ~trusted ~bytecode_b64_opt ~deployer ~nonce ~tar
 let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
   plan_deploy_input_with_keys
     ~trusted:[]
+    ~point_ops:false
     ~bytecode_b64_opt
     ~deployer
     ~nonce

@@ -12,6 +12,8 @@ type t
 
 val state_relative_path : string
 
+val state_path : string -> string
+
 val disabled :
   chain_id:string ->
   t

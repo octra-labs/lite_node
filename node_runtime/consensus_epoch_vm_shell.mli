@@ -36,7 +36,9 @@ type ('value_snapshot, 'program_snapshot) deps = {
     nonce:int ->
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  point_ops : bool;
   object_cost : bool;
+  int_work : Octra_vm.Int_work.mode;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -220,11 +222,13 @@ type vm_tx_deps = {
   save_receipt_raw : tx_hash:string -> json:string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
+  proof_mode : Octra_core.Rule_graph.mode;
   epoch : int;
   now : unit -> float;
 }
 
 val prepare_program_package :
+  point_ops:bool ->
   Transaction.t ->
   (Octra_vm.Program_package.admitted, string) result Lwt.t
 
@@ -240,6 +244,7 @@ type live_vm_tx_args = {
   ensure_account : string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
+  proof_mode : Octra_core.Rule_graph.mode;
   epoch : int;
   now : unit -> float;
 }
@@ -263,6 +268,7 @@ type live_contract_ctx_args = {
   trusted_program_keys : Octra_vm.Program_trust.t;
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  proof_mode : Octra_core.Rule_graph.mode;
   object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
@@ -297,6 +303,7 @@ type live_sender_vm_tx_args = {
   chaindata : Octra_core.Store_chaindata.t;
   tx : Transaction.t;
   object_cost : bool;
+  proof_mode : Octra_core.Rule_graph.mode;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
   pre_state_hash : string;
@@ -421,6 +428,7 @@ val make_multi_exec_deps :
 
 val run_contract_deploy :
   trusted_program_keys:Octra_vm.Program_trust.t ->
+  point_ops:bool ->
   fee:Z.t ->
   balance:Z.t option ->
   bytecode_b64_opt:string option ->
@@ -445,6 +453,7 @@ val run_contract_deploy :
 
 val run_deploy_tx :
   trusted_program_keys:Octra_vm.Program_trust.t ->
+  point_ops:bool ->
   balance:Z.t option ->
   Transaction.t ->
   handle_reject:(Call_plan.deploy_reject -> unit Lwt.t) ->
@@ -464,6 +473,7 @@ val run_deploy_tx :
 
 val run_deploy_tx_runtime :
   trusted_program_keys:Octra_vm.Program_trust.t ->
+  point_ops:bool ->
   call_runtime ->
   balance:Z.t option ->
   Transaction.t ->

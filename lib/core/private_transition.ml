@@ -4,7 +4,7 @@
 module P = Private_ledger
 module T = Transaction
 
-let consensus_id = "private_receipt:verify_apply:retry_tx"
+let consensus_id = "private_receipt:verify_apply:retry_tx:amount_link_v1"
 
 type limits = {
   max_fhe : int;
@@ -182,12 +182,14 @@ let encrypt t tx =
               ~verify:(fun () ->
                 P.encrypt_plan
                   ~field_policy:t.field_policy
+                  ~strict:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
                   t.ledger
                   tx)
               ~prepare:(fun () ->
                 P.prepare_encrypt_plan
                   ~field_policy:t.field_policy
+                  ~cap:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
                   t.ledger
                   tx)
@@ -237,12 +239,14 @@ let decrypt t tx =
               ~verify:(fun () ->
                 P.decrypt_plan
                   ~field_policy:t.field_policy
+                  ~strict:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
                   t.ledger
                   tx)
               ~prepare:(fun () ->
                 P.prepare_decrypt_plan
                   ~field_policy:t.field_policy
+                  ~cap:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
                   t.ledger
                   tx)
@@ -312,12 +316,14 @@ let key_switch t tx =
           ~verify:(fun () ->
             P.key_switch_plan
               ~field_policy:t.field_policy
+              ~strict:(t.proof_mode = Rule_graph.Active)
               ?legacy_public_replay:replay
               t.ledger
               tx)
           ~prepare:(fun () ->
             P.prepare_key_switch_plan
               ~field_policy:t.field_policy
+              ~cap:(t.proof_mode = Rule_graph.Active)
               t.ledger
               tx)
           ~pack:(fun plan -> P.Prepared_key_switch plan)
@@ -349,6 +355,7 @@ let verified_stealth_plan t tx =
     let* result =
       P.prepare_stealth_plan
         ~field_policy:t.field_policy
+        ~cap:(t.proof_mode = Rule_graph.Active)
         ~result_policy:t.result_policy
         t.ledger
         tx
@@ -365,6 +372,7 @@ let verified_stealth_plan t tx =
     let* result =
       P.stealth_plan
         ~field_policy:t.field_policy
+        ~cap:(t.proof_mode = Rule_graph.Active)
         ~result_policy:t.result_policy
         t.ledger
         tx
@@ -373,7 +381,13 @@ let verified_stealth_plan t tx =
       match result with
       | Error e -> Lwt.return (failure t e)
       | Ok plan ->
-        let* range = P.stealth_inline_range t.ledger tx plan in
+        let* range =
+          P.stealth_inline_range
+            ~strict:(t.proof_mode = Rule_graph.Active)
+            t.ledger
+            tx
+            plan
+        in
         begin
           match range with
           | Error e -> Lwt.return (failure t e)
@@ -385,6 +399,7 @@ let verified_stealth_plan t tx =
                 let* binding =
                   P.stealth_binding
                     ~field_policy:t.field_policy
+                    ~strict:(t.proof_mode = Rule_graph.Active)
                     t.ledger
                     tx
                     plan
@@ -480,9 +495,17 @@ let verified_claim_plan t tx =
     let* claim =
       match check with
       | Verify_proof _ ->
-        P.claim_plan ~field_policy:t.field_policy t.ledger tx
+        P.claim_plan
+          ~field_policy:t.field_policy
+          ~strict:(t.proof_mode = Rule_graph.Active)
+          t.ledger
+          tx
       | Apply_receipt _ ->
-        P.prepare_claim_plan ~field_policy:t.field_policy t.ledger tx
+        P.prepare_claim_plan
+          ~field_policy:t.field_policy
+          ~cap:(t.proof_mode = Rule_graph.Active)
+          t.ledger
+          tx
     in
     begin
       match claim with
@@ -494,7 +517,12 @@ let verified_claim_plan t tx =
         end
       | Ok claim ->
         let* balance =
-          P.claim_balance_plan ~result_policy:t.result_policy t.ledger tx claim
+          P.claim_balance_plan
+            ~cap:(t.proof_mode = Rule_graph.Active)
+            ~result_policy:t.result_policy
+            t.ledger
+            tx
+            claim
         in
         begin
           match balance with

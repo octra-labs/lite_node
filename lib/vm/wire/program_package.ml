@@ -72,6 +72,7 @@ let magic = "OCPS"
 let wire_version = 1
 let compiler_profile = 1
 let compiler_profile_id = "rehovot_1"
+let standard_id = "rehovot_runtime"
 let supported_compiler_profiles = [1]
 let max_sources = 32
 let max_path = 256
@@ -258,13 +259,17 @@ let compile_sources_with compile package =
   in
   result, used
 
-let compile_sources package =
-  compile_sources_with Oct_compile.compile_program_multi_first package
+let compile_sources ~point_ops package =
+  let compile =
+    if point_ops then Oct_compile.compile_program_multi_first
+    else Prior_compile.compile_program_multi_first
+  in
+  compile_sources_with compile package
 
 let compile_sources_checked package =
   compile_sources_with Oct_compile.compile_program_multi package
 
-let build_with compile package =
+let build_with ~point_ops compile package =
   let result, used = compile package in
   match result.Oct_compile.error, result.program_envelope with
   | Some reason, _ -> Error (Compile_failed reason)
@@ -278,7 +283,7 @@ let build_with compile package =
     | Some source -> Error (Unused_source source.path)
     | None ->
       bind
-        (match Admission.decode_program_source envelope with
+        (match Admission.decode_program_source ~point_ops envelope with
          | Ok admitted -> Ok admitted
          | Error error ->
            Error (Admission_failed (Admission.error_message error)))
@@ -286,28 +291,35 @@ let build_with compile package =
           bind (encode { package with envelope }) (fun encoded ->
             Ok { package = encoded; envelope; result }))
 
-let build package =
-  build_with compile_sources package
+let build ~point_ops package =
+  build_with ~point_ops (compile_sources ~point_ops) package
 
-let compile ~main ~sources =
+let compile_for ~point_ops ~main ~sources =
   bind (normalize ~main sources) (fun sources ->
-    build_with compile_sources_checked {
+    let compile =
+      if point_ops then compile_sources_checked
+      else compile_sources_with Prior_compile.compile_program_multi
+    in
+    build_with ~point_ops compile {
       compiler_profile;
       main;
       sources;
       envelope = "";
     })
 
+let compile ~main ~sources =
+  compile_for ~point_ops:true ~main ~sources
+
 let validate_base64 encoded =
   bind (decode_base64 encoded) (fun _ -> Ok ())
 
-let admit_base64 encoded =
+let admit_base64 ?(point_ops = false) encoded =
   bind (decode_base64 encoded) (fun package ->
-    bind (build { package with envelope = "" }) (fun compiled ->
+    bind (build ~point_ops { package with envelope = "" }) (fun compiled ->
       if not (String.equal compiled.envelope package.envelope) then
         Error Envelope_mismatch
       else
-        match Admission.decode_program_source package.envelope with
+        match Admission.decode_program_source ~point_ops package.envelope with
         | Error error ->
           Error (Admission_failed (Admission.error_message error))
         | Ok admitted ->

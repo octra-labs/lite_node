@@ -17,6 +17,7 @@ module PC = Octra_node_runtime.P2p_config
 module A = Octra_node_runtime.Consensus_epoch_apply_shared
 module AC = Octra_node_runtime.Consensus_epoch_apply_checked
 module V = Octra_node_runtime.Epoch_visibility
+module VM = Octra_node_runtime.Consensus_epoch_vm_shell
 
 let fail msg =
   failwith ("test_epoch_exec_reward_atomic: " ^ msg)
@@ -474,6 +475,33 @@ let test_consensus_cutover () =
   expect "cutover switches only the activation epoch"
     (!switched = [1_500_000])
 
+let test_integer_work_gate () =
+  with_store (fun store ->
+    let make proof_mode =
+      VM.make_live_contract_ctx
+        {
+          value_journal =
+            Octra_vm.Value_journal.create ~balance:(fun _ -> Z.zero);
+          program_journal = Octra_vm.Program_journal.create ();
+          trusted_program_keys = Octra_vm.Program_trust.empty;
+          store;
+          get_fhe_pubkey = (fun _ -> None);
+          proof_mode;
+          object_cost = false;
+          current_epoch = 0;
+          epoch_time_ms = 0L;
+          tree_hash = "";
+          node_id = "";
+          tx_hash = "";
+        }
+    in
+    let prior = make Octra_core.Rule_graph.Prior in
+    let active = make Octra_core.Rule_graph.Active in
+    expect "prior integer work mode"
+      (prior.Octra_vm.Contract_vm.int_work = Octra_vm.Int_work.Prior);
+    expect "active integer work mode"
+      (active.Octra_vm.Contract_vm.int_work = Octra_vm.Int_work.Active))
+
 let test_epoch_serialization () =
   let visibility = V.create () in
   let release, wake = Lwt.wait () in
@@ -497,9 +525,9 @@ let test_epoch_serialization () =
   let first_result, second_result = Lwt_main.run (Lwt.both first second) in
   expect "first epoch apply completes"
     (match first_result with V.Applied () -> true | V.Busy -> false);
-  expect "waiting epoch apply is stale"
+  expect "waiting epoch apply is superseded"
     (match second_result with V.Busy -> true | V.Applied () -> false);
-  expect "stale epoch payload is discarded"
+  expect "superseded epoch payload is discarded"
     (List.rev !events = ["first-start"; "first-end"]);
   expect "epoch visibility reopens" (not (V.is_applying visibility));
   let third =
@@ -1047,10 +1075,13 @@ let test_sender_key_preview_parity () =
             Octra_core.State_preview.with_preview
               ~base_store:store
               ~base_ledger:ledger
+              ~proof_mode:Octra_core.Rule_graph.Prior
               ~fold:X.prior_fold
               ~epoch_id:env.X.epoch_id
               ~proposal_id:"sender-key-preview"
               (fun backend ->
+                expect "preview proof mode"
+                  (backend.X.proof_mode = Octra_core.Rule_graph.Prior);
                 X.run
                   ~backend
                   ~env
@@ -1087,10 +1118,14 @@ let test_preview_clone_requires_clean_ledger () =
       Octra_core.State_preview.with_preview
         ~base_store:store
         ~base_ledger:ledger
+        ~proof_mode:Octra_core.Rule_graph.Prior
         ~fold:X.prior_fold
         ~epoch_id:env.X.epoch_id
         ~proposal_id:"dirty-preview"
-        (fun _ -> Lwt.return_ok ())
+        (fun backend ->
+          expect "dirty preview proof mode"
+            (backend.X.proof_mode = Octra_core.Rule_graph.Prior);
+          Lwt.return_ok ())
       |> Lwt_main.run
     in
     expect "dirty preview rejected"
@@ -1305,6 +1340,7 @@ let () =
   test_validator_unbond ();
   test_consensus_standard ();
   test_consensus_cutover ();
+  test_integer_work_gate ();
   test_epoch_serialization ();
   test_epoch_busy_gate ();
   test_upgrade_ready_refresh ();

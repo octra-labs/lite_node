@@ -140,13 +140,13 @@ let validate_decision decision =
     Error "migration public_net is outside the supply envelope"
   | _ when decision.can_public_migrate
       && decision.audit_class <> Replay.Public_clean ->
-    Error "public migration entitlement requires public_clean audit"
+    Error "public migration admission requires public_clean audit"
   | _ when decision.can_public_migrate
       && Option.is_none decision.public_net ->
-    Error "public migration entitlement requires public_net"
+    Error "public migration admission requires public_net"
   | _ when decision.can_public_migrate
       && decision.blockers <> [] ->
-    Error "public migration entitlement must not contain blockers"
+    Error "public migration admission must not contain blockers"
   | _ ->
     Ok ()
 
@@ -186,7 +186,7 @@ let create ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   else if activation_epoch <= snapshot_epoch then
     Error "migration activation_epoch must follow snapshot_epoch"
   else if List.length entries > max_entries then
-    Error "migration entitlement entry cap exceeded"
+    Error "migration admission entry cap exceeded"
   else
     let entries =
       List.sort (fun left right -> String.compare left.address right.address) entries
@@ -434,9 +434,9 @@ let load_json ~chain_id ~expected_root = function
             (fun value ->
           match root value with
           | Some actual when String.equal actual expected_root -> Ok value
-          | Some _ -> Error "migration entitlement root mismatch"
-          | None -> Error "migration entitlement artifact disabled")))))))))
-  | _ -> Error "migration entitlement artifact must be an object"
+          | Some _ -> Error "migration admission root mismatch"
+          | None -> Error "migration admission artifact disabled")))))))))
+  | _ -> Error "migration admission artifact must be an object"
 
 let configured getenv name =
   match getenv name with
@@ -452,9 +452,9 @@ let read_file path =
       let descriptor = Unix.descr_of_in_channel channel in
       let before = Unix.fstat descriptor in
       if before.Unix.st_kind <> Unix.S_REG then
-        Error "migration entitlement artifact must be a regular file"
+        Error "migration admission artifact must be a regular file"
       else if before.Unix.st_size > max_artifact_bytes then
-        Error "migration entitlement artifact exceeds size cap"
+        Error "migration admission artifact exceeds size cap"
       else
         let body = really_input_string channel before.Unix.st_size in
         let has_suffix =
@@ -464,7 +464,7 @@ let read_file path =
         in
         let after = Unix.fstat descriptor in
         if has_suffix || after.Unix.st_size <> before.Unix.st_size then
-          Error "migration entitlement artifact changed while loading"
+          Error "migration admission artifact changed while loading"
         else Ok body)
 
 let load_body ~chain_id ~expected_root body =
@@ -474,7 +474,7 @@ let load_body ~chain_id ~expected_root body =
       ~expected_root
       (Yojson.Safe.from_string body)
   with exn ->
-    Error ("migration entitlement parse failed: " ^ Printexc.to_string exn)
+    Error ("migration admission parse failed: " ^ Printexc.to_string exn)
 
 let load_file ~chain_id ~expected_root path =
   bind
@@ -493,12 +493,12 @@ let load_env ~chain_id ~data_dir ~getenv =
   | Some expected_root ->
     let path = state_path data_dir in
     if not (Sys.file_exists path) then
-      Error "migration entitlement state is missing from node data"
+      Error "migration admission state is missing from node data"
     else begin
       try
         load_file ~chain_id ~expected_root path
       with exn ->
-        Error ("migration entitlement load failed: " ^ Printexc.to_string exn)
+        Error ("migration admission load failed: " ^ Printexc.to_string exn)
     end
 
 let option_json encode = function
@@ -521,7 +521,7 @@ let entry_json entry =
 
 let to_yojson = function
   | Disabled _ ->
-    Error "disabled migration entitlement cannot be serialized"
+    Error "disabled migration admission cannot be serialized"
   | Enabled value ->
     let entries =
       Hashtbl.fold (fun _ entry acc -> entry :: acc) value.entries []

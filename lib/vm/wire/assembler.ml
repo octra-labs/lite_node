@@ -73,6 +73,8 @@ let parse_line line =
     | "SLOADK", [_;_] -> Contract_vm.SLOADK (r 0, r 1)
     | "SSTOREK", [_;_] -> Contract_vm.SSTOREK (r 0, r 1)
     | "SDELK", [_] -> Contract_vm.SDELK (r 0)
+    | "CAP_CHECK", [kind;_] -> Contract_vm.CAP_CHECK (parse_int kind, r 1)
+    | "CAP_CLOSE", [kind;_] -> Contract_vm.CAP_CLOSE (parse_int kind, r 1)
     | "MLOAD", [d;idx] -> Contract_vm.MLOAD (parse_reg d, int_of_string (trim idx))
     | "MSTORE", [idx;s] -> Contract_vm.MSTORE (int_of_string (trim idx), parse_reg s)
     | "JMP", [a] -> Contract_vm.JMP (int_of_string (trim a))
@@ -163,6 +165,9 @@ let parse_line line =
     | "FHE_VERIFY_BOUND", [_;_;_;_;_] -> Contract_vm.FHE_VERIFY_BOUND (r 0, r 1, r 2, r 3, r 4)
     | "FHE_COMMIT", [_;_;_] -> Contract_vm.FHE_COMMIT (r 0, r 1, r 2)
     | "FHE_PEDERSEN", [_;_;_] -> Contract_vm.FHE_PEDERSEN (r 0, r 1, r 2)
+    | "FHE_PEDERSEN_ADD", [_;_;_] -> Contract_vm.FHE_PEDERSEN_ADD (r 0, r 1, r 2)
+    | "FHE_PEDERSEN_SUB", [_;_;_] -> Contract_vm.FHE_PEDERSEN_SUB (r 0, r 1, r 2)
+    | "FHE_PEDERSEN_IDENTITY", [_] -> Contract_vm.FHE_PEDERSEN_IDENTITY (r 0)
     | "FHE_SER", [_;_] -> Contract_vm.FHE_SER (r 0, r 1)
     | "FHE_DESER", [_;_] -> Contract_vm.FHE_DESER (r 0, r 1)
     | "FHE_SER_PK", [_;_] -> Contract_vm.FHE_SER_PK (r 0, r 1)
@@ -187,6 +192,7 @@ let emit_v = function
   | Contract_vm.VU128 z -> Z.to_string z
   | Contract_vm.VU256 z -> Z.to_string z
   | Contract_vm.VAddr a -> Printf.sprintf "\"%s\"" a
+  | Contract_vm.VCap _ -> invalid_arg "capability cannot be assembled"
   | Contract_vm.VCipher _ -> "\"<cipher>\""
   | Contract_vm.VPubKey _ -> "\"<pubkey>\""
 
@@ -212,6 +218,10 @@ let emit_instr = function
   | Contract_vm.SLOADK (d,s) -> Printf.sprintf "SLOADK %s, %s" (emit_reg d) (emit_reg s)
   | Contract_vm.SSTOREK (d,s) -> Printf.sprintf "SSTOREK %s, %s" (emit_reg d) (emit_reg s)
   | Contract_vm.SDELK r -> Printf.sprintf "SDELK %s" (emit_reg r)
+  | Contract_vm.CAP_CHECK (kind, r) ->
+    Printf.sprintf "CAP_CHECK %s, %s" (Z.to_string kind) (emit_reg r)
+  | Contract_vm.CAP_CLOSE (kind, r) ->
+    Printf.sprintf "CAP_CLOSE %s, %s" (Z.to_string kind) (emit_reg r)
   | Contract_vm.MLOAD (d,i) -> Printf.sprintf "MLOAD %s, %d" (emit_reg d) i
   | Contract_vm.MSTORE (i,s) -> Printf.sprintf "MSTORE %d, %s" i (emit_reg s)
   | Contract_vm.JMP a -> Printf.sprintf "JMP %d" a
@@ -321,6 +331,12 @@ let emit_instr = function
     Printf.sprintf "FHE_COMMIT %s, %s, %s" (emit_reg d) (emit_reg pk) (emit_reg ct)
   | Contract_vm.FHE_PEDERSEN (d,a,bl) ->
     Printf.sprintf "FHE_PEDERSEN %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg bl)
+  | Contract_vm.FHE_PEDERSEN_ADD (d,a,b) ->
+    Printf.sprintf "FHE_PEDERSEN_ADD %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg b)
+  | Contract_vm.FHE_PEDERSEN_SUB (d,a,b) ->
+    Printf.sprintf "FHE_PEDERSEN_SUB %s, %s, %s" (emit_reg d) (emit_reg a) (emit_reg b)
+  | Contract_vm.FHE_PEDERSEN_IDENTITY d ->
+    Printf.sprintf "FHE_PEDERSEN_IDENTITY %s" (emit_reg d)
   | Contract_vm.FHE_SER (d,ct) -> Printf.sprintf "FHE_SER %s, %s" (emit_reg d) (emit_reg ct)
   | Contract_vm.FHE_DESER (d,b) -> Printf.sprintf "FHE_DESER %s, %s" (emit_reg d) (emit_reg b)
   | Contract_vm.FHE_SER_PK (d,pk) -> Printf.sprintf "FHE_SER_PK %s, %s" (emit_reg d) (emit_reg pk)

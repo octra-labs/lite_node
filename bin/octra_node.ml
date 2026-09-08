@@ -10,7 +10,7 @@ module Epochlog = Octra_core.Epochlog
 module Store_chaindata = Octra_core.Store_chaindata
 module Store_irmin = Octra_core.Store_irmin
 module Tx_drop = Octra_core.Tx_drop
-module Pvac_migration_entitlement = Octra_core.Pvac_migration_entitlement
+module Pvac_migration_admission = Octra_core.Pvac_migration_admission
 module Pvac_verify_worker = Octra_core.Pvac_verify_worker
 module Private_ledger = Octra_core.Private_ledger
 module Consensus_bundle_cache = Octra_node_runtime.Consensus_bundle_cache
@@ -215,9 +215,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~activation_epoch:private_result_activation_epoch
         epoch
     in
-    let migration_entitlements =
+    let migration_admissions =
       match
-        Pvac_migration_entitlement.load_env
+        Pvac_migration_admission.load_env
           ~chain_id:startup_network.chain_id
           ~data_dir
           ~getenv:env_opt
@@ -225,19 +225,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok value -> value
       | Error reason ->
         Log.fatal "init"
-          "event = migration_entitlements status = rejected reason = %s"
+          "event = migration_admissions status = rejected reason = %s"
           reason;
         exit_error ()
     in
     Log.info "init"
-      "event = migration_entitlements status = loaded entries = %d root = %s"
-      (Pvac_migration_entitlement.entry_count migration_entitlements)
+      "event = migration_admissions status = loaded entries = %d root = %s"
+      (Pvac_migration_admission.entry_count migration_admissions)
       (Option.value
          ~default:"none"
-         (Pvac_migration_entitlement.root migration_entitlements));
+         (Pvac_migration_admission.root migration_admissions));
     let legacy_replay ~epoch ~address ~cipher =
-      Pvac_migration_entitlement.decision
-        migration_entitlements
+      Pvac_migration_admission.decision
+        migration_admissions
         ~epoch
         ~address
         ~cipher
@@ -439,27 +439,27 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     Log.info "init" "event = chaindata_open tx_count = %d mode = lmdb_txlog_epochlog"
       !total_tx_count;
     begin
-      match Pvac_migration_entitlement.root migration_entitlements with
+      match Pvac_migration_admission.root migration_admissions with
       | None ->
         Log.info "init"
           "event = migration_snapshot status = disabled"
       | Some root ->
         let binding =
-          match Pvac_migration_entitlement.snapshot_epoch migration_entitlements with
+          match Pvac_migration_admission.snapshot_epoch migration_admissions with
           | None -> Error "migration snapshot epoch is missing"
           | Some epoch ->
               begin
                 match Store_chaindata.get_bound_epoch_header chaindata epoch with
                 | Ok header ->
-                    Pvac_migration_entitlement.bind_snapshot
-                      migration_entitlements
+                    Pvac_migration_admission.bind_snapshot
+                      migration_admissions
                       (fun _ -> Ok header.Epochlog.state_root)
                 | Error "epoch not found" ->
                     begin
                       match history_floor, floor_config_hash with
                       | Some floor, Some config_hash ->
-                          Pvac_migration_entitlement.bind_floor
-                            migration_entitlements
+                          Pvac_migration_admission.bind_floor
+                            migration_admissions
                             ~config_hash
                             ~floor_config_hash:(History_floor.config_hash floor)
                             ~floor_epoch:(History_floor.epoch floor)
@@ -473,7 +473,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         | Ok () ->
           Log.info "init"
             "event = migration_snapshot status = bound epoch = %s root = %s"
-            (Pvac_migration_entitlement.snapshot_epoch migration_entitlements
+            (Pvac_migration_admission.snapshot_epoch migration_admissions
              |> Option.map string_of_int
              |> Option.value ~default:"none")
             root
@@ -510,6 +510,12 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let private_field_policy epoch =
       match Rule_graph.private_payload rules ~epoch with
       | Ok mode -> Private_ledger.field_policy_of_mode mode
+      | Error fault -> failwith (Rule_graph.fault_message fault)
+    in
+    let private_proof_strict epoch =
+      match Rule_graph.standard rules ~epoch with
+      | Ok Rule_graph.Active -> true
+      | Ok Rule_graph.Prior -> false
       | Error fault -> failwith (Rule_graph.fault_message fault)
     in
     let bind_rule
@@ -1268,11 +1274,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let key_switch_preverify =
       Consensus_key_switch_preverify.create
         ~field_policy:(fun () -> private_field_policy !current_epoch)
+        ~strict:(fun () -> private_proof_strict !current_epoch)
         ledger
     in
     let private_preverify =
       Consensus_private_preverify.create
         ~field_policy:(fun () -> private_field_policy !current_epoch)
+        ~strict:(fun () -> private_proof_strict !current_epoch)
         ~result_policy:(fun () -> private_result_policy !current_epoch)
         ledger
     in
@@ -1284,6 +1292,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         (Staging.all ());
     let stealth_preverify =
       Preverify_submit.{
+        strict = (fun () -> private_proof_strict !current_epoch);
         get_pvac_pubkey =
           (fun addr -> Ledger.get_pvac_pubkey ledger addr);
         sender_enc =
@@ -1293,8 +1302,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               (Ledger.find ledger addr).encrypted_balance);
         start_task = Preverify_cache.start_task;
         verify_ranges =
-          (fun ~pubkey_blob ~sender_enc ptd ->
+          (fun ~strict ~pubkey_blob ~sender_enc ptd ->
             Octra_node_runtime.Tx_view.preverify_stealth_ranges
+              ~strict
               ~pubkey_blob
               ~sender_enc
               ptd);
@@ -1627,6 +1637,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             let* batch =
               Octra_core.Preverify_worker.run_many
                 ~field_policy:(private_field_policy !current_epoch)
+                ~strict:(private_proof_strict !current_epoch)
                 ~ledger
                 ~result_policy:(private_result_policy !current_epoch)
                 ~circle_preverify:
@@ -1780,6 +1791,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           store;
           chaindata;
           wallet;
+          force_publish = publisher_mode;
           config_hash = State_sync_http.configured_config_hash;
           trusted_validator_set = State_sync_http.configured_validator_set;
           head = Octra_core.Head_manifest.get_cached;
@@ -1890,7 +1902,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
         ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
         ~validator_view_sk ~validator_view_pub ~program_trust ~chaindata
-        ~migration_entitlements
+        ~migration_admissions
         ~rules
         ~consensus_driver_ref:driver_ref
         ~epoch_visibility

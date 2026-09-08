@@ -153,6 +153,7 @@ let kind_of_value = function
   | Contract_vm.VAddr _ -> Addr
   | Contract_vm.VCipher _ -> Cipher
   | Contract_vm.VPubKey _ -> PubKey
+  | Contract_vm.VCap _ -> Unknown
 
 let numeric = function
   | Int | U64 | U128 | U256 -> true
@@ -624,6 +625,14 @@ let step facts pc env = function
      | Ok _, Ok _ -> write pc env dest String
      | Error error, _
      | _, Error error -> Error error)
+  | Contract_vm.FHE_PEDERSEN_ADD (dest, left, right)
+  | Contract_vm.FHE_PEDERSEN_SUB (dest, left, right) ->
+    (match expect_text pc env left, expect_text pc env right with
+     | Ok _, Ok _ -> write pc env dest String
+     | Error error, _
+     | _, Error error -> Error error)
+  | Contract_vm.FHE_PEDERSEN_IDENTITY dest ->
+    write pc env dest String
   | Contract_vm.FHE_SER (dest, cipher) ->
     (match expect_cipher pc env cipher with
      | Error error -> Error error

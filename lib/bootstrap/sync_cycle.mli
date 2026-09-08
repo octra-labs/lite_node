@@ -4,7 +4,7 @@
 type policy
 
 type outcome =
-  | Published
+  | Published of int64
   | Failed
 
 type event =

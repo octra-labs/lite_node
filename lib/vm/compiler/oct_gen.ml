@@ -3,9 +3,9 @@
 
 open Oct_lang
 
-exception GenError of string * int
+exception GenError of string * int * int
 
-let gerr line msg = raise (GenError (msg, line))
+let gerr ?(column = 1) line msg = raise (GenError (msg, line, column))
 
 type env = {
   structs : struct_def list;
@@ -15,32 +15,64 @@ type env = {
   events : event_def list;
   errors : error_def list;
   funcs : func_def list;
+  forms : string list;
+  direct : string list;
   func_labels : (string, int) Hashtbl.t;
   mutable locals : (string * int * typ) list;
   mutable base_reg : int;
   mutable next_reg : int;
   mutable next_label : int;
   mutable code : Contract_vm.instr list;
+  mutable seals : Aml_call.t list;
   mutable line : int;
+  mutable column : int;
   has_payable : bool;
   mutable in_nonreentrant : bool;
   mutable fn_is_view : bool;
   mutable fn_is_pure : bool;
+  mutable fn_is_direct : bool;
+  mutable fn_ret : typ;
   declaration : declaration;
 }
 
-let make_env declaration structs enums consts state events errors funcs = {
-  structs; enums; consts; state; events; errors; funcs;
+let make_env declaration structs enums consts state events errors funcs forms direct = {
+  structs; enums; consts; state; events; errors; funcs; forms; direct;
   func_labels = Hashtbl.create 16;
   locals = [];
   base_reg = 1; next_reg = 1; next_label = 10000;
-  code = []; line = 0;
+  code = []; seals = []; line = 0; column = 0;
   has_payable = List.exists (fun f -> f.fn_payable) funcs;
   in_nonreentrant = false;
   fn_is_view = false;
   fn_is_pure = false;
+  fn_is_direct = false;
+  fn_ret = TVoid;
   declaration;
 }
+
+let user_call env name =
+  List.exists (String.equal name) env.direct
+
+let form_call env name =
+  List.exists (String.equal name) env.forms
+
+let direct_call env name =
+  List.exists (String.equal name) env.direct
+
+let is_direct env f =
+  List.exists (String.equal f.fn_name) env.direct
+
+let nonpayable_guard env f =
+  env.has_payable && not f.fn_payable && f.fn_vis = Public
+
+let split_guard env f =
+  is_direct env f && nonpayable_guard env f
+
+let require_type env context expected actual =
+  if not (Oct_types.compatible expected actual) then
+    gerr ~column:env.column env.line
+      (Printf.sprintf "%s expected = %s actual = %s"
+        context (typ_to_string expected) (typ_to_string actual))
 
 let check_no_storage_write env =
   if env.fn_is_pure then gerr env.line "pure function cannot write storage";
@@ -58,7 +90,7 @@ let check_no_call env =
 
 let alloc_reg env =
   let r = env.next_reg in
-  if r > 63 then gerr env.line "too many local variables (max 63 registers)";
+  if r > 63 then gerr env.line "register capacity exceeded maximum = 64";
   env.next_reg <- r + 1;
   r
 
@@ -172,6 +204,16 @@ let resolve_enum_variant env enum_name variant_name =
 
 let storage_key_for_field name = name
 
+let internal_key family name = "@aml/" ^ family ^ "/" ^ name
+
+let list_length_key field = internal_key "list" field ^ "/length"
+
+let list_item_prefix field = internal_key "list" field ^ "/item/"
+
+let option_presence_key name = internal_key "option" name ^ "/present"
+
+let nonreentrant_key = internal_key "guard" "nonreentrant"
+
 let map_value_type t =
   let rec dig = function TMap (_, v) -> dig v | t -> t in
   dig t
@@ -231,16 +273,18 @@ let resolve_storage_path_type env field keys path =
 
 let gen_storage_key env field_name keys =
   let kr = alloc_reg env in
-  emit env (Contract_vm.LDI (kr, VString (field_name ^ ":")));
-  let need_sep = List.length keys > 1 in
-  let sep = if need_sep then begin
-    let s = alloc_reg env in
-    emit env (Contract_vm.LDI (s, VString ":"));
-    s
-  end else 0 in
-  List.iteri (fun i k_reg ->
-    if i > 0 then emit env (Contract_vm.CONCAT (kr, kr, sep));
-    emit env (Contract_vm.CONCAT (kr, kr, k_reg))
+  emit env (Contract_vm.LDI (kr, VString (internal_key "map" field_name ^ "/")));
+  List.iter (fun key_r ->
+    let text_r = alloc_reg env in
+    emit env (Contract_vm.LDI (text_r, VString ""));
+    emit env (Contract_vm.CONCAT (text_r, text_r, key_r));
+    let length_r = alloc_reg env in
+    emit env (Contract_vm.STRLEN (length_r, text_r));
+    let mark_r = alloc_reg env in
+    emit env (Contract_vm.LDI (mark_r, VString "#"));
+    emit env (Contract_vm.CONCAT (kr, kr, length_r));
+    emit env (Contract_vm.CONCAT (kr, kr, mark_r));
+    emit env (Contract_vm.CONCAT (kr, kr, text_r))
   ) keys;
   kr
 
@@ -284,13 +328,13 @@ let gen_storage_path_prefix_key env field key_regs path =
   let kr =
     if key_regs = [] then begin
       let r = alloc_reg env in
-      emit env (Contract_vm.LDI (r, VString field));
+      emit env (Contract_vm.LDI (r, VString (internal_key "path" field)));
       r
     end else gen_storage_key env field key_regs
   in
   List.iter (fun segment ->
     let sr = alloc_reg env in
-    emit env (Contract_vm.LDI (sr, VString (":" ^ segment)));
+    emit env (Contract_vm.LDI (sr, VString ("/path/" ^ segment)));
     emit env (Contract_vm.CONCAT (kr, kr, sr))
   ) path;
   kr
@@ -747,7 +791,7 @@ let gen_object_transition_apply env rd transition_ref_r object_ref_r previous_st
          status_r,
          intent_id_r ))
 
-let rec typ_of_expr env = function
+let rec typ_of_expr_with constants env = function
   | EInt _ -> TInt
   | EBool _ -> TBool
   | EString _ -> TString
@@ -756,41 +800,144 @@ let rec typ_of_expr env = function
   | EBalance _ -> TInt
   | ETreeHash | ENodeId | ETxHash -> TString
   | EVar name ->
+    if List.exists (String.equal name) constants then
+      gerr ~column:env.column env.line
+        ("constant dependency is cyclic name = " ^ name)
+    else
     (match find_const env name with
+     | Some c when c.c_typ = TVoid ->
+       typ_of_expr_with (name :: constants) env c.c_value
      | Some c -> c.c_typ
      | None ->
        (match find_local env name with
         | Some (_, _, t) -> t
-        | None -> gerr env.line (Printf.sprintf "undefined variable: %s" name)))
+        | None ->
+          gerr ~column:env.column env.line
+            (Printf.sprintf "undefined variable: %s" name)))
   | EField name ->
     (match find_state env name with
      | Some sf -> sf.sf_typ
-     | None -> gerr env.line (Printf.sprintf "undefined field: %s" name))
+     | None ->
+       gerr ~column:env.column env.line
+         (Printf.sprintf "undefined field: %s" name))
   | EIndex (name, _keys) ->
     (match find_state env name with
      | Some sf -> map_value_type sf.sf_typ
-     | None -> gerr env.line (Printf.sprintf "undefined field: %s" name))
+     | None ->
+       gerr ~column:env.column env.line
+         (Printf.sprintf "undefined field: %s" name))
   | EBinop (op, a, b) ->
     (match op with
      | Add ->
-       let ta = typ_of_expr env a in
-       let tb = typ_of_expr env b in
-       if ta = TString || tb = TString || ta = TAddress || tb = TAddress then TString
-       else if ta = TU256 || tb = TU256 then TU256
-       else if ta = TU128 || tb = TU128 then TU128
-       else if ta = TU64 || tb = TU64 then TU64
-       else TInt
+       let ta = typ_of_expr_with constants env a in
+       let tb = typ_of_expr_with constants env b in
+       if Oct_types.text ta || Oct_types.text tb then TString
+       else if Oct_types.numeric ta && Oct_types.numeric tb then
+         Oct_types.numeric_result ta tb
+       else
+         gerr ~column:env.column env.line
+           (Printf.sprintf
+             "addition operand type differs left = %s right = %s"
+             (typ_to_string ta) (typ_to_string tb))
      | Sub | Mul | Div | Mod ->
-       let ta = typ_of_expr env a and tb = typ_of_expr env b in
-       if ta = TU256 || tb = TU256 then TU256
-       else if ta = TU128 || tb = TU128 then TU128
-       else if ta = TU64 || tb = TU64 then TU64
-       else TInt
-     | Eq | Neq | Lt | Gt | Le | Ge | And | Or -> TBool)
-  | EUnop (Neg, _) -> TInt
-  | EUnop (Not, _) -> TBool
+       let ta = typ_of_expr_with constants env a in
+       let tb = typ_of_expr_with constants env b in
+       if Oct_types.numeric ta && Oct_types.numeric tb then
+         Oct_types.numeric_result ta tb
+       else
+         gerr ~column:env.column env.line
+           (Printf.sprintf
+             "arithmetic operand type differs left = %s right = %s"
+             (typ_to_string ta) (typ_to_string tb))
+     | Eq | Neq ->
+       let ta = typ_of_expr_with constants env a in
+       let tb = typ_of_expr_with constants env b in
+       let zero = function EInt value -> Z.equal value Z.zero | _ -> false in
+       if not
+           (Oct_types.compatible ta tb
+            || Oct_types.opaque ta && zero b
+            || Oct_types.opaque tb && zero a)
+       then
+         gerr ~column:env.column env.line
+           (Printf.sprintf
+             "equality operand type differs left = %s right = %s"
+             (typ_to_string ta) (typ_to_string tb));
+       TBool
+     | Lt | Gt | Le | Ge ->
+       let ta = typ_of_expr_with constants env a in
+       let tb = typ_of_expr_with constants env b in
+       if Oct_types.numeric ta && Oct_types.numeric tb then TBool
+       else
+         gerr ~column:env.column env.line
+           (Printf.sprintf
+             "comparison operand type differs left = %s right = %s"
+             (typ_to_string ta) (typ_to_string tb))
+     | And | Or ->
+       let ta = typ_of_expr_with constants env a in
+       let tb = typ_of_expr_with constants env b in
+       require_type env "logical left operand type differs" TBool ta;
+       require_type env "logical right operand type differs" TBool tb;
+       TBool)
+  | EUnop (Neg, value) ->
+    let typ = typ_of_expr_with constants env value in
+    if Oct_types.numeric typ then typ
+    else
+      gerr ~column:env.column env.line
+        ("negation operand type differs actual = " ^ typ_to_string typ)
+  | EUnop (Not, value) ->
+    let typ = typ_of_expr_with constants env value in
+    require_type env "logical negation type differs" TBool typ;
+    TBool
+  | EAction (_, value) -> typ_of_expr_with constants env value
+  | EUse value ->
+    let target =
+      match
+        List.find_opt
+          (fun item ->
+            String.equal item.fn_name value.ux_name
+            && form_call env item.fn_name)
+          env.funcs
+      with
+      | Some found -> found
+      | None ->
+        gerr ~column:env.column env.line
+          ("form is absent = " ^ value.ux_name)
+    in
+    if env.fn_is_pure && not target.fn_pure then
+      gerr ~column:env.column env.line
+        ("pure function form marks are not empty = " ^ value.ux_name);
+    let args = value.ux_caps @ [value.ux_arg] in
+    let expected = List.length target.fn_params in
+    let actual = List.length args in
+    if expected <> actual then
+      gerr ~column:env.column env.line
+        (Printf.sprintf
+          "function argument count differs function = %s expected = %d actual = %d"
+          value.ux_name expected actual);
+    List.iter2
+      (fun arg param ->
+        require_type env "function argument type differs"
+          param.p_typ (typ_of_expr_with constants env arg))
+      args target.fn_params;
+    require_type env "use result type differs" target.fn_ret value.ux_typ;
+    let saved = env.locals in
+    env.locals <- (value.ux_bind, 0, value.ux_typ) :: saved;
+    let result = typ_of_expr_with constants env value.ux_body in
+    env.locals <- saved;
+    result
   | ECall (name, call_args) ->
-    (match name with
+    if form_call env name && not (direct_call env name) then
+      gerr ~column:env.column env.line
+        ("form requires explicit use = " ^ name);
+    let direct =
+      if user_call env name then
+        List.find_opt (fun value -> String.equal value.fn_name name) env.funcs
+      else None
+    in
+    (match direct with
+     | Some value -> value.fn_ret
+     | None ->
+      match name with
      | "concat" | "to_string" | "fhe_ser" | "fhe_ser_pk"
      | "substr" | "sha256" | "keccak256"
      | "digest_sha256" | "digest_keccak256" | "current_tx_hash"
@@ -805,7 +952,8 @@ let rec typ_of_expr env = function
      | "is_address" | "assert_address" | "starts_with" | "is_hex"
      | "ed25519_ok" | "sig_ok_ed25519"
      | "is_some_opt" -> TBool
-     | "fhe_commit" | "fhe_pedersen" -> TBytes
+     | "fhe_commit" | "fhe_pedersen" | "pedersen_add" | "pedersen_sub"
+     | "pedersen_identity" -> TBytes
      | "circle_balance_state_ref"
      | "circle_balance_status"
      | "circle_balance_last_workflow"
@@ -880,9 +1028,19 @@ let rec typ_of_expr env = function
      | "circle_register_workflow_record" -> TBool
      | "min" | "max" | "abs" | "to_int" | "parse_ints" | "mget" | "pow"
      | "vecdot" | "vecdot_fp" | "vecdot_q16" | "argmax_fp" | "argmax_q16" | "exp_lut" | "exp_q16"
-     | "unwrap" | "split" -> TInt
-     | "some" -> (match call_args with [e] -> typ_of_expr env e | _ -> TInt)
-     | "none" -> TString
+     | "unwrap" ->
+       (match call_args with
+        | [value] ->
+          (match typ_of_expr_with constants env value with
+           | TOption typ -> typ
+           | _ -> TInt)
+        | _ -> TInt)
+     | "split" -> TList TString
+     | "some" ->
+       (match call_args with
+        | [value] -> TOption (typ_of_expr_with constants env value)
+        | _ -> TOption TVoid)
+     | "none" -> TOption TVoid
      | "transfer" | "checkpoint" | "rollback" | "commit" | "mset"
      | "matmul" | "softmax" | "softmax_q16" | "layernorm" | "layernorm_q16"
      | "relu" | "rmsnorm" | "rmsnorm_q16" | "silu" | "silu_q16" | "elemwise_mul"
@@ -897,7 +1055,9 @@ let rec typ_of_expr env = function
      | _ ->
        (match List.find_opt (fun f -> f.fn_name = name) env.funcs with
         | Some f -> f.fn_ret
-        | None -> gerr env.line (Printf.sprintf "unknown function: %s" name)))
+        | None ->
+          gerr ~column:env.column env.line
+            (Printf.sprintf "unknown function: %s" name)))
   | EStoragePath (field, keys, path) ->
     (match resolve_storage_path_type env field keys path with
      | Some t -> t
@@ -910,16 +1070,65 @@ let rec typ_of_expr env = function
     (match resolve_storage_path_type env field _keys [sf] with
      | Some t -> t
      | None -> gerr env.line (Printf.sprintf "unknown storage path: %s" (storage_path_to_string field [sf])))
-  | EEnumVariant _ -> TInt
-  | EArray _ | ETuple _ -> TString
-  | ETernary (_, then_e, _) -> typ_of_expr env then_e
+  | EEnumVariant (name, _) -> TEnum name
+  | EArray values ->
+    (match values with
+     | [] -> TList TVoid
+     | value :: _ -> TList (typ_of_expr_with constants env value))
+  | ETuple values ->
+    TTuple (List.map (typ_of_expr_with constants env) values)
+  | EEqual (declared, left, right) ->
+    require_type env "equality left type differs" declared
+      (typ_of_expr_with constants env left);
+    require_type env "equality right type differs" declared
+      (typ_of_expr_with constants env right);
+    TBool
+  | ELet (name, _, declared, value, body) ->
+    require_type env "local initializer type differs" declared
+      (typ_of_expr_with constants env value);
+    let saved = env.locals in
+    env.locals <- (name, 0, declared) :: saved;
+    let result = typ_of_expr_with constants env body in
+    env.locals <- saved;
+    result
+  | ESplit (value, (left, _, left_typ), (right, _, right_typ), body) ->
+    require_type env "split type differs" (TTuple [left_typ; right_typ])
+      (typ_of_expr_with constants env value);
+    let saved = env.locals in
+    env.locals <- (right, 0, right_typ) :: (left, 0, left_typ) :: saved;
+    let result = typ_of_expr_with constants env body in
+    env.locals <- saved;
+    result
+  | EOrbit (_, turns, seed, (name, _, declared), body) ->
+    Option.iter
+      (fun value ->
+        require_type env "orbit count type differs" TInt
+          (typ_of_expr_with constants env value))
+      turns;
+    require_type env "orbit seed type differs" declared
+      (typ_of_expr_with constants env seed);
+    let saved = env.locals in
+    env.locals <- (name, 0, declared) :: saved;
+    require_type env "orbit body type differs" declared
+      (typ_of_expr_with constants env body);
+    env.locals <- saved;
+    declared
+  | ETernary (guard, then_e, else_e) ->
+    require_type env "ternary condition type differs" TBool
+      (typ_of_expr_with constants env guard);
+    let then_type = typ_of_expr_with constants env then_e in
+    let else_type = typ_of_expr_with constants env else_e in
+    require_type env "ternary branch type differs" then_type else_type;
+    then_type
 
-let gen_some_key_field name = name ^ "_some"
+let typ_of_expr env expr = typ_of_expr_with [] env expr
+
+let gen_some_key_field name = option_presence_key name
 
 let gen_some_key_index env field_name key_regs =
   let kr = gen_storage_key env field_name key_regs in
   let suffix = alloc_reg env in
-  emit env (Contract_vm.LDI (suffix, VString "_some"));
+  emit env (Contract_vm.LDI (suffix, VString "/option-present"));
   emit env (Contract_vm.CONCAT (kr, kr, suffix));
   kr
 
@@ -1177,6 +1386,9 @@ and gen_builtin env name args =
    | "fhe_verify_bound" -> emit env (Contract_vm.FHE_VERIFY_BOUND (rd, nth 0, nth 1, nth 2, nth 3))
    | "fhe_commit" -> emit env (Contract_vm.FHE_COMMIT (rd, nth 0, nth 1))
    | "fhe_pedersen" -> emit env (Contract_vm.FHE_PEDERSEN (rd, nth 0, nth 1))
+   | "pedersen_add" -> emit env (Contract_vm.FHE_PEDERSEN_ADD (rd, nth 0, nth 1))
+   | "pedersen_sub" -> emit env (Contract_vm.FHE_PEDERSEN_SUB (rd, nth 0, nth 1))
+   | "pedersen_identity" -> emit env (Contract_vm.FHE_PEDERSEN_IDENTITY rd)
    | "fhe_ser" -> emit env (Contract_vm.FHE_SER (rd, nth 0))
    | "fhe_deser" -> emit env (Contract_vm.FHE_DESER (rd, nth 0))
    | "fhe_ser_pk" -> emit env (Contract_vm.FHE_SER_PK (rd, nth 0))
@@ -1632,27 +1844,51 @@ and gen_builtin env name args =
      let cmp = alloc_reg env in
      emit env (Contract_vm.LT (cmp, i_r, exp_r));
      emit env (Contract_vm.JIF (cmp, loop_l))
-   | _ ->
-     match Hashtbl.find_opt env.func_labels name with
-     | Some label ->
-       let target_func = List.find (fun f -> f.fn_name = name) env.funcs in
-       List.iteri (fun i _ ->
-         let src = if i < nargs then nth i else begin
-           let z = alloc_reg env in
-           emit env (Contract_vm.LDI (z, VInt Z.zero)); z end in
-       emit env (Contract_vm.MSTORE (1001 + i, src))
-      ) target_func.fn_params;
-      emit env (Contract_vm.CALL_INT (rd, label))
-     | None -> gerr env.line (Printf.sprintf "unknown function: %s" name));
+   | _ -> emit_user env name args arg_regs rd);
   rd
+
+and gen_user env name args =
+  let arg_regs = List.map (gen_expr env) args in
+  let rd = alloc_reg env in
+  emit_user env name args arg_regs rd;
+  rd
+
+and emit_user env name args arg_regs rd =
+  match Hashtbl.find_opt env.func_labels name with
+  | Some label ->
+    let target = List.find (fun value -> value.fn_name = name) env.funcs in
+    let expected = List.length target.fn_params in
+    let actual = List.length args in
+    if expected <> actual then
+      gerr env.line
+        (Printf.sprintf
+          "function argument count differs function = %s expected = %d actual = %d"
+          name expected actual);
+    List.iter2
+      (fun arg param ->
+        require_type env "function argument type differs"
+          param.p_typ (typ_of_expr env arg))
+      args target.fn_params;
+    List.iteri
+      (fun index src -> emit env (Contract_vm.MSTORE (1001 + index, src)))
+      arg_regs;
+    emit env (Contract_vm.CALL_INT (rd, label))
+  | None -> gerr env.line (Printf.sprintf "unknown function: %s" name)
 
 and gen_storage_path_key env field keys path =
   let key_regs = List.map (gen_expr env) keys in
+  gen_storage_path_key_regs env field keys key_regs path
+
+and gen_storage_path_key_regs env field keys key_regs path =
   match resolve_storage_length_prefix env field keys path with
+  | Some [] when key_regs = [] ->
+    let key_r = alloc_reg env in
+    emit env (Contract_vm.LDI (key_r, VString (list_length_key field)));
+    key_r
   | Some prefix ->
     let kr = gen_storage_path_prefix_key env field key_regs prefix in
     let suffix = alloc_reg env in
-    emit env (Contract_vm.LDI (suffix, VString "_len"));
+    emit env (Contract_vm.LDI (suffix, VString "/length"));
     emit env (Contract_vm.CONCAT (kr, kr, suffix));
     kr
   | None ->
@@ -1698,6 +1934,8 @@ and gen_storage_path_write env field keys path expr =
     | None ->
       gerr env.line (Printf.sprintf "unknown storage path: %s" (storage_path_to_string field path))
   in
+  require_type env "storage path assignment type differs"
+    typ (typ_of_expr env expr);
   let kr = gen_storage_path_key env field keys path in
   let sr = gen_storage_value_for_write env typ expr in
   emit env (Contract_vm.SSTOREK (kr, sr))
@@ -1807,6 +2045,101 @@ and gen_expr env expr =
        end else r
      | None -> gerr env.line (Printf.sprintf "undefined field: %s" name))
   | EArray elems | ETuple elems -> gen_netstring_pack env elems
+  | EEqual (declared, left, right) ->
+    require_type env "equality left type differs" declared (typ_of_expr env left);
+    require_type env "equality right type differs" declared
+      (typ_of_expr env right);
+    let left_r = gen_expr env left in
+    let right_r = gen_expr env right in
+    let result_r = alloc_reg env in
+    emit env (Contract_vm.EQ (result_r, left_r, right_r));
+    result_r
+  | ELet (name, _, declared, value, body) ->
+    require_type env "local initializer type differs" declared
+      (typ_of_expr env value);
+    let local_r = gen_expr env value in
+    let saved = env.locals in
+    env.locals <- (name, local_r, declared) :: saved;
+    let result = gen_expr env body in
+    env.locals <- saved;
+    result
+  | ESplit (value, (left, _, left_typ), (right, _, right_typ), body) ->
+    require_type env "split type differs" (TTuple [left_typ; right_typ])
+      (typ_of_expr env value);
+    let source_r = gen_expr env value in
+    let hash_r = alloc_reg env in
+    let remaining_r = alloc_reg env in
+    let left_r = alloc_reg env in
+    let right_r = alloc_reg env in
+    emit env (Contract_vm.LDI (hash_r, VString "#"));
+    emit env (Contract_vm.MOV (remaining_r, source_r));
+    emit_netstring_unpack_next env ~hash_r ~remaining_r ~local_r:left_r;
+    ignore (gen_storage_loaded_value env left_r left_typ);
+    emit_netstring_unpack_next env ~hash_r ~remaining_r ~local_r:right_r;
+    ignore (gen_storage_loaded_value env right_r right_typ);
+    let saved = env.locals in
+    env.locals <-
+      (right, right_r, right_typ) :: (left, left_r, left_typ) :: saved;
+    let result = gen_expr env body in
+    env.locals <- saved;
+    result
+  | EOrbit (count, turns, seed, (name, _, declared), body) ->
+    Option.iter
+      (fun value ->
+        require_type env "orbit count type differs" TInt
+          (typ_of_expr env value))
+      turns;
+    let turn_r = Option.map (gen_expr env) turns in
+    require_type env "orbit seed type differs" declared (typ_of_expr env seed);
+    let seed_r = gen_expr env seed in
+    let state_r = alloc_reg env in
+    emit env (Contract_vm.MOV (state_r, seed_r));
+    let first_reg = env.next_reg in
+    let apply () =
+      let saved = env.locals in
+      env.locals <- (name, state_r, declared) :: saved;
+      let body_r = gen_expr env body in
+      env.locals <- saved;
+      emit env (Contract_vm.MOV (state_r, body_r))
+    in
+    let rec expand index left =
+      if left > 0 then begin
+        begin
+          match turn_r with
+          | None -> apply ()
+          | Some turns ->
+            let apply_l = alloc_label env in
+            let next_l = alloc_label env in
+            let index_r = alloc_reg env in
+            let active_r = alloc_reg env in
+            emit env (Contract_vm.LDI (index_r, VInt (Z.of_int index)));
+            emit env (Contract_vm.LT (active_r, index_r, turns));
+            emit env (Contract_vm.JIF (active_r, apply_l));
+            emit env (Contract_vm.JMP next_l);
+            emit env (Contract_vm.JDEST apply_l);
+            apply ();
+            emit env (Contract_vm.JDEST next_l)
+        end;
+        env.next_reg <- first_reg;
+        expand (index + 1) (left - 1)
+      end
+    in
+    expand 0 (C_nat.to_int count);
+    state_r
+  | EAction _ ->
+    gerr env.line "effect action requires sealed form"
+  | EUse value ->
+    let args = value.ux_caps @ [value.ux_arg] in
+    ignore (typ_of_expr env (EUse value));
+    let result = gen_user env value.ux_name args in
+    let saved = env.locals in
+    env.locals <- (value.ux_bind, result, value.ux_typ) :: saved;
+    let output = gen_expr env value.ux_body in
+    env.locals <- saved;
+    output
+  | ECall (name, _) when form_call env name && not (direct_call env name) ->
+    gerr env.line ("form requires explicit use = " ^ name)
+  | ECall (name, args) when user_call env name -> gen_user env name args
   | ECall (name, args) -> gen_builtin env name args
   | EStoragePath (field, keys, path) -> gen_storage_path_read env field keys path
   | EFieldProp (field, prop) -> gen_field_prop env field prop
@@ -1904,9 +2237,29 @@ and gen_short_circuit_or env l r_expr =
   emit env (Contract_vm.JDEST end_label);
   result
 
+and emit_update_value env op typ left_r right_r =
+  let result_r = alloc_reg env in
+  begin
+    match op with
+    | Add when typ = TString || typ = TAddress ->
+      emit env (Contract_vm.CONCAT (result_r, left_r, right_r))
+    | Add -> emit env (Contract_vm.ADD (result_r, left_r, right_r))
+    | Sub -> emit env (Contract_vm.SUB (result_r, left_r, right_r))
+    | Mul -> emit env (Contract_vm.MUL (result_r, left_r, right_r))
+    | Div -> emit env (Contract_vm.DIV (result_r, left_r, right_r))
+    | Mod -> emit env (Contract_vm.MOD (result_r, left_r, right_r))
+    | Eq -> emit env (Contract_vm.EQ (result_r, left_r, right_r))
+    | Neq -> emit env (Contract_vm.NEQ (result_r, left_r, right_r))
+    | Lt -> emit env (Contract_vm.LT (result_r, left_r, right_r))
+    | Gt -> emit env (Contract_vm.GT (result_r, left_r, right_r))
+    | Le | Ge | And | Or -> gerr env.line "compound operator is unavailable"
+  end;
+  emit_type_check env result_r typ;
+  result_r
+
 and reserve_local_slot env =
   let r = env.base_reg in
-  if r > 63 then gerr env.line "too many local variables (max 63 registers)";
+  if r > 63 then gerr env.line "register capacity exceeded maximum = 64";
   env.base_reg <- r + 1;
   env.next_reg <- env.base_reg;
   r
@@ -1949,6 +2302,7 @@ and bind_tuple_element env ~hash_r ~remaining_r ~types_ref name =
   let elem_t = next_tuple_type types_ref in
   let local_r = reserve_local_slot env in
   emit_netstring_unpack_next env ~hash_r ~remaining_r ~local_r;
+  ignore (gen_storage_loaded_value env local_r elem_t);
   env.locals <- (name, local_r, elem_t) :: env.locals
 
 and gen_tuple_unpack env names expr =
@@ -1961,47 +2315,97 @@ and gen_tuple_unpack env names expr =
   let types_ref = ref elem_types in
   List.iter (bind_tuple_element env ~hash_r ~remaining_r ~types_ref) names
 
+and list_item_key env field index_r =
+  let key_r = alloc_reg env in
+  emit env (Contract_vm.LDI (key_r, VString (list_item_prefix field)));
+  emit env (Contract_vm.CONCAT (key_r, key_r, index_r));
+  key_r
+
 and emit_list_push_method env field args =
   let len_r = alloc_reg env in
-  emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
+  emit env (Contract_vm.SLOAD (len_r, list_length_key field));
   ignore (gen_int_from_storage env len_r);
   let val_r = gen_expr env (List.hd args) in
-  let kr = alloc_reg env in
-  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-  emit env (Contract_vm.CONCAT (kr, kr, len_r));
+  let kr = list_item_key env field len_r in
   emit env (Contract_vm.SSTOREK (kr, val_r));
   let one = alloc_reg env in
   emit env (Contract_vm.LDI (one, VInt Z.one));
   emit env (Contract_vm.ADD (len_r, len_r, one));
-  emit env (Contract_vm.SSTORE (field ^ "_len", len_r))
+  emit env (Contract_vm.SSTORE (list_length_key field, len_r))
 
 and emit_list_delete_method env field args =
-  let key_r = gen_expr env (List.hd args) in
-  let kr = alloc_reg env in
-  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-  emit env (Contract_vm.CONCAT (kr, kr, key_r));
-  emit env (Contract_vm.SDELK kr)
+  let index_r = gen_expr env (List.hd args) in
+  let len_r = alloc_reg env in
+  emit env (Contract_vm.SLOAD (len_r, list_length_key field));
+  ignore (gen_int_from_storage env len_r);
+  let zero_r = alloc_reg env in
+  emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
+  let invalid_r = alloc_reg env in
+  let fail_l = alloc_label env in
+  let valid_l = alloc_label env in
+  emit env (Contract_vm.LT (invalid_r, index_r, zero_r));
+  emit env (Contract_vm.JIF (invalid_r, fail_l));
+  emit env (Contract_vm.LT (invalid_r, index_r, len_r));
+  emit env (Contract_vm.JIF (invalid_r, valid_l));
+  emit env (Contract_vm.JMP fail_l);
+  emit env (Contract_vm.JDEST valid_l);
+  let one_r = alloc_reg env in
+  emit env (Contract_vm.LDI (one_r, VInt Z.one));
+  let last_r = alloc_reg env in
+  emit env (Contract_vm.SUB (last_r, len_r, one_r));
+  let iter_r = alloc_reg env in
+  emit env (Contract_vm.MOV (iter_r, index_r));
+  let test_l = alloc_label env in
+  let shift_l = alloc_label env in
+  emit env (Contract_vm.JMP test_l);
+  emit env (Contract_vm.JDEST shift_l);
+  let next_r = alloc_reg env in
+  emit env (Contract_vm.ADD (next_r, iter_r, one_r));
+  let source_key_r = list_item_key env field next_r in
+  let value_r = alloc_reg env in
+  emit env (Contract_vm.SLOADK (value_r, source_key_r));
+  let target_key_r = list_item_key env field iter_r in
+  emit env (Contract_vm.SSTOREK (target_key_r, value_r));
+  emit env (Contract_vm.ADD (iter_r, iter_r, one_r));
+  emit env (Contract_vm.JDEST test_l);
+  let shift_r = alloc_reg env in
+  emit env (Contract_vm.LT (shift_r, iter_r, last_r));
+  emit env (Contract_vm.JIF (shift_r, shift_l));
+  let last_key_r = list_item_key env field last_r in
+  emit env (Contract_vm.SDELK last_key_r);
+  emit env (Contract_vm.SSTORE (list_length_key field, last_r));
+  let end_l = alloc_label env in
+  emit env (Contract_vm.JMP end_l);
+  emit env (Contract_vm.JDEST fail_l);
+  emit env Contract_vm.REVERT;
+  emit env (Contract_vm.JDEST end_l)
 
 and emit_list_len_method env field =
   let r = alloc_reg env in
-  emit env (Contract_vm.SLOAD (r, field ^ "_len"));
+  emit env (Contract_vm.SLOAD (r, list_length_key field));
   ignore (gen_int_from_storage env r);
   emit env (Contract_vm.MOV (0, r))
 
 and emit_list_pop_method env field =
   let len_r = alloc_reg env in
-  emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
+  emit env (Contract_vm.SLOAD (len_r, list_length_key field));
   ignore (gen_int_from_storage env len_r);
+  let zero_r = alloc_reg env in
+  let has_item_r = alloc_reg env in
+  let valid_l = alloc_label env in
+  emit env (Contract_vm.LDI (zero_r, VInt Z.zero));
+  emit env (Contract_vm.GT (has_item_r, len_r, zero_r));
+  emit env (Contract_vm.JIF (has_item_r, valid_l));
+  emit env Contract_vm.REVERT;
+  emit env (Contract_vm.JDEST valid_l);
   let one = alloc_reg env in
   emit env (Contract_vm.LDI (one, VInt Z.one));
   emit env (Contract_vm.SUB (len_r, len_r, one));
-  let kr = alloc_reg env in
-  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-  emit env (Contract_vm.CONCAT (kr, kr, len_r));
+  let kr = list_item_key env field len_r in
   let val_r = alloc_reg env in
   emit env (Contract_vm.SLOADK (val_r, kr));
   emit env (Contract_vm.SDELK kr);
-  emit env (Contract_vm.SSTORE (field ^ "_len", len_r));
+  emit env (Contract_vm.SSTORE (list_length_key field, len_r));
   emit env (Contract_vm.MOV (0, val_r))
 
 let is_pseudo_event name =
@@ -2009,19 +2413,17 @@ let is_pseudo_event name =
 
 let guard_pure_while env =
   if env.fn_is_pure then
-    gerr env.line "pure function cannot use while loops (use for..in with bounded range)"
+    gerr env.line "pure function cannot use while loops (use for..in with finite range)"
 
 let reserve_foreach_slot env =
   let r = env.base_reg in
-  if r > 63 then gerr env.line "too many local variables";
+  if r > 63 then gerr env.line "register capacity exceeded maximum = 64";
   env.base_reg <- r + 1;
   env.next_reg <- env.base_reg;
   r
 
 let emit_foreach_item_load env field iter_r item_r =
-  let kr = alloc_reg env in
-  emit env (Contract_vm.LDI (kr, VString (field ^ ":")));
-  emit env (Contract_vm.CONCAT (kr, kr, iter_r));
+  let kr = list_item_key env field iter_r in
   emit env (Contract_vm.SLOADK (item_r, kr))
 
 let check_match_exhaustive env arms =
@@ -2038,9 +2440,15 @@ let check_match_exhaustive env arms =
   | [] -> gerr env.line "empty match expression"
 
 let rec gen_foreach_loop env var_name field body =
+  let item_type =
+    match find_state env field with
+    | Some { sf_typ = TList typ; _ } -> typ
+    | Some _ -> gerr env.line ("field is not a list: " ^ field)
+    | None -> gerr env.line ("undefined field: " ^ field)
+  in
   let len_r = reserve_foreach_slot env in
   let iter_r = reserve_foreach_slot env in
-  emit env (Contract_vm.SLOAD (len_r, field ^ "_len"));
+  emit env (Contract_vm.SLOAD (len_r, list_length_key field));
   ignore (gen_int_from_storage env len_r);
   emit env (Contract_vm.LDI (iter_r, VInt Z.zero));
   let saved_locals = env.locals in
@@ -2050,7 +2458,8 @@ let rec gen_foreach_loop env var_name field body =
   emit env (Contract_vm.JDEST loop_label);
   let item_r = reserve_foreach_slot env in
   emit_foreach_item_load env field iter_r item_r;
-  env.locals <- (var_name, item_r, TString) :: env.locals;
+  ignore (gen_storage_loaded_value env item_r item_type);
+  env.locals <- (var_name, item_r, item_type) :: env.locals;
   List.iter (gen_stmt env) body;
   env.next_reg <- env.base_reg;
   let one = alloc_reg env in
@@ -2068,12 +2477,19 @@ let rec gen_foreach_loop env var_name field body =
 and gen_stmt env stmt =
   env.next_reg <- env.base_reg;
   match stmt with
+  | SLocated (line, column, statement) ->
+    env.line <- line;
+    env.column <- column;
+    gen_stmt env statement
+
   | SLet (name, typ_ann, expr) ->
-    let r = gen_expr env expr in
+    let actual = typ_of_expr env expr in
     let t = match typ_ann with
       | Some t -> t
-      | None -> typ_of_expr env expr
+      | None -> actual
     in
+    require_type env "local initializer type differs" t actual;
+    let r = gen_expr env expr in
     emit_type_check env r t;
     let local_r = env.base_reg in
     if local_r > 63 then gerr env.line "too many local variables (max 63 registers)";
@@ -2082,11 +2498,25 @@ and gen_stmt env stmt =
     env.next_reg <- env.base_reg;
     env.locals <- (name, local_r, t) :: env.locals
 
-  | SLetTuple (names, expr) -> gen_tuple_unpack env names expr
+  | SLetTuple (names, expr) ->
+    begin
+      match typ_of_expr env expr with
+      | TTuple types when List.length names = List.length types -> ()
+      | TTuple types ->
+        gerr env.line
+          (Printf.sprintf "tuple binding arity differs expected = %d actual = %d"
+            (List.length names) (List.length types))
+      | actual ->
+        gerr env.line
+          (Printf.sprintf "tuple binding type differs actual = %s"
+            (typ_to_string actual))
+    end;
+    gen_tuple_unpack env names expr
 
   | SAssign (name, expr) ->
     (match find_local env name with
      | Some (_, reg, t) ->
+       require_type env "assignment type differs" t (typ_of_expr env expr);
        let r = gen_expr env expr in
        emit_type_check env r t;
        if r <> reg then emit env (Contract_vm.MOV (reg, r))
@@ -2096,6 +2526,8 @@ and gen_stmt env stmt =
     check_no_storage_write env;
     (match find_state env name with
      | Some sf ->
+       require_type env "state assignment type differs"
+         sf.sf_typ (typ_of_expr env expr);
        (match sf.sf_typ with
         | TOption _ ->
           (match expr with
@@ -2138,6 +2570,8 @@ and gen_stmt env stmt =
     (match find_state env name with
      | Some sf ->
        let vt = map_value_type sf.sf_typ in
+       require_type env "indexed assignment type differs"
+         vt (typ_of_expr env expr);
        (match vt with
         | TOption _ ->
           let key_regs = List.map (gen_expr env) keys in
@@ -2151,8 +2585,7 @@ and gen_stmt env stmt =
              let kr = gen_storage_key env name key_regs in
              let r = gen_expr env e in
              emit env (Contract_vm.SSTOREK (kr, r));
-             let key_regs2 = List.map (gen_expr env) keys in
-             let some_kr = gen_some_key_index env name key_regs2 in
+             let some_kr = gen_some_key_index env name key_regs in
              let tr = alloc_reg env in
              emit env (Contract_vm.LDI (tr, VString "true"));
              emit env (Contract_vm.SSTOREK (some_kr, tr))
@@ -2160,8 +2593,7 @@ and gen_stmt env stmt =
              let kr = gen_storage_key env name key_regs in
              let r = gen_expr env expr in
              emit env (Contract_vm.SSTOREK (kr, r));
-             let key_regs2 = List.map (gen_expr env) keys in
-             let some_kr = gen_some_key_index env name key_regs2 in
+             let some_kr = gen_some_key_index env name key_regs in
              let tr = alloc_reg env in
              emit env (Contract_vm.LDI (tr, VString "true"));
              emit env (Contract_vm.SSTOREK (some_kr, tr)))
@@ -2173,29 +2605,57 @@ and gen_stmt env stmt =
           emit env (Contract_vm.SSTOREK (kr, r)))
      | None -> gerr env.line (Printf.sprintf "undefined field: %s" name))
 
+  | SIndexUpdate (name, keys, op, expr) ->
+    check_no_storage_write env;
+    begin
+      match find_state env name with
+      | Some sf ->
+        let typ = map_value_type sf.sf_typ in
+        require_type env "indexed update type differs"
+          typ (typ_of_expr env expr);
+        let key_regs = List.map (gen_expr env) keys in
+        let key_r = gen_storage_key env name key_regs in
+        let left_r = alloc_reg env in
+        emit env (Contract_vm.SLOADK (left_r, key_r));
+        ignore (gen_storage_loaded_value env left_r typ);
+        let right_r = gen_expr env expr in
+        let value_r = emit_update_value env op typ left_r right_r in
+        emit env (Contract_vm.SSTOREK (key_r, value_r))
+      | None -> gerr env.line (Printf.sprintf "undefined field: %s" name)
+    end
+
   | SReturn (Some expr) ->
+    if env.fn_ret = TVoid then
+      gerr env.line "void function cannot return a value";
+    require_type env "return type differs" env.fn_ret (typ_of_expr env expr);
     let r = gen_expr env expr in
     if r <> 0 then emit env (Contract_vm.MOV (0, r));
     if env.in_nonreentrant then begin
       let zr = alloc_reg env in
       emit env (Contract_vm.LDI (zr, VString "0"));
-      emit env (Contract_vm.SSTORE ("_lock", zr))
+      emit env (Contract_vm.SSTORE (nonreentrant_key, zr))
     end;
     emit env Contract_vm.STOP
 
   | SReturn None ->
+    if env.fn_ret <> TVoid then
+      gerr env.line
+        (Printf.sprintf "return value is required type = %s"
+          (typ_to_string env.fn_ret));
     if env.in_nonreentrant then begin
       let zr = alloc_reg env in
       emit env (Contract_vm.LDI (zr, VString "0"));
-      emit env (Contract_vm.SSTORE ("_lock", zr))
+      emit env (Contract_vm.SSTORE (nonreentrant_key, zr))
     end;
     emit env Contract_vm.STOP
 
   | SAssert expr ->
+    require_type env "assert condition type differs" TBool (typ_of_expr env expr);
     let r = gen_expr env expr in
     emit env (Contract_vm.ASSERT r)
 
   | SRequire (cond, msg) ->
+    require_type env "require condition type differs" TBool (typ_of_expr env cond);
     let rc = gen_expr env cond in
     let ok_label = alloc_label env in
     emit env (Contract_vm.JIF (rc, ok_label));
@@ -2217,6 +2677,7 @@ and gen_stmt env stmt =
      | None -> gerr env.line (Printf.sprintf "undefined event: %s" name))
 
   | SIf (cond, then_body, else_body) ->
+    require_type env "if condition type differs" TBool (typ_of_expr env cond);
     let rc = gen_expr env cond in
     let then_label = alloc_label env in
     let end_label = alloc_label env in
@@ -2231,6 +2692,7 @@ and gen_stmt env stmt =
 
   | SWhile (cond, body) ->
     guard_pure_while env;
+    require_type env "while condition type differs" TBool (typ_of_expr env cond);
     let test_label = alloc_label env in
     let loop_label = alloc_label env in
     emit env (Contract_vm.JMP test_label);
@@ -2242,12 +2704,18 @@ and gen_stmt env stmt =
     emit env (Contract_vm.JIF (rc, loop_label))
 
   | SFor (name, start_e, end_e, body) ->
+    require_type env "range start type differs" TInt (typ_of_expr env start_e);
+    require_type env "range end type differs" TInt (typ_of_expr env end_e);
+    let saved_base = env.base_reg in
+    let iter_r = saved_base in
+    let end_r = saved_base + 1 in
+    if end_r > 63 then gerr env.line "register capacity exceeded maximum = 64";
+    env.base_reg <- end_r + 1;
+    env.next_reg <- env.base_reg;
     let rs = gen_expr env start_e in
     let re = gen_expr env end_e in
-    let iter_r = env.base_reg in
-    if iter_r > 63 then gerr env.line "too many local variables (max 63 registers)";
     emit env (Contract_vm.MOV (iter_r, rs));
-    env.base_reg <- iter_r + 1;
+    emit env (Contract_vm.MOV (end_r, re));
     env.next_reg <- env.base_reg;
     let saved_locals = env.locals in
     env.locals <- (name, iter_r, TInt) :: env.locals;
@@ -2263,10 +2731,10 @@ and gen_stmt env stmt =
     emit env (Contract_vm.JDEST test_label);
     env.next_reg <- env.base_reg;
     let cmp = alloc_reg env in
-    emit env (Contract_vm.LT (cmp, iter_r, re));
+    emit env (Contract_vm.LT (cmp, iter_r, end_r));
     emit env (Contract_vm.JIF (cmp, loop_label));
     env.locals <- saved_locals;
-    env.base_reg <- iter_r;
+    env.base_reg <- saved_base;
     env.next_reg <- env.base_reg
 
   | SForEach (var_name, field, body) -> gen_foreach_loop env var_name field body
@@ -2303,17 +2771,54 @@ and gen_stmt env stmt =
     check_no_storage_write env;
     gen_storage_path_write env field keys path expr
 
+  | SStoragePathUpdate (field, keys, path, op, expr) ->
+    check_no_storage_write env;
+    let typ =
+      match resolve_storage_path_type env field keys path with
+      | Some value -> value
+      | None ->
+        gerr env.line
+          (Printf.sprintf "unknown storage path: %s"
+            (storage_path_to_string field path))
+    in
+    require_type env "storage path update type differs"
+      typ (typ_of_expr env expr);
+    let key_regs = List.map (gen_expr env) keys in
+    let key_r = gen_storage_path_key_regs env field keys key_regs path in
+    let left_r = alloc_reg env in
+    emit env (Contract_vm.SLOADK (left_r, key_r));
+    ignore (gen_storage_loaded_value env left_r typ);
+    let right_r = gen_expr env expr in
+    let value_r = emit_update_value env op typ left_r right_r in
+    emit env (Contract_vm.SSTOREK (key_r, value_r))
+
   | SIndexFieldSet (field, keys, sf, expr) ->
     check_no_storage_write env;
     gen_storage_path_write env field keys [sf] expr
 
   | SFieldCall (field, method_name, args) ->
-    (match method_name with
-     | "push" -> emit_list_push_method env field args
-     | "delete" -> emit_list_delete_method env field args
-     | "len" -> emit_list_len_method env field
-     | "pop" -> emit_list_pop_method env field
-     | _ -> gerr env.line (Printf.sprintf "unknown method: %s" method_name))
+    begin
+      match find_state env field with
+      | Some { sf_typ = TList item_type; _ } ->
+        begin
+          match method_name, args with
+          | "push", [value] ->
+            require_type env "list item type differs"
+              item_type (typ_of_expr env value);
+            emit_list_push_method env field args
+          | "delete", [index] ->
+            require_type env "list index type differs"
+              TInt (typ_of_expr env index);
+            emit_list_delete_method env field args
+          | "len", [] -> emit_list_len_method env field
+          | "pop", [] -> emit_list_pop_method env field
+          | "push", _ | "delete", _ | "len", _ | "pop", _ ->
+            gerr env.line ("list method arity differs method = " ^ method_name)
+          | _ -> gerr env.line ("unknown list method = " ^ method_name)
+        end
+      | Some _ -> gerr env.line ("field is not a list: " ^ field)
+      | None -> gerr env.line ("undefined field: " ^ field)
+    end
 
   | SExpr e ->
     ignore (gen_expr env e)
@@ -2330,7 +2835,7 @@ and gen_stmt env stmt =
        if env.in_nonreentrant then begin
          let zr = alloc_reg env in
          emit env (Contract_vm.LDI (zr, VString "0"));
-         emit env (Contract_vm.SSTORE ("_lock", zr))
+         emit env (Contract_vm.SSTORE (nonreentrant_key, zr))
        end;
        emit env Contract_vm.REVERT
      | None -> gerr env.line (Printf.sprintf "undefined error: %s" name))
@@ -2339,6 +2844,8 @@ let gen_constructor env (ctor : func_def) =
   let saved_locals = env.locals in
   let saved_base = env.base_reg in
   let saved_next = env.next_reg in
+  let saved_ret = env.fn_ret in
+  env.fn_ret <- TVoid;
   env.locals <- [];
   env.base_reg <- 1;
   env.next_reg <- 1;
@@ -2369,7 +2876,8 @@ let gen_constructor env (ctor : func_def) =
    | _ -> emit env Contract_vm.STOP);
   env.locals <- saved_locals;
   env.base_reg <- saved_base;
-  env.next_reg <- saved_next
+  env.next_reg <- saved_next;
+  env.fn_ret <- saved_ret
 
 let gen_dispatcher env (funcs : func_def list) =
   env.base_reg <- 1;
@@ -2389,17 +2897,13 @@ let gen_dispatcher env (funcs : func_def list) =
   ) funcs;
   emit env Contract_vm.REVERT
 
-let should_emit_nonpayable_guard env f =
-  env.has_payable && not f.fn_payable && f.fn_vis = Public
-
-let emit_nonpayable_guard env =
+let emit_nonpayable_guard env ok_label =
   let vr = alloc_reg env in
   emit env (Contract_vm.VALUE vr);
   let zero_r = alloc_reg env in
   emit env (Contract_vm.LDI (zero_r, Contract_vm.VInt Z.zero));
   let cmp_r = alloc_reg env in
   emit env (Contract_vm.EQ (cmp_r, vr, zero_r));
-  let ok_label = alloc_label env in
   emit env (Contract_vm.JIF (cmp_r, ok_label));
   emit env Contract_vm.REVERT;
   emit env (Contract_vm.JDEST ok_label);
@@ -2407,7 +2911,7 @@ let emit_nonpayable_guard env =
 
 let emit_nonreentrant_enter env =
   let lock_r = alloc_reg env in
-  emit env (Contract_vm.SLOAD (lock_r, "_lock"));
+  emit env (Contract_vm.SLOAD (lock_r, nonreentrant_key));
   let one_r = alloc_reg env in
   emit env (Contract_vm.LDI (one_r, VString "1"));
   let locked = alloc_reg env in
@@ -2419,13 +2923,13 @@ let emit_nonreentrant_enter env =
   emit env (Contract_vm.JIF (not_locked, ok_label));
   emit env Contract_vm.REVERT;
   emit env (Contract_vm.JDEST ok_label);
-  emit env (Contract_vm.SSTORE ("_lock", one_r));
+  emit env (Contract_vm.SSTORE (nonreentrant_key, one_r));
   env.next_reg <- env.base_reg
 
 let emit_nonreentrant_exit env =
   let zero_r = alloc_reg env in
   emit env (Contract_vm.LDI (zero_r, VString "0"));
-  emit env (Contract_vm.SSTORE ("_lock", zero_r))
+  emit env (Contract_vm.SSTORE (nonreentrant_key, zero_r))
 
 let gen_function env (f : func_def) label =
   let saved_locals = env.locals in
@@ -2433,12 +2937,24 @@ let gen_function env (f : func_def) label =
   let saved_next = env.next_reg in
   let saved_view = env.fn_is_view in
   let saved_pure = env.fn_is_pure in
+  let saved_direct = env.fn_is_direct in
+  let saved_ret = env.fn_ret in
+  env.line <- Oct_types.block_line f.fn_body;
+  if f.fn_ret <> TVoid && not (Oct_types.block_returns f.fn_body) then
+    gerr env.line
+      (Printf.sprintf "function return is not total function = %s type = %s"
+        f.fn_name (typ_to_string f.fn_ret));
   env.fn_is_view <- f.fn_view;
   env.fn_is_pure <- f.fn_pure;
+  env.fn_is_direct <- List.exists (String.equal f.fn_name) env.direct;
+  env.fn_ret <- f.fn_ret;
   env.locals <- [];
   env.base_reg <- 1;
   env.next_reg <- 1;
+  let call_label = Hashtbl.find env.func_labels f.fn_name in
+  let split = call_label <> label in
   emit env (Contract_vm.JDEST label);
+  if split then emit_nonpayable_guard env call_label;
   List.iteri (fun i p ->
     let r = env.base_reg in
     emit env (Contract_vm.MLOAD (r, 1001 + i));
@@ -2454,6 +2970,9 @@ let gen_function env (f : func_def) label =
   List.iter (fun p ->
     match p.p_refine with
     | None -> ()
+    | Some _ when not (Oct_types.numeric p.p_typ) ->
+      gerr env.line
+        ("refinement type is not numeric parameter = " ^ p.p_name)
     | Some refine ->
       (match find_local env p.p_name with
        | Some (_, reg, _) ->
@@ -2503,7 +3022,8 @@ let gen_function env (f : func_def) label =
             emit env (Contract_vm.JDEST ok_label))
        | None -> ())
   ) f.fn_params;
-  if should_emit_nonpayable_guard env f then emit_nonpayable_guard env;
+  if nonpayable_guard env f && not split then
+    emit_nonpayable_guard env (alloc_label env);
   if f.fn_nonreentrant then emit_nonreentrant_enter env;
   env.in_nonreentrant <- f.fn_nonreentrant;
   List.iter (gen_stmt env) f.fn_body;
@@ -2514,34 +3034,44 @@ let gen_function env (f : func_def) label =
   env.in_nonreentrant <- false;
   env.fn_is_view <- saved_view;
   env.fn_is_pure <- saved_pure;
+  env.fn_is_direct <- saved_direct;
+  env.fn_ret <- saved_ret;
   env.locals <- saved_locals;
   env.base_reg <- saved_base;
   env.next_reg <- saved_next
 
-let check_interface_arity iface_name im f =
+let gen_call env name evidence label =
+  match Aml_call.make ~entry:label ~first:env.next_label evidence with
+  | Error error -> gerr 0 (name ^ " " ^ Aml_call.text error)
+  | Ok value ->
+    env.next_label <- Aml_call.next value;
+    env.seals <- value :: env.seals;
+    Array.iter (emit env) (Aml_call.code value)
+
+let check_interface_arity iface_name im (f : func_def) =
   let expected_n = List.length im.im_params in
   let actual_n = List.length f.fn_params in
   if expected_n <> actual_n then
     raise (GenError (Printf.sprintf "%s.%s: expected %d params, got %d"
-      iface_name im.im_name expected_n actual_n, 0))
+      iface_name im.im_name expected_n actual_n, 0, 0))
 
-let check_interface_params iface_name im f =
+let check_interface_params iface_name im (f : func_def) =
   List.iter2 (fun ep ap ->
     if ep.p_typ <> ap.p_typ then
       raise (GenError (Printf.sprintf "%s.%s: param '%s' type mismatch: expected %s, got %s"
-        iface_name im.im_name ap.p_name (typ_to_string ep.p_typ) (typ_to_string ap.p_typ), 0))
+        iface_name im.im_name ap.p_name (typ_to_string ep.p_typ) (typ_to_string ap.p_typ), 0, 0))
   ) im.im_params f.fn_params
 
-let check_interface_return iface_name im f =
+let check_interface_return iface_name im (f : func_def) =
   if im.im_ret <> f.fn_ret then
     raise (GenError (Printf.sprintf "%s.%s: return type mismatch: expected %s, got %s"
-      iface_name im.im_name (typ_to_string im.im_ret) (typ_to_string f.fn_ret), 0))
+      iface_name im.im_name (typ_to_string im.im_ret) (typ_to_string f.fn_ret), 0, 0))
 
-let check_interface_visibility iface_name im f =
+let check_interface_visibility iface_name im (f : func_def) =
   if f.fn_vis <> Public then
-    raise (GenError (Printf.sprintf "%s.%s must be public" iface_name im.im_name, 0))
+    raise (GenError (Printf.sprintf "%s.%s must be public" iface_name im.im_name, 0, 0))
 
-let check_interface_method iface_name im f =
+let check_interface_method iface_name im (f : func_def) =
   check_interface_arity iface_name im f;
   check_interface_params iface_name im f;
   check_interface_return iface_name im f;
@@ -2551,22 +3081,147 @@ let check_interfaces (ct : contract) =
   List.iter (fun iface_name ->
     let iface = match List.find_opt (fun i -> i.if_name = iface_name) ct.interfaces with
       | Some i -> i
-      | None -> raise (GenError (Printf.sprintf "unknown interface: %s" iface_name, 0))
+      | None -> raise (GenError (Printf.sprintf "unknown interface: %s" iface_name, 0, 0))
     in
     List.iter (fun im ->
       match List.find_opt (fun f -> f.fn_name = im.im_name) ct.funcs with
       | None ->
         raise (GenError (Printf.sprintf "contract %s implements %s but missing method: %s"
-          ct.name iface_name im.im_name, 0))
+          ct.name iface_name im.im_name, 0, 0))
       | Some f -> check_interface_method iface_name im f
     ) iface.if_methods
   ) ct.implements
 
-let generate (ct : contract) =
+let mark_pc code label =
+  let rec walk pc =
+    if pc = Array.length code then
+      gerr 0 (Printf.sprintf "function label is absent = %d" label)
+    else
+      match code.(pc) with
+      | Contract_vm.JDEST found when found = label -> pc
+      | _ -> walk (pc + 1)
+  in
+  walk 0
+
+let call_graph env code =
+  let labels =
+    List.map
+      (fun f -> Hashtbl.find env.func_labels f.fn_name, f.fn_name)
+      env.funcs
+  in
+  let name label =
+    match List.assoc_opt label labels with
+    | Some value -> value
+    | None -> gerr 0 (Printf.sprintf "function call label is absent = %d" label)
+  in
+  let calls first last =
+    let rec walk pc out =
+      if pc >= last then List.sort_uniq String.compare out
+      else
+        match code.(pc) with
+        | Contract_vm.CALL_INT (_, label) -> walk (pc + 1) (name label :: out)
+        | _ -> walk (pc + 1) out
+    in
+    walk first []
+  in
+  let starts =
+    List.mapi
+      (fun index f ->
+        let label = 200 + index * 100 in
+        f.fn_name, mark_pc code label)
+      env.funcs
+  in
+  let graph = Hashtbl.create (List.length starts) in
+  let rec fill = function
+    | [] -> ()
+    | [caller, first] ->
+      Hashtbl.replace graph caller (calls first (Array.length code))
+    | (caller, first) :: ((_, last) :: _ as rest) ->
+      Hashtbl.replace graph caller (calls first last);
+      fill rest
+  in
+  fill starts;
+  let root =
+    match starts with
+    | (_, first) :: _ -> calls 0 first
+    | [] -> []
+  in
+  graph, root
+
+let validate_depth env code =
+  let graph, root = call_graph env code in
+  let forms = List.sort_uniq String.compare env.forms in
+  let rec close prior =
+    let next =
+      Hashtbl.fold
+        (fun caller targets out ->
+          if List.exists (fun target -> List.mem target out) targets then
+            caller :: out
+          else out)
+        graph prior
+      |> List.sort_uniq String.compare
+    in
+    if next = prior then next else close next
+  in
+  let leads = close forms in
+  let memo = Hashtbl.create (List.length env.funcs * 2) in
+  let rec span trail entered name =
+    if List.mem name trail then
+      gerr 0 ("direct form recursion is forbidden = " ^ name)
+    else
+      let entered = entered || List.mem name forms in
+      match Hashtbl.find_opt memo (name, entered) with
+      | Some value -> value
+      | None ->
+        let targets = Option.value ~default:[] (Hashtbl.find_opt graph name) in
+        let targets =
+          if entered then targets
+          else List.filter (fun target -> List.mem target leads) targets
+        in
+        let value =
+          List.fold_left
+            (fun depth target ->
+              Int.max depth (1 + span (name :: trail) entered target))
+            0 targets
+        in
+        Hashtbl.replace memo (name, entered) value;
+        value
+  in
+  let check actual =
+    if actual > Contract_vm.call_depth_max then
+      gerr 0
+        ("direct form call depth max = "
+          ^ string_of_int Contract_vm.call_depth_max
+          ^ " actual = " ^ string_of_int actual)
+  in
+  List.iter
+    (fun f ->
+      if f.fn_vis = Public && List.mem f.fn_name leads then
+        check (span [] false f.fn_name))
+    env.funcs;
+  let root_depth =
+    List.fold_left
+      (fun depth target ->
+        if List.mem target leads then
+          Int.max depth (1 + span [] false target)
+        else depth)
+      0 root
+  in
+  check root_depth
+
+let generate ?(direct = []) ?(calls = []) (ct : contract) =
   check_interfaces ct;
-  let env = make_env ct.declaration ct.structs ct.enums ct.consts ct.state ct.events ct.errors ct.funcs in
+  let forms = List.map (fun value -> value.fm_name) ct.forms in
+  let env =
+    make_env ct.declaration ct.structs ct.enums ct.consts ct.state ct.events
+      ct.errors ct.funcs forms direct
+  in
+  if forms <> [] then
+    env.next_label <- Int.max env.next_label (200 + List.length ct.funcs * 100);
   List.iteri (fun i f ->
-    Hashtbl.replace env.func_labels f.fn_name (200 + i * 100)
+    let label = 200 + i * 100 in
+    let label = if split_guard env f then alloc_label env else label in
+    Hashtbl.replace env.func_labels f.fn_name label
   ) ct.funcs;
   (match ct.ctor with
    | Some ctor -> gen_constructor env ctor
@@ -2584,9 +3239,13 @@ let generate (ct : contract) =
   gen_dispatcher env ct.funcs;
   List.iteri (fun i f ->
     let label = 200 + i * 100 in
-    gen_function env f label
+    match List.assoc_opt f.fn_name calls with
+    | Some evidence -> gen_call env f.fn_name evidence label
+    | None -> gen_function env f label
   ) ct.funcs;
-  Array.of_list (List.rev env.code)
+  let code = Array.of_list (List.rev env.code) in
+  if env.forms <> [] then validate_depth env code;
+  code, List.rev env.seals
 
 let to_abi (ct : contract) : Ocs01.abi =
   let typ_to_arg = function

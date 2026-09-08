@@ -31,6 +31,11 @@
  (libraries octra_core))
 
 (test
+ (name test_account_pack)
+ (modules test_account_pack)
+ (libraries octra_core base64 zarith lwt.unix unix))
+
+(test
  (name test_epoch_exec_reward_atomic)
  (modules test_epoch_exec_reward_atomic)
  (libraries octra_core octra_consensus octra_net octra_node_runtime
@@ -47,3 +52,93 @@
    OCTRA_PVAC_VERIFY_WORKER
    %{exe:../bin/octra_pvac_worker.exe}
    (run %{test}))))
+
+(test
+ (name test_node_runtime_preverify_cache)
+ (libraries octra_node_runtime lwt lwt.unix))
+
+(test
+ (name test_store_growth)
+ (modules test_store_growth)
+ (libraries octra_core digestif irmin-pack lwt.unix zarith))
+
+(test
+ (name test_program_compile)
+ (modules test_program_compile)
+ (libraries octra_core octra_vm digestif zarith base64 pvac_ffi lwt.unix unix))
+
+(test
+ (name test_prior)
+ (modules test_prior)
+ (deps (glob_files ../lib/vm/compiler/prior/*.ml))
+ (libraries octra_core octra_vm octra_circle_runtime digestif zarith base64 lwt.unix))
+
+(test
+ (name test_gc_head)
+ (modules test_gc_head)
+ (libraries octra_core octra_node_runtime lwt.unix))
+
+(test
+ (name test_state_sync_reliability)
+ (modules test_state_sync_reliability)
+ (libraries octra_bootstrap octra_node_runtime unix))
+
+(executables
+ (names test_epoch_replay test_epoch_store replay)
+ (modules test_epoch_replay test_epoch_store replay epoch_replay epoch_store)
+ (libraries octra_core octra_consensus octra_node_runtime octra_bootstrap
+  octra_vm lwt.unix yojson zarith digestif.c))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:test_epoch_replay.exe})))
+
+(rule
+ (alias runtest)
+ (action (run %{exe:test_epoch_store.exe})))
+
+(rule
+ (target cipher_slots.exe)
+ (deps cipher_slots.cpp ../pvac_ffi/pvac_serialize.hpp
+  (source_tree ../pvac/include))
+ (action
+  (bash "ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; c++ -std=c++17 -O2 $AES_FLAGS -I../pvac/include -I../pvac_ffi %{dep:cipher_slots.cpp} -o %{target}")))
+
+(rule
+ (alias runtest)
+ (action (run ./cipher_slots.exe)))
+
+(test
+ (name test_aml_profile)
+ (modules test_aml_profile)
+ (libraries octra_vm base64 digestif zarith))
+
+(test
+ (name test_aml_program)
+ (modules test_aml_program)
+ (libraries octra_vm digestif zarith))
+
+(test
+ (name test_p2p_preauth)
+ (modules test_p2p_preauth)
+ (libraries octra_net lwt.unix mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
+ (name test_call_plan)
+ (modules test_call_plan)
+ (libraries octra_vm yojson zarith))
+
+(test
+ (name test_wasm_guard)
+ (modules test_wasm_guard)
+ (libraries octra_circle_runtime octra_core octra_vm lwt.unix zarith unix))
+
+(test
+ (name test_multi_exec)
+ (modules test_multi_exec)
+ (libraries octra_core octra_vm yojson zarith))
+
+(test
+ (name test_direct_exec)
+ (modules test_direct_exec)
+ (libraries octra_vm yojson zarith lwt lwt.unix))

@@ -27,3 +27,10 @@ let scaled_product values ~divisor =
 let charge ~used ~cost ~limit =
   if used < 0 || cost < 0 || limit < 0 || used > limit || cost > limit - used then None
   else Some (used + cost)
+
+let charge_z ~used ~cost ~limit =
+  if used < 0 || limit < 0 || used > limit || Z.sign cost < 0 then None
+  else
+    let left = limit - used in
+    if Z.gt cost (Z.of_int left) then None
+    else Option.map (Int.add used) (int_of_nonnegative cost)

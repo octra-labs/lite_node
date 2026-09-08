@@ -14,6 +14,7 @@ type mode =
   | Consume of entry list
 
 let schema = "octra_circle_hfhe_transcript_v1"
+let consensus_id = "receipt_mode:amount_link_v1"
 let max_entries = 16
 let max_verifiers = 2
 

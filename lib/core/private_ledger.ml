@@ -54,6 +54,7 @@ type key_switch_source = {
   source_cipher : string;
   source_key_hash : string;
   source_fields : field_policy;
+  source_strict : bool;
 }
 
 type key_switch_snapshot = {
@@ -65,6 +66,7 @@ type key_switch_artifact =
   | Verified_key_switch of {
       artifact_tx_hash : string;
       artifact_fields : field_policy;
+      artifact_strict : bool;
       artifact_plan : key_switch_plan;
     }
   | Rejected_key_switch of {
@@ -97,6 +99,7 @@ type private_source = {
   source_claim : private_claim;
   source_policy : Private_result_policy.t;
   source_fields : field_policy;
+  source_strict : bool;
   source_verifier : string;
 }
 
@@ -105,10 +108,17 @@ let key_switch_cache_cap = 32
 let key_switch_cache : (string, key_switch_plan) Hashtbl.t =
   Hashtbl.create key_switch_cache_cap
 
-let key_switch_cache_key field_policy ledger tx =
+let key_switch_cache_key field_policy strict ledger tx =
   let open Lwt.Syntax in
   let* root = Ledger.hash ledger in
-  Lwt.return (T.hash tx ^ ":" ^ root ^ ":" ^ field_policy_key field_policy)
+  Lwt.return
+    (T.hash tx
+     ^ ":"
+     ^ root
+     ^ ":"
+     ^ field_policy_key field_policy
+     ^ ":"
+     ^ string_of_bool strict)
 
 let remember_key_switch_plan key plan =
   if
@@ -672,7 +682,7 @@ let private_claim_source field_policy ledger tx =
     end
   | _ -> Lwt.return Private_claim_none
 
-let private_source ~field_policy ~result_policy ledger tx =
+let private_source ~field_policy ~strict ~result_policy ledger tx =
   let open Lwt.Syntax in
   match private_op tx with
   | None ->
@@ -693,6 +703,7 @@ let private_source ~field_policy ~result_policy ledger tx =
       source_claim;
       source_policy = result_policy;
       source_fields = field_policy;
+      source_strict = strict;
       source_verifier = private_verifier;
     }
 
@@ -704,6 +715,7 @@ let private_source_equal left right =
   && left.source_claim = right.source_claim
   && left.source_policy = right.source_policy
   && left.source_fields = right.source_fields
+  && Bool.equal left.source_strict right.source_strict
   && String.equal left.source_verifier right.source_verifier
 
 let kat_state ledger addr =
@@ -756,17 +768,18 @@ let with_loaded_pk blob bad_tag verify =
   | Error e -> error bad_tag e
   | Ok pk -> verify pk
 
-let guard_private_input cipher tag op =
-  match FB.check_private_input cipher with
+let guard_private_input ~cap cipher tag op =
+  match FB.check_private_input ~cap cipher with
   | Error e -> error tag e ~user_reason:(op ^ ": " ^ e)
   | Ok () -> Ok ()
 
-let guard_refresh_source cipher =
-  match FB.check_refresh_source cipher with
+let guard_refresh_source ~cap cipher =
+  match FB.check_refresh_source ~cap cipher with
   | Error e -> error "key_switch_rejected" e
   | Ok () -> Ok ()
 
 let encrypt_balance_plan
+    ~cap
     ?(worker_priority = Compute_pool.Required)
     result_policy
     blob
@@ -779,11 +792,12 @@ let encrypt_balance_plan
         ("encrypt: " ^ e)
         ~user_reason:("encrypt: bound zero proof failed: " ^ e)
     | Ok pk ->
-      match FB.decode_cipher payload.cipher with
+      match FB.decode_cipher ~cap payload.cipher with
       | Error e -> error "encrypt_balance_failed" e
       | Ok delta ->
         match
           FB.deposit_with_pubkey
+            ~cap
             ~result_policy
             pk
             ~current_cipher:(Some current)
@@ -793,6 +807,7 @@ let encrypt_balance_plan
         | Ok next_cipher -> Ok { current_cipher = current; next_cipher })
 
 let verify_encrypt
+    ~strict
     worker_priority
     result_policy
     blob
@@ -800,12 +815,13 @@ let verify_encrypt
     amount
     (payload : encrypt_payload) =
   let open Lwt.Syntax in
-  match guard_private_input current "encrypt_balance_failed" "encrypt" with
+  match guard_private_input ~cap:strict current "encrypt_balance_failed" "encrypt" with
   | Error e -> Lwt.return (Error e)
   | Ok () ->
     let* verified =
       VW.verify_encrypt_classified_with_priority
         worker_priority
+        ~strict
         ~pubkey:blob
         ~cipher:payload.cipher
         ~amount
@@ -824,6 +840,7 @@ let verify_encrypt
              worker_failure)
       | Ok () ->
         encrypt_balance_plan
+          ~cap:strict
           ~worker_priority
           result_policy
           blob
@@ -833,6 +850,7 @@ let verify_encrypt
 
 let prepare_encrypt_plan
     ~field_policy
+    ?(cap = true)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -847,12 +865,13 @@ let prepare_encrypt_plan
       match current_cipher ledger tx.T.from "encrypt_balance_failed" with
       | Error e -> Lwt.return (Error e)
       | Ok current ->
-        match guard_private_input current "encrypt_balance_failed" "encrypt" with
+        match guard_private_input ~cap current "encrypt_balance_failed" "encrypt" with
         | Error e -> Lwt.return (Error e)
-        | Ok () -> encrypt_balance_plan result_policy blob current payload
+        | Ok () -> encrypt_balance_plan ~cap result_policy blob current payload
 
 let encrypt_plan
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -869,6 +888,7 @@ let encrypt_plan
       | Error e -> Lwt.return (Error e)
       | Ok current ->
         verify_encrypt
+          ~strict
           worker_priority
           result_policy
           blob
@@ -879,6 +899,7 @@ let encrypt_plan
 let max_decrypt_amount = Z.of_string "1000000000000"
 
 let decrypt_balance_plan
+    ~cap
     ?(worker_priority = Compute_pool.Required)
     result_policy
     blob
@@ -891,12 +912,13 @@ let decrypt_balance_plan
         ("decrypt: " ^ e)
         ~user_reason:("decrypt: bound zero proof failed: " ^ e)
     | Ok pk ->
-      match FB.decode_cipher payload.cipher with
+      match FB.decode_cipher ~cap payload.cipher with
       | Error e ->
         error "decrypt_cipher_failed" ("cannot decode delta cipher: " ^ e)
       | Ok delta ->
         match
           FB.withdraw_with_pubkey
+            ~cap
             ~result_policy
             pk
             ~current_cipher:(Some current)
@@ -908,6 +930,7 @@ let decrypt_balance_plan
           Ok { current_cipher = current; next_cipher })
 
 let verify_decrypt
+    ~strict
     worker_priority
     result_policy
     blob
@@ -915,7 +938,7 @@ let verify_decrypt
     amount
     (payload : decrypt_payload) =
   let open Lwt.Syntax in
-  match guard_private_input current "decrypt_cipher_failed" "decrypt" with
+  match guard_private_input ~cap:strict current "decrypt_cipher_failed" "decrypt" with
   | Error e -> Lwt.return (Error e)
   | Ok () ->
     begin
@@ -929,6 +952,7 @@ let verify_decrypt
         let* verified =
           VW.verify_encrypt_classified_with_priority
             worker_priority
+            ~strict
             ~pubkey:blob
             ~cipher:payload.cipher
             ~amount
@@ -948,6 +972,7 @@ let verify_decrypt
           | Ok () ->
             let* plan =
               decrypt_balance_plan
+                ~cap:strict
                 ~worker_priority
                 result_policy
                 blob
@@ -961,6 +986,7 @@ let verify_decrypt
                 let* range =
                   VW.verify_range_classified_with_priority
                     worker_priority
+                    ~strict
                     ~pubkey:blob
                     ~cipher:plan.next_cipher
                     ~proof:range_proof
@@ -987,6 +1013,7 @@ let verify_decrypt
 
 let prepare_decrypt_plan
     ~field_policy
+    ?(cap = true)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
@@ -1008,12 +1035,13 @@ let prepare_decrypt_plan
         match current_cipher ledger tx.T.from "decrypt_cipher_failed" with
         | Error e -> Lwt.return (Error e)
         | Ok current ->
-          match guard_private_input current "decrypt_cipher_failed" "decrypt" with
+          match guard_private_input ~cap current "decrypt_cipher_failed" "decrypt" with
           | Error e -> Lwt.return (Error e)
-          | Ok () -> decrypt_balance_plan result_policy blob current payload
+          | Ok () -> decrypt_balance_plan ~cap result_policy blob current payload
 
 let decrypt_plan
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -1037,6 +1065,7 @@ let decrypt_plan
         | Error e -> Lwt.return (Error e)
         | Ok current ->
           verify_decrypt
+            ~strict
             worker_priority
             result_policy
             blob
@@ -1064,11 +1093,12 @@ let apply_encrypt_plan ledger tx plan =
 
 let apply_encrypt
     ~field_policy
+    ~strict
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = encrypt_plan ~field_policy ~result_policy ledger tx in
+  let* plan = encrypt_plan ~field_policy ~strict ~result_policy ledger tx in
   match plan with
   | Error e -> Lwt.return (Error e)
   | Ok plan -> apply_encrypt_plan ledger tx plan
@@ -1089,11 +1119,12 @@ let apply_decrypt_plan ledger tx plan =
 
 let apply_decrypt
     ~field_policy
+    ~strict
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = decrypt_plan ~field_policy ~result_policy ledger tx in
+  let* plan = decrypt_plan ~field_policy ~strict ~result_policy ledger tx in
   match plan with
   | Error e -> Lwt.return (Error e)
   | Ok plan -> apply_decrypt_plan ledger tx plan
@@ -1115,13 +1146,14 @@ let legacy_audit_commitment = function
     | _, None -> Error "legacy commitment migration requires reconstructable commitment history")
   | None -> Error "legacy commitment migration requires node history audit"
 
-let verify_legacy_public_migration new_pubkey amount payload =
+let verify_legacy_public_migration ~strict new_pubkey amount payload =
   match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
   | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
     begin
-      match PM.classify_cipher new_cipher with
+      match PM.classify_cipher ~cap:strict new_cipher with
     | PM.V3 ->
       VW.verify_encrypt
+        ~strict
         ~pubkey:new_pubkey
         ~cipher:new_cipher
         ~amount
@@ -1135,17 +1167,18 @@ let verify_legacy_public_migration new_pubkey amount payload =
     Lwt.return_error
       "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
 
-let verify_legacy_commitment_migration new_pubkey commitment payload =
+let verify_legacy_commitment_migration ~strict new_pubkey commitment payload =
   match payload.new_cipher, payload.new_zero_proof with
   | Some new_cipher, Some new_zero_proof ->
-    if not (FB.cipher_is_wrapped_scalar new_cipher) then
+    if not (FB.cipher_is_wrapped_scalar ~cap:strict new_cipher) then
       Lwt.return_error
         "legacy commitment migration requires a wrapped scalar new cipher"
     else
       begin
-        match PM.classify_cipher new_cipher with
+        match PM.classify_cipher ~cap:strict new_cipher with
       | PM.V3 ->
         VW.verify_claim
+          ~strict
           ~pubkey:new_pubkey
           ~cipher:new_cipher
           ~proof:new_zero_proof
@@ -1158,7 +1191,7 @@ let verify_legacy_commitment_migration new_pubkey commitment payload =
     Lwt.return_error
       "legacy commitment migration requires new_cipher and new_zero_proof"
 
-let verify_legacy_zero_reset new_pubkey payload =
+let verify_legacy_zero_reset ~strict new_pubkey payload =
   match payload.old_bound_pubkey_b64, payload.old_bound_cipher, payload.old_zero_proof with
   | Some _, _, _
   | _, Some _, _
@@ -1169,9 +1202,10 @@ let verify_legacy_zero_reset new_pubkey payload =
     match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
     | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
       begin
-        match PM.classify_cipher new_cipher with
+        match PM.classify_cipher ~cap:strict new_cipher with
       | PM.V3 ->
         VW.verify_encrypt
+          ~strict
           ~pubkey:new_pubkey
           ~cipher:new_cipher
           ~amount:Z.zero
@@ -1199,7 +1233,7 @@ let verify_new_key new_pubkey label verify =
   | Ok () ->
     Lwt.return_ok ()
 
-let prepared_legacy_zero_reset payload =
+let prepared_legacy_zero_reset ~cap payload =
   match
     payload.old_bound_pubkey_b64,
     payload.old_bound_cipher,
@@ -1220,7 +1254,7 @@ let prepared_legacy_zero_reset payload =
     with
     | Some new_cipher, Some _, Some _, Some _ ->
       begin
-        match PM.classify_cipher new_cipher with
+        match PM.classify_cipher ~cap new_cipher with
         | PM.V3 -> Ok new_cipher
         | _ ->
           error
@@ -1232,11 +1266,11 @@ let prepared_legacy_zero_reset payload =
         "key_switch_rejected"
         "legacy zero reset requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
 
-let prepared_legacy_commitment payload =
+let prepared_legacy_commitment ~cap payload =
   match payload.new_cipher, payload.new_zero_proof with
-  | Some new_cipher, Some _ when FB.cipher_is_wrapped_scalar new_cipher ->
+  | Some new_cipher, Some _ when FB.cipher_is_wrapped_scalar ~cap new_cipher ->
     begin
-      match PM.classify_cipher new_cipher with
+      match PM.classify_cipher ~cap new_cipher with
       | PM.V3 -> Ok new_cipher
       | _ ->
         error
@@ -1252,7 +1286,7 @@ let prepared_legacy_commitment payload =
       "key_switch_rejected"
       "legacy commitment migration requires new_cipher and new_zero_proof"
 
-let prepared_legacy_public payload =
+let prepared_legacy_public ~cap payload =
   match
     payload.new_cipher,
     payload.new_zero_proof,
@@ -1261,7 +1295,7 @@ let prepared_legacy_public payload =
   with
   | Some new_cipher, Some _, Some _, Some _ ->
     begin
-      match PM.classify_cipher new_cipher with
+      match PM.classify_cipher ~cap new_cipher with
       | PM.V3 -> Ok new_cipher
       | _ ->
         error
@@ -1273,7 +1307,7 @@ let prepared_legacy_public payload =
       "key_switch_rejected"
       "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
 
-let prepared_bound_migration old_pk current_cipher payload =
+let prepared_bound_migration ~cap old_pk current_cipher payload =
   match payload.source_cipher_hash with
   | None ->
     error
@@ -1285,7 +1319,7 @@ let prepared_bound_migration old_pk current_cipher payload =
       "encrypted balance changed before key switch verification"
   | Some _ ->
     begin
-      match guard_refresh_source current_cipher with
+      match guard_refresh_source ~cap current_cipher with
       | Error _ as result -> result
       | Ok () ->
         match
@@ -1296,7 +1330,7 @@ let prepared_bound_migration old_pk current_cipher payload =
           payload.amount_commitment
         with
         | Some _, Some new_cipher, Some _, Some _, Some _
-            when FB.cipher_is_wrapped_scalar new_cipher ->
+            when FB.cipher_is_wrapped_scalar ~cap new_cipher ->
           Ok new_cipher
         | Some _, Some _, Some _, Some _, Some _ ->
           error
@@ -1308,7 +1342,7 @@ let prepared_bound_migration old_pk current_cipher payload =
             "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"
     end
 
-let prepared_historical_owner current_cipher payload =
+let prepared_historical_owner ~cap current_cipher payload =
   match
     payload.old_bound_pubkey_b64,
     payload.old_bound_cipher,
@@ -1339,7 +1373,7 @@ let prepared_historical_owner current_cipher payload =
             "encrypted balance changed before historical owner verification"
         | Some _ ->
           begin
-            match guard_refresh_source current_cipher with
+            match guard_refresh_source ~cap current_cipher with
             | Error _ as result -> result
             | Ok () ->
               match
@@ -1348,7 +1382,7 @@ let prepared_historical_owner current_cipher payload =
                 payload.amount_commitment
               with
               | Some new_cipher, Some new_proof,
-                Some commitment when FB.cipher_is_wrapped_scalar new_cipher ->
+                Some commitment when FB.cipher_is_wrapped_scalar ~cap new_cipher ->
                 Ok (new_cipher, new_proof, commitment)
               | Some _, Some _, Some _ ->
                 error
@@ -1362,13 +1396,14 @@ let prepared_historical_owner current_cipher payload =
     end
 
 let verify_historical_owner
+    ~strict
     ~worker_priority
     ~legacy_public_replay
     ~current_cipher
     ~new_pubkey
     payload =
   let open Lwt.Syntax in
-  match prepared_historical_owner current_cipher payload with
+  match prepared_historical_owner ~cap:strict current_cipher payload with
   | Error failure -> Lwt.return (Error failure)
   | Ok (new_cipher, new_proof, commitment) ->
     begin
@@ -1383,6 +1418,7 @@ let verify_historical_owner
         let* new_checked =
           VW.verify_claim_classified_with_priority
             worker_priority
+            ~strict
             ~pubkey:new_pubkey
             ~cipher:new_cipher
             ~proof:new_proof
@@ -1399,6 +1435,7 @@ let verify_historical_owner
 
 let verify_key_switch_plan
     ~field_policy
+    ~strict
     ?legacy_public_replay
     ?snapshot
     ?(worker_priority = Compute_pool.Required)
@@ -1441,6 +1478,7 @@ let verify_key_switch_plan
                 ~priority:worker_priority
                 (fun () ->
                   PM.status_of_state
+                    ~cap:strict
                     ~cipher:current_cipher
                     ~pubkey:old_pk)
             in
@@ -1456,7 +1494,7 @@ let verify_key_switch_plan
               if payload.migration = Verified_zero_reset then
                   let* checked =
                     verify_new_key new_pubkey "legacy zero reset failed: "
-                    (fun pubkey -> verify_legacy_zero_reset pubkey payload)
+                    (fun pubkey -> verify_legacy_zero_reset ~strict pubkey payload)
                 in
                 (match checked, payload.new_cipher with
                 | Error e, _ -> Lwt.return (Error e)
@@ -1478,6 +1516,7 @@ let verify_key_switch_plan
                 else
                   let* checked =
                     verify_historical_owner
+                      ~strict
                       ~worker_priority
                       ~legacy_public_replay
                       ~current_cipher
@@ -1504,6 +1543,7 @@ let verify_key_switch_plan
                     verify_new_key new_pubkey "legacy commitment migration failed: "
                       (fun pubkey ->
                         verify_legacy_commitment_migration
+                          ~strict
                           pubkey
                           commitment
                           payload)
@@ -1527,7 +1567,11 @@ let verify_key_switch_plan
                   let* checked =
                     verify_new_key new_pubkey "legacy public migration failed: "
                       (fun pubkey ->
-                        verify_legacy_public_migration pubkey amount payload)
+                        verify_legacy_public_migration
+                          ~strict
+                          pubkey
+                          amount
+                          payload)
                   in
                   (match checked, payload.new_cipher with
                   | Error e, _ -> Lwt.return (Error e)
@@ -1557,12 +1601,12 @@ let verify_key_switch_plan
                   (error "key_switch_rejected"
                     "encrypted balance changed before key switch verification")
               | Some _ ->
-                match guard_refresh_source current_cipher with
+                match guard_refresh_source ~cap:strict current_cipher with
                 | Error e -> Lwt.return (Error e)
                 | Ok () ->
                 match old_pk, payload.new_cipher, payload.old_zero_proof, payload.new_zero_proof, payload.amount_commitment with
                 | Some old_blob, Some new_cipher, Some old_zero_proof, Some new_zero_proof, Some amount_commitment ->
-                  if not (FB.cipher_is_wrapped_scalar new_cipher) then
+                  if not (FB.cipher_is_wrapped_scalar ~cap:strict new_cipher) then
                     Lwt.return
                       (error "key_switch_rejected"
                         "new encrypted balance must be a wrapped scalar")
@@ -1570,6 +1614,7 @@ let verify_key_switch_plan
                     let* old_checked =
                       VW.verify_key_switch_claim_classified_with_priority
                         worker_priority
+                        ~strict
                         ~pubkey:old_blob
                         ~cipher:current_cipher
                         ~proof:old_zero_proof
@@ -1586,6 +1631,7 @@ let verify_key_switch_plan
                         let* new_checked =
                           VW.verify_claim_classified_with_priority
                             worker_priority
+                            ~strict
                             ~pubkey:new_pubkey
                             ~cipher:new_cipher
                             ~proof:new_zero_proof
@@ -1614,7 +1660,7 @@ let verify_key_switch_plan
                       "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"))
     end
 
-let prepare_key_switch_plan_uncached field_policy ledger tx =
+let prepare_key_switch_plan_uncached ~cap field_policy ledger tx =
   let open Lwt.Syntax in
   match parse_key_switch field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
@@ -1646,6 +1692,7 @@ let prepare_key_switch_plan_uncached field_policy ledger tx =
             Proof_pool.run
               (fun () ->
                 PM.status_of_state
+                  ~cap
                   ~cipher:current_cipher
                   ~pubkey:old_pk)
           in
@@ -1660,7 +1707,7 @@ let prepare_key_switch_plan_uncached field_policy ledger tx =
               Ok None
             else if PM.needs_history_migration status then
               if payload.migration = Verified_zero_reset then
-                Result.map Option.some (prepared_legacy_zero_reset payload)
+                Result.map Option.some (prepared_legacy_zero_reset ~cap payload)
               else if payload.migration = Historical_owner_proof then
                 if
                   status.cipher_class <> PM.V3
@@ -1672,15 +1719,15 @@ let prepare_key_switch_plan_uncached field_policy ledger tx =
                 else
                   Result.map
                     (fun (new_cipher, _, _) -> Some new_cipher)
-                    (prepared_historical_owner current_cipher payload)
+                    (prepared_historical_owner ~cap current_cipher payload)
               else if payload.migration = Commitment_history then
-                Result.map Option.some (prepared_legacy_commitment payload)
+                Result.map Option.some (prepared_legacy_commitment ~cap payload)
               else if payload.migration = Rejected_rebinding then
                 error
                   "key_switch_rejected"
                   "legacy ciphertext rebinding is not statement preserving; use public or commitment history migration"
               else if payload.migration = Public_history then
-                Result.map Option.some (prepared_legacy_public payload)
+                Result.map Option.some (prepared_legacy_public ~cap payload)
               else
                 error
                   "key_switch_rejected"
@@ -1689,7 +1736,7 @@ let prepare_key_switch_plan_uncached field_policy ledger tx =
               error "key_switch_rejected" status.reason
             else
               Result.map Option.some
-                (prepared_bound_migration old_pk current_cipher payload)
+                (prepared_bound_migration ~cap old_pk current_cipher payload)
           in
           Lwt.return
             (Result.map
@@ -1706,19 +1753,21 @@ let prepare_key_switch_plan_uncached field_policy ledger tx =
 
 let prepare_key_switch_plan
     ~field_policy
+    ?(cap = true)
     ledger
     tx =
   let open Lwt.Syntax in
   if key_switch_requests_legacy_audit ~field_policy tx then
-    prepare_key_switch_plan_uncached field_policy ledger tx
+    prepare_key_switch_plan_uncached ~cap field_policy ledger tx
   else
-    let* key = key_switch_cache_key field_policy ledger tx in
+    let* key = key_switch_cache_key field_policy cap ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some plan -> Lwt.return_ok plan
-    | None -> prepare_key_switch_plan_uncached field_policy ledger tx
+    | None -> prepare_key_switch_plan_uncached ~cap field_policy ledger tx
 
 let key_switch_plan
     ~field_policy
+    ~strict
     ?legacy_public_replay
     ledger
     tx =
@@ -1727,12 +1776,13 @@ let key_switch_plan
   let* cache_key =
     if legacy then Lwt.return_none
     else
-      let* key = key_switch_cache_key field_policy ledger tx in
+      let* key = key_switch_cache_key field_policy strict ledger tx in
       Lwt.return_some key
   in
   let* result =
     verify_key_switch_plan
       ~field_policy
+      ~strict
       ?legacy_public_replay
       ledger
       tx
@@ -1744,13 +1794,14 @@ let key_switch_plan
       match cache_key with
       | None -> Lwt.return result
       | Some key ->
-        let* current = key_switch_cache_key field_policy ledger tx in
+        let* current = key_switch_cache_key field_policy strict ledger tx in
         if String.equal key current then remember_key_switch_plan key plan;
         Lwt.return result
     end
 
 let preverify_key_switch_artifact
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Speculative)
     ledger
     tx =
@@ -1769,11 +1820,13 @@ let preverify_key_switch_artifact
         source_cipher = snapshot.snapshot_cipher;
         source_key_hash = key_hash_of_pubkey snapshot.snapshot_pubkey;
         source_fields = field_policy;
+        source_strict = strict;
       } in
       let artifact_tx_hash = T.hash tx in
       let* result =
         verify_key_switch_plan
           ~field_policy
+          ~strict
           ~snapshot
           ~worker_priority
           ledger
@@ -1786,6 +1839,7 @@ let preverify_key_switch_artifact
             (Verified_key_switch {
                artifact_tx_hash;
                artifact_fields = field_policy;
+               artifact_strict = strict;
                artifact_plan;
              })
         | Error artifact_failure when
@@ -1802,6 +1856,7 @@ let preverify_key_switch_artifact
 
 let bind_key_switch_artifact
     ~field_policy
+    ~strict
     ledger
     tx
     artifact =
@@ -1831,10 +1886,13 @@ let bind_key_switch_artifact
           let plan = verified.artifact_plan in
           if
             verified.artifact_fields = field_policy
+            && Bool.equal verified.artifact_strict strict
             && String.equal current_cipher plan.source_cipher
             && String.equal current_key_hash plan.old_key_hash
           then begin
-            let* cache_key = key_switch_cache_key field_policy ledger tx in
+            let* cache_key =
+              key_switch_cache_key field_policy strict ledger tx
+            in
             remember_key_switch_plan cache_key plan;
             Lwt.return (Key_switch_bound (Prepared_key_switch plan))
           end
@@ -1843,6 +1901,7 @@ let bind_key_switch_artifact
         | Rejected_key_switch rejected ->
           if
             rejected.artifact_source.source_fields = field_policy
+            && Bool.equal rejected.artifact_source.source_strict strict
             && String.equal current_cipher rejected.artifact_source.source_cipher
             && String.equal
                  current_key_hash
@@ -1856,17 +1915,19 @@ let bind_key_switch_artifact
 
 let key_switch_plan_for_apply
     ~field_policy
+    ~strict
     ?legacy_public_replay
     ledger
     tx =
   let open Lwt.Syntax in
   if key_switch_requests_legacy_audit ~field_policy tx then
-    key_switch_plan ~field_policy ?legacy_public_replay ledger tx
+    key_switch_plan ~field_policy ~strict ?legacy_public_replay ledger tx
   else
-    let* key = key_switch_cache_key field_policy ledger tx in
+    let* key = key_switch_cache_key field_policy strict ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some plan -> Lwt.return_ok plan
-    | None -> key_switch_plan ~field_policy ?legacy_public_replay ledger tx
+    | None ->
+      key_switch_plan ~field_policy ~strict ?legacy_public_replay ledger tx
 
 let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
   let open Lwt.Syntax in
@@ -1905,6 +1966,7 @@ let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
 
 let apply_key_switch
     ~field_policy
+    ~strict
     ?legacy_public_replay
     ledger
     tx =
@@ -1912,6 +1974,7 @@ let apply_key_switch
   let* plan =
     key_switch_plan_for_apply
       ~field_policy
+      ~strict
       ?legacy_public_replay
       ledger
       tx
@@ -1923,6 +1986,7 @@ let apply_key_switch
 
 let prepare_stealth_plan
     ~field_policy
+    ?(cap = true)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -1941,22 +2005,23 @@ let prepare_stealth_plan
     | Ok blob ->
       match current_cipher ledger tx.T.from "encrypted_balance_update_failed" with
       | Error e -> Lwt.return (Error e)
-      | Ok _ when not (FB.cipher_is_wrapped_scalar ptd.PT.delta_cipher) ->
+      | Ok _ when not (FB.cipher_is_wrapped_scalar ~cap ptd.PT.delta_cipher) ->
         Lwt.return
           (error "bad_delta_cipher"
             "stealth delta cipher must be a wrapped scalar")
       | Ok current ->
-        match guard_private_input current "encrypted_balance_update_failed" "stealth" with
+        match guard_private_input ~cap current "encrypted_balance_update_failed" "stealth" with
         | Error e -> Lwt.return (Error e)
         | Ok () ->
           Proof_pool.run ~priority:worker_priority (fun () ->
             with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
-              match FB.decode_cipher ptd.PT.delta_cipher with
+              match FB.decode_cipher ~cap ptd.PT.delta_cipher with
               | Error e ->
                 error "bad_delta_cipher" ("cannot decode delta cipher: " ^ e)
               | Ok delta ->
                 match
                   FB.withdraw_with_pubkey
+                    ~cap
                     ~result_policy
                     pk
                     ~current_cipher:(Some current)
@@ -1982,6 +2047,7 @@ let prepare_stealth_plan
 
 let stealth_plan
     ~field_policy
+    ?(cap = true)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -1990,6 +2056,7 @@ let stealth_plan
   let* plan =
     prepare_stealth_plan
       ~field_policy
+      ~cap
       ~worker_priority
       ~result_policy
       ledger
@@ -2015,6 +2082,7 @@ let stealth_plan
               with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
                 if
                   FB.verify_commitment
+                    ~cap
                     pk
                     ptd.PT.delta_cipher
                     ptd.PT.commitment
@@ -2043,6 +2111,7 @@ let range_status prefix = function
       worker_failure
 
 let stealth_inline_range
+    ~strict
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx
@@ -2059,6 +2128,7 @@ let stealth_inline_range
     let* delta =
       VW.verify_range_classified_with_priority
         worker_priority
+        ~strict
         ~pubkey:blob
         ~cipher:plan.stealth_delta_cipher
         ~proof:plan.stealth_range_proof_delta
@@ -2070,6 +2140,7 @@ let stealth_inline_range
         let* balance =
           VW.verify_range_classified_with_priority
             worker_priority
+            ~strict
             ~pubkey:blob
             ~cipher:plan.stealth_next_cipher
             ~proof:plan.stealth_range_proof_balance
@@ -2091,6 +2162,7 @@ let stealth_accept_range range =
 
 let stealth_binding
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx
@@ -2115,6 +2187,7 @@ let stealth_binding
           let* verified =
             VW.verify_claim_classified_with_priority
               worker_priority
+              ~strict
               ~pubkey:blob
               ~cipher:plan.stealth_delta_cipher
               ~proof:ptd.PT.send_zero_proof
@@ -2138,6 +2211,7 @@ let stealth_binding
 
 let prepare_claim_plan
     ~field_policy
+    ?(cap = true)
     ledger
     tx =
   let open Lwt.Syntax in
@@ -2156,7 +2230,7 @@ let prepare_claim_plan
       | Some so ->
         match claim_gate tx.T.from so claim with
         | Error e -> Lwt.return (Error e)
-        | Ok () when not (FB.cipher_is_wrapped_scalar claim.SC.claim_cipher) ->
+        | Ok () when not (FB.cipher_is_wrapped_scalar ~cap claim.SC.claim_cipher) ->
           Lwt.return
             (error "bad_claim_cipher"
               "claim cipher must be a wrapped scalar")
@@ -2168,11 +2242,12 @@ let prepare_claim_plan
 
 let claim_plan
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Required)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = prepare_claim_plan ~field_policy ledger tx in
+  let* plan = prepare_claim_plan ~field_policy ~cap:strict ledger tx in
   match plan with
   | Error _ as result -> Lwt.return result
   | Ok plan ->
@@ -2201,6 +2276,7 @@ let claim_plan
                   with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
                     if
                       FB.verify_commitment
+                        ~cap:strict
                         pk
                         claim.SC.claim_cipher
                         claim.SC.commitment
@@ -2218,6 +2294,7 @@ let claim_plan
                   let* verified =
                     VW.verify_claim_classified_with_priority
                       worker_priority
+                      ~strict
                       ~pubkey:blob
                       ~cipher:claim.SC.claim_cipher
                       ~proof:claim.SC.zero_proof
@@ -2244,6 +2321,7 @@ let claim_plan
       end
 
 let claim_balance_plan
+    ?(cap = true)
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -2261,17 +2339,18 @@ let claim_balance_plan
     match current_cipher ledger tx.T.from "encrypted_balance_update_failed" with
     | Error e -> Lwt.return (Error e)
     | Ok current ->
-      match guard_private_input current "encrypted_balance_update_failed" "claim" with
+      match guard_private_input ~cap current "encrypted_balance_update_failed" "claim" with
       | Error e -> Lwt.return (Error e)
       | Ok () ->
         Proof_pool.run ~priority:worker_priority (fun () ->
           with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
-            match FB.decode_cipher plan.claim_cipher with
+            match FB.decode_cipher ~cap plan.claim_cipher with
             | Error e ->
               error "bad_claim_cipher" ("cannot decode claim cipher: " ^ e)
             | Ok delta ->
               match
                 FB.deposit_with_pubkey
+                  ~cap
                   ~result_policy
                   pk
                   ~current_cipher:(Some current)
@@ -2284,6 +2363,7 @@ let claim_balance_plan
 
 let verify_private
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Required)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
@@ -2292,7 +2372,13 @@ let verify_private
   match tx.T.op_type with
   | T.EncryptOp ->
     let* result =
-      encrypt_plan ~field_policy ~worker_priority ~result_policy ledger tx
+      encrypt_plan
+        ~field_policy
+        ~strict
+        ~worker_priority
+        ~result_policy
+        ledger
+        tx
     in
     Lwt.return
       (result
@@ -2300,7 +2386,13 @@ let verify_private
        |> Result.map_error private_reject)
   | T.DecryptOp ->
     let* result =
-      decrypt_plan ~field_policy ~worker_priority ~result_policy ledger tx
+      decrypt_plan
+        ~field_policy
+        ~strict
+        ~worker_priority
+        ~result_policy
+        ledger
+        tx
     in
     Lwt.return
       (result
@@ -2308,14 +2400,20 @@ let verify_private
        |> Result.map_error private_reject)
   | T.StealthOp ->
     let* plan =
-      stealth_plan ~field_policy ~worker_priority ~result_policy ledger tx
+      stealth_plan
+        ~field_policy
+        ~cap:strict
+        ~worker_priority
+        ~result_policy
+        ledger
+        tx
     in
     begin
       match plan with
       | Error failure -> Lwt.return_error (private_reject failure)
       | Ok plan ->
         let* range =
-          stealth_inline_range ~worker_priority ledger tx plan
+          stealth_inline_range ~strict ~worker_priority ledger tx plan
         in
         begin
           match range with
@@ -2326,7 +2424,13 @@ let verify_private
               | Error failure -> Lwt.return_error (private_reject failure)
               | Ok () ->
                 let* binding =
-                  stealth_binding ~field_policy ~worker_priority ledger tx plan
+                  stealth_binding
+                    ~field_policy
+                    ~strict
+                    ~worker_priority
+                    ledger
+                    tx
+                    plan
                 in
                 Lwt.return
                   (binding
@@ -2336,7 +2440,9 @@ let verify_private
         end
     end
   | T.ClaimOp ->
-    let* claim = claim_plan ~field_policy ~worker_priority ledger tx in
+    let* claim =
+      claim_plan ~field_policy ~strict ~worker_priority ledger tx
+    in
     begin
       match claim with
       | Error failure ->
@@ -2345,6 +2451,7 @@ let verify_private
       | Ok claim ->
         let* balance =
           claim_balance_plan
+            ~cap:strict
             ~worker_priority
             ~result_policy
             ledger
@@ -2366,18 +2473,22 @@ let verify_private
 
 let preverify_private_artifact
     ~field_policy
+    ~strict
     ?(worker_priority = Compute_pool.Speculative)
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* source = private_source ~field_policy ~result_policy ledger tx in
+  let* source =
+    private_source ~field_policy ~strict ~result_policy ledger tx
+  in
   match source with
   | Error failure -> Lwt.return_error failure
   | Ok private_source ->
     let* result =
       verify_private
         ~field_policy
+        ~strict
         ~worker_priority
         ~result_policy
         ledger
@@ -2398,6 +2509,7 @@ let preverify_private_artifact
 
 let bind_private_artifact
     ~field_policy
+    ~strict
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx
@@ -2408,7 +2520,9 @@ let bind_private_artifact
     | Verified_private verified -> verified.private_source
     | Rejected_private rejected -> rejected.private_source
   in
-  let* current = private_source ~field_policy ~result_policy ledger tx in
+  let* current =
+    private_source ~field_policy ~strict ~result_policy ledger tx
+  in
   match current with
   | Error private_error ->
     Lwt.return
@@ -2442,11 +2556,11 @@ let key_switch_current ledger tx (plan : key_switch_plan) =
             (key_hash_of_pubkey source.snapshot_pubkey)
             plan.old_key_hash)
 
-let claim_current ~field_policy ledger tx claim balance =
+let claim_current ~field_policy ~cap ledger tx claim balance =
   let open Lwt.Syntax in
   if not (balance_current ledger tx balance) then Lwt.return_false
   else
-    let* current = prepare_claim_plan ~field_policy ledger tx in
+    let* current = prepare_claim_plan ~field_policy ~cap ledger tx in
     Lwt.return
       (match current with
        | Error _ -> false
@@ -2454,7 +2568,7 @@ let claim_current ~field_policy ledger tx claim balance =
          current.claim_output_id = claim.claim_output_id
          && String.equal current.claim_cipher claim.claim_cipher)
 
-let prepared_current ~field_policy ledger tx = function
+let prepared_current ~field_policy ?(cap = true) ledger tx = function
   | Prepared_encrypt plan when tx.T.op_type = T.EncryptOp ->
     Lwt.return (balance_current ledger tx plan)
   | Prepared_decrypt plan when tx.T.op_type = T.DecryptOp ->
@@ -2467,7 +2581,7 @@ let prepared_current ~field_policy ledger tx = function
        | Ok current -> String.equal current plan.stealth_current_cipher
        | Error _ -> false)
   | Prepared_claim (claim, balance) when tx.T.op_type = T.ClaimOp ->
-    claim_current ~field_policy ledger tx claim balance
+    claim_current ~field_policy ~cap ledger tx claim balance
   | Prepared_encrypt _
   | Prepared_decrypt _
   | Prepared_key_switch _

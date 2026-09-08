@@ -15,7 +15,7 @@ let eligible_with field_policy tx =
           ~field_policy
           tx)
 
-let create ~field_policy ledger =
+let create ~field_policy ~strict ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
@@ -29,6 +29,7 @@ let create ~field_policy ledger =
         let* result =
           Private_ledger.preverify_key_switch_artifact
             ~field_policy:fields
+            ~strict:(strict ())
             ~worker_priority:priority
             ledger
             tx
@@ -41,6 +42,7 @@ let create ~field_policy ledger =
             let* binding =
               Private_ledger.bind_key_switch_artifact
                 ~field_policy:(field_policy ())
+                ~strict:(strict ())
                 ledger
                 tx
                 artifact
@@ -60,6 +62,7 @@ let create ~field_policy ledger =
         let* binding =
           Private_ledger.bind_key_switch_artifact
             ~field_policy:(field_policy ())
+            ~strict:(strict ())
             ledger
             tx
             artifact

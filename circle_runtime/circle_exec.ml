@@ -113,7 +113,7 @@ let oldest_wasm_view_storage_cache_key () =
 
 let prune_wasm_view_storage_cache incoming_count incoming_weight =
   let now = Unix.gettimeofday () in
-  let stale =
+  let expired =
     Hashtbl.fold
       (fun key entry keys ->
         if now -. entry.touched_at > wasm_view_storage_cache_ttl_secs then
@@ -122,7 +122,7 @@ let prune_wasm_view_storage_cache incoming_count incoming_weight =
           keys)
       wasm_view_storage_cache
       [] in
-  List.iter remove_wasm_view_storage_cache stale;
+  List.iter remove_wasm_view_storage_cache expired;
   while
     Hashtbl.length wasm_view_storage_cache + incoming_count
     > wasm_view_storage_cache_limit
@@ -139,7 +139,7 @@ let prune_wasm_view_storage_cache incoming_count incoming_weight =
 let drop_previous_wasm_view_storage circle_id keep_key =
   let prefix = circle_id ^ ":" in
   let prefix_len = String.length prefix in
-  let stale =
+  let old_keys =
     Hashtbl.fold
       (fun key _ keys ->
         if
@@ -152,7 +152,7 @@ let drop_previous_wasm_view_storage circle_id keep_key =
           keys)
       wasm_view_storage_cache
       [] in
-  List.iter remove_wasm_view_storage_cache stale
+  List.iter remove_wasm_view_storage_cache old_keys
 
 let cache_wasm_view_storage circle_id stable_root storage_tbl =
   let cache_key = wasm_view_storage_cache_key circle_id stable_root in
@@ -208,13 +208,13 @@ let asset_effect_body_b64_cap = ((asset_effect_raw_cap + 2) / 3) * 4
 
 let preview_prune_cache () =
   let now = Unix.gettimeofday () in
-  let stale = ref [] in
+  let expired = ref [] in
   Hashtbl.iter
     (fun key entry ->
       if now -. entry.updated_at > preview_session_ttl_secs then
-        stale := key :: !stale)
+        expired := key :: !expired)
     preview_session_cache;
-  List.iter (fun key -> Hashtbl.remove preview_session_cache key) !stale;
+  List.iter (fun key -> Hashtbl.remove preview_session_cache key) !expired;
   if Hashtbl.length preview_session_cache > preview_session_cache_limit then begin
     Hashtbl.reset preview_session_cache;
     Hashtbl.reset preview_session_inflight
@@ -392,7 +392,7 @@ let public_reads_hash snapshots =
   |> List.map Octra_core.Circle_wasm_public_read.yojson_of_snapshot
   |> fun values -> hash_json "octra:circle_public_reads:v1" (`List values)
 
-let hfhe_context_hash caps pubkeys active_key =
+let hfhe_context_hash ~strict caps pubkeys active_key =
   let caps =
     caps
     |> List.sort_uniq String.compare
@@ -417,7 +417,10 @@ let hfhe_context_hash caps pubkeys active_key =
     | None -> `Null
   in
   hash_json
-    "octra:circle_hfhe_context:v1"
+    (if strict then
+       "octra:circle_hfhe_context:standard:v1"
+     else
+       "octra:circle_hfhe_context:v1")
     (`Assoc [
       "caps", `List caps;
       "pubkeys", `List pubkeys;
@@ -710,7 +713,7 @@ let empty_runtime_hfhe_details (ctx : ContractVM.exec_ctx) owner = {
   active_relay = None;
 }
 
-let load_runtime_hfhe_ctx ?(receipt_bound=false)
+let load_runtime_hfhe_ctx ?(receipt_linked = false)
     (ctx : ContractVM.exec_ctx) store circle_id caller =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
@@ -734,7 +737,7 @@ let load_runtime_hfhe_ctx ?(receipt_bound=false)
     let key_policy_satisfied =
       not policy.require_live_key_policy || key_policy_live in
     let proof_binding_satisfied =
-      receipt_bound || not policy.require_receipt_transport_binding in
+      receipt_linked || not policy.require_receipt_transport_binding in
     let get_fhe_pubkey requested_addr =
       if
         key_policy_satisfied
@@ -841,7 +844,7 @@ let load_runtime_hfhe_ctx ?(receipt_bound=false)
          active_relay;
        })
 
-let wasm_hfhe_caps_of_runtime_ctx ?(has_active_keypair=false) (ctx : ContractVM.exec_ctx) =
+let wasm_hfhe_caps_of_runtime_ctx ?(has_active_keypair = false) (ctx : ContractVM.exec_ctx) =
   let caps = ref [] in
   let add flag name =
     if flag then
@@ -995,6 +998,7 @@ let execute_wasm_view
     ~hfhe_caps
     ~hfhe_pubkeys
     ~hfhe_active_key
+    ~hfhe_strict
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1013,6 +1017,7 @@ let execute_wasm_view
       ~hfhe_caps
       ~hfhe_pubkeys
       ~hfhe_active_key
+      ~hfhe_strict
       ~hfhe_mode
       ~public_reads
       ~fuel_limit:(wasm_fuel_limit fuel_limit)
@@ -1032,6 +1037,7 @@ let execute_wasm_view
       ~hfhe_caps
       ~hfhe_pubkeys
       ~hfhe_active_key
+      ~hfhe_strict
       ~hfhe_mode
       ~public_reads
       ~fuel_limit:(wasm_compute_fuel_limit fuel_limit)
@@ -1049,7 +1055,7 @@ let run_preview_prefetch ~clear task =
       clear ();
       Lwt.return_unit)
 
-let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+let rec execute_view_call_with_execution execution ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id method_name params caller =
   let timing_enabled = wasm_view_method_timing_enabled method_name in
   let timing_started_at = if timing_enabled then Some (Unix.gettimeofday ()) else None in
@@ -1088,7 +1094,8 @@ let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractV
         phases
     end;
     Lwt.return receipt in
-  let* loaded_result = Circle_program.load ~trusted store circle_id in
+  let* loaded_result =
+    Circle_program.load ~trusted ~point_ops:ctx.point_ops store circle_id in
   timing_mark "load_program";
   match loaded_result with
   | Error e ->
@@ -1223,6 +1230,7 @@ let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractV
                             ~hfhe_caps
                             ~hfhe_pubkeys
                             ~hfhe_active_key
+                            ~hfhe_strict:true
                             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
                             ~public_reads:public_reads.snapshots
                             ~fuel_limit:wasm_limit in
@@ -1264,7 +1272,7 @@ let rec execute_view_call_with_execution execution ?(trusted=[]) ?(ctx=ContractV
     end
     end
 
-and maybe_prefetch_preview ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+and maybe_prefetch_preview ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id caller prompt_csv prompt_tokens delivered_csv =
   match parse_csv_tokens delivered_csv with
   | None ->
@@ -1310,7 +1318,7 @@ and maybe_prefetch_preview ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_00
               Lwt.return_unit))
       end
 
-and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+and execute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id method_name params caller =
   match preview_request_of_call method_name params with
   | None ->
@@ -1373,7 +1381,7 @@ and execute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(l
         Lwt.return receipt
     end
 
-let execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+let execute_view_call_direct ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id method_name params caller =
   execute_view_call_with_execution
     Circle_program.Standard
@@ -1387,7 +1395,7 @@ let execute_view_call_direct ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth
     params
     caller
 
-let execute_compute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0) ?(limit=2_000_000_000)
+let execute_compute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id method_name params caller =
   execute_view_call_with_execution
     Circle_program.Compute
@@ -1401,14 +1409,16 @@ let execute_compute_view_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(dept
     params
     caller
 
-let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
-    ?(limit=1_000_000)
-    ?(hfhe_mode=Octra_core.Circle_hfhe_transcript.Direct)
-    ?(update_policy=false)
-    ?(manifest_profile=Octra_core.Circle_wasm_host.Manifest)
+let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
+    ?(limit = 1_000_000)
+    ?(hfhe_strict = false)
+    ?(hfhe_mode = Octra_core.Circle_hfhe_transcript.Direct)
+    ?(update_policy = false)
+    ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     store circle_id method_name params caller value =
   let* loaded_result =
-    Circle_program.load ~trusted ~manifest_profile store circle_id in
+    Circle_program.load
+      ~trusted ~point_ops:ctx.point_ops ~manifest_profile store circle_id in
   match loaded_result with
   | Error (Octra_core.Circle_wasm_host.Rejected e) ->
     Lwt.return (failed_call_result e)
@@ -1488,7 +1498,7 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
                           loaded
                           circle_id
                           (public_reads_hash [])
-                          (hfhe_context_hash [] [] None)
+                          (hfhe_context_hash ~strict:hfhe_strict [] [] None)
                           [];
                     }
                 end
@@ -1498,7 +1508,7 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
               let* runtime_ctx_result =
                 if wasm_method_needs_hfhe method_name then
                   load_runtime_hfhe_ctx
-                    ~receipt_bound:(receipt_mode hfhe_mode)
+                    ~receipt_linked:(receipt_mode hfhe_mode)
                     ctx
                     store
                     circle_id
@@ -1561,6 +1571,7 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
                               ~hfhe_caps
                               ~hfhe_pubkeys
                               ~hfhe_active_key
+                              ~hfhe_strict
                               ~hfhe_mode
                               ~public_reads:public_reads.snapshots
                               ~fuel_limit:(wasm_fuel_limit wasm_limit)
@@ -1612,6 +1623,7 @@ let execute_call ?(trusted=[]) ?(ctx=ContractVM.default_ctx) ?(depth=0)
                                       circle_id
                                       (public_reads_hash public_reads.snapshots)
                                       (hfhe_context_hash
+                                         ~strict:hfhe_strict
                                          hfhe_caps
                                          hfhe_pubkeys
                                          hfhe_active_key)
@@ -1666,7 +1678,8 @@ let list_storage_page store circle_id ~limit =
   Octra_core.Store_irmin.load_circle_stable_storage_page store circle_id ~limit
 
 let commit_call_result
-    ?(deployment_profile=Octra_core.Circle_wasm_host.Standard)
+    ?(deployment_profile = Octra_core.Circle_wasm_host.Standard)
+    ~proof_mode
     store
     circle_id
     t =
@@ -1679,6 +1692,7 @@ let commit_call_result
     else begin
       match
         Circle_runtime_storage.validate_runtime_storage_delta
+          ~proof_mode
           t.baseline_storage_tbl
           t.storage_tbl
       with

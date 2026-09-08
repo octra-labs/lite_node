@@ -10,6 +10,8 @@ type lexer = {
   mutable line : int;
   mutable col : int;
   mutable depth : int;
+  mutable token_line : int;
+  mutable token_col : int;
 }
 
 exception LexError of string * int * int
@@ -21,6 +23,8 @@ let create src = {
   line = 1;
   col = 1;
   depth = 0;
+  token_line = 1;
+  token_col = 1;
 }
 
 let peek lx = if lx.pos < lx.len then Some lx.src.[lx.pos] else None
@@ -71,7 +75,7 @@ let skip_block_comment lx =
   advance lx; advance lx;
   let rec go depth =
     match peek lx with
-    | None -> err lx "unterminated block comment"
+    | None -> err lx "comment is not closed"
     | Some '*' ->
       advance lx;
       (match peek lx with
@@ -100,6 +104,7 @@ let read_string lx =
        | Some '\\' -> Buffer.add_char buf '\\'; advance lx; go ()
        | Some '"' -> Buffer.add_char buf '"'; advance lx; go ()
        | _ -> err lx "invalid escape")
+    | Some '\000' -> err lx "NUL byte is not allowed in string"
     | Some c -> Buffer.add_char buf c; advance lx; go ()
   in go ()
 
@@ -132,7 +137,7 @@ let keyword_map = [
   "true", TkTrue; "false", TkFalse;
   "int", TkTyInt; "bool", TkTyBool; "string", TkTyString;
   "address", TkTyAddress; "bytes", TkTyBytes; "bytes32", TkTyBytes32;
-  "u64", TkTyU64; "u128", TkTyU128; "u256", TkTyU256; "uint", TkTyU256;
+  "u64", TkTyU64; "u128", TkTyU128; "u256", TkTyU256; "uint", TkTyUint;
   "cipher", TkTyCipher; "pubkey", TkTyPubKey;
   "map", TkMap; "tree_hash", TkTreeHash; "node_id", TkNodeId; "tx_hash", TkTxHash;
   "for", TkFor; "in", TkIn; "list", TkTyList;
@@ -156,6 +161,8 @@ let classify_ident s =
 
 let next_token lx =
   skip_ws lx;
+  lx.token_line <- lx.line;
+  lx.token_col <- lx.col;
   match peek lx with
   | None -> TkEOF
   | Some '\n' -> advance lx; TkNewline
@@ -233,7 +240,10 @@ let next_token lx =
      | _ -> err lx "expected ||")
   | Some c ->
     if Char.code c > 127 then
-      (advance lx; err lx (Printf.sprintf "unexpected character: 0x%02X" (Char.code c)))
+      raise
+        (LexError
+          (Printf.sprintf "unexpected character: 0x%02X" (Char.code c),
+           lx.token_line, lx.token_col))
     else
       err lx (Printf.sprintf "unexpected character: %c" c)
 
@@ -267,15 +277,20 @@ let eat ts =
 let expect ts tk =
   let got = peek_token ts in
   if got <> tk then
-    err ts.lx (Printf.sprintf "expected %s, got %s"
-      (match tk with
-       | TkLBrace -> "{" | TkRBrace -> "}" | TkLParen -> "(" | TkRParen -> ")"
-       | TkLBrack -> "[" | TkRBrack -> "]" | TkColon -> ":" | TkComma -> ","
-       | TkEq -> "=" | TkDot -> "." | TkDotDot -> ".."
-       | TkIn -> "in" | TkFatArrow -> "=>" | _ -> "token")
-      (match got with
-       | TkIdent s -> s | TkIntLit z -> Z.to_string z | TkStrLit s -> "\"" ^ s ^ "\""
-       | TkEOF -> "EOF" | TkNewline -> "newline" | _ -> "token"));
+    raise
+      (LexError
+        (Printf.sprintf "expected %s, got %s"
+          (match tk with
+           | TkLBrace -> "{" | TkRBrace -> "}" | TkLParen -> "(" | TkRParen -> ")"
+           | TkLBrack -> "[" | TkRBrack -> "]" | TkColon -> ":" | TkComma -> ","
+           | TkEq -> "=" | TkDot -> "." | TkDotDot -> ".."
+           | TkIn -> "in" | TkFatArrow -> "=>" | _ -> "token")
+          (match got with
+           | TkIdent s -> s | TkIntLit z -> Z.to_string z | TkStrLit s -> "\"" ^ s ^ "\""
+           | TkEOF -> "EOF" | TkNewline -> "newline" | _ -> "token"),
+         ts.lx.token_line, ts.lx.token_col));
   eat ts
 
-let current_line ts = ts.lx.line
+let current_line ts = ts.lx.token_line
+
+let current_column ts = ts.lx.token_col

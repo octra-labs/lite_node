@@ -83,7 +83,7 @@ let validate_migration getenv profile =
   | Some root when valid_migration_root root ->
     Ok ()
   | _ ->
-    Error (profile ^ " requires migration entitlement root")
+    Error (profile ^ " requires migration admission root")
 
 let validate_validator_schedule validator_policy schedule =
   match validator_policy, schedule with
@@ -278,6 +278,13 @@ let standard_hash ~chain_id getenv =
       Octra_core.Private_transition.consensus_id;
     put_standard_component buf "circle_receipt"
       Octra_core.Circle_cell_transition.consensus_id;
+    put_standard_component buf "circle_storage"
+      Octra_circle_runtime.Circle_runtime_storage.consensus_id;
+    put_standard_component buf "circle_hfhe"
+      Octra_core.Circle_hfhe_transcript.consensus_id;
+    put_standard_component buf "integer_work" Octra_vm.Int_work.consensus_id;
+    put_standard_component buf "program_compiler" Octra_vm.Program_package.standard_id;
+    put_standard_component buf "vm_undo" "nested_commit";
     put_standard_component buf "proposal_protocol"
       (Octra_consensus.C_protocol.consensus_id getenv))
 

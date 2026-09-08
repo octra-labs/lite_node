@@ -21,8 +21,26 @@ let reserved_prefixes = [
   "ingress:";
 ]
 
+let consensus_id = "circle_storage:cell_owner:standard"
+
 let reserved_prefix key =
   List.find_opt (fun prefix -> String.starts_with ~prefix key) reserved_prefixes
+
+let cell_prefix key =
+  if String.starts_with ~prefix:"balance_cell:" key then
+    Some "balance_cell:"
+  else if String.starts_with ~prefix:"register_cell:" key then
+    Some "register_cell:"
+  else
+    None
+
+let validate_cell_change proof_mode raw_key =
+  match proof_mode, cell_prefix raw_key with
+  | Octra_core.Rule_graph.Active, Some prefix ->
+    Error ("circle_runtime_cell_write_denied", raw_key, prefix)
+  | Octra_core.Rule_graph.Active, None
+  | Octra_core.Rule_graph.Prior, _ ->
+    Ok ()
 
 let object_policy_suffix_allowed = function
   | "delivery_key_id"
@@ -153,37 +171,55 @@ let validate_runtime_storage_keys storage_tbl =
     storage_tbl
     (Ok ())
 
-let validate_runtime_storage_delta before_tbl after_tbl =
-  let seen = Hashtbl.create 64 in
+let validate_runtime_storage_delta ~proof_mode before_tbl after_tbl =
   let validate_key raw_key =
-    if Hashtbl.mem seen raw_key then
+    let before_value = Hashtbl.find_opt before_tbl raw_key in
+    let after_value = Hashtbl.find_opt after_tbl raw_key in
+    match before_value, after_value with
+    | Some before_value, Some after_value when String.equal before_value after_value ->
       Ok ()
-    else begin
-      Hashtbl.replace seen raw_key ();
-      let before_value = Hashtbl.find_opt before_tbl raw_key in
-      let after_value = Hashtbl.find_opt after_tbl raw_key in
-      match before_value, after_value with
-      | Some before_value, Some after_value when String.equal before_value after_value ->
-        Ok ()
-      | _, Some after_value ->
-        validate_runtime_key_write raw_key after_value
-      | Some _, None ->
-        validate_runtime_key_delete raw_key
-      | None, None ->
-        Ok ()
-    end
+    | _, Some after_value ->
+      begin
+        match validate_cell_change proof_mode raw_key with
+        | Error _ as e -> e
+        | Ok () -> validate_runtime_key_write raw_key after_value
+      end
+    | Some _, None ->
+      begin
+        match validate_cell_change proof_mode raw_key with
+        | Error _ as e -> e
+        | Ok () -> validate_runtime_key_delete raw_key
+      end
+    | None, None ->
+      Ok ()
   in
-  let result = ref (Ok ()) in
-  Hashtbl.iter
-    (fun raw_key _ ->
+  let keys () =
+    List.of_seq (Hashtbl.to_seq_keys before_tbl)
+    @ List.of_seq (Hashtbl.to_seq_keys after_tbl)
+    |> List.sort_uniq String.compare
+  in
+  let rec walk = function
+    | [] -> Ok ()
+    | raw_key :: rest ->
+      begin
+        match validate_key raw_key with
+        | Error _ as e -> e
+        | Ok () -> walk rest
+      end
+  in
+  match proof_mode with
+  | Octra_core.Rule_graph.Active -> walk (keys ())
+  | Octra_core.Rule_graph.Prior ->
+    let seen = Hashtbl.create 64 in
+    let result = ref (Ok ()) in
+    let visit raw_key _ =
       match !result with
       | Error _ -> ()
-      | Ok () -> result := validate_key raw_key)
-    before_tbl;
-  Hashtbl.iter
-    (fun raw_key _ ->
-      match !result with
-      | Error _ -> ()
-      | Ok () -> result := validate_key raw_key)
-    after_tbl;
-  !result
+      | Ok () when Hashtbl.mem seen raw_key -> ()
+      | Ok () ->
+        Hashtbl.replace seen raw_key ();
+        result := validate_key raw_key
+    in
+    Hashtbl.iter visit before_tbl;
+    Hashtbl.iter visit after_tbl;
+    !result

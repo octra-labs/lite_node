@@ -55,6 +55,7 @@ type live_tx_args = {
 type live_ledger_tx_args = {
   ledger : Octra_core.Ledger.t;
   field_policy : Private_ledger.field_policy;
+  strict : bool;
   legacy_replay : string -> Octra_core.Pvac_legacy_public_replay.decision;
   gate : unit -> Private_gate.reject option;
   reject_gate : Private_gate.reject -> unit Lwt.t;
@@ -146,6 +147,7 @@ let run_live_ledger_tx args tx =
       apply_tx = (fun ?legacy_public_replay tx ->
         Private_ledger.apply_key_switch
           ~field_policy:args.field_policy
+          ~strict:args.strict
           ?legacy_public_replay
           args.ledger
           tx);

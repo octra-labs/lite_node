@@ -4,6 +4,7 @@
 type result = Preverify_submit.result = {
   delta_ok : bool;
   balance_ok : bool;
+  strict : bool;
   sender_enc_snapshot : string;
 }
 
@@ -229,13 +230,14 @@ let gate ~state ~defer_count ~max_defer =
       | Pending -> Defer_gate { next_count; status = "pending" }
       | Ready | Failed _ -> Defer_gate { next_count; status = "unexpected" }
 
-let ready_result hash ~sender_enc_snapshot =
+let ready_result hash ~strict ~sender_enc_snapshot =
   match find hash with
   | Some task ->
     begin
       match Lwt.state task with
       | Lwt.Return (Checked result)
-        when String.equal result.sender_enc_snapshot sender_enc_snapshot ->
+        when Bool.equal result.strict strict
+          && String.equal result.sender_enc_snapshot sender_enc_snapshot ->
         Some result
       | _ ->
         None

@@ -17,7 +17,7 @@ let max_u64 = Z.of_string "18446744073709551615"
 let max_u128 = Z.sub (Z.shift_left Z.one 128) Z.one
 let max_u256 = Z.sub (Z.shift_left Z.one 256) Z.one
 
-let bounded max make value =
+let within max make value =
   if Z.sign value >= 0 && Z.compare value max <= 0 then Some (make value)
   else None
 
@@ -49,11 +49,11 @@ let value kind json =
   | Program_type_flow.Bytes32, `String value ->
     Option.map (fun raw -> Contract_vm.VBytes32 raw) (raw_bytes32 value)
   | Program_type_flow.U64, (`Int _ | `Intlit _) ->
-    Option.map (fun v -> Contract_vm.VU64 v) (Option.bind (json_z json) (bounded max_u64 Fun.id))
+    Option.map (fun v -> Contract_vm.VU64 v) (Option.bind (json_z json) (within max_u64 Fun.id))
   | Program_type_flow.U128, (`Int _ | `Intlit _) ->
-    Option.map (fun v -> Contract_vm.VU128 v) (Option.bind (json_z json) (bounded max_u128 Fun.id))
+    Option.map (fun v -> Contract_vm.VU128 v) (Option.bind (json_z json) (within max_u128 Fun.id))
   | Program_type_flow.U256, (`Int _ | `Intlit _) ->
-    Option.map (fun v -> Contract_vm.VU256 v) (Option.bind (json_z json) (bounded max_u256 Fun.id))
+    Option.map (fun v -> Contract_vm.VU256 v) (Option.bind (json_z json) (within max_u256 Fun.id))
   | Program_type_flow.Addr, `String value when valid_addr value ->
     Some (Contract_vm.VAddr value)
   | Program_type_flow.Cipher, _
@@ -76,6 +76,7 @@ let kind_of_value = function
   | Contract_vm.VAddr _ -> Some Program_type_flow.Addr
   | Contract_vm.VCipher _ -> Some Program_type_flow.Cipher
   | Contract_vm.VPubKey _ -> Some Program_type_flow.PubKey
+  | Contract_vm.VCap _ -> None
 
 let validate kinds values =
   if List.length kinds <> List.length values then Error Invalid_count

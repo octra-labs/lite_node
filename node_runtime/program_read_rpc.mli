@@ -7,6 +7,12 @@ type 'handler dispatch_adapters = {
   store_label_read :
     (store:Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result) ->
     'handler;
+  store_chaindata_read :
+    (store:Octra_core.Store_irmin.t ->
+     chaindata:Octra_core.Store_chaindata.t ->
+     Yojson.Safe.t ->
+     rpc_result) ->
+    'handler;
   chaindata_read :
     (chaindata:Octra_core.Store_chaindata.t -> Yojson.Safe.t -> rpc_result) ->
     'handler;
@@ -15,6 +21,9 @@ type 'handler dispatch_adapters = {
     'handler;
   json0_read :
     (json:Yojson.Safe.t option -> rpc_result) ->
+    'handler;
+  compile_read :
+    (point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
     'handler;
   program_info : 'handler;
   program_list : 'handler;

@@ -443,6 +443,33 @@ let () =
   let pack_plan = account_pack_activation seed in
   require (pack_plan.activation_epoch = 1_480_000)
     "account pack activation epoch changed";
+  let pack_graph =
+    graph (fun epoch ->
+      if epoch = pack_plan.anchor_epoch then
+        Graph.Root pack_plan.anchor_state_root
+      else
+        Graph.Missing)
+  in
+  require
+    (Graph.account_pack
+       pack_graph
+       ~epoch:(pack_plan.activation_epoch - 1)
+     = Ok Graph.Prior)
+    "account pack changed before activation";
+  require
+    (Graph.account_pack
+       pack_graph
+       ~epoch:pack_plan.activation_epoch
+     = Ok Graph.Active)
+    "account pack inactive at activation";
+  require
+    (match Graph.account_pack missing ~epoch:pack_plan.activation_epoch with
+     | Error (Graph.Anchor_missing epoch) -> epoch = pack_plan.anchor_epoch
+     | _ -> false)
+    "account pack accepted without anchor";
+  require
+    (Graph.account_pack unrelated ~epoch:max_int = Ok Graph.Prior)
+    "unrelated network activated devnet account pack";
   require (standard_plan.activation_epoch = 1_500_000)
     "standard activation epoch changed";
   let standard_graph =
@@ -553,8 +580,5 @@ let () =
   require
     (Graph.private_payload mainnet ~epoch:max_int = Ok Graph.Active)
     "new mainnet did not require strict private payloads at genesis";
-  Printf.printf "rule_graph_before = 1\n";
-  Printf.printf "rule_graph_boundary = 1\n";
-  Printf.printf "rule_graph_after = 1\n";
-  Printf.printf "rule_graph_mixed = 1\n";
-  Printf.printf "PASS\n%!"
+  Printf.printf
+    "rule_graph_before = 1\nrule_graph_boundary = 1\nrule_graph_after = 1\nrule_graph_mixed = 1\nPASS\n%!"

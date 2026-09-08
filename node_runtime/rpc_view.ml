@@ -306,7 +306,7 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
   ]
 
 let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
-    ~gc_enabled ~gc_running =
+    ~gc_enabled ~gc_running ~gc_need =
   `Assoc [
     "count", `Int count;
     "min_epoch", `Int min_epoch;
@@ -315,6 +315,8 @@ let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
     "split_epoch", (match split_epoch with Some epoch -> `Int epoch | None -> `Null);
     "pack_gc_enabled", `Bool gc_enabled;
     "pack_gc_running", `Bool gc_running;
+    "pack_gc_need_bytes",
+      (match gc_need with Some value -> `String (Int64.to_string value) | None -> `Null);
   ]
 
 let balance ~addr ~account ~pending_nonce =
@@ -470,12 +472,12 @@ let pvac_status ~addr (status : Pvac_registry.status) =
   ]
 
 let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
-    (status : Pvac_migration.status) entitlements =
-  let entitlement =
+    (status : Pvac_migration.status) admissions =
+  let admission =
     if Pvac_migration.needs_history_migration status then
       Some
-        (Octra_core.Pvac_migration_entitlement.find
-           entitlements
+        (Octra_core.Pvac_migration_admission.find
+           admissions
            ~epoch
            ~address:addr
            ~cipher)
@@ -483,18 +485,18 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
       None
   in
   let can_owner_proof_migrate =
-    match owner_migration_mode, status.cipher_class, status.key_class, entitlement with
+    match owner_migration_mode, status.cipher_class, status.key_class, admission with
     | Rule_graph.Active, Pvac_migration.V3, Pvac_migration.Historical,
       Some (Ok entry)
       when
-        entry.Octra_core.Pvac_migration_entitlement.decision.audit_class
+        entry.Octra_core.Pvac_migration_admission.decision.audit_class
         <> Pvac_legacy_public_replay.Poisoned
         && Option.is_some entry.decision.commitment_net ->
       true
     | _ -> false
   in
   let replay_json =
-    match entitlement with
+    match admission with
     | None -> `Null
     | Some result ->
       match result with
@@ -511,7 +513,7 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
           "reason", `String reason;
         ]
       | Ok entry ->
-        let decision = entry.Octra_core.Pvac_migration_entitlement.decision in
+        let decision = entry.Octra_core.Pvac_migration_admission.decision in
         `Assoc [
           "total", `Int entry.total;
           "scanned", `Int entry.total;
@@ -557,19 +559,19 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
     "needs_legacy_public_replay", `Bool (Pvac_migration.needs_history_migration status);
     "reason", `String status.reason;
     "entitlement_root",
-      (match Octra_core.Pvac_migration_entitlement.root entitlements with
+      (match Octra_core.Pvac_migration_admission.root admissions with
        | None -> `Null
        | Some value -> `String value);
     "entitlement_activation_epoch",
-      (match Octra_core.Pvac_migration_entitlement.activation_epoch entitlements with
+      (match Octra_core.Pvac_migration_admission.activation_epoch admissions with
        | None -> `Null
        | Some value -> `Int value);
     "entitlement_snapshot_epoch",
-      (match Octra_core.Pvac_migration_entitlement.snapshot_epoch entitlements with
+      (match Octra_core.Pvac_migration_admission.snapshot_epoch admissions with
        | None -> `Null
        | Some value -> `Int value);
     "entitlement_state_root",
-      (match Octra_core.Pvac_migration_entitlement.state_root entitlements with
+      (match Octra_core.Pvac_migration_admission.state_root admissions with
        | None -> `Null
        | Some value -> `String value);
     "legacy_public_replay", replay_json;

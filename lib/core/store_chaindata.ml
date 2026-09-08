@@ -18,6 +18,14 @@ type token_rows_page = {
   incomplete : bool;
 }
 
+type program_record = {
+  source : string;
+  abi : string;
+  report : string option;
+  certificate : string option;
+  code_hash : string;
+}
+
 let max_txlog_record_len = 128_000_000
 let rebuild_tx_batch = 50_000
 let rebuild_epoch_batch = 10_000
@@ -134,7 +142,7 @@ let rec mkdir_p path =
     (try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
   end
 
-let open_chaindata ?(readonly=false) base_dir =
+let open_chaindata ?(readonly = false) base_dir =
   if not readonly then mkdir_p base_dir;
   let txlog_dir = Filename.concat base_dir "txlog" in
   let epochlog_path = Filename.concat (Filename.concat base_dir "epochlog") "epochs.dat" in
@@ -156,6 +164,116 @@ let open_chaindata ?(readonly=false) base_dir =
     rejected_rows_page_cache = Hashtbl.create 128;
     token_rows_page_cache = Hashtbl.create 128;
   }
+
+let program_record_legacy_key address =
+  "program_record:" ^ address
+
+let program_record_key address code_hash =
+  program_record_legacy_key address ^ ":" ^ code_hash
+
+let program_record_json record =
+  Yojson.Safe.to_string
+    (`Assoc [
+      "version", `Int 1;
+      "source", `String record.source;
+      "abi", `String record.abi;
+      "report",
+        (match record.report with
+         | Some value -> `String value
+         | None -> `Null);
+      "certificate",
+        (match record.certificate with
+         | Some value -> `String value
+         | None -> `Null);
+      "code_hash", `String record.code_hash;
+    ])
+
+let record_text fields name =
+  match List.assoc_opt name fields with
+  | Some (`String value) -> value
+  | _ -> invalid_arg ("program record field is invalid name = " ^ name)
+
+let record_text_opt fields name =
+  match List.assoc_opt name fields with
+  | Some (`String value) -> Some value
+  | Some `Null -> None
+  | _ -> invalid_arg ("program record field is invalid name = " ^ name)
+
+let valid_program_hash code_hash =
+  String.length code_hash = 64
+  && String.for_all Circles.is_hex_char code_hash
+
+let program_record_of_json raw =
+  try
+    match Yojson.Safe.from_string raw with
+    | `Assoc fields ->
+      begin
+        match List.assoc_opt "version" fields with
+        | Some (`Int 1) ->
+          let code_hash = record_text fields "code_hash" in
+          if not (valid_program_hash code_hash) then
+            Error "program record hash is invalid"
+          else
+            Ok {
+              source = record_text fields "source";
+              abi = record_text fields "abi";
+              report = record_text_opt fields "report";
+              certificate = record_text_opt fields "certificate";
+              code_hash;
+            }
+        | _ -> Error "program record version is invalid"
+      end
+    | _ -> Error "program record is invalid"
+  with
+  | Invalid_argument reason -> Error reason
+  | Yojson.Json_error _ -> Error "program record JSON is invalid"
+
+let matching_program_record code_hash raw =
+  match program_record_of_json raw with
+  | Error reason -> Error reason
+  | Ok record when String.equal record.code_hash code_hash -> Ok (Some record)
+  | Ok _ -> Ok None
+
+let get_program_record t ~address ~code_hash =
+  match
+    Chaindata_index.get_meta t.index (program_record_key address code_hash)
+  with
+  | Some raw -> matching_program_record code_hash raw
+  | None ->
+    begin
+      match
+        Chaindata_index.get_meta t.index (program_record_legacy_key address)
+      with
+      | None -> Ok None
+      | Some raw -> matching_program_record code_hash raw
+    end
+
+let same_program_record left right =
+  String.equal left.source right.source
+  && String.equal left.abi right.abi
+  && Option.equal String.equal left.report right.report
+  && Option.equal String.equal left.certificate right.certificate
+  && String.equal left.code_hash right.code_hash
+
+let save_program_record t address record =
+  if not (Crypto.is_octra_address address) then
+    Error "program record address is invalid"
+  else if not (valid_program_hash record.code_hash) then
+    Error "program record hash is invalid"
+  else
+    try
+      Chaindata_index.set_meta_direct
+        t.index
+        (program_record_key address record.code_hash)
+        (program_record_json record);
+      Chaindata_index.sync t.index;
+      match get_program_record t ~address ~code_hash:record.code_hash with
+      | Ok (Some stored) when same_program_record stored record -> Ok ()
+      | Ok (Some _) -> Error "program record read differs"
+      | Ok None -> Error "program record is absent after write"
+      | Error reason -> Error reason
+    with exn ->
+      Error ("program record write failed reason = " ^ Printexc.to_string exn)
 
 let close t =
   Txlog.close t.txlog;

@@ -5,6 +5,17 @@ val client_progress_body_cap : int
 
 val chunk_read_limit : string option -> int
 
+val manifest_epoch_limit : int64
+
+val snapshot_epoch_state :
+  current_epoch:int64 ->
+  snapshot_epoch:int64 ->
+  [ `Old_epoch of int64 | `Ready of int64 ]
+
+val committed_epoch :
+  int ref ->
+  int64
+
 val certificate_path :
   data_dir:string ->
   string
@@ -30,6 +41,7 @@ val handle_manifest :
   chain_id:string ->
   config_hash:string ->
   validator_set:Octra_consensus.C_types.validator_set ->
+  current_epoch:int ref ->
   (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
 
 val handle_head :

@@ -4,5 +4,6 @@
 val admit :
   store:Octra_core.Store_irmin.t ->
   program_trust:Octra_vm.Program_trust.t ->
+  point_ops:bool ->
   Octra_core.Transaction.t ->
   (unit, string * string) result Lwt.t

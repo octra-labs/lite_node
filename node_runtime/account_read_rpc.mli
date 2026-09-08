@@ -77,7 +77,7 @@ val pvac_status :
 val pvac_migration_status :
   Pvac_status_actor.t ->
   Octra_core.Store_irmin.t ->
-  Octra_core.Pvac_migration_entitlement.t ->
+  Octra_core.Pvac_migration_admission.t ->
   epoch:int ->
   owner_migration_mode:Octra_core.Rule_graph.mode ->
   addr:string ->

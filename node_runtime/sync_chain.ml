@@ -214,8 +214,9 @@ type bridge_failure =
   | Bridge_unavailable
   | Bridge_invalid of string
 
-let bridge_range ~head_epoch ~after_epoch ~through_epoch ~activate_epoch =
+let bridge_range ~head_epoch ~after_epoch ~before_epoch ~activate_epoch =
   if Int64.compare head_epoch 0L <= 0
+     || Int64.compare before_epoch 0L <= 0
      || Int64.equal after_epoch Int64.max_int then
     None
   else
@@ -225,7 +226,9 @@ let bridge_range ~head_epoch ~after_epoch ~through_epoch ~activate_epoch =
         (Int64.succ after_epoch)
         (Int64.max activate_epoch (Int64.sub head_epoch span))
     in
-    let ceiling = Int64.min through_epoch (Int64.pred head_epoch) in
+    let ceiling =
+      Int64.min (Int64.pred before_epoch) (Int64.pred head_epoch)
+    in
     if Int64.compare ceiling floor < 0 then None else Some (floor, ceiling)
 
 let bridge_step_at deps ~validator_set raw epoch =
@@ -252,7 +255,7 @@ let bridge_step_at deps ~validator_set raw epoch =
               proof = proof.proof;
             })
 
-let bridge_step deps ~head_epoch ~after_epoch ~through_epoch ~validator_set raw
+let bridge_step deps ~head_epoch ~after_epoch ~before_epoch ~validator_set raw
     update =
   if Int64.equal after_epoch Int64.max_int then
     Lwt.return_error
@@ -265,7 +268,7 @@ let bridge_step deps ~head_epoch ~after_epoch ~through_epoch ~validator_set raw
       bridge_range
         ~head_epoch
         ~after_epoch
-        ~through_epoch
+        ~before_epoch
         ~activate_epoch:update.Update.activate_epoch
     with
     | None -> Lwt.return_error Bridge_unavailable
@@ -292,7 +295,7 @@ let prior_update deps update =
       Lwt.return_ok value
 
 let walk deps ~head_epoch ~base ~stop raw =
-  let rec loop depth seen through_epoch raw =
+  let rec loop depth seen before_epoch raw =
     if depth >= 1_024 then
       Lwt.return_error "state sync validator transition chain is too long"
     else
@@ -335,11 +338,11 @@ let walk deps ~head_epoch ~base ~stop raw =
                               begin
                                 match transition_epoch item with
                                 | Error reason -> Lwt.return_error reason
-                                | Ok (prior_through, _) ->
+                                | Ok (prior_before, _) ->
                                     loop
                                       (depth + 1)
                                       (S.add digest seen)
-                                      prior_through
+                                      prior_before
                                       prior_raw
                               end
                         end
@@ -365,7 +368,7 @@ let walk deps ~head_epoch ~base ~stop raw =
                     deps
                     ~head_epoch
                     ~after_epoch:prior.epoch
-                    ~through_epoch
+                    ~before_epoch
                     ~validator_set:prior.validator_set
                     raw
                     item >>= function
@@ -387,7 +390,7 @@ let walk deps ~head_epoch ~base ~stop raw =
                   deps
                   ~head_epoch
                   ~after_epoch:stop.epoch
-                  ~through_epoch
+                  ~before_epoch
                   ~validator_set:stop.validator_set
                   raw
                   item >>= function
@@ -398,7 +401,7 @@ let walk deps ~head_epoch ~base ~stop raw =
   if Int64.compare head_epoch 0L <= 0 then
     Lwt.return_error "state sync checkpoint epoch is invalid"
   else
-    loop 0 S.empty (Int64.pred head_epoch) raw
+    loop 0 S.empty head_epoch raw
 
 let build deps ~head_epoch trusted active =
   match Anchor.raw_validator_set trusted with

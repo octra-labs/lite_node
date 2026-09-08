@@ -33,6 +33,7 @@ type deps = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   wallet : Octra_core.Crypto.Wallet.t;
+  force_publish : bool;
   config_hash : unit -> (string, string) result;
   trusted_validator_set : unit -> (C_types.validator_set, string) result;
   head : unit -> Head.t option;
@@ -121,6 +122,12 @@ let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
   let finality_hash = C_config.validator_set_hash record.validator_set in
   if active_hash <> finality_hash then
     Error "state sync finality validator set is not active"
+  else if List.length steps > Anchor.max_steps then
+    Error
+      (Printf.sprintf
+         "state sync validator chain exceeds limit steps = %d limit = %d"
+         (List.length steps)
+         Anchor.max_steps)
   else if Int64.compare epoch (Int64.of_int max_int) >= 0 then
     Error "state sync finalized epoch exceeds platform limit"
   else if head.Head.epoch_id <> Int64.to_int epoch then
@@ -197,16 +204,23 @@ let retention_plan ~retain ~current snapshots =
   |> List.filter_map (fun (id, _) ->
     if List.mem id kept then None else Some id)
 
+let lstat path =
+  try Some (Unix.lstat path) with
+  | Unix.Unix_error (Unix.ENOENT, _, _) -> None
+
 let rec remove_tree path =
-  if Sys.file_exists path then
-    match (Unix.lstat path).Unix.st_kind with
-    | Unix.S_DIR ->
-        Sys.readdir path
-        |> Array.iter (fun name ->
-          if name <> "." && name <> ".." then
-            remove_tree (Filename.concat path name));
-        Unix.rmdir path
-    | _ -> Unix.unlink path
+  match lstat path with
+  | None -> ()
+  | Some stat ->
+      match stat.Unix.st_kind with
+      | Unix.S_DIR ->
+          Unix.chmod path (stat.Unix.st_perm lor 0o700);
+          Sys.readdir path
+          |> Array.iter (fun name ->
+            if name <> "." && name <> ".." then
+              remove_tree (Filename.concat path name));
+          Unix.rmdir path
+      | _ -> Unix.unlink path
 
 let remove_snapshots root ids =
   ids
@@ -298,6 +312,20 @@ let exporter_wallet ~force exporter_set wallet =
   | Some _ -> Error "state sync exporter wallet public key differs"
   | None -> Error "state sync exporter wallet is not configured"
 
+let publisher_current deps ~force expected =
+  match deps.exporter_set () with
+  | Error _ as error -> error
+  | Ok current ->
+      begin
+        match exporter_wallet ~force current deps.wallet with
+        | Error _ as error -> error
+        | Ok ()
+          when C_config.validator_set_hash current
+               <> C_config.validator_set_hash expected ->
+            Error "state sync exporter set changed"
+        | Ok () -> Ok ()
+      end
+
 let build_draft prepared target =
   Lwt_preemptive.detach
     (fun () ->
@@ -311,6 +339,39 @@ let clear_stage target =
   Lwt_preemptive.detach
     (fun () -> remove_tree (target ^ ".next"))
     ()
+
+let stage_bytes target =
+  let path = Filename.concat (target ^ ".next") "ledger.dat" in
+  try (Unix.LargeFile.stat path).Unix.LargeFile.st_size with
+  | Unix.Unix_error _ -> 0L
+
+let monitor_capture deps prepared target capture =
+  let completed = capture >|= fun result -> `Completed result in
+  let rec loop prior quiet =
+    Lwt.pick [
+      Lwt.protected completed;
+      (deps.sleep 60. >|= fun () -> `Progress);
+    ] >>= function
+    | `Completed result -> Lwt.return result
+    | `Progress ->
+        let bytes = stage_bytes target in
+        let quiet = if Int64.compare bytes prior > 0 then 0 else quiet + 1 in
+        deps.info
+          (Printf.sprintf
+             "event = sync_capture_progress epoch = %Ld bytes = %Ld quiet_intervals = %d"
+             prepared.checkpoint.epoch
+             bytes
+             quiet);
+        if quiet > 0 && quiet mod 10 = 0 then
+          deps.warn
+            (Printf.sprintf
+               "event = sync_capture_no_progress epoch = %Ld bytes = %Ld seconds = %d"
+               prepared.checkpoint.epoch
+               bytes
+               (quiet * 60));
+        loop bytes quiet
+  in
+  loop 0L 0
 
 let write_certificate path certificate =
   Lwt_preemptive.detach
@@ -340,7 +401,7 @@ let published_manifest_hash deps checkpoint_hash =
   | Ok _
   | Error _ -> None
 
-let publish deps exporter_set prepared =
+let publish deps ~force exporter_set prepared =
   let target = State_sync.snapshot_dir deps.data_dir prepared.checkpoint_hash in
   deps.info
     (Printf.sprintf
@@ -370,14 +431,18 @@ let publish deps exporter_set prepared =
       in
       let fresh () =
         clear_stage target >>= fun () ->
-        Capture.build
-          Capture.{
-            data_dir = deps.data_dir;
-            head = prepared.head;
-            store = deps.store;
-            roots = prepared.roots;
-          }
-          ~target >>= function
+        monitor_capture
+          deps
+          prepared
+          target
+          (Capture.build
+             Capture.{
+               data_dir = deps.data_dir;
+               head = prepared.head;
+               store = deps.store;
+               roots = prepared.roots;
+             }
+             ~target) >>= function
         | Error reason -> Lwt.return_error reason
         | Ok report ->
             build_draft prepared target >|= function
@@ -400,40 +465,46 @@ let publish deps exporter_set prepared =
             | Error reason -> Lwt.return_error reason
             | Ok () ->
               begin
-                match Manifest.make_exporter_signature
-                  ~wallet:deps.wallet
-                  draft.manifest with
+                match publisher_current deps ~force exporter_set with
                 | Error reason -> Lwt.return_error reason
-                | Ok exporter_signature ->
-                    let certificate = Manifest.{
-                      checkpoint = prepared.checkpoint;
-                      checkpoint_hash = prepared.checkpoint_hash;
-                      authority = Finalized (Anchor.encode prepared.anchor);
-                      manifest = draft.manifest;
-                      manifest_hash = draft.manifest_hash;
-                      exporter_signatures = [exporter_signature];
-                    } in
+                | Ok () ->
                     begin
-                      match Manifest.verify_certificate
-                        ~validator_set:prepared.trusted_validator_set
-                        ~exporter_set
-                        certificate with
+                      match Manifest.make_exporter_signature
+                        ~wallet:deps.wallet
+                        draft.manifest with
                       | Error reason -> Lwt.return_error reason
-                      | Ok verified ->
-                          archive_current deps >>= fun () ->
-                          write_certificate
-                            (snapshot_certificate_path deps verified)
-                            verified >>= fun () ->
-                          write_certificate (deps.certificate_path ()) verified
-                          >>= fun () ->
-                          deps.info
-                            (Printf.sprintf
-                               "event = sync_published epoch = %Ld checkpoint = %s files = %d bytes = %Ld"
-                               verified.checkpoint.epoch
-                               verified.checkpoint_hash
-                               files
-                               bytes);
-                          Lwt.return_ok verified.manifest.snapshot_id
+                      | Ok exporter_signature ->
+                          let certificate = Manifest.{
+                            checkpoint = prepared.checkpoint;
+                            checkpoint_hash = prepared.checkpoint_hash;
+                            authority = Finalized (Anchor.encode prepared.anchor);
+                            manifest = draft.manifest;
+                            manifest_hash = draft.manifest_hash;
+                            exporter_signatures = [exporter_signature];
+                          } in
+                          begin
+                            match Manifest.verify_certificate
+                              ~validator_set:prepared.trusted_validator_set
+                              ~exporter_set
+                              certificate with
+                            | Error reason -> Lwt.return_error reason
+                            | Ok verified ->
+                                archive_current deps >>= fun () ->
+                                write_certificate
+                                  (snapshot_certificate_path deps verified)
+                                  verified >>= fun () ->
+                                write_certificate
+                                  (deps.certificate_path ())
+                                  verified >>= fun () ->
+                                deps.info
+                                  (Printf.sprintf
+                                     "event = sync_published epoch = %Ld checkpoint = %s files = %d bytes = %Ld"
+                                     verified.checkpoint.epoch
+                                     verified.checkpoint_hash
+                                     files
+                                     bytes);
+                                Lwt.return_ok verified.checkpoint.epoch
+                          end
                     end
               end
           end)
@@ -465,22 +536,50 @@ let load_published deps exporter_set =
                   deps.data_dir
                   certificate.manifest.snapshot_id
               in
+              let started = deps.now () in
+              deps.info
+                (Printf.sprintf
+                   "event = sync_snapshot_check status = started epoch = %Ld snapshot = %s"
+                   certificate.checkpoint.epoch
+                   certificate.manifest.snapshot_id);
               Lwt_preemptive.detach
                 (fun () ->
-                  if not (Sys.file_exists target) then None
-                  else
-                    match
-                      Manifest.build
-                        ~checkpoint:certificate.checkpoint
-                        ~source_dir:target
-                        ~chunk_size:certificate.manifest.chunk_size
-                    with
-                    | Error _ -> None
-                    | Ok draft
-                      when draft.manifest_hash = certificate.manifest_hash ->
-                        Some certificate.checkpoint.epoch
-                    | Ok _ -> None)
-                ()
+                  try
+                    if not (Sys.file_exists target) then
+                      Error "state sync snapshot directory is missing"
+                    else
+                      match
+                        Manifest.build
+                          ~checkpoint:certificate.checkpoint
+                          ~source_dir:target
+                          ~chunk_size:certificate.manifest.chunk_size
+                      with
+                      | Error reason -> Error reason
+                      | Ok draft
+                        when draft.manifest_hash = certificate.manifest_hash ->
+                          Ok certificate.checkpoint.epoch
+                      | Ok _ -> Error "state sync snapshot manifest hash differs"
+                  with exn -> Error (Printexc.to_string exn))
+                () >>= fun checked ->
+              let elapsed = max 0. (deps.now () -. started) in
+              begin
+                match checked with
+                | Ok epoch ->
+                    deps.info
+                      (Printf.sprintf
+                         "event = sync_snapshot_check status = complete epoch = %Ld elapsed_seconds = %.1f"
+                         epoch
+                         elapsed);
+                    Lwt.return_some epoch
+                | Error reason ->
+                    deps.warn
+                      (Printf.sprintf
+                         "event = sync_snapshot_check status = failed epoch = %Ld elapsed_seconds = %.1f reason = %s"
+                         certificate.checkpoint.epoch
+                         elapsed
+                         reason);
+                    Lwt.return_none
+              end
         end
     | _ -> Lwt.return_none
 
@@ -587,31 +686,41 @@ let capture_epochs ~target = function
       if Int64.compare latest target > 0 then [latest; target] else [target]
   | None -> [target]
 
-let capture deps exporter_set target =
+let capture deps ~force exporter_set target =
   let rec loop last = function
     | [] ->
         Lwt.return_error
           (Option.value ~default:"state sync HEAD is missing" last)
     | epoch :: rest ->
         read_prepared deps epoch >>= function
-        | Ok prepared -> publish deps exporter_set prepared
+        | Ok prepared -> publish deps ~force exporter_set prepared
         | Error reason -> loop (Some reason) rest
   in
   loop None (capture_epochs ~target (deps.head ()))
 
-let rec perform deps exporter_set state effects =
+let rec perform deps ~force exporter_set state effects =
   match effects with
   | [] -> Lwt.return state
   | Cycle.Capture epoch :: rest ->
-      capture deps exporter_set epoch >>= fun result ->
+      let started = deps.now () in
+      capture deps ~force exporter_set epoch >>= fun result ->
+      let elapsed = max 0. (deps.now () -. started) in
       let outcome =
         match result with
-        | Ok _ -> Cycle.Published
+        | Ok published_epoch ->
+            deps.info
+              (Printf.sprintf
+                 "event = sync_capture_complete target_epoch = %Ld published_epoch = %Ld elapsed_seconds = %.1f"
+                 epoch
+                 published_epoch
+                 elapsed);
+            Cycle.Published published_epoch
         | Error reason ->
             deps.warn
               (Printf.sprintf
-                 "event = sync_capture_failed epoch = %Ld reason = %s"
+                 "event = sync_capture_failed epoch = %Ld elapsed_seconds = %.1f reason = %s"
                  epoch
+                 elapsed
                  reason);
             Cycle.Failed
       in
@@ -621,12 +730,12 @@ let rec perform deps exporter_set state effects =
             deps.warn ("event = sync_cycle_failed reason = " ^ reason);
             Lwt.return state
         | Ok (next, completed) ->
-            perform deps exporter_set next (rest @ completed)
+            perform deps ~force exporter_set next (rest @ completed)
       end
   | Cycle.Retain count :: rest ->
       begin
         match Cycle.published state with
-        | None -> perform deps exporter_set state rest
+        | None -> perform deps ~force exporter_set state rest
         | Some _ ->
             let current =
               match Manifest.load_certificate (deps.certificate_path ()) with
@@ -648,66 +757,98 @@ let rec perform deps exporter_set state effects =
                   ("event = sync_retention_failed reason = "
                    ^ Printexc.to_string exn);
                 Lwt.return_unit) >>= fun () ->
-            perform deps exporter_set state rest
+            perform deps ~force exporter_set state rest
       end
 
-let rec dormant deps =
-  deps.sleep 3_600. >>= fun () -> dormant deps
-
-let run_loop deps exporter_set initial =
+let run_loop deps ~force exporter_set initial =
   let rec loop state =
-    Lwt.catch
-      (fun () ->
-        match deps.head () with
-        | None -> Lwt.return state
-        | Some head ->
-            begin
-              match Cycle.step
-                Cycle.default
-                state
-                (Cycle.Finalized (Int64.of_int head.Head.epoch_id)) with
-              | Error reason ->
-                  deps.warn ("event = sync_cycle_failed reason = " ^ reason);
-                  Lwt.return state
-              | Ok (next, effects) -> perform deps exporter_set next effects
-            end)
-      (fun exn ->
-        deps.warn
-          ("event = sync_loop_failed reason = " ^ Printexc.to_string exn);
-        Lwt.return state) >>= fun next ->
-    deps.sleep 15. >>= fun () ->
-    loop next
+    match publisher_current deps ~force exporter_set with
+    | Error reason ->
+        deps.info ("event = sync_cycle_role_changed reason = " ^ reason);
+        Lwt.return_unit
+    | Ok () ->
+        Lwt.catch
+          (fun () ->
+            match deps.head () with
+            | None -> Lwt.return state
+            | Some head ->
+                begin
+                  match Cycle.step
+                    Cycle.default
+                    state
+                    (Cycle.Finalized (Int64.of_int head.Head.epoch_id)) with
+                  | Error reason ->
+                      deps.warn ("event = sync_cycle_failed reason = " ^ reason);
+                      Lwt.return state
+                  | Ok (next, effects) ->
+                      perform deps ~force exporter_set next effects
+                end)
+          (fun exn ->
+            deps.warn
+              ("event = sync_loop_failed reason = " ^ Printexc.to_string exn);
+            Lwt.return state) >>= fun next ->
+        deps.sleep 15. >>= fun () ->
+        loop next
   in
   loop initial
 
-let run deps =
+let role_retry_seconds = 60.
+
+let rec run deps =
+  let retry log event reason =
+    log
+      (Printf.sprintf
+         "event = %s reason = %s retry_seconds = %.0f"
+         event
+         reason
+         role_retry_seconds);
+    deps.sleep role_retry_seconds >>= fun () -> run deps
+  in
   match publisher_override (Sys.getenv_opt "OCTRA_STATE_SYNC_FORCE_PUBLISH") with
   | Error reason ->
-      deps.warn ("event = sync_disabled reason = " ^ reason);
-      dormant deps
-  | Ok force ->
+      retry deps.warn "sync_disabled" reason
+  | Ok configured_force ->
+      let force = deps.force_publish || configured_force in
       begin
         match deps.exporter_set () with
         | Error reason ->
-            deps.warn ("event = sync_disabled reason = " ^ reason);
-            dormant deps
+            retry deps.warn "sync_disabled" reason
         | Ok exporter_set ->
             begin
               match exporter_wallet ~force exporter_set deps.wallet with
               | Error reason ->
-                  deps.info ("event = sync_cycle_dormant reason = " ^ reason);
-                  dormant deps
+                  let selected =
+                    publisher_addresses exporter_set
+                    |> String.concat ","
+                  in
+                  retry
+                    deps.info
+                    "sync_cycle_dormant"
+                    (Printf.sprintf
+                       "%s wallet = %s selected = %s forced = %b"
+                       reason
+                       deps.wallet.address
+                       selected
+                       force)
               | Ok () ->
+                  deps.info
+                    (Printf.sprintf
+                       "event = sync_cycle_check wallet = %s forced = %b"
+                       deps.wallet.address
+                       force);
                   load_published deps exporter_set >>= fun published ->
                   deps.info
                     (Printf.sprintf
-                       "event = sync_cycle_started published = %s interval_epochs = %Ld retain = %d"
+                       "event = sync_cycle_started published = %s interval_epochs = %Ld retain = %d forced = %b"
                        (Option.fold
                           ~none:"none"
                           ~some:Int64.to_string
                           published)
                        (Cycle.interval Cycle.default)
-                       (Cycle.retention Cycle.default));
-                  run_loop deps exporter_set (Cycle.init ~published)
+                       (Cycle.retention Cycle.default)
+                       force);
+                  run_loop deps ~force exporter_set (Cycle.init ~published)
+                  >>= fun () ->
+                  run deps
             end
       end

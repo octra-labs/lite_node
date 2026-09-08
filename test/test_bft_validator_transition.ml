@@ -574,6 +574,57 @@ let check_fold_event_binds_finalized_parent () =
     (Driver.fold_event driver { finalize with parent_commit = None } = None)
     "missing finalized parent produced fold event"
 
+let check_strict_quorum_history () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let make address byte =
+    C_types.{ address; pubkey = String.make 32 byte }
+  in
+  let a = make "octAAAA" '\x01' in
+  let b = make "octBBBB" '\x02' in
+  let c = make "octCCCC" '\x03' in
+  let d = make "octDDDD" '\x04' in
+  let validator_set =
+    C_types.make_weighted_validator_set [
+      a, Z.of_int 100;
+      b, Z.one;
+      c, Z.one;
+      d, Z.one;
+    ]
+    |> Result.get_ok
+  in
+  let verdict epoch_id =
+    let header = header ~chain_id ~epoch_id ~creator_addr:a.address in
+    let proposal_id = C_hash.proposal_id header in
+    let vote = C_types.{
+      chain_id;
+      epoch_id;
+      round = 0;
+      vote_type = Precommit;
+      proposal_id;
+      validator = a.address;
+      signature = String.make 64 '\x05';
+    } in
+    C_qc.validate_certificate_with_policy
+      ~strict_quorum:true
+      ~chain_id
+      ~validator_set
+      ~verify_vote:(fun _ -> true)
+      C_types.{
+        chain_id;
+        epoch_id;
+        commit_round = 0;
+        header;
+        proposal_id;
+        precommits = [vote];
+      }
+  in
+  assert_msg
+    (verdict 1_000_000L = C_qc.Valid)
+    "strict validation changed historical weighted quorum";
+  assert_msg
+    (verdict 1_400_000L = C_qc.Invalid "quorum")
+    "strict validation skipped active signer floor"
+
 let () =
   check_future_validator_engine_boundary ();
   check_profile_offer ();
@@ -583,4 +634,5 @@ let () =
   check_start_height_activates_target_set ();
   check_marked_set_repairs_runtime ();
   check_fold_event_binds_finalized_parent ();
+  check_strict_quorum_history ();
   Printf.printf "status = pass test = bft_validator_transition\n%!"

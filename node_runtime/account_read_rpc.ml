@@ -136,7 +136,7 @@ let pvac_status store ~addr =
 let pvac_migration_status
     status_actor
     store
-    entitlements
+    admissions
     ~epoch
     ~owner_migration_mode
     ~addr
@@ -167,7 +167,7 @@ let pvac_migration_status
          ~epoch
          ~owner_migration_mode
          status
-         entitlements)
+         admissions)
 
 let encrypted_cipher ~addr ~account =
   ok (Rpc_view.encrypted_cipher ~addr ~cipher:(public_cipher (account_cipher account)))

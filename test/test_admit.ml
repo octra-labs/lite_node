@@ -1,3 +1,6 @@
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
+
 open Octra_core
 
 module View = Octra_node_runtime.Tx_view
@@ -12,7 +15,13 @@ let check name value =
 let sender index =
   Printf.sprintf "oct%044d" index
 
-let tx ?(fee = 1_000) ?message ?(op_type = Transaction.Standard) from nonce =
+let tx
+    ?(fee = 1_000)
+    ?message
+    ?encrypted_data
+    ?(op_type = Transaction.Standard)
+    from
+    nonce =
   Transaction.{
     from;
     to_ = "oct99999999999999999999999999999999999999999999";
@@ -24,7 +33,7 @@ let tx ?(fee = 1_000) ?message ?(op_type = Transaction.Standard) from nonce =
     public_key = None;
     message;
     op_type;
-    encrypted_data = None;
+    encrypted_data;
   }
 
 let lookup _ =
@@ -158,6 +167,47 @@ let check_dispatch_limit () =
   Dispatch.process_body meta allowed () routes |> Lwt_main.run |> ignore;
   check "allowed batch reaches handler" (!calls = 1)
 
+let public_cipher slots =
+  let image = Bytes.make 63 '\000' in
+  Bytes.blit_string "PVAC" 0 image 0 4;
+  Bytes.set image 4 (Char.chr 4);
+  Bytes.set_int64_le image 6 (Int64.of_int slots);
+  Bytes.set_int64_le image 14 1L;
+  "hfhe_v1|" ^ Base64.encode_exn (Bytes.to_string image)
+
+let check_cipher_limit () =
+  let cipher = public_cipher 9 in
+  check
+    "prior cipher profile changed"
+    (Result.is_ok (Crypto.FheBalance.decode_cipher ~strict:false cipher));
+  check
+    "public cipher slot limit missing"
+    (Result.is_error (Crypto.FheBalance.decode_cipher ~strict:true cipher));
+  let claim =
+    Crypto.StealthClaimV5.{
+      version = 5;
+      output_id = 0;
+      claim_cipher = cipher;
+      commitment = Base64.encode_exn (String.make 32 '\000');
+      claim_secret = String.make 64 '0';
+      zero_proof = "invalid";
+    }
+    |> Crypto.StealthClaimV5.to_json
+    |> Yojson.Safe.to_string
+  in
+  let value =
+    tx
+      ~encrypted_data:claim
+      ~op_type:Transaction.ClaimOp
+      (sender 9_000)
+      1
+  in
+  check
+    "public cipher reached signature admission"
+    (View.payload_admission ~limits:View.payload_limits value
+     = Error
+         ("malformed_transaction", "malformed or oversized encrypted_data"))
+
 let check_full_reject () =
   let limit = 100_000 in
   Tx_staging.clear ();
@@ -250,4 +300,5 @@ let () =
   check_evict_cap ();
   check_rpc_limit ();
   check_inner_limit ();
-  check_dispatch_limit ()
+  check_dispatch_limit ();
+  check_cipher_limit ()

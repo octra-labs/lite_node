@@ -73,7 +73,7 @@ val start :
   validator_view_sk:string ->
   validator_view_pub:string ->
   program_trust:Octra_vm.Program_trust.t ->
-  migration_entitlements:Octra_core.Pvac_migration_entitlement.t ->
+  migration_admissions:Octra_core.Pvac_migration_admission.t ->
   rules:Octra_core.Rule_graph.t ->
   chaindata:Store_chaindata.t ->
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->
@@ -100,7 +100,7 @@ val start_task :
   validator_view_sk:string ->
   validator_view_pub:string ->
   program_trust:Octra_vm.Program_trust.t ->
-  migration_entitlements:Octra_core.Pvac_migration_entitlement.t ->
+  migration_admissions:Octra_core.Pvac_migration_admission.t ->
   rules:Octra_core.Rule_graph.t ->
   chaindata:Store_chaindata.t ->
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->

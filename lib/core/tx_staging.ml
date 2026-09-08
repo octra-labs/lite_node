@@ -34,7 +34,6 @@ module Index_key = struct
 end
 
 module Index = Map.Make(Index_key)
-
 module Sender_queue = Map.Make(String)
 
 module Selection_head = Set.Make(struct
@@ -58,7 +57,6 @@ module Evict_index = Set.Make(struct
       let hash = String.compare a.hash b.hash in
       if hash <> 0 then hash else String.compare a.key b.key
 end)
-
 let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
 let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
 let view_index = ref Index.empty

@@ -55,11 +55,11 @@ let can_bound_migrate status =
 let needs_history_migration status =
   status.route = History_migration
 
-let classify_cipher = function
+let classify_cipher ?(cap = true) = function
   | "" | "0" -> Empty
   | cipher when not (Crypto.FheBalance.is_fhe_cipher cipher) -> Foreign
   | cipher ->
-    match Crypto.FheBalance.cipher_has_key_bound_material cipher with
+    match Crypto.FheBalance.cipher_has_key_bound_material ~cap cipher with
     | Ok true -> V3
     | Ok false -> Legacy_hfhe
     | Error e -> Malformed e
@@ -133,5 +133,5 @@ let status_of_classes cipher_class key_class =
       reason = "encrypted balance is malformed: " ^ error;
     }
 
-let status_of_state ~cipher ~pubkey =
-  status_of_classes (classify_cipher cipher) (classify_key pubkey)
+let status_of_state ~cap ~cipher ~pubkey =
+  status_of_classes (classify_cipher ~cap cipher) (classify_key pubkey)

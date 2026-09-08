@@ -35,6 +35,7 @@ let context ~program_trust ~object_cost backend env
       trusted_program_keys = program_trust;
       store = backend.Epoch_exec.store;
       get_fhe_pubkey = Vm.live_fhe_pubkey backend.store;
+      proof_mode = backend.proof_mode;
       object_cost;
       current_epoch = env.Epoch_exec.epoch_id;
       epoch_time_ms =
@@ -54,8 +55,8 @@ let wasm_load_profile = function
   | Rule_graph.Prior -> Octra_core.Circle_wasm_host.Compute
   | Rule_graph.Active -> Octra_core.Circle_wasm_host.Manifest
 
-let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
-    ?(save_receipt_raw=(fun ~tx_hash:_ ~json:_ -> ()))
+let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
+    ?(save_receipt_raw = (fun ~tx_hash:_ ~json:_ -> ()))
     ~circle_mode ~wasm_compute_mode ~program_trust ~object_cost backend env
     (tx : Transaction.t) =
   let effects =
@@ -188,7 +189,9 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
           (backend.ops.find_opt current.Transaction.from));
       deploy_and_save = (fun _ ~admitted ~params ~bytecode ~bytecode_raw ->
         deploy_and_save ~admitted ~params ~bytecode ~bytecode_raw);
-      program_prepare = Vm.prepare_program_package;
+      program_prepare =
+        Vm.prepare_program_package
+          ~point_ops:(backend.proof_mode = Rule_graph.Active);
       ensure_account = (fun address ->
         match Tx_effects.ensure_account effects address with
         | Ok () -> ()
@@ -201,6 +204,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
             ~trusted:(Program_trust.keys program_trust)
             ~ctx
             ~limit:call.Call_plan.effort_limit
+            ~hfhe_strict:(backend.proof_mode = Rule_graph.Active)
             ~hfhe_mode
             ~update_policy:(circle_mode = Rule_graph.Active)
             ~manifest_profile:(wasm_load_profile wasm_compute_mode)
@@ -247,6 +251,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
       circle_commit = (fun current result ->
         Circle_exec.commit_call_result
           ~deployment_profile:(wasm_admission_profile wasm_compute_mode)
+          ~proof_mode:backend.proof_mode
           backend.store
           current.to_
           result);
@@ -289,6 +294,7 @@ let run ?(hfhe_mode=Transcript.Direct) ?circle_capture ?expected_circle
       reject_malformed = (fun reason ->
         reject "malformed_transaction" reason);
       max_multi_exec_calls = Vm.max_multi_exec_calls ~env:Sys.getenv_opt;
+      proof_mode = backend.proof_mode;
       epoch = env.epoch_id;
       now = (fun () -> env.epoch_ts);
     }
@@ -476,6 +482,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       Consensus_circle_code_admission.admit
         ~store:backend.Epoch_exec.store
         ~program_trust
+        ~point_ops:(backend.proof_mode = Rule_graph.Active)
         tx
     in
     begin
@@ -496,6 +503,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       Consensus_circle_code_admission.admit
         ~store:backend.Epoch_exec.store
         ~program_trust
+        ~point_ops:(backend.proof_mode = Rule_graph.Active)
         tx
     in
     begin

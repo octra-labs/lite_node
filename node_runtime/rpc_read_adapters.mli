@@ -109,6 +109,14 @@ val store_label_read :
   'ctx ->
   'result
 
+val store_chaindata_read :
+  store:('ctx -> 'store) ->
+  chaindata:('ctx -> 'chaindata) ->
+  (store:'store -> chaindata:'chaindata -> 'params -> 'result) ->
+  'params ->
+  'ctx ->
+  'result
+
 val chaindata_read :
   chaindata:('ctx -> 'chaindata) ->
   (chaindata:'chaindata -> 'params -> 'result) ->

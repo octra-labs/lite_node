@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstring>
+#include <stdexcept>
 
 #include "../core/hash.hpp"
 #include "../core/types.hpp"
@@ -63,7 +64,7 @@ struct ComDecision {
 
 inline void com_acc_fp(Sha256& h, const Fp& x) {
     sha256_acc_u64(h, x.lo);
-    sha256_acc_u64(h, x.hi & MASK63);
+    sha256_acc_u64(h, x.hi);
 }
 
 inline bool com_digest_eq(const std::array<uint8_t, 32>& a, const std::array<uint8_t, 32>& b) {
@@ -100,6 +101,8 @@ inline std::array<uint8_t, 32> com_expr_digest(ComOp op, const std::array<uint8_
 }
 
 inline ComOpen make_com_open(Fp value, const std::array<uint8_t, 32>& blind) {
+    if (!fp_is_reduced(value))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     ComOpen open;
     open.value = value;
     open.blind = blind;
@@ -120,24 +123,34 @@ inline std::array<uint8_t, 32> com_blind_expr(ComOp op, const std::array<uint8_t
 }
 
 inline ComOpen com_open_add(const ComOpen& left, const ComOpen& right) {
+    if (!fp_is_reduced(left.value) || !fp_is_reduced(right.value))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     return make_com_open(fp_add(left.value, right.value), com_blind_expr(ComOp::ADD, left.blind, right.blind, fp_from_u64(0)));
 }
 
 inline ComOpen com_open_sub(const ComOpen& left, const ComOpen& right) {
+    if (!fp_is_reduced(left.value) || !fp_is_reduced(right.value))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     return make_com_open(fp_sub(left.value, right.value), com_blind_expr(ComOp::SUB, left.blind, right.blind, fp_from_u64(0)));
 }
 
 inline ComOpen com_open_scale(const ComOpen& source, const Fp& scalar) {
+    if (!fp_is_reduced(source.value) || !fp_is_reduced(scalar))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     std::array<uint8_t, 32> zero{};
     return make_com_open(fp_mul(source.value, scalar), com_blind_expr(ComOp::SCALE, source.blind, zero, scalar));
 }
 
 inline ComOpen com_open_add_const(const ComOpen& source, const Fp& constant) {
+    if (!fp_is_reduced(source.value) || !fp_is_reduced(constant))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     std::array<uint8_t, 32> zero{};
     return make_com_open(fp_add(source.value, constant), com_blind_expr(ComOp::ADD_CONST, source.blind, zero, constant));
 }
 
 inline ComOpen com_open_product(const ComOpen& left, const ComOpen& right) {
+    if (!fp_is_reduced(left.value) || !fp_is_reduced(right.value))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     return make_com_open(fp_mul(left.value, right.value), com_blind_expr(ComOp::PRODUCT, left.blind, right.blind, fp_from_u64(0)));
 }
 
@@ -151,10 +164,16 @@ inline bool com_op_closed(ComOp op) {
 }
 
 inline bool com_fp_eq(const Fp& a, const Fp& b) {
-    return a.lo == b.lo && ((a.hi ^ b.hi) & MASK63) == 0;
+    return
+        fp_is_reduced(a) &&
+        fp_is_reduced(b) &&
+        a.lo == b.lo &&
+        a.hi == b.hi;
 }
 
 inline ComCell make_com_cell(const std::array<uint8_t, 32>& tag, const ComOpen& open, bool prebound) {
+    if (!fp_is_reduced(open.value))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     ComCell cell;
     cell.kind = ComKind::CELL;
     cell.op = ComOp::SOURCE;
@@ -170,6 +189,8 @@ inline ComCell make_com_cell(const std::array<uint8_t, 32>& tag, const ComOpen& 
 }
 
 inline ComCell make_com_expr(ComOp op, const ComCell& left, const ComCell& right, const Fp& scalar) {
+    if (!fp_is_reduced(scalar))
+        throw std::invalid_argument("pvac: commitment scalar is outside field");
     ComCell cell;
     cell.kind = ComKind::EXPR;
     cell.op = op;
@@ -185,6 +206,8 @@ inline ComCell make_com_expr(ComOp op, const ComCell& left, const ComCell& right
 }
 
 inline ComCell make_com_expr(ComOp op, const ComCell& left, const ComCell& right, const Fp& scalar, const ComOpen& out_open) {
+    if (!fp_is_reduced(out_open.value))
+        throw std::invalid_argument("pvac: commitment opening is outside field");
     auto cell = make_com_expr(op, left, right, scalar);
     cell.digest = com_cell_digest(cell.tag, out_open);
     return cell;
@@ -194,6 +217,7 @@ inline ComDecision decide_com_open(const ComCell& cell, const ComOpen& open) {
     ComDecision decision;
     decision.digest =
         cell.kind == ComKind::CELL &&
+        fp_is_reduced(open.value) &&
         com_digest_eq(cell.digest, com_cell_digest(cell.tag, open));
     decision.bound = cell.bound;
     decision.hiding = cell.hiding;
@@ -234,6 +258,15 @@ inline ComDecision decide_com_claim(const ComCell& cell) {
 
 inline ComDecision decide_com_expr_open(ComOp op, const ComCell& left, const ComOpen& left_open, const ComCell& right, const ComOpen& right_open, const Fp& scalar, const ComCell& out, const ComOpen& out_open) {
     ComDecision decision;
+    if (
+        !fp_is_reduced(left_open.value) ||
+        !fp_is_reduced(right_open.value) ||
+        !fp_is_reduced(scalar) ||
+        !fp_is_reduced(out_open.value)
+    ) {
+        decision.rejects_nonclosed = true;
+        return decision;
+    }
     auto left_decision = decide_com_open(left, left_open);
     auto right_decision = (op == ComOp::SCALE || op == ComOp::ADD_CONST) ? left_decision : decide_com_open(right, right_open);
     ComOpen expected;

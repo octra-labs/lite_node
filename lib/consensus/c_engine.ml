@@ -153,16 +153,16 @@ let missing_proposal_request ~proposal_known (vote : vote) result =
     else
       Some (vote.round, vote.proposal_id)
 
-let bounded_int raw ~fallback ~minimum ~limit =
+let parse_int raw ~default ~minimum ~limit =
   try
     let value = int_of_string raw in
-    if value < minimum || value > limit then fallback else value
-  with _ -> fallback
+    if value < minimum || value > limit then default else value
+  with _ -> default
 
-let int_env name ~fallback ~minimum ~limit =
+let int_env name ~default ~minimum ~limit =
   match Sys.getenv_opt name with
-  | Some raw -> bounded_int raw ~fallback ~minimum ~limit
-  | None -> fallback
+  | Some raw -> parse_int raw ~default ~minimum ~limit
+  | None -> default
 
 let timeout_ms_with ~round ~step ~base ~propose ~per_round =
   let step_base, cap = match step with
@@ -183,19 +183,19 @@ let timeout_ms_with ~round ~step ~base ~propose ~per_round =
 let timeout_ms ~round ~step =
   let base =
     int_env "OCTRA_BFT_TIMEOUT_BASE_MS"
-      ~fallback:3000
+      ~default:3000
       ~minimum:100
       ~limit:120_000
   in
   let propose =
     int_env "OCTRA_BFT_PROPOSE_TIMEOUT_MS"
-      ~fallback:base
+      ~default:base
       ~minimum:100
       ~limit:max_propose_timeout_ms
   in
   let per_round =
     int_env "OCTRA_BFT_TIMEOUT_ROUND_MS"
-      ~fallback:1000
+      ~default:1000
       ~minimum:100
       ~limit:30_000
   in

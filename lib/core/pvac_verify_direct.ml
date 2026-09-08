@@ -44,7 +44,13 @@ let decode_range_proof encoded =
     with _ ->
       Error "invalid range proof"
 
-let verify_circle_proof pubkey cipher kind proof amount_commitment =
+let verify_circle_proof
+    ~strict
+    pubkey
+    cipher
+    kind
+    proof
+    amount_commitment =
   match kind with
   | P.Circle_none ->
     if proof = "" && amount_commitment = "" then Ok ()
@@ -63,7 +69,14 @@ let verify_circle_proof pubkey cipher kind proof amount_commitment =
       | Error _, _ -> Error "invalid bound zero proof"
       | _, Error error -> Error error
       | Ok value, Ok commitment ->
-        if Pvac_ffi.verify_zero_bound pubkey cipher value commitment then Ok ()
+        if
+          (if strict then Pvac_ffi.verify_zero_bound
+           else Pvac_ffi.verify_zero_amount_prior)
+            pubkey
+            cipher
+            value
+            commitment
+        then Ok ()
         else Error "bound zero proof verification failed"
     end
   | P.Circle_range ->
@@ -72,7 +85,14 @@ let verify_circle_proof pubkey cipher kind proof amount_commitment =
       | Error error, _ -> Error error
       | _, Error error -> Error error
       | Ok value, Ok commitment ->
-        if Pvac_ffi.verify_range_bound pubkey cipher value commitment then Ok ()
+        if
+          (if strict then Pvac_ffi.verify_range_bound
+           else Pvac_ffi.verify_range_amount_prior)
+            pubkey
+            cipher
+            value
+            commitment
+        then Ok ()
         else Error "bound range proof verification failed"
     end
 
@@ -87,7 +107,7 @@ let verify_circle_cell (value : P.circle_cell) =
   else
     match
       proof_pubkey value.pubkey,
-      FB.decode_cipher value.cipher,
+      FB.decode_cipher ~strict:value.strict ~cap:value.strict value.cipher,
       decode_commitment value.ciphertext_commitment
     with
     | Error error, _, _ -> Error error
@@ -102,6 +122,7 @@ let verify_circle_cell (value : P.circle_cell) =
           Error "ciphertext commitment mismatch"
         else
           verify_circle_proof
+            ~strict:value.strict
             pubkey
             cipher
             value.proof_kind
@@ -118,6 +139,7 @@ let execute request =
       | Error error -> Error error
       | Ok pubkey ->
         FB.verify_encrypt_proof
+          ~strict:value.strict
           pubkey
           value.cipher
           value.amount
@@ -131,6 +153,7 @@ let execute request =
       | Error error -> Error error
       | Ok pubkey ->
         FB.verify_claim_amount_v5
+          ~strict:value.strict
           pubkey
           value.cipher
           value.proof
@@ -142,6 +165,7 @@ let execute request =
       | Error error -> Error error
       | Ok pubkey ->
         FB.verify_key_switch_claim_amount
+          ~strict:value.strict
           pubkey
           value.cipher
           value.proof
@@ -151,7 +175,7 @@ let execute request =
     begin
       match
         historical_pubkey value.pubkey,
-        FB.decode_cipher value.cipher,
+        FB.decode_cipher ~strict:value.strict ~cap:value.strict value.cipher,
         FB.decode_zero_proof value.proof,
         decode_commitment value.commitment
       with
@@ -161,7 +185,9 @@ let execute request =
       | _, _, _, Error error -> Error error
       | Ok pubkey, Ok cipher, Ok proof, Ok commitment ->
         if
-          Pvac_ffi.verify_zero_bound_historical_migration
+          (if value.strict
+           then Pvac_ffi.verify_zero_bound_historical_migration
+           else Pvac_ffi.verify_zero_amount_historical_prior)
             pubkey
             cipher
             proof
@@ -174,7 +200,7 @@ let execute request =
       match proof_pubkey value.pubkey with
       | Error error -> Error error
       | Ok pubkey ->
-        if FB.verify_range pubkey value.cipher value.proof then Ok ()
+        if FB.verify_range ~strict:value.strict pubkey value.cipher value.proof then Ok ()
         else Error "range proof verification failed"
     end
   | P.Zero value ->
@@ -189,7 +215,7 @@ let execute request =
     begin
       match
         proof_pubkey value.pubkey,
-        FB.decode_cipher value.cipher
+        FB.decode_cipher ~strict:value.strict ~cap:value.strict value.cipher
       with
       | Error error, _ -> Error error
       | _, Error error -> Error error
@@ -219,7 +245,8 @@ let execute request =
               if Bytes.length commitment <> 32 then
                 Error "amount commitment must be 32 bytes"
               else if
-                Pvac_ffi.verify_range_bound
+                (if value.strict then Pvac_ffi.verify_range_bound
+                 else Pvac_ffi.verify_range_amount_prior)
                   pubkey
                   cipher
                   proof

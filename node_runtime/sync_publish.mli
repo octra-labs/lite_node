@@ -16,6 +16,7 @@ type deps = {
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
   wallet : Octra_core.Crypto.Wallet.t;
+  force_publish : bool;
   config_hash : unit -> (string, string) result;
   trusted_validator_set :
     unit ->

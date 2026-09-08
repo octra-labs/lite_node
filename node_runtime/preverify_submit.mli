@@ -4,6 +4,7 @@
 type result = {
   delta_ok : bool;
   balance_ok : bool;
+  strict : bool;
   sender_enc_snapshot : string;
 }
 
@@ -37,10 +38,12 @@ type io = {
   tx_hash : string;
   sender : string;
   ptd : Octra_core.Crypto.PrivateTransferV4.t;
+  strict : bool;
   get_pvac_pubkey : string -> string option Lwt.t;
   sender_enc : string -> string;
   start_task : string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
+    strict:bool ->
     pubkey_blob:string ->
     sender_enc:string ->
     Octra_core.Crypto.PrivateTransferV4.t ->
@@ -49,10 +52,12 @@ type io = {
 }
 
 type launcher = {
+  strict : unit -> bool;
   get_pvac_pubkey : string -> string option Lwt.t;
   sender_enc : string -> string;
   start_task : string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
+    strict:bool ->
     pubkey_blob:string ->
     sender_enc:string ->
     Octra_core.Crypto.PrivateTransferV4.t ->
@@ -61,6 +66,7 @@ type launcher = {
 }
 
 val result_of_ranges :
+  strict:bool ->
   sender_enc_snapshot:string ->
   ((bool * bool), Tx_view.preverify_error) Stdlib.result ->
   task_result

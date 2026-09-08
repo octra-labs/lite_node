@@ -37,6 +37,8 @@ type binop =
 
 type unop = Neg | Not
 
+type mult = Once | Many
+
 type expr =
   | EInt of Z.t
   | EBool of bool
@@ -64,12 +66,30 @@ type expr =
   | EIndexField of string * expr list * string
   | EEnumVariant of string * string
   | ETernary of expr * expr * expr
+  | EEqual of typ * expr * expr
+  | ELet of string * mult * typ * expr * expr
+  | ESplit of expr * (string * mult * typ) * (string * mult * typ) * expr
+  | EOrbit of C_nat.t * expr option * expr * (string * mult * typ) * expr
+  | EAction of C_eff.atom * expr
+  | EUse of use_expr
+
+and use_expr = {
+  ux_name : string;
+  ux_caps : expr list;
+  ux_arg : expr;
+  ux_mult : mult;
+  ux_bind : string;
+  ux_typ : typ;
+  ux_body : expr;
+}
 
 type stmt =
+  | SLocated of int * int * stmt
   | SLet of string * typ option * expr
   | SAssign of string * expr
   | SFieldSet of string * expr
   | SIndexSet of string * expr list * expr
+  | SIndexUpdate of string * expr list * binop * expr
   | SReturn of expr option
   | SAssert of expr
   | SRequire of expr * expr
@@ -79,6 +99,7 @@ type stmt =
   | SFor of string * expr * expr * stmt list
   | SFieldCall of string * string * expr list
   | SStoragePathSet of string * expr list * string list * expr
+  | SStoragePathUpdate of string * expr list * string list * binop * expr
   | SIndexFieldSet of string * expr list * string * expr
   | SForEach of string * string * stmt list
   | SMatch of expr * (string * string * stmt list) list
@@ -125,6 +146,30 @@ type func_def = {
   fn_nonreentrant : bool;
   fn_vis : visibility;
   fn_body : stmt list;
+}
+
+type form_param = {
+  fp_name : string;
+  fp_typ : typ;
+  fp_mult : mult;
+}
+
+type form_mark = {
+  mk_atom : C_eff.atom;
+  mk_target : string;
+}
+
+type form_def = {
+  fm_name : string;
+  fm_params : form_param list;
+  fm_ret : typ;
+  fm_mult : mult;
+  fm_marks : form_mark list;
+  fm_lim : C_limit.t option;
+  fm_body : expr;
+  fm_public : bool;
+  fm_line : int;
+  fm_column : int;
 }
 
 type state_field = {
@@ -184,7 +229,10 @@ type contract = {
   implements : string list;
   ctor : func_def option;
   funcs : func_def list;
+  forms : form_def list;
 }
+
+type program = contract
 
 let typ_to_string = function
   | TInt -> "int" | TBool -> "bool" | TString -> "string"
@@ -200,7 +248,7 @@ type token =
   | TkSelf | TkCaller | TkOrigin | TkEpoch | TkEpochTime | TkValue | TkBalance
   | TkTrue | TkFalse
   | TkTyInt | TkTyBool | TkTyString | TkTyAddress | TkTyBytes | TkTyBytes32
-  | TkTyU64 | TkTyU128 | TkTyU256
+  | TkTyU64 | TkTyU128 | TkTyU256 | TkTyUint
   | TkTyCipher | TkTyPubKey | TkMap
   | TkTreeHash | TkNodeId | TkTxHash
   | TkFor | TkIn | TkDotDot | TkTyList

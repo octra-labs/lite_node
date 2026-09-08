@@ -158,8 +158,12 @@ let handshake_penalty reason =
     Some "bad_signature_handshake"
   else if contains reason "node_id does not match pubkey" then
     Some "bad_signature_handshake"
+  else if contains reason "frame_payload_limit" then
+    Some "invalid_frame_handshake"
   else if contains reason "expected HELLO" then
     Some "invalid_frame_handshake"
+  else if contains reason "handshake timeout" then
+    Some "timeout_handshake"
   else
     None
 

@@ -3,7 +3,7 @@
 
 module P = Pvac_verify_protocol
 
-let consensus_id = "circle_receipt:verify_apply:retry_tx"
+let consensus_id = "circle_receipt:verify_apply:retry_tx:amount_link_v1"
 
 type cell =
   | Balance of Circle_balance_cell.write_request
@@ -433,7 +433,7 @@ let prepare ~store ~ledger ~current_epoch tx =
         end
     end
 
-let verify_classified plan =
+let verify_classified ~strict plan =
   Pvac_verify_worker.classified_result
     (P.Circle_cell {
        pubkey = plan.pubkey;
@@ -442,11 +442,12 @@ let verify_classified plan =
        proof_kind = plan.proof_kind;
        proof = plan.proof;
        amount_commitment = plan.amount_commitment;
+       strict;
      })
 
-let verify plan =
+let verify ~strict plan =
   let open Lwt.Syntax in
-  let* result = verify_classified plan in
+  let* result = verify_classified ~strict plan in
   Lwt.return
     (Result.map_error
        Pvac_verify_worker.verification_failure_message

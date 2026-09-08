@@ -1,6 +1,13 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type cap = {
+  scope : string;
+  kind : int;
+  id : int;
+  rev : int;
+}
+
 type v =
   | VInt of Z.t
   | VBool of bool
@@ -11,6 +18,7 @@ type v =
   | VU128 of Z.t
   | VU256 of Z.t
   | VAddr of string
+  | VCap of cap
   | VCipher of Pvac_ffi.cipher
   | VPubKey of Pvac_ffi.pubkey
 
@@ -36,6 +44,8 @@ type instr =
   | SLOADK of reg * reg
   | SSTOREK of reg * reg
   | SDELK of reg
+  | CAP_CHECK of Z.t * reg
+  | CAP_CLOSE of Z.t * reg
   | MLOAD of reg * int
   | MSTORE of int * reg
   | JMP of int
@@ -80,6 +90,9 @@ type instr =
   | GROTH16_VERIFY_BN254 of reg * reg * reg * reg
   | FHE_COMMIT of reg * reg * reg
   | FHE_PEDERSEN of reg * reg * reg
+  | FHE_PEDERSEN_ADD of reg * reg * reg
+  | FHE_PEDERSEN_SUB of reg * reg * reg
+  | FHE_PEDERSEN_IDENTITY of reg
   | FHE_SER of reg * reg
   | FHE_DESER of reg * reg
   | FHE_SER_PK of reg * reg
@@ -157,6 +170,7 @@ type mem = { mutable data : (int, v) Hashtbl.t; mutable size : int }
 type undo_entry =
   | UndoMarker of int
   | UndoWrite of string * string option
+  | UndoClose of cap
 
 type event_record = {
   contract : string;
@@ -198,10 +212,13 @@ type exec_ctx = {
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   get_fhe_keypair : string -> (Pvac_ffi.pubkey * Pvac_ffi.seckey) option;
   allow_fhe_capability : fhe_capability -> bool;
+  cap_live : cap -> bool;
   circle_hfhe_key_id : string option;
   circle_hfhe_intent_id : string option;
   circle_hfhe_active_relay_id : string option;
+  point_ops : bool;
   object_cost : bool;
+  int_work : Int_work.mode;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -218,10 +235,13 @@ let default_ctx = {
   get_fhe_pubkey = (fun _ -> None);
   get_fhe_keypair = (fun _ -> None);
   allow_fhe_capability = (fun _ -> true);
+  cap_live = (fun _ -> false);
   circle_hfhe_key_id = None;
   circle_hfhe_intent_id = None;
   circle_hfhe_active_relay_id = None;
+  point_ops = false;
   object_cost = false;
+  int_work = Int_work.Prior;
   current_epoch = 0;
   epoch_time_ms = 0L;
   tree_hash = String.make 64 '0';
@@ -238,6 +258,15 @@ type storage_kind =
   | StorageU128
   | StorageU256
   | StorageAddr
+
+type byte_result =
+  | String_bytes
+  | Typed_bytes
+
+type progress =
+  | Running
+  | Finished
+  | Refused
 
 type member_index = {
   keys : string array;
@@ -259,6 +288,8 @@ type s = {
   value : Z.t;
   logs : event_record list ref;
   ctx : exec_ctx;
+  int_mode : Int_work.mode;
+  byte_result : byte_result;
   mutable undo_stack : undo_entry list;
   mutable undo_id : int;
   mutable call_depth : int;
@@ -268,7 +299,12 @@ type s = {
   strict_values : bool;
   storage_kinds : (string, storage_kind) Hashtbl.t;
   decoded_chunk_cache : (int, string) Hashtbl.t;
+  mutable closes : cap list;
 }
+
+let call_depth_max = 8
+let register_count = 64
+let input_limit = register_count - 4
 
 let max_storage_value_len = 4_194_304
 
@@ -286,14 +322,17 @@ let effort_cost = function
   | JIF _ | ASSERT _ | ASSERT_ADDR _ | TREEHASH _ | NODEID _ | TXHASH _ -> 5
   | SLOAD _ | SLOADK _ | BALANCE _ -> 20
   | EMIT _ -> 30
-  | SDEL _ | SDELK _ | TRANSFER _ -> 50
+  | SDEL _ | SDELK _ | CAP_CLOSE _ | TRANSFER _ -> 50
+  | CAP_CHECK _ -> 20
   | SSTORE _ | SSTOREK _ | XCALL _ | CHECKPOINT -> 100
   | ROLLBACK -> 200
   | SPAWN _ | SPAWN2 _ -> 5000
   | COMMIT -> 10
   | FHE_SER_PK _ | FHE_DESER_PK _ -> 50
   | FHE_LOAD_PK _ | FHE_SER _ | FHE_DESER _ -> 100
-  | FHE_COMMIT _ | FHE_PEDERSEN _ -> 200
+  | FHE_COMMIT _ | FHE_PEDERSEN _
+  | FHE_PEDERSEN_ADD _ | FHE_PEDERSEN_SUB _
+  | FHE_PEDERSEN_IDENTITY _ -> 200
   | FHE_ADD _ | FHE_SUB _ | FHE_ADD_CONST _ | FHE_SUB_CONST _ -> 500
   | FHE_SCALE _ | FHE_DIV_CONST _ -> 1000
   | FHE_MUL _ -> 10000
@@ -364,11 +403,12 @@ let is_valid_addr s =
       else false
     in check 3
 
-let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=false)
-    ?(strict_values=false) ?(storage_kinds=[]) ~caller ~origin ~address ~value
-    ~storage () =
+let create_state ?(limit = 1_000_000) ?(ctx = default_ctx) ?(depth = 0) ?(is_view = false)
+    ?(strict_values = false) ?(storage_kinds = [])
+    ?(byte_result = String_bytes)
+    ~caller ~origin ~address ~value ~storage () =
   {
-    regs = Array.make 64 (VInt Z.zero);
+    regs = Array.make register_count (VInt Z.zero);
     memory = { data = Hashtbl.create 1024; size = 0 };
     storage;
     member_index = None;
@@ -379,6 +419,8 @@ let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=fals
     caller; origin; address; value;
     logs = ref [];
     ctx;
+    int_mode = ctx.int_work;
+    byte_result;
     undo_stack = [];
     undo_id = 0;
     call_depth = depth;
@@ -388,6 +430,7 @@ let create_state ?(limit=1_000_000) ?(ctx=default_ctx) ?(depth=0) ?(is_view=fals
     strict_values;
     storage_kinds = Hashtbl.of_seq (List.to_seq storage_kinds);
     decoded_chunk_cache = Hashtbl.create 512;
+    closes = [];
   }
 
 let to_z = function
@@ -415,8 +458,11 @@ let to_string = function
   | VU128 z -> Z.to_string z
   | VU256 z -> Z.to_string z
   | VAddr a -> a
+  | VCap _ -> "<cap>"
   | VCipher _ -> "<cipher>"
   | VPubKey _ -> "<pubkey>"
+
+let storage_work value = String.length (to_string value) / 32
 
 let to_cipher = function VCipher c -> Some c | _ -> None
 let to_pubkey = function VPubKey pk -> Some pk | _ -> None
@@ -687,7 +733,10 @@ let decode_raw_or_b64_len expected s =
 let deterministic_seed parts =
   Bytes.of_string (Digestif.SHA256.(digest_string (String.concat "\000" parts) |> to_raw_string))
 
-let revert st = st.reverted <- true; false
+let revert st =
+  st.closes <- [];
+  st.reverted <- true;
+  false
 
 let revert_with_reason st reason =
   st.logs := { contract = st.address; depth = st.call_depth;
@@ -705,6 +754,26 @@ let view_guard st =
 
 let getr st r = st.regs.(r)
 let setr st r v = st.regs.(r) <- v
+
+let cap_equal left right =
+  String.equal left.scope right.scope
+  && left.kind = right.kind
+  && left.id = right.id
+  && left.rev = right.rev
+
+let cap_nat value =
+  value >= 0 && value <= 1_000_000
+
+let cap_value kind = function
+  | VCap cap ->
+    String.length cap.scope = 32
+    && Z.sign kind >= 0
+    && Z.leq kind (Z.of_int 1_000_000)
+    && cap_nat cap.kind
+    && cap_nat cap.id
+    && cap_nat cap.rev
+    && Z.to_int kind = cap.kind
+  | _ -> false
 
 let finish_fhe_verification st rd = function
   | Fhe_verified ->
@@ -769,8 +838,21 @@ let strict_operands st = function
   | BITAND (_, a, b) | BITOR (_, a, b) | BITXOR (_, a, b)
   | BITSHL (_, a, b) | BITSHR (_, a, b) ->
     is_numeric (getr st a) && is_numeric (getr st b)
-  | NEG (_, a) | ABS (_, a) | MLOADR (_, a) | MSTORER (a, _) ->
+  | NEG (_, a) | ABS (_, a) | MLOADR (_, a) ->
     is_numeric (getr st a)
+  | MSTORE (_, source) ->
+    begin
+      match getr st source with
+      | VCap _ -> false
+      | _ -> true
+    end
+  | MSTORER (index, source) ->
+    is_numeric (getr st index)
+    && begin
+      match getr st source with
+      | VCap _ -> false
+      | _ -> true
+    end
   | VECDOT_Q16 (_, a, b, n) ->
     is_numeric (getr st a) && is_numeric (getr st b) && is_numeric (getr st n)
   | ELEMWISE_MUL_Q16 (a, b, n) | RESIDUAL_ADD_Q16 (a, b, n) ->
@@ -799,6 +881,8 @@ let strict_operands st = function
   | BALANCE (_, a) | SLOADK (_, a) | SDELK a | ISADDR (_, a)
   | ISHEX (_, a) | STATE_PATH_KEY (_, a) | ASSERT_ADDR a ->
     is_address (getr st a)
+  | CAP_CHECK (kind, reg) | CAP_CLOSE (kind, reg) ->
+    cap_value kind (getr st reg)
   | SSTORE (key, source) ->
     (match Hashtbl.find_opt st.storage_kinds key with
      | Some kind -> storage_value_matches kind (getr st source)
@@ -832,11 +916,32 @@ let strict_operands st = function
   | SSTOREN (base_key, base_value, count) ->
     List.for_all (fun reg -> is_numeric (getr st reg)) [base_key; base_value; count]
   | CONCAT (_, left, right) ->
-    is_scalar_value (getr st left) && is_scalar_value (getr st right)
+    begin
+      match st.byte_result, getr st left, getr st right with
+      | Typed_bytes, VBytes _, VBytes _ -> true
+      | Typed_bytes, _, _ -> false
+      | String_bytes, left, right ->
+        is_scalar_value left && is_scalar_value right
+    end
   | STRLEN (_, text) -> is_text (getr st text)
-  | XCALL (_, target, method_name, _, _) ->
+  | XCALL (_, target, method_name, base, count) ->
     is_address (getr st target) && is_text (getr st method_name)
-  | SPAWN (_, code) | SPAWN2 (_, code, _, _) -> is_text (getr st code)
+    && base >= 0 && count >= 0 && base <= register_count
+    && count <= register_count - base
+    && List.for_all
+      (fun index -> match getr st (base + index) with VCap _ -> false | _ -> true)
+      (List.init count Fun.id)
+  | SPAWN (_, code) -> is_text (getr st code)
+  | SPAWN2 (_, code, base, count) ->
+    is_text (getr st code) && base >= 0 && count >= 0
+    && base <= register_count && count <= register_count - base
+    && List.for_all
+      (fun index -> match getr st (base + index) with VCap _ -> false | _ -> true)
+      (List.init count Fun.id)
+  | EMIT (_, regs) ->
+    List.for_all
+      (fun reg -> match getr st reg with VCap _ -> false | _ -> true)
+      regs
   | TRANSFER (_, target, value) ->
     is_address (getr st target) && is_numeric (getr st value)
   | FHE_LOAD_PK (_, address) -> is_address (getr st address)
@@ -865,6 +970,10 @@ let strict_operands st = function
     (match getr st key, getr st cipher with VPubKey _, VCipher _ -> true | _ -> false)
   | FHE_PEDERSEN (_, amount, blinding) ->
     is_numeric (getr st amount) && is_text (getr st blinding)
+  | FHE_PEDERSEN_ADD (_, left, right)
+  | FHE_PEDERSEN_SUB (_, left, right) ->
+    is_text (getr st left) && is_text (getr st right)
+  | FHE_PEDERSEN_IDENTITY _ -> true
   | FHE_SER (_, cipher) -> (match getr st cipher with VCipher _ -> true | _ -> false)
   | FHE_DESER (_, bytes) | FHE_DESER_PK (_, bytes) -> is_text (getr st bytes)
   | FHE_SER_PK (_, key) -> (match getr st key with VPubKey _ -> true | _ -> false)
@@ -929,6 +1038,69 @@ let add_dyn_effort st cost =
   match Cost.charge ~used:st.effort_used ~cost ~limit:st.effort_limit with
   | None -> false
   | Some effort -> st.effort_used <- effort; true
+
+let add_z_effort st cost =
+  match Cost.charge_z ~used:st.effort_used ~cost ~limit:st.effort_limit with
+  | None -> false
+  | Some effort -> st.effort_used <- effort; true
+
+let op_effort st op =
+  let binary kind left right =
+    Int_work.cost st.int_mode ~base:(effort_cost op) kind
+      (to_z (getr st left)) (to_z (getr st right))
+  in
+  let unary kind source =
+    Int_work.cost st.int_mode ~base:(effort_cost op) kind
+      (to_z (getr st source)) Z.zero
+  in
+  match op with
+  | ADD (_, left, right) -> binary Int_work.Add left right
+  | SUB (_, left, right) -> binary Int_work.Sub left right
+  | MUL (_, left, right) -> binary Int_work.Mul left right
+  | DIV (_, left, right) -> binary Int_work.Div left right
+  | MOD (_, left, right) -> binary Int_work.Mod left right
+  | NEG (_, source) -> unary Int_work.Neg source
+  | ABS (_, source) -> unary Int_work.Abs source
+  | _ -> Z.of_int (effort_cost op)
+
+type int_values = Live | Fixed of (Z.t * Z.t) array
+
+let prepare_int_work st op count operands =
+  match st.int_mode with
+  | Int_work.Prior -> Some Live
+  | Int_work.Active ->
+    let left = st.effort_limit - st.effort_used in
+    if count < 0 || count > Int_work.item_cap || left < 0 || count > left then
+      None
+    else
+      let cap = Z.of_int left in
+      let values = Array.make count (Z.zero, Z.zero) in
+      let rec sum index total =
+        if index = count then
+          if add_z_effort st total then Some (Fixed values) else None
+        else
+          let first, second = operands index in
+          values.(index) <- first, second;
+          let total = Z.add total (Int_work.variable op first second) in
+          if Z.gt total cap then None else sum (index + 1) total
+      in
+      sum 0 Z.zero
+
+let int_values values index current =
+  match values with
+  | Live -> current index
+  | Fixed saved -> saved.(index)
+
+let charge_same_int_work st op count first second =
+  match st.int_mode with
+  | Int_work.Prior -> true
+  | Int_work.Active ->
+    let left = st.effort_limit - st.effort_used in
+    if count < 0 || count > Int_work.item_cap || left < 0 || count > left then
+      false
+    else
+      let one = Int_work.variable op first second in
+      add_z_effort st (Z.mul (Z.of_int count) one)
 
 let add_dyn_product st factors divisor =
   match Cost.scaled_product factors ~divisor with
@@ -1031,8 +1203,10 @@ let rec apply_object_writes st = function
       false
 
 let exec_one st op =
-  if not (add_dyn_effort st (effort_cost op)) then revert st
-  else if not (strict_ok st op) then revert st
+  let strict = strict_ok st op in
+  let work = if strict then op_effort st op else Z.of_int (effort_cost op) in
+  if not (add_z_effort st work) then revert st
+  else if not strict then revert st
   else match op with
   | ADD (rd, rs1, rs2) ->
     setr st rd (VInt (Z.add (to_z (getr st rs1)) (to_z (getr st rs2)))); true
@@ -1091,6 +1265,7 @@ let exec_one st op =
      | VCipher _, _ | _, VCipher _ | VPubKey _, _ | _, VPubKey _ ->
        setr st rd (VBool true); true
      | _ -> setr st rd (VBool (to_string a <> to_string b)); true)
+  | LDI (_, VCap _) -> revert st
   | LDI (rd, v) ->
     setr st rd v; true
   | MOV (rd, rs) ->
@@ -1104,7 +1279,7 @@ let exec_one st op =
     else if is_reserved_key key then revert st
     else
     (match getr st rs with
-     | VCipher _ | VPubKey _ -> revert st
+     | VCap _ | VCipher _ | VPubKey _ -> revert st
      | v ->
        let s = to_string v in
        let len = String.length s in
@@ -1135,6 +1310,26 @@ let exec_one st op =
         st.undo_stack <- UndoWrite (key, old_val) :: st.undo_stack;
         storage_remove st key; true
       end
+  | CAP_CHECK (kind, reg) ->
+    begin
+      match getr st reg with
+      | VCap cap when cap_value kind (VCap cap) && st.ctx.cap_live cap -> true
+      | _ -> revert st
+    end
+  | CAP_CLOSE (kind, reg) ->
+    if not (view_guard st) then false
+    else
+      begin
+        match getr st reg with
+        | VCap cap
+            when cap_value kind (VCap cap)
+              && st.ctx.cap_live cap
+              && not (List.exists (cap_equal cap) st.closes) ->
+          st.closes <- cap :: st.closes;
+          st.undo_stack <- UndoClose cap :: st.undo_stack;
+          true
+        | _ -> revert st
+      end
   | SLOADK (rd, rs) ->
     let key = to_string (getr st rs) in
     let v = match Hashtbl.find_opt st.storage key with
@@ -1144,7 +1339,7 @@ let exec_one st op =
     if not (view_guard st) then false
     else
     (match getr st rv with
-     | VCipher _ | VPubKey _ -> revert st
+     | VCap _ | VCipher _ | VPubKey _ -> revert st
      | v ->
        let key = to_string (getr st rk) in
        if is_reserved_key key then revert st
@@ -1340,16 +1535,22 @@ let exec_one st op =
       revert st
     end
   | SUBSTR (rd, rs, rstart, rlen) ->
-    let s = to_string (getr st rs) in
+    let source = getr st rs in
+    let s = to_string source in
     let slen = String.length s in
     if not (add_dyn_effort st (slen / 256)) then revert st
     else
     let start = Z.to_int (to_z (getr st rstart)) in
     let len = Z.to_int (to_z (getr st rlen)) in
-    if start < 0 || start > slen || len < 0 then setr st rd (VString "")
+    let output value =
+      match st.byte_result, source with
+      | Typed_bytes, VBytes _ -> VBytes value
+      | Typed_bytes, _ | String_bytes, _ -> VString value
+    in
+    if start < 0 || start > slen || len < 0 then setr st rd (output "")
     else begin
       let actual_len = min len (slen - start) in
-      setr st rd (VString (String.sub s start actual_len))
+      setr st rd (output (String.sub s start actual_len))
     end; true
   | INDEXOF (rd, rs, rsearch) ->
     let s = to_string (getr st rs) in
@@ -1580,20 +1781,32 @@ let exec_one st op =
           | Some v -> to_z v
           | None -> Z.zero
         in
-        for r = 0 to m - 1 do
-          for c = 0 to n - 1 do
-            let acc = ref Z.zero in
-            for i = 0 to k - 1 do
-              let lv = mem_get (lhs_addr + r * k + i) in
-              let rv = mem_get (rhs_addr + i * n + c) in
-              acc := Z.add !acc (Z.mul lv rv)
-            done;
-            let cell = dst_addr + r * n + c in
-            Hashtbl.replace st.memory.data cell (VInt !acc);
-            if cell >= st.memory.size then st.memory.size <- cell + 1
-          done
-        done;
-        true
+        let row_size = n * k in
+        let operands index =
+          let row = index / row_size in
+          let offset = index mod row_size in
+          let column = offset / k in
+          let inner = offset mod k in
+          mem_get (lhs_addr + row * k + inner),
+          mem_get (rhs_addr + inner * n + column)
+        in
+        match prepare_int_work st Int_work.Mul (m * row_size) operands with
+        | None -> revert st
+        | Some values ->
+          for r = 0 to m - 1 do
+            for c = 0 to n - 1 do
+              let acc = ref Z.zero in
+              for i = 0 to k - 1 do
+                let index = r * row_size + c * k + i in
+                let lv, rv = int_values values index operands in
+                acc := Z.add !acc (Z.mul lv rv)
+              done;
+              let cell = dst_addr + r * n + c in
+              Hashtbl.replace st.memory.data cell (VInt !acc);
+              if cell >= st.memory.size then st.memory.size <- cell + 1
+            done
+          done;
+          true
       end
     end
   | VECDOT (rd, rs_a, rs_b, rs_n) ->
@@ -1609,14 +1822,19 @@ let exec_one st op =
           | Some v -> to_z v
           | None -> Z.zero
         in
-        let acc = ref Z.zero in
-        for i = 0 to n - 1 do
-          let av = mem_get (a_addr + i) in
-          let bv = mem_get (b_addr + i) in
-          acc := Z.add !acc (Z.mul av bv)
-        done;
-        setr st rd (VInt !acc);
-        true
+        let operands index =
+          mem_get (a_addr + index), mem_get (b_addr + index)
+        in
+        match prepare_int_work st Int_work.Mul n operands with
+        | None -> revert st
+        | Some values ->
+          let acc = ref Z.zero in
+          for i = 0 to n - 1 do
+            let av, bv = int_values values i operands in
+            acc := Z.add !acc (Z.mul av bv)
+          done;
+          setr st rd (VInt !acc);
+          true
       end
     end
   | VECDOT_Q16 (rd, rs_a, rs_b, rs_n) ->
@@ -1872,17 +2090,29 @@ let exec_one st op =
     if n <= 0 || n > 1048576 then revert st
     else begin
       if not (add_dyn_effort st (n / 2)) then revert st
-      else begin
-        for i = 0 to n - 1 do
-          let a_z = match Hashtbl.find_opt st.memory.data (dst + i) with
-            | Some v -> to_z v | None -> Z.zero in
-          let b_z = match Hashtbl.find_opt st.memory.data (src + i) with
-            | Some v -> to_z v | None -> Z.zero in
-          Hashtbl.replace st.memory.data (dst + i)
-            (VInt (Fixed_q16.trunc_mul a_z b_z))
-        done;
-        true
-      end
+      else
+        let operands index =
+          let first =
+            match Hashtbl.find_opt st.memory.data (dst + index) with
+            | Some value -> to_z value
+            | None -> Z.zero
+          in
+          let second =
+            match Hashtbl.find_opt st.memory.data (src + index) with
+            | Some value -> to_z value
+            | None -> Z.zero
+          in
+          first, second
+        in
+        match prepare_int_work st Int_work.Mul n operands with
+        | None -> revert st
+        | Some values ->
+          for i = 0 to n - 1 do
+            let first, second = int_values values i operands in
+            Hashtbl.replace st.memory.data (dst + i)
+              (VInt (Fixed_q16.trunc_mul first second))
+          done;
+          true
     end
   | ELEMWISE_MUL_Q16 (rs_dst, rs_src, rs_n) ->
     (match read_int st rs_dst, read_int st rs_src, read_int st rs_n with
@@ -1908,6 +2138,9 @@ let exec_one st op =
     else if off < 0 || off + n > slen then revert st
     else begin
       if not (add_dyn_effort st (n / 2)) then revert st
+      else if not
+          (charge_same_int_work st Int_work.Mul n Z.zero scale_z) then
+        revert st
       else begin
         for i = 0 to n - 1 do
           let b = Char.code src_str.[off + i] in
@@ -1925,16 +2158,29 @@ let exec_one st op =
     if n <= 0 || n > 1_048_576 then revert st
     else begin
       if not (add_dyn_effort st (n / 4)) then revert st
-      else begin
-        for i = 0 to n - 1 do
-          let a_z = match Hashtbl.find_opt st.memory.data (dst + i) with
-            | Some v -> to_z v | None -> Z.zero in
-          let b_z = match Hashtbl.find_opt st.memory.data (src + i) with
-            | Some v -> to_z v | None -> Z.zero in
-          Hashtbl.replace st.memory.data (dst + i) (VInt (Z.add a_z b_z))
-        done;
-        true
-      end
+      else
+        let operands index =
+          let first =
+            match Hashtbl.find_opt st.memory.data (dst + index) with
+            | Some value -> to_z value
+            | None -> Z.zero
+          in
+          let second =
+            match Hashtbl.find_opt st.memory.data (src + index) with
+            | Some value -> to_z value
+            | None -> Z.zero
+          in
+          first, second
+        in
+        match prepare_int_work st Int_work.Add n operands with
+        | None -> revert st
+        | Some values ->
+          for i = 0 to n - 1 do
+            let first, second = int_values values i operands in
+            Hashtbl.replace st.memory.data (dst + i)
+              (VInt (Z.add first second))
+          done;
+          true
     end
   | RESIDUAL_ADD_Q16 (rs_dst, rs_src, rs_n) ->
     (match read_int st rs_dst, read_int st rs_src, read_int st rs_n with
@@ -2014,6 +2260,9 @@ let exec_one st op =
         if off < 0 || off + n > dlen then revert st
         else begin
           if not (add_dyn_effort st (n + dlen / 4)) then revert st
+          else if not
+              (charge_same_int_work st Int_work.Mul n Z.zero scale_z) then
+            revert st
           else begin
             for i = 0 to n - 1 do
               let b = Char.code decoded.[off + i] in
@@ -2585,6 +2834,11 @@ let exec_one st op =
     st.undo_stack <- UndoMarker st.undo_id :: st.undo_stack;
     true
   | ROLLBACK ->
+    let rec remove cap left = function
+      | [] -> List.rev left
+      | value :: rest when cap_equal cap value -> List.rev_append left rest
+      | value :: rest -> remove cap (value :: left) rest
+    in
     let rec restore = function
       | [] -> []
       | UndoMarker _ :: rest -> rest
@@ -2592,16 +2846,27 @@ let exec_one st op =
         storage_replace st k v; restore rest
       | UndoWrite (k, None) :: rest ->
         storage_remove st k; restore rest
+      | UndoClose cap :: rest ->
+        st.closes <- remove cap [] st.closes;
+        restore rest
     in
     st.undo_stack <- restore st.undo_stack;
     true
   | COMMIT ->
-    let rec discard = function
-      | [] -> []
-      | UndoMarker _ :: rest -> rest
-      | _ :: rest -> discard rest
+    let rec has_marker = function
+      | [] -> false
+      | UndoMarker _ :: _ -> true
+      | UndoWrite _ :: rest | UndoClose _ :: rest -> has_marker rest
     in
-    st.undo_stack <- discard st.undo_stack;
+    let rec discard undo = function
+      | [] -> []
+      | UndoMarker _ :: rest ->
+        if st.ctx.point_ops && has_marker rest then List.rev_append undo rest
+        else rest
+      | (UndoWrite _ | UndoClose _) as entry :: rest ->
+        discard (entry :: undo) rest
+    in
+    st.undo_stack <- discard [] st.undo_stack;
     true
   | EMIT (event, regs_list) ->
     if List.length !(st.logs) >= 256 then revert st
@@ -2611,7 +2876,16 @@ let exec_one st op =
                :: !(st.logs);
     true
   | CONCAT (rd, rs1, rs2) ->
-    setr st rd (VString (to_string (getr st rs1) ^ to_string (getr st rs2))); true
+    let left = getr st rs1 in
+    let right = getr st rs2 in
+    let value = to_string left ^ to_string right in
+    let out =
+      match st.byte_result, left, right with
+      | Typed_bytes, VBytes _, VBytes _ -> VBytes value
+      | Typed_bytes, _, _ | String_bytes, _, _ -> VString value
+    in
+    setr st rd out;
+    true
   | STRLEN (rd, rs) ->
     setr st rd (VInt (Z.of_int (String.length (to_string (getr st rs))))); true
   | ASSERT rs ->
@@ -2760,6 +3034,7 @@ let exec_one st op =
              | None -> Fhe_rejected
              | Some proof ->
                Octra_core.Pvac_verify_worker.try_verify_range_sync_classified
+                 ~strict:true
                  ~pubkey:(encoded_worker_pubkey pk)
                  ~cipher:(encoded_worker_cipher ct)
                  ~proof
@@ -2828,6 +3103,7 @@ let exec_one st op =
                with
                | Some proof, Some commitment ->
                  Octra_core.Pvac_verify_worker.try_verify_claim_sync_classified
+                   ~strict:true
                    ~pubkey:(encoded_worker_pubkey pk)
                    ~cipher:(encoded_worker_cipher ct)
                    ~proof
@@ -2860,6 +3136,41 @@ let exec_one st op =
             setr st rd (VString (Base64.encode_exn (Bytes.to_string result))); true
           with _ -> revert st)
        | _ -> revert st)
+  | (FHE_PEDERSEN_ADD (rd, rleft, rright)
+    | FHE_PEDERSEN_SUB (rd, rleft, rright)) as point_op ->
+    if not st.ctx.point_ops
+        || not (st.ctx.allow_fhe_capability Fhe_pedersen_cap) then
+      revert st
+    else
+      (match to_bytes (getr st rleft), to_bytes (getr st rright) with
+       | Some left, Some right ->
+         (match decode_raw_or_b64_len 32 left, decode_raw_or_b64_len 32 right with
+          | Some left_raw, Some right_raw ->
+            (try
+               let combine =
+                 match point_op with
+                 | FHE_PEDERSEN_ADD _ -> Pvac_ffi.pedersen_add
+                 | FHE_PEDERSEN_SUB _ -> Pvac_ffi.pedersen_sub
+                 | _ -> assert false
+               in
+               let result =
+                 combine (Bytes.of_string left_raw) (Bytes.of_string right_raw)
+               in
+               setr st rd (VString (Base64.encode_exn (Bytes.to_string result)));
+               true
+             with _ -> revert st)
+          | _ -> revert st)
+       | _ -> revert st)
+  | FHE_PEDERSEN_IDENTITY rd ->
+    if not st.ctx.point_ops
+        || not (st.ctx.allow_fhe_capability Fhe_pedersen_cap) then
+      revert st
+    else
+      (try
+         let result = Pvac_ffi.pedersen_identity () in
+         setr st rd (VString (Base64.encode_exn (Bytes.to_string result)));
+         true
+       with _ -> revert st)
   | FHE_SER (rd, rct) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_serde_cap) then
       revert st
@@ -2883,7 +3194,12 @@ let exec_one st op =
            revert st
          else
            (try
-              let ct = Pvac_ffi.deserialize_cipher (Bytes.of_string raw) in
+              let ct =
+                Pvac_ffi.deserialize_cipher
+                  ~strict:st.ctx.point_ops
+                  ~cap:(st.is_view || st.ctx.point_ops)
+                  (Bytes.of_string raw)
+              in
               setr st rd (VCipher ct);
               true
             with _ ->
@@ -2948,8 +3264,35 @@ let run state program =
   | Failure _
   | Not_found
   | Division_by_zero ->
+    state.closes <- [];
     state.reverted <- true;
     false
+
+let refuse state =
+  state.closes <- [];
+  state.reverted <- true;
+  Refused
+
+let step state program =
+  try
+    let len = Array.length program in
+    if state.reverted then Refused
+    else if state.pc < 0 then refuse state
+    else if state.pc >= len then Finished
+    else
+      let op = program.(state.pc) in
+      state.pc <- state.pc + 1;
+      if not (exec_one state op) then state.pc <- len;
+      if state.reverted then Refused
+      else if state.pc >= len then Finished
+      else Running
+  with
+  | Z.Overflow
+  | Invalid_argument _
+  | Failure _
+  | Not_found
+  | Division_by_zero ->
+    refuse state
 
 module Verifier = struct
   type err =
@@ -2960,6 +3303,8 @@ module Verifier = struct
     | CodeTooLarge of int
     | EmptyCode
     | ReservedKey of int * string
+    | CapabilityLiteral of int
+    | CapabilityKind of int * Z.t
 
   let max_size = 33_554_432
 
@@ -2972,6 +3317,11 @@ module Verifier = struct
   let check_reg_span pc base count =
     if not (valid_reg_span base count) then
       Some (InvalidRegSpan (pc, base, count))
+    else None
+
+  let check_cap pc kind =
+    if Z.sign kind < 0 || Z.gt kind (Z.of_int 1_000_000) then
+      Some (CapabilityKind (pc, kind))
     else None
 
   let verify code =
@@ -3001,6 +3351,13 @@ module Verifier = struct
             | SLOADK (d,s) | SSTOREK (d,s) | SPAWN (d,s)
             | STRLEN (d,s) -> check_regs pc [d;s]
             | SDELK s -> check_reg pc s
+            | CAP_CHECK (kind, src) | CAP_CLOSE (kind, src) ->
+              begin
+                match check_cap pc kind with
+                | Some error -> Some error
+                | None -> check_reg pc src
+              end
+            | LDI (_, VCap _) -> Some (CapabilityLiteral pc)
             | LDI (d,_) | SLOAD (d,_) | MLOAD (d,_)
             | CALLER d | ORIGIN d | SELF d | EPOCH d | EPOCH_TIME d | VALUE d
             | TREEHASH d | NODEID d | TXHASH d | EFFORT d -> check_reg pc d
@@ -3026,7 +3383,10 @@ module Verifier = struct
               check_regs pc [d;pk;a;b]
             | GROTH16_VERIFY_BN254 (d,vk,pf,inp) -> check_regs pc [d;vk;pf;inp]
             | FHE_VERIFY_BOUND (d,pk,ct,pf,cm) -> check_regs pc [d;pk;ct;pf;cm]
-            | FHE_COMMIT (d,pk,ct) | FHE_PEDERSEN (d,pk,ct) -> check_regs pc [d;pk;ct]
+            | FHE_COMMIT (d,pk,ct) | FHE_PEDERSEN (d,pk,ct)
+            | FHE_PEDERSEN_ADD (d,pk,ct)
+            | FHE_PEDERSEN_SUB (d,pk,ct) -> check_regs pc [d;pk;ct]
+            | FHE_PEDERSEN_IDENTITY d -> check_regs pc [d]
             | FHE_LOAD_PK (d,s) | FHE_SER (d,s) | FHE_DESER (d,s)
             | FHE_SER_PK (d,s) | FHE_DESER_PK (d,s)
             | MLOADR (d,s) | MSTORER (d,s) -> check_regs pc [d;s]

@@ -13,7 +13,13 @@ type partition = {
   rejections : rejection list;
 }
 
+type item =
+  | Preverify of string
+  | Rejection of rejection
+
 val encode_rejection : rejection -> string
+val parse : string -> (item, string) result
+val split : string list -> (partition, string) result
 val split_admit : string list -> (partition, string) result
 val build :
   candidates:Transaction.t list ->
@@ -23,6 +29,10 @@ val merge :
   confirmed:Transaction.t list ->
   rejections:rejection list ->
   (Transaction.t list, string) result
+val decode :
+  confirmed:Transaction.t list ->
+  string list ->
+  (partition, string) result
 val decode_admit :
   confirmed:Transaction.t list ->
   string list ->

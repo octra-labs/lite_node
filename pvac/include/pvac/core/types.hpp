@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 #include <array>
+#include <algorithm>
 
 #include "field.hpp"
 #include "bitvec.hpp"
@@ -183,6 +184,21 @@ inline bool is_valid_cipher_shape(const Cipher& cipher) {
             return false;
         if (edge.w.size() != cipher.slots)
             return false;
+    }
+    return true;
+}
+
+inline bool cipher_mul_depth(const Cipher& cipher, size_t& depth) {
+    if (!is_valid_cipher_shape(cipher))
+        return false;
+    std::vector<size_t> layers(cipher.L.size(), 0);
+    depth = 0;
+    for (size_t layer_id = 0; layer_id < cipher.L.size(); ++layer_id) {
+        const auto& layer = cipher.L[layer_id];
+        if (layer.rule == RRule::PROD) {
+            layers[layer_id] = std::max(layers[layer.pa], layers[layer.pb]) + 1;
+            depth = std::max(depth, layers[layer_id]);
+        }
     }
     return true;
 }

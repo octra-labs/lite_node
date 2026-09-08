@@ -43,7 +43,7 @@ type config = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
-  migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
+  migration_admissions : Octra_core.Pvac_migration_admission.t;
   rules : Octra_core.Rule_graph.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
@@ -67,7 +67,7 @@ type ctx = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
-  migration_entitlements : Octra_core.Pvac_migration_entitlement.t;
+  migration_admissions : Octra_core.Pvac_migration_admission.t;
   rules : Octra_core.Rule_graph.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t;
@@ -241,6 +241,11 @@ let account_lwt_read =
 let store_label_read =
   Rpc_read_adapters.store_label_read ~store:ctx_store
 
+let store_chaindata_read =
+  Rpc_read_adapters.store_chaindata_read
+    ~store:ctx_store
+    ~chaindata:ctx_chaindata
+
 let chaindata_read =
   Rpc_read_adapters.chaindata_read ~chaindata:ctx_chaindata
 
@@ -259,10 +264,11 @@ let program_info_read params ctx =
     ~ledger:ctx.ledger
     params
 
-let program_list_read _params ctx =
-  Octra_vm.Contract_rpc.list_contracts
+let program_list_read params ctx =
+  Octra_vm.Contract_rpc.list_contracts_params
     ~store:ctx.store
     ~ledger:ctx.ledger
+    params
 
 let circle_asset_public_read f params ctx =
   f
@@ -355,7 +361,7 @@ let octra_pvac_migration_status params ctx =
       Account_read_rpc.pvac_migration_status
         ctx.pvac_status
         ctx.store
-        ctx.migration_entitlements
+        ctx.migration_admissions
         ~epoch:!(ctx.current_epoch)
         ~owner_migration_mode
         ~addr
@@ -417,9 +423,16 @@ let circle_dispatch =
 let program_dispatch =
   Program_read_rpc.dispatch Program_read_rpc.{
     store_label_read;
+    store_chaindata_read;
     chaindata_read;
     no_ctx;
     json0_read;
+    compile_read = (fun handler params ctx ->
+      let point_ops =
+        Octra_core.Rule_graph.standard_at ~chain_id:ctx.chain_id
+          ~epoch:!(ctx.current_epoch) = Octra_core.Rule_graph.Active
+      in
+      handler ~point_ops params);
     program_info = program_info_read;
     program_call = contract_call;
     program_list = program_list_read;
@@ -536,7 +549,7 @@ let start (cfg : config) =
     validator_view_sk = cfg.validator_view_sk;
     validator_view_pub = cfg.validator_view_pub;
     program_trust = cfg.program_trust;
-    migration_entitlements = cfg.migration_entitlements;
+    migration_admissions = cfg.migration_admissions;
     rules = cfg.rules;
     consensus_driver_ref = cfg.consensus_driver_ref;
     resource_compute = cfg.resource_compute;

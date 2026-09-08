@@ -63,6 +63,9 @@ let account_lwt_read ~with_account f params ctx =
 let store_label_read ~store f params ctx =
   f ~store:(store ctx) params
 
+let store_chaindata_read ~store ~chaindata f params ctx =
+  f ~store:(store ctx) ~chaindata:(chaindata ctx) params
+
 let chaindata_read ~chaindata f params ctx =
   f ~chaindata:(chaindata ctx) params
 

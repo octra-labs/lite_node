@@ -29,7 +29,7 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
     ~validator_address
 
 let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
-    ~gc_enabled ~gc_running =
+    ~gc_enabled ~gc_running ~gc_need =
   Rpc_view.epoch_tags
     ~count
     ~min_epoch
@@ -38,6 +38,7 @@ let epoch_tags ~count ~min_epoch ~max_epoch ~keep_epochs ~split_epoch
     ~split_epoch
     ~gc_enabled
     ~gc_running
+    ~gc_need
 
 let enrollment_epoch = function
   | None -> `Null

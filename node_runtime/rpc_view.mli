@@ -139,6 +139,7 @@ val epoch_tags :
   split_epoch:int option ->
   gc_enabled:bool ->
   gc_running:bool ->
+  gc_need:int64 option ->
   Yojson.Safe.t
 
 val balance :
@@ -239,7 +240,7 @@ val pvac_migration_status :
   epoch:int ->
   owner_migration_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Pvac_migration.status ->
-  Octra_core.Pvac_migration_entitlement.t ->
+  Octra_core.Pvac_migration_admission.t ->
   Yojson.Safe.t
 
 val encrypted_cipher :

@@ -63,18 +63,18 @@ type loaded = {
   profile : Admission.profile;
 }
 
-let decode_loaded ?(trusted = []) raw =
+let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
   try
-    match Admission.decode_deploy ~trusted raw with
+    match Admission.decode_deploy ~trusted ~point_ops raw with
     | Ok admitted ->
       Some { code = Admission.code admitted; profile = Admission.profile admitted }
     | Error _ -> None
   with _ -> None
 
-let decode_loaded_for_admission ?(trusted = []) admission raw =
+let decode_loaded_for_admission ?(trusted = []) ?(point_ops = false) admission raw =
   if String.equal admission "source" then
     try
-      match Admission.decode_program_source raw with
+      match Admission.decode_program_source ~point_ops raw with
       | Ok admitted ->
         Some {
           code = Admission.code admitted;
@@ -83,9 +83,9 @@ let decode_loaded_for_admission ?(trusted = []) admission raw =
       | Error _ -> None
     with _ -> None
   else
-    decode_loaded ~trusted raw
+    decode_loaded ~trusted ~point_ops raw
 
-let load_loaded ?(trusted = []) store contract_addr =
+let load_loaded ?(trusted = []) ?(point_ops = false) store contract_addr =
   match run_s (Octra_core.Store_irmin.load_bytecode store contract_addr) with
   | Some b64 ->
     let admission =
@@ -96,13 +96,15 @@ let load_loaded ?(trusted = []) store contract_addr =
     (try
        decode_loaded_for_admission
          ~trusted
+         ~point_ops
          admission
          (Base64.decode_exn b64)
      with _ -> None)
   | None -> None
 
-let load_bytecode ?(trusted = []) store contract_addr =
-  Option.map (fun loaded -> loaded.code) (load_loaded ~trusted store contract_addr)
+let load_bytecode ?(trusted = []) ?(point_ops = false) store contract_addr =
+  Option.map (fun loaded -> loaded.code)
+    (load_loaded ~trusted ~point_ops store contract_addr)
 
 let load_storage store contract_addr =
   run_s (Octra_core.Store_irmin.load_contract_storage store contract_addr)
@@ -287,11 +289,11 @@ let storage_kinds = function
 let count_storage_writes state =
   List.fold_left (fun acc e -> match e with
     | Contract_vm.UndoWrite _ -> acc + 1
-    | Contract_vm.UndoMarker _ -> acc
+    | Contract_vm.UndoMarker _ | Contract_vm.UndoClose _ -> acc
   ) 0 state.Contract_vm.undo_stack
 
-let setup_call_state_values ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
-    ?(strict_values=false) ?(storage_kinds=[])
+let setup_call_state_values ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
+    ?(strict_values = false) ?(storage_kinds = [])
     ~caller ~address ~value ~storage_tbl ~method_name ~params () =
   let state = Contract_vm.create_state ~ctx ~depth ~limit ~strict_values
     ~storage_kinds
@@ -302,7 +304,7 @@ let setup_call_state_values ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_
   List.iteri (fun i value -> Hashtbl.add state.memory.data (1001 + i) value) params;
   state
 
-let setup_call_state ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
+let setup_call_state ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
     ~caller ~address ~value ~storage_tbl ~method_name ~params () =
   setup_call_state_values ~ctx ~depth ~limit ~caller ~address ~value ~storage_tbl
     ~method_name ~params:(List.map parse_param params) ()
@@ -342,8 +344,8 @@ let exec_result_to_result r =
   else
     Error (trim_error (Option.value r.error ~default:"execution failed"))
 
-let deploy ~journal ?(trusted = []) ?admitted ?(ctx=Contract_vm.default_ctx)
-    ?(params=[]) store deployer ctype _code bytecode_raw nonce =
+let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
+    ?(params = []) store deployer ctype _code bytecode_raw nonce =
   let addr = addr_from_code bytecode_raw deployer nonce in
   let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
   Octra_log.info "program" "event = deploy_start addr = %s deployer = %s size = %d hash = %s"
@@ -352,8 +354,10 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx=Contract_vm.default_ctx)
   let source_bound = Option.is_some admitted in
   let admission_result =
     match admitted with
-    | Some value -> Ok value
-    | None -> Admission.decode_deploy ~trusted bytecode_raw
+    | Some value ->
+      Result.map (fun () -> value)
+        (Admission.check_standard ~point_ops:ctx.point_ops value)
+    | None -> Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw
   in
   match admission_result with
   | Error error ->
@@ -419,9 +423,9 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx=Contract_vm.default_ctx)
         (addr, result)
       )
 
-let deploy_internal ~journal ?(trusted = []) ~ctx ~depth ?(params=[]) store ~deployer
+let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(params = []) store ~deployer
     ~bytecode_raw ~nonce =
-  match Admission.decode_deploy ~trusted bytecode_raw with
+  match Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw with
   | Error (Admission.Decode_error error) -> Error (Printf.sprintf "bad bytecode: %s" error)
   | Error (Admission.Verify_error _) -> Error "verify failed"
   | Error (Admission.Unsafe_error error) -> Error error
@@ -475,7 +479,7 @@ let deploy_internal ~journal ?(trusted = []) ~ctx ~depth ?(params=[]) store ~dep
             Error "constructor failed"
           )
 
-let upgrade ~journal ?(trusted = []) store ~address ~caller
+let upgrade ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) store ~address ~caller
     ~expected_code_hash ~bytecode_raw =
   if Program_journal.has_upgrade journal address then
     Error "program upgrade already staged"
@@ -491,7 +495,7 @@ let upgrade ~journal ?(trusted = []) store ~address ~caller
       Error "program upgrade code hash mismatch"
     | Some meta ->
       begin
-        match Admission.decode_program ~trusted bytecode_raw with
+        match Admission.decode_program ~trusted ~point_ops:ctx.point_ops bytecode_raw with
         | Error error ->
           Error (Admission.error_message error)
         | Ok _ ->
@@ -522,12 +526,13 @@ let load_storage_with_overlay journal store program_addr =
   | Some storage -> storage
   | None -> load_storage store program_addr
 
-let load_loaded_with_overlay ?(trusted = []) journal store program_addr =
+let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store program_addr =
   match Program_journal.find_upgrade journal program_addr with
   | Some upgrade ->
     (try
        decode_loaded_for_admission
          ~trusted
+         ~point_ops
          upgrade.admission
          (Base64.decode_exn upgrade.bytecode_b64)
      with _ -> None)
@@ -537,25 +542,27 @@ let load_loaded_with_overlay ?(trusted = []) journal store program_addr =
       (try
          decode_loaded_for_admission
            ~trusted
+           ~point_ops
            deploy.admission
            (Base64.decode_exn deploy.bytecode_b64)
        with _ -> None)
-    | None -> load_loaded ~trusted store program_addr
+    | None -> load_loaded ~trusted ~point_ops store program_addr
 
-let load_bytecode_with_overlay ?(trusted = []) journal store program_addr =
+let load_bytecode_with_overlay ?(trusted = []) ?(point_ops = false) journal store program_addr =
   Option.map (fun loaded -> loaded.code)
-    (load_loaded_with_overlay ~trusted journal store program_addr)
+    (load_loaded_with_overlay ~trusted ~point_ops journal store program_addr)
 
 let contract_exists_with_overlay journal store program_addr =
   if Program_journal.has_deploy journal program_addr then true
   else run_s (Octra_core.Store_irmin.contract_exists store program_addr)
 
-let execute_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=1_000_000)
+let execute_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
     ~journal store program_addr method_name params caller value =
   Octra_log.info "program"
     "event = call_start addr = %s method = %s depth = %d limit = %d"
     program_addr method_name depth limit;
-  match load_loaded_with_overlay ~trusted journal store program_addr with
+  match load_loaded_with_overlay
+    ~trusted ~point_ops:ctx.point_ops journal store program_addr with
   | None ->
     { success = false; return_value = None; effort_used = 0;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }
@@ -589,8 +596,8 @@ let execute_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(lim
              ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
            run_fixed_from_dispatcher state fixed)
 
-let execute_view_call ?(trusted = []) ?(ctx=Contract_vm.default_ctx) ?(depth=0) ?(limit=2_000_000_000) store contract_addr method_name params caller =
-  match load_loaded ~trusted store contract_addr with
+let execute_view_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000) store contract_addr method_name params caller =
+  match load_loaded ~trusted ~point_ops:ctx.point_ops store contract_addr with
   | None ->
     { success = false; return_value = None; effort_used = 0;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }

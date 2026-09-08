@@ -250,6 +250,7 @@ let native_execute ~model ~program ~storage (request : Provider_rpc.execute) =
             ~hfhe_caps:[]
             ~hfhe_pubkeys:[]
             ~hfhe_active_key:None
+            ~hfhe_strict:true
             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
             ~public_reads:[]
             ~fuel_limit:2_000_000_000 in

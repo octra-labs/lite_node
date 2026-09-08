@@ -14,6 +14,7 @@ type circle_cell = {
   proof_kind : circle_proof;
   proof : string;
   amount_commitment : string;
+  strict : bool;
 }
 
 type request =
@@ -25,29 +26,34 @@ type request =
       proof : string;
       commitment : string;
       blinding : string;
+      strict : bool;
     }
   | Claim of {
       pubkey : string;
       cipher : string;
       proof : string;
       commitment : string;
+      strict : bool;
     }
   | Key_switch_claim of {
       pubkey : string;
       cipher : string;
       proof : string;
       commitment : string;
+      strict : bool;
     }
   | Historical_migration_claim of {
       pubkey : string;
       cipher : string;
       proof : string;
       commitment : string;
+      strict : bool;
     }
   | Range of {
       pubkey : string;
       cipher : string;
       proof : string;
+      strict : bool;
     }
   | Zero of {
       pubkey : string;
@@ -59,6 +65,7 @@ type request =
       cipher : string;
       proof : string;
       commitment : string;
+      strict : bool;
     }
   | Circle_cell of circle_cell
 
@@ -97,6 +104,12 @@ let bool_field name fields =
   bind (field name fields) (function
     | `Bool value -> Ok value
     | _ -> Error (name ^ "_invalid"))
+
+let strict_field fields =
+  match List.assoc_opt "strict" fields with
+  | None -> Ok false
+  | Some (`Bool value) -> Ok value
+  | Some _ -> Error "strict_invalid"
 
 let lower_hex_char = function
   | '0' .. '9'
@@ -145,6 +158,10 @@ let request_fields request =
       "pubkey", `String (encode_pubkey pubkey);
     ]
   in
+  let strict value =
+    if value then ["strict", `Bool true]
+    else []
+  in
   match request with
   | Ping ->
     [
@@ -158,30 +175,30 @@ let request_fields request =
       "proof", `String value.proof;
       "commitment", `String value.commitment;
       "blinding", `String value.blinding;
-    ]
+    ] @ strict value.strict
   | Claim value ->
     common "claim" value.pubkey @ [
       "cipher", `String value.cipher;
       "proof", `String value.proof;
       "commitment", `String value.commitment;
-    ]
+    ] @ strict value.strict
   | Key_switch_claim value ->
     common "key_switch_claim" value.pubkey @ [
       "cipher", `String value.cipher;
       "proof", `String value.proof;
       "commitment", `String value.commitment;
-    ]
+    ] @ strict value.strict
   | Historical_migration_claim value ->
     common "historical_migration_claim" value.pubkey @ [
       "cipher", `String value.cipher;
       "proof", `String value.proof;
       "commitment", `String value.commitment;
-    ]
+    ] @ strict value.strict
   | Range value ->
     common "range" value.pubkey @ [
       "cipher", `String value.cipher;
       "proof", `String value.proof;
-    ]
+    ] @ strict value.strict
   | Zero value ->
     common "zero" value.pubkey @ [
       "cipher", `String value.cipher;
@@ -192,7 +209,7 @@ let request_fields request =
       "cipher", `String value.cipher;
       "proof", `String value.proof;
       "commitment", `String value.commitment;
-    ]
+    ] @ strict value.strict
   | Circle_cell value ->
     common "circle_cell" value.pubkey @ [
       "cipher", `String value.cipher;
@@ -200,16 +217,16 @@ let request_fields request =
       "proof_kind", `String (circle_proof_name value.proof_kind);
       "proof", `String value.proof;
       "amount_commitment", `String value.amount_commitment;
-    ]
+    ] @ strict value.strict
 
 let request_json request =
   `Assoc (request_fields request)
 
-let canonical_request request =
+let request_bytes request =
   Yojson.Safe.to_string (request_json request)
 
 let request_hash request =
-  Digestif.SHA256.digest_string (schema ^ "\000" ^ canonical_request request)
+  Digestif.SHA256.digest_string (schema ^ "\000" ^ request_bytes request)
   |> Digestif.SHA256.to_hex
 
 let parse_amount fields =
@@ -239,6 +256,7 @@ let request_of_json = function
           bind (parse_value "proof" fields) (fun proof ->
           bind (parse_value "commitment" fields) (fun commitment ->
           bind (parse_value "blinding" fields) (fun blinding ->
+          bind (strict_field fields) (fun strict ->
             Ok
               (Encrypt {
                  pubkey;
@@ -247,46 +265,53 @@ let request_of_json = function
                  proof;
                  commitment;
                  blinding;
-               }))))))))
+                 strict;
+               })))))))))
         | "claim" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
           bind (parse_value "cipher" fields) (fun cipher ->
           bind (parse_value "proof" fields) (fun proof ->
           bind (parse_value "commitment" fields) (fun commitment ->
-            Ok (Claim { pubkey; cipher; proof; commitment }))))))
+          bind (strict_field fields) (fun strict ->
+            Ok (Claim { pubkey; cipher; proof; commitment; strict })))))))
         | "key_switch_claim" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
           bind (parse_value "cipher" fields) (fun cipher ->
           bind (parse_value "proof" fields) (fun proof ->
           bind (parse_value "commitment" fields) (fun commitment ->
+          bind (strict_field fields) (fun strict ->
             Ok
               (Key_switch_claim {
                  pubkey;
                  cipher;
                  proof;
                  commitment;
-               }))))))
+                 strict;
+               })))))))
         | "historical_migration_claim" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
           bind (parse_value "cipher" fields) (fun cipher ->
           bind (parse_value "proof" fields) (fun proof ->
           bind (parse_value "commitment" fields) (fun commitment ->
+          bind (strict_field fields) (fun strict ->
             Ok
               (Historical_migration_claim {
                  pubkey;
                  cipher;
                  proof;
                  commitment;
-               }))))))
+                 strict;
+               })))))))
         | "range" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
           bind (parse_value "cipher" fields) (fun cipher ->
           bind (parse_value "proof" fields) (fun proof ->
-            Ok (Range { pubkey; cipher; proof })))))
+          bind (strict_field fields) (fun strict ->
+            Ok (Range { pubkey; cipher; proof; strict }))))))
         | "zero" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
@@ -299,7 +324,9 @@ let request_of_json = function
           bind (parse_value "cipher" fields) (fun cipher ->
           bind (parse_value "proof" fields) (fun proof ->
           bind (parse_value "commitment" fields) (fun commitment ->
-            Ok (Range_bound { pubkey; cipher; proof; commitment }))))))
+          bind (strict_field fields) (fun strict ->
+            Ok
+              (Range_bound { pubkey; cipher; proof; commitment; strict })))))))
         | "circle_cell" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
@@ -313,6 +340,7 @@ let request_of_json = function
           bind
             (parse_value "amount_commitment" fields)
             (fun amount_commitment ->
+          bind (strict_field fields) (fun strict ->
               Ok
                 (Circle_cell {
                    pubkey;
@@ -321,7 +349,8 @@ let request_of_json = function
                    proof_kind;
                    proof;
                    amount_commitment;
-                 })))))))))
+                   strict;
+                 }))))))))))
         | _ ->
           Error "op_invalid"))
   | _ ->

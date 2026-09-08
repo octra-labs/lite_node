@@ -31,43 +31,51 @@ let verifier_error = function
     "empty code"
   | Contract_vm.Verifier.ReservedKey (pc, _) ->
     Printf.sprintf "write to reserved key at pc %d" pc
+  | Contract_vm.Verifier.CapabilityLiteral pc ->
+    Printf.sprintf "capability literal at pc %d" pc
+  | Contract_vm.Verifier.CapabilityKind (pc, kind) ->
+    Printf.sprintf "capability kind %s at pc %d" (Z.to_string kind) pc
 
-let admit ~program code =
+let admit ~program ~point_ops code =
   match Contract_vm.Verifier.verify code with
   | Error err -> Error (Verify_error (verifier_error err))
   | Ok () ->
-    let policy_error =
-      if program then
-        Option.map
-          (fun hit -> `Consensus_unsafe hit)
-          (Opcode_policy.first_host_float code)
-      else
-        match Opcode_policy.legacy_error code with
-        | Some (Opcode_policy.Program_only hit) -> Some (`Program_only hit)
-        | Some (Opcode_policy.Consensus_unsafe hit) -> Some (`Consensus_unsafe hit)
-        | None -> None
-    in
-    match policy_error with
-    | Some (`Program_only hit) ->
-      Error (Unsafe_error (Opcode_policy.program_only_error_message hit))
-    | Some (`Consensus_unsafe hit) ->
-      Error (Unsafe_error (Opcode_policy.error_message hit))
+    match if point_ops then None else Opcode_policy.first_standard code with
+    | Some hit ->
+      Error (Unsafe_error (Opcode_policy.standard_error_message hit))
     | None ->
-      Ok {
-        admitted_code = Array.copy code;
-        admitted_effects = Program_effects.scan code;
-        profile = if program then Program Program_type_flow.empty_facts else Legacy;
-      }
+      let policy_error =
+        if program then
+          Option.map
+            (fun hit -> `Consensus_unsafe hit)
+            (Opcode_policy.first_host_float code)
+        else
+          match Opcode_policy.legacy_error code with
+          | Some (Opcode_policy.Program_only hit) -> Some (`Program_only hit)
+          | Some (Opcode_policy.Consensus_unsafe hit) -> Some (`Consensus_unsafe hit)
+          | None -> None
+      in
+      match policy_error with
+      | Some (`Program_only hit) ->
+        Error (Unsafe_error (Opcode_policy.program_only_error_message hit))
+      | Some (`Consensus_unsafe hit) ->
+        Error (Unsafe_error (Opcode_policy.error_message hit))
+      | None ->
+        Ok {
+          admitted_code = Array.copy code;
+          admitted_effects = Program_effects.scan code;
+          profile = if program then Program Program_type_flow.empty_facts else Legacy;
+        }
 
-let of_code code = admit ~program:false code
+let of_code ?(point_ops = false) code = admit ~program:false ~point_ops code
 
-let decode raw =
-  match Bytecode.decode raw with
+let decode ?(point_ops = false) raw =
+  match Bytecode.decode_image ~active:point_ops raw with
   | Error err -> Error (Decode_error err)
-  | Ok code -> of_code code
+  | Ok image -> of_code ~point_ops image.code
 
-let of_program ?(facts = Program_type_flow.empty_facts) code =
-  match admit ~program:true code with
+let of_program ?(point_ops = false) ?(facts = Program_type_flow.empty_facts) code =
+  match admit ~program:true ~point_ops code with
   | Error error -> Error error
   | Ok admitted ->
     (match Program_type_flow.check ~facts admitted.admitted_code with
@@ -329,31 +337,45 @@ let verify_program_cert ~attested ~trusted raw_code code raw =
     | _ -> Error "program certificate must be an object"
   with _ -> Error "invalid program certificate"
 
-let decode_program ?(trusted = []) raw =
+let decode_program ?(trusted = []) ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
   | Ok envelope ->
-    match Bytecode.decode envelope.code with
+    match Bytecode.decode_image ~active:point_ops envelope.code with
     | Error error -> Error (Decode_error error)
-    | Ok code ->
-      (match verify_program_cert ~attested:true ~trusted envelope.code code envelope.cert with
-       | Error error -> Error (Verify_error error)
-       | Ok facts -> of_program ~facts code)
+    | Ok image ->
+      match
+        verify_program_cert
+          ~attested:true
+          ~trusted
+          envelope.code
+          image.code
+          envelope.cert
+      with
+      | Error error -> Error (Verify_error error)
+      | Ok facts -> of_program ~point_ops ~facts image.code
 
-let decode_deploy ?(trusted = []) raw =
-  if Program_envelope.is_program raw then decode_program ~trusted raw
-  else decode raw
+let decode_deploy ?(trusted = []) ?(point_ops = false) raw =
+  if Program_envelope.is_program raw then decode_program ~trusted ~point_ops raw
+  else decode ~point_ops raw
 
-let decode_program_source raw =
+let decode_program_source ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
   | Ok envelope ->
-    match Bytecode.decode envelope.code with
+    match Bytecode.decode_image ~active:point_ops envelope.code with
     | Error error -> Error (Decode_error error)
-    | Ok code ->
-      (match verify_program_cert ~attested:false ~trusted:[] envelope.code code envelope.cert with
-       | Error error -> Error (Verify_error error)
-       | Ok facts -> of_program ~facts code)
+    | Ok image ->
+      match
+        verify_program_cert
+          ~attested:false
+          ~trusted:[]
+          envelope.code
+          image.code
+          envelope.cert
+      with
+      | Error error -> Error (Verify_error error)
+      | Ok facts -> of_program ~point_ops ~facts image.code
 
 let code admitted =
   Array.copy admitted.admitted_code
@@ -363,6 +385,11 @@ let effects admitted =
 
 let profile admitted =
   admitted.profile
+
+let check_standard ~point_ops admitted =
+  match if point_ops then None else Opcode_policy.first_standard admitted.admitted_code with
+  | None -> Ok ()
+  | Some hit -> Error (Unsafe_error (Opcode_policy.standard_error_message hit))
 
 let error_message = function
   | Decode_error message

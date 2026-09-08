@@ -77,7 +77,9 @@ let validator_view_pubkey ~validator_view_pub ~validator_address =
 let epoch_tags store =
   let open Lwt.Syntax in
   let* count, min_epoch, max_epoch = Store_irmin.epoch_tag_stats store in
-  let* split_epoch, gc_enabled, gc_running = Store_irmin.pack_gc_status store in
+  let* split_epoch, gc_enabled, gc_running, gc_need =
+    Store_irmin.pack_gc_status store
+  in
   ok
     (Status_rpc.epoch_tags
        ~count
@@ -86,7 +88,8 @@ let epoch_tags store =
        ~keep_epochs:Store_irmin.gc_keep_epochs
        ~split_epoch
        ~gc_enabled
-       ~gc_running)
+       ~gc_running
+       ~gc_need)
 
 let signed_root signer head =
   match head with

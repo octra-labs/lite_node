@@ -44,6 +44,17 @@ let program_only_opcode = function
   | VM.ARGMAX_Q16 _ -> Some "ARGMAX_Q16"
   | _ -> None
 
+let point_opcode = function
+  | VM.FHE_PEDERSEN_ADD _ -> Some "FHE_PEDERSEN_ADD"
+  | VM.FHE_PEDERSEN_SUB _ -> Some "FHE_PEDERSEN_SUB"
+  | VM.FHE_PEDERSEN_IDENTITY _ -> Some "FHE_PEDERSEN_IDENTITY"
+  | _ -> None
+
+let standard_opcode = function
+  | VM.CAP_CHECK _ -> Some "CAP_CHECK"
+  | VM.CAP_CLOSE _ -> Some "CAP_CLOSE"
+  | op -> point_opcode op
+
 let uses_host_float op =
   Option.is_some (host_float_opcode op)
 
@@ -75,6 +86,26 @@ let first_program_only code =
     code;
   !hit
 
+let first_point code =
+  let hit = ref None in
+  Array.iteri
+    (fun pc op ->
+      match !hit, point_opcode op with
+      | None, Some opcode -> hit := Some { pc; opcode }
+      | _ -> ())
+    code;
+  !hit
+
+let first_standard code =
+  let hit = ref None in
+  Array.iteri
+    (fun pc op ->
+      match !hit, standard_opcode op with
+      | None, Some opcode -> hit := Some { pc; opcode }
+      | _ -> ())
+    code;
+  !hit
+
 let require_legacy_safe code =
   match first_program_only code with
   | Some hit -> Error hit
@@ -96,3 +127,11 @@ let error_message hit =
 
 let program_only_error_message hit =
   Printf.sprintf "Program-only opcode %s at pc %d" hit.opcode hit.pc
+
+let point_error_message hit =
+  Printf.sprintf "Pedersen point opcode %s is not active at pc %d"
+    hit.opcode hit.pc
+
+let standard_error_message hit =
+  Printf.sprintf "standard opcode %s is not active at pc %d"
+    hit.opcode hit.pc

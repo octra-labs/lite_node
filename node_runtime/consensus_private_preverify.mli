@@ -7,6 +7,7 @@ val eligible : Octra_core.Transaction.t -> bool
 
 val create :
   field_policy:(unit -> Octra_core.Private_ledger.field_policy) ->
+  strict:(unit -> bool) ->
   result_policy:(unit -> Octra_core.Private_result_policy.t) ->
   Octra_core.Ledger.t ->
   t

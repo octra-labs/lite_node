@@ -195,7 +195,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
-    ~program_trust ~migration_entitlements ~rules ~chaindata
+    ~program_trust ~migration_admissions ~rules ~chaindata
     ~consensus_driver_ref
     ~epoch_visibility ~resource_compute ~validator_enrollment =
   let deps = Node_rpc_server.{
@@ -225,7 +225,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     validator_view_sk;
     validator_view_pub;
     program_trust;
-    migration_entitlements;
+    migration_admissions;
     rules;
     chaindata;
     consensus_driver_ref;
@@ -238,7 +238,7 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
     ~validator_view_sk ~validator_view_pub ~program_trust
-    ~migration_entitlements ~rules ~chaindata
+    ~migration_admissions ~rules ~chaindata
     ~consensus_driver_ref ~epoch_visibility ~resource_compute
     ~validator_enrollment () =
   start
@@ -258,7 +258,7 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~validator_view_sk
     ~validator_view_pub
     ~program_trust
-    ~migration_entitlements
+    ~migration_admissions
     ~rules
     ~chaindata
     ~consensus_driver_ref

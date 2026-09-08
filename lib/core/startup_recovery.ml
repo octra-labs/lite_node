@@ -326,8 +326,8 @@ let recover ~data_dir ~chaindata ~store =
       None
     | Head_manifest.Corrupt err ->
       pf "FATAL: HEAD.json present but unparseable: %s" err;
-      pf "op: restore HEAD.json from backup (the canonical visibility";
-      pf "pointer cannot be silently ignored once written) >>> REFUSING to start";
+      pf "op = restore HEAD.json from backup";
+      pf "status = refused reason = committed visibility pointer is invalid";
       exit 1
     | Head_manifest.Present h ->
       Head_manifest.set_cached h;

@@ -315,6 +315,10 @@ let validate_hello_finish ~(initiator : hello) ~(responder : hello)
     Result.Error "invalid Ed25519 signature on HELLO_FINISH"
   else Result.Ok ()
 
+let handshake_error = function
+  | Lwt_unix.Timeout -> "handshake timeout"
+  | exn -> Printf.sprintf "handshake failed: %s" (Printexc.to_string exn)
+
 let dial_handshake fd ~(my_hello : hello) ~allowed_pubkeys ~sign_fn =
   let open Lwt.Syntax in
   Lwt.catch
@@ -322,7 +326,7 @@ let dial_handshake fd ~(my_hello : hello) ~allowed_pubkeys ~sign_fn =
       let payload = encode_hello my_hello in
       let* () = P2p_frame.write_frame fd
         { msg_type = P2p_frame.msg_hello; payload } in
-      let* frame = P2p_frame.read_frame fd in
+      let* frame = P2p_frame.read_handshake_frame fd in
       if frame.msg_type <> P2p_frame.msg_hello_ack then
         Lwt.return (Error (Printf.sprintf "expected HELLO_ACK, got 0x%02x" frame.msg_type))
       else
@@ -337,14 +341,13 @@ let dial_handshake fd ~(my_hello : hello) ~allowed_pubkeys ~sign_fn =
             payload = encode_hello_finish finish;
           } in
           Lwt.return (Ok ack.hello))
-    (fun exn ->
-      Lwt.return (Error (Printf.sprintf "handshake failed: %s" (Printexc.to_string exn))))
+    (fun exn -> Lwt.return (Error (handshake_error exn)))
 
 let accept_handshake fd ~(my_hello : hello) ~allowed_pubkeys ~sign_fn =
   let open Lwt.Syntax in
   Lwt.catch
     (fun () ->
-      let* frame = P2p_frame.read_frame fd in
+      let* frame = P2p_frame.read_handshake_frame fd in
       if frame.msg_type <> P2p_frame.msg_hello then
         Lwt.return (Error (Printf.sprintf "expected HELLO, got 0x%02x" frame.msg_type))
       else
@@ -359,7 +362,7 @@ let accept_handshake fd ~(my_hello : hello) ~allowed_pubkeys ~sign_fn =
           let* () = P2p_frame.write_frame fd
             { msg_type = P2p_frame.msg_hello_ack;
               payload = encode_hello_ack ack } in
-          let* finish_frame = P2p_frame.read_frame fd in
+          let* finish_frame = P2p_frame.read_handshake_frame fd in
           if finish_frame.msg_type <> P2p_frame.msg_hello_finish then
             Lwt.return (Error (Printf.sprintf "expected HELLO_FINISH, got 0x%02x"
               finish_frame.msg_type))
@@ -369,5 +372,4 @@ let accept_handshake fd ~(my_hello : hello) ~allowed_pubkeys ~sign_fn =
               ~responder:my_hello finish with
             | Result.Error error -> Lwt.return (Error error)
             | Result.Ok () -> Lwt.return (Ok peer_hello))
-    (fun exn ->
-      Lwt.return (Error (Printf.sprintf "handshake failed: %s" (Printexc.to_string exn))))
+    (fun exn -> Lwt.return (Error (handshake_error exn)))

@@ -43,6 +43,7 @@ external commit_ct : pubkey -> cipher -> bytes = "caml_pvac_commit_ct"
 external cipher_has_key_bound_material : cipher -> bool = "caml_pvac_cipher_has_key_bound_material"
 external cipher_base_layers : cipher -> int = "caml_pvac_cipher_base_layers"
 external cipher_shape : cipher -> cipher_shape = "caml_pvac_cipher_shape"
+external cipher_mul_depth : cipher -> int = "caml_pvac_cipher_mul_depth"
 external cipher_is_wrapped_scalar : cipher -> bool = "caml_pvac_cipher_is_wrapped_scalar"
 external pubkey_is_key_bound_extension : pubkey -> pubkey -> bool = "caml_pvac_pubkey_is_key_bound_extension"
 external pubkey_supports_alias_rejection : pubkey -> bool = "caml_pvac_pubkey_supports_alias_rejection"
@@ -55,15 +56,23 @@ external make_zero_proof_bound : pubkey -> seckey -> cipher -> int64 -> bytes ->
   = "caml_pvac_make_zero_proof_bound"
 external verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
   = "caml_pvac_verify_zero_bound"
+external verify_zero_amount_prior : pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_amount_prior"
 external verify_zero_bound_key_switch :
   pubkey -> cipher -> zero_proof -> bytes -> bool
   = "caml_pvac_verify_zero_bound_key_switch"
+external verify_zero_amount_key_switch_prior :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_amount_key_switch_prior"
 external make_zero_proof_bound_historical_migration :
   pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
   = "caml_pvac_make_zero_proof_bound_historical_migration"
 external verify_zero_bound_historical_migration :
   pubkey -> cipher -> zero_proof -> bytes -> bool
   = "caml_pvac_verify_zero_bound_historical_migration"
+external verify_zero_amount_historical_prior :
+  pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_amount_historical_prior"
 external make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
   = "caml_pvac_make_zero_proof_bound_range"
 
@@ -82,18 +91,29 @@ external make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> ag
 external serialize_agg_range_proof : agg_range_proof -> bytes
   = "caml_pvac_serialize_agg_range_proof"
 
-external verify_range_any : pubkey -> cipher -> bytes -> bool
+external verify_range_any : pubkey -> cipher -> bytes -> bool -> bool
   = "caml_pvac_verify_range_any"
 external verify_range_bound : pubkey -> cipher -> bytes -> bytes -> bool
   = "caml_pvac_verify_range_bound"
+external verify_range_amount_prior : pubkey -> cipher -> bytes -> bytes -> bool
+  = "caml_pvac_verify_range_amount_prior"
 
 external serialize_cipher : cipher -> bytes = "caml_pvac_serialize_cipher"
 external serialize_cipher_public : cipher -> bytes = "caml_pvac_serialize_cipher_public"
 external deserialize_cipher_result : bytes -> (cipher, string) result
   = "caml_pvac_deserialize_cipher_result"
+external deserialize_cipher_prior_result : bytes -> (cipher, string) result
+  = "caml_pvac_deserialize_cipher_prior_result"
+external deserialize_cipher_cap_result : bytes -> (cipher, string) result
+  = "caml_pvac_deserialize_cipher_cap_result"
 
-let deserialize_cipher bytes =
-  match deserialize_cipher_result bytes with
+let deserialize_cipher ?(strict = true) ?(cap = true) bytes =
+  let result =
+    if strict then deserialize_cipher_result bytes
+    else if cap then deserialize_cipher_cap_result bytes
+    else deserialize_cipher_prior_result bytes
+  in
+  match result with
   | Ok cipher -> cipher
   | Error reason -> failwith reason
 external serialize_pubkey : pubkey -> bytes = "caml_pvac_serialize_pubkey"

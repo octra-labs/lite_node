@@ -55,6 +55,10 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok account_mode ->
+    match Rule_graph.standard runtime.rules ~epoch:env.epoch_id with
+    | Error fault ->
+      Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
+    | Ok proof_mode ->
     let object_cost = object_cost_mode = Rule_graph.Active in
     let proposal_id = "circle-" ^ Transaction.hash tx in
     let open Lwt.Syntax in
@@ -64,6 +68,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
           State_preview.with_preview
             ~base_store:runtime.store
             ~base_ledger:runtime.ledger
+            ~proof_mode
             ~fold:(fun epoch ->
               Result.map
                 (fun ctx -> { ctx with Epoch_exec.account_mode })
