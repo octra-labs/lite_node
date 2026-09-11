@@ -3163,6 +3163,7 @@ let rec process_outputs_once t =
                 failwith "finalized output is not pending";
               let next = Int64.add epoch_id 1L in
               if Int64.compare t.engine.state.height next >= 0 then begin
+                notify_fold t ~next_epoch:next fold;
                 log_node t.config.my_addr
                   "event = finalized_ack epoch = %Ld height = %Ld"
                   epoch_id
