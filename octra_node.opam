@@ -8,6 +8,7 @@ depends: [
   "ocaml" {>= "4.14.2" & < "5.0"}
   "dune" {>= "3.0"}
   "base64"
+  "bigstringaf"
   "cohttp-lwt-unix"
   "conf-gmp"
   "conf-libev"
@@ -17,6 +18,8 @@ depends: [
   "digestif"
   "eqaf"
   "fmt"
+  "h2"
+  "h2-lwt-unix"
   "irmin-pack"
   "lmdb"
   "lwt"
@@ -24,6 +27,7 @@ depends: [
   "mirage-crypto-ec"
   "mirage-crypto-rng"
   "mtime"
+  "pbrt"
   "sqlite3"
   "tls-lwt"
   "uri"

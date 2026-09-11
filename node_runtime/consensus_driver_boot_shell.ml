@@ -823,13 +823,18 @@ let resume_fork (deps : deps) =
       Fork_repair_boot.run Fork_repair_boot.{
         read_plan = (fun () ->
           Octra_core.Fork_head_repair.read_plan deps.data_dir);
-        head_epoch = deps.committed_head_epoch;
+        head = deps.cached_head;
         finality_at = (fun target ->
           Octra_consensus.Finality_log.find
             (Octra_consensus.Finality_log.index deps.data_dir)
             target);
         journal_committed = (fun () ->
           Consensus_finality_journal.committed deps.data_dir);
+        committed_for = (fun entry ->
+          Consensus_finality_journal.committed_for
+            ~chain_id:deps.chain_id
+            ~entry
+            deps.data_dir);
         rewind_journal = (fun entry ->
           Consensus_finality_journal.rewind_committed
             ~chain_id:deps.chain_id
@@ -844,10 +849,11 @@ let resume_fork (deps : deps) =
   match result with
   | Error reason -> refuse_fork_resume deps reason
   | Ok Fork_repair_boot.Idle -> ()
-  | Ok (Fork_repair_boot.Resumed { target; dropped }) ->
+  | Ok (Fork_repair_boot.Resumed { target; head; dropped }) ->
     Log.warn "consensus"
-      "event = fork_repair phase = finality status = resumed epoch = %d dropped = %d"
+      "event = fork_repair phase = finality status = resumed target = %d head = %d dropped = %d"
       target
+      head
       dropped
 
 let run_driver (deps : deps) p2p_start p2p normalize finality_runtime

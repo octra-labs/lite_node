@@ -35,6 +35,60 @@ let has_propose outputs =
 let has_finalize outputs =
   List.exists (function C_engine.SendFinalize _ | C_engine.Finalized _ -> true | _ -> false) outputs
 
+let make_finalize header =
+  let proposal_id = C_hash.proposal_id header in
+  C_types.{
+    chain_id = header.chain_id;
+    epoch_id = header.epoch_id;
+    commit_round = 0;
+    header;
+    proposal_id;
+    precommits = [];
+    parent_commit = None;
+  }
+
+let check_finalize_retention () =
+  let chain_id = "finalize-retention-test" in
+  let a = validator "octAAAA" in
+  let validator_set = C_types.make_validator_set [a] in
+  let engine =
+    C_engine.create
+      ~chain_id
+      ~my_addr:a.address
+      ~validator_set
+      ~start_height:30L
+      ~can_vote:(fun () -> true)
+  in
+  let batch =
+    header ~chain_id ~epoch_id:30L ~creator_addr:a.address
+    |> make_finalize
+  in
+  assert_msg
+    (C_engine.accept_finalize_batch engine batch)
+    "finalize batch is accepted";
+  engine.C_engine.outputs <- [];
+  assert_msg
+    (has_finalize (C_engine.drain_outputs engine))
+    "accepted finalize survives output reset";
+  assert_msg
+    (C_engine.accept_finalize_batch engine batch)
+    "pending finalize accepts an identical retry";
+  assert_msg
+    (has_finalize (C_engine.drain_outputs engine))
+    "pending finalize is delivered again";
+  assert_msg
+    (C_engine.ack_finalized engine batch)
+    "applied finalize is acknowledged";
+  assert_msg
+    (not (C_engine.ack_finalized engine batch))
+    "finalize cannot be acknowledged twice";
+  assert_msg
+    (not (C_engine.accept_finalize_batch engine batch))
+    "completed finalize is not accepted again";
+  assert_msg
+    (not (has_finalize (C_engine.drain_outputs engine)))
+    "completed finalize is not delivered again"
+
 let check_future_validator_engine_boundary () =
   let chain_id = "transition-test" in
   let a = validator "octAAAA" in
@@ -626,6 +680,7 @@ let check_strict_quorum_history () =
     "strict validation skipped active signer floor"
 
 let () =
+  check_finalize_retention ();
   check_future_validator_engine_boundary ();
   check_profile_offer ();
   check_profile_switch ();

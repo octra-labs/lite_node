@@ -7,6 +7,7 @@ module Finalize = Consensus_epoch_apply_finalize
 module Footer = Consensus_epoch_apply_footer
 module Guard = Consensus_epoch_apply_guard
 module Lifecycle = Consensus_epoch_lifecycle
+module Ledger = Octra_core.Ledger
 module Tree = Consensus_epoch_apply_tree
 
 type commit_result = {
@@ -241,7 +242,10 @@ let node_effects refs effects input =
           ~stealth_in_epoch_counter:refs.stealth_in_epoch_counter
           ~fhe_in_epoch_counter:refs.fhe_in_epoch_counter
           ~swarm_opt:refs.swarm_opt
-          ~save_drops:effects.save_drops)
+          ~save_drops:effects.save_drops
+          ~confirmed_nonce:(fun addr ->
+            Ledger.find_opt refs.ledger addr
+            |> Option.map (fun account -> account.Ledger.nonce)))
         {
           now = input.now;
           epoch_id;

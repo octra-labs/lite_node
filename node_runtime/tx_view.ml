@@ -8,6 +8,7 @@ module Transaction = Octra_core.Transaction
 module Crypto = Octra_core.Crypto
 module Pvac_registry = Octra_core.Pvac_registry
 module Rpc = Octra_core.Rpc
+module Staging = Octra_core.Tx_staging
 module Program_package = Octra_vm.Program_package
 
 let anon = "-"
@@ -89,6 +90,26 @@ let standard_fields ~decode_message ~from_addr ~to_addr ~amount_raw ~nonce ~ou ~
        | Some m -> `String (decode_message m)
        | None -> `Null);
   ]
+
+let queue_fields = function
+  | None -> []
+  | Some (Staging.Ready { expires_at }) ->
+    [
+      "stage_status", `String "ready";
+      "expires_at", `Float expires_at;
+    ]
+  | Some (Staging.Wait_nonce { expected; expires_at }) ->
+    [
+      "stage_status", `String "waiting_nonce";
+      "waiting_for_nonce", `Int expected;
+      "expires_at", `Float expires_at;
+    ]
+  | Some (Staging.Nonce_used { confirmed; expires_at }) ->
+    [
+      "stage_status", `String "nonce_used";
+      "confirmed_nonce", `Int confirmed;
+      "expires_at", `Float expires_at;
+    ]
 
 let rpc_pending ~hash ~fields =
   `Assoc ([
@@ -202,9 +223,12 @@ let transaction_lookup ~pending ~confirmed ~rejected ~dropped =
         | Some row -> dropped_lookup row
         | None -> Lookup_missing
 
-let transaction_lookup_response ~decode_message ~hash = function
+let transaction_lookup_response ?queue_state ~decode_message ~hash = function
   | Lookup_pending tx ->
-    Ok (rpc_pending ~hash ~fields:(tx_fields ~decode_message tx))
+    Ok
+      (rpc_pending
+         ~hash
+         ~fields:(queue_fields queue_state @ tx_fields ~decode_message tx))
   | Lookup_confirmed (epoch, tx_json) ->
     let fields =
       match Transaction.parse_raw_json tx_json with

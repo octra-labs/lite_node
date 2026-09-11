@@ -3159,6 +3159,16 @@ let rec process_outputs_once t =
                   ~validator_set:t.engine.vs
                   finalize
               in
+              if not (C_engine.ack_finalized t.engine finalize) then
+                failwith "finalized output is not pending";
+              let next = Int64.add epoch_id 1L in
+              if Int64.compare t.engine.state.height next >= 0 then begin
+                log_node t.config.my_addr
+                  "event = finalized_ack epoch = %Ld height = %Ld"
+                  epoch_id
+                  t.engine.state.height;
+                Lwt.return_unit
+              end else
               let vote_log_ready =
                 match C_vote_log.set_floor t.vote_log ~through_epoch:epoch_id with
                 | Error reason ->
@@ -3190,14 +3200,13 @@ let rec process_outputs_once t =
               let* () =
                 maybe_activate_scheduled_validator_set
                   t
-                  ~target_epoch:(Int64.add epoch_id 1L)
+                  ~target_epoch:next
               in
               let* () =
                 maybe_activate_resource_committee
                   t
-                  ~target_epoch:(Int64.add epoch_id 1L)
+                  ~target_epoch:next
               in
-              let next = Int64.add epoch_id 1L in
               notify_fold t ~next_epoch:next fold;
               Hashtbl.clear t.durable_votes;
               Hashtbl.clear t.round_peers;

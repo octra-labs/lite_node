@@ -41,6 +41,7 @@ module Set_post = Octra_node_runtime.Set_post
 module Set_rule = Octra_node_runtime.Set_rule
 module Epoch_atomic = Octra_node_runtime.Epoch_atomic
 module Epoch_visibility = Octra_node_runtime.Epoch_visibility
+module Grpc_config = Octra_node_runtime.Grpc_config
 module Log = Octra_node_runtime.Log
 module Rest = Octra_node_runtime.Node_rest_facade
 module Rule_graph = Octra_core.Rule_graph
@@ -92,6 +93,17 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
   let () =
     Startup_process_shell.configure_process ~exit_fatal:exit_error;
+
+    let grpc =
+      match Grpc_config.of_env env_opt with
+      | Ok config -> config
+      | Error reason ->
+        Log.fatal
+          "grpc"
+          "event = config status = rejected reason = %s"
+          reason;
+        exit_error ()
+    in
 
     begin
       match Pvac_verify_worker.ready_sync () with
@@ -1898,7 +1910,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
     let rpc_task =
       Rest.start_task rest_runtime
-        ~port:api_port ~data_dir ~store ~ledger ~tree_ref:tree ~wallet
+        ~port:api_port ~grpc ~data_dir ~store ~ledger ~tree_ref:tree ~wallet
         ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
         ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
         ~validator_view_sk ~validator_view_pub ~program_trust ~chaindata

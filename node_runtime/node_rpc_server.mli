@@ -27,6 +27,7 @@ type deps = {
 
 type config = {
   port : int;
+  grpc : Grpc_config.setting;
   data_dir : string;
   store : Store_irmin.t;
   ledger : Ledger.t;

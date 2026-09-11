@@ -47,10 +47,12 @@ type node_refs = {
   fhe_in_epoch_counter : int ref;
   swarm_opt : P2p_swarm.t option ref;
   save_drops : Staging.drop_record list -> unit;
+  confirmed_nonce : string -> int option;
 }
 
 let refs ~last_epoch_time ~tree ~deferred_stealth_txs
-    ~stealth_in_epoch_counter ~fhe_in_epoch_counter ~swarm_opt ~save_drops =
+    ~stealth_in_epoch_counter ~fhe_in_epoch_counter ~swarm_opt ~save_drops
+    ~confirmed_nonce =
   {
     last_epoch_time;
     tree;
@@ -59,6 +61,7 @@ let refs ~last_epoch_time ~tree ~deferred_stealth_txs
     fhe_in_epoch_counter;
     swarm_opt;
     save_drops;
+    confirmed_nonce;
   }
 
 let cleanup deps ctx =
@@ -127,7 +130,8 @@ let node_deps refs =
     reset_private_counters = (fun () ->
       refs.stealth_in_epoch_counter := 0;
       refs.fhe_in_epoch_counter := 0);
-    expire_old = Staging.expire_old;
+    expire_old = (fun () ->
+      Staging.expire_old ~confirmed_nonce:refs.confirmed_nonce ());
     save_drops = refs.save_drops;
     cleanup_dropped = Staging.cleanup_dropped;
     sweep_low_fee = (fun () -> ignore (Node_rest_facade.sweep_low_fee_stealth ()));

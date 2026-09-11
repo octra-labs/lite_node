@@ -26,6 +26,10 @@ type program_record = {
   code_hash : string;
 }
 
+type program_record_save_error =
+  | Program_record_conflict
+  | Program_record_store_error of string
+
 let max_txlog_record_len = 128_000_000
 let rebuild_tx_batch = 50_000
 let rebuild_epoch_batch = 10_000
@@ -257,23 +261,52 @@ let same_program_record left right =
 
 let save_program_record t address record =
   if not (Crypto.is_octra_address address) then
-    Error "program record address is invalid"
+    Error (Program_record_store_error "program record address is invalid")
   else if not (valid_program_hash record.code_hash) then
-    Error "program record hash is invalid"
+    Error (Program_record_store_error "program record hash is invalid")
   else
     try
-      Chaindata_index.set_meta_direct
-        t.index
-        (program_record_key address record.code_hash)
-        (program_record_json record);
-      Chaindata_index.sync t.index;
-      match get_program_record t ~address ~code_hash:record.code_hash with
-      | Ok (Some stored) when same_program_record stored record -> Ok ()
-      | Ok (Some _) -> Error "program record read differs"
-      | Ok None -> Error "program record is absent after write"
-      | Error reason -> Error reason
+      let key = program_record_key address record.code_hash in
+      let existing =
+        match Chaindata_index.get_meta t.index key with
+        | None ->
+          begin
+            match get_program_record t ~address ~code_hash:record.code_hash with
+            | Ok stored -> Ok stored
+            | Error reason -> Error (Program_record_store_error reason)
+          end
+        | Some raw ->
+          begin
+            match program_record_of_json raw with
+            | Error reason -> Error (Program_record_store_error reason)
+            | Ok stored when String.equal stored.code_hash record.code_hash ->
+              Ok (Some stored)
+            | Ok _ ->
+              Error (Program_record_store_error "program record hash differs")
+          end
+      in
+      match existing with
+      | Error error -> Error error
+      | Ok (Some stored) when same_program_record stored record -> Ok stored
+      | Ok (Some _) -> Error Program_record_conflict
+      | Ok None ->
+        Chaindata_index.set_meta_direct
+          t.index
+          key
+          (program_record_json record);
+        match get_program_record t ~address ~code_hash:record.code_hash with
+        | Ok (Some stored) when same_program_record stored record -> Ok stored
+        | Ok (Some _) ->
+          Error (Program_record_store_error "program record read differs")
+        | Ok None ->
+          Error
+            (Program_record_store_error
+               "program record is absent after write")
+        | Error reason -> Error (Program_record_store_error reason)
     with exn ->
-      Error ("program record write failed reason = " ^ Printexc.to_string exn)
+      Error
+        (Program_record_store_error
+           ("program record write failed reason = " ^ Printexc.to_string exn))
 
 let close t =
   Txlog.close t.txlog;

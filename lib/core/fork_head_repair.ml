@@ -161,10 +161,25 @@ let validate_binding plan binding =
       Ok ()
   | _ -> Error "fork repair binding is incomplete"
 
+let same_source left right =
+  left.Head_manifest.schema_version = right.Head_manifest.schema_version
+  && left.generation = right.generation
+  && left.epoch_id = right.epoch_id
+  && String.equal left.state_root right.state_root
+  && left.ledger_state_root = right.ledger_state_root
+  && Int64.equal left.txid_hi right.txid_hi
+  && left.txlog_seg = right.txlog_seg
+  && left.txlog_off = right.txlog_off
+  && left.epochlog_off = right.epochlog_off
+  && Float.equal left.ts right.ts
+  && left.quorum_cert_hash = right.quorum_cert_hash
+  && left.epoch_index_hash = right.epoch_index_hash
+  && left.epoch_index_root = right.epoch_index_root
+
 let source_ready data_dir plan =
   match head_at data_dir with
   | Error reason -> Error reason
-  | Ok current when current = plan.Fork_repair_log.source -> Ok ()
+  | Ok current when same_source current plan.Fork_repair_log.source -> Ok ()
   | Ok current when current = plan.head -> Ok ()
   | Ok _ -> Error "fork repair source HEAD changed"
 

@@ -59,6 +59,7 @@ val list_saved_epochs :
 val start :
   runtime ->
   port:int ->
+  grpc:Grpc_config.setting ->
   data_dir:string ->
   store:Store_irmin.t ->
   ledger:Ledger.t ->
@@ -86,6 +87,7 @@ val start :
 val start_task :
   runtime ->
   port:int ->
+  grpc:Grpc_config.setting ->
   data_dir:string ->
   store:Store_irmin.t ->
   ledger:Ledger.t ->

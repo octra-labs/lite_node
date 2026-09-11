@@ -225,6 +225,7 @@ type t = {
   mutable higher_round_evidence : (string, int) Hashtbl.t;
   mutable outputs : output list;
   mutable finalized_height : int64;
+  mutable pending_finalized : finalize option;
   mutable generation : int;
   can_vote : unit -> bool;
   mutable round_skip_ready : unit -> bool;
@@ -255,6 +256,7 @@ let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
     higher_round_evidence = Hashtbl.create 4;
     outputs = [];
     finalized_height = Int64.pred start_height;
+    pending_finalized = None;
     generation = 0;
     can_vote;
     round_skip_ready = (fun () -> true);
@@ -276,6 +278,7 @@ let is_pristine t =
   && t.current_proposal = None
   && Hashtbl.length t.prevotes.votes = 0
   && Hashtbl.length t.precommits.votes = 0
+  && Option.is_none t.pending_finalized
   && t.outputs = []
 
 let cache_proposal_bundle t pid header tx_hashes ~parent_commit =
@@ -348,10 +351,33 @@ let find_proposal_message t ~proposal_id ~round =
 
 let emit t o = t.outputs <- o :: t.outputs
 
+let same_finalize left right =
+  Int64.equal left.epoch_id right.epoch_id
+  && String.equal left.proposal_id right.proposal_id
+
+let finalized_output finalize =
+  Finalized { epoch_id = finalize.epoch_id; finalize }
+
+let output_has_finalize finalize = function
+  | Finalized pending -> same_finalize pending.finalize finalize
+  | _ -> false
+
 let drain_outputs t =
   let out = List.rev t.outputs in
   t.outputs <- [];
-  out
+  match t.pending_finalized with
+  | Some finalize when not (List.exists (output_has_finalize finalize) out) ->
+    out @ [finalized_output finalize]
+  | Some _
+  | None -> out
+
+let ack_finalized t finalize =
+  match t.pending_finalized with
+  | Some pending when same_finalize pending finalize ->
+    t.pending_finalized <- None;
+    true
+  | Some _
+  | None -> false
 
 type local_vote_outcome =
   | LocalVoteCast of vote_add_result
@@ -469,9 +495,13 @@ let make_finalize t ~header ~proposal_id ~round =
     (parent_commit_for_finalize t ~header ~proposal_id)
 
 let emit_finalized ?(send = true) t finalize =
-  t.finalized_height <- finalize.epoch_id;
-  if send then emit t (SendFinalize finalize);
-  emit t (Finalized { epoch_id = finalize.epoch_id; finalize })
+  match t.pending_finalized with
+  | Some pending -> same_finalize pending finalize
+  | None ->
+    t.finalized_height <- finalize.epoch_id;
+    t.pending_finalized <- Some finalize;
+    if send then emit t (SendFinalize finalize);
+    true
 
 let finalize_block_name = function
   | Parent_commit_missing -> "parent_commit_missing"
@@ -480,8 +510,7 @@ let finalize_block_name = function
 let emit_local_finalize t ~header ~proposal_id ~round =
   match make_finalize t ~header ~proposal_id ~round with
   | Ok finalize ->
-    emit_finalized t finalize;
-    true
+    emit_finalized t finalize
   | Error reason ->
     err_node t.my_addr
       "event = defer_local_finalize reason = %s height = %Ld round = %d pid = %s"
@@ -1520,7 +1549,13 @@ let on_vote t (v : vote) ~sign_fn =
   end
 
 let accept_finalize_batch t (f : finalize) =
-  if f.epoch_id <= t.finalized_height then false
+  if f.epoch_id < t.finalized_height then false
+  else if f.epoch_id = t.finalized_height then
+    begin
+      match t.pending_finalized with
+      | Some pending -> same_finalize pending f
+      | None -> false
+    end
   else if f.epoch_id <> t.state.height then false
   else begin
     let proposal_id = f.proposal_id in
@@ -1551,8 +1586,7 @@ let accept_finalize_batch t (f : finalize) =
           valid_round = f.commit_round;
           valid_value = Some f.header;
         };
-        emit_finalized ~send:false t f;
-        true
+        emit_finalized ~send:false t f
       end
     end
   end

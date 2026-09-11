@@ -97,6 +97,7 @@ val transaction_lookup :
   transaction_lookup
 
 val transaction_lookup_response :
+  ?queue_state:Octra_core.Tx_staging.queue_state ->
   decode_message:(string -> string) ->
   hash:string ->
   transaction_lookup ->

@@ -128,12 +128,20 @@ let lookup_confirmed_tx_with_heal chaindata txh =
 let confirmed_tx_epoch_with_heal chaindata hash =
   Option.map fst (lookup_confirmed_tx_with_heal chaindata hash)
 
-let transaction ~find_drop chaindata ~params =
+let transaction ~find_drop ?(account_nonce = fun _ -> None) chaindata ~params =
   match Rpc.require_hash params 0 "hash" with
   | Error e ->
     err e
   | Ok txh ->
     let pending = Staging.find_by_hash txh in
+    let queue_state =
+      match pending with
+      | None -> None
+      | Some tx ->
+        Option.bind
+          (account_nonce tx.Transaction.from)
+          (fun confirmed -> Staging.queue_state ~confirmed txh)
+    in
     let confirmed =
       if Option.is_some pending then None
       else lookup_confirmed_tx_with_heal chaindata txh
@@ -166,6 +174,7 @@ let transaction ~find_drop chaindata ~params =
       Tx_view.transaction_lookup_response
         ~decode_message:Text.decode_message_if_hex
         ~hash:txh
+        ?queue_state
         (Tx_view.transaction_lookup ~pending ~confirmed ~rejected ~dropped)
     with
     | Ok response ->

@@ -43,6 +43,7 @@ val refs :
   fhe_in_epoch_counter:int ref ->
   swarm_opt:Octra_net.P2p_swarm.t option ref ->
   save_drops:(Octra_core.Tx_staging.drop_record list -> unit) ->
+  confirmed_nonce:(string -> int option) ->
   node_refs
 
 val run : deps -> ctx -> unit Lwt.t

@@ -29,6 +29,7 @@ val confirmed_tx_epoch_with_heal :
 
 val transaction :
   find_drop:(string -> Octra_core.Tx_drop.row option) ->
+  ?account_nonce:(string -> int option) ->
   Octra_core.Store_chaindata.t ->
   params:Yojson.Safe.t ->
   rpc_result

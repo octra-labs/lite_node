@@ -29,6 +29,7 @@ type deps = {
 
 type config = {
   port : int;
+  grpc : Grpc_config.setting;
   data_dir : string;
   store : Store_irmin.t;
   ledger : Ledger.t;
@@ -173,6 +174,9 @@ let octra_transactions_by_epoch params ctx =
 let octra_transaction params ctx =
   History_read_rpc.transaction
     ~find_drop:ctx.deps.find_drop
+    ~account_nonce:(fun addr ->
+      Ledger.find_opt ctx.ledger addr
+      |> Option.map (fun account -> account.Ledger.nonce))
     ctx.chaindata
     ~params
 
@@ -480,26 +484,25 @@ let guard_reads visibility routes =
       name, stable_read visibility handler)
     routes
 
+let read_dispatch visibility :
+    (string * (Yojson.Safe.t -> ctx -> rpc_result Lwt.t)) list =
+  Status_read_rpc.core_dispatch status_dispatch_adapters
+  @ Account_read_rpc.public_dispatch account_dispatch_adapters
+  @ history_dispatch
+  @ rest_dispatch
+  @ circle_dispatch
+  @ program_dispatch
+  @ Account_read_rpc.pvac_dispatch account_dispatch_adapters
+  @ Status_read_rpc.proof_dispatch status_dispatch_adapters
+  |> guard_reads visibility
+
 let dispatch visibility :
     (string * (Yojson.Safe.t -> ctx -> rpc_result Lwt.t)) list =
-  let reads =
-    Status_read_rpc.core_dispatch status_dispatch_adapters
-    @ Account_read_rpc.public_dispatch account_dispatch_adapters
-    @ history_dispatch
-    @ rest_dispatch
-    @ circle_dispatch
-    @ program_dispatch
-    @ Account_read_rpc.pvac_dispatch account_dispatch_adapters
-    @ Status_read_rpc.proof_dispatch status_dispatch_adapters
-    |> guard_reads visibility
-  in
-  let effects =
-    effect_dispatch.submission
-    @ effect_dispatch.staging
-    @ effect_dispatch.mutation
-    @ compute_dispatch
-  in
-  reads @ effects
+  read_dispatch visibility
+  @ effect_dispatch.submission
+  @ effect_dispatch.staging
+  @ effect_dispatch.mutation
+  @ compute_dispatch
 
 let stable_http visibility handler req body =
   let open Lwt.Syntax in
@@ -558,6 +561,7 @@ let start (cfg : config) =
     deps = cfg.deps;
   } in
   let routes = dispatch cfg.epoch_visibility in
+  let read_routes = read_dispatch cfg.epoch_visibility in
   let rpc_handler =
     Rpc_http.handle_rpc_post
       ~process:(fun meta body_str ->
@@ -589,8 +593,18 @@ let start (cfg : config) =
       ~rpc_handler
       ~fallback_handler:state_http_handler
   in
+  let http = Rpc_http.create_server ~port:cfg.port ~callback in
+  let serve =
+    match cfg.grpc with
+    | Grpc_config.Disabled -> http
+    | Grpc_config.Enabled config ->
+      let call meta request =
+        Rpc_dispatch.handle_request meta request rpc_ctx read_routes
+      in
+      Lwt.pick [http; Grpc_http2.start config ~call]
+  in
   Lwt.finalize
-    (fun () -> Rpc_http.create_server ~port:cfg.port ~callback)
+    (fun () -> serve)
     (fun () ->
       let open Lwt.Syntax in
       let* () = Pvac_status_actor.shutdown pvac_status in

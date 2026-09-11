@@ -101,6 +101,24 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
               reason;
             Error reason
           | Ok () ->
+            begin
+              match lookup tx.from with
+              | Some (_, confirmed) ->
+                begin
+                  match Staging.queue_state ~confirmed tx_hash with
+                  | Some (Staging.Wait_nonce { expected; expires_at }) ->
+                    Log.info "staging"
+                      "event = wait_nonce tx = %s expected = %d received = %d expires_at = %.3f"
+                      (Text.hash_short tx_hash)
+                      expected
+                      tx.nonce
+                      expires_at
+                  | Some (Staging.Ready _)
+                  | Some (Staging.Nonce_used _)
+                  | None -> ()
+                end
+              | None -> ()
+            end;
             let swarm_opt = !(runtime.swarm_ref) in
             let peer_count =
               match swarm_opt with
@@ -191,7 +209,7 @@ let list_saved_epochs chaindata =
   |> List.sort_uniq compare
   |> List.rev
 
-let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
+let start runtime ~port ~grpc ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
@@ -211,6 +229,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
   } in
   Node_rpc_server.start Node_rpc_server.{
     port;
+    grpc;
     data_dir;
     store;
     ledger;
@@ -234,7 +253,7 @@ let start runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_id
     deps;
   }
 
-let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
+let start_task runtime ~port ~grpc ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
     ~validator_view_sk ~validator_view_pub ~program_trust
@@ -244,6 +263,7 @@ let start_task runtime ~port ~data_dir ~store ~ledger ~tree_ref ~wallet
   start
     runtime
     ~port
+    ~grpc
     ~data_dir
     ~store
     ~ledger

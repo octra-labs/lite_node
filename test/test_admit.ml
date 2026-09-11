@@ -167,6 +167,32 @@ let check_dispatch_limit () =
   Dispatch.process_body meta allowed () routes |> Lwt_main.run |> ignore;
   check "allowed batch reaches handler" (!calls = 1)
 
+let check_queue_view () =
+  Tx_staging.clear ();
+  let value = tx (sender 6_000) 3 in
+  add ~limit:10 value |> Result.get_ok |> ignore;
+  let hash = Transaction.hash value in
+  let queue_state = Tx_staging.queue_state ~confirmed:0 hash in
+  let response =
+    View.transaction_lookup_response
+      ?queue_state
+      ~decode_message:(fun text -> text)
+      ~hash
+      (View.Lookup_pending value)
+    |> Result.get_ok
+  in
+  match response with
+  | `Assoc fields ->
+    check "queue view status"
+      (List.assoc_opt "stage_status" fields = Some (`String "waiting_nonce"));
+    check "queue view nonce"
+      (List.assoc_opt "waiting_for_nonce" fields = Some (`Int 1));
+    check "queue view expiry"
+      (match List.assoc_opt "expires_at" fields with
+       | Some (`Float value) -> value > Unix.gettimeofday ()
+       | _ -> false)
+  | _ -> failwith "queue view object"
+
 let public_cipher slots =
   let image = Bytes.make 63 '\000' in
   Bytes.blit_string "PVAC" 0 image 0 4;
@@ -301,4 +327,5 @@ let () =
   check_rpc_limit ();
   check_inner_limit ();
   check_dispatch_limit ();
+  check_queue_view ();
   check_cipher_limit ()

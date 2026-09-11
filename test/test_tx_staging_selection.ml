@@ -9,7 +9,7 @@ let check name value =
 let sender index =
   Printf.sprintf "oct%044d" index
 
-let transaction ?(fee = 1_000) ?message
+let transaction ?(fee = 1_000) ?message ?(timestamp = 0.)
     ?(op_type = Transaction.Standard) from nonce =
   Transaction.{
     from;
@@ -17,7 +17,7 @@ let transaction ?(fee = 1_000) ?message
     amount = Z.zero;
     nonce;
     ou = Z.of_int fee;
-    timestamp = 0.;
+    timestamp;
     signature = from ^ string_of_int nonce;
     public_key = None;
     message;
@@ -153,6 +153,57 @@ let check_pool_eviction () =
   let reverse = run low_b low_a in
   check "eviction is independent of insertion order" (forward = reverse)
 
+let check_queue_state () =
+  Tx_staging.clear ();
+  let from = sender 700 in
+  let first_tx = transaction from 1 in
+  let second_tx = transaction from 2 in
+  let third_tx = transaction from 3 in
+  let hash = Transaction.hash third_tx in
+  let started = Unix.gettimeofday () in
+  add third_tx;
+  begin
+    match Tx_staging.queue_state ~confirmed:0 hash with
+    | Some (Tx_staging.Wait_nonce { expected = 1; expires_at }) ->
+      check "queue expiry" (expires_at > started)
+    | _ -> failwith "queue first nonce"
+  end;
+  add first_tx;
+  begin
+    match Tx_staging.queue_state ~confirmed:0 hash with
+    | Some (Tx_staging.Wait_nonce { expected = 2; _ }) -> ()
+    | _ -> failwith "queue second nonce"
+  end;
+  add second_tx;
+  begin
+    match Tx_staging.queue_state ~confirmed:0 hash with
+    | Some (Tx_staging.Ready _) -> ()
+    | _ -> failwith "queue ready"
+  end;
+  begin
+    match Tx_staging.queue_state ~confirmed:3 hash with
+    | Some (Tx_staging.Nonce_used { confirmed = 3; _ }) -> ()
+    | _ -> failwith "queue nonce used"
+  end;
+  check "nonce gap expiry reason"
+    (Tx_staging.expiry_reason ~confirmed:1320 ~received:1323
+     = "TTL exceeded: waiting for nonce 1321 before nonce 1323");
+  check "ready expiry reason"
+    (Tx_staging.expiry_reason ~confirmed:1322 ~received:1323
+     = "TTL exceeded: transaction was not included")
+
+let check_recent_order () =
+  Tx_staging.clear ();
+  let first = transaction ~timestamp:2. (sender 710) 1 in
+  let second = transaction ~timestamp:1. (sender 711) 1 in
+  let third = transaction ~timestamp:3. (sender 712) 1 in
+  List.iter add [first; second; third];
+  let actual =
+    Tx_staging.recent 3
+    |> List.map (fun (_, tx) -> tx.Transaction.timestamp)
+  in
+  check "recent transaction order" (actual = [3.; 2.; 1.])
+
 let check_selection_time () =
   let sender_count = 200 in
   let tx_count = 50 in
@@ -208,5 +259,7 @@ let () =
   check_capacity_skip ();
   check_insertion_independence ();
   check_pool_eviction ();
+  check_queue_state ();
+  check_recent_order ();
   check_selection_time ();
   check_payload_independence ()

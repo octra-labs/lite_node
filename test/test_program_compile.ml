@@ -418,6 +418,59 @@ let ensure_dir path =
   else
     Unix.mkdir path 0o700
 
+let verify_lane_test () =
+  let release, release_wakener = Lwt.wait () in
+  let finished, finished_wakener = Lwt.wait () in
+  let first =
+    Octra_vm.Contract_rpc.run_verify (fun () ->
+      let open Lwt.Syntax in
+      let* () = release in
+      Lwt.wakeup_later finished_wakener ();
+      Lwt.return_ok 7)
+  in
+  let expect_busy request =
+    match Lwt_main.run request with
+    | Error error when error.Octra_core.Rpc.code = -32005 -> ()
+    | _ -> failwith "concurrent program verification was admitted"
+  in
+  expect_busy (Octra_vm.Contract_rpc.run_verify (fun () -> Lwt.return_ok 8));
+  Lwt.cancel first;
+  expect_busy (Octra_vm.Contract_rpc.run_verify (fun () -> Lwt.return_ok 8));
+  Lwt.wakeup_later release_wakener ();
+  Lwt_main.run finished;
+  Lwt_main.run (Lwt.pause ());
+  match
+    Lwt_main.run
+      (Octra_vm.Contract_rpc.run_verify (fun () -> Lwt.return_ok 9))
+  with
+  | Ok 9 -> ()
+  | _ -> failwith "program verification lane did not reset"
+
+let verify_worker_test () =
+  let first =
+    Octra_vm.Contract_rpc.run_verify (fun () ->
+      let open Lwt.Syntax in
+      let+ result =
+        Octra_vm.Contract_rpc.run_verify_worker (fun () ->
+          Unix.sleepf 0.1;
+          Ok 10)
+      in
+      match result with
+      | Ok value -> Ok value
+      | Error message -> Error (Octra_core.Rpc.err (-32000) message None))
+  in
+  begin
+    match
+      Lwt_main.run
+        (Octra_vm.Contract_rpc.run_verify (fun () -> Lwt.return_ok 11))
+    with
+    | Error error when error.Octra_core.Rpc.code = -32005 -> ()
+    | _ -> failwith "program verification worker did not retain its lane"
+  end;
+  match Lwt_main.run first with
+  | Ok 10 -> ()
+  | _ -> failwith "program verification worker did not finish"
+
 let verify_record_test (compiled : Octra_vm.Aml_source.t) =
   let data = Filename.concat (Sys.getcwd ()) "runtime_data" in
   let scope = Filename.concat data "program-record-tests" in
@@ -615,32 +668,120 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         | Error error -> failwith error.Octra_core.Rpc.message
       end;
       let head_before = Lwt_main.run (Octra_core.Store_irmin.get_head_hash store) in
-      let active = Option.get !chain in
-      begin
+      let verify_record chaindata source =
         match
           Lwt_main.run
             (Octra_vm.Contract_rpc.verify
                ~store
-               ~chaindata:active
+               ~chaindata
                ~addr:address
-               ~source:nested_loop_source
+               ~source
                ~files_json:None)
         with
         | Ok (`Assoc fields) ->
           require
             (List.assoc_opt "verified" fields = Some (`Bool true))
-            "program verification did not report success"
+            "program verification did not report success";
+          require
+            (List.assoc_opt "published" fields = Some (`Bool false))
+            "binary program verification published metadata";
+          require
+            (List.assoc_opt "code_hash" fields = Some (`String code_hash))
+            "program verification record hash differs"
         | Ok _ -> failwith "program verification response is invalid"
         | Error error -> failwith error.Octra_core.Rpc.message
+      in
+      let source_file path body =
+        `Assoc [
+          "path", `String path;
+          "source", `String body;
+        ]
+      in
+      let verify_input_rejected files reason =
+        match
+          Lwt_main.run
+            (Octra_vm.Contract_rpc.verify
+               ~store
+               ~chaindata:(Option.get !chain)
+               ~addr:address
+               ~source:nested_loop_source
+               ~files_json:(Some files))
+        with
+        | Error error ->
+          require
+            (error.Octra_core.Rpc.code = -32602
+             && error.Octra_core.Rpc.data = Some (`String reason))
+            "program source input reason differs"
+        | Ok _ -> failwith "program source input was accepted"
+      in
+      verify_input_rejected
+        [source_file "main.aml" nested_loop_source]
+        "program source path is reserved";
+      verify_input_rejected
+        [source_file "lib/value.aml" ""; source_file "lib/value.aml" ""]
+        "program source path is duplicated";
+      verify_input_rejected
+        [source_file "lib/../main.aml" nested_loop_source]
+        "program source path is invalid";
+      begin
+        match
+          Octra_core.Store_chaindata.get_program_record
+            (Option.get !chain)
+            ~address
+            ~code_hash
+        with
+        | Ok None -> ()
+        | Ok (Some _) -> failwith "program source input wrote a record"
+        | Error reason -> failwith reason
       end;
+      let first_files =
+        [source_file "z/value.aml" ""; source_file "a/value.aml" ""]
+      in
+      let second_files = List.rev first_files in
+      let verify_files files =
+        match
+          Lwt_main.run
+            (Octra_vm.Contract_rpc.verify
+               ~store
+               ~chaindata:(Option.get !chain)
+               ~addr:address2
+               ~source:nested_loop_source
+               ~files_json:(Some files))
+        with
+        | Ok (`Assoc fields) ->
+          require
+            (List.assoc_opt "published" fields = Some (`Bool false))
+            "binary program source map was published"
+        | Ok _ -> failwith "binary program verification response is invalid"
+        | Error error -> failwith error.Octra_core.Rpc.message
+      in
+      verify_files first_files;
+      verify_files second_files;
+      begin
+        match
+          Octra_core.Store_chaindata.get_program_record
+            (Option.get !chain)
+            ~address:address2
+            ~code_hash
+        with
+        | Ok None -> ()
+        | Ok (Some _) -> failwith "binary program source map was stored"
+        | Error reason -> failwith reason
+      end;
+      verify_record (Option.get !chain) nested_loop_source;
+      verify_record (Option.get !chain) (nested_loop_source ^ "\n");
       let head_after = Lwt_main.run (Octra_core.Store_irmin.get_head_hash store) in
       require (head_before = head_after) "program verification changed state root";
       require
         (Lwt_main.run (Octra_core.Store_irmin.get_contract_source store address) = None)
         "program verification wrote source into state";
       close_chain ();
-      let reopened = Octra_core.Store_chaindata.open_chaindata history in
+      let reopened =
+        Octra_core.Store_chaindata.open_chaindata ~readonly:true history
+      in
       chain := Some reopened;
+      verify_record reopened nested_loop_source;
+      verify_record reopened (nested_loop_source ^ "\n");
       begin
         match
           Octra_core.Store_chaindata.get_program_record
@@ -648,11 +789,8 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
             ~address
             ~code_hash
         with
-        | Ok (Some record) ->
-          require (String.equal record.source nested_loop_source) "program source differs";
-          require (String.equal record.code_hash code_hash) "program record hash differs";
-          require (not (String.equal record.abi "")) "program record ABI is absent"
-        | Ok None -> failwith "program record did not survive reopen"
+        | Ok None -> ()
+        | Ok (Some _) -> failwith "binary program record survived reopen"
         | Error reason -> failwith reason
       end;
       begin
@@ -676,8 +814,8 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         with
         | Ok (`Assoc fields) ->
           require
-            (List.assoc_opt "source" fields = Some (`String nested_loop_source))
-            "program source response differs"
+            (List.assoc_opt "source" fields = Some `Null)
+            "binary program source response differs"
         | Ok _ -> failwith "program source response is invalid"
         | Error error -> failwith error.Octra_core.Rpc.message
       end;
@@ -925,6 +1063,8 @@ let () =
           (String.equal packed.result.bytecode linked.octb)
           (name ^ " package compiler differs"))
     ["mixed", mixed_source; "main", main_source];
+  verify_lane_test ();
+  verify_worker_test ();
   verify_record_test linked_nested;
   let multi_resolver = function
     | "main.aml" -> Some multi_main_source

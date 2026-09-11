@@ -57,12 +57,18 @@ let derived_abi ~store ~addr =
       "instruction_count", `Int (Array.length bytecode);
     ])
 
+let source_admission = function
+  | Some meta -> String.equal meta.Store_irmin.admission "source"
+  | None -> false
+
 let current_program_record ~store ~chaindata ~addr =
   let open Lwt.Syntax in
   let* info = Store_irmin.get_contract_info store addr in
-  match info with
-  | None -> Lwt.return_ok None
-  | Some (_, code_hash, _, _) ->
+  let* meta = Store_irmin.get_contract_meta store addr in
+  match info, source_admission meta with
+  | None, _ -> Lwt.return_ok None
+  | Some _, false -> Lwt.return_ok None
+  | Some (_, code_hash, _, _), true ->
     begin
       match
         Store_chaindata.get_program_record
@@ -73,13 +79,14 @@ let current_program_record ~store ~chaindata ~addr =
       | Error _ as error -> Lwt.return error
       | Ok record ->
         let* current = Store_irmin.get_contract_info store addr in
+        let* current_meta = Store_irmin.get_contract_meta store addr in
         begin
-          match current with
-          | Some (_, current_hash, _, _)
+          match current, source_admission current_meta with
+          | Some (_, current_hash, _, _), true
             when String.equal code_hash current_hash ->
             Lwt.return_ok record
-          | Some _ -> Lwt.return_error "program changed during metadata read"
-          | None -> Lwt.return_error "program disappeared during metadata read"
+          | Some _, _ -> Lwt.return_error "program changed during metadata read"
+          | None, _ -> Lwt.return_error "program disappeared during metadata read"
         end
     end
 
@@ -120,7 +127,26 @@ let file_source item =
   | _ ->
     None
 
-let validate_compile_input source files =
+let compile_path_char = function
+  | 'a'..'z'
+  | 'A'..'Z'
+  | '0'..'9'
+  | '.'
+  | '_'
+  | '-'
+  | '/' -> true
+  | _ -> false
+
+let valid_compile_path path =
+  let length = String.length path in
+  length > 0
+  && length <= max_compile_path_bytes
+  && path.[0] <> '/'
+  && String.for_all compile_path_char path
+  && (String.split_on_char '/' path
+      |> List.for_all (fun part -> part <> "" && part <> "." && part <> ".."))
+
+let validate_compile_input ?reserved_path source files =
   if String.length source > max_compile_source_bytes then
     Error "program source exceeds compile limit"
   else
@@ -129,6 +155,7 @@ let validate_compile_input source files =
     | Some items when List.length items > max_compile_files ->
       Error "program file count exceeds compile limit"
     | Some items ->
+      let paths = Hashtbl.create (List.length items) in
       let rec check total = function
         | [] -> Ok ()
         | item :: rest ->
@@ -137,14 +164,24 @@ let validate_compile_input source files =
             | None -> Error "invalid program source file"
             | Some (path, item_source) ->
               let next = total + String.length path + String.length item_source in
-              if String.length path > max_compile_path_bytes then
-                Error "program source path exceeds compile limit"
+              if not (valid_compile_path path) then
+                Error "program source path is invalid"
+              else if
+                match reserved_path with
+                | Some value -> String.equal path value
+                | None -> false
+              then
+                Error "program source path is reserved"
+              else if Hashtbl.mem paths path then
+                Error "program source path is duplicated"
               else if String.length item_source > max_compile_source_bytes then
                 Error "program source file exceeds compile limit"
               else if next > max_compile_total_bytes then
                 Error "program sources exceed compile limit"
-              else
+              else begin
+                Hashtbl.add paths path ();
                 check next rest
+              end
           end
       in
       check (String.length source) items
@@ -157,6 +194,7 @@ let source_files source files_json =
         | Some (path, item_source) -> Some (path, `String item_source)
         | None -> None)
       files_json
+    |> List.sort (fun (left, _) (right, _) -> String.compare left right)
   in
   `Assoc (("main.aml", `String source) :: files)
 
@@ -187,6 +225,26 @@ let parse_certificate_json raw =
   else
     try ["certificate", Yojson.Safe.from_string raw]
     with _ -> []
+
+let verified_record_response ~published record =
+  let report =
+    match record.Store_chaindata.report with
+    | Some raw -> parse_optional_json raw
+    | None -> []
+  in
+  let certificate =
+    match record.Store_chaindata.certificate with
+    | Some raw -> parse_certificate_json raw
+    | None -> []
+  in
+  `Assoc
+    ([
+       "verified", `Bool true;
+       "published", `Bool published;
+       "code_hash", `String record.Store_chaindata.code_hash;
+     ]
+     @ report
+     @ certificate)
 
 let aml_compile_result ~source_mode ~source_material compiled =
   let declaration =
@@ -699,9 +757,88 @@ let tokens_by_address_params ~actor params =
       | Ok payload -> ok_lwt payload
       | Error error -> err_lwt (token_actor_error error)
 
-let verify ~store ~chaindata ~addr ~source ~files_json =
+let verify_active = ref false
+
+let run_verify handler =
+  if !verify_active then
+    Lwt.return_error
+      (Rpc.err (-32005) "Program verification busy" None)
+  else begin
+    verify_active := true;
+    Lwt.finalize
+      handler
+      (fun () ->
+        verify_active := false;
+        Lwt.return_unit)
+    |> Lwt.protected
+  end
+
+let verify_compilation ~meta ~source ~files_json =
+  match meta with
+  | Some meta when String.equal meta.Store_irmin.admission "source" ->
+    let sources =
+      Program_package.{ path = "main.aml"; body = source }
+      ::
+      (Option.value files_json ~default:[]
+       |> List.filter_map (fun item ->
+         match file_source item with
+         | Some (path, body) ->
+           Some Program_package.{ path; body }
+         | None -> None))
+    in
+    let current = Program_package.compile ~main:"main.aml" ~sources in
+    let prior = Program_package.compile_for ~point_ops:false
+      ~main:"main.aml" ~sources in
+    let results = List.filter_map (function
+      | Ok (compiled : Program_package.compiled) ->
+        Some (compiled.envelope, compiled.result)
+      | Error _ -> None
+    ) [current; prior] in
+    begin
+      match results, current with
+      | [], Error error -> Error (Program_package.error_message error)
+      | _ -> Ok results
+    end
+  | Some _
+  | None ->
+    let current = aml_source_result source files_json in
+    let prior = compile_source source files_json in
+    let results =
+      match current with
+      | Ok result -> [result.bytecode, result]
+      | Error _ -> []
+    in
+    let results =
+      match prior.error with
+      | None when
+          not
+            (List.exists
+               (fun (code, _) -> String.equal code prior.bytecode)
+               results) ->
+        results @ [prior.bytecode, prior]
+      | None | Some _ -> results
+    in
+    begin
+      match results, current, prior.error with
+      | _ :: _, _, _ -> Ok results
+      | [], Error msg, _ -> Error msg
+      | [], Ok _, Some msg -> Error msg
+      | [], Ok _, None -> Error "compiler result is absent"
+    end
+
+let run_verify_worker handler =
+  Lwt.catch
+    (fun () -> Lwt_preemptive.detach handler ())
+    (function
+      | Out_of_memory as error -> Lwt.fail error
+      | Lwt.Canceled as error -> Lwt.fail error
+      | Stack_overflow ->
+        Lwt.return_error "compiler complexity limit exceeded"
+      | _ -> Lwt.return_error "compiler failed")
+
+let verify_request ~store ~chaindata ~addr ~source ~files_json =
   let open Lwt.Syntax in
-  match validate_compile_input source files_json with
+  match validate_compile_input ~reserved_path:"main.aml" source files_json with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
   | Ok () ->
     let* stored_b64 =
@@ -721,58 +858,9 @@ let verify ~store ~chaindata ~addr ~source ~files_json =
       match stored with
       | Error msg -> err_lwt (Rpc.err (-32000) msg None)
       | Ok stored ->
-        let compilation =
-          match meta with
-          | Some meta when String.equal meta.Store_irmin.admission "source" ->
-            let sources =
-              Program_package.{ path = "main.aml"; body = source }
-              ::
-              (Option.value files_json ~default:[]
-               |> List.filter_map (fun item ->
-                 match file_source item with
-                 | Some (path, body) ->
-                   Some Program_package.{ path; body }
-                 | None -> None))
-            in
-            begin
-              let current = Program_package.compile ~main:"main.aml" ~sources in
-              let prior = Program_package.compile_for ~point_ops:false
-                ~main:"main.aml" ~sources in
-              let results = List.filter_map (function
-                | Ok (compiled : Program_package.compiled) ->
-                  Some (compiled.envelope, compiled.result)
-                | Error _ -> None
-              ) [current; prior] in
-              match results, current with
-              | [], Error error -> Error (Program_package.error_message error)
-              | _ -> Ok results
-            end
-          | Some _
-          | None ->
-            let current = aml_source_result source files_json in
-            let prior = compile_source source files_json in
-            let results =
-              match current with
-              | Ok result -> [result.bytecode, result]
-              | Error _ -> []
-            in
-            let results =
-              match prior.error with
-              | None when
-                  not
-                    (List.exists
-                       (fun (code, _) -> String.equal code prior.bytecode)
-                       results) ->
-                results @ [prior.bytecode, prior]
-              | None | Some _ -> results
-            in
-            begin
-              match results, current, prior.error with
-              | _ :: _, _, _ -> Ok results
-              | [], Error msg, _ -> Error msg
-              | [], Ok _, Some msg -> Error msg
-              | [], Ok _, None -> Error "compiler result is absent"
-            end
+        let* compilation =
+          run_verify_worker (fun () ->
+            verify_compilation ~meta ~source ~files_json)
         in
         match compilation with
         | Error msg ->
@@ -828,11 +916,20 @@ let verify ~store ~chaindata ~addr ~source ~files_json =
                 code_hash = stored_hash;
               } in
               let* current = Store_irmin.get_contract_info store addr in
+              let* current_meta = Store_irmin.get_contract_meta store addr in
               begin
                 match current with
                 | Some (_, code_hash, _, _)
                   when String.equal code_hash stored_hash ->
-                  begin
+                  if not (source_admission meta) then
+                    ok_lwt (verified_record_response ~published:false record)
+                  else if not (source_admission current_meta) then
+                    err_lwt
+                      (Rpc.err
+                         (-32000)
+                         "program changed during verification"
+                         None)
+                  else begin
                     let* saved =
                       Lwt_preemptive.detach
                         (fun () ->
@@ -843,17 +940,19 @@ let verify ~store ~chaindata ~addr ~source ~files_json =
                         ()
                     in
                     match saved with
-                    | Error reason ->
+                    | Error Store_chaindata.Program_record_conflict ->
+                      err_lwt
+                        (Rpc.err
+                           (-32000)
+                           "program record differs"
+                           (Some
+                              (`Assoc
+                                 ["reason", `String "record_conflict"])))
+                    | Error (Store_chaindata.Program_record_store_error reason) ->
                       err_lwt (Rpc.err (-32000) reason None)
-                    | Ok () ->
+                    | Ok saved ->
                       ok_lwt
-                        (`Assoc
-                           ([
-                              "verified", `Bool true;
-                              "code_hash", `String stored_hash;
-                            ]
-                            @ parse_optional_json result.verification_json
-                            @ parse_certificate_json result.certificate_json))
+                        (verified_record_response ~published:true saved)
                   end
                 | Some _ ->
                   err_lwt
@@ -864,6 +963,10 @@ let verify ~store ~chaindata ~addr ~source ~files_json =
                 | None -> err_lwt (Rpc.not_found "program not found")
               end
           end
+
+let verify ~store ~chaindata ~addr ~source ~files_json =
+  run_verify (fun () ->
+    verify_request ~store ~chaindata ~addr ~source ~files_json)
 
 let verify_params ~store ~chaindata params =
   match Rpc.require_address params 0 "address",

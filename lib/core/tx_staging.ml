@@ -3,6 +3,7 @@
 
 let max_ou = Z.of_int 10_000_000_000
 let max_staging_txs = 100_000
+let staging_ttl = 600.
 
 let public_balance_cost (tx : Transaction.t) =
   match tx.op_type with
@@ -16,6 +17,11 @@ type entry = {
   added_at : float;
   hash : string;
 }
+
+type queue_state =
+  | Ready of { expires_at : float }
+  | Wait_nonce of { expected : int; expires_at : float }
+  | Nonce_used of { confirmed : int; expires_at : float }
 
 let compare_entry_rate a b =
   Z.compare
@@ -57,10 +63,25 @@ module Evict_index = Set.Make(struct
       let hash = String.compare a.hash b.hash in
       if hash <> 0 then hash else String.compare a.key b.key
 end)
+
+module Recent_index = Set.Make(struct
+  type t = entry
+
+  let compare a b =
+    let timestamp =
+      Float.compare b.tx.Transaction.timestamp a.tx.Transaction.timestamp
+    in
+    if timestamp <> 0 then timestamp
+    else
+      let received = Float.compare b.added_at a.added_at in
+      if received <> 0 then received else String.compare a.hash b.hash
+end)
+
 let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
 let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
 let view_index = ref Index.empty
 let evict_index = ref Evict_index.empty
+let recent_index = ref Recent_index.empty
 let total_ou = ref Z.zero
 
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
@@ -166,14 +187,44 @@ let sender_has_pending sender =
     String.equal entry_sender sender
   | Seq.Nil -> false
 
+let first_missing_nonce sender confirmed =
+  let rec loop expected = function
+    | [] -> expected
+    | entry :: rest ->
+      let nonce = entry.tx.Transaction.nonce in
+      if nonce < expected then loop expected rest
+      else if nonce = expected then loop (expected + 1) rest
+      else expected
+  in
+  loop (confirmed + 1) (sender_entries sender)
+
+let queue_state ~confirmed hash =
+  match Hashtbl.find_opt hash_index hash with
+  | None -> None
+  | Some entry ->
+    let expires_at = entry.added_at +. staging_ttl in
+    if entry.tx.Transaction.nonce <= confirmed then
+      Some (Nonce_used { confirmed; expires_at })
+    else
+      let expected = first_missing_nonce entry.tx.from confirmed in
+      if expected < entry.tx.nonce then
+        Some (Wait_nonce { expected; expires_at })
+      else
+        Some (Ready { expires_at })
+
 let sample limit =
   first (max 0 limit) (Index.to_seq !view_index) []
   |> List.map (fun (_, entry) -> entry.hash, entry.tx)
+
+let recent limit =
+  first (max 0 limit) (Recent_index.to_seq !recent_index) []
+  |> List.map (fun entry -> entry.hash, entry.tx)
 
 let clear () =
   List.iter Hashtbl.clear [staging; hash_index];
   view_index := Index.empty;
   evict_index := Evict_index.empty;
+  recent_index := Recent_index.empty;
   Hashtbl.clear virtual_balances;
   Hashtbl.clear virtual_nonces;
   total_ou := Z.zero
@@ -189,6 +240,7 @@ let insert tx ou =
   Hashtbl.add hash_index hash entry;
   view_index := Index.add (index_key entry) entry !view_index;
   evict_index := Evict_index.add entry !evict_index;
+  recent_index := Recent_index.add entry !recent_index;
   total_ou := Z.add !total_ou ou;
   Hashtbl.replace virtual_balances tx.from
     (Z.sub (Hashtbl.find virtual_balances tx.from) (public_balance_cost tx));
@@ -200,6 +252,7 @@ let evict entry =
   Hashtbl.remove hash_index entry.hash;
   view_index := Index.remove (index_key entry) !view_index;
   evict_index := Evict_index.remove entry !evict_index;
+  recent_index := Recent_index.remove entry !recent_index;
   total_ou := Z.sub !total_ou entry.ou;
   Hashtbl.replace virtual_balances entry.tx.from
     (Z.add (Hashtbl.find virtual_balances entry.tx.from)
@@ -427,19 +480,48 @@ let remove_processed hashes =
   ) hashes;
   clear_virtual_state touched
 
-let staging_ttl = 600.
+let expiry_reason ~confirmed ~received =
+  let gap = Int64.sub (Int64.of_int received) (Int64.of_int confirmed) in
+  if Int64.compare gap 1L > 0 then
+    Printf.sprintf
+      "TTL exceeded: waiting for nonce %d before nonce %d"
+      (confirmed + 1)
+      received
+  else if Int64.compare gap 0L <= 0 then
+    Printf.sprintf
+      "TTL exceeded: nonce %d was already consumed at %d"
+      received
+      confirmed
+  else
+    "TTL exceeded: transaction was not included"
 
-let expire_old () =
+let expire_old ?(confirmed_nonce = fun _ -> None) () =
   let now = Unix.gettimeofday () in
   let expired = Hashtbl.fold (fun _ (e : entry) acc ->
     if now -. e.added_at > staging_ttl then e :: acc else acc
   ) staging [] in
   let touched = Hashtbl.create 16 in
+  let confirmed = Hashtbl.create 16 in
+  let find_confirmed sender =
+    match Hashtbl.find_opt confirmed sender with
+    | Some value -> value
+    | None ->
+      let value = confirmed_nonce sender in
+      Hashtbl.add confirmed sender value;
+      value
+  in
   let records =
     List.map (fun (e : entry) ->
       Hashtbl.replace touched e.tx.Transaction.from ();
       evict e;
-      record_drop e.hash e.tx Expired "TTL exceeded"
+      let detail =
+        match find_confirmed e.tx.from with
+        | Some confirmed ->
+          expiry_reason ~confirmed ~received:e.tx.Transaction.nonce
+        | None ->
+          "TTL exceeded: transaction was not included"
+      in
+      record_drop e.hash e.tx Expired detail
     ) expired
   in
   clear_virtual_state touched;

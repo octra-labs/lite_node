@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
+
+syntax = "proto3";
+
+package octra.node.v1;
+
+service Node {
+  rpc Status(Empty) returns (JsonReply);
+  rpc Account(AddressRequest) returns (JsonReply);
+  rpc Transaction(HashRequest) returns (JsonReply);
+  rpc Epoch(EpochRequest) returns (JsonReply);
+}
+
+message Empty {}
+
+message AddressRequest {
+  string address = 1;
+}
+
+message HashRequest {
+  string hash = 1;
+}
+
+message EpochRequest {
+  uint64 epoch = 1;
+}
+
+message JsonReply {
+  bytes json = 1;
+}

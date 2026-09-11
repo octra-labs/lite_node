@@ -116,7 +116,7 @@ let epoch_summaries chaindata ~params =
 let staging_view () =
   let total = Staging.staging_size () in
   let tx_rows =
-    Staging.sample view_limit
+    Staging.recent view_limit
     |> List.map (fun (hash, tx) ->
       Rest_view.staging_tx_row ~hash ~fields:(staging_fields tx))
   in

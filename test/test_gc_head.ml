@@ -5,6 +5,9 @@ open Lwt.Syntax
 
 module S = Octra_core.Store_irmin
 module J = Octra_node_runtime.Consensus_finality_journal
+module R = Octra_core.Fork_head_repair
+module B = Octra_node_runtime.Fork_repair_boot
+module F = Octra_consensus.Finality_log
 
 let expect name value = if not value then failwith name
 
@@ -30,6 +33,110 @@ let gc_keep_case () =
     (Result.is_error (S.gc_keep_epochs_of (read (Some "65537"))));
   expect "GC keep text accepted"
     (Result.is_error (S.gc_keep_epochs_of (read (Some "many"))))
+
+let repair_source_case () =
+  let source = Octra_core.Head_manifest.{
+    schema_version;
+    generation = 12;
+    epoch_id = 12;
+    state_root = "state";
+    ledger_state_root = Some "ledger";
+    irmin_commit = Some "first";
+    txid_hi = 13L;
+    txlog_seg = Some 1;
+    txlog_off = Some 2;
+    epochlog_off = Some 3;
+    commit_id = "first";
+    ts = 4.;
+    quorum_cert_hash = Some "qc";
+    epoch_index_hash = Some "index";
+    epoch_index_root = Some "root";
+  } in
+  let rewritten = {
+    source with
+    irmin_commit = Some "second";
+    commit_id = "second";
+  } in
+  expect "equivalent repair source rejected" (R.same_source source rewritten);
+  expect "different repair root accepted"
+    (not (R.same_source source { rewritten with state_root = "other" }))
+
+let boot_head epoch root txid =
+  Octra_core.Head_manifest.{
+    schema_version;
+    generation = epoch;
+    epoch_id = epoch;
+    state_root = root;
+    ledger_state_root = Some root;
+    irmin_commit = Some root;
+    txid_hi = txid;
+    txlog_seg = Some 0;
+    txlog_off = Some 0;
+    epochlog_off = Some 0;
+    commit_id = root;
+    ts = 0.;
+    quorum_cert_hash = None;
+    epoch_index_hash = Some root;
+    epoch_index_root = Some root;
+  }
+
+let final_entry epoch root txid =
+  F.{
+    height = epoch;
+    round = 0;
+    proposal_id = root;
+    tx_list_hash = root;
+    state_root = root;
+    creator_addr = root;
+    txid_hi = txid;
+    qc_hash = None;
+    ts = 0.;
+  }
+
+let repair_boot_case () =
+  let source = boot_head 12 "source" 13L in
+  let target = boot_head 11 "target" 12L in
+  let current = boot_head 14 "current" 15L in
+  let plan = Octra_core.Fork_repair_log.{
+    source;
+    target_root = target.state_root;
+    next_txid = 13L;
+    head = target;
+  } in
+  let cleared = ref false in
+  let rewound = ref false in
+  let dropped = ref false in
+  let deps head = B.{
+    read_plan = (fun () -> Ok (Some plan));
+    head = (fun () -> Some head);
+    finality_at = (function
+      | 11 -> Some (final_entry 11 "target" 12L)
+      | 14 -> Some (final_entry 14 "current" 15L)
+      | _ -> None);
+    journal_committed = (fun () -> true);
+    committed_for = (fun entry ->
+      if entry.F.height = 14 then Ok () else Error "wrong current entry");
+    rewind_journal = (fun _ -> rewound := true; Ok ());
+    drop_after = (fun _ -> dropped := true; 3);
+    clear = (fun () -> cleared := true);
+  } in
+  let advanced = B.run (deps current) in
+  expect "advanced repair did not finish"
+    (advanced = Ok (B.Resumed { target = 11; head = 14; dropped = 0 }));
+  expect "advanced repair rewound journal" (not !rewound);
+  expect "advanced repair dropped finality" (not !dropped);
+  expect "advanced repair log survived" !cleared;
+  cleared := false;
+  let exact = B.run (deps target) in
+  expect "target repair did not finish"
+    (exact = Ok (B.Resumed { target = 11; head = 11; dropped = 3 }));
+  expect "target repair did not rewind journal" !rewound;
+  expect "target repair did not drop finality" !dropped;
+  expect "target repair log survived" !cleared;
+  cleared := false;
+  let mismatched = B.run (deps { current with state_root = "other" }) in
+  expect "advanced repair accepted mismatched HEAD" (Result.is_error mismatched);
+  expect "mismatched repair cleared log" (not !cleared)
 
 let rec remove path =
   match Unix.lstat path with
@@ -146,6 +253,8 @@ let old_anchor path =
 
 let () =
   gc_keep_case ();
+  repair_source_case ();
+  repair_boot_case ();
   let data = Filename.concat (Sys.getcwd ()) "runtime_data" in
   if not (Sys.file_exists data) then Unix.mkdir data 0o700;
   let path = Filename.concat data (Printf.sprintf "gc-head-%d" (Unix.getpid ())) in

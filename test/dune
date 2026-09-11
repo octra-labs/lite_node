@@ -55,6 +55,7 @@
 
 (test
  (name test_node_runtime_preverify_cache)
+ (modules test_node_runtime_preverify_cache)
  (libraries octra_node_runtime lwt lwt.unix))
 
 (test
@@ -82,6 +83,16 @@
  (name test_state_sync_reliability)
  (modules test_state_sync_reliability)
  (libraries octra_bootstrap octra_node_runtime unix))
+
+(test
+ (name test_grpc)
+ (modules test_grpc)
+ (libraries octra_core octra_node_runtime lwt.unix yojson pbrt))
+
+(test
+ (name test_grpc_http2)
+ (modules test_grpc_http2)
+ (libraries octra_core octra_node_runtime lwt.unix yojson pbrt h2 h2-lwt-unix bigstringaf))
 
 (executables
  (names test_epoch_replay test_epoch_store replay)
