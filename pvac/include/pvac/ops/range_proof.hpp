@@ -9,6 +9,7 @@
 #include <thread>
 #include <algorithm>
 #include <stdexcept>
+#include <exception>
 
 #include "../core/types.hpp"
 #include "verify_zero.hpp"
@@ -25,6 +26,36 @@ static constexpr size_t RANGE_MAX_VALUE_EDGES = 65536;
 static constexpr size_t RANGE_MAX_BIT_LAYERS = 4;
 static constexpr size_t RANGE_MAX_BIT_EDGES = 8192;
 static constexpr size_t RANGE_MAX_SLOTS = 1;
+
+namespace detail {
+
+template<class F>
+inline void range_run(unsigned lanes, F worker) {
+    std::vector<std::exception_ptr> errors(lanes);
+    std::vector<std::thread> threads;
+    threads.reserve(lanes);
+    const size_t chunk = (RANGE_BITS + lanes - 1) / lanes;
+    try {
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            const size_t from = lane * chunk;
+            const size_t to = std::min(from + chunk, RANGE_BITS);
+            if (from < to) {
+                threads.emplace_back([&, lane, from, to] {
+                    try { worker(from, to); }
+                    catch (...) { errors[lane] = std::current_exception(); }
+                });
+            }
+        }
+    } catch (...) {
+        for (auto& thread : threads) thread.join();
+        throw;
+    }
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+}
+
+}
 
 struct RangeProof {
 
@@ -60,6 +91,7 @@ inline RangeProof make_range_proof(
 ) {
     if (!range_value_cipher_ok(pk, ct_value))
         throw std::runtime_error("pvac: range proof value rejected");
+    detail::check_index_count(8, pk.prm.B);
     RangeProof rp;
     rp.ct_bit.resize(RANGE_BITS);
     rp.bit_proofs.resize(RANGE_BITS);
@@ -92,16 +124,7 @@ inline RangeProof make_range_proof(
             }
         };
 
-        std::vector<std::thread> threads;
-        size_t chunk = (RANGE_BITS + n_threads - 1) / n_threads;
-        for (unsigned t = 0; t < n_threads; ++t) {
-            size_t from = t * chunk;
-            size_t to = std::min(from + chunk, RANGE_BITS);
-            if (from < to)
-                threads.emplace_back(worker, from, to);
-        }
-        for (auto& th : threads)
-            th.join();
+        detail::range_run(n_threads, worker);
     }
 
     Cipher ct_sum = rp.ct_bit[0];
@@ -139,10 +162,14 @@ inline bool verify_range(
     for (const auto& ct_bit : rp.ct_bit)
         if (!range_bit_cipher_ok(pk, ct_bit, ct_value.slots))
             return false;
+    if (!detail::index_count_ok(8, pk.prm.B)
+        && std::any_of(rp.ct_bit.begin(), rp.ct_bit.end(),
+            [](const Cipher& ct) { return !ct.L.empty(); }))
+        return false;
 
     unsigned hw = std::thread::hardware_concurrency();
     unsigned n_threads = (hw > 1) ? std::min(hw, (unsigned)RANGE_BITS) : 1;
-    std::vector<bool> results(RANGE_BITS, false);
+    std::vector<uint8_t> results(RANGE_BITS, 0);
 
     if (n_threads <= 1) {
         for (size_t i = 0; i < RANGE_BITS; ++i) {
@@ -166,16 +193,7 @@ inline bool verify_range(
             }
         };
 
-        std::vector<std::thread> threads;
-        size_t chunk = (RANGE_BITS + n_threads - 1) / n_threads;
-        for (unsigned t = 0; t < n_threads; ++t) {
-            size_t from = t * chunk;
-            size_t to = std::min(from + chunk, RANGE_BITS);
-            if (from < to)
-                threads.emplace_back(worker, from, to);
-        }
-        for (auto& th : threads)
-            th.join();
+        detail::range_run(n_threads, worker);
 
         for (size_t i = 0; i < RANGE_BITS; ++i) {
             if (!results[i]) return false;
@@ -314,6 +332,7 @@ inline AggregatedRangeProof make_aggregated_range_proof(
 ) {
     if (!range_value_cipher_ok(pk, ct_value))
         throw std::runtime_error("pvac: aggregated range value rejected");
+    detail::check_index_count(8, pk.prm.B);
     AggregatedRangeProof arp;
     arp.ct_bit.resize(RANGE_BITS);
 
@@ -333,16 +352,7 @@ inline AggregatedRangeProof make_aggregated_range_proof(
     if (n_threads <= 1) {
         worker(0, RANGE_BITS);
     } else {
-        std::vector<std::thread> threads;
-        size_t chunk = (RANGE_BITS + n_threads - 1) / n_threads;
-        for (unsigned t = 0; t < n_threads; ++t) {
-            size_t from = t * chunk;
-            size_t to = std::min(from + chunk, RANGE_BITS);
-            if (from < to)
-                threads.emplace_back(worker, from, to);
-        }
-        for (auto& th : threads)
-            th.join();
+        detail::range_run(n_threads, worker);
     }
 
     auto ct_lc_diff = detail::compute_lc_diff(pk, arp.ct_bit, ct_value);

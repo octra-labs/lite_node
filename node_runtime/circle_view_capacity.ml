@@ -13,13 +13,29 @@ let create ~limit =
 let active t =
   t.active
 
-let with_slot t ~busy run =
+let with_slot ?timeout ?(stop = Fun.id) t ~busy run =
   if t.active >= t.limit then busy ()
   else begin
     t.active <- t.active + 1;
-    Lwt.finalize
-      run
-      (fun () ->
-         t.active <- t.active - 1;
-         Lwt.return_unit)
+    let work =
+      Lwt.finalize
+        run
+        (fun () ->
+           t.active <- t.active - 1;
+           Lwt.return_unit)
+    in
+    let response =
+      match timeout with
+      | None -> Lwt.protected work
+      | Some (seconds, expired) ->
+        let timer =
+          let open Lwt.Syntax in
+          let* () = Lwt_unix.sleep seconds in
+          stop ();
+          expired ()
+        in
+        Lwt.pick [Lwt.protected work; timer]
+    in
+    Lwt.on_cancel response stop;
+    response
   end

@@ -11,7 +11,7 @@
  (targets flags.sexp)
  (action
   (with-stdout-to flags.sexp
-   (bash "find_root () { p=$(cd \"$1\" && pwd); while [ \"$p\" != / ]; do if [ -f \"$p/dune-project\" ] && [ -d \"$p/mcl/include\" ]; then printf '%s\\n' \"$p\"; return 0; fi; p=$(dirname \"$p\"); done; return 1; }; SRC_ROOT=${OCTRA_SRC_ROOT:-$(find_root '%{project_root}')}; test -f \"$SRC_ROOT/dune-project\" && test -d \"$SRC_ROOT/mcl/include\"; echo \"(-std=c++17 -O2 -fPIC -DMCL_FP_BIT=256 -DMCL_FR_BIT=256 -I $SRC_ROOT/mcl/include)\""))))
+   (bash "EH_FLAGS=''; if [ \"$(uname -s)\" = 'Darwin' ]; then EH_FLAGS='-femit-dwarf-unwind=always'; fi; find_root () { p=$(cd \"$1\" && pwd); while [ \"$p\" != / ]; do if [ -f \"$p/dune-project\" ] && [ -d \"$p/mcl/include\" ]; then printf '%s\\n' \"$p\"; return 0; fi; p=$(dirname \"$p\"); done; return 1; }; SRC_ROOT=${OCTRA_SRC_ROOT:-$(find_root '%{project_root}')}; test -f \"$SRC_ROOT/dune-project\" && test -d \"$SRC_ROOT/mcl/include\"; echo \"(-std=c++17 -O2 -fPIC $EH_FLAGS -DMCL_FP_BIT=256 -DMCL_FR_BIT=256 -I $SRC_ROOT/mcl/include)\""))))
 
 (rule
  (targets clib_flags.sexp)

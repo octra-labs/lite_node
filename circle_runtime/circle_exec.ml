@@ -1055,7 +1055,7 @@ let run_preview_prefetch ~clear task =
       clear ();
       Lwt.return_unit)
 
-let rec execute_view_call_with_execution execution ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id method_name params caller =
   let timing_enabled = wasm_view_method_timing_enabled method_name in
   let timing_started_at = if timing_enabled then Some (Unix.gettimeofday ()) else None in
@@ -1151,7 +1151,7 @@ let rec execute_view_call_with_execution execution ?(trusted = []) ?(ctx = Contr
                     let* receipt =
                       Lwt_preemptive.detach
                         (fun () ->
-                          Contract.run_fixed_from_dispatcher state fixed)
+                          Contract.run_fixed_from_dispatcher ?running state fixed)
                         ()
                     in
                     timing_mark "run_dispatcher";
@@ -1272,8 +1272,9 @@ let rec execute_view_call_with_execution execution ?(trusted = []) ?(ctx = Contr
     end
     end
 
-and maybe_prefetch_preview ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+and maybe_prefetch_preview ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id caller prompt_csv prompt_tokens delivered_csv =
+  if Option.is_some running then () else
   match parse_csv_tokens delivered_csv with
   | None ->
     ()
@@ -1318,12 +1319,13 @@ and maybe_prefetch_preview ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit 
               Lwt.return_unit))
       end
 
-and execute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id method_name params caller =
   match preview_request_of_call method_name params with
   | None ->
     execute_view_call_with_execution
       Circle_program.Standard
+      ?running
       ~trusted
       ~ctx
       ~depth
@@ -1339,6 +1341,7 @@ and execute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 
       match preview_cache_lookup cache_key n_tokens with
       | Some result_csv ->
         maybe_prefetch_preview
+          ?running
           ~ctx
           ~depth
           ~limit
@@ -1353,6 +1356,7 @@ and execute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 
         let* receipt =
           execute_view_call_with_execution
             Circle_program.Standard
+            ?running
             ~ctx
             ~depth
             ~limit
@@ -1366,6 +1370,7 @@ and execute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 
           | Some result_csv ->
             preview_cache_store cache_key result_csv;
             maybe_prefetch_preview
+              ?running
               ~ctx
               ~depth
               ~limit

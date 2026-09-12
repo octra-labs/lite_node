@@ -15,6 +15,7 @@ type refs = {
 
 type deps = {
   env : string -> string option;
+  refs : refs;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   data_dir : string;
@@ -45,6 +46,13 @@ type t = {
 val create_refs :
   unit ->
   refs
+
+val bind_profile :
+  refs ->
+  chain_id:string ->
+  program_trust_hash:string option ->
+  runtime_profile_hash:string ->
+  string
 
 val sync :
   recovery:bool ->

@@ -15,7 +15,6 @@ module Manifest = Octra_bootstrap.State_sync_manifest
 module Anchor = Octra_bootstrap.Sync_anchor
 module Roots = Octra_bootstrap.Root_win
 module Verify = Octra_bootstrap.State_sync_verify
-module Trust = Octra_vm.Program_trust
 module Migration = Octra_core.Pvac_migration_admission
 
 let read path limit =
@@ -56,6 +55,20 @@ let file_digest path =
     in
     loop Digestif.SHA256.empty)
 
+let prepare cert_path =
+  let cert = certificate cert_path in
+  let checkpoint = cert.Manifest.checkpoint in
+  let configured_hash =
+    R.get (Octra_node_runtime.State_sync_http.configured_config_hash ()) in
+  let trust = R.get (Epoch_store.network ~getenv:Sys.getenv_opt
+    ~chain_id:checkpoint.chain_id ~config_hash:checkpoint.config_hash
+    ~configured_hash) in
+  let worker = some "proof worker executable" (Sys.getenv_opt "OCTRA_PVAC_VERIFY_WORKER") in
+  Unix.access worker [Unix.X_OK];
+  let worker_hash = file_digest worker in
+  R.get (Octra_core.Pvac_verify_worker.ready_sync ());
+  cert, trust, worker_hash
+
 let environment () =
   Unix.environment ()
   |> Array.to_list
@@ -92,11 +105,10 @@ let write output value =
 
 let run ~data ~cert_path ~range_path ~output =
   let open Lwt.Syntax in
-  let cert = certificate cert_path in
+  let cert, trust, worker_hash = prepare cert_path in
   let checkpoint = cert.Manifest.checkpoint in
   let chain_id = checkpoint.chain_id in
-  R.require "replay chain configuration differs"
-    (Sys.getenv_opt "OCTRA_CHAIN_ID" = Some chain_id);
+  let ready_config_hash = checkpoint.config_hash in
   let marker = read (Filename.concat data "replay_copy") 256 |> String.trim in
   R.require "replay requires an explicit snapshot copy" (marker = cert.manifest_hash);
   let* verified = Verify.verify checkpoint data in
@@ -116,16 +128,6 @@ let run ~data ~cert_path ~range_path ~output =
     Lwt.finalize (fun () ->
       let ledger = Ledger.create store in
       ignore (R.get (Ledger.freeze ledger));
-      let trust = Trust.of_env Sys.getenv_opt
-        |> Result.map_error Trust.error_message |> R.get in
-      let ready_config_hash =
-        C.network_hash ~chain_id ?program_trust_hash:(Trust.config_hash trust)
-          ~runtime_profile_hash:
-            (Octra_node_runtime.Consensus_profile.compat_hash Sys.getenv_opt) ()
-        |> Octra_bootstrap.State_sync_checkpoint.raw_to_hex
-      in
-      R.require "replay network identity differs from checkpoint"
-        (ready_config_hash = checkpoint.config_hash);
       let root_at epoch =
         let stored = Option.map (fun header -> header.Octra_core.Epochlog.state_root)
           (Data.get_epoch_header chain epoch) in
@@ -190,8 +192,7 @@ let run ~data ~cert_path ~range_path ~output =
         "range_sha256", `String (digest raw);
         "environment_sha256", `String (environment ());
         "binary_sha256", `String (file_digest Sys.executable_name);
-        "worker_sha256", `String (file_digest
-          (some "proof worker executable" (Sys.getenv_opt "OCTRA_PVAC_VERIFY_WORKER")));
+        "worker_sha256", `String worker_hash;
         "first_epoch", `String (Int64.to_string cursor.epoch);
       ]);
       let* final, count = loop cursor 0 records in
@@ -208,13 +209,17 @@ let run ~data ~cert_path ~range_path ~output =
 let () =
   try
     match Sys.argv with
+    | [| _; "--check"; cert_path |] ->
+      let cert, _, worker_hash = prepare cert_path in
+      Printf.printf "event = replay_check status = pass manifest = %s worker_sha256 = %s\n%!"
+        cert.Manifest.manifest_hash worker_hash
     | [| _; data; cert_path; range_path; output_path |] ->
       let descriptor = Unix.openfile output_path
         [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL] 0o600 in
       let output = Unix.out_channel_of_descr descriptor in
       Fun.protect ~finally:(fun () -> close_out_noerr output) (fun () ->
         Lwt_main.run (run ~data ~cert_path ~range_path ~output))
-    | _ -> failwith "usage: replay DATA_COPY CERTIFICATE RANGE OUTPUT"
+    | _ -> failwith "usage: replay DATA_COPY CERTIFICATE RANGE OUTPUT | replay --check CERTIFICATE"
   with error ->
     Printf.eprintf "event = replay status = fail reason = %s\n%!" (Printexc.to_string error);
     exit 1

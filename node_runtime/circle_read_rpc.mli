@@ -294,6 +294,8 @@ val view_call :
   ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
+  running:(unit -> bool) ->
+  stop:(unit -> unit) ->
   circle_id:string ->
   method_name:string ->
   call_params:Yojson.Safe.t list ->
@@ -305,6 +307,8 @@ val view_call_public :
   ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
+  running:(unit -> bool) ->
+  stop:(unit -> unit) ->
   circle_id:string ->
   method_name:string ->
   call_params:Yojson.Safe.t list ->
@@ -316,6 +320,8 @@ val view_call_public_params :
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
+  running:(unit -> bool) ->
+  stop:(unit -> unit) ->
   rpc_result Lwt.t
 
 val view_call_auth :
@@ -323,6 +329,8 @@ val view_call_auth :
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
+  running:(unit -> bool) ->
+  stop:(unit -> unit) ->
   rpc_result Lwt.t
 
 val object_read :

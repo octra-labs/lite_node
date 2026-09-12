@@ -288,14 +288,27 @@ val range_response :
 
 val http_range :
   ?fetch_json:(string -> Yojson.Safe.t Lwt.t) ->
+  ?timeout:float ->
   (string -> string option) ->
   from_epoch:int64 ->
   max_epochs:int ->
+  validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
   Octra_consensus.C_driver.catchup_range_response_record option Lwt.t
+
+val proved_head :
+  chain_id:string ->
+  validator_hash:(int64 -> string) ->
+  head ->
+  record ->
+  bool
 
 val http_head :
   ?fetch_json:(string -> Yojson.Safe.t Lwt.t) ->
+  ?timeout:float ->
   (string -> string option) ->
+  chain_id:string ->
+  validator_hash:(int64 -> string) ->
+  after:int64 ->
   int64 option Lwt.t
 
 val sync_plan :

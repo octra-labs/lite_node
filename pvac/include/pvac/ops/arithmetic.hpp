@@ -10,6 +10,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <utility>
+#include <limits>
 
 #include "../core/types.hpp"
 #include "encrypt.hpp"
@@ -43,7 +44,18 @@ inline auto gsum_accumulator = [](const Fp& acc, const Fp& term, uint8_t ch) -> 
     return ch == SGN_P ? fp_add(acc, term) : fp_sub(acc, term);
 };
 
+inline bool index_count_ok(size_t n, int B) {
+    return n == 0 || (B > 0 && n <= static_cast<size_t>(B)
+        && n <= size_t{1} + std::numeric_limits<uint16_t>::max());
+}
+
+inline void check_index_count(size_t n, int B) {
+    if (!index_count_ok(n, B))
+        throw std::runtime_error("pvac: index count exceeds domain");
+}
+
 inline void sample_unique_indices(uint16_t* dst, size_t n, int B) {
+    check_index_count(n, B);
     for (size_t i = 0; i < n; ++i) {
         uint16_t x;
         do {
@@ -54,6 +66,7 @@ inline void sample_unique_indices(uint16_t* dst, size_t n, int B) {
 }
 
 inline void sample_unique_indices(uint16_t* dst, size_t n, int B, SeedableRng& rng) {
+    check_index_count(n, B);
     for (size_t i = 0; i < n; ++i) {
         uint16_t x;
         do {

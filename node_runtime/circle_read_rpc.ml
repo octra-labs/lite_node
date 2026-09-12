@@ -390,12 +390,17 @@ let view_call
     ?(trusted=[])
     store
     ~view_ctx
+    ~running
+    ~stop
     ~circle_id
     ~method_name
     ~call_params
     ~caller_addr
     ~include_storage =
   Circle_view_capacity.with_slot
+    ~timeout:(Octra_vm.Contract_rpc.view_seconds, fun () ->
+      Lwt.return (Error (Rpc.err (-32005) "circle view time limit exceeded" None)))
+    ~stop
     view_capacity
     ~busy:(fun () ->
       Lwt.return
@@ -404,6 +409,7 @@ let view_call
       let open Lwt.Syntax in
       let* result =
         Octra_circle_runtime.Circle_exec.execute_view_call
+          ~running
           ~trusted
           ~ctx:view_ctx
           store
@@ -432,6 +438,8 @@ let view_call_public
     ?(trusted=[])
     store
     ~view_ctx
+    ~running
+    ~stop
     ~circle_id
     ~method_name
     ~call_params
@@ -446,6 +454,7 @@ let view_call_public
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle view required" None))
     else
       view_call
+        ~running ~stop
         ~trusted
         store
         ~view_ctx
@@ -455,12 +464,13 @@ let view_call_public
         ~caller_addr
         ~include_storage:false
 
-let view_call_public_params ?(trusted=[]) store params ~view_ctx =
+let view_call_public_params ?(trusted=[]) store params ~view_ctx ~running ~stop =
   match Circle_view.view_call_params params with
   | Error e ->
     err_lwt e
   | Ok call ->
     view_call_public
+      ~running ~stop
       ~trusted
       store
       ~view_ctx
@@ -469,7 +479,7 @@ let view_call_public_params ?(trusted=[]) store params ~view_ctx =
       ~call_params:call.call_params
       ~caller_addr:"oct00000000000000000000000000000000000000000000"
 
-let view_call_auth ?(trusted=[]) store params ~view_ctx =
+let view_call_auth ?(trusted=[]) store params ~view_ctx ~running ~stop =
   match Circle_view.view_call_params params with
   | Error e ->
     err_lwt e
@@ -498,6 +508,7 @@ let view_call_auth ?(trusted=[]) store params ~view_ctx =
           ~include_storage)
         (fun caller_addr ->
           view_call
+            ~running ~stop
             ~trusted
             store
             ~view_ctx

@@ -688,8 +688,18 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         }
     in
     let fold_wake = ref (fun ~head:_ -> ()) in
-    let profile_set =
-      ref (fun _ -> failwith "profile switch is unavailable")
+    let network_refs = Startup_network_boot_shell.create_refs () in
+    let set_profile runtime_profile_hash =
+      let config_hash =
+        Startup_network_boot_shell.bind_profile
+          network_refs
+          ~chain_id:startup_network.chain_id
+          ~program_trust_hash:(Program_trust.config_hash program_trust)
+          ~runtime_profile_hash
+      in
+      Log.info "consensus"
+        "event = profile_switch config = %s"
+        (Octra_consensus.C_config.short config_hash)
     in
     let mark_state_attested =
       match recovery_need with
@@ -979,7 +989,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           short = addr_short;
           require_sync;
           exit = exit_error;
-          set_profile = (fun hash -> (!profile_set) hash);
+          set_profile;
         }
         Consensus_epoch_apply_finish_shell.{
           now;
@@ -1126,6 +1136,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Startup_network_boot_shell.run
         Startup_network_boot_shell.{
           env = env_opt;
+          refs = network_refs;
           read_active_validator_meta = (fun () ->
             irmin_get_meta
               store
@@ -1168,20 +1179,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           exit_success;
         }
     in
-    profile_set := (fun runtime_profile_hash ->
-      let config_hash =
-        Octra_consensus.C_config.hash
-          ~chain_id
-          ~validator_set:!consensus_validator_set_ref
-          ?scheduled:!scheduled_validator_set_ref
-          ?program_trust_hash:(Program_trust.config_hash program_trust)
-          ~runtime_profile_hash
-          ()
-      in
-      consensus_config_hash_ref := config_hash;
-      Log.info "consensus"
-        "event = profile_switch config = %s"
-        (Octra_consensus.C_config.short config_hash));
     let catchup_base_eic_root () =
       Consensus_join_rpc.base_eic_root_from_head
         (Octra_core.Head_manifest.get_cached ()) in

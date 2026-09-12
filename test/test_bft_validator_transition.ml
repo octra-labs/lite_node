@@ -89,7 +89,7 @@ let check_finalize_retention () =
     (not (has_finalize (C_engine.drain_outputs engine)))
     "completed finalize is not delivered again"
 
-let check_future_validator_engine_boundary () =
+let check_future_validator_cutoff () =
   let chain_id = "transition-test" in
   let a = validator "octAAAA" in
   let b = validator "octBBBB" in
@@ -362,7 +362,7 @@ let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_e
     ~relief_log:(C_relief_log.memory ())
     ~vote_log:(C_vote_log.memory ())
 
-let check_scheduled_activation_restart_boundaries () =
+let check_activation_restart () =
   let chain_id = "transition-driver-test" in
   let a = validator "octAAAA" in
   let b = validator "octBBBB" in
@@ -479,7 +479,7 @@ let check_live_plan () =
   assert_msg (List.rev !activated = ["live-plan"])
     "stale startup plan never activates after live plan"
 
-let check_start_height_activates_target_set () =
+let check_start_height_set () =
   let chain_id = "transition-start-height-test" in
   let a = validator "octAAAA" in
   let b = validator "octBBBB" in
@@ -544,7 +544,7 @@ let check_marked_set_repairs_runtime () =
   assert_msg (!activations = 1)
     "matching validator set activation is idempotent"
 
-let check_fold_event_binds_finalized_parent () =
+let check_fold_finalized_parent () =
   let chain_id = "transition-fold-test" in
   let a = validator "octAAAA" in
   let b = validator "octBBBB" in
@@ -681,13 +681,13 @@ let check_strict_quorum_history () =
 
 let () =
   check_finalize_retention ();
-  check_future_validator_engine_boundary ();
+  check_future_validator_cutoff ();
   check_profile_offer ();
   check_profile_switch ();
-  check_scheduled_activation_restart_boundaries ();
+  check_activation_restart ();
   check_live_plan ();
-  check_start_height_activates_target_set ();
+  check_start_height_set ();
   check_marked_set_repairs_runtime ();
-  check_fold_event_binds_finalized_parent ();
+  check_fold_finalized_parent ();
   check_strict_quorum_history ();
   Printf.printf "status = pass test = bft_validator_transition\n%!"

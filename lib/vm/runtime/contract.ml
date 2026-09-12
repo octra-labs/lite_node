@@ -309,14 +309,30 @@ let setup_call_state ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_0
   setup_call_state_values ~ctx ~depth ~limit ~caller ~address ~value ~storage_tbl
     ~method_name ~params:(List.map parse_param params) ()
 
-let run_fixed_from_dispatcher state fixed =
+let run_fixed_from_dispatcher ?running state fixed =
+  let run () =
+    match running with
+    | None -> Contract_vm.run state fixed
+    | Some running ->
+      let rec loop () =
+        if not (running ()) then begin
+          ignore (Contract_vm.refuse state);
+          false
+        end else
+          match Contract_vm.step state fixed with
+          | Contract_vm.Running -> loop ()
+          | Contract_vm.Finished -> true
+          | Contract_vm.Refused -> false
+      in
+      loop ()
+  in
   let ok = match find_dispatcher fixed with
     | Some entry ->
       state.Contract_vm.pc <- entry;
-      let success = Contract_vm.run state fixed in
+      let success = run () in
       success && not state.reverted
     | None ->
-      let success = Contract_vm.run state fixed in
+      let success = run () in
       success && not state.reverted
   in
   let return_value = if ok then
@@ -596,7 +612,7 @@ let execute_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?
              ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
            run_fixed_from_dispatcher state fixed)
 
-let execute_view_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000) store contract_addr method_name params caller =
+let execute_view_call ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000) store contract_addr method_name params caller =
   match load_loaded ~trusted ~point_ops:ctx.point_ops store contract_addr with
   | None ->
     { success = false; return_value = None; effort_used = 0;
@@ -629,7 +645,7 @@ let execute_view_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth =
              ~address:contract_addr ~value:Z.zero ~storage_tbl:storage_copy
              ~method_name ~params:values () in
            state.is_view <- true;
-           run_fixed_from_dispatcher state fixed)
+           run_fixed_from_dispatcher ?running state fixed)
 
 let contract_exists store addr =
   run_s (Octra_core.Store_irmin.contract_exists store addr)

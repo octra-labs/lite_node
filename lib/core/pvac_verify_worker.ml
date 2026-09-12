@@ -108,6 +108,10 @@ let worker_path () =
 let monotonic_seconds () =
   Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.
 
+external wait_io :
+  Unix.file_descr -> Unix.file_descr -> Unix.file_descr -> int -> int
+  = "octra_io_wait"
+
 let rss_mb_of_status_line line =
   if not (String.starts_with ~prefix:"VmRSS:" line) then None
   else
@@ -160,10 +164,10 @@ let terminate pid =
   in
   reap 100
 
-let close_stream stream =
+let close_stream ?(close = close_noerr) stream =
   if stream.open_ then begin
     stream.open_ <- false;
-    close_noerr stream.fd
+    close stream.fd
   end
 
 let append stream limit bytes count =
@@ -173,23 +177,23 @@ let append stream limit bytes count =
     Ok ()
   end
 
-let rec read_available stream limit bytes =
+let rec read_available ?(close = close_noerr) stream limit bytes =
   if not stream.open_ then Ok ()
   else
     try
       match Unix.read stream.fd bytes 0 (Bytes.length bytes) with
       | 0 ->
-        close_stream stream;
+        close_stream ~close stream;
         Ok ()
       | count ->
         begin
           match append stream limit bytes count with
           | Error _ as error -> error
-          | Ok () -> read_available stream limit bytes
+          | Ok () -> read_available ~close stream limit bytes
         end
     with
     | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> Ok ()
-    | Unix.Unix_error (Unix.EINTR, _, _) -> read_available stream limit bytes
+    | Unix.Unix_error (Unix.EINTR, _, _) -> read_available ~close stream limit bytes
     | error -> Error (Printexc.to_string error)
 
 let write_available fd raw offset =
@@ -244,35 +248,29 @@ let process_response expected_hash stdout stderr status =
   | Unix.WSTOPPED signal ->
     Failed (Printf.sprintf "worker_stopped_%d" signal)
 
-let run_process worker request =
+let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
   let raw = P.request_bytes request in
   let expected_hash = P.request_hash request in
-  let input_read, input_write = Unix.pipe () in
-  let output_read, output_write = Unix.pipe () in
-  let error_read, error_write = Unix.pipe () in
-  List.iter
-    Unix.set_close_on_exec
-    [
-      input_read;
-      input_write;
-      output_read;
-      output_write;
-      error_read;
-      error_write;
-    ];
+  let descriptors = ref [] in
+  let acquire () =
+    let read, write = pipe () in
+    descriptors := read :: write :: !descriptors;
+    read, write
+  in
+  let close fd =
+    if List.mem fd !descriptors then begin
+      descriptors := List.filter ((<>) fd) !descriptors;
+      close_noerr fd
+    end
+  in
   let close_all () =
-    List.iter close_noerr
-      [
-        input_read;
-        input_write;
-        output_read;
-        output_write;
-        error_read;
-        error_write;
-      ]
+    List.iter close !descriptors
   in
   let pid_ref = ref None in
   try
+    let input_read, input_write = acquire () in
+    let output_read, output_write = acquire () in
+    let error_read, error_write = acquire () in
     let pid =
       Unix.create_process_env
         worker
@@ -283,9 +281,9 @@ let run_process worker request =
         error_write
     in
     pid_ref := Some pid;
-    close_noerr input_read;
-    close_noerr output_write;
-    close_noerr error_write;
+    close input_read;
+    close output_write;
+    close error_write;
     Unix.set_nonblock input_write;
     Unix.set_nonblock output_read;
     Unix.set_nonblock error_read;
@@ -296,10 +294,10 @@ let run_process worker request =
     let started = monotonic_seconds () in
     let bytes = Bytes.create 65_536 in
     let finish outcome =
-      if !input_open then close_noerr input_write;
+      if !input_open then close input_write;
       input_open := false;
-      close_stream output;
-      close_stream error;
+      close_stream ~close output;
+      close_stream ~close error;
       outcome
     in
     let fail reason =
@@ -323,7 +321,7 @@ let run_process worker request =
             | None -> poll_status pid
           in
           if Option.is_some status && !input_open then begin
-            close_noerr input_write;
+            close input_write;
             input_open := false
           end;
           if
@@ -342,39 +340,35 @@ let run_process worker request =
             | None ->
               fail "worker_status_missing"
           else
-            let reads =
-              List.filter_map
-                (fun stream -> if stream.open_ then Some stream.fd else None)
-                [output; error]
+            let mask =
+              (if output.open_ then 1 else 0)
+              lor (if error.open_ then 2 else 0)
+              lor (if !input_open then 4 else 0)
             in
-            let writes = if !input_open then [input_write] else [] in
-            let readable, writable, _ =
-              try Unix.select reads writes [] 0.1
-              with Unix.Unix_error (Unix.EINTR, _, _) -> [], [], []
-            in
+            let ready = wait_io input_write output_read error_read mask in
             let read_result =
               List.fold_left
-                (fun result stream ->
+                (fun result (bit, stream) ->
                   match result with
                   | Error _ -> result
                   | Ok () when
                       stream.open_
-                      && List.mem stream.fd readable ->
-                    read_available stream P.max_response_bytes bytes
+                      && ready land bit <> 0 ->
+                    read_available ~close stream P.max_response_bytes bytes
                   | Ok () -> Ok ())
                 (Ok ())
-                [output; error]
+                [1, output; 2, error]
             in
             begin
               match read_result with
               | Error reason -> fail reason
               | Ok () ->
-                if !input_open && List.mem input_write writable then
+                if !input_open && ready land 4 <> 0 then
                   begin
                     match write_available input_write raw input_offset with
                     | Error reason -> fail reason
                     | Ok true ->
-                      close_noerr input_write;
+                      close input_write;
                       input_open := false;
                       loop status
                     | Ok false ->

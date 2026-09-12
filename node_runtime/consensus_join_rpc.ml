@@ -347,6 +347,8 @@ let fetch_range_json fetch_json base ~from_epoch ~max_epochs =
   | Ok (Range_part.Full json) -> Lwt.return json
   | Ok (Range_part.Part first) when first.index <> 0 ->
     Lwt.fail (Fetch_retry "range first part index is invalid")
+  | Ok (Range_part.Part first) when first.count > Range_part.part_max ->
+    Lwt.fail (Fetch_retry "range part count exceeds limit")
   | Ok (Range_part.Part first) ->
     let rec collect index parts =
       if index = first.count then
@@ -529,7 +531,7 @@ let raw_hash name value =
   | Error reason ->
     failwith (Printf.sprintf "join %s: %s" name reason)
 
-let canonical_record (record : record) =
+let wire_record (record : record) =
   Octra_consensus.C_codec.{
     epoch_id = record.epoch_id;
     prev_state_root = raw_hash "prev_state_root" record.prev_state_root;
@@ -548,7 +550,7 @@ let canonical_record (record : record) =
 
 let range_response ~source ~from_epoch ~max_epochs = function
   | Records records when max_epochs > 0 && List.length records <= max_epochs ->
-    let records = List.map canonical_record records in
+    let records = List.map wire_record records in
     let next_epoch =
       match List.rev records with
       | last :: _ -> Some (Int64.succ last.Octra_consensus.C_codec.epoch_id)
@@ -565,51 +567,122 @@ let range_response ~source ~from_epoch ~max_epochs = function
   | Missing
   | Records _ -> None
 
-let http_range ?(fetch_json = fun url -> http_get_json url) env ~from_epoch
-    ~max_epochs =
-  match configured_join env with
-  | None -> Lwt.return_none
-  | Some source ->
-    let open Lwt.Syntax in
-    Lwt.catch
-      (fun () ->
-        let source = normalize_base source in
-        let* json =
-          fetch_range_json fetch_json source ~from_epoch ~max_epochs
-        in
-        Lwt.return
-          (range_response
-             ~source
-             ~from_epoch
-             ~max_epochs
-             (parse_range ~from_epoch json)))
-      (fun exn ->
+let http_range ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
+    env ~from_epoch ~max_epochs ~validate =
+  let open Lwt.Syntax in
+  let get url =
+    Lwt_unix.with_timeout timeout (fun () -> fetch_json url)
+  in
+  let rec next = function
+    | [] -> Lwt.return_none
+    | base :: rest ->
+      let source = normalize_base base in
+      let* result =
+        fetch (fun () ->
+          let* json = fetch_range_json get source ~from_epoch ~max_epochs in
+          Lwt.return
+            (range_response
+               ~source
+               ~from_epoch
+               ~max_epochs
+               (parse_range ~from_epoch json)))
+      in
+      match result with
+      | Ok (Some response) when validate response ->
+        Lwt.return_some response
+      | Ok _ ->
+        Octra_log.info "catchup"
+          "event = range_http_next from = %Ld source = %s"
+          from_epoch source;
+        next rest
+      | Error error ->
         Octra_log.warn "catchup"
-          "event = range_http_unavailable from = %Ld error = %s"
-          from_epoch
-          (Printexc.to_string exn);
-        Lwt.return_none)
+          "event = range_http_unavailable from = %Ld source = %s error = %s"
+          from_epoch source error;
+        next rest
+  in
+  next (configured_sources env)
 
-let http_head ?(fetch_json = fun url -> http_get_json url) env =
-  match configured_join env with
-  | None -> Lwt.return_none
-  | Some source ->
-    let open Lwt.Syntax in
-    Lwt.catch
-      (fun () ->
+let proved_head ~chain_id ~validator_hash (head : head) (record : record) =
+  if record.epoch_id <> head.epoch || record.state_root <> head.root then
+    false
+  else
+    let txid = record.finality.finalize.header.txid_hi in
+    Int64.compare txid Int64.max_int < 0
+    && Result.is_ok
+         (Octra_consensus.C_catchup.verify_record_finality
+            ~chain_id
+            ~expected_validator_set_hash:(validator_hash head.epoch)
+            ~expected_txid:(Int64.succ txid)
+            ~record:(wire_record record))
+
+let prefix_head ~chain_id ~validator_hash ~after records =
+  let rec next epoch root best = function
+    | [] -> best
+    | (record : record) :: rest ->
+      let head = { epoch = record.epoch_id; root = record.state_root } in
+      if record.epoch_id <> epoch
+         || (match root with Some value -> record.prev_state_root <> value | None -> false)
+         || not (proved_head ~chain_id ~validator_hash head record) then
+        best
+      else
+        next (Int64.succ epoch) (Some record.state_root) (Some epoch) rest
+  in
+  next (Int64.succ after) None None records
+
+let http_head ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
+    env ~chain_id ~validator_hash ~after =
+  let open Lwt.Syntax in
+  let get url =
+    Lwt_unix.with_timeout timeout (fun () -> fetch_json url)
+  in
+  let range source ~from_epoch ~max_epochs =
+    fetch (fun () ->
+      let* json = fetch_range_json get source ~from_epoch ~max_epochs in
+      Lwt.return (parse_range ~from_epoch json))
+  in
+  let read source =
+    let* result =
+      fetch (fun () ->
         let source = normalize_base source in
-        let* json = fetch_json (head_url source) in
-        let epoch = (parse_head json).epoch in
-        if Int64.compare epoch 0L < 0
-           || Int64.compare epoch (Int64.of_int max_int) > 0 then
+        let* json = get (head_url source) in
+        let head = parse_head json in
+        if Int64.compare head.epoch 0L < 0
+           || Int64.compare head.epoch after <= 0
+           || Int64.compare head.epoch (Int64.of_int max_int) > 0 then
           Lwt.return_none
         else
-          Lwt.return_some epoch)
-      (fun exn ->
-        Octra_log.warn "catchup"
-          "event = head_http_unavailable error = %s"
-          (Printexc.to_string exn);
-        Lwt.return_none)
+          let* proof = range source ~from_epoch:head.epoch ~max_epochs:1 in
+          match proof with
+          | Ok (Records [record]) when proved_head ~chain_id ~validator_hash head record ->
+            Lwt.return_some head.epoch
+          | Ok _ | Error _ ->
+            let max_epochs = Int64.min 16L (Int64.sub head.epoch after) |> Int64.to_int in
+            let* prefix = range source ~from_epoch:(Int64.succ after) ~max_epochs in
+            let epoch =
+              match prefix with
+              | Ok (Records records) when List.length records <= max_epochs ->
+                prefix_head ~chain_id ~validator_hash ~after records
+              | Ok _ | Error _ -> None
+            in
+            Lwt.return epoch)
+    in
+    match result with
+    | Ok epoch -> Lwt.return epoch
+    | Error error ->
+      Octra_log.warn "catchup"
+        "event = head_http_unavailable source = %s error = %s"
+        source error;
+      Lwt.return_none
+  in
+  let* heads = Lwt_list.map_p read (configured_sources env) in
+  Lwt.return
+    (List.fold_left
+       (fun best head ->
+         match best, head with
+         | None, value | value, None -> value
+         | Some left, Some right -> Some (Int64.max left right))
+       None heads)
 
 let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
   if record.epoch_id <> cursor.epoch then
@@ -690,7 +763,7 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
         ~chain_id
         ~expected_validator_set_hash
         ~expected_txid:next_cursor.txid
-        ~record:(canonical_record record)
+        ~record:(wire_record record)
     with
     | Error error -> failwith ("join " ^ error)
     | Ok _ -> ()

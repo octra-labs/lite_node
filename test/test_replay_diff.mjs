@@ -9,7 +9,7 @@ import {spawnSync} from "node:child_process";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const work = path.join(root, "runtime_data", "replay-diff-" + process.pid);
 const digest = value => value.repeat(64);
-const fixture = binary => [
+const sample = binary => [
   {event: "start", scope: "ledger_execution", manifest: digest("a"),
     range_sha256: digest("b"), environment_sha256: digest("c"),
     binary_sha256: digest(binary), worker_sha256: digest(binary), first_epoch: "1"},
@@ -37,7 +37,7 @@ const cases = [
   ["environment", records => { records[0].environment_sha256 = digest("f"); return records; }, false],
   ["manifest", records => { records[0].manifest = digest("f"); return records; }, false],
   ["range", records => { records[0].range_sha256 = digest("f"); return records; }, false],
-  ["scope", records => { records[0].scope = "fixture"; return records; }, false],
+  ["scope", records => { records[0].scope = "sample"; return records; }, false],
   ["provenance", records => { delete records[0].worker_sha256; return records; }, false],
   ["gap", records => { records[2].epoch = "3"; return records; }, false],
   ["count", records => { records[3].epochs = 3; return records; }, false],
@@ -62,9 +62,9 @@ try {
   const right = path.join(work, "candidate.jsonl");
   const pins = path.join(work, "builds.json");
   fs.writeFileSync(pins, JSON.stringify(builds));
-  fs.writeFileSync(left, encode(fixture("e")));
+  fs.writeFileSync(left, encode(sample("e")));
   for (const [name, change, expected] of cases) {
-    const changed = change(fixture("f"));
+    const changed = change(sample("f"));
     fs.writeFileSync(right, typeof changed === "string" ? changed : encode(changed));
     const run = spawnSync(process.execPath, [path.join(root, "test", "replay_diff.mjs"), left, right, pins],
       {encoding: "utf8", timeout: 5000});
@@ -72,10 +72,10 @@ try {
       throw new Error("case = " + name + " status = " + run.status);
     }
   }
-  const withoutConfirmed = fixture("e");
+  const withoutConfirmed = sample("e");
   withoutConfirmed[1].confirmed = [];
   fs.writeFileSync(left, encode(withoutConfirmed));
-  const matchingEmpty = fixture("f");
+  const matchingEmpty = sample("f");
   matchingEmpty[1].confirmed = [];
   fs.writeFileSync(right, encode(matchingEmpty));
   const empty = spawnSync(process.execPath,
@@ -85,15 +85,15 @@ try {
     || !empty.stderr.includes("trace has no confirmed transactions")) {
     throw new Error("empty confirmed trace accepted");
   }
-  fs.writeFileSync(left, encode(fixture("e")));
-  fs.writeFileSync(right, encode(fixture("f")));
+  fs.writeFileSync(left, encode(sample("e")));
+  fs.writeFileSync(right, encode(sample("f")));
   const wrong = {...builds, reference: {...builds.reference, source: "2".repeat(40)}};
   fs.writeFileSync(pins, JSON.stringify(wrong));
   const rejected = spawnSync(process.execPath, [path.join(root, "test", "replay_diff.mjs"), left, right, pins],
     {encoding: "utf8", timeout: 5000});
   if (rejected.error || rejected.status === 0) throw new Error("wrong reference source accepted");
   console.log("event = replay_diff_checks status = pass cases = " + (cases.length + 2)
-    + " execution = fixture");
+    + " execution = sample");
 } finally {
   fs.rmSync(work, {recursive: true});
 }

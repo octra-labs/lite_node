@@ -30,7 +30,7 @@ let admit ~now ~max_drift ~sender_pk tx =
   if not (addr_valid tx) then Invalid_address
   else
     match
-      Tx_view.payload_admission
+      Tx_view.payload_size_admission
         ~limits:Tx_view.payload_limits
         tx
     with
@@ -39,4 +39,7 @@ let admit ~now ~max_drift ~sender_pk tx =
       let drift = Float.abs (tx.Octra_core.Transaction.timestamp -. now) in
       if drift > max_drift then Timestamp_drift drift
       else if not (sig_valid tx sender_pk) then Invalid_signature
-      else Accept
+      else
+        match Tx_view.payload_admission ~limits:Tx_view.payload_limits tx with
+        | Error _ -> Invalid_payload
+        | Ok () -> Accept

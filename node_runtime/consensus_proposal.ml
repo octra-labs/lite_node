@@ -2004,8 +2004,8 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
       let proposer = deps.proposer () in
       let validator_pubkeys = deps.validator_pubkeys epoch_id in
       let epoch_ts = deps.now () in
-      let rec preview_until_stable attempt remaining accumulated =
-        if attempt > List.length tx_list + 1 then
+      let rec preview_until_stable attempt candidates remaining accumulated =
+        if attempt > (2 * List.length tx_list) + 1 then
           Lwt.return_error "preview_retry_limit"
         else
           let remaining_hashes = List.map Transaction.hash remaining in
@@ -2049,7 +2049,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
                 begin
                   match
                     Octra_core.Tx_outcome.build
-                      ~candidates:tx_list
+                      ~candidates
                       (rejection_tuples accumulated)
                   with
                   | Error error ->
@@ -2075,13 +2075,35 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
                   attempt
                   (List.length current)
                   (List.length confirmed);
-                preview_until_stable
-                  (attempt + 1)
-                  confirmed
-                  (List.rev_append current accumulated)
+                if accumulated = [] then
+                  preview_until_stable
+                    (attempt + 1)
+                    candidates
+                    confirmed
+                    current
+                else
+                  let module Hashes = Set.Make (String) in
+                  let deferred =
+                    List.map
+                      (fun (item : Octra_core.Epoch_exec.tx_reject) ->
+                        Transaction.hash item.tx)
+                      current
+                    |> Hashes.of_list
+                  in
+                  let candidates =
+                    List.filter
+                      (fun tx -> not (Hashes.mem (Transaction.hash tx) deferred))
+                      candidates
+                  in
+                  Octra_log.info "consensus"
+                    "event = proposal_dependency_deferred epoch = %Ld count = %d candidates = %d"
+                    epoch_id
+                    (Hashes.cardinal deferred)
+                    (List.length candidates);
+                  preview_until_stable (attempt + 1) candidates candidates []
             end
       in
-      let* stable_preview = preview_until_stable 1 tx_list [] in
+      let* stable_preview = preview_until_stable 1 tx_list tx_list [] in
       match stable_preview with
       | Stdlib.Error error ->
         Octra_log.warn "consensus"

@@ -508,6 +508,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
           ~ledger
           ~current_epoch:0
           ~get_fhe_pubkey:(fun _ -> None)
+          ()
       in
       require
         (view_ctx.Octra_vm.Contract_vm.int_work = Octra_vm.Int_work.Active)
@@ -1240,3 +1241,33 @@ let () =
     (not invalid_ok && invalid_state.Octra_vm.Contract_vm.reverted)
     "invalid point encoding executed";
   Printf.printf "status = pass\n%!"
+
+let () =
+  let open Octra_vm.Contract_vm in
+  let encoded hex =
+    require (String.length hex mod 2 = 0) "vector hex length";
+    String.init (String.length hex / 2) (fun i ->
+      Char.chr (int_of_string ("0x" ^ String.sub hex (i * 2) 2)))
+    |> Base64.encode_exn
+  in
+  let key = encoded "505641430501010000000100000001000000c000000080000000800000000000000000005e409a9999999999e13f0000000000003040804f12000000000000100000004000000100000008000000b81e85eb51b8de3fa4703d0ad7a3e03f0800000000000000000000000100000000000000010000000000000001000000000000000000000000000000010000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000010000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001" in
+  let cipher = encoded "50564143030001000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000" in
+  List.iter (fun point_ops ->
+    List.iter (fun is_view ->
+      let ctx = { default_ctx with point_ops } in
+      let state = create_state ~ctx ~is_view ~limit:1_000_000
+        ~caller:"sender" ~origin:"sender" ~address:"program" ~value:Z.zero
+        ~storage:(Hashtbl.create 1) () in
+      let code = [|
+        LDI (0, VString key); FHE_DESER_PK (1, 0);
+        LDI (2, VString cipher); FHE_DESER (3, 2);
+        FHE_MUL (4, 1, 3, 3); STOP
+      |] in
+      for _ = 0 to 3 do
+        require (step state code = Running) "product input was not decoded"
+      done;
+      require (step state code = Refused && state.reverted) "product domain was not refused";
+      require (state.regs.(4) = VInt Z.zero) "product wrote a result after refusal"
+    ) [false; true]
+  ) [false; true];
+  Printf.printf "status = pass test = product_domain\n%!"

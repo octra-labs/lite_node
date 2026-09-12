@@ -6,6 +6,8 @@ type t
 val create : limit:int -> t
 val active : t -> int
 val with_slot :
+  ?timeout:(float * (unit -> 'a Lwt.t)) ->
+  ?stop:(unit -> unit) ->
   t ->
   busy:(unit -> 'a Lwt.t) ->
   (unit -> 'a Lwt.t) ->

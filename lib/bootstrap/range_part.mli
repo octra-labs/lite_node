@@ -14,6 +14,7 @@ type view =
 
 val body_max : int
 val full_max : int
+val part_max : int
 val reply : ?index:int -> Yojson.Safe.t -> (Yojson.Safe.t, string) result
 val view : Yojson.Safe.t -> (view, string) result
 val join : part list -> (Yojson.Safe.t, string) result

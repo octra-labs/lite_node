@@ -303,11 +303,17 @@ let fhe_pubkey_loader store addr =
     | Error _ -> None
 
 let make_view_ctx store ledger current_epoch_ref =
-  Octra_vm.Contract_rpc.make_view_ctx
-    ~store
-    ~ledger
-    ~current_epoch:!current_epoch_ref
-    ~get_fhe_pubkey:(fhe_pubkey_loader store)
+  let running, stop = Octra_vm.Contract_rpc.view_clock () in
+  let ctx =
+    Octra_vm.Contract_rpc.make_view_ctx
+      ~running
+      ~store
+      ~ledger
+      ~current_epoch:!current_epoch_ref
+      ~get_fhe_pubkey:(fhe_pubkey_loader store)
+      ()
+  in
+  ctx, running, stop
 
 let contract_call params ctx =
   Octra_vm.Contract_rpc.call_params
@@ -319,14 +325,16 @@ let contract_call params ctx =
     params
 
 let circle_view params ctx =
-  let view_ctx = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
+  let view_ctx, running, stop = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
   Circle_read_rpc.view_call_public_params
+    ~running ~stop
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
     ctx.store params ~view_ctx
 
 let circle_view_auth params ctx =
-  let view_ctx = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
+  let view_ctx, running, stop = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
   Circle_read_rpc.view_call_auth
+    ~running ~stop
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
     ctx.store params ~view_ctx
 

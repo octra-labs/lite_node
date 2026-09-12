@@ -54,9 +54,39 @@
    (run %{test}))))
 
 (test
- (name test_node_runtime_preverify_cache)
- (modules test_node_runtime_preverify_cache)
+ (name test_preverify_cache)
+ (modules test_preverify_cache)
  (libraries octra_node_runtime lwt lwt.unix))
+
+(test
+ (name test_consensus_profile_golden)
+ (modules test_consensus_profile_golden)
+ (libraries octra_core octra_consensus octra_net octra_vm octra_circle_runtime octra_node_runtime))
+
+(test
+ (name test_join_rpc)
+ (modules test_join_rpc)
+ (libraries octra_node_runtime octra_core octra_consensus octra_net octra_bootstrap zarith lwt.unix))
+
+(test
+ (name test_catchup_shell)
+ (modules test_catchup_shell)
+ (libraries octra_node_runtime lwt lwt.unix))
+
+(test
+ (name test_proposal)
+ (modules test_proposal)
+ (libraries octra_node_runtime octra_core zarith))
+
+(test
+ (name test_driver_boot)
+ (modules test_driver_boot)
+ (libraries octra_node_runtime))
+
+(test
+ (name test_net_boot)
+ (modules test_net_boot)
+ (libraries octra_node_runtime octra_core octra_consensus))
 
 (test
  (name test_store_growth)
@@ -118,6 +148,49 @@
 (rule
  (alias runtest)
  (action (run ./cipher_slots.exe)))
+
+(rule
+ (target native_math.exe)
+ (deps native_math.cpp ../pvac_ffi/pvac_serialize.hpp
+  (source_tree ../pvac/include))
+ (action
+  (bash "ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; c++ -std=c++17 -O2 -pthread $AES_FLAGS -I../pvac/include -I../pvac_ffi %{dep:native_math.cpp} -o %{target}")))
+
+(rule
+ (alias runtest)
+ (action (run ./native_math.exe)))
+
+(test
+ (name test_pvac_verify_worker)
+ (modules test_pvac_verify_worker)
+ (deps ../bin/octra_pvac_worker.exe)
+ (libraries octra_core lwt lwt.unix unix))
+
+(test
+ (name test_contract_rpc_guard)
+ (modules test_contract_rpc_guard)
+ (libraries octra_vm unix lwt.unix base64 digestif))
+
+(test
+ (name test_circle_program_admission)
+ (modules test_circle_program_admission)
+ (libraries octra_core octra_circle_runtime octra_vm unix lwt lwt.unix yojson base64 zarith))
+
+(test
+ (name test_circle_view_cap)
+ (modules test_circle_view_cap)
+ (libraries octra_node_runtime lwt.unix))
+
+(test
+ (name test_node_runtime_tx_view)
+ (modules test_node_runtime_tx_view)
+ (deps ../bin/octra_pvac_worker.exe)
+ (libraries octra_node_runtime octra_core yojson zarith))
+
+(test
+ (name test_node_runtime_p2p_tx_admit)
+ (modules test_node_runtime_p2p_tx_admit)
+ (libraries octra_node_runtime octra_core zarith base64 mirage-crypto-ec mirage-crypto-rng.unix))
 
 (test
  (name test_aml_profile)

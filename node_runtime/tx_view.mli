@@ -289,6 +289,11 @@ type payload_limits = {
 
 val payload_limits : payload_limits
 
+val payload_size_admission :
+  limits:payload_limits ->
+  Octra_core.Transaction.t ->
+  (unit, string * string) result
+
 val payload_admission :
   limits:payload_limits ->
   Octra_core.Transaction.t ->

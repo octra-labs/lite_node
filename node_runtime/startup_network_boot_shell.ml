@@ -17,6 +17,7 @@ type refs = {
 
 type deps = {
   env : string -> string option;
+  refs : refs;
   read_active_validator_meta : unit -> string option;
   read_pending_validator_meta : unit -> string option;
   data_dir : string;
@@ -52,6 +53,19 @@ let create_refs () =
     scheduled_validator_set = ref None;
   }
 
+let bind_profile refs ~chain_id ~program_trust_hash ~runtime_profile_hash =
+  let hash =
+    Octra_consensus.C_config.hash
+      ~chain_id
+      ~validator_set:!(refs.consensus_validator_set)
+      ?scheduled:!(refs.scheduled_validator_set)
+      ?program_trust_hash
+      ~runtime_profile_hash
+      ()
+  in
+  refs.consensus_config_hash := hash;
+  hash
+
 let sync ~recovery run =
   if recovery then () else Lwt_main.run (run ())
 
@@ -64,7 +78,7 @@ let run deps =
     consensus_peers;
     chain_id;
   } = network_config in
-  let refs = create_refs () in
+  let refs = deps.refs in
   let validator_anchor = Consensus_validator_anchor.{
     getenv = deps.env;
     chain_id;

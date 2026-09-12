@@ -625,9 +625,20 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
   }
 
 let run_driver_probe (deps : driver_probe_deps) driver =
+  let open Lwt.Syntax in
+  let module D = Octra_consensus.C_driver in
   Consensus_health_shell.run
     ~repair:(repair_empty_fork deps.fork_repair)
-    ~http_target:(fun () -> Consensus_join_rpc.http_head deps.getenv)
+    ~http_target:(fun () ->
+      let* plan = D.load_validator_set_plan driver in
+      let chain_id = driver.D.config.chain_id in
+      let current = driver.D.stake_vs in
+      let validator_hash epoch =
+        D.validator_set_at ~chain_id ~current ~epoch plan
+        |> Octra_consensus.C_config.validator_set_hash
+      in
+      Consensus_join_rpc.http_head deps.getenv ~chain_id ~validator_hash
+        ~after:(Int64.of_int (deps.committed_head_epoch ())))
     (driver_probe_config deps driver)
     (driver_probe_deps deps driver)
 

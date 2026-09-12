@@ -115,3 +115,8 @@ val enabled :
   bool
 
 val run : deps -> unit
+
+val sync_plan :
+  head:int ->
+  Sync_mark.state ->
+  (Sync_need.t option, string) result

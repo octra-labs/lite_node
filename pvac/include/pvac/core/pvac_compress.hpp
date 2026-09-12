@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <array>
 #include <stdexcept>
 
 namespace pvac {
@@ -21,8 +22,12 @@ struct AdaptiveState {
     const int n_states;
     int prev;
     uint32_t* ctx;
-    static int rate_table[256];
-    static bool rate_init;
+    inline static constexpr auto rate_table = [] {
+        std::array<int, 256> rates{};
+        for (size_t i = 0; i < rates.size(); ++i)
+            rates[i] = 32768 / (i + i + 3);
+        return rates;
+    }();
 
     AdaptiveState(int n = 256) : n_states(n), prev(0) {
         ctx = (uint32_t*)calloc(n_states, sizeof(uint32_t));
@@ -31,11 +36,6 @@ struct AdaptiveState {
             uint32_t w = (i & 1) * 2 + (i & 2) + (i >> 2 & 1) + (i >> 3 & 1)
                        + (i >> 4 & 1) + (i >> 5 & 1) + (i >> 6 & 1) + (i >> 7 & 1) + 3;
             ctx[i] = w << 28 | 6;
-        }
-        if (!rate_init) {
-            for (int i = 0; i < 256; ++i)
-                rate_table[i] = 32768 / (i + i + 3);
-            rate_init = true;
         }
     }
 
@@ -55,9 +55,6 @@ struct AdaptiveState {
         }
     }
 };
-
-bool AdaptiveState::rate_init = false;
-int AdaptiveState::rate_table[256] = {0};
 
 struct Predictor {
     int prev;

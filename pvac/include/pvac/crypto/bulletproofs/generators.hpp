@@ -89,13 +89,17 @@ class GeneratorTable {
 public:
     GeneratorTable() = default;
 
-    const RistrettoPoint& G(size_t i) const {
+    RistrettoPoint G(size_t i) const {
+        if (i >= BP_MAX_VECTOR_SIZE)
+            throw std::runtime_error("pvac: generator size rejected");
         std::lock_guard<std::mutex> lock(mtx_);
         ensure_size(i + 1);
         return G_[i];
     }
 
-    const RistrettoPoint& H(size_t i) const {
+    RistrettoPoint H(size_t i) const {
+        if (i >= BP_MAX_VECTOR_SIZE)
+            throw std::runtime_error("pvac: generator size rejected");
         std::lock_guard<std::mutex> lock(mtx_);
         ensure_size(i + 1);
         return H_[i];

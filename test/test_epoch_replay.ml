@@ -245,5 +245,5 @@ let () =
   | Error "replay rejected order differs", 0 -> ()
   | _ -> failwith "rejection permutation accepted"
   end;
-  Printf.printf "event = replay_checks status = pass cases = %d execution = fixture preverify = fixture\n"
+  Printf.printf "event = replay_checks status = pass cases = %d execution = sample preverify = sample\n"
     (List.length faults + 11)

@@ -177,9 +177,12 @@ pvac_cipher pvac_ct_sub(pvac_pubkey pk, pvac_cipher a, pvac_cipher b) {
 }
 
 pvac_cipher pvac_ct_mul_seeded(pvac_pubkey pk, pvac_cipher a, pvac_cipher b, const uint8_t seed[32]) {
-    auto* ct = new pvac::Cipher();
-    *ct = pvac::ct_mul_seeded(*PK(pk), *CT(a), *CT(b), seed);
-    return ct;
+    try {
+        if (!pk || !a || !b || !seed) return nullptr;
+        return new pvac::Cipher(pvac::ct_mul_seeded(*PK(pk), *CT(a), *CT(b), seed));
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 pvac_cipher pvac_ct_scale(pvac_pubkey pk, pvac_cipher ct, int64_t scalar) {
@@ -400,9 +403,10 @@ int pvac_pedersen_commit_v2(uint64_t amount, const uint8_t blinding[32],
 
 pvac_range_proof pvac_make_range_proof(pvac_pubkey pk, pvac_seckey sk,
                                        pvac_cipher ct, uint64_t value) {
-    auto* rp = new pvac::RangeProof();
-    *rp = pvac::make_range_proof(*PK(pk), *SK(sk), *CT(ct), value);
-    return rp;
+    try {
+        if (!pk || !sk || !ct) return nullptr;
+        return new pvac::RangeProof(pvac::make_range_proof(*PK(pk), *SK(sk), *CT(ct), value));
+    } catch (...) { return nullptr; }
 }
 
 int pvac_verify_range(pvac_pubkey pk, pvac_cipher ct, pvac_range_proof proof) {
@@ -543,9 +547,10 @@ pvac_range_proof pvac_deserialize_range_proof(const uint8_t* data, size_t len) {
 
 pvac_agg_range_proof pvac_make_aggregated_range_proof(pvac_pubkey pk, pvac_seckey sk,
                                                        pvac_cipher ct, uint64_t value) {
-    auto* arp = new pvac::AggregatedRangeProof();
-    *arp = pvac::make_aggregated_range_proof(*PK(pk), *SK(sk), *CT(ct), value);
-    return arp;
+    try {
+        if (!pk || !sk || !ct) return nullptr;
+        return new pvac::AggregatedRangeProof(pvac::make_aggregated_range_proof(*PK(pk), *SK(sk), *CT(ct), value));
+    } catch (...) { return nullptr; }
 }
 
 int pvac_verify_aggregated_range(pvac_pubkey pk, pvac_cipher ct, pvac_agg_range_proof proof) {

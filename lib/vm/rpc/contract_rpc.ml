@@ -1079,23 +1079,43 @@ let view_fhe_capability_gate () =
       true
 
 let view_active = ref false
+let view_seconds = 10.
 
-let run_view handler =
+let view_clock () =
+  let active = Atomic.make true in
+  let deadline = Octra_core.Pvac_verify_worker.monotonic_seconds () +. view_seconds in
+  let running () =
+    Atomic.get active
+    && Octra_core.Pvac_verify_worker.monotonic_seconds () < deadline
+  in
+  running, (fun () -> Atomic.set active false)
+
+let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
   if !view_active then
     Lwt.return_error
       (Rpc.err (-32005) "Program view busy" None)
   else begin
     view_active := true;
-    Lwt.finalize
+    let work = Lwt.finalize
       (fun () ->
         Lwt_preemptive.detach handler ()
         |> Lwt.map (fun value -> Ok value))
       (fun () ->
         view_active := false;
         Lwt.return_unit)
+    in
+    let timer =
+      let open Lwt.Syntax in
+      let* () = Lwt_unix.sleep seconds in
+      stop ();
+      Lwt.return_error (Rpc.err (-32005) "Program view time limit exceeded" None)
+    in
+    let response = Lwt.pick [Lwt.protected work; timer] in
+    Lwt.on_cancel response stop;
+    response
   end
 
-let make_view_ctx ~store ~ledger ~current_epoch ~get_fhe_pubkey =
+let make_view_ctx ?running ~store ~ledger ~current_epoch ~get_fhe_pubkey () =
   let get_balance addr =
     match Ledger.find_opt ledger addr with
     | Some account -> account.Ledger.balance
@@ -1115,6 +1135,7 @@ let make_view_ctx ~store ~ledger ~current_epoch ~get_fhe_pubkey =
       let params = List.map Receipt_view.call_arg_json args in
       let result =
         Contract.execute_view_call
+          ?running
           ~ctx:view_ctx
           ~depth
           ~limit:view_effort_limit
@@ -1179,10 +1200,12 @@ let call ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
     | _ ->
       err_lwt (Rpc.invalid_params "balance_of expects exactly one address parameter")
   else
-    let view_ctx = make_view_ctx ~store ~ledger ~current_epoch ~get_fhe_pubkey in
+    let running, stop = view_clock () in
+    let view_ctx = make_view_ctx ~running ~store ~ledger ~current_epoch ~get_fhe_pubkey () in
     let* executed =
-      run_view (fun () ->
+      run_view ~stop (fun () ->
         Contract.execute_view_call
+          ~running
           ~ctx:view_ctx
           ~limit:view_effort_limit
           store

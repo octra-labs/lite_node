@@ -806,9 +806,10 @@ let stealth_delta_cipher_allowed encoded_cipher =
   && Crypto.FheBalance.cipher_is_wrapped_scalar ~strict:true encoded_cipher
 
 let zero_proof_payload_ok encoded_proof =
-  match Crypto.FheBalance.decode_zero_proof encoded_proof with
-  | Ok _ -> true
-  | Error _ -> false
+  Octra_core.Pvac_verify_policy.proof_allowed encoded_proof
+  && match Crypto.FheBalance.decode_zero_proof encoded_proof with
+     | Ok _ -> true
+     | Error _ -> false
 
 let encrypt_decrypt_payload_ok s =
   try
@@ -1061,13 +1062,18 @@ let circle_asset_body_too_large tx =
     String.length value > Transaction.circle_asset_max_encrypted_data_len
   | _ -> false
 
-let payload_admission ~limits tx =
+let payload_size_admission ~limits tx =
   if circle_asset_body_too_large tx then
     Error ("malformed_transaction", "circle asset body exceeds max encoded size")
   else
     match Octra_core.Tx_payload.admit ~limits tx with
     | Error e -> Error ("malformed_transaction", e)
-    | Ok () ->
+    | Ok () -> Ok ()
+
+let payload_admission ~limits tx =
+  match payload_size_admission ~limits tx with
+  | Error _ as error -> error
+  | Ok () ->
       if not (encrypted_payload_ok tx) then
         Error ("malformed_transaction", "malformed or oversized encrypted_data")
       else if not (call_params_ok tx) then
@@ -1142,7 +1148,7 @@ let submit_pre_signature_admission
     match address_route_admission tx with
     | Error e -> Error e
     | Ok () ->
-      match payload_admission ~limits tx with
+      match payload_size_admission ~limits tx with
       | Error e -> Error e
       | Ok () ->
         match self_route_admission tx with
@@ -1197,7 +1203,9 @@ let submit_signature_admission
   match signature_admission ~account_public_key tx with
   | Error e -> Error e
   | Ok () ->
-    post_signature_admission
+    match payload_admission ~limits:payload_limits tx with
+    | Error _ as error -> error
+    | Ok () -> post_signature_admission
       ~preverify_has_capacity
       ~preverify_pending
       ~preverify_pending_max

@@ -257,7 +257,7 @@ struct Shake256 {
     };
 
     static uint64_t rotl(uint64_t x, int r) {
-        return (x << r) | (x >> (64 - r));
+        return r == 0 ? x : (x << r) | (x >> (64 - r));
     }
 
     void keccakf() {

@@ -424,6 +424,10 @@ def build_candidate():
         env=environment,
     )
     bind_build_toolchains(environment, switch)
+    run(
+        ["opam", "update", "--switch", switch, "-y"],
+        env=environment,
+    )
     compiler = subprocess.run(
         ["opam", "exec", "--switch", switch, "--", "ocamlc", "-version"],
         cwd=ROOT,

@@ -81,6 +81,7 @@ type query_deps = {
   http_range :
     from_epoch:int64 ->
     max_epochs:int ->
+    validate:(C_driver.catchup_range_response_record -> bool) ->
     C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -267,6 +268,7 @@ type driver_runner_wiring = {
   http_range :
     from_epoch:int64 ->
     max_epochs:int ->
+    validate:(C_driver.catchup_range_response_record -> bool) ->
     C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -294,6 +296,7 @@ type driver_runner_node_wiring = {
   http_range :
     from_epoch:int64 ->
     max_epochs:int ->
+    validate:(C_driver.catchup_range_response_record -> bool) ->
     C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -451,6 +454,7 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
         deps.range_query.http_range
           ~from_epoch
           ~max_epochs:range_cap
+          ~validate
       in
       begin
         match response with
@@ -1290,7 +1294,7 @@ let driver_io_of_driver driver =
           ~max_epochs
           ~timeout_seconds
           ~validate);
-      http_range = (fun ~from_epoch:_ ~max_epochs:_ -> Lwt.return_none);
+      http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
     };
   }
 

@@ -13,7 +13,7 @@ extern "C" {
 
 #include "pvac/pvac.hpp"
 #include "pvac/ops/recrypt_legacy.hpp"
-#include <pvac_serialize.hpp>
+#include "pvac_serialize.hpp"
 
 #include <cstring>
 #include <new>

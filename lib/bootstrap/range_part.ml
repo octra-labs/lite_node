@@ -34,6 +34,8 @@ let valid_hash value =
 let count length =
   (length + raw_max - 1) / raw_max
 
+let part_max = count full_max
+
 let slice raw index =
   let offset = index * raw_max in
   let length = min raw_max (String.length raw - offset) in

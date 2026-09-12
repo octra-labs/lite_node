@@ -24,17 +24,15 @@ constexpr size_t SCRATCH_SIZE = 128;
 constexpr int IO_BE = MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN;
 
 bool ensure_init() {
-    static bool initialized = false;
-    static bool init_ok = false;
-    if (!initialized) {
+    static const bool init_ok = [] {
         int ret = mclBn_init(MCL_BN_SNARK1, MCLBN_COMPILED_TIME_VAR);
         if (ret == 0) {
             mclBn_verifyOrderG1(1);
             mclBn_verifyOrderG2(1);
-            init_ok = true;
+            return true;
         }
-        initialized = true;
-    }
+        return false;
+    }();
     return init_ok;
 }
 

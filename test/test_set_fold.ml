@@ -511,7 +511,7 @@ let check_participation_profile () =
   in
   expect "omitted signed vote satisfies participation" (names appealed = addresses)
 
-let check_slow_signer_survives_finalized_cutoff () =
+let check_slow_signer_cutoff () =
   let cfg = Fold.participating in
   let state =
     Fold.note_set cfg ~epoch:100L ~active:addresses Fold.empty
@@ -571,7 +571,7 @@ let check_slow_signer_survives_finalized_cutoff () =
   let snapshots, _ = loop 101L None 0 state in
   expect "slow signer survives ten evidence windows" (snapshots >= 80)
 
-let check_single_removal_does_not_ratchet () =
+let check_removal_no_ratchet () =
   let cfg = Fold.participating in
   let offline = List.hd rotating_addresses in
   let survivors = List.tl rotating_addresses in
@@ -733,7 +733,7 @@ let () =
   check_scale ();
   check_compaction ();
   check_participation_profile ();
-  check_slow_signer_survives_finalized_cutoff ();
-  check_single_removal_does_not_ratchet ();
+  check_slow_signer_cutoff ();
+  check_removal_no_ratchet ();
   check_advance ();
   Printf.printf "status = pass test = set_fold\n%!"

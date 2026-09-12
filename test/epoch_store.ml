@@ -22,6 +22,25 @@ type context = {
   result_policy : int -> Octra_core.Private_result_policy.t;
 }
 
+let network ~getenv ~chain_id ~config_hash ~configured_hash =
+  let ( let* ) = Result.bind in
+  let require reason value = if value then Ok () else Error reason in
+  let* () = N.Consensus_profile.validate getenv in
+  let* () = require "replay chain configuration differs"
+    (getenv "OCTRA_CHAIN_ID" = Some chain_id) in
+  let* () = require "replay configured identity differs from checkpoint"
+    (configured_hash = config_hash) in
+  let module Trust = Octra_vm.Program_trust in
+  let* trust = Trust.of_env getenv |> Result.map_error Trust.error_message in
+  let actual = Octra_consensus.C_config.network_hash ~chain_id
+    ?program_trust_hash:(Trust.config_hash trust)
+    ~runtime_profile_hash:(N.Consensus_profile.compat_hash getenv) ()
+    |> Octra_bootstrap.State_sync_checkpoint.raw_to_hex
+  in
+  let* () = require "replay network identity differs from checkpoint"
+    (actual = config_hash) in
+  Ok trust
+
 let persist_index context (cursor : R.J.cursor) (prepared : R.J.prepared)
     (result : X.exec_result) =
   R.artifacts prepared.txs result;
@@ -70,7 +89,6 @@ let deps (context : context) ~(cursor : R.J.cursor)
       ~parent:parent_commit ~epoch)
   in
   let proof_mode = (R.get (fold epoch)).X.standard_mode in
-  R.require "replay requires prior standard mode" (proof_mode = G.Prior);
   let rule select =
     select context.rules ~epoch |> Result.map_error G.fault_message |> R.get
   in

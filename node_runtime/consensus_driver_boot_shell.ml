@@ -900,7 +900,15 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
 let enabled consensus_port =
   consensus_port > 0
 
-let run (deps : deps) =
+let sync_plan ~head state =
+  match Sync_mark.need state with
+  | Error _ as error -> error
+  | Ok (Some need)
+    when need.Sync_need.cause = Sync_need.Root && head < need.epoch ->
+      Ok (Some need)
+  | Ok _ -> Ok None
+
+let start (deps : deps) =
   let () = resume_fork deps in
   if not (enabled deps.consensus_port) then
     Log.info "init" "event = consensus_p2p_disabled reason = no_port"
@@ -934,3 +942,22 @@ let run (deps : deps) =
       run_driver deps p2p_start p2p normalize finality_runtime
         run_catchup_to_target
         finality_proof_needed
+
+let run (deps : deps) =
+  let head = deps.committed_head_epoch () in
+  match
+    sync_plan ~head
+      (Sync_mark.read ~data_dir:deps.data_dir ~chain:deps.chain_id)
+  with
+  | Ok None -> start deps
+  | Ok (Some need) ->
+      deps.clear_state_attested ();
+      deps.mark_quarantine
+        (Printf.sprintf "signed_snapshot_required epoch = %d head = %d"
+          need.Sync_need.epoch head);
+      Log.warn "init"
+        "event = sync_recovery status = waiting cause = root epoch = %d head = %d action = recover.sh"
+        need.epoch head
+  | Error reason ->
+      Log.fatal "init" "event = sync_recovery status = rejected reason = %s" reason;
+      deps.exit_error ()

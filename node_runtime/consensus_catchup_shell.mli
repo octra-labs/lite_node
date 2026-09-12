@@ -73,6 +73,7 @@ type query_deps = {
   http_range :
     from_epoch:int64 ->
     max_epochs:int ->
+    validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
     Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -283,6 +284,7 @@ type driver_runner_wiring = {
   http_range :
     from_epoch:int64 ->
     max_epochs:int ->
+    validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
     Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
 }
 
@@ -316,6 +318,7 @@ type driver_runner_node_wiring = {
   http_range :
     from_epoch:int64 ->
     max_epochs:int ->
+    validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
     Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
 }
 

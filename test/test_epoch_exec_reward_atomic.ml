@@ -1106,7 +1106,7 @@ let test_sender_key_preview_parity () =
           expect "live sender key persisted"
             ((L.find ledger env.X.proposer_addr).L.public_key = Some "pub")))))
 
-let test_preview_clone_requires_clean_ledger () =
+let test_preview_clean_ledger () =
   with_store (fun store ->
     let ledger = L.create store in
     expect "dirty preview account added"
@@ -1195,7 +1195,7 @@ let test_tx_reject_rollback () =
     expect "rejected store write rolled back"
       (Lwt_main.run (S.get_meta store "partial_tx") = None))
 
-let test_sender_key_rejected_after_fee () =
+let test_sender_key_after_fee () =
   with_store (fun store ->
     let ledger = L.create store in
     expect "fee rejection account added"
@@ -1356,9 +1356,9 @@ let () =
   test_sender_key_policy ();
   test_sender_key_activation ();
   test_sender_key_preview_parity ();
-  test_preview_clone_requires_clean_ledger ();
+  test_preview_clean_ledger ();
   test_tx_reject_rollback ();
-  test_sender_key_rejected_after_fee ();
+  test_sender_key_after_fee ();
   test_tx_exception_rollback ();
   test_worker_retry_rollback ();
   test_worker_retry_loop ();

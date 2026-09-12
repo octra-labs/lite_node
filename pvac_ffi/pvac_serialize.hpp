@@ -100,13 +100,17 @@ struct Writer {
 };
 
 struct Reader {
+    inline static constexpr uint8_t empty = 0;
     const uint8_t* p;
     const uint8_t* end;
     bool failed;
     char error[128];
 
     Reader(const uint8_t* data, size_t len)
-        : p(data), end(data + len), failed(false) { error[0] = 0; }
+        : p(data ? data : &empty), end(p + (data ? len : 0)), failed(false) {
+        error[0] = 0;
+        if (!data && len != 0) fail("pvac_ser: truncated");
+    }
 
     void fail(const char* msg) {
         if (!failed) {
@@ -117,7 +121,7 @@ struct Reader {
 
     void need(size_t n) {
         if (failed) return;
-        if (p + n > end) fail("pvac_ser: truncated");
+        if (n > static_cast<size_t>(end - p)) fail("pvac_ser: truncated");
     }
 
     uint8_t u8() { need(1); if (failed) return 0; return *p++; }

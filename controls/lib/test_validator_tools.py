@@ -238,7 +238,7 @@ class ValidatorToolsTest(unittest.TestCase):
             shutil.rmtree(WORK)
         WORK.mkdir(parents=True)
 
-    def test_store_report_counts_exact_prior_paths(self):
+    def test_store_prior_paths(self):
         data = WORK / "devnet"
         data.mkdir()
         prior_a = WORK / "devnet.prior-10"
@@ -252,7 +252,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(tree_bytes(prior_a), 3)
         self.assertEqual(tree_bytes(prior_b), 4)
 
-    def test_store_report_skips_prior_link(self):
+    def test_store_prior_link(self):
         data = WORK / "devnet"
         data.mkdir()
         target = WORK / "target"
@@ -261,7 +261,7 @@ class ValidatorToolsTest(unittest.TestCase):
         link.symlink_to(target, target_is_directory=True)
         self.assertEqual(prior_scan(data), [(link, "link")])
 
-    def test_store_report_resolves_data_link_and_measures_store(self):
+    def test_store_data_link(self):
         target = WORK / "volume/devnet"
         store = target / "irmin_store"
         store.mkdir(parents = True)
@@ -279,7 +279,7 @@ class ValidatorToolsTest(unittest.TestCase):
             report(values)
         disk.assert_called_once_with(store)
 
-    def test_store_report_uses_node_collection_estimate(self):
+    def test_store_gc_estimate(self):
         data = WORK / "devnet"
         store = data / "irmin_store"
         store.mkdir(parents = True)
@@ -301,7 +301,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(storage["gc_need_bytes"], 100)
         self.assertEqual(storage["gc_ready"], "true")
 
-    def test_store_report_does_not_guess_collection_estimate(self):
+    def test_store_gc_unknown(self):
         data = WORK / "devnet"
         store = data / "irmin_store"
         store.mkdir(parents = True)
@@ -318,7 +318,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(storage["gc_need_bytes"], "unknown")
         self.assertEqual(storage["gc_ready"], "unknown")
 
-    def test_store_report_accepts_removed_live_file(self):
+    def test_store_removed_file(self):
         data = WORK / "devnet"
         store = data / "irmin_store"
         store.mkdir(parents=True)
@@ -342,7 +342,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch("validator_store.emit"):
             report(values)
 
-    def test_store_report_accepts_removed_live_dir(self):
+    def test_store_removed_dir(self):
         data = WORK / "devnet"
         store = data / "irmin_store"
         store.mkdir(parents=True)
@@ -366,7 +366,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch("validator_store.emit"):
             report(values)
 
-    def test_store_report_skips_bad_prior_tree(self):
+    def test_store_prior_invalid(self):
         data = WORK / "devnet"
         store = data / "irmin_store"
         store.mkdir(parents=True)
@@ -388,7 +388,7 @@ class ValidatorToolsTest(unittest.TestCase):
             events,
         )
 
-    def test_store_report_skips_nested_mount(self):
+    def test_store_mount(self):
         data = WORK / "devnet"
         data.mkdir()
         prior = WORK / "devnet.prior-10"
@@ -413,7 +413,7 @@ class ValidatorToolsTest(unittest.TestCase):
             events,
         )
 
-    def test_store_report_counts_suffix_chunks(self):
+    def test_store_suffix(self):
         data = WORK / "devnet"
         store = data / "irmin_store"
         store.mkdir(parents=True)
@@ -423,7 +423,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(suffix_bytes(data), 7)
         self.assertEqual(pack_bytes(data), 14)
 
-    def test_store_reports_snapshot_payload(self):
+    def test_store_snapshot(self):
         data = WORK / "devnet"
         data.mkdir()
         root = WORK / "snapshots"
@@ -449,7 +449,7 @@ class ValidatorToolsTest(unittest.TestCase):
             {"count": 2, "payload": 24, "leased": 1, "skipped": 1},
         )
 
-    def test_store_prune_checks_all_states_before_removal(self):
+    def test_prune_checks(self):
         data = WORK / "devnet"
         data.mkdir()
         identity_path = WORK / "wallet.json"
@@ -471,7 +471,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(first.exists())
         self.assertTrue(second.is_dir())
 
-    def test_store_prune_removes_checked_states(self):
+    def test_prune_checked(self):
         data = WORK / "devnet"
         data.mkdir()
         identity_path = WORK / "wallet.json"
@@ -489,7 +489,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(skipped, 0)
         self.assertFalse(prior.exists())
 
-    def test_store_prune_refuses_active_state(self):
+    def test_prune_active(self):
         data = WORK / "devnet"
         data.mkdir()
         identity_path = WORK / "wallet.json"
@@ -523,14 +523,14 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(os.stat(wallet_path).st_mode & 0o777, 0o600)
         self.assertEqual(ensure_wallet(wallet_path), wallet)
 
-    def test_upgrade_requires_one_proven_choice(self):
+    def test_upgrade_choice(self):
         self.assertEqual(choose("config", ["a", "a"]), "a")
         with self.assertRaisesRegex(ValidatorError, "was not found"):
             choose("config", [])
         with self.assertRaisesRegex(ValidatorError, "is ambiguous"):
             choose("config", ["a", "b"])
 
-    def test_upgrade_reads_systemd_environment_files(self):
+    def test_upgrade_systemd_env(self):
         self.assertEqual(
             env_paths("/etc/octra/node.env (ignore_errors=no) -/etc/octra/extra.env"),
             [
@@ -539,7 +539,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ],
         )
 
-    def test_upgrade_verifies_pinned_release_signature(self):
+    def test_upgrade_signature(self):
         marker = signed_release_value()
         raw = json.dumps(marker).encode("utf-8")
         now = datetime.datetime(2026, 8, 16, 20, tzinfo=datetime.timezone.utc)
@@ -548,7 +548,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "signature verification failed"):
             release_tool.decode(json.dumps(marker).encode("utf-8"), now=now)
 
-    def test_upgrade_refuses_release_rollback_and_sequence_reuse(self):
+    def test_upgrade_sequence(self):
         prior = release_value()
         rollback = {**prior, "sequence": 1}
         reused = {**prior, "action": "recommended"}
@@ -563,7 +563,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ), self.assertRaisesRegex(ValidatorError, message):
                 release_tool.trusted(WORK)
 
-    def test_upgrade_uses_cache_only_when_origin_is_unavailable(self):
+    def test_upgrade_cache_origin(self):
         cached = release_value()
         with mock.patch.object(release_tool, "cache_path", return_value=WORK / "release"), mock.patch.object(
             release_tool, "read", side_effect=[cached, cached]
@@ -593,7 +593,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         self.assertEqual(list(WORK.glob("*.staged")), [])
 
-    def test_upgrade_refuses_linked_cache(self):
+    def test_upgrade_cache_link(self):
         target = WORK / "target.json"
         target.write_text("{}\n", encoding="utf-8")
         path = WORK / "release.json"
@@ -601,7 +601,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "unreadable"):
             release_tool.read(path, fresh=False)
 
-    def test_upgrade_checks_remote_without_fetching(self):
+    def test_upgrade_remote_check(self):
         (WORK / ".git").mkdir()
         head = "a" * 40
 
@@ -626,7 +626,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(state["upstream"], "origin:refs/heads/main")
         self.assertFalse(any(call.args[0][1] == "fetch" for call in capture_git.call_args_list))
 
-    def test_upgrade_checks_detached_remote_without_fetching(self):
+    def test_upgrade_detached_check(self):
         (WORK / ".git").mkdir()
         head = "a" * 40
         latest = "b" * 40
@@ -650,7 +650,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(state["upstream"], "origin:refs/heads/main")
         self.assertFalse(any(call.args[0][1] == "fetch" for call in capture_git.call_args_list))
 
-    def test_upgrade_uses_signed_release_target(self):
+    def test_upgrade_target(self):
         public = "a" * 40
         source = "b" * 40
         (WORK / "SOURCE_COMMIT").write_text(source + "\n", encoding="utf-8")
@@ -689,7 +689,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ],
         )
 
-    def test_upgrade_fast_forwards_detached_release(self):
+    def test_upgrade_detached_head(self):
         public = "a" * 40
         source = "b" * 40
         heads = iter(["c" * 40, public])
@@ -727,7 +727,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ],
         )
 
-    def test_upgrade_diagnoses_durable_records_without_deleting_them(self):
+    def test_upgrade_records(self):
         wal = WORK / "wal"
         votes = WORK / "vote_log"
         wal.mkdir()
@@ -741,7 +741,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(pending.is_file())
         self.assertTrue(vote.is_file())
 
-    def test_upgrade_success_is_role_specific(self):
+    def test_upgrade_role(self):
         common = {
             "process": "online",
             "rpc": "ready",
@@ -767,7 +767,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(ready("validator", observer))
         self.assertFalse(ready("observer", {**observer, "binary_match": False}))
 
-    def test_upgrade_plans_terminal_range_sync(self):
+    def test_upgrade_sync_plan(self):
         values = {
             "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
             "OCTRA_CATCHUP_MAX_LAG": "5000",
@@ -784,7 +784,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertIsNone(sync_plan(values, {**state, "rpc": "unavailable"}, 5101))
 
-    def test_upgrade_reads_bounded_sync_head(self):
+    def test_upgrade_head_limit(self):
         payload = json.dumps({
             "version": "octra-state-sync",
             "mode": "live_head",
@@ -820,7 +820,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "byte limit"):
                 upgrade_tool.sync_epoch("https://seed.example")
 
-    def test_upgrade_reads_snapshot_epoch_from_certificate(self):
+    def test_upgrade_snapshot_epoch(self):
         head = json.dumps({
             "version": "octra-state-sync",
             "mode": "live_head",
@@ -846,7 +846,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 {"head": 41, "snapshot": 39},
             )
 
-    def test_upgrade_rejects_snapshot_without_root_window(self):
+    def test_upgrade_root_window(self):
         head = json.dumps({
             "version": "octra-state-sync",
             "mode": "live_head",
@@ -871,7 +871,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "root window"):
                 upgrade_tool.sync_epoch("https://seed.example")
 
-    def test_upgrade_rejects_unsigned_snapshot_epoch(self):
+    def test_upgrade_epoch_unsigned(self):
         head = json.dumps({
             "version": "octra-state-sync",
             "mode": "live_head",
@@ -896,7 +896,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "fields differ"):
                 upgrade_tool.sync_epoch("https://seed.example")
 
-    def test_upgrade_waits_for_snapshot_boundary(self):
+    def test_upgrade_snapshot_wait(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example"}
         need = make_need("octra-test", "root", 101, 100, None)
         with mock.patch.object(
@@ -912,7 +912,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 {"head": 201, "snapshot": 150, "required": 101},
             )
 
-    def test_upgrade_distinguishes_unavailable_snapshot_metadata(self):
+    def test_upgrade_snapshot_missing(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
         need = make_need("octra-test", "root", 101, 100, None)
         with mock.patch.object(
@@ -923,7 +923,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "metadata is unavailable"):
                 upgrade_tool.sync_wait(values, need, 0.0, 0.1)
 
-    def test_upgrade_reports_snapshot_below_boundary(self):
+    def test_upgrade_snapshot_old(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
         need = make_need("octra-test", "root", 101, 100, None)
         with mock.patch.object(
@@ -936,7 +936,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "below recovery boundary"):
                 upgrade_tool.sync_wait(values, need, 0.0, 0.1)
 
-    def test_upgrade_rejects_snapshot_beyond_catchup_window(self):
+    def test_upgrade_snapshot_future(self):
         values = {
             "OCTRA_CATCHUP_MAX_LAG": "5000",
             "OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example",
@@ -959,7 +959,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 },
             )
 
-    def test_upgrade_prefers_live_peer_head(self):
+    def test_upgrade_peer_head(self):
         self.assertEqual(
             sync_target(
                 {"peer_epoch": 1344077},
@@ -968,7 +968,7 @@ class ValidatorToolsTest(unittest.TestCase):
             1344077,
         )
 
-    def test_upgrade_reports_installed_during_consensus_recovery(self):
+    def test_upgrade_recovery_status(self):
         state = {
             "process": "online",
             "rpc": "ready",
@@ -1004,7 +1004,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ("pending", "health_deadline", "do_not_restart", 2),
         )
 
-    def test_upgrade_floor_requires_synced_bootstrap_round(self):
+    def test_upgrade_floor_round(self):
         state = {
             "process": "online",
             "rpc": "ready",
@@ -1025,7 +1025,7 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool.floor_target({**state, "voting_reason": "vote_log_corrupt"})
         )
 
-    def test_upgrade_installs_recovery_floor_around_one_stop(self):
+    def test_upgrade_floor_stop(self):
         events = []
         config = WORK / "node.env"
         data = WORK / "data"
@@ -1069,7 +1069,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
         self.assertEqual(events, ["check", "stop", "write", "start"])
 
-    def test_upgrade_floor_check_fails_before_stop(self):
+    def test_upgrade_floor_check(self):
         config = WORK / "node.env"
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1101,7 +1101,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 )
         stop_node.assert_not_called()
 
-    def test_upgrade_restarts_when_floor_write_fails(self):
+    def test_upgrade_floor_write(self):
         config = WORK / "node.env"
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1147,7 +1147,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 )
         self.assertEqual(calls, ["start"])
 
-    def test_upgrade_restarts_when_floor_owner_remains(self):
+    def test_upgrade_floor_owner(self):
         config = WORK / "node.env"
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1187,7 +1187,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 )
         self.assertEqual(calls, ["start"])
 
-    def test_upgrade_manual_hashes_are_assertions_only(self):
+    def test_upgrade_hash_pins(self):
         release = release_value()
         values = {"OCTRA_CHAIN_ID": release["chain_id"]}
         args = mock.Mock(public_commit=None, source_commit=None)
@@ -1199,7 +1199,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "does not match the signed release"):
             upgrade_tool.release_target(release, args, values)
 
-    def test_upgrade_verifies_signed_release_tree(self):
+    def test_upgrade_tree(self):
         network = WORK / "config/network.env"
         network.parent.mkdir()
         network.write_text("OCTRA_CHAIN_ID=octra-devnet-9871-cluster\n", encoding="utf-8")
@@ -1214,7 +1214,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "network configuration"):
             upgrade_tool.verify_release_tree(WORK, release)
 
-    def test_upgrade_uses_signed_snapshot_sources(self):
+    def test_upgrade_sources(self):
         network = network_values()
         network["OCTRA_STATE_SYNC_SOURCES"] = "https://fresh.example"
         network["OCTRA_JOIN_RPC"] = "https://join-a.example,https://join-b.example"
@@ -1246,7 +1246,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(selected["OCTRA_CATCHUP_MAX_LAG"], "7000")
         self.assertEqual(selected["OCTRA_DATA_DIR"], str(WORK / "data"))
 
-    def test_upgrade_updates_release_before_snapshot_wait(self):
+    def test_upgrade_wait_order(self):
         events = []
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1317,7 +1317,7 @@ class ValidatorToolsTest(unittest.TestCase):
         run.assert_not_called()
         stop_node.assert_not_called()
 
-    def test_upgrade_builds_and_checks_before_one_stop_start(self):
+    def test_upgrade_build_order(self):
         events = []
         config = WORK / "node.env"
         binary = WORK / "candidate/octra_node.exe"
@@ -1433,7 +1433,7 @@ class ValidatorToolsTest(unittest.TestCase):
         stop_node.assert_called_once()
         start_node.assert_called_once()
 
-    def test_upgrade_never_stops_when_build_fails(self):
+    def test_upgrade_build_failure(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_OPERATOR_BINARY": str(WORK / "candidate/octra_node.exe"),
@@ -1485,7 +1485,7 @@ class ValidatorToolsTest(unittest.TestCase):
         stop_node.assert_not_called()
         start_node.assert_not_called()
 
-    def test_upgrade_reexecs_after_fast_forward_before_build(self):
+    def test_upgrade_reexec(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_OPERATOR_BINARY": str(WORK / "candidate/octra_node.exe"),
@@ -1537,7 +1537,7 @@ class ValidatorToolsTest(unittest.TestCase):
         stop_node.assert_not_called()
         start_node.assert_not_called()
 
-    def test_upgrade_recovers_marked_state_once(self):
+    def test_upgrade_recovery_once(self):
         config = WORK / "node.env"
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1550,7 +1550,7 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertEqual(restore_need(values, config), need)
         run.assert_called_once_with(config, replace_state=True, plan=need)
 
-    def test_upgrade_skips_unmarked_state(self):
+    def test_upgrade_no_marker(self):
         config = WORK / "node.env"
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1562,7 +1562,7 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertIsNone(restore_need(values, config))
         run.assert_not_called()
 
-    def test_restore_plan_refuses_wire_dict_plan(self):
+    def test_restore_plan_type(self):
         config = WORK / "node.env"
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
@@ -1576,7 +1576,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 upgrade_tool.restore_plan(values, config, plan)
         run.assert_not_called()
 
-    def test_restore_cycle_starts_once_when_state_returns(self):
+    def test_restore_start_once(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
@@ -1597,7 +1597,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIs(caught.exception, failure)
         start_node.assert_called_once()
 
-    def test_restore_cycle_holds_when_state_differs(self):
+    def test_restore_state_diff(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
@@ -1644,7 +1644,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 ):
                     resource_report(WORK, "validator")
 
-    def test_validator_accepts_operator_resources(self):
+    def test_validator_resources(self):
         usage = mock.Mock(
             total=80 * 1000 ** 3,
             free=60 * 1000 ** 3,
@@ -1660,7 +1660,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 ):
                     resource_report(WORK, "validator")
 
-    def test_observer_accepts_operator_resources(self):
+    def test_observer_resources(self):
         usage = mock.Mock(
             total=80 * 1000 ** 3,
             free=60 * 1000 ** 3,
@@ -1676,7 +1676,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 ):
                     resource_report(WORK, "observer")
 
-    def test_rejoin_requires_configured_data_directory(self):
+    def test_rejoin_data_missing(self):
         values = {"OCTRA_DATA_DIR": str(WORK)}
         self.assertEqual(configured_data(values, WORK), WORK.resolve())
         with self.assertRaisesRegex(
@@ -1685,28 +1685,28 @@ class ValidatorToolsTest(unittest.TestCase):
         ):
             configured_data(values, WORK / "other")
 
-    def test_rejoin_defaults_to_configured_data_directory(self):
+    def test_rejoin_data_default(self):
         values = {"OCTRA_DATA_DIR": str(WORK)}
         self.assertEqual(configured_data(values), WORK.resolve())
 
     def test_config_build_only_mode(self):
         self.assertTrue(parser().parse_args(["--build-only"]).build_only)
 
-    def test_rejoin_uses_packaged_floor_tool(self):
+    def test_rejoin_floor_tool(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
         tool.write_bytes(b"floor")
         self.assertEqual(floor_binary(root), tool)
 
-    def test_rejoin_uses_built_node_binary(self):
+    def test_rejoin_binary(self):
         root = WORK / "source"
         binary = root / "_build/default/bin/octra_node.exe"
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b"node")
         self.assertEqual(node_binary(root), binary)
 
-    def test_rejoin_invokes_floor_tool_with_bound_identity(self):
+    def test_rejoin_floor_identity(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
@@ -1736,7 +1736,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ],
         )
 
-    def test_rejoin_binds_signed_round_with_local_minimum(self):
+    def test_rejoin_round_minimum(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
@@ -1760,7 +1760,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ["--round-sync", "signed", "--round-min", "7", "--check"],
         )
 
-    def test_rejoin_checks_meet_floor_exactly(self):
+    def test_rejoin_floor_exact(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
@@ -1774,7 +1774,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][-3:], ["--round", "10", "--check"])
         self.assertTrue(run.call_args.kwargs["capture_output"])
 
-    def test_rejoin_refuses_meet_floor_above_target(self):
+    def test_rejoin_floor_high(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
@@ -1787,7 +1787,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "does not exceed durable vote"):
                 checked_floor(root, values, wallet, WORK, 41, 10)
 
-    def test_rejoin_requires_staged_floor(self):
+    def test_rejoin_floor_stage(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
@@ -1803,7 +1803,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ["--round", "10", "--check", "--staged"],
         )
 
-    def test_rejoin_checks_prepared_floor(self):
+    def test_rejoin_floor_prepared(self):
         root = WORK / "candidate"
         tool = root / "artifacts/vote_floor.exe"
         tool.parent.mkdir(parents=True)
@@ -1819,7 +1819,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ["--round", "10", "--check", "--prepared"],
         )
 
-    def test_rejoin_meet_round_stays_in_sync_window(self):
+    def test_rejoin_round_window(self):
         snapshot = {"round_epoch": 42, "round": 7, "peer_floor": 7}
         self.assertEqual(meet_round(snapshot, 41, "1030"), 1030)
         with self.assertRaisesRegex(ValidatorError, "outside local window"):
@@ -1827,21 +1827,21 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "outside local window"):
             meet_round(snapshot, 41, "7")
 
-    def test_rejoin_meet_round_respects_peer_window(self):
+    def test_rejoin_peer_window(self):
         snapshot = {"round_epoch": 42, "round": 50, "peer_floor": 7}
         with self.assertRaisesRegex(ValidatorError, "exceeds peer window"):
             meet_round(snapshot, 41, "1031")
         with self.assertRaisesRegex(ValidatorError, "fresh peer evidence"):
             meet_round({"round_epoch": 42, "round": 50}, 41, "100")
 
-    def test_rejoin_meet_cap_matches_consensus_sync_window(self):
+    def test_rejoin_window_cap(self):
         engine = CONFIG_ROOT / "lib/consensus/c_engine.ml"
         text = engine.read_text(encoding="utf-8")
         match = re.search(r"^let max_sync_ahead = ([0-9]+)$", text, re.MULTILINE)
         self.assertIsNotNone(match)
         self.assertEqual(MEET_CAP, int(match.group(1)))
 
-    def test_rejoin_meet_round_next_requires_peer_gap(self):
+    def test_rejoin_peer_gap(self):
         snapshot = {
             "round_epoch": 42,
             "round": 7,
@@ -1852,19 +1852,19 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "outside local window"):
             meet_round({**snapshot, "peer_round": 1030}, 41, "next")
 
-    def test_rejoin_meet_round_requires_current_epoch(self):
+    def test_rejoin_round_epoch(self):
         snapshot = {"round_epoch": 41, "round": 7}
         with self.assertRaisesRegex(ValidatorError, "does not match finalized head"):
             meet_round(snapshot, 41, "10")
 
-    def test_rejoin_meet_start_requires_explicit_nonnegative_round(self):
+    def test_rejoin_round_explicit(self):
         self.assertEqual(meet_value("19"), 19)
         with self.assertRaisesRegex(ValidatorError, "explicit round"):
             meet_value("next")
         with self.assertRaisesRegex(ValidatorError, "meet round is invalid"):
             meet_value("-1")
 
-    def test_rejoin_meet_stage_requires_active_member(self):
+    def test_rejoin_member_required(self):
         wallet = {"address": identity()[0]}
         with mock.patch(
             "validator_rejoin.membership",
@@ -1873,13 +1873,13 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "active validator"):
                 active_member({}, wallet)
 
-    def test_rejoin_meet_stage_accepts_active_member(self):
+    def test_rejoin_member_active(self):
         wallet = {"address": identity()[0]}
         member = {"active": True}
         with mock.patch("validator_rejoin.membership", return_value=member):
             self.assertEqual(active_member({}, wallet), member)
 
-    def test_rejoin_meet_stage_requires_matched_head_and_voting(self):
+    def test_rejoin_head_voting(self):
         with self.assertRaisesRegex(ValidatorError, "matching finalized head"):
             meet_ready({"local_head": 41, "remote_head": 42, "voting": True})
         with self.assertRaisesRegex(ValidatorError, "voting enabled"):
@@ -1893,7 +1893,7 @@ class ValidatorToolsTest(unittest.TestCase):
             })
         )
 
-    def test_rejoin_meet_stage_refuses_inactive_validator(self):
+    def test_rejoin_member_inactive(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK),
             "OCTRA_OPERATOR_ROLE": "validator",
@@ -1963,7 +1963,7 @@ class ValidatorToolsTest(unittest.TestCase):
                                                         )
         stage.assert_not_called()
 
-    def test_rejoin_meet_stage_pauses_before_floor_write(self):
+    def test_rejoin_pause_order(self):
         values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
@@ -1989,7 +1989,7 @@ class ValidatorToolsTest(unittest.TestCase):
         stop_node.assert_called_once_with(WORK, WORK / "node.env")
         floor.assert_called_once_with(WORK, values, wallet, WORK, 41, 10)
 
-    def test_rejoin_meet_start_requires_staged_floor(self):
+    def test_rejoin_start_floor(self):
         values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
@@ -2012,7 +2012,7 @@ class ValidatorToolsTest(unittest.TestCase):
         staged.assert_called_once_with(WORK, values, wallet, WORK, 41, 10)
         launch_node.assert_called_once_with(WORK, WORK / "node.env")
 
-    def test_rejoin_meet_start_refuses_running_node(self):
+    def test_rejoin_start_running(self):
         values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
@@ -2028,7 +2028,7 @@ class ValidatorToolsTest(unittest.TestCase):
                     10,
                 )
 
-    def test_rejoin_confirms_process_before_meet_stage(self):
+    def test_rejoin_stage_process(self):
         values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
         entries = [{
             "name": "octra-test",
@@ -2044,7 +2044,7 @@ class ValidatorToolsTest(unittest.TestCase):
                     confirmed_node(values, WORK, 17)
         binary.assert_called_once_with(17)
 
-    def test_rejoin_meet_stage_restores_unmarked_failure(self):
+    def test_rejoin_stage_failure(self):
         values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
@@ -2079,7 +2079,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(raised.exception.state, "restored")
         launch_node.assert_called_once_with(WORK, WORK / "node.env")
 
-    def test_rejoin_meet_stage_keeps_prepared_node_stopped(self):
+    def test_rejoin_stage_stopped(self):
         values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
@@ -2112,7 +2112,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn("--meet-start --wait-seconds 600", raised.exception.command)
         launch_node.assert_not_called()
 
-    def test_rejoin_requires_running_validator(self):
+    def test_rejoin_validator_live(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK),
             "OCTRA_OPERATOR_ROLE": "validator",
@@ -2146,7 +2146,7 @@ class ValidatorToolsTest(unittest.TestCase):
                                             30,
                                         )
 
-    def test_rejoin_captures_round_before_stopping(self):
+    def test_rejoin_capture_order(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK),
             "OCTRA_OPERATOR_ROLE": "validator",
@@ -2231,7 +2231,7 @@ class ValidatorToolsTest(unittest.TestCase):
         stop_node.assert_called_once_with(WORK, WORK / "node.env")
         launch_node.assert_called_once_with(WORK, WORK / "node.env")
 
-    def test_rejoin_check_never_stops_validator(self):
+    def test_rejoin_check_running(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK),
             "OCTRA_OPERATOR_ROLE": "validator",
@@ -2295,7 +2295,7 @@ class ValidatorToolsTest(unittest.TestCase):
         stop_node.assert_not_called()
         launch_node.assert_not_called()
 
-    def test_rejoin_legacy_pauses_before_handoff(self):
+    def test_rejoin_legacy_pause(self):
         values = {
             "OCTRA_DATA_DIR": str(WORK),
             "OCTRA_OPERATOR_ROLE": "validator",
@@ -2388,7 +2388,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(floor.call_args_list[0].args[5], 14)
         self.assertEqual(floor.call_args_list[1].args[5], 14)
 
-    def test_legacy_handoff_resumes_after_log_refusal(self):
+    def test_legacy_handoff_log(self):
         values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
@@ -2414,24 +2414,24 @@ class ValidatorToolsTest(unittest.TestCase):
         resume_node.assert_called_once_with(17)
         stop_node.assert_not_called()
 
-    def test_rejoin_captured_round_requires_current_epoch(self):
+    def test_rejoin_capture_epoch(self):
         with self.assertRaisesRegex(ValidatorError, "does not match"):
             captured_round({"round_epoch": 41, "round": 7}, 41)
 
-    def test_rejoin_captured_round_uses_local_round(self):
+    def test_rejoin_capture_local(self):
         self.assertEqual(
             captured_round({"round_epoch": 42, "round": 7, "peer_round": 9}, 41),
             8,
         )
 
-    def test_rejoin_requires_explicit_legacy_handoff(self):
+    def test_rejoin_handoff_explicit(self):
         snapshot = {}
         values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
         wallet = {"address": identity()[0]}
         with self.assertRaisesRegex(ValidatorError, "legacy handoff"):
             floor_source(snapshot, values, wallet, 41, False)
 
-    def test_rejoin_uses_signed_legacy_handoff(self):
+    def test_rejoin_handoff_signed(self):
         snapshot = {}
         values = {"OCTRA_OPERATOR_PM2_NAME": "octra-test"}
         wallet = {"address": identity()[0]}
@@ -2441,7 +2441,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 (None, "signed"),
             )
 
-    def test_rejoin_reads_local_round_log(self):
+    def test_rejoin_round_log(self):
         output = (
             "event = round_skip height = 42 old_round = 9 new_round = 10\n"
             "event = make_proposal epoch = 42 round = 11\n"
@@ -2450,7 +2450,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with mock.patch("validator_rejoin.subprocess.run", return_value=result):
             self.assertEqual(log_round("octra-test", 42), 11)
 
-    def test_rejoin_refuses_missing_local_round_log(self):
+    def test_rejoin_round_missing(self):
         result = mock.Mock(returncode=0, stdout="")
         with mock.patch("validator_rejoin.subprocess.run", return_value=result):
             with self.assertRaisesRegex(ValidatorError, "local log"):
@@ -2465,7 +2465,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ):
             self.assertEqual(signed_round(values, wallet), "signed")
 
-    def test_rejoin_witness_sets_operator_agent(self):
+    def test_rejoin_agent(self):
         response = mock.Mock()
         response.read.return_value = b'{"result":{"round_sync":"signed"}}'
         context = mock.Mock()
@@ -2483,7 +2483,7 @@ class ValidatorToolsTest(unittest.TestCase):
         request = open_rpc.call_args.args[0]
         self.assertEqual(request.get_header("User-agent"), "octra-validator-rejoin/1")
 
-    def test_rejoin_requires_one_online_process(self):
+    def test_rejoin_process_count(self):
         data_dir = WORK.resolve()
         entries = [{
             "name": "octra-test",
@@ -2516,7 +2516,7 @@ class ValidatorToolsTest(unittest.TestCase):
             }),
         )
 
-    def test_rejoin_peer_head_ignores_invalid_entries(self):
+    def test_rejoin_head_invalid(self):
         payload = {
             "peers": [
                 {"head_epoch": "41"},
@@ -2557,7 +2557,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertEqual(round_view({"round_state": {}}), {})
 
-    def test_rejoin_requires_round_alignment(self):
+    def test_rejoin_round_alignment(self):
         aligned = round_alignment({
             "round_state": {"epoch_id": "41", "round": 18},
             "round_agreed": True,
@@ -2599,7 +2599,7 @@ class ValidatorToolsTest(unittest.TestCase):
         })
         self.assertEqual(waiting["state"], "waiting_round")
 
-    def test_rejoin_keeps_recent_peer_floor_for_meet(self):
+    def test_rejoin_peer_floor(self):
         status = round_alignment({
             "round_state": {"epoch_id": "41", "round": 18},
             "round_agreed": False,
@@ -2610,7 +2610,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(status["state"], "waiting_round")
         self.assertEqual(status["peer_floor"], 11)
 
-    def test_rejoin_requires_current_round_not_global_agreement(self):
+    def test_rejoin_round_local(self):
         self.assertEqual(
             sync_state(41, 41, {"state": "round_unconfirmed"}),
             "synced",
@@ -2624,7 +2624,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "waiting_round",
         )
 
-    def test_snapshot_keeps_local_vote_ready_state(self):
+    def test_snapshot_vote_ready(self):
         values = {
             "OCTRA_OPERATOR_PM2_NAME": "octra-test",
             "OCTRA_API_PORT": "8080",
@@ -2651,7 +2651,7 @@ class ValidatorToolsTest(unittest.TestCase):
                         with mock.patch("validator_rejoin.rpc_method", return_value=peers):
                             self.assertEqual(snapshot(values, WORK)["state"], "synced")
 
-    def test_rejoin_refuses_vote_log_conflict(self):
+    def test_rejoin_vote_conflict(self):
         values = {"OCTRA_OPERATOR_ROLE": "validator"}
         wallet = {"address": identity()[0]}
         snapshot = {
@@ -2675,7 +2675,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "vote_log_conflict",
         )
 
-    def test_rejoin_reports_meet_only_after_finality_advances(self):
+    def test_rejoin_finality(self):
         values = {"OCTRA_OPERATOR_ROLE": "validator"}
         wallet = {"address": identity()[0]}
         member = {"active": True}
@@ -2724,7 +2724,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "outside"):
             positive_seconds("29")
 
-    def test_rejoin_launch_rebinds_runtime(self):
+    def test_rejoin_runtime(self):
         root = WORK / "release"
         config = WORK / "node.env"
         root.mkdir()
@@ -2736,19 +2736,19 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(command[-1], "--rebind-runtime")
         self.assertEqual(environment["OCTRA_OPERATOR_CONFIG"], str(config))
 
-    def test_validator_accepts_active_on_chain_identity(self):
+    def test_validator_active(self):
         require_validator_membership(
             "validator",
             {"active": True, "scheduled": False},
         )
 
-    def test_validator_accepts_scheduled_on_chain_identity(self):
+    def test_validator_scheduled(self):
         require_validator_membership(
             "validator",
             {"active": False, "scheduled": True},
         )
 
-    def test_validator_rejects_unselected_identity(self):
+    def test_validator_unselected(self):
         with self.assertRaisesRegex(
             ValidatorError,
             "not active or scheduled",
@@ -2769,13 +2769,13 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(loaded["OCTRA_BFT_PROPOSE_TIMEOUT_MS"], "180000")
         self.assertEqual(loaded["OCTRA_PEERS"], values["OCTRA_BOOTSTRAP_PEERS"])
 
-    def test_network_rejects_unsafe_override(self):
+    def test_network_override(self):
         values = network_values()
         values["OCTRA_ALLOW_UNSAFE_QUORUM"] = "1"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_address_key_mismatch(self):
+    def test_network_key_mismatch(self):
         values = network_values()
         entries = values["OCTRA_VALIDATORS"].split(",")
         address, _ = entries[0].split(":", 1)
@@ -2785,25 +2785,25 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_activation_drift(self):
+    def test_network_activation(self):
         values = network_values()
         values["OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH"] = "101"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_missing_migration_root(self):
+    def test_network_root_missing(self):
         values = network_values()
         del values["OCTRA_PVAC_MIGRATION_ROOT"]
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_invalid_migration_root(self):
+    def test_network_root_invalid(self):
         values = network_values()
         values["OCTRA_PVAC_MIGRATION_ROOT"] = "invalid"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_bundle_validator_is_source_build_independent(self):
+    def test_bundle_independent(self):
         bundle = WORK / "network.env"
         values = network_values()
         write_env(bundle, values)
@@ -2811,19 +2811,19 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertNotIn("OCTRA_BINARY_HASH", loaded)
         self.assertEqual(digest, hashlib.sha256(bundle.read_bytes()).hexdigest())
 
-    def test_network_requires_permissionless_validator_activation(self):
+    def test_network_validator_epoch(self):
         values = network_values()
         del values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"]
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_requires_proposal_protocol_activation(self):
+    def test_network_protocol_epoch(self):
         values = network_values()
         del values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"]
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_allows_checkpoint_rotation(self):
+    def test_network_checkpoint(self):
         values = network_values()
         values["OCTRA_CHECKPOINT_EPOCH"] = "250"
         values["OCTRA_CHECKPOINT_STATE_ROOT"] = "5" * 64
@@ -2831,19 +2831,19 @@ class ValidatorToolsTest(unittest.TestCase):
         validated = validate_network(values, WORK)
         self.assertEqual(validated["OCTRA_CHECKPOINT_EPOCH"], "250")
 
-    def test_proposal_protocol_activation_cannot_precede_emission(self):
+    def test_protocol_epoch_order(self):
         values = network_values()
         values["OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH"] = "99"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_validator_activation_cannot_precede_emission(self):
+    def test_validator_epoch_order(self):
         values = network_values()
         values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"] = "99"
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_rejects_public_plain_http_state_sync(self):
+    def test_network_http(self):
         values = network_values()
         values["OCTRA_STATE_SYNC_SOURCES"] = (
             "http://203.0.113.1:8080,https://seed-b.example"
@@ -2851,7 +2851,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_network_allows_one_signed_state_sync_source(self):
+    def test_network_single_source(self):
         values = network_values()
         values["OCTRA_STATE_SYNC_SOURCES"] = "https://seed-a.example"
         self.assertEqual(
@@ -2859,7 +2859,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "https://seed-a.example",
         )
 
-    def test_network_validates_join_sources(self):
+    def test_network_join_sources(self):
         values = network_values()
         values["OCTRA_JOIN_RPC"] = "https://join-a.example,https://join-b.example"
         self.assertEqual(
@@ -2870,7 +2870,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_network(values, WORK)
 
-    def test_advertise_uses_consensus_port(self):
+    def test_advertise_port(self):
         self.assertEqual(
             validate_advertise("203.0.113.1:19000", 19000),
             "203.0.113.1:19000",
@@ -2878,7 +2878,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_advertise("203.0.113.1:9000", 19000)
 
-    def test_rpc_url_requires_secure_public_transport(self):
+    def test_rpc_transport(self):
         self.assertEqual(
             rpc_url("https://devnet.example/rpc"),
             "https://devnet.example/rpc",
@@ -2890,7 +2890,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             rpc_url("http://203.0.113.1:8080/rpc")
 
-    def test_membership_requires_exact_identity(self):
+    def test_membership_identity(self):
         address, pubkey = identity()
         wallet = {"address": address, "pub": pubkey}
         self.assertTrue(
@@ -2900,7 +2900,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             exact_member([{"address": address, "pubkey": identity()[1]}], wallet)
 
-    def test_membership_reports_only_own_activation_epoch(self):
+    def test_membership_epoch(self):
         address, pubkey = identity()
         wallet = {"address": address, "pub": pubkey}
         values = {"OCTRA_API_PORT": "8080", "OCTRA_CHAIN_ID": "octra-test"}
@@ -2926,7 +2926,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(state["scheduled"])
         self.assertEqual(state["activate_epoch"], 1372752)
 
-    def test_committed_enrollment_requires_exact_identity(self):
+    def test_enrollment_identity(self):
         address, pubkey = identity()
         wallet = {"address": address, "pub": pubkey}
         values = {"OCTRA_API_PORT": "8080"}
@@ -2968,7 +2968,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaises(ValidatorError):
                 committed_enrollment(values, wallet)
 
-    def test_join_step_uses_committed_enrollment(self):
+    def test_join_enrollment(self):
         member = {"active": False, "scheduled": False}
         absent = Enrollment(EnrollmentState.ABSENT, 9, None, None, None, None)
         bonded = Enrollment(EnrollmentState.BONDED, 9, 1000000, 1, None, None)
@@ -2983,7 +2983,7 @@ class ValidatorToolsTest(unittest.TestCase):
             JoinStep.ACTIVATE,
         )
 
-    def test_existing_committed_bond_blocks_duplicate(self):
+    def test_bond_duplicate(self):
         enrollment = Enrollment(
             EnrollmentState.BONDED,
             9,
@@ -3008,7 +3008,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 )
         control.assert_not_called()
 
-    def test_enrollment_nonce_comes_from_local_observer(self):
+    def test_enrollment_nonce(self):
         wallet = {"address": identity()[0]}
         values = {"OCTRA_API_PORT": "8080"}
         with mock.patch(
@@ -3021,7 +3021,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ("http://127.0.0.1:8080/rpc", "octra_account", [wallet["address"], 1]),
         )
 
-    def test_admission_waits_for_activation_epoch(self):
+    def test_admission_epoch(self):
         values = {
             "OCTRA_API_PORT": "8080",
             "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "100",
@@ -3038,7 +3038,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ):
             require_admission_active(values)
 
-    def test_validator_mode_runs_control_through_shell(self):
+    def test_validator_control(self):
         config = WORK / "node.env"
         values = {"OCTRA_OPERATOR_ROLE": "observer"}
         state = {
@@ -3055,7 +3055,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertEqual(parse_env(config)["OCTRA_OPERATOR_ROLE"], "validator")
 
-    def test_active_validator_waits_for_committed_head(self):
+    def test_validator_head(self):
         values = {"OCTRA_API_PORT": "8080"}
         wallet = {"address": identity()[0], "pub": identity()[1]}
         state = {
@@ -3080,7 +3080,7 @@ class ValidatorToolsTest(unittest.TestCase):
             )
         pause.assert_not_called()
 
-    def test_selection_timeout_remains_pending(self):
+    def test_selection_pending(self):
         values = {"OCTRA_API_PORT": "8080"}
         wallet = {"address": identity()[0], "pub": identity()[1]}
         state = {
@@ -3100,7 +3100,7 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertIsNone(wait_scheduled(values, wallet, args))
         pause.assert_called_once_with(0.1)
 
-    def test_join_resumes_confirmed_transaction(self):
+    def test_join_confirmed(self):
         config = WORK / "node.env"
         config.write_text("", encoding="utf-8")
         state = {
@@ -3129,7 +3129,7 @@ class ValidatorToolsTest(unittest.TestCase):
             resume_join_transaction(config, values, "ready", args)
         )
 
-    def test_missing_ready_transaction_can_be_resubmitted(self):
+    def test_ready_resubmit(self):
         config = WORK / "node.env"
         config.write_text("", encoding="utf-8")
         state = {
@@ -3162,17 +3162,17 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(operator_pm2_name("val01"), "octra-val01")
         self.assertEqual(operator_pm2_name("octra-val01"), "octra-val01")
 
-    def test_promotion_readiness_tracks_observer_marker(self):
+    def test_promotion_observer(self):
         values = {"OCTRA_OPERATOR_ROLE": "observer"}
         self.assertEqual(promotion_readiness(values, WORK), "pending")
         (WORK / "ready_to_vote.json").write_text("{}\n", encoding="utf-8")
         self.assertEqual(promotion_readiness(values, WORK), "ready")
 
-    def test_active_validator_does_not_require_promotion_marker(self):
+    def test_validator_active_marker(self):
         values = {"OCTRA_OPERATOR_ROLE": "validator"}
         self.assertEqual(promotion_readiness(values, WORK), "not_required")
 
-    def test_strict_validator_requires_promotion_marker(self):
+    def test_validator_strict_marker(self):
         values = {
             "OCTRA_OPERATOR_ROLE": "validator",
             "OCTRA_VALIDATOR_READY_STRICT": "1",
@@ -3181,7 +3181,7 @@ class ValidatorToolsTest(unittest.TestCase):
         (WORK / "ready_to_vote.json").write_text("{}\n", encoding="utf-8")
         self.assertEqual(promotion_readiness(values, WORK), "ready")
 
-    def test_permissionless_validator_uses_chain_readiness(self):
+    def test_validator_chain_ready(self):
         values = {
             "OCTRA_OPERATOR_ROLE": "validator",
             "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "100",
@@ -3189,7 +3189,7 @@ class ValidatorToolsTest(unittest.TestCase):
         }
         self.assertEqual(promotion_readiness(values, WORK), "not_required")
 
-    def test_verified_snapshot_installs_atomically(self):
+    def test_snapshot_atomic(self):
         values = network_values()
         snapshot = WORK / "stage/snapshots/abc"
         data = snapshot / "data"
@@ -3220,7 +3220,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue((target / ".state_sync/snapshot_verified.json").is_file())
         self.assertFalse(data.exists())
 
-    def test_checkpoint_rejects_wrong_root(self):
+    def test_checkpoint_root(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3231,7 +3231,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_checkpoint(data, network_values())
 
-    def test_checkpoint_allows_progress_for_restart(self):
+    def test_checkpoint_restart(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3244,7 +3244,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             validate_checkpoint(data, values)
 
-    def test_env_parser_never_executes_values(self):
+    def test_env_literals(self):
         marker = WORK / "executed"
         bundle = WORK / "hostile.env"
         bundle.write_text(f"OCTRA_CHAIN_ID='$(touch {marker})'\n", encoding="utf-8")
@@ -3252,7 +3252,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(values["OCTRA_CHAIN_ID"], f"$(touch {marker})")
 
-    def test_source_commit_rejects_invalid_value(self):
+    def test_source_commit(self):
         root = WORK / "candidate-source"
         root.mkdir()
         (root / "SOURCE_COMMIT").write_text("invalid\n", encoding="utf-8")
@@ -3260,7 +3260,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "SOURCE_COMMIT is invalid"):
                 source_commit()
 
-    def test_run_requires_explicit_candidate_binding(self):
+    def test_run_candidate(self):
         source_path = Path(__file__).resolve().parent / "run.sh"
         exported_path = Path(__file__).resolve().parent.parent / "run.sh"
         script_path = source_path if source_path.is_file() else exported_path
@@ -3280,14 +3280,14 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertLess(runtime, start)
         self.assertNotIn("pm2 restart", script)
 
-    def test_recover_forwards_explicit_options(self):
+    def test_recover_options(self):
         source_path = Path(__file__).resolve().parent / "recover.sh"
         exported_path = Path(__file__).resolve().parent.parent / "recover.sh"
         script_path = source_path if source_path.is_file() else exported_path
         script = script_path.read_text(encoding="utf-8")
         self.assertIn('validator_recover.py" --config "$CONFIG" "$@"', script)
 
-    def test_runtime_rebind_preserves_node_state(self):
+    def test_runtime_rebind(self):
         root = WORK / "candidate"
         config = WORK / "live/.keys/validator/node.env"
         packaged_network = root / "config/network.env"
@@ -3342,7 +3342,7 @@ class ValidatorToolsTest(unittest.TestCase):
             str(installed_network.resolve()),
         )
 
-    def test_network_adoption_preserves_local_state(self):
+    def test_network_adoption(self):
         config = WORK / "live/.keys/validator/node.env"
         installed = config.parent / "network.env"
         candidate = WORK / "candidate/config/network.env"
@@ -3372,7 +3372,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(values["OCTRA_OPERATOR_NETWORK_SHA256"], candidate_hash)
         self.assertEqual(installed.read_bytes(), candidate.read_bytes())
 
-    def test_install_prepares_operator_data_root(self):
+    def test_install_data(self):
         source_path = Path(__file__).resolve().parent / "install.sh"
         exported_path = Path(__file__).resolve().parent.parent / "install.sh"
         script_path = source_path if source_path.is_file() else exported_path
@@ -3403,7 +3403,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertNotIn("pm2 install", script)
         self.assertNotIn("pm2 save --force", script)
 
-    def test_pm2_service_enabled_reads_systemd(self):
+    def test_pm2_systemd(self):
         probe = subprocess.CompletedProcess([], 0)
         with mock.patch("validator_config.subprocess.run", return_value=probe) as run:
             self.assertTrue(pm2_service_enabled("octra"))
@@ -3413,7 +3413,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertFalse(run.call_args.kwargs["check"])
 
-    def test_install_runtime_preserves_existing_pm2(self):
+    def test_install_pm2_existing(self):
         account = mock.Mock(pw_dir="/home/octra")
         with mock.patch("validator_config.ubuntu_host", return_value=True):
             with mock.patch("validator_config.install_rust_toolchain"):
@@ -3434,7 +3434,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(any(command[0] == "npm" for command in commands))
         self.assertFalse(any("startup" in command for command in commands))
 
-    def test_install_runtime_initializes_missing_pm2(self):
+    def test_install_pm2_missing(self):
         account = mock.Mock(pw_dir="/home/octra")
         with mock.patch("validator_config.ubuntu_host", return_value=True):
             with mock.patch("validator_config.install_rust_toolchain"):
@@ -3454,7 +3454,7 @@ class ValidatorToolsTest(unittest.TestCase):
         startup = next(command for command in commands if "startup" in command)
         self.assertEqual(startup[-4:], ["-u", "octra", "--hp", "/home/octra"])
 
-    def test_build_toolchain_bootstraps_old_rust(self):
+    def test_build_rust(self):
         old = {"PATH": "old"}
         fresh = {"PATH": "fresh"}
 
@@ -3474,7 +3474,7 @@ class ValidatorToolsTest(unittest.TestCase):
                         self.assertEqual(ensure_build_toolchain(), fresh)
         install.assert_called_once_with()
 
-    def test_gate_reports_missing_python_runtime(self):
+    def test_gate_python(self):
         source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
         exported_path = Path(__file__).resolve().parent.parent / "check.sh"
         script_path = source_path if source_path.is_file() else exported_path
@@ -3490,20 +3490,20 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn("source_commit_missing", script)
         self.assertIn("source_commit_invalid", script)
 
-    def test_sync_budget_matches_seed_capacity(self):
+    def test_sync_budget(self):
         args = parser().parse_args([])
         self.assertEqual(args.sync_concurrency, 4)
         self.assertEqual(args.sync_source_concurrency, 4)
         self.assertIsNone(args.sync_stage)
 
-    def test_default_sync_stage_is_sibling(self):
+    def test_sync_stage_sibling(self):
         data = WORK / "node"
         self.assertEqual(
             resolve_sync_stage(None, data),
             (WORK / "node.state_sync").resolve(),
         )
 
-    def test_nested_sync_stage_is_rejected(self):
+    def test_sync_stage_nested(self):
         data = WORK / "node"
         with self.assertRaises(ValidatorError):
             validate_sync_layout(data / "state_sync", data)
@@ -3530,7 +3530,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "2" * 64,
         )
 
-    def test_sync_minimum_epoch_reaches_client(self):
+    def test_sync_epoch(self):
         command = sync_client_command(
             WORK / "state_sync_client",
             WORK / "stage",
@@ -3542,7 +3542,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--min-epoch") + 1], "1340000")
 
-    def test_sync_source_check_uses_each_published_source(self):
+    def test_sync_sources(self):
         sync_binary = WORK / "state_sync_client"
         sync_binary.write_bytes(b"client")
         sources = ["https://seed-a.example", "https://seed-b.example"]
@@ -3569,7 +3569,7 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertEqual(command[command.index("--source") + 1], source)
             self.assertEqual(command[command.index("--max-bytes") + 1], "1")
 
-    def test_sync_source_check_rejects_route_mismatch(self):
+    def test_sync_route(self):
         sync_binary = WORK / "state_sync_client"
         sync_binary.write_bytes(b"client")
         result = subprocess.CompletedProcess(
@@ -3595,7 +3595,7 @@ class ValidatorToolsTest(unittest.TestCase):
                     ["https://seed-a.example"],
                 )
 
-    def test_unattended_configuration_syncs_by_default(self):
+    def test_unattended_sync(self):
         sync_binary = WORK / "state_sync_client"
         sync_binary.write_bytes(b"client")
         args = parser().parse_args([
@@ -3609,7 +3609,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "captured"):
                 maybe_sync(args, str(WORK / "data"), network_values())
 
-    def test_recovery_keeps_valid_offline_state(self):
+    def test_recovery_offline(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3629,7 +3629,7 @@ class ValidatorToolsTest(unittest.TestCase):
             recover(config)
         inspect.assert_not_called()
 
-    def test_recovery_starts_observer_for_journal_marker(self):
+    def test_recovery_journal(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3657,7 +3657,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(reported["cause"], "journal")
         self.assertEqual(reported["action"], "start_observer")
 
-    def test_recovery_marker_is_chain_bound(self):
+    def test_recovery_marker_chain(self):
         data = WORK / "data"
         marker = write_need(data, "octra-devnet-bft-v1")
         self.assertEqual(
@@ -3671,7 +3671,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "not a regular file"):
             read_need(data, "octra-devnet-bft-v1")
 
-    def test_recovery_marker_fields_are_exact(self):
+    def test_recovery_marker_fields(self):
         value = {
             "schema": "octra_sync_need_v1",
             "chain_id": "octra-devnet-bft-v1",
@@ -3684,7 +3684,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "fields are invalid"):
             need_of(value, "octra-devnet-bft-v1")
 
-    def test_recovery_marker_cause_type_is_checked(self):
+    def test_recovery_marker_cause(self):
         value = {
             "schema": "octra_sync_need_v1",
             "chain_id": "octra-devnet-bft-v1",
@@ -3696,7 +3696,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidatorError, "cause is invalid"):
             need_of(value, "octra-devnet-bft-v1")
 
-    def test_recovery_refuses_systemd_data_owner(self):
+    def test_recovery_systemd_owner(self):
         data = WORK / "data"
         data.mkdir()
         config = WORK / "node.env"
@@ -3711,7 +3711,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "pid:41"):
                 recover(config)
 
-    def test_recovery_refuses_link_name_owner(self):
+    def test_recovery_link_owner(self):
         target = WORK / "volume/data"
         data = WORK / "home/data"
         (target / "irmin_store").mkdir(parents=True)
@@ -3741,7 +3741,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "octra-validator"):
                 recover(config, replace_state=True)
 
-    def test_recovery_downloads_verified_state(self):
+    def test_recovery_verified(self):
         data = WORK / "data"
         bundle = WORK / "network.env"
         sync_binary = WORK / "state_sync_client"
@@ -3780,7 +3780,7 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
 
-    def test_recovery_preserves_nonempty_invalid_state(self):
+    def test_recovery_invalid(self):
         data = WORK / "data"
         data.mkdir()
         evidence = data / "unknown"
@@ -3794,7 +3794,7 @@ class ValidatorToolsTest(unittest.TestCase):
             recover(config)
         self.assertEqual(evidence.read_bytes(), b"preserve")
 
-    def test_recovery_replaces_valid_state_and_preserves_identity(self):
+    def test_recovery_identity(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3840,7 +3840,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue((preserved / "HEAD.json").is_file())
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
 
-    def test_recovery_preserves_data_link(self):
+    def test_recovery_data_link(self):
         home = WORK / "home"
         volume = WORK / "volume"
         target = volume / "data"
@@ -3905,7 +3905,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual((target / "HEAD.json").read_bytes(), head_bytes)
         self.assertFalse(target.with_name("data.prior-100").exists())
 
-    def test_recovery_restores_state_after_sync_failure(self):
+    def test_recovery_sync_failure(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3944,7 +3944,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
         self.assertFalse(preserved_state_path(data, 99).exists())
 
-    def test_recovery_rejects_snapshot_below_marker(self):
+    def test_recovery_snapshot_old(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -3989,7 +3989,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIsNotNone(read_need(data, network["OCTRA_CHAIN_ID"]))
         self.assertTrue(data.with_name(data.name + ".rejected-99").is_dir())
 
-    def test_recovery_accepts_snapshot_at_marker(self):
+    def test_recovery_snapshot_ready(self):
         data = WORK / "data"
         (data / "irmin_store").mkdir(parents=True)
         (data / "chaindata").mkdir()
@@ -4048,7 +4048,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             tool_version("rustc invalid")
 
-    def test_source_toolchains_are_repo_local(self):
+    def test_toolchains_local(self):
         with mock.patch.object(Path, "mkdir") as mkdir:
             environment = rust_environment()
         mkdir.assert_called_once_with(parents=True, exist_ok=True)
@@ -4063,7 +4063,7 @@ class ValidatorToolsTest(unittest.TestCase):
             str(CARGO_HOME / "bin"),
         )
 
-    def test_source_build_metadata_is_pinned(self):
+    def test_build_metadata(self):
         self.assertTrue((CONFIG_ROOT / "octra_node.opam.locked").is_file())
         install_path = Path(__file__).resolve().parent / "install.sh"
         exported_install = Path(__file__).resolve().parent.parent / "install.sh"
@@ -4082,7 +4082,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn('"--locked"', config_value)
         self.assertIn('"--require-checksums"', config_value)
 
-    def test_source_build_exports_all_runtime_artifacts(self):
+    def test_build_exports(self):
         (WORK / "octra_node.opam.locked").write_text(
             'opam-version: "2.0"\n',
             encoding="utf-8",
@@ -4137,9 +4137,15 @@ class ValidatorToolsTest(unittest.TestCase):
                             ):
                                 build_candidate()
         command_values = [command for command, _, _ in commands]
+        refresh = next(command for command in command_values if command[:2] == ["opam", "update"])
         install = next(command for command in command_values if command[:2] == ["opam", "install"])
         build = next(command for command in command_values if "dune" in command)
         build_env = next(env for command, _, env in commands if command == build)
+        self.assertEqual(
+            refresh,
+            ["opam", "update", "--switch", str(OPAM_SWITCH), "-y"],
+        )
+        self.assertLess(command_values.index(refresh), command_values.index(install))
         self.assertIn("--locked", install)
         self.assertIn("--require-checksums", install)
         self.assertEqual(build_env["OCTRA_SRC_ROOT"], str(WORK))
@@ -4152,7 +4158,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 name.encode("ascii"),
             )
 
-    def test_source_build_reuses_existing_local_switch(self):
+    def test_build_switch(self):
         (WORK / "octra_node.opam.locked").write_text(
             'opam-version: "2.0"\n',
             encoding="utf-8",
@@ -4217,7 +4223,7 @@ class ValidatorToolsTest(unittest.TestCase):
             values,
         )
 
-    def test_hashed_file_rejects_tampering(self):
+    def test_file_digest(self):
         worker = WORK / "octra_pvac_worker.exe"
         worker.write_bytes(b"worker")
         values = {
@@ -4250,7 +4256,7 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaises(ValidatorError):
                 validate_gc_keep({"OCTRA_GC_KEEP_EPOCHS": value})
 
-    def test_control_builder_creates_deterministic_bond_proof(self):
+    def test_control_bond(self):
         built = CONFIG_ROOT / "_build/default/bin/bft_control_tx.exe"
         packaged = CONFIG_ROOT / "artifacts/bft_control_tx.exe"
         binary = built if built.is_file() else packaged
@@ -4307,7 +4313,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(tx["nonce"], 7)
         self.assertEqual(payload["consensus_pubkey"], wallet["pub"])
 
-    def test_process_plan_removes_stale_owner(self):
+    def test_process_old_owner(self):
         entries = [
             {
                 "name": "octra-old",
@@ -4322,13 +4328,13 @@ class ValidatorToolsTest(unittest.TestCase):
             ["octra-old"],
         )
 
-    def test_process_plan_accepts_fresh_install(self):
+    def test_process_install(self):
         self.assertEqual(
             process_plan([], "octra-new", "/data/octra"),
             [],
         )
 
-    def test_process_plan_rejects_active_owner(self):
+    def test_process_active_owner(self):
         entries = [
             {
                 "name": "octra-old",
@@ -4341,7 +4347,7 @@ class ValidatorToolsTest(unittest.TestCase):
         with self.assertRaises(ValidatorError):
             process_plan(entries, "octra-new", "/data/octra")
 
-    def test_process_pids_tracks_deleted_entries(self):
+    def test_process_deleted(self):
         entries = [
             {
                 "name": "octra-new",
@@ -4373,7 +4379,7 @@ class ValidatorToolsTest(unittest.TestCase):
             [199, 201],
         )
 
-    def test_active_data_owners_block_recovery(self):
+    def test_data_owner_active(self):
         entries = [
             {
                 "name": "octra-validator",
@@ -4395,7 +4401,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ["octra-validator"],
         )
 
-    def test_data_pids_find_systemd_owner(self):
+    def test_data_owner_systemd(self):
         root = WORK / "proc"
         process = root / "41"
         process.mkdir(parents=True)
@@ -4405,13 +4411,13 @@ class ValidatorToolsTest(unittest.TestCase):
         )
         self.assertEqual(data_pids(data, root=root), [41])
 
-    def test_optional_pm2_inspection_allows_systemd_host(self):
+    def test_pm2_optional(self):
         with mock.patch("validator_process.shutil.which", return_value=None):
             self.assertEqual(pm2_entries(required=False), [])
             with self.assertRaisesRegex(ValidatorError, "PM2 process table"):
                 pm2_entries()
 
-    def test_optional_pm2_inspection_fails_closed(self):
+    def test_pm2_failure(self):
         with mock.patch(
             "validator_process.shutil.which",
             return_value="/usr/bin/pm2",
@@ -4420,7 +4426,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidatorError, "PM2 process table"):
                     pm2_entries(required=False)
 
-    def test_remaining_owners_detects_name_and_data_dir(self):
+    def test_remaining_owners(self):
         entries = [
             {
                 "name": "octra-new",
@@ -4446,7 +4452,7 @@ class ValidatorToolsTest(unittest.TestCase):
             ["octra-new", "octra-renamed"],
         )
 
-    def test_wait_stopped_observes_process_exit(self):
+    def test_wait_process_exit(self):
         with mock.patch(
             "validator_process.process_alive",
             side_effect=[True, False],
@@ -4455,7 +4461,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 wait_stopped([41], timeout=5.0, poll=0.0)
         self.assertEqual(alive.call_count, 2)
 
-    def test_wait_stopped_refuses_lingering_process(self):
+    def test_wait_process_running(self):
         with mock.patch(
             "validator_process.process_alive",
             return_value=True,
