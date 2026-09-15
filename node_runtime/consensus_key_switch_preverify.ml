@@ -80,3 +80,11 @@ let observe = Pool.observe
 let await = Pool.await
 let retain = Pool.retain
 let stats = Pool.stats
+
+let artifacts t txs =
+  List.filter_map
+    (fun tx ->
+      Option.map
+        (fun artifact -> Transaction.hash tx, artifact)
+        (Pool.artifact t tx))
+    txs

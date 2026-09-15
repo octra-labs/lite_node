@@ -106,6 +106,35 @@ let read_exact fd buffer offset length =
   in
   loop offset length
 
+let record_length_valid ~remaining length =
+  length >= 8 && length <= max_record_len && length <= remaining
+
+let read_scan_record fd ~segment ~offset ~size ~check_checksum =
+  if size - offset < 4 then Error (Prefix_truncated (segment, offset))
+  else
+    let prefix = Bytes.create 4 in
+    ignore (Unix.lseek fd offset Unix.SEEK_SET);
+    if not (read_exact fd prefix 0 4) then
+      Error (Prefix_truncated (segment, offset))
+    else
+      let length = read_u32_le prefix 0 in
+      if not (record_length_valid ~remaining:(size - offset - 4) length) then
+        Error (Length_invalid (segment, offset, length))
+      else
+        let bytes = Bytes.create length in
+        if not (read_exact fd bytes 0 length) then
+          Error (Record_truncated (segment, offset))
+        else
+          let epoch = read_u32_le bytes 0 in
+          let payload_length = length - 8 in
+          let payload = Bytes.sub_string bytes 4 payload_length in
+          if check_checksum
+             && Bytes.sub_string bytes (4 + payload_length) 4
+                <> checksum (Bytes.sub_string bytes 0 4) payload then
+            Error (Checksum_mismatch (segment, offset))
+          else
+            Ok { segment; offset; length; epoch; payload }
+
 let write_header fd seg_id =
   let buf = Bytes.make header_size '\000' in
   Bytes.blit_string magic 0 buf 0 4;
@@ -125,21 +154,30 @@ let validate_header fd =
   if v <> version then failwith (Printf.sprintf "txlog: version %d != %d" v version);
   read_u32_le buf 6
 
-let open_segment ?(readonly=false) dir seg_id =
+let open_segment ?(readonly = false) dir seg_id =
   let path = seg_path dir seg_id in
-  if Sys.file_exists path then begin
-    let flags = if readonly then [Unix.O_RDONLY] else [Unix.O_RDWR] in
-    let fd = Unix.openfile path flags 0o644 in
-    let _seg = validate_header fd in
-    let off = Unix.lseek fd 0 Unix.SEEK_END in
-    (fd, off)
-  end else if readonly then begin
-    failwith "txlog: read-only segment is missing"
-  end else begin
-    let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
-    write_header fd seg_id;
-    (fd, header_size)
-  end
+  let exists = Sys.file_exists path in
+  if not exists && readonly then failwith "txlog: read-only segment is missing";
+  let flags =
+    if not exists then [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC]
+    else if readonly then [Unix.O_RDONLY]
+    else [Unix.O_RDWR]
+  in
+  let fd = Unix.openfile path flags 0o644 in
+  match
+    if exists then begin
+      ignore (validate_header fd);
+      Unix.lseek fd 0 Unix.SEEK_END
+    end else begin
+      write_header fd seg_id;
+      header_size
+    end
+  with
+  | offset -> fd, offset
+  | exception error ->
+    let trace = Printexc.get_raw_backtrace () in
+    Unix.close fd;
+    Printexc.raise_with_backtrace error trace
 
 let parse_segment_id filename =
   let len = String.length filename in
@@ -212,6 +250,18 @@ let ensure_physical_eof_matches t =
       "txlog: physical EOF drift seg=%d expected=%d actual=%d"
       t.current_seg t.current_offset actual)
 
+let read_at t ~seg_id ~offset length =
+  let read fd =
+    let bytes = Bytes.create length in
+    ignore (Unix.lseek fd offset Unix.SEEK_SET);
+    if not (read_exact fd bytes 0 length) then failwith "txlog: unexpected EOF";
+    bytes
+  in
+  if seg_id = t.current_seg then read t.current_fd
+  else
+    let fd = Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDONLY] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> read fd)
+
 let rec append t ~epoch_id ~payload =
   if t.readonly then failwith "txlog: append on read-only log";
   ensure_physical_eof_matches t;
@@ -258,20 +308,7 @@ let rec append t ~epoch_id ~payload =
   (seg_id, offset, record_len)
 
 and read_record t ~seg_id ~offset ~len =
-  let fd =
-    if seg_id = t.current_seg then t.current_fd
-    else Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDONLY] 0
-  in
-  let total = 4 + len in
-  let buf = Bytes.create total in
-  let _ = Unix.lseek fd offset Unix.SEEK_SET in
-  let rd = ref 0 in
-  while !rd < total do
-    let n = Unix.read fd buf !rd (total - !rd) in
-    if n = 0 then failwith "txlog: unexpected EOF";
-    rd := !rd + n
-  done;
-  if seg_id <> t.current_seg then Unix.close fd;
+  let buf = read_at t ~seg_id ~offset (4 + len) in
   let stored_len = read_u32_le buf 0 in
   if stored_len <> len then failwith "txlog: record_len mismatch";
   let epoch_id = read_u32_le buf 4 in
@@ -284,32 +321,14 @@ and read_record t ~seg_id ~offset ~len =
   (epoch_id, payload)
 
 let read_record_prefix t ~seg_id ~offset ~len ~prefix_len =
-  let fd =
-    if seg_id = t.current_seg then t.current_fd
-    else Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDONLY] 0
-  in
   let payload_len = max 0 (len - 8) in
   let prefix_len = min payload_len (max 0 prefix_len) in
-  let total = 8 + prefix_len in
-  let buf = Bytes.create total in
-  let close_needed = seg_id <> t.current_seg in
-  try
-    let _ = Unix.lseek fd offset Unix.SEEK_SET in
-    let rd = ref 0 in
-    while !rd < total do
-      let n = Unix.read fd buf !rd (total - !rd) in
-      if n = 0 then failwith "txlog: unexpected EOF";
-      rd := !rd + n
-    done;
-    if close_needed then Unix.close fd;
-    let stored_len = read_u32_le buf 0 in
-    if stored_len <> len then failwith "txlog: record_len mismatch";
-    let epoch_id = read_u32_le buf 4 in
-    let payload_prefix = Bytes.sub_string buf 8 prefix_len in
-    (epoch_id, payload_prefix)
-  with e ->
-    if close_needed then (try Unix.close fd with _ -> ());
-    raise e
+  let buf = read_at t ~seg_id ~offset (8 + prefix_len) in
+  let stored_len = read_u32_le buf 0 in
+  if stored_len <> len then failwith "txlog: record_len mismatch";
+  let epoch_id = read_u32_le buf 4 in
+  let payload_prefix = Bytes.sub_string buf 8 prefix_len in
+  (epoch_id, payload_prefix)
 
 let fsync t =
   if not t.readonly then Unix.fsync t.current_fd
@@ -318,29 +337,22 @@ let scan_all t f =
   let seg_id = ref 0 in
   while Sys.file_exists (seg_path t.dir !seg_id) do
     let fd = Unix.openfile (seg_path t.dir !seg_id) [Unix.O_RDONLY] 0 in
-    let _seg = validate_header fd in
-    let file_size = Unix.lseek fd 0 Unix.SEEK_END in
-    let pos = ref header_size in
-    let _ = Unix.lseek fd header_size Unix.SEEK_SET in
-    (try while !pos < file_size do
-      let hdr = Bytes.create 4 in
-      let n = Unix.read fd hdr 0 4 in
-      if n < 4 then raise Exit;
-      let record_len = read_u32_le hdr 0 in
-      let record_buf = Bytes.create record_len in
-      let rd = ref 0 in
-      (try while !rd < record_len do
-        let n = Unix.read fd record_buf !rd (record_len - !rd) in
-        if n = 0 then raise Exit;
-        rd := !rd + n
-      done with Exit -> raise Exit);
-      let epoch_id = read_u32_le record_buf 0 in
-      let payload_len = record_len - 4 - 4 in
-      let payload = Bytes.sub_string record_buf 4 payload_len in
-      f !seg_id !pos record_len epoch_id payload;
-      pos := !pos + 4 + record_len
-    done with Exit -> ());
-    Unix.close fd;
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+      let _seg = validate_header fd in
+      let file_size = Unix.lseek fd 0 Unix.SEEK_END in
+      let pos = ref header_size in
+      let _ = Unix.lseek fd header_size Unix.SEEK_SET in
+      try while !pos < file_size do
+        match read_scan_record fd ~segment:!seg_id ~offset:!pos ~size:file_size
+                ~check_checksum:false with
+        | Error (Prefix_truncated _ | Record_truncated _) -> raise Exit
+        | Error (Length_invalid (_, _, length))
+          when length >= 8 && length <= max_record_len -> raise Exit
+        | Error error -> failwith (scan_error_message error)
+        | Ok record ->
+          f record.segment record.offset record.length record.epoch record.payload;
+          pos := !pos + 4 + record.length
+      done with Exit -> ());
     incr seg_id
   done
 
@@ -373,35 +385,14 @@ let fold_strict t ~init ~f =
               else
                 let rec records state offset =
                   if offset = size then Ok state
-                  else if size - offset < 4 then
-                    Error (Prefix_truncated (segment, offset))
                   else
-                    let prefix = Bytes.create 4 in
-                    ignore (Unix.lseek fd offset Unix.SEEK_SET);
-                    if not (read_exact fd prefix 0 4) then
-                      Error (Prefix_truncated (segment, offset))
-                    else
-                      let length = read_u32_le prefix 0 in
-                      let remaining = size - offset - 4 in
-                      if length < 8 || length > max_record_len || length > remaining then
-                        Error (Length_invalid (segment, offset, length))
-                      else
-                        let bytes = Bytes.create length in
-                        if not (read_exact fd bytes 0 length) then
-                          Error (Record_truncated (segment, offset))
-                        else
-                          let epoch = read_u32_le bytes 0 in
-                          let payload_length = length - 8 in
-                          let payload = Bytes.sub_string bytes 4 payload_length in
-                          let epoch_bytes = Bytes.sub_string bytes 0 4 in
-                          let stored = Bytes.sub_string bytes (4 + payload_length) 4 in
-                          if stored <> checksum epoch_bytes payload then
-                            Error (Checksum_mismatch (segment, offset))
-                          else
-                            let record = { segment; offset; length; epoch; payload } in
-                            match f state record with
-                            | Error reason -> Error (Record_rejected (segment, offset, reason))
-                            | Ok state -> records state (offset + 4 + length)
+                    match read_scan_record fd ~segment ~offset ~size
+                            ~check_checksum:true with
+                    | Error _ as error -> error
+                    | Ok record ->
+                      match f state record with
+                      | Error reason -> Error (Record_rejected (segment, offset, reason))
+                      | Ok state -> records state (offset + 4 + record.length)
                 in
                 records state header_size)
   in

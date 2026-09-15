@@ -18,6 +18,8 @@ type t = {
   direction : direction;
   mutable connected : bool;
   write_queue : P2p_frame.frame Lwt_mvar.t;
+  closed : unit Lwt.t;
+  wake_close : unit Lwt.u;
   mutable msg_count_in : int;
   mutable msg_count_out : int;
   mutable last_seen : float;
@@ -29,18 +31,22 @@ let read_idle_timeout_s = 60.0
 let monotonic_seconds () =
   Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.0
 
-let create ~peer_class fd ~peer_id ~addr ~direction = {
-  fd;
-  peer_id;
-  addr;
-  direction;
-  connected = true;
-  write_queue = Lwt_mvar.create_empty ();
-  msg_count_in = 0;
-  msg_count_out = 0;
-  last_seen = Unix.gettimeofday ();
-  frame_budget = P2p_frame_budget.create ~now:(monotonic_seconds ()) ~peer_class;
-}
+let create ~peer_class fd ~peer_id ~addr ~direction =
+  let closed, wake_close = Lwt.wait () in
+  {
+    fd;
+    peer_id;
+    addr;
+    direction;
+    connected = true;
+    write_queue = Lwt_mvar.create_empty ();
+    closed;
+    wake_close;
+    msg_count_in = 0;
+    msg_count_out = 0;
+    last_seen = Unix.gettimeofday ();
+    frame_budget = P2p_frame_budget.create ~now:(monotonic_seconds ()) ~peer_class;
+  }
 
 let set_peer_class t peer_class =
   P2p_frame_budget.set_peer_class t.frame_budget peer_class
@@ -77,6 +83,7 @@ let expected_disconnect = function
 let close t =
   if t.connected then begin
     t.connected <- false;
+    Lwt.wakeup_later t.wake_close ();
     (try Lwt_unix.shutdown t.fd Lwt_unix.SHUTDOWN_ALL with _ -> ());
     Lwt.catch
       (fun () -> Lwt_unix.close t.fd)
@@ -84,9 +91,15 @@ let close t =
   end else
     Lwt.return_unit
 
+let until_closed t wait =
+  Lwt.pick [
+    Lwt.map Option.some wait;
+    Lwt.map (fun () -> None) (Lwt.protected t.closed);
+  ]
+
 let send t (frame : P2p_frame.frame) =
   if t.connected then
-    Lwt_mvar.put t.write_queue frame
+    Lwt.map (fun _ -> ()) (until_closed t (Lwt_mvar.put t.write_queue frame))
   else
     Lwt.return_unit
 
@@ -99,25 +112,31 @@ let rec repeat step =
     let* () = Lwt.pause () in
     repeat step
 
-let write_loop t =
+let write_loop ?idle_s t =
   let open Lwt.Syntax in
   let step () =
     if not t.connected then Lwt.return Done
     else
-      let* frame = Lwt_mvar.take t.write_queue in
-      if not t.connected then Lwt.return Done
-      else
+      let* item = until_closed t (Lwt_mvar.take t.write_queue) in
+      match item with
+      | None -> Lwt.return Done
+      | Some _ when not t.connected -> Lwt.return Done
+      | Some frame ->
         Lwt.catch
           (fun () ->
-            let* () = P2p_frame.write_frame t.fd frame in
+            let* () = P2p_frame.write_frame ?idle_s t.fd frame in
             t.msg_count_out <- t.msg_count_out + 1;
             Lwt.return Again)
           (fun exn ->
             let error = Printexc.to_string exn in
-            if expected_disconnect exn then
-              trace_conn t.addr "event = disconnected reason = %s" error
-            else
-              err_conn t.addr "event = write_loop_error error = %s" error;
+            (match exn with
+             | Lwt_unix.Timeout ->
+               err_conn t.addr "event = write_idle seconds = %.3f action = close"
+                 (Option.value idle_s ~default:P2p_frame.default_write_idle_s)
+             | _ when expected_disconnect exn ->
+               trace_conn t.addr "event = disconnected reason = %s" error
+             | _ ->
+               err_conn t.addr "event = write_loop_error error = %s" error);
             let* () = close t in
             Lwt.return Done)
   in

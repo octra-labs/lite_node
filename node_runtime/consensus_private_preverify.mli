@@ -35,3 +35,8 @@ val retain :
 val stats :
   t ->
   Consensus_preverify_pool.stats
+
+val artifacts :
+  t ->
+  Octra_core.Transaction.t list ->
+  (string * Octra_core.Private_ledger.private_artifact) list

@@ -690,11 +690,14 @@ let get_tx_by_hash t hash =
   match Chaindata_index.get_tx_loc t.index hash with
   | None -> None
   | Some (seg_id, offset, len, epoch_id) ->
-    (try
-       let (_eid, payload) = Txlog.read_record t.txlog ~seg_id ~offset ~len in
-       let (stored_hash, tx_json) = split_payload payload in
-       Some (epoch_id, visible_tx_json stored_hash tx_json)
-     with _ -> None)
+    if seg_id < 0 || offset < 0 || len <= 8 || len > max_txlog_record_len then None
+    else
+      (try
+         let (stored_epoch, payload) = Txlog.read_record t.txlog ~seg_id ~offset ~len in
+         let (stored_hash, tx_json) = split_payload payload in
+         if stored_epoch <> epoch_id || not (String.equal stored_hash hash) then None
+         else Some (epoch_id, visible_tx_json stored_hash tx_json)
+       with _ -> None)
 
 let capped_replace cache key value =
   if Hashtbl.length cache >= 256 && not (Hashtbl.mem cache key) then

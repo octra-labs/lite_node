@@ -492,7 +492,7 @@ let guard_reads visibility routes =
       name, stable_read visibility handler)
     routes
 
-let read_dispatch visibility :
+let read_dispatch ?(page_lock = Lwt_mutex.create ()) visibility :
     (string * (Yojson.Safe.t -> ctx -> rpc_result Lwt.t)) list =
   Status_read_rpc.core_dispatch status_dispatch_adapters
   @ Account_read_rpc.public_dispatch account_dispatch_adapters
@@ -503,10 +503,14 @@ let read_dispatch visibility :
   @ Account_read_rpc.pvac_dispatch account_dispatch_adapters
   @ Status_read_rpc.proof_dispatch status_dispatch_adapters
   |> guard_reads visibility
+  |> List.map (fun (name, handler) ->
+    if name = "octra_epochPage" then
+      name, (fun params ctx -> Epoch_page.admit page_lock (fun () -> handler params ctx))
+    else name, handler)
 
-let dispatch visibility :
+let dispatch ?page_lock visibility :
     (string * (Yojson.Safe.t -> ctx -> rpc_result Lwt.t)) list =
-  read_dispatch visibility
+  read_dispatch ?page_lock visibility
   @ effect_dispatch.submission
   @ effect_dispatch.staging
   @ effect_dispatch.mutation
@@ -568,8 +572,9 @@ let start (cfg : config) =
     pvac_status;
     deps = cfg.deps;
   } in
-  let routes = dispatch cfg.epoch_visibility in
-  let read_routes = read_dispatch cfg.epoch_visibility in
+  let page_lock = Lwt_mutex.create () in
+  let routes = dispatch ~page_lock cfg.epoch_visibility in
+  let read_routes = read_dispatch ~page_lock cfg.epoch_visibility in
   let rpc_handler =
     Rpc_http.handle_rpc_post
       ~process:(fun meta body_str ->
@@ -609,7 +614,10 @@ let start (cfg : config) =
       let call meta request =
         Rpc_dispatch.handle_request meta request rpc_ctx read_routes
       in
-      Lwt.pick [http; Grpc_http2.start config ~call]
+      let submit meta request =
+        Rpc_dispatch.handle_request meta request rpc_ctx ["octra_submit", octra_submit]
+      in
+      Grpc_http2.serve config ~call ~submit ~http
   in
   Lwt.finalize
     (fun () -> serve)

@@ -413,7 +413,12 @@ let node_standard_adapters runtime =
     read_prev_ledger_root = runtime.read_prev_ledger_root;
     staging_txs = Staging.all;
     staging_epoch_txs = (fun () ->
-      Staging.get_epoch_txs ~capacity:runtime.staging_epoch_capacity);
+      Staging.ready_epoch_txs
+        ~capacity:runtime.staging_epoch_capacity
+        ~confirmed_nonce:(fun sender ->
+          Option.map
+            (fun account -> account.Octra_core.Ledger.nonce)
+            (runtime.find_account sender)));
     staging_total = Staging.staging_size;
     proposer = (fun () -> runtime.wallet_addr);
     head_txid_hi = (fun () ->

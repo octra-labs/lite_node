@@ -61,6 +61,11 @@ val retain :
   (string -> bool) ->
   unit
 
+val artifact :
+  ('artifact, 'prepared) t ->
+  Octra_core.Transaction.t ->
+  'artifact option
+
 val stats :
   ('artifact, 'prepared) t ->
   stats

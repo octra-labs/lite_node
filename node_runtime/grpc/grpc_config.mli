@@ -5,6 +5,7 @@ type t = {
   host : string;
   port : int;
   max_request_bytes : int;
+  submit_bytes : int option;
   max_response_bytes : int;
   max_streams : int;
   default_deadline_s : float;

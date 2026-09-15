@@ -16,6 +16,10 @@ type sample = {
   bonded : bool;
 }
 
+type point = { epoch : int64; head : int64 option; finalized : bool }
+
+type refusal = Moved | Uncommitted | Finalized
+
 type stats = {
   queued : int;
   appeals : int;
@@ -26,12 +30,14 @@ type stats = {
 type deps = {
   sample : unit -> sample;
   peers : unit -> int;
-  send : action -> (unit, string) result Lwt.t;
+  send : epoch:int64 -> action -> (unit, string) result Lwt.t;
   warn : string -> unit;
 }
 
 type t
 
+val plan : epoch:int64 -> point -> (int64, refusal) result
+val reason : refusal -> string
 val stream_capacity : int
 val appeal_capacity : int
 val notify :

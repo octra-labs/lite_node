@@ -253,6 +253,75 @@ let check_payload_independence () =
     count
     elapsed_ms
 
+let check_ready_gap () =
+  Tx_staging.clear ();
+  let first = transaction ~fee:2_000 (sender 1) 1 in
+  let third = transaction ~op_type:Transaction.KeySwitch (sender 1) 3 in
+  let other = transaction (sender 2) 2 in
+  let used = transaction (sender 3) 1 in
+  let next = transaction (sender 3) 2 in
+  let later = transaction (sender 3) 4 in
+  let unknown = transaction (sender 4) 1 in
+  List.iter add [third; other; later; unknown; used; next; first];
+  let confirmed_nonce addr =
+    if addr = sender 4 then None
+    else Some (if addr = sender 3 then 1 else 0)
+  in
+  let read capacity =
+    Tx_staging.ready_epoch_txs ~capacity ~confirmed_nonce |> List.map identity
+  in
+  let capacity = Tx_staging.max_ou_per_epoch in
+  let before = Tx_staging.staging_size () in
+  let expected = List.map identity [first; next] in
+  check "ready prefix only" (read capacity = expected);
+  check "selection leaves queue intact" (Tx_staging.staging_size () = before);
+  check "used nonce omitted" (not (List.mem (identity used) (read capacity)));
+  check "ready prefix deterministic" (read capacity = read capacity);
+  check "zero capacity empty" (read Z.zero = []);
+  check "capacity stops sender suffix"
+    (read (Transaction.ou_cost first) = [identity first]);
+  let second = transaction (sender 1) 2 in
+  add second;
+  let filled = read capacity in
+  check "missing nonce restores chain"
+    (List.filter (fun (addr, _) -> addr = sender 1) filled
+     = List.map identity [first; second; third]);
+  check "independent sender retained" (List.mem (identity next) filled);
+  let snapshot () =
+    Tx_staging.get_epoch_txs ~capacity |> List.map Transaction.hash
+  in
+  let contents = snapshot () in
+  let moved =
+    Tx_staging.ready_epoch_txs ~capacity
+      ~confirmed_nonce:(fun addr ->
+        if addr = sender 1 then Some 1 else confirmed_nonce addr)
+    |> List.map identity
+  in
+  check "confirmed nonce advances prefix"
+    (List.filter (fun (addr, _) -> addr = sender 1) moved
+     = List.map identity [second; third]);
+  check "selection preserves contents" (snapshot () = contents);
+  Tx_staging.clear ();
+  List.iter add [first; next; used; unknown; later; other; third; second];
+  check "ready order ignores insertion" (read capacity = filled);
+  check "nonce limit has no successor"
+    (Tx_staging.ready_epoch_txs ~capacity ~confirmed_nonce:(fun _ -> Some max_int) = [])
+
+let check_ready_cost () =
+  Tx_staging.clear ();
+  let first = transaction ~fee:4_000 (sender 1) 1 in
+  let second = transaction ~fee:400_000 ~op_type:Transaction.KeySwitch (sender 1) 2 in
+  let third = transaction (sender 1) 3 in
+  let other = transaction (sender 2) 1 in
+  List.iter add [third; second; other; first];
+  let capacity = Z.add (Transaction.ou_cost first) (Transaction.ou_cost other) in
+  check "middle cost exceeds budget" (Z.gt (Transaction.ou_cost second) capacity);
+  let selected =
+    Tx_staging.ready_epoch_txs ~capacity ~confirmed_nonce:(fun _ -> Some 0)
+    |> List.map identity
+  in
+  check "over budget suffix omitted" (selected = List.map identity [first; other])
+
 let () =
   check_fee_order ();
   check_cost_rate_order ();
@@ -261,5 +330,7 @@ let () =
   check_pool_eviction ();
   check_queue_state ();
   check_recent_order ();
+  check_ready_gap ();
+  check_ready_cost ();
   check_selection_time ();
   check_payload_independence ()

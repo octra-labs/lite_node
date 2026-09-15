@@ -302,6 +302,121 @@ let test_validator_preverify_wait () =
   | Ok _ -> ()
   | Error reason -> fail ("validator rejected prepared proposal " ^ reason)
 
+let cached_check cache item verify =
+  Cache.run_preverify_once
+    cache
+    ~purpose:Cache.Validate_proposal
+    ~state_root:(raw 'p')
+    ~tx_hashes:[Transaction.hash item]
+    ~txs:[item]
+    (fun _ _ -> verify ())
+
+let test_cache_retry_order () =
+  let cache = Cache.create ~cap:2 in
+  let first = tx 31 in
+  let calls = ref 0 in
+  let verify () =
+    incr calls;
+    if !calls = 1 then
+      fake_batch
+        ~skipped:[{ W.tx = first; reason = "pending"; kind = W.Deferred }]
+        []
+    else fake_batch [first]
+  in
+  let run item verify = Lwt_main.run (cached_check cache item verify) in
+  let _ = run first verify in
+  let _ = run (tx 32) (fun () -> fake_batch [tx 32]) in
+  let _ = run first verify in
+  let _ = run (tx 33) (fun () -> fake_batch [tx 33]) in
+  let batch = run first verify in
+  expect "retry kept its insertion order" (!calls = 2);
+  expect "retry kept its result" (W.txs batch = [first])
+
+let test_cache_retry_space () =
+  List.iter
+    (fun cap ->
+      let cache = Cache.create ~cap in
+      let item = tx 34 in
+      List.iter
+        (fun index ->
+          let result =
+            Lwt.catch
+              (fun () ->
+                let open Lwt.Syntax in
+                let* _ = cached_check cache item (fun () ->
+                  match index mod 3 with
+                  | 0 -> failwith "retry"
+                  | 1 -> Lwt.fail_with "retry"
+                  | _ ->
+                    fake_batch
+                      ~skipped:[{ W.tx = item; reason = "pending"; kind = W.Deferred }]
+                      [])
+                in
+                Lwt.return_unit)
+              (function
+                | Failure reason when reason = "retry" -> Lwt.return_unit
+                | exn -> Lwt.fail exn)
+          in
+          Lwt_main.run result;
+          let stats = Cache.stats cache in
+          expect "retry removed its result" (stats.preverify_size = 0);
+          expect "retry queue respects capacity" (stats.preverify_queue <= max 0 cap))
+        (List.init 100 Fun.id))
+    [-1; 0; 1; 2; 4]
+
+let test_cache_cancel_job () =
+  let cache = Cache.create ~cap:2 in
+  let item = tx 35 in
+  let job, wake = Lwt.task () in
+  let calls = ref 0 in
+  let verify () = incr calls; job in
+  let first = cached_check cache item verify in
+  let second = cached_check cache item verify in
+  Lwt.cancel first;
+  expect "cancelled caller detached" (Lwt.state first = Lwt.Fail Lwt.Canceled);
+  expect "shared job still pending" (Lwt.is_sleeping job);
+  Lwt.wakeup wake W.{ ready = [{ tx = item; receipt = None }]; skipped = [] };
+  let result = Lwt_main.run second in
+  expect "shared job ran once" (!calls = 1);
+  expect "remaining caller completed" (W.txs result = [item])
+
+let test_cache_late_failure () =
+  let cache = Cache.create ~cap:1 in
+  let item = tx 36 in
+  let old, wake = Lwt.task () in
+  let first = cached_check cache item (fun () -> old) in
+  let _ = Lwt_main.run (cached_check cache (tx 37) (fun () -> fake_batch [tx 37])) in
+  let calls = ref 0 in
+  let verify () = incr calls; fake_batch [item] in
+  let _ = Lwt_main.run (cached_check cache item verify) in
+  Lwt.wakeup_exn wake (Failure "retry");
+  begin
+    match Lwt.state first with
+    | Lwt.Fail (Failure reason) when reason = "retry" -> ()
+    | _ -> fail "old caller lost its failure"
+  end;
+  let result = Lwt_main.run (cached_check cache item verify) in
+  expect "old failure kept newer result" (!calls = 1);
+  expect "newer result complete" (W.txs result = [item])
+
+let test_cache_result_parity () =
+  let items = List.init 64 (fun index -> tx (40 + index mod 7)) in
+  let run cap =
+    let cache = Cache.create ~cap in
+    List.map
+      (fun item ->
+        let batch = Lwt_main.run (cached_check cache item (fun () -> fake_batch [item])) in
+        let stats = Cache.stats cache in
+        expect "result capacity" (stats.preverify_size <= max 0 cap);
+        expect "queue capacity" (stats.preverify_queue <= max 0 cap);
+        batch)
+      items
+  in
+  let expected = run 0 in
+  List.iter
+    (fun cap -> expect "cache removal preserves result" (run cap = expected))
+    [1; 2; 7; 64]
+
 let test_reject_forged_heavy_receipt () =
   let base = tx 1 in
   let heavy = { base with Transaction.op_type = Transaction.DecryptOp } in
@@ -1740,6 +1855,69 @@ let test_verify_local_preview () =
   expect "verify accept shared" (!shared = [[item]]);
   expect "verify accept stores twice" (List.length !stores = 2)
 
+let test_verify_staging_lookup () =
+  let module S = Octra_core.Tx_staging in
+  let module D = Octra_node_runtime.Consensus_driver_wiring in
+  S.clear ();
+  Fun.protect ~finally:S.clear (fun () ->
+    let pending = tx 3 in
+    let ready = Transaction.{ (tx 1) with from = "oct_other" } in
+    List.iter (fun item ->
+      match S.add_smart ~lookup:(fun _ -> Some (Z.of_int 1_000_000_000, 0)) item with
+      | Ok _ -> ()
+      | Error reason -> fail reason) [pending; ready];
+    let adapters = D.node_standard_adapters D.{
+      getenv = (fun _ -> None);
+      get_meta = (fun _ -> None);
+      wallet_addr = "oct_creator";
+      wallet_pub = "pub";
+      find_account = (fun _ -> Some Octra_core.Ledger.empty_account);
+      cached_head = (fun () -> None);
+      read_prev_ledger_root = (fun () -> Lwt.return_none);
+      next_txid = (fun () -> 7L);
+      proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
+      catchup_active = ref false;
+      staging_epoch_capacity = Z.of_int 10_000;
+      write_pending = (fun _ -> ());
+      validator_pubkeys_for_epoch = (fun ~wallet_addr:_ ~wallet_pub:_ ~epoch:_ -> []);
+    } in
+    expect "proposer excludes nonce gap" (adapters.staging_epoch_txs () = [ready]);
+    let items = [ready; pending] in
+    let proposal = proposal_for_txs items in
+    let queries = ref 0 in
+    let deps, _, _, _, _, _, proposals, previews =
+      verify_proposal_deps ~driver_available:true
+        ~validate_preverify_once:(fun ~state_root:_ ~tx_hashes:_ txs ->
+          expect "local proposal order" (txs = items);
+          fake_batch txs) ()
+    in
+    let deps = C.{ deps with
+      staging_txs = adapters.staging_txs;
+      query_bundle = (fun ~epoch_id:_ ~proposal_id:_ ~validate:_ ->
+        incr queries;
+        Lwt.return_none);
+    } in
+    expect "ready-only lookup needs bundle"
+      (verdict_waits (Lwt_main.run (C.verify_proposal
+        { deps with staging_txs = adapters.staging_epoch_txs }
+        ~chain_id:"octra-test" proposal)));
+    expect "missing lookup queries once" (!queries = 1 && !previews = []);
+    queries := 0;
+    expect "all staging supplies bundle"
+      (verdict_accepts (Lwt_main.run
+        (C.verify_proposal deps ~chain_id:"octra-test" proposal)));
+    expect "local lookup avoids query" (!queries = 0);
+    expect "local lookup preserves order"
+      (!proposals = [items, List.map Transaction.hash items]);
+    expect "local lookup still previews" (List.length !previews = 1);
+    expect "local lookup still verifies"
+      (verdict_rejects (Lwt_main.run (C.verify_proposal
+        { deps with verify_tx_signature = (fun _ ~pubkey:_ -> false) }
+        ~chain_id:"octra-test" proposal)));
+    expect "invalid signature avoids preview" (List.length !previews = 1);
+    expect "validator leaves staging intact" (adapters.staging_total () = 2);
+    expect "proposer remains ready-only" (adapters.staging_epoch_txs () = [ready]))
+
 let test_verify_ledger_preverify () =
   let item = tx 1 in
   let calls = ref [] in
@@ -2566,6 +2744,11 @@ let () =
   test_local_preverify_disabled ();
   test_check_local_bundle ();
   test_validator_preverify_wait ();
+  test_cache_retry_order ();
+  test_cache_retry_space ();
+  test_cache_cancel_job ();
+  test_cache_late_failure ();
+  test_cache_result_parity ();
   test_reject_forged_heavy_receipt ();
   test_preverify_cap_skip_sample ();
   test_layera_validator_addrs ();
@@ -2619,6 +2802,7 @@ let () =
   test_verify_missing_prev_time ();
   test_verify_missing_bundle_wait ();
   test_verify_local_preview ();
+  test_verify_staging_lookup ();
   test_verify_ledger_preverify ();
   test_verify_reproduced_rejection ();
   test_verify_forged_rejection ();

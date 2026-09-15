@@ -196,6 +196,144 @@ let timeout_ban () =
   done;
   Guard.is_banned guard ~now:3.0 ~key
 
+let close_waiters () =
+  let module Conn = Octra_net.P2p_conn in
+  pair (fun fd _ ->
+    let open Lwt.Syntax in
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Observer
+      fd ~peer_id:"waiting-peer" ~addr:"local" ~direction:Conn.Inbound in
+    let frame = Frame.{ msg_type = msg_ping; payload = "queued" } in
+    let* () = Conn.send conn frame in
+    let cancelled = Conn.send conn frame in
+    require (Lwt.is_sleeping cancelled) "first sender did not wait";
+    Lwt.cancel cancelled;
+    require (Conn.is_connected conn) "sender cancellation closed the peer";
+    let waiting = Conn.send conn frame in
+    require (Lwt.is_sleeping waiting) "sender did not wait for the queue";
+    Lwt.finalize
+      (fun () ->
+        let* () = Conn.close conn in
+        let* () = Lwt.pause () in
+        Lwt.return (match Lwt.state waiting with
+          | Lwt.Return () -> true
+          | Lwt.Sleep | Lwt.Fail _ -> false))
+      (fun () ->
+        Lwt.cancel waiting;
+        Conn.close conn))
+
+let close_idle () =
+  let module Conn = Octra_net.P2p_conn in
+  pair (fun fd _ ->
+    let open Lwt.Syntax in
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Observer
+      fd ~peer_id:"idle-peer" ~addr:"local" ~direction:Conn.Inbound in
+    let writing = Conn.write_loop conn in
+    require (Lwt.is_sleeping writing) "writer did not wait for a frame";
+    Lwt.finalize
+      (fun () ->
+        let* () = Conn.close conn in
+        let* () = Lwt_unix.with_timeout 1.0 (fun () -> Lwt.protected writing) in
+        Lwt.return (not (Conn.is_connected conn)))
+      (fun () ->
+        Lwt.cancel writing;
+        Conn.close conn))
+
+let write_idle () =
+  let module Conn = Octra_net.P2p_conn in
+  pair (fun fd peer ->
+    let open Lwt.Syntax in
+    Lwt_unix.setsockopt_int fd Unix.SO_SNDBUF 4096;
+    Lwt_unix.setsockopt_int peer Unix.SO_RCVBUF 4096;
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator
+      fd ~peer_id:"paused-peer" ~addr:"local" ~direction:Conn.Inbound in
+    let writing = Conn.write_loop ~idle_s:0.05 conn in
+    Lwt.finalize
+      (fun () ->
+        let frame = Frame.{ msg_type = msg_bundle_response;
+          payload = String.make (2 * 1024 * 1024) 'p' } in
+        let* () = Conn.send conn frame in
+        let* () = Lwt_unix.with_timeout 2.0 (fun () -> Lwt.protected writing) in
+        require (not (Conn.is_connected conn)) "idle write kept the peer open";
+        require (conn.msg_count_out = 0) "partial frame counted as sent";
+        let* () = Conn.send conn frame in
+        require (Lwt_mvar.is_empty conn.write_queue) "closed peer queued a frame";
+        Lwt.catch
+          (fun () ->
+            let* _ = Frame.read_frame ~timeout_s:1.0 peer in
+            Lwt.return_false)
+          (function
+            | Failure reason -> Lwt.return (reason = "connection_closed")
+            | _ -> Lwt.return_false))
+      (fun () ->
+        Lwt.cancel writing;
+        Conn.close conn))
+
+let write_progress () =
+  pair (fun writer reader ->
+    let open Lwt.Syntax in
+    Lwt_unix.setsockopt_int writer Unix.SO_SNDBUF 4096;
+    Lwt_unix.setsockopt_int reader Unix.SO_RCVBUF 4096;
+    let payload = String.make (256 * 1024) 'r' in
+    let received = Bytes.create (String.length payload) in
+    let rec read off =
+      if off = Bytes.length received then Lwt.return_unit
+      else
+        let* count = Lwt_unix.read reader received off
+          (min 4096 (Bytes.length received - off)) in
+        require (count > 0) "progressing writer closed early";
+        let* () = Lwt_unix.sleep 0.02 in
+        read (off + count)
+    in
+    let started = Mtime_clock.elapsed_ns () in
+    let writing =
+      let* () = Frame.write_all ~idle_s:0.3 writer payload in
+      Lwt.return (Int64.sub (Mtime_clock.elapsed_ns ()) started)
+    in
+    let* elapsed, () = Lwt.both writing (read 0) in
+    Lwt.return (Int64.compare elapsed 300_000_000L > 0
+      && Bytes.to_string received = payload))
+
+let write_interval () =
+  pair (fun writer _ ->
+    Lwt.return (List.for_all (fun idle_s ->
+      try
+        ignore (Frame.write_all ~idle_s writer "");
+        false
+      with Invalid_argument reason -> reason = "invalid write idle interval")
+      [0.; -1.; Float.nan; Float.infinity]))
+
+let wait_release () =
+  let module Conn = Octra_net.P2p_conn in
+  pair (fun fd _ ->
+    let open Lwt.Syntax in
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator
+      fd ~peer_id:"queue-peer" ~addr:"local" ~direction:Conn.Inbound in
+    let proxies = Weak.create 3 in
+    let run n =
+      let wait, wake = Lwt.task () in
+      if n = 0 then Lwt.wakeup wake ();
+      let proxy = Lwt.protected conn.closed in
+      Weak.set proxies n (Some proxy);
+      let selected = Lwt.pick [
+        Lwt.map Option.some wait;
+        Lwt.map (fun () -> None) proxy;
+      ] in
+      if n = 1 then Lwt.wakeup wake ();
+      if n = 2 then Lwt.cancel selected;
+      Lwt.catch (fun () -> Lwt.map (fun _ -> ()) selected) (function
+        | Lwt.Canceled when n = 2 -> Lwt.return_unit
+        | error -> Lwt.fail error)
+    in
+    Lwt.finalize
+      (fun () ->
+        let* () = Lwt_list.iter_s run [0; 1; 2] in
+        Gc.full_major ();
+        Gc.full_major ();
+        Lwt.return (List.for_all (fun n -> not (Weak.check proxies n)) [0; 1; 2]
+          && Conn.is_connected conn
+          && Lwt.state conn.closed = Lwt.Sleep))
+      (fun () -> Conn.close conn))
+
 let () =
   require (Lwt_main.run (preauth_refusal ())) "pre-auth payload accepted";
   require (Lwt_main.run (accept_refusal ())) "accept path payload accepted";
@@ -226,4 +364,11 @@ let () =
       = Some "invalid_frame_handshake")
     "pre-auth payload refusal is unscored";
   require (timeout_ban ()) "handshake timeout ban is absent";
-  Printf.printf "p2p_preauth = pass cases = 10\n%!"
+  require (Lwt_main.run (close_waiters ())) "closed peer retains pending sender";
+  require (Lwt_main.run (close_idle ())) "closed peer retains idle writer";
+  require (Lwt_main.run (write_idle ())) "idle write did not close cleanly";
+  require (Lwt_main.run (Lwt_unix.with_timeout 10.0 write_progress))
+    "write progress did not renew the interval";
+  require (Lwt_main.run (write_interval ())) "invalid write interval accepted";
+  require (Lwt_main.run (wait_release ())) "peer queue retained completed waits";
+  Printf.printf "p2p_preauth = pass cases = 16\n%!"

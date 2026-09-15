@@ -4,12 +4,26 @@
 type t = {
   budgets : Resource_lanes.lane -> Resource_lanes.budget;
   receipts : Preverify_receipt.t list;
+  artifacts : (string * Private_ledger.private_artifact) list;
+  keys : (string * Private_ledger.key_switch_artifact) list;
 }
 
-let create ?(budgets=Resource_lanes.default_budget) receipts = {
+let create ?(budgets = Resource_lanes.default_budget) receipts = {
   budgets;
   receipts;
+  artifacts = [];
+  keys = [];
 }
+
+let with_artifacts artifacts gate = { gate with artifacts }
+
+let artifact_for_tx gate tx =
+  List.assoc_opt (Transaction.hash tx) gate.artifacts
+
+let with_keys keys gate = { gate with keys }
+
+let key_for_tx gate tx =
+  List.assoc_opt (Transaction.hash tx) gate.keys
 
 let same_cost a b =
   a.Resource_lanes.txs = b.Resource_lanes.txs

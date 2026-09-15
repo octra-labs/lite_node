@@ -23,6 +23,8 @@ let status_path = "/octra.node.v1.Node/Status"
 let account_path = "/octra.node.v1.Node/Account"
 let transaction_path = "/octra.node.v1.Node/Transaction"
 let epoch_path = "/octra.node.v1.Node/Epoch"
+let epochs_path = "/octra.node.v1.Node/Epochs"
+let submit_path = "/octra.node.v1.Node/Submit"
 
 let paths = [
   health_path;
@@ -30,6 +32,8 @@ let paths = [
   account_path;
   transaction_path;
   epoch_path;
+  epochs_path;
+  submit_path;
 ]
 
 let map result make =
@@ -53,6 +57,12 @@ let decode path payload =
     map
       (Grpc_proto.decode_epoch payload)
       (fun epoch -> Rpc ("epoch_get", `List [`Int epoch]))
+  | path when path = epochs_path ->
+    map (Grpc_proto.decode_page payload)
+      (fun request -> Rpc ("octra_epochPage", Epoch_page.request_json request))
+  | path when path = submit_path ->
+    map (Grpc_proto.decode_submit payload)
+      (fun transaction -> Rpc ("octra_submit", `List [transaction]))
   | _ -> Error "gRPC method is not implemented"
 
 let reply ?body ?rpc_method status =
@@ -67,10 +77,12 @@ let health service =
   else
     reply (Grpc_status.make Grpc_status.Not_found "service is not registered")
 
-let rpc_request method_ params =
-  Rpc.{ jsonrpc = "2.0"; method_; params; id = `Null }
-
-let invoke ~call ~meta ~path payload =
+let invoke ?submit ~call ~meta ~path payload =
+  let selected = if path = submit_path then submit else Some call in
+  match selected with
+  | None ->
+    Lwt.return (reply (Grpc_status.make Grpc_status.Unimplemented "submission is disabled"))
+  | Some call ->
   match decode path payload with
   | Error message ->
     let code =
@@ -82,16 +94,28 @@ let invoke ~call ~meta ~path payload =
     Lwt.return (health service)
   | Ok (Rpc (method_, params)) ->
     let open Lwt.Syntax in
-    let* response = call meta (rpc_request method_ params) in
+    let* response =
+      match Rpc.parse_single (`Assoc [
+        "jsonrpc", `String "2.0";
+        "method", `String method_;
+        "params", params;
+        "id", `Null;
+      ]) with
+      | Ok request -> call meta request
+      | Error error -> Lwt.return (Rpc.Error_ (error, `Null))
+    in
     begin
       match response with
       | Rpc.Result (result, _) ->
-        let json = Yojson.Safe.to_string result in
-        Lwt.return
-          (reply
-             ~body:(Grpc_proto.encode_json json)
-             ~rpc_method:method_
-             Grpc_status.ok)
+        let body =
+          if path = epochs_path then
+            Result.map Grpc_proto.encode_page (Epoch_page.of_json result)
+          else Ok (Grpc_proto.encode_json (Yojson.Safe.to_string result))
+        in
+        Lwt.return (match body with
+          | Ok body -> reply ~body ~rpc_method:method_ Grpc_status.ok
+          | Error message -> reply ~rpc_method:method_
+              (Grpc_status.make Grpc_status.Internal message))
       | Rpc.Error_ (error, _) ->
         Lwt.return
           (reply

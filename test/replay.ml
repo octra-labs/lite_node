@@ -103,8 +103,9 @@ let write output value =
   flush output;
   Unix.fsync (Unix.descr_of_out_channel output)
 
-let run ~data ~cert_path ~range_path ~output =
+let run ~data ~cert_path ~range_paths ~output =
   let open Lwt.Syntax in
+  let pages = R.Input.prepare range_paths in
   let cert, trust, worker_hash = prepare cert_path in
   let checkpoint = cert.Manifest.checkpoint in
   let chain_id = checkpoint.chain_id in
@@ -158,11 +159,6 @@ let run ~data ~cert_path ~range_path ~output =
         eic = some "epoch index" head.epoch_index_root;
         txid = Int64.succ head.txid_hi;
       } in
-      let raw = read range_path (64 * 1024 * 1024) in
-      let records = match J.parse_range ~from_epoch:cursor.epoch (Yojson.Safe.from_string raw) with
-        | J.Records (_ :: _ as records) -> records
-        | _ -> failwith "replay range is empty or unavailable"
-      in
       let rec loop cursor count = function
         | [] -> Lwt.return (cursor, count)
         | (record : J.record) :: rest ->
@@ -185,17 +181,31 @@ let run ~data ~cert_path ~range_path ~output =
           Printf.printf "event = replay_epoch status = verified epoch = %Ld\n%!" trace.epoch;
           loop prepared.next_cursor (count + 1) rest
       in
+      let rec ranges cursor count = function
+        | [] -> Lwt.return (cursor, count)
+        | page :: rest ->
+          let records =
+            R.Input.read page |> Yojson.Safe.from_string
+            |> J.parse_range ~from_epoch:cursor.J.epoch
+          in
+          begin match records with
+          | J.Records (_ :: _ as records) ->
+            let* cursor, count = loop cursor count records in
+            ranges cursor count rest
+          | _ -> Lwt.fail_with "replay range is empty or unavailable"
+          end
+      in
       write output (`Assoc [
         "event", `String "start";
         "scope", `String "ledger_execution";
         "manifest", `String cert.manifest_hash;
-        "range_sha256", `String (digest raw);
+        "range_sha256", `String (R.Input.hash pages);
         "environment_sha256", `String (environment ());
         "binary_sha256", `String (file_digest Sys.executable_name);
         "worker_sha256", `String worker_hash;
         "first_epoch", `String (Int64.to_string cursor.epoch);
       ]);
-      let* final, count = loop cursor 0 records in
+      let* final, count = ranges cursor 0 pages in
       write output (`Assoc [
         "event", `String "complete";
         "epochs", `Int count;
@@ -208,18 +218,18 @@ let run ~data ~cert_path ~range_path ~output =
 
 let () =
   try
-    match Sys.argv with
-    | [| _; "--check"; cert_path |] ->
+    match Array.to_list Sys.argv with
+    | [_; "--check"; cert_path] ->
       let cert, _, worker_hash = prepare cert_path in
       Printf.printf "event = replay_check status = pass manifest = %s worker_sha256 = %s\n%!"
         cert.Manifest.manifest_hash worker_hash
-    | [| _; data; cert_path; range_path; output_path |] ->
+    | _ :: data :: cert_path :: range_path :: output_path :: more ->
       let descriptor = Unix.openfile output_path
         [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL] 0o600 in
       let output = Unix.out_channel_of_descr descriptor in
       Fun.protect ~finally:(fun () -> close_out_noerr output) (fun () ->
-        Lwt_main.run (run ~data ~cert_path ~range_path ~output))
-    | _ -> failwith "usage: replay DATA_COPY CERTIFICATE RANGE OUTPUT | replay --check CERTIFICATE"
+        Lwt_main.run (run ~data ~cert_path ~range_paths:(range_path :: more) ~output))
+    | _ -> failwith "usage: replay DATA_COPY CERTIFICATE RANGE OUTPUT [RANGE ...] | replay --check CERTIFICATE"
   with error ->
     Printf.eprintf "event = replay status = fail reason = %s\n%!" (Printexc.to_string error);
     exit 1

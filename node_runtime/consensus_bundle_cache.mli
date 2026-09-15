@@ -26,6 +26,8 @@ type stats = {
   evictions : int;
   cache_size : int;
   fifo_size : int;
+  preverify_size : int;
+  preverify_queue : int;
 }
 
 type cached =

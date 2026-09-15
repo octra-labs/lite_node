@@ -29,6 +29,7 @@ type balance_plan = {
 
 type key_switch_plan = {
   old_key_hash : string;
+  old_pubkey : string option;
   new_key_hash : string;
   new_pubkey : string;
   new_cipher : string option;

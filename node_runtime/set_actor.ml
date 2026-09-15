@@ -19,6 +19,10 @@ type sample = {
   bonded : bool;
 }
 
+type point = { epoch : int64; head : int64 option; finalized : bool }
+
+type refusal = Moved | Uncommitted | Finalized
+
 type stats = {
   queued : int;
   appeals : int;
@@ -29,7 +33,7 @@ type stats = {
 type deps = {
   sample : unit -> sample;
   peers : unit -> int;
-  send : action -> (unit, string) result Lwt.t;
+  send : epoch:int64 -> action -> (unit, string) result Lwt.t;
   warn : string -> unit;
 }
 
@@ -87,6 +91,19 @@ let lifetime = 120.0
 let pulse_step =
   let half = Int64.div Octra_core.Set_fold.standard.pulse_gap 2L in
   if Int64.compare half 1L < 0 then 1L else half
+
+let plan ~epoch (point : point) =
+  if not (Int64.equal epoch point.epoch) then Error Moved
+  else if epoch <= 0L then Error Uncommitted
+  else match point.head with
+    | Some head when head = Int64.pred epoch ->
+      if point.finalized then Error Finalized else Ok head
+    | _ -> Error Uncommitted
+
+let reason = function
+  | Moved -> "validator duty epoch changed"
+  | Uncommitted -> "validator duty head is not committed"
+  | Finalized -> "validator duty epoch is already finalized"
 
 let empty = {
   appeals = String_map.empty;
@@ -223,7 +240,7 @@ let handle_notice t notice =
     t.deps.warn "validator set fold transport has no peers";
     Lwt.return_unit
   | Some (key, action) ->
-    let* result = t.deps.send action in
+    let* result = t.deps.send ~epoch:sample.epoch action in
     begin
       match result with
       | Ok () ->

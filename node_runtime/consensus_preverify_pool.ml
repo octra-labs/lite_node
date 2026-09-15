@@ -109,6 +109,14 @@ let log_lookup tx status =
     (Transaction.op_type_to_string tx.Transaction.op_type)
     status
 
+let artifact t tx =
+  match Hashtbl.find_opt t.entries (Transaction.hash tx) with
+  | Some (Complete { completion = Verified artifact; _ }) -> Some artifact
+  | Some (Complete { completion = Rejected _; _ })
+  | Some (Queued _)
+  | Some (Running _)
+  | None -> None
+
 let wake_queued queued =
   if Lwt.is_sleeping queued.activated then
     Lwt.wakeup_later queued.activate ()

@@ -44,6 +44,7 @@ type balance_plan = {
 
 type key_switch_plan = {
   old_key_hash : string;
+  old_pubkey : string option;
   new_key_hash : string;
   new_pubkey : string;
   new_cipher : string option;
@@ -52,7 +53,7 @@ type key_switch_plan = {
 
 type key_switch_source = {
   source_cipher : string;
-  source_key_hash : string;
+  source_pubkey : string option;
   source_fields : field_policy;
   source_strict : bool;
 }
@@ -62,12 +63,18 @@ type key_switch_snapshot = {
   snapshot_pubkey : string option;
 }
 
+type key_switch_entry = {
+  plan : key_switch_plan;
+  source : key_switch_snapshot option;
+}
+
 type key_switch_artifact =
   | Verified_key_switch of {
       artifact_tx_hash : string;
       artifact_fields : field_policy;
       artifact_strict : bool;
       artifact_plan : key_switch_plan;
+      artifact_snapshot : key_switch_snapshot;
     }
   | Rejected_key_switch of {
       artifact_tx_hash : string;
@@ -95,7 +102,7 @@ type private_source = {
   source_tx_hash : string;
   source_op : private_op;
   source_account : private_account;
-  source_key_hash : string option;
+  source_pubkey : string option;
   source_claim : private_claim;
   source_policy : Private_result_policy.t;
   source_fields : field_policy;
@@ -105,7 +112,7 @@ type private_source = {
 
 let key_switch_cache_cap = 32
 
-let key_switch_cache : (string, key_switch_plan) Hashtbl.t =
+let key_switch_cache : (string, key_switch_entry) Hashtbl.t =
   Hashtbl.create key_switch_cache_cap
 
 let key_switch_cache_key field_policy strict ledger tx =
@@ -120,13 +127,13 @@ let key_switch_cache_key field_policy strict ledger tx =
      ^ ":"
      ^ string_of_bool strict)
 
-let remember_key_switch_plan key plan =
+let remember_key_switch_plan ?source key plan =
   if
     not (Hashtbl.mem key_switch_cache key)
     && Hashtbl.length key_switch_cache >= key_switch_cache_cap
   then
     Hashtbl.reset key_switch_cache;
-  Hashtbl.replace key_switch_cache key plan
+  Hashtbl.replace key_switch_cache key { plan; source }
 
 type key_switch_apply = {
   old_key_hash : string;
@@ -692,14 +699,13 @@ let private_source ~field_policy ~strict ~result_policy ledger tx =
          "private artifact operation is not supported")
   | Some source_op ->
     let source_account = private_account ledger tx.T.from in
-    let* source_key = Ledger.get_pvac_pubkey ledger tx.T.from in
-    let source_key_hash = Option.map PR.key_hash source_key in
+    let* source_pubkey = Ledger.get_pvac_pubkey ledger tx.T.from in
     let* source_claim = private_claim_source field_policy ledger tx in
     Lwt.return_ok {
       source_tx_hash = T.hash tx;
       source_op;
       source_account;
-      source_key_hash;
+      source_pubkey;
       source_claim;
       source_policy = result_policy;
       source_fields = field_policy;
@@ -711,7 +717,7 @@ let private_source_equal left right =
   String.equal left.source_tx_hash right.source_tx_hash
   && left.source_op = right.source_op
   && left.source_account = right.source_account
-  && left.source_key_hash = right.source_key_hash
+  && Option.equal String.equal left.source_pubkey right.source_pubkey
   && left.source_claim = right.source_claim
   && left.source_policy = right.source_policy
   && left.source_fields = right.source_fields
@@ -744,6 +750,10 @@ let load_key_switch_snapshot ledger tx =
   | Ok snapshot_cipher ->
     let* snapshot_pubkey = Ledger.get_pvac_pubkey ledger tx.T.from in
     Lwt.return_ok { snapshot_cipher; snapshot_pubkey }
+
+let key_source_equal left right =
+  String.equal left.snapshot_cipher right.snapshot_cipher
+  && Option.equal String.equal left.snapshot_pubkey right.snapshot_pubkey
 
 let load_pk_blob ledger addr tag op =
   let open Lwt.Syntax in
@@ -1220,9 +1230,10 @@ let verify_legacy_zero_reset ~strict new_pubkey payload =
       Lwt.return_error
         "legacy zero reset requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
 
-let key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey ~new_cipher
+let key_switch_value ~old_pubkey ~new_key_hash ~new_pubkey ~new_cipher
     ~source_cipher =
-  Ok { old_key_hash; new_key_hash; new_pubkey; new_cipher; source_cipher }
+  let old_key_hash = key_hash_of_pubkey old_pubkey in
+  Ok { old_key_hash; old_pubkey; new_key_hash; new_pubkey; new_cipher; source_cipher }
 
 let verify_new_key new_pubkey label verify =
   let open Lwt.Syntax in
@@ -1463,7 +1474,6 @@ let verify_key_switch_plan
             | Some value -> Lwt.return value.snapshot_pubkey
             | None -> Ledger.get_pvac_pubkey ledger tx.T.from
           in
-          let old_key_hash = key_hash_of_pubkey old_pk in
           let new_key_hash = PR.key_hash new_pubkey in
           let current =
             match snapshot with
@@ -1473,6 +1483,11 @@ let verify_key_switch_plan
           match current with
           | Error e -> Lwt.return (Error e)
           | Ok current_cipher ->
+            let source = {
+              snapshot_cipher = current_cipher;
+              snapshot_pubkey = old_pk;
+            } in
+            let* result =
             let* migration_status =
               Proof_pool.run
                 ~priority:worker_priority
@@ -1488,7 +1503,7 @@ let verify_key_switch_plan
               Lwt.return (error "key_switch_rejected" "legacy zero reset requires a legacy hfhe balance")
             else if PM.can_key_switch migration_status then
               Lwt.return
-                (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                (key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
                   ~new_cipher:None ~source_cipher:current_cipher)
             else if PM.needs_history_migration migration_status then
               if payload.migration = Verified_zero_reset then
@@ -1500,7 +1515,7 @@ let verify_key_switch_plan
                 | Error e, _ -> Lwt.return (Error e)
                 | Ok (), Some new_cipher ->
                   Lwt.return
-                    (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                    (key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
                       ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
                 | Ok (), None ->
                   Lwt.return (error "key_switch_rejected" "legacy zero reset lost new cipher"))
@@ -1529,7 +1544,7 @@ let verify_key_switch_plan
                     | Ok new_cipher ->
                       Lwt.return
                         (key_switch_value
-                           ~old_key_hash
+                           ~old_pubkey:old_pk
                            ~new_key_hash
                            ~new_pubkey
                            ~new_cipher:(Some new_cipher)
@@ -1552,7 +1567,7 @@ let verify_key_switch_plan
                   | Error e, _ -> Lwt.return (Error e)
                   | Ok (), Some new_cipher ->
                     Lwt.return
-                      (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                      (key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
                         ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
                   | Ok (), None ->
                     Lwt.return (error "key_switch_rejected" "legacy commitment migration lost new cipher")))
@@ -1577,7 +1592,7 @@ let verify_key_switch_plan
                   | Error e, _ -> Lwt.return (Error e)
                   | Ok (), Some new_cipher ->
                     Lwt.return
-                      (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                      (key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
                         ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher)
                   | Ok (), None ->
                     Lwt.return (error "key_switch_rejected" "legacy public migration lost new cipher"))
@@ -1652,12 +1667,14 @@ let verify_key_switch_plan
                     | Error e -> Lwt.return (Error e)
                     | Ok () ->
                       Lwt.return
-                        (key_switch_value ~old_key_hash ~new_key_hash ~new_pubkey
+                        (key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
                           ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher))
                 | _ ->
                   Lwt.return
                     (error "key_switch_rejected"
                       "encrypted balance migration requires new_cipher, old_zero_proof, new_zero_proof and amount_commitment"))
+            in
+            Lwt.return (Result.map (fun plan -> plan, source) result)
     end
 
 let prepare_key_switch_plan_uncached ~cap field_policy ledger tx =
@@ -1743,6 +1760,7 @@ let prepare_key_switch_plan_uncached ~cap field_policy ledger tx =
                (fun new_cipher ->
                  {
                    old_key_hash;
+                   old_pubkey = old_pk;
                    new_key_hash;
                    new_pubkey;
                    new_cipher;
@@ -1762,7 +1780,7 @@ let prepare_key_switch_plan
   else
     let* key = key_switch_cache_key field_policy cap ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
-    | Some plan -> Lwt.return_ok plan
+    | Some entry -> Lwt.return_ok entry.plan
     | None -> prepare_key_switch_plan_uncached ~cap field_policy ledger tx
 
 let key_switch_plan
@@ -1779,25 +1797,48 @@ let key_switch_plan
       let* key = key_switch_cache_key field_policy strict ledger tx in
       Lwt.return_some key
   in
-  let* result =
-    verify_key_switch_plan
-      ~field_policy
-      ~strict
-      ?legacy_public_replay
-      ledger
-      tx
+  let* cached =
+    match strict, cache_key with
+    | true, Some key ->
+      begin
+        match Hashtbl.find_opt key_switch_cache key with
+        | Some { plan; source = Some source } ->
+          let* current = load_key_switch_snapshot ledger tx in
+          Lwt.return
+            (match current with
+             | Ok current when key_source_equal source current -> Some plan
+             | Ok _ | Error _ -> None)
+        | Some { source = None; _ } | None -> Lwt.return_none
+      end
+    | false, _ | true, None -> Lwt.return_none
   in
-  match result with
-  | Error _ -> Lwt.return result
-  | Ok plan ->
-    begin
-      match cache_key with
-      | None -> Lwt.return result
-      | Some key ->
-        let* current = key_switch_cache_key field_policy strict ledger tx in
-        if String.equal key current then remember_key_switch_plan key plan;
-        Lwt.return result
-    end
+  match cached with
+  | Some plan -> Lwt.return_ok plan
+  | None ->
+    let* result =
+      verify_key_switch_plan
+        ~field_policy
+        ~strict
+        ?legacy_public_replay
+        ledger
+        tx
+    in
+    match result with
+    | Error error -> Lwt.return_error error
+    | Ok (plan, source) ->
+      let* () =
+        match cache_key with
+        | None -> Lwt.return_unit
+        | Some key ->
+          let* current = key_switch_cache_key field_policy strict ledger tx in
+          if not (String.equal key current) then Lwt.return_unit
+          else begin
+            let source = if strict then Some source else None in
+            remember_key_switch_plan ?source key plan;
+            Lwt.return_unit
+          end
+      in
+      Lwt.return_ok plan
 
 let preverify_key_switch_artifact
     ~field_policy
@@ -1818,7 +1859,7 @@ let preverify_key_switch_artifact
     | Ok snapshot ->
       let artifact_source = {
         source_cipher = snapshot.snapshot_cipher;
-        source_key_hash = key_hash_of_pubkey snapshot.snapshot_pubkey;
+        source_pubkey = snapshot.snapshot_pubkey;
         source_fields = field_policy;
         source_strict = strict;
       } in
@@ -1834,13 +1875,14 @@ let preverify_key_switch_artifact
       in
       begin
         match result with
-        | Ok artifact_plan ->
+        | Ok (artifact_plan, artifact_snapshot) ->
           Lwt.return_ok
             (Verified_key_switch {
                artifact_tx_hash;
                artifact_fields = field_policy;
                artifact_strict = strict;
                artifact_plan;
+               artifact_snapshot;
              })
         | Error artifact_failure when
             key_switch_failure_retryable artifact_failure ->
@@ -1879,7 +1921,6 @@ let bind_key_switch_artifact
     | Error _ -> Lwt.return Key_switch_source_changed
     | Ok snapshot ->
       let current_cipher = snapshot.snapshot_cipher in
-      let current_key_hash = key_hash_of_pubkey snapshot.snapshot_pubkey in
       begin
         match artifact with
         | Verified_key_switch verified ->
@@ -1888,12 +1929,15 @@ let bind_key_switch_artifact
             verified.artifact_fields = field_policy
             && Bool.equal verified.artifact_strict strict
             && String.equal current_cipher plan.source_cipher
-            && String.equal current_key_hash plan.old_key_hash
+            && key_source_equal snapshot verified.artifact_snapshot
           then begin
-            let* cache_key =
-              key_switch_cache_key field_policy strict ledger tx
+            let* () =
+              if strict then Lwt.return_unit
+              else
+                let* key = key_switch_cache_key field_policy strict ledger tx in
+                remember_key_switch_plan key plan;
+                Lwt.return_unit
             in
-            remember_key_switch_plan cache_key plan;
             Lwt.return (Key_switch_bound (Prepared_key_switch plan))
           end
           else
@@ -1903,9 +1947,9 @@ let bind_key_switch_artifact
             rejected.artifact_source.source_fields = field_policy
             && Bool.equal rejected.artifact_source.source_strict strict
             && String.equal current_cipher rejected.artifact_source.source_cipher
-            && String.equal
-                 current_key_hash
-                 rejected.artifact_source.source_key_hash
+            && Option.equal String.equal
+                 snapshot.snapshot_pubkey
+                 rejected.artifact_source.source_pubkey
           then
             Lwt.return
               (Key_switch_artifact_invalid rejected.artifact_failure)
@@ -1920,12 +1964,12 @@ let key_switch_plan_for_apply
     ledger
     tx =
   let open Lwt.Syntax in
-  if key_switch_requests_legacy_audit ~field_policy tx then
+  if strict || key_switch_requests_legacy_audit ~field_policy tx then
     key_switch_plan ~field_policy ~strict ?legacy_public_replay ledger tx
   else
     let* key = key_switch_cache_key field_policy strict ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
-    | Some plan -> Lwt.return_ok plan
+    | Some entry -> Lwt.return_ok entry.plan
     | None ->
       key_switch_plan ~field_policy ~strict ?legacy_public_replay ledger tx
 
@@ -2552,9 +2596,7 @@ let key_switch_current ledger tx (plan : key_switch_plan) =
      | Error _ -> false
      | Ok source ->
        String.equal source.snapshot_cipher plan.source_cipher
-       && String.equal
-            (key_hash_of_pubkey source.snapshot_pubkey)
-            plan.old_key_hash)
+       && Option.equal String.equal source.snapshot_pubkey plan.old_pubkey)
 
 let claim_current ~field_policy ~cap ledger tx claim balance =
   let open Lwt.Syntax in

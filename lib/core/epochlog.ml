@@ -483,3 +483,27 @@ let get t epoch_id =
     end
   end else
     None
+
+let read_entry t ~max_bytes epoch_id =
+  if max_bytes < 0 then Error `Limit
+  else
+    match Hashtbl.find_opt t.offsets epoch_id with
+    | None -> Ok None
+    | Some offset ->
+      try
+        ignore (Unix.lseek t.fd offset Unix.SEEK_SET);
+        let prefix = Bytes.create 4 in
+        if not (read_exact t.fd prefix 0 4) then Error `Invalid
+        else
+          let length = read_u32_le prefix 0 in
+          let remaining = (Unix.fstat t.fd).Unix.st_size - offset - 4 in
+          if not (record_length_valid ~remaining length) then Error `Invalid
+          else if length - 4 > max_bytes then Error `Limit
+          else
+            let bytes = Bytes.create length in
+            if not (read_exact t.fd bytes 0 length) then Error `Invalid
+            else
+              let payload = Bytes.sub_string bytes 0 (length - 4) in
+              if checksum payload <> Bytes.sub_string bytes (length - 4) 4 then Error `Invalid
+              else Ok (Some payload)
+      with Unix.Unix_error _ -> Error `Io

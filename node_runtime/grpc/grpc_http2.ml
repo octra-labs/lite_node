@@ -40,7 +40,8 @@ let identity_encoding headers =
 
 let plain reqd status =
   Body.Reader.close (Reqd.request_body reqd);
-  Reqd.respond_with_string reqd (Response.create status) ""
+  Reqd.respond_with_string reqd (Response.create status) "";
+  Lwt.return_unit
 
 let body_length_ok request limit =
   match Request.body_length request with
@@ -106,10 +107,14 @@ let response_writer reqd =
 let send reqd writer body status =
   try
     Reqd.schedule_trailers reqd (Headers.of_list (Grpc_status.trailers status));
-    Option.iter
-      (fun value -> Body.Writer.write_string writer (Grpc_frame.encode value))
-      body;
-    Body.Writer.close writer;
+    begin match body with
+    | None -> Body.Writer.close writer
+    | Some value ->
+      Body.Writer.write_string writer (Grpc_frame.encode value);
+      Body.Writer.flush writer (function
+        | `Written when Reqd.response reqd <> None -> Body.Writer.close writer
+        | `Written | `Closed -> ())
+    end;
     Sent
   with
   | Failure message
@@ -135,9 +140,15 @@ let meta address body_bytes =
     rpc_body_bytes = body_bytes;
   }
 
-let run config call address request input =
+let request_limit config request =
+  if request.Request.target = Grpc_service.submit_path then
+    Option.value ~default:0 config.Grpc_config.submit_bytes
+  else config.Grpc_config.max_request_bytes
+
+let run config call submit address request input =
   let open Lwt.Syntax in
-  let* wire = read_body ~limit:(config.Grpc_config.max_request_bytes + 5) input in
+  let limit = request_limit config request in
+  let* wire = read_body ~limit:(limit + 5) input in
   match wire with
   | Error code ->
     Lwt.return
@@ -145,17 +156,18 @@ let run config call address request input =
          (Grpc_status.make code "request body exceeds limit"))
   | Ok wire ->
     begin
-      match Grpc_frame.decode ~max_message:config.max_request_bytes wire with
+      match Grpc_frame.decode ~max_message:limit wire with
       | Error error -> Lwt.return (Grpc_service.reply (frame_status error))
       | Ok payload ->
         Grpc_service.invoke
+          ?submit
           ~call
           ~meta:(meta address (String.length wire))
           ~path:request.Request.target
           payload
     end
 
-let run_limited config call address request input =
+let run_limited config call submit address request input =
   match
     Grpc_deadline.seconds
       ~default:config.Grpc_config.default_deadline_s
@@ -170,7 +182,7 @@ let run_limited config call address request input =
   | Ok deadline ->
     let work =
       Lwt.catch
-        (fun () -> run config call address request input)
+        (fun () -> run config call submit address request input)
         (function
           | Lwt.Canceled as canceled -> Lwt.fail canceled
           | _ ->
@@ -187,13 +199,19 @@ let run_limited config call address request input =
     in
     Lwt.pick [work; elapsed]
 
-let handle config call address reqd =
+let handle config call submit lock address reqd =
   let request = Reqd.request reqd in
   if request.Request.meth <> `POST then
     plain reqd `Method_not_allowed
   else if not (content_type request.headers) then
     plain reqd `Unsupported_media_type
-  else if not (body_length_ok request (config.Grpc_config.max_request_bytes + 5)) then begin
+  else if request.target = Grpc_service.submit_path && Option.is_none submit then begin
+    Body.Reader.close (Reqd.request_body reqd);
+    let writer = response_writer reqd in
+    ignore (send reqd writer None
+      (Grpc_status.make Grpc_status.Unimplemented "submission is disabled"));
+    Lwt.return_unit
+  end else if not (body_length_ok request (request_limit config request + 5)) then begin
     Body.Reader.close (Reqd.request_body reqd);
     let writer = response_writer reqd in
     ignore
@@ -201,7 +219,8 @@ let handle config call address reqd =
          reqd
          writer
          None
-         (Grpc_status.make Grpc_status.Resource_exhausted "request body exceeds limit"))
+         (Grpc_status.make Grpc_status.Resource_exhausted "request body exceeds limit"));
+    Lwt.return_unit
   end else if not (trailers_header request.headers) then begin
     Body.Reader.close (Reqd.request_body reqd);
     let writer = response_writer reqd in
@@ -210,7 +229,8 @@ let handle config call address reqd =
          reqd
          writer
          None
-         (Grpc_status.make Grpc_status.Invalid_argument "te header must include trailers"))
+         (Grpc_status.make Grpc_status.Invalid_argument "te header must include trailers"));
+    Lwt.return_unit
   end else if not (identity_encoding request.headers) then begin
     Body.Reader.close (Reqd.request_body reqd);
     let writer = response_writer reqd in
@@ -219,34 +239,44 @@ let handle config call address reqd =
          reqd
          writer
          None
-         (Grpc_status.make Grpc_status.Unimplemented "message encoding is not supported"))
+         (Grpc_status.make Grpc_status.Unimplemented "message encoding is not supported"));
+    Lwt.return_unit
   end else begin
     let writer = response_writer reqd in
-    Lwt.async (fun () ->
-      let started = Unix.gettimeofday () in
-      let open Lwt.Syntax in
-      let* reply = run_limited config call address request (Reqd.request_body reqd) in
-      let reply = limited_reply config reply in
-      let elapsed_ms = (Unix.gettimeofday () -. started) *. 1000.0 in
-      Log.trace
-        "grpc"
-        "event = call path = %s rpc = %s status = %d elapsed_ms = %.0f peer = %s"
-        request.target
-        (Option.value ~default:"none" reply.Grpc_service.rpc_method)
-        (Grpc_status.number reply.status.code)
-        elapsed_ms
-        (peer address);
-      begin
-        match send reqd writer reply.body reply.status with
-        | Sent -> ()
-        | Stream_closed ->
-          Log.trace
-            "grpc"
-            "event = response status = dropped reason = stream_closed path = %s peer = %s"
-            request.target
-            (peer address)
-      end;
-      Lwt.return_unit)
+    let started = Mtime_clock.elapsed_ns () in
+    let open Lwt.Syntax in
+    let work () = run_limited config call submit address request (Reqd.request_body reqd) in
+    let* reply =
+      if request.target <> Grpc_service.submit_path then work ()
+      else if Lwt_mutex.is_locked lock then begin
+        Body.Reader.close (Reqd.request_body reqd);
+        Lwt.return (Grpc_service.reply
+          (Grpc_status.make Grpc_status.Resource_exhausted "submission is busy"))
+      end else Lwt_mutex.with_lock lock work
+    in
+    let reply = limited_reply config reply in
+    let elapsed_ms =
+      Int64.to_float (Int64.sub (Mtime_clock.elapsed_ns ()) started) /. 1_000_000.
+    in
+    Log.trace
+      "grpc"
+      "event = call path = %s rpc = %s status = %d elapsed_ms = %.0f peer = %s"
+      request.target
+      (Option.value ~default:"none" reply.Grpc_service.rpc_method)
+      (Grpc_status.number reply.status.code)
+      elapsed_ms
+      (peer address);
+    begin
+      match send reqd writer reply.body reply.status with
+      | Sent -> ()
+      | Stream_closed ->
+        Log.trace
+          "grpc"
+          "event = response status = dropped reason = stream_closed path = %s peer = %s"
+          request.target
+          (peer address)
+    end;
+    Lwt.return_unit
   end
 
 let error_text = function
@@ -254,7 +284,14 @@ let error_text = function
   | `Internal_server_error -> "internal server error"
   | `Exn _ -> "connection error"
 
-let connection config call =
+type pending = {
+  reqd : Reqd.t;
+  ended : unit Lwt.t;
+  finish : unit Lwt.u;
+  job : unit Lwt.t;
+}
+
+let connection config call submit lock address socket =
   let h2_config = H2.Config.{
     default with
     request_body_buffer_size = 4096;
@@ -263,10 +300,46 @@ let connection config call =
     max_concurrent_streams = Int32.of_int config.Grpc_config.max_streams;
     initial_window_size = 65_535l;
   } in
-  let request_handler address reqd =
-    handle config call address reqd
+  let jobs = ref [] in
+  let advance () =
+    List.iter (fun pending ->
+      if Reqd.response pending.reqd = None && Lwt.is_sleeping pending.ended then
+        Lwt.wakeup pending.finish ()) !jobs
   in
-  let error_handler address ?request error start =
+  let request_handler reqd =
+    advance ();
+    if List.length !jobs >= config.max_streams then begin
+      Body.Reader.close (Reqd.request_body reqd);
+      let writer = response_writer reqd in
+      ignore (send reqd writer None
+        (Grpc_status.make Grpc_status.Resource_exhausted "connection request limit"))
+    end else begin
+      let ended, finish = Lwt.task () in
+      let job = Lwt.catch
+        (fun () ->
+          let open Lwt.Syntax in
+          let run =
+            let* () = handle config call submit lock address reqd in
+            let timeout =
+              let* () = Lwt_unix.sleep config.max_deadline_s in
+              Reqd.report_exn reqd (Failure "response delivery timeout");
+              Lwt.return_unit
+            in
+            Lwt.pick [ended; timeout]
+          in
+          Lwt.pick [run; ended])
+        (function
+          | Lwt.Canceled -> Lwt.return_unit
+          | exn -> Reqd.report_exn reqd exn; Lwt.return_unit)
+      in
+      jobs := { reqd; ended; finish; job } :: !jobs;
+      let remove _ = jobs := List.filter (fun current -> current.job != job) !jobs in
+      Lwt.on_any job remove remove;
+      advance ();
+      Lwt.async (fun () -> job)
+    end
+  in
+  let error_handler ?request error start =
     let path =
       match request with
       | None -> "none"
@@ -281,38 +354,144 @@ let connection config call =
     let writer = start Headers.empty in
     Body.Writer.close writer
   in
-  H2_lwt_unix.Server.create_connection_handler
-    ~config:h2_config
-    ~request_handler
-    ~error_handler
+  Lwt.finalize
+    (fun () -> Grpc_io.serve ~config:h2_config ~request_handler ~error_handler ~advance socket)
+    (fun () ->
+      let pending = !jobs in
+      jobs := [];
+      List.iter (fun pending -> Lwt.cancel pending.job) pending;
+      Lwt.return_unit)
 
 let pipe_signal = lazy (Sys.set_signal Sys.sigpipe Sys.Signal_ignore)
 
-let accept config ~call =
+let accept ?submit config ~call =
   Lazy.force pipe_signal;
-  connection config call
+  let submit = if Option.is_some config.Grpc_config.submit_bytes then submit else None in
+  let lock = Lwt_mutex.create () in
+  connection config call submit lock
 
-let start config ~call =
+external socket_codes : unit -> int list = "octra_accept_codes"
+
+let accept_codes = socket_codes ()
+
+let accept_delay attempt error =
+  let delay = min 1.0 (0.01 *. Float.of_int (1 lsl min 7 (max 0 attempt))) in
+  match error with
+  | Unix.Unix_error (Unix.EUNKNOWNERR code, _, _)
+      when List.mem code accept_codes -> Some delay
+  | Unix.Unix_error ((Unix.EINTR | Unix.EAGAIN | Unix.EWOULDBLOCK
+      | Unix.ECONNABORTED | Unix.ENETDOWN | Unix.ENETUNREACH
+      | Unix.EHOSTDOWN | Unix.EHOSTUNREACH
+      | Unix.ENOPROTOOPT | Unix.EOPNOTSUPP | Unix.EMFILE | Unix.ENFILE
+      | Unix.ENOBUFS | Unix.ENOMEM), _, _) ->
+    Some delay
+  | _ -> None
+
+let take_client ?(take = fun socket -> Lwt_unix.accept ~cloexec:true socket)
+    ?(sleep = Lwt_unix.sleep) socket =
+  let open Lwt.Syntax in
+  let rec next attempt =
+    let* result = Lwt.catch
+      (fun () -> Lwt.map Result.ok (take socket))
+      (fun error -> Lwt.return_error error)
+    in
+    match result with
+    | Ok client ->
+      if attempt > 0 then Log.info "grpc" "event = accept status = resumed";
+      Lwt.return client
+    | Error error ->
+      match accept_delay attempt error with
+      | None -> Lwt.fail error
+      | Some delay ->
+        if attempt = 0 then
+          Log.warn "grpc" "event = accept status = waiting reason = %s"
+            (Printexc.to_string error);
+        let* () = sleep delay in
+        next (min 7 (attempt + 1))
+  in
+  next 0
+
+let start ?submit ?socket config ~call =
   let address =
     Unix.ADDR_INET
       (Unix.inet_addr_of_string config.Grpc_config.host, config.port)
   in
   let open Lwt.Syntax in
-  let* server =
-    Lwt_io.establish_server_with_client_socket
-      ~backlog:128
-      address
-      (accept config ~call)
+  let socket = match socket with
+    | Some value -> value
+    | None -> Lwt_unix.socket (Unix.domain_of_sockaddr address) Unix.SOCK_STREAM 0
   in
-  Log.info
-    "grpc"
-    "event = listen host = %s port = %d streams = %d request_bytes = %d response_bytes = %d"
-    config.host
-    config.port
-    config.max_streams
-    config.max_request_bytes
-    config.max_response_bytes;
-  let forever, _ = Lwt.wait () in
+  let close socket =
+    if Lwt_unix.state socket = Lwt_unix.Closed then Lwt.return_unit
+    else Lwt_unix.close socket
+  in
+  let clients = ref [] in
+  let handle = accept ?submit config ~call in
+  let rec listen () =
+    let* client, address = take_client socket in
+    let* () =
+        if List.length !clients >= 128 then close client
+        else begin
+          let job = Lwt.catch
+            (fun () -> Lwt.finalize
+              (fun () ->
+                Lwt_unix.set_close_on_exec client;
+                handle address client)
+              (fun () -> close client))
+            (function
+              | Lwt.Canceled -> Lwt.return_unit
+              | error ->
+                Log.warn "grpc" "event = connection status = closed reason = %s"
+                  (Printexc.to_string error);
+                Lwt.return_unit)
+          in
+          clients := job :: !clients;
+          let remove _ = clients := List.filter (fun item -> item != job) !clients in
+          Lwt.on_any job remove remove;
+          Lwt.return_unit
+        end
+    in
+    let* () = Lwt.pause () in
+    listen ()
+  in
   Lwt.finalize
-    (fun () -> forever)
-    (fun () -> Lwt_io.shutdown_server server)
+    (fun () ->
+      Lwt_unix.set_close_on_exec socket;
+      Lwt_unix.setsockopt socket Unix.SO_REUSEADDR true;
+      let* () = Lwt_unix.bind socket address in
+      Lwt_unix.listen socket 128;
+      Log.info
+        "grpc"
+        "event = listen host = %s port = %d streams = %d request_bytes = %d response_bytes = %d submit_bytes = %d"
+        config.host
+        config.port
+        config.max_streams
+        config.max_request_bytes
+        config.max_response_bytes
+        (if Option.is_some submit then Option.value ~default:0 config.submit_bytes else 0);
+      listen ())
+    (fun () ->
+      let pending = !clients in
+      clients := [];
+      List.iter Lwt.cancel pending;
+      Lwt.finalize (fun () -> Lwt.join pending) (fun () -> close socket))
+
+let serve ?submit ?socket config ~call ~http =
+  let grpc =
+    Lwt.catch
+      (fun () -> start ?submit ?socket config ~call)
+      (function
+        | Lwt.Canceled as exn -> Lwt.fail exn
+        | exn ->
+          Log.error "grpc"
+            "event = listen status = unavailable host = %s port = %d reason = %s"
+            config.Grpc_config.host config.port (Printexc.to_string exn);
+          Lwt.return_unit)
+  in
+  Lwt.finalize
+    (fun () -> http)
+    (fun () ->
+      Lwt.cancel grpc;
+      Lwt.catch
+        (fun () -> grpc)
+        (function Lwt.Canceled -> Lwt.return_unit | exn -> Lwt.fail exn))

@@ -29,12 +29,19 @@ type stats = {
   evictions : int;
   cache_size : int;
   fifo_size : int;
+  preverify_size : int;
+  preverify_queue : int;
 }
 
 type cached =
   | Missing
   | Decode_error of string
   | Cached of decoded
+
+type check_job = {
+  ticket : unit ref;
+  result : Octra_core.Preverify_worker.checked Lwt.t;
+}
 
 type t = {
   cache : (string, encoded) Hashtbl.t;
@@ -46,8 +53,8 @@ type t = {
   shared_limit : int;
   mutable shared_bytes : int;
   frozen : (string, frozen) Hashtbl.t;
-  preverify : (string, Octra_core.Preverify_worker.checked Lwt.t) Hashtbl.t;
-  preverify_fifo : string Queue.t;
+  preverify : (string, check_job) Hashtbl.t;
+  preverify_fifo : (string * unit ref) Queue.t;
   mutable stores : int;
   mutable hits : int;
   mutable misses : int;
@@ -102,6 +109,8 @@ let stats t =
     evictions = t.evictions;
     cache_size = Hashtbl.length t.cache;
     fifo_size = Queue.length t.fifo;
+    preverify_size = Hashtbl.length t.preverify;
+    preverify_queue = Queue.length t.preverify_fifo;
   }
 
 let encode_txs txs =
@@ -258,9 +267,9 @@ let pid_label pid =
 
 let log_summary (stats : stats) =
   Octra_log.info "bundle_cache"
-    "summary stores = %d hits = %d misses = %d evictions = %d cache_size = %d fifo_size = %d"
+    "summary stores = %d hits = %d misses = %d evictions = %d cache_size = %d fifo_size = %d preverify_size = %d preverify_queue = %d"
     stats.stores stats.hits stats.misses stats.evictions
-    stats.cache_size stats.fifo_size
+    stats.cache_size stats.fifo_size stats.preverify_size stats.preverify_queue
 
 let store_with_log t ~pid ~tx_hashes ~txs ~receipts_json =
   match store t ~pid ~tx_hashes ~txs ~receipts_json with
@@ -349,12 +358,17 @@ let preverify_item_key ~purpose ~state_root ~tx_hash =
     "octra:consensus_preverify_item_cache:v1"
     (Buffer.contents buffer)
 
+let forget_preverify t key ticket =
+  match Hashtbl.find_opt t.preverify key with
+  | Some current when current.ticket == ticket -> Hashtbl.remove t.preverify key
+  | Some _ | None -> ()
+
 let evict_preverify t =
   let rec loop () =
-    if Hashtbl.length t.preverify > t.cap then
+    if Queue.length t.preverify_fifo > max 0 t.cap then
       match Queue.take_opt t.preverify_fifo with
-      | Some key ->
-        Hashtbl.remove t.preverify key;
+      | Some (key, ticket) ->
+        forget_preverify t key ticket;
         loop ()
       | None -> ()
   in
@@ -364,23 +378,18 @@ let run_preverify_item_once t ~purpose ~state_root ~tx_hash verify =
   let key = preverify_item_key ~purpose ~state_root ~tx_hash in
   match Hashtbl.find_opt t.preverify key with
   | Some job ->
-    Lwt.protected job
+    Lwt.protected job.result
   | None ->
+    let ticket = ref () in
     let job =
       try verify () with exn -> Lwt.fail exn
     in
-    Hashtbl.add t.preverify key job;
-    Queue.push key t.preverify_fifo;
+    Hashtbl.add t.preverify key { ticket; result = job };
+    Queue.push (key, ticket) t.preverify_fifo;
     Lwt.on_success job (fun checked ->
       if not (Octra_core.Preverify_worker.checked_cacheable checked) then
-        match Hashtbl.find_opt t.preverify key with
-        | Some current when current == job -> Hashtbl.remove t.preverify key
-        | Some _ | None -> ());
-    Lwt.on_failure job (fun _ ->
-      match Hashtbl.find_opt t.preverify key with
-      | Some current when current == job ->
-        Hashtbl.remove t.preverify key
-      | Some _ | None -> ());
+        forget_preverify t key ticket);
+    Lwt.on_failure job (fun _ -> forget_preverify t key ticket);
     evict_preverify t;
     Lwt.protected job
 

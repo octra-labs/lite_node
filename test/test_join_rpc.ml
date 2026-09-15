@@ -1407,7 +1407,67 @@ let test_catchup_sources_exhausted () =
   expect "missing range confirmations" (!ranges = 6);
   expect "missing range waits" (!sleeps = 4)
 
+let test_ready_params () =
+  let module R = Octra_node_runtime.Status_read_rpc in
+  let module P = Octra_core.Validator_ready_policy in
+  let pubkey = Base64.encode_exn (raw 'p') in
+  let chain_id = "octra-test" in
+  let config_hash = hex_of_raw (raw 'c') in
+  let snapshot : R.enrollment_snapshot = {
+    head_epoch = 1_503_093;
+    state_root = hex_of_raw (raw 'r');
+    chain_id;
+    config_hash;
+    candidate = Some {
+      Octra_core.Validator_admission.address = "oct_test";
+      pubkey = raw 'p';
+      bond = Z.of_int 1_000_000;
+      bonded_epoch = 1_501_965L;
+      ready_epoch = None;
+      exit_epoch = None;
+    };
+  } in
+  let read snapshot =
+    Lwt_main.run (R.validator_enrollment
+      ~snapshot ~validator_address:"oct_test" ~validator_pubkey:pubkey)
+  in
+  let value = match read (Ok snapshot) with
+    | Error _ -> fail "ready params response"
+    | Ok value -> value
+  in
+  let ready = Yojson.Safe.Util.member "ready" value in
+  let payload =
+    match Octra_core.Validator_registry.ready_payload_of_message
+      (Some (Yojson.Safe.to_string ready)) with
+    | Error _ -> fail "ready params parse"
+    | Ok payload -> payload
+  in
+  let claim : P.claim = {
+    chain_id = payload.chain_id;
+    config_hash = payload.config_hash;
+    catchup_head_epoch = payload.catchup_head_epoch;
+  } in
+  expect "ready params policy"
+    (P.validate ~runtime:{ chain_id; config_hash }
+       ~head_epoch:1_503_093L claim = Ok ());
+  expect "ready params old message"
+    (P.validate ~runtime:{ chain_id; config_hash }
+       ~head_epoch:1_503_093L
+       { chain_id = None; config_hash = None; catchup_head_epoch = None }
+     = Error "chain_id missing");
+  expect "ready params root" (payload.state_root = snapshot.state_root);
+  expect "ready params key" (payload.consensus_pubkey_b64 = pubkey);
+  expect "ready params head" (payload.head_epoch = 1_503_093L);
+  expect "ready params changed head"
+    (Result.is_error (P.validate ~runtime:{ chain_id; config_hash }
+       ~head_epoch:1_503_094L claim));
+  expect "ready params no snapshot" (Result.is_error (read (Error "head missing")));
+  let other = Option.map (fun (candidate : Octra_core.Validator_admission.candidate) ->
+    { candidate with Octra_core.Validator_admission.pubkey = raw 'q' }) snapshot.candidate in
+  expect "ready params identity" (Result.is_error (read (Ok { snapshot with candidate = other })))
+
 let () =
+  test_ready_params ();
   test_normalize_base ();
   test_http_get_json ();
   test_retry_delay ();

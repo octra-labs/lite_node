@@ -161,6 +161,41 @@ let resolve_plan t check ~verify ~prepare ~pack =
     | Error e -> Lwt.return_error e
     | Ok () -> Lwt.return_ok plan
 
+let verify_balance t tx verify =
+  let open Lwt.Syntax in
+  let artifact =
+    match t.proof_mode, t.preverify with
+    | Rule_graph.Active, Some gate -> Preverify_commit.artifact_for_tx gate tx
+    | _ -> None
+  in
+  let* plan =
+    match artifact with
+    | None -> Lwt.return_none
+    | Some artifact ->
+      let* binding =
+        P.bind_private_artifact
+          ~field_policy:t.field_policy
+          ~strict:true
+          ~result_policy:t.result_policy
+          t.ledger
+          tx
+          artifact
+      in
+      Lwt.return
+        (match tx.T.op_type, binding with
+         | T.EncryptOp, P.Private_bound (P.Prepared_encrypt plan)
+         | T.DecryptOp, P.Private_bound (P.Prepared_decrypt plan) -> Some plan
+         | _ -> None)
+  in
+  match plan with
+  | None -> verify ()
+  | Some plan ->
+    Octra_log.info "consensus"
+      "event = private_plan tx = %s op = %s status = reused"
+      (String.sub (T.hash tx) 0 12)
+      (T.op_type_to_string tx.T.op_type);
+    Lwt.return_ok plan
+
 let encrypt t tx =
   let open Lwt.Syntax in
   match self tx, cap "fhe_epoch_cap" t.fhe t.limits.max_fhe with
@@ -179,13 +214,13 @@ let encrypt t tx =
             resolve_plan
               t
               check
-              ~verify:(fun () ->
+              ~verify:(fun () -> verify_balance t tx (fun () ->
                 P.encrypt_plan
                   ~field_policy:t.field_policy
                   ~strict:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
                   t.ledger
-                  tx)
+                  tx))
               ~prepare:(fun () ->
                 P.prepare_encrypt_plan
                   ~field_policy:t.field_policy
@@ -236,13 +271,13 @@ let decrypt t tx =
             resolve_plan
               t
               check
-              ~verify:(fun () ->
+              ~verify:(fun () -> verify_balance t tx (fun () ->
                 P.decrypt_plan
                   ~field_policy:t.field_policy
                   ~strict:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
                   t.ledger
-                  tx)
+                  tx))
               ~prepare:(fun () ->
                 P.prepare_decrypt_plan
                   ~field_policy:t.field_policy
@@ -272,6 +307,40 @@ let decrypt t tx =
             Lwt.return_ok tx.T.ou
         end
     end
+
+let verify_key t tx replay =
+  let open Lwt.Syntax in
+  let artifact =
+    match t.proof_mode, t.preverify, replay with
+    | Rule_graph.Active, Some gate, None -> Preverify_commit.key_for_tx gate tx
+    | _ -> None
+  in
+  let* plan =
+    match artifact with
+    | None -> Lwt.return_none
+    | Some artifact ->
+      let* binding =
+        P.bind_key_switch_artifact
+          ~field_policy:t.field_policy
+          ~strict:true
+          t.ledger
+          tx
+          artifact
+      in
+      Lwt.return
+        (match binding with
+         | P.Key_switch_bound (P.Prepared_key_switch plan) -> Some plan
+         | _ -> None)
+  in
+  match plan with
+  | Some plan -> Lwt.return_ok plan
+  | None ->
+    P.key_switch_plan
+      ~field_policy:t.field_policy
+      ~strict:(t.proof_mode = Rule_graph.Active)
+      ?legacy_public_replay:replay
+      t.ledger
+      tx
 
 let key_switch t tx =
   let open Lwt.Syntax in
@@ -313,13 +382,7 @@ let key_switch t tx =
         resolve_plan
           t
           check
-          ~verify:(fun () ->
-            P.key_switch_plan
-              ~field_policy:t.field_policy
-              ~strict:(t.proof_mode = Rule_graph.Active)
-              ?legacy_public_replay:replay
-              t.ledger
-              tx)
+          ~verify:(fun () -> verify_key t tx replay)
           ~prepare:(fun () ->
             P.prepare_key_switch_plan
               ~field_policy:t.field_policy

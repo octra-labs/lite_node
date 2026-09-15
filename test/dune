@@ -110,6 +110,11 @@
  (libraries octra_core octra_node_runtime lwt.unix))
 
 (test
+ (name test_txlog)
+ (modules test_txlog)
+ (libraries octra_core unix))
+
+(test
  (name test_state_sync_reliability)
  (modules test_state_sync_reliability)
  (libraries octra_bootstrap octra_node_runtime unix))
@@ -118,6 +123,11 @@
  (name test_grpc)
  (modules test_grpc)
  (libraries octra_core octra_node_runtime lwt.unix yojson pbrt))
+
+(test
+ (name test_epoch_page)
+ (modules test_epoch_page)
+ (libraries octra_core octra_node_runtime lwt.unix yojson pbrt mtime.clock.os))
 
 (test
  (name test_grpc_http2)
@@ -226,3 +236,8 @@
  (name test_direct_exec)
  (modules test_direct_exec)
  (libraries octra_vm yojson zarith lwt lwt.unix))
+
+(test
+ (name test_set_actor)
+ (modules test_set_actor)
+ (libraries octra_node_runtime octra_core octra_consensus lwt.unix zarith))

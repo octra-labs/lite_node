@@ -3,6 +3,7 @@
 
 let max_frame_size = 10_000_000
 let default_read_timeout_s = 10.0
+let default_write_idle_s = 300.0
 
 let msg_hello = 0x01
 let msg_hello_ack = 0x02
@@ -191,13 +192,16 @@ let read_exact_raw fd n =
   let* () = loop 0 in
   Lwt.return (Bytes.unsafe_to_string buf)
 
-let write_all fd s =
+let write_all ?(idle_s = default_write_idle_s) fd s =
+  if not (Float.is_finite idle_s) || idle_s <= 0. then
+    invalid_arg "invalid write idle interval";
   let len = String.length s in
   let rec loop off =
     if off >= len then Lwt.return_unit
     else
       let open Lwt.Syntax in
-      let* count = Lwt_unix.write_string fd s off (len - off) in
+      let* count = Lwt_unix.with_timeout idle_s (fun () ->
+        Lwt_unix.write_string fd s off (len - off)) in
       if count = 0 then Lwt.fail (Failure "write_failed")
       else
         let* () = Lwt.pause () in
@@ -239,5 +243,5 @@ let read_frame
 let read_handshake_frame ?timeout_s fd =
   read_frame ?timeout_s ~payload_cap:handshake_payload_max fd
 
-let write_frame fd (f : frame) =
-  write_all fd (encode_frame f)
+let write_frame ?idle_s fd (f : frame) =
+  write_all ?idle_s fd (encode_frame f)

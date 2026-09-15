@@ -24,6 +24,12 @@ type deps = {
 }
 
 val node_backend :
+  ?private_artifacts:
+    (Octra_core.Transaction.t list ->
+     (string * Octra_core.Private_ledger.private_artifact) list) ->
+  ?key_artifacts:
+    (Octra_core.Transaction.t list ->
+     (string * Octra_core.Private_ledger.key_switch_artifact) list) ->
   program_trust:Octra_vm.Program_trust.t ->
   rules:Octra_core.Rule_graph.t ->
   legacy_replay:

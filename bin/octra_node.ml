@@ -530,6 +530,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok Rule_graph.Prior -> false
       | Error fault -> failwith (Rule_graph.fault_message fault)
     in
+    let key_switch_preverify =
+      Consensus_key_switch_preverify.create
+        ~field_policy:(fun () -> private_field_policy !current_epoch)
+        ~strict:(fun () -> private_proof_strict !current_epoch)
+        ledger
+    in
+    let private_preverify =
+      Consensus_private_preverify.create
+        ~field_policy:(fun () -> private_field_policy !current_epoch)
+        ~strict:(fun () -> private_proof_strict !current_epoch)
+        ~result_policy:(fun () -> private_result_policy !current_epoch)
+        ledger
+    in
     let bind_rule
         name
         (activation : Rule_graph.activation option)
@@ -876,7 +889,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           ~required:consensus_mode
           preverify_receipts_json
       with
-      | Ok gate -> gate
+      | Ok gate ->
+        Option.map
+          (fun gate ->
+            Octra_core.Preverify_commit.with_artifacts
+              (Consensus_private_preverify.artifacts private_preverify ordered_txs)
+              gate
+            |> Octra_core.Preverify_commit.with_keys
+                 (Consensus_key_switch_preverify.artifacts key_switch_preverify ordered_txs))
+          gate
       | Error reason ->
         failwith ("finalized preverify receipt parse failed: " ^ reason)
     in
@@ -1201,6 +1222,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           program_trust;
           backend =
             Consensus_proposal_preview_shell.node_backend
+              ~private_artifacts:
+                (Consensus_private_preverify.artifacts private_preverify)
+              ~key_artifacts:
+                (Consensus_key_switch_preverify.artifacts key_switch_preverify)
               ~program_trust
               ~rules
               ~legacy_replay
@@ -1279,19 +1304,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         rules;
         env = circle_preverify.env;
       }
-    in
-    let key_switch_preverify =
-      Consensus_key_switch_preverify.create
-        ~field_policy:(fun () -> private_field_policy !current_epoch)
-        ~strict:(fun () -> private_proof_strict !current_epoch)
-        ledger
-    in
-    let private_preverify =
-      Consensus_private_preverify.create
-        ~field_policy:(fun () -> private_field_policy !current_epoch)
-        ~strict:(fun () -> private_proof_strict !current_epoch)
-        ~result_policy:(fun () -> private_result_policy !current_epoch)
-        ledger
     in
     if consensus_mode then
       List.iter
@@ -1373,7 +1385,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           (Status_read_rpc.load_validator_enrollment
              ~store
              ~head:(Octra_core.Head_manifest.get_cached ())
-             ~validator_address:wallet.address)
+             ~validator_address:wallet.address
+             ~chain_id
+             ~config_hash:ready_config_hash)
       in
       enrollment_ref := result;
       result
@@ -1532,14 +1546,21 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 })
         end
     in
-    let send_fold action =
-      let open Lwt.Syntax in
+    let fold_point () =
       let epoch = !current_epoch in
-      if not (fold_enabled epoch) then
-        Lwt.return_error "validator set fold rule is not active"
-      else
-        let head_epoch = Int64.of_int (epoch - 1) in
-        let* state_root = ready_state_root_at (epoch - 1) in
+      let head =
+        match Octra_core.Head_manifest.get_cached () with
+        | None -> None
+        | Some head -> Some (Int64.of_int head.epoch_id)
+      in
+      Set_actor.{
+        epoch = Int64.of_int epoch;
+        head;
+        finalized = Consensus_finality_state.has_finalized finality_state epoch;
+      }
+    in
+    let send_fold ~epoch action =
+      let send ~head_epoch state_root =
         match state_root, Ledger.find_opt ledger wallet.address with
         | None, _ -> Lwt.return_error "validator set fold head root is unavailable"
         | _, None -> Lwt.return_error "validator set fold account is unavailable"
@@ -1576,6 +1597,18 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               Lwt.return_ok ()
             | Error error -> Lwt.return_error error
           end
+      in
+      if not (fold_enabled !current_epoch) then
+        Lwt.return_error "validator set fold rule is not active"
+      else
+        match Set_actor.plan ~epoch (fold_point ()) with
+        | Error reason -> Lwt.return_error (Set_actor.reason reason)
+        | Ok head_epoch ->
+          let open Lwt.Syntax in
+          let* state_root = ready_state_root_at (Int64.to_int head_epoch) in
+          match Set_actor.plan ~epoch (fold_point ()) with
+          | Error reason -> Lwt.return_error (Set_actor.reason reason)
+          | Ok _ -> send ~head_epoch state_root
     in
     let fold_actor =
       Set_actor.create Set_actor.{

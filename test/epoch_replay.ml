@@ -41,6 +41,55 @@ let get = function
 let require reason value =
   if not value then failwith reason
 
+module Input : sig
+  type t
+  val prepare : string list -> t list
+  val hash : t list -> string
+  val read : t -> string
+end = struct
+  type t = { path : string; sum : string }
+
+  let digest raw = Digestif.SHA256.(to_hex (digest_string raw))
+
+  let bytes path =
+    let descriptor = Unix.openfile path [Unix.O_RDONLY; Unix.O_NONBLOCK] 0 in
+    let channel, size =
+      try
+        let info = Unix.fstat descriptor in
+        require "replay input is not a regular file" (info.st_kind = Unix.S_REG);
+        require "replay input exceeds size limit"
+          (info.st_size >= 0 && info.st_size <= 64 * 1024 * 1024);
+        Unix.clear_nonblock descriptor;
+        Unix.in_channel_of_descr descriptor, info.st_size
+      with error -> Unix.close descriptor; raise error
+    in
+    Fun.protect ~finally:(fun () -> close_in_noerr channel) (fun () ->
+      let raw = really_input_string channel size in
+      require "replay input grew during read"
+        (input channel (Bytes.create 1) 0 1 = 0);
+      raw)
+
+  let prepare paths =
+    require "replay input count is invalid"
+      (paths <> [] && List.length paths <= 256);
+    let pages = List.map (fun path -> { path; sum = digest (bytes path) }) paths in
+    let sums = List.map (fun page -> page.sum) pages in
+    require "replay inputs repeat"
+      (List.length (List.sort_uniq String.compare sums) = List.length sums);
+    pages
+
+  let hash pages =
+    match List.map (fun page -> page.sum) pages with
+    | [] -> failwith "replay input count is invalid"
+    | [sum] -> sum
+    | sums -> digest ("octra:replay_ranges:v1\000" ^ String.concat "" sums)
+
+  let read page =
+    let raw = bytes page.path in
+    require "replay input changed after preparation" (digest raw = page.sum);
+    raw
+end
+
 let hashes txs = List.map T.hash txs
 
 let positions txs result =

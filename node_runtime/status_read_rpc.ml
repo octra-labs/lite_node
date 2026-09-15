@@ -12,6 +12,9 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
 type enrollment_snapshot = {
   head_epoch : int;
+  state_root : string;
+  chain_id : string;
+  config_hash : string;
   candidate : Octra_core.Validator_admission.candidate option;
 }
 
@@ -136,7 +139,7 @@ let validator_set_proof ~chain_id ~program_trust_hash
        ?scheduled
        validator_set)
 
-let load_validator_enrollment ~store ~head ~validator_address =
+let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_hash =
   let open Lwt.Syntax in
   match head with
   | None -> Lwt.return_error "committed head unavailable"
@@ -175,6 +178,9 @@ let load_validator_enrollment ~store ~head ~validator_address =
               | Ok registry ->
                 Lwt.return_ok {
                   head_epoch = head.epoch_id;
+                  state_root = head.state_root;
+                  chain_id;
+                  config_hash;
                   candidate =
                     Octra_core.Validator_registry.find
                       validator_address
@@ -194,12 +200,23 @@ let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
             error
             None))
   | Ok snapshot ->
+    let ready = `Assoc [
+      "consensus_pubkey", `String validator_pubkey;
+      "head_epoch", `String (string_of_int snapshot.head_epoch);
+      "state_root", `String snapshot.state_root;
+      "chain_id", `String snapshot.chain_id;
+      "config_hash", `String snapshot.config_hash;
+      "catchup_head_epoch", `String (string_of_int snapshot.head_epoch);
+    ] in
     Lwt.return
-      (Status_rpc.validator_enrollment
+      (Result.bind (Status_rpc.validator_enrollment
          ~head_epoch:snapshot.head_epoch
          ~address:validator_address
          ~pubkey:validator_pubkey
          snapshot.candidate)
+         (function
+           | `Assoc fields -> Ok (`Assoc (fields @ ["ready", ready]))
+           | _ -> Error (Octra_core.Rpc.err (-32000) "invalid enrollment result" None)))
 
 let runtime_version ~chain_id ~validator_address ~program_trust_hash
     ~runtime_profile_hash ~validator_set_ref ~scheduled_validator_set_ref =
@@ -415,6 +432,26 @@ let node_stats_params _params ctx =
 let node_metrics_params _params _ctx =
   ok (Metrics.get_metrics ())
 
+let epoch_page_params params ctx =
+  match Epoch_page.parse params with
+  | Error error -> Lwt.return (Error error)
+  | Ok request ->
+    let head = Option.map
+      (fun (head : Octra_core.Head_manifest.t) -> Epoch_page.{
+        chain = ctx.chain_id; epoch = head.epoch_id; root = head.state_root;
+      }) (Octra_core.Head_manifest.get_cached ())
+    in
+    let load ~max_bytes epoch =
+      Octra_core.Epochlog.read_entry ctx.chaindata.Store_chaindata.epochlog ~max_bytes epoch
+      |> Result.map_error (function
+        | `Limit -> Octra_core.Rpc.err 107 "epoch record exceeds read limit" None
+        | `Invalid -> Octra_core.Rpc.err (-32012) "epoch journal is inconsistent" None
+        | `Io -> Octra_core.Rpc.err (-32012) "epoch journal is unavailable" None)
+    in
+    let open Lwt.Syntax in
+    let+ page = Epoch_page.read ~head ~load request in
+    Result.map Epoch_page.json page
+
 let core_dispatch adapters =
   [
     "node_version", adapters.status_read node_version_params;
@@ -423,6 +460,7 @@ let core_dispatch adapters =
     "node_status", adapters.status_read node_status_params;
     "node_stats", adapters.status_read node_stats_params;
     "node_metrics", adapters.status_read node_metrics_params;
+    "octra_epochPage", adapters.status_read epoch_page_params;
   ]
 
 let proof_dispatch adapters =

@@ -42,9 +42,10 @@ const config = () => {
 };
 
 try {
-  requireValue(process.argv.length === 9,
-    "usage: replay_run.mjs BINARY WORKER DATA_COPY CERTIFICATE RANGE OUTPUT LABEL");
+  requireValue(process.argv.length >= 9 && process.argv.length <= 264,
+    "usage: replay_run.mjs BINARY WORKER DATA_COPY CERTIFICATE RANGE OUTPUT LABEL [RANGE ...]");
   const [binary, worker, data, certificate, range] = process.argv.slice(2, 7).map(local);
+  const more = process.argv.slice(9).map(local);
   const output = path.resolve(process.argv[7]);
   const label = process.argv[8];
   const work = path.join(root, "runtime_data", "replay", "work");
@@ -65,7 +66,7 @@ try {
     OCTRA_PVAC_VERIFY_WORKER: worker,
   };
   console.log("event = replay_run label = " + label + " mode = offline scope = ledger_execution");
-  const result = spawnSync(binary, [data, certificate, range, output],
+  const result = spawnSync(binary, [data, certificate, range, output, ...more],
     {cwd: root, env, stdio: "inherit", timeout: 60 * 60 * 1000});
   if (result.error) throw result.error;
   requireValue(result.status === 0, "replay executable failed status = " + result.status);

@@ -184,7 +184,74 @@ let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
   in
   outcome, !writes
 
+let input_cases () =
+  if not (Sys.file_exists "runtime_data") then Unix.mkdir "runtime_data" 0o700;
+  let root = Filename.concat "runtime_data"
+    ("replay_inputs_" ^ string_of_int (Unix.getpid ())) in
+  Unix.mkdir root 0o700;
+  let names = ["first"; "second"; "copy"; "large"; "pipe"] in
+  let path name = Filename.concat root name in
+  let count = ref 0 in
+  let check name value = expect name value; incr count in
+  let refused name reason action =
+    let result = try ignore (action ()); None with Failure value -> Some value in
+    check name (result = Some reason)
+  in
+  let write name flags raw =
+    let channel = open_out_gen flags 0o600 (path name) in
+    Fun.protect ~finally:(fun () -> close_out_noerr channel) (fun () ->
+      output_string channel raw)
+  in
+  let digest raw = Digestif.SHA256.(to_hex (digest_string raw)) in
+  Fun.protect ~finally:(fun () ->
+    List.iter (fun name ->
+      if Sys.file_exists (path name) then Unix.unlink (path name)) names;
+    Unix.rmdir root) (fun () ->
+    List.iter (fun (name, raw) ->
+      write name [Open_wronly; Open_creat; Open_excl; Open_binary] raw)
+      ["first", "alpha"; "second", "beta"; "copy", "alpha"];
+    let first = R.Input.prepare [path "first"] in
+    let pages = R.Input.prepare [path "first"; path "second"] in
+    check "single input hash retained" (R.Input.hash first = digest "alpha");
+    check "page digest binds ordered contents"
+      (R.Input.hash pages = digest
+        ("octra:replay_ranges:v1\000" ^ digest "alpha" ^ digest "beta"));
+    check "page order differs"
+      (R.Input.hash pages <> R.Input.hash (List.rev pages));
+    check "input paths are not identity"
+      (R.Input.hash first = R.Input.hash (R.Input.prepare [path "copy"]));
+    check "pages retain input bytes" (List.map R.Input.read pages = ["alpha"; "beta"]);
+    refused "repeated path" "replay inputs repeat"
+      (fun () -> R.Input.prepare [path "first"; path "first"]);
+    refused "repeated contents" "replay inputs repeat"
+      (fun () -> R.Input.prepare [path "first"; path "copy"]);
+    refused "empty input list" "replay input count is invalid"
+      (fun () -> R.Input.prepare []);
+    refused "empty input digest" "replay input count is invalid"
+      (fun () -> R.Input.hash []);
+    refused "input list limit" "replay input count is invalid"
+      (fun () -> R.Input.prepare (List.init 257 (fun _ -> path "first")));
+    refused "directory input" "replay input is not a regular file"
+      (fun () -> R.Input.prepare [root]);
+    Unix.mkfifo (path "pipe") 0o600;
+    refused "pipe input" "replay input is not a regular file"
+      (fun () -> R.Input.prepare [path "pipe"]);
+    let descriptor = Unix.openfile (path "large")
+      [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL] 0o600 in
+    Fun.protect ~finally:(fun () -> Unix.close descriptor) (fun () ->
+      Unix.ftruncate descriptor (64 * 1024 * 1024 + 1));
+    refused "input size limit" "replay input exceeds size limit"
+      (fun () -> R.Input.prepare [path "large"]);
+    write "first" [Open_wronly; Open_trunc; Open_binary] "other";
+    refused "same size input change" "replay input changed after preparation"
+      (fun () -> R.Input.read (List.hd first));
+    write "first" [Open_wronly; Open_trunc; Open_binary] "";
+    refused "shorter input change" "replay input changed after preparation"
+      (fun () -> R.Input.read (List.hd first));
+    !count)
+
 let () =
+  let inputs = input_cases () in
   let trace = match execute "" with
     | Ok trace, 1 -> trace
     | _ -> failwith "replay legitimate control failed"
@@ -246,4 +313,4 @@ let () =
   | _ -> failwith "rejection permutation accepted"
   end;
   Printf.printf "event = replay_checks status = pass cases = %d execution = sample preverify = sample\n"
-    (List.length faults + 11)
+    (List.length faults + 11 + inputs)

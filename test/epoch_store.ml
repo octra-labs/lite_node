@@ -99,6 +99,19 @@ let deps (context : context) ~(cursor : R.J.cursor)
   let field_policy =
     Octra_core.Private_ledger.field_policy_of_mode (rule G.private_payload)
   in
+  let key_pool =
+    N.Consensus_key_switch_preverify.create
+      ~field_policy:(fun () -> field_policy)
+      ~strict:(fun () -> proof_mode = G.Active)
+      context.ledger
+  in
+  let private_pool =
+    N.Consensus_private_preverify.create
+      ~field_policy:(fun () -> field_policy)
+      ~strict:(fun () -> proof_mode = G.Active)
+      ~result_policy:(fun () -> context.result_policy epoch)
+      context.ledger
+  in
   let limits =
     N.Startup_runtime_limits.private_limits {
       int_value = N.Env.int_value;
@@ -132,6 +145,8 @@ let deps (context : context) ~(cursor : R.J.cursor)
   in
   let preview =
     N.Consensus_proposal_preview_shell.node_backend
+      ~private_artifacts:(N.Consensus_private_preverify.artifacts private_pool)
+      ~key_artifacts:(N.Consensus_key_switch_preverify.artifacts key_pool)
       ~program_trust:context.trust
       ~rules:context.rules
       ~legacy_replay:context.legacy_replay
@@ -170,6 +185,10 @@ let deps (context : context) ~(cursor : R.J.cursor)
             } in
             let* batch =
               R.W.run_many
+                ~prepared:(fun tx ->
+                  if tx.R.T.op_type = R.T.KeySwitch then
+                    N.Consensus_key_switch_preverify.await key_pool tx
+                  else N.Consensus_private_preverify.await private_pool tx)
                 ~field_policy
                 ~strict:(proof_mode = G.Active)
                 ~ledger
@@ -194,6 +213,13 @@ let deps (context : context) ~(cursor : R.J.cursor)
         ~env
         ~txs);
     apply = (fun preverify current ->
+      let preverify =
+        Octra_core.Preverify_commit.with_artifacts
+          (N.Consensus_private_preverify.artifacts private_pool current.R.J.txs)
+          preverify
+        |> Octra_core.Preverify_commit.with_keys
+             (N.Consensus_key_switch_preverify.artifacts key_pool current.R.J.txs)
+      in
       R.require "replay apply preparation differs" (current = prepared);
       R.require "replay chaindata is read-only"
         (not context.chaindata.index.readonly);

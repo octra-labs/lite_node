@@ -2828,12 +2828,6 @@ let admit_current_proposal t ~route (p : C_types.propose) =
     | Some verdict ->
       clear_proposal_wait t p;
       let accepted = verdict = Proposal_accept in
-      let* () =
-        if accepted then
-          send_verified_proposal t route p
-        else
-          Lwt.return_unit
-      in
       if accepted && p.round > t.engine.state.round then
         defer_verified_proposal t p;
       ignore
@@ -2843,7 +2837,8 @@ let admit_current_proposal t ~route (p : C_types.propose) =
            ~verify_fn:(verify_engine_signature t)
            ~execute_fn:(fun _ -> accepted)
            ~sign_fn:t.config.sign_fn);
-      Lwt.return_unit
+      if accepted then send_verified_proposal t route p
+      else Lwt.return_unit
 
 let replay_waiting_proposal t =
   match t.proposal_wait with

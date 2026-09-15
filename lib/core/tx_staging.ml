@@ -457,6 +457,34 @@ let get_epoch_txs ~capacity =
     Z.zero
     []
 
+let ready_queue ~confirmed queue =
+  let rec take expected kept = function
+    | [] -> List.rev kept
+    | entry :: rest ->
+      let nonce = entry.tx.Transaction.nonce in
+      if nonce < expected then take expected kept rest
+      else if nonce > expected then List.rev kept
+      else if nonce = max_int then List.rev (entry :: kept)
+      else take (expected + 1) (entry :: kept) rest
+  in
+  if confirmed < 0 || confirmed = max_int then []
+  else take (confirmed + 1) [] queue
+
+let ready_epoch_txs ~capacity ~confirmed_nonce =
+  let queues =
+    sender_queues ()
+    |> Sender_queue.mapi (fun sender queue ->
+      match confirmed_nonce sender with
+      | None -> []
+      | Some confirmed -> ready_queue ~confirmed queue)
+  in
+  select_epoch_txs
+    capacity
+    queues
+    (selection_heads queues)
+    Z.zero
+    []
+
 let remove_by_hash h =
   match Hashtbl.find_opt hash_index h with
   | Some entry -> evict entry; true

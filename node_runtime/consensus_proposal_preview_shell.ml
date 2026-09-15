@@ -24,6 +24,8 @@ type deps = {
 }
 
 let node_backend
+    ?(private_artifacts = fun _ -> [])
+    ?(key_artifacts = fun _ -> [])
     ~program_trust
     ~rules
     ~legacy_replay
@@ -35,6 +37,12 @@ let node_backend
   {
     run = (fun ~epoch_id ~proposal_id ~expected_prev_root ~preverify
         ~parent_commit ~reward ~env ~txs ->
+      let preverify =
+        Octra_core.Preverify_commit.with_artifacts
+          (private_artifacts txs)
+          preverify
+        |> Octra_core.Preverify_commit.with_keys (key_artifacts txs)
+      in
       match Octra_core.Rule_graph.circle rules ~epoch:epoch_id with
       | Error fault ->
         Lwt.return_error (Octra_core.Rule_graph.fault_message fault)

@@ -1464,6 +1464,30 @@ let handle_proposal_admission ~start_height ~epoch_id ~current_epoch
   | Proceed ->
     Lwt.return Proposal_admit
 
+type verify_step = Bundle | Checks | Outcomes | State
+
+let step_name = function
+  | Bundle -> "bundle"
+  | Checks -> "checks"
+  | Outcomes -> "outcomes"
+  | State -> "state"
+
+let time_verify (propose : Octra_consensus.C_types.propose) pid step run =
+  let started = Mtime_clock.elapsed_ns () in
+  let write status =
+    let elapsed = Int64.sub (Mtime_clock.elapsed_ns ()) started in
+    Octra_log.info "consensus"
+      "event = proposal_step epoch = %Ld round = %d pid = %s step = %s status = %s elapsed_ms = %.0f"
+      propose.epoch_id propose.round (proposal_id_short pid) (step_name step)
+      status (Int64.to_float elapsed /. 1_000_000.)
+  in
+  write "begin";
+  Lwt.try_bind run
+    (fun result -> write "returned"; Lwt.return result)
+    (fun exn ->
+      write (match exn with Lwt.Canceled -> "cancelled" | _ -> "exception");
+      Lwt.fail exn)
+
 let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
@@ -1624,10 +1648,10 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
               txs
           in
           let* shaped =
-            local_preverify_bundle
+            time_verify propose pid Checks (fun () -> local_preverify_bundle
               ~run_many
               ~tx_hashes:tx_hashes_hex
-              txs
+              txs)
           in
           if shaped.skipped_count > 0 then
             Octra_log.warn "consensus"
@@ -1642,7 +1666,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         in
         let proposal_id_short = proposal_id_short pid in
         let* bundle_state =
-          Consensus_bundle_fetch.ensure_proposal
+          time_verify propose pid Bundle (fun () -> Consensus_bundle_fetch.ensure_proposal
             {
               cached_proposal_bundle = (fun () ->
                 deps.cached_bundle ~proposal_id:pid);
@@ -1677,7 +1701,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
             ~local_tx_count:(List.length tx_list_local)
             ~missing_count
             ~hashes_empty:
-              (Consensus_bundle_cache.header_has_empty_bundle propose.header)
+              (Consensus_bundle_cache.header_has_empty_bundle propose.header))
         in
         match bundle_state with
         | Consensus_bundle_fetch.Proposal_wait ->
@@ -1704,14 +1728,14 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         | Ok verified ->
           let candidate_hashes = List.map Transaction.hash verified.candidates in
           let* local_candidates =
-            local_preverify_bundle
+            time_verify propose pid Checks (fun () -> local_preverify_bundle
               ~run_many:(fun txs ->
                 deps.validate_preverify_once
                   ~state_root:local_ledger_root_for_preview
                   ~tx_hashes:candidate_hashes
                   txs)
               ~tx_hashes:candidate_hashes
-              verified.candidates
+              verified.candidates)
           in
           if local_candidates.skipped_count > 0 then
             Octra_log.warn "consensus"
@@ -1770,7 +1794,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
               | [] -> Lwt.return_ok ()
               | rejections ->
                 let* result =
-                  deps.preview {
+                  time_verify propose pid Outcomes (fun () -> deps.preview {
                     epoch_id = propose.epoch_id;
                     epoch_ts = propose.header.ts;
                     proposal_id =
@@ -1782,7 +1806,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                     validator_pubkeys;
                     preverify = candidate_preverify;
                     txs = verified.candidates;
-                  }
+                  })
                 in
                 Lwt.return
                   (verify_preview_partition
@@ -1800,7 +1824,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
               Lwt.return reject
             | Ok () ->
             let* preview_result =
-              deps.preview {
+              time_verify propose pid State (fun () -> deps.preview {
                 epoch_id = propose.epoch_id;
                 epoch_ts = propose.header.ts;
                 proposal_id = Printf.sprintf "verify-%Ld" propose.epoch_id;
@@ -1811,7 +1835,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                 validator_pubkeys;
                 preverify;
                 txs = tx_list;
-              }
+              })
             in
             match
               verify_preview_partition

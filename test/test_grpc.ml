@@ -55,11 +55,12 @@ let decode_json_reply body =
   loop None
 
 let test_config () =
-  begin
-    match Config.of_env (env []) with
+  List.iter (fun values ->
+    match Config.of_env (env values) with
     | Ok Config.Disabled -> ()
-    | _ -> fail "disabled config differs"
-  end;
+    | _ -> fail "disabled config differs")
+    [[]; ["OCTRA_GRPC_SUBMIT_ENABLE", "true"];
+     ["OCTRA_GRPC_ENABLE", "false"; "OCTRA_GRPC_SUBMIT_ENABLE", "true"]];
   let config =
     match Config.of_env (env ["OCTRA_GRPC_ENABLE", "1"]) with
     | Ok (Config.Enabled value) -> value
@@ -106,6 +107,45 @@ let test_deadline () =
     | Error _ -> ()
     | Ok _ -> fail "long deadline was admitted"
   end
+
+let test_submit_config () =
+  let get extra = Config.of_env (env (("OCTRA_GRPC_ENABLE", "1") :: extra)) in
+  let size extra = match get extra with
+    | Ok (Config.Enabled value) -> value.submit_bytes
+    | _ -> fail "submission config was refused"
+  in
+  let limit = Octra_net.P2p_tx_gossip.max_tx_json + 5 in
+  expect (size [] = Some limit) "submission default cap differs";
+  List.iter (fun value ->
+    expect (size ["OCTRA_GRPC_SUBMIT_ENABLE", value] = Some limit)
+      "submission enable differs") ["1"; "true"; "YES"];
+  List.iter (fun value ->
+    expect (size ["OCTRA_GRPC_SUBMIT_ENABLE", value] = None)
+      "submission disable differs") ["0"; "false"; "NO"];
+  List.iter (fun value ->
+    expect (size ["OCTRA_GRPC_MAX_SUBMIT_BYTES", string_of_int value] = Some value)
+      "submission configured cap differs") [1; 65_536; limit];
+  List.iter (fun value ->
+    expect (Result.is_error (get ["OCTRA_GRPC_MAX_SUBMIT_BYTES", value]))
+      "invalid submission cap admitted") ["0"; "-1"; string_of_int (limit + 1); "invalid"];
+  expect (Result.is_error (get ["OCTRA_GRPC_SUBMIT_ENABLE", "invalid"]))
+    "invalid submission flag admitted"
+
+let test_submit_proto () =
+  let json = `Assoc ["nonce", `Int 7; "signature", `String "signed"] in
+  let encoded = field_string (Yojson.Safe.to_string json) in
+  expect (Proto.decode_submit encoded = Ok json) "submission object differs";
+  expect (Proto.decode_submit (Bytes.cat (field_string "{}") encoded) = Ok json)
+    "protobuf final field differs";
+  List.iter (fun value ->
+    expect (Result.is_error (Proto.decode_submit value)) "invalid submission admitted")
+    [Bytes.empty; field_epoch 7L; Bytes.cat encoded (field_epoch 7L);
+     oversized_string; field_string ""; field_string "[{}]"; field_string "null";
+     field_string "{"; field_string "{} {}"];
+  let limit = Octra_net.P2p_tx_gossip.max_tx_json in
+  let sized size = field_string ("{\"p\":\"" ^ String.make (size - 8) 'a' ^ "\"}") in
+  expect (Result.is_ok (Proto.decode_submit (sized limit))) "maximum submission refused";
+  expect (Result.is_error (Proto.decode_submit (sized (limit + 1)))) "large submission admitted"
 
 let test_frame () =
   let payload = "abc" in
@@ -257,6 +297,58 @@ let test_health () =
   expect (reply.Service.status.code = Status.Ok) "health check failed";
   expect (reply.body = Some "\008\001") "health response differs"
 
+let test_submit_parity () =
+  let module Tx = Octra_core.Transaction in
+  let module Submit = Octra_node_runtime.Submit_rpc in
+  let tx = Tx.{
+    from = "octCixRsEcmuMHP1SHc4MMVJUSJZbUeQq9kBpNFNj1WKqeB";
+    to_ = "octB86WduDWXVPq3KxifVvczzc6NonLzSPHCG4cdkghCErq";
+    amount = Z.one; nonce = 7; ou = Z.of_int 1000; timestamp = 1.0;
+    signature = "sig"; public_key = None; message = None;
+    op_type = Standard; encrypted_data = None;
+  } in
+  let read _ _ = fail "submission reached read capability" in
+  let seen = ref [] in
+  let validate tx = seen := tx :: !seen; Ok "accepted-7" in
+  let dispatch validate =
+    let handler params () = Submit.submit ~validate params in
+    fun meta request -> Dispatch.handle_request meta request () ["octra_submit", handler]
+  in
+  let submit = dispatch validate in
+  List.iter (fun op_type ->
+    let tx = { tx with op_type } in
+    let json = Tx.to_yojson tx in
+    let params = `List [json] in
+    let request = Rpc.{ jsonrpc = "2.0"; method_ = "octra_submit"; params; id = `Null } in
+    let expected = Lwt_main.run (submit meta request) in
+    seen := [];
+    let reply = Lwt_main.run (Service.invoke ~call:read ~submit ~meta
+      ~path:Service.submit_path (field_string (Yojson.Safe.to_string json))) in
+    expect (!seen = [tx]) "transaction changed or admitted more than once";
+    match expected, reply.body with
+    | Rpc.Result (json, _), Some body ->
+      expect (reply.status.code = Status.Ok && decode_json_reply body = json) "accepted reply differs"
+    | _ -> fail "submission parity failed")
+    Tx.[Standard; EncryptOp; DecryptOp; StealthOp; ClaimOp; KeySwitch];
+  List.iter (fun (code, message) ->
+    let submit = dispatch (fun _ -> Error (code, message)) in
+    let params = `List [Tx.to_yojson tx] in
+    let request = Rpc.{ jsonrpc = "2.0"; method_ = "octra_submit"; params; id = `Null } in
+    let expected = Lwt_main.run (submit meta request) in
+    let reply = Lwt_main.run (Service.invoke ~call:read ~submit ~meta ~path:Service.submit_path
+      (field_string (Yojson.Safe.to_string (Tx.to_yojson tx)))) in
+    match expected with
+    | Rpc.Error_ (error, _) ->
+      expect (reply.status = Status.of_rpc error && reply.body = None) "submission refusal differs"
+    | _ -> fail "rejected submission succeeded")
+    ["invalid_signature", "signature differs"; "invalid_nonce", "nonce differs";
+     "duplicate", "already admitted"; "staging_full", "full"; "readonly_observer", "read only"];
+  seen := [];
+  let reply = Lwt_main.run (Service.invoke ~call:read ~submit ~meta ~path:Service.submit_path
+    (field_string "{}")) in
+  expect (reply.status.code = Status.Invalid_argument && !seen = [])
+    "invalid transaction reached validation"
+
 let test_error_map () =
   let failing method_ error meta request =
     let route _ () = Lwt.return (Error error) in
@@ -290,8 +382,51 @@ let test_error_map () =
     (reply.Service.status.code = Status.Not_found)
     "missing-account map differs"
 
+let test_submit_depth () =
+  let rec nest wrap count value =
+    if count = 0 then value else wrap (nest wrap (count - 1) value)
+  in
+  List.iter (fun wrap ->
+    List.iter (fun depth ->
+      let json = `Assoc ["payload", nest wrap depth (`String "value")] in
+      let params = `List [json] in
+      let body = `Assoc [
+        "jsonrpc", `String "2.0"; "method", `String "octra_submit";
+        "params", params; "id", `Null;
+      ] in
+      let expected = Rpc.parse_body (Yojson.Safe.to_string body) in
+      let seen = ref [] in
+      let submit _ request =
+        seen := request :: !seen;
+        Lwt.return (Rpc.Result (request.Rpc.params, request.id))
+      in
+      let payload = field_string (Yojson.Safe.to_string json) in
+      let reply = Lwt_main.run
+        (Service.invoke ~call ~submit ~meta ~path:Service.submit_path payload)
+      in
+      match expected with
+      | Error error ->
+        expect (error = Rpc.invalid_params "params too deep or too large")
+          "depth refusal differs";
+        expect (reply.status = Status.of_rpc error && reply.body = None)
+          "shared validation refusal differs";
+        expect (!seen = []) "deep submission reached backend"
+      | Ok (`Single request) ->
+        expect (depth <= Rpc.max_param_depth - 2) "deep HTTP submission admitted";
+        expect (!seen = [request]) "valid submission changed";
+        expect (reply.status = Status.ok) "valid submission refused";
+        expect (Option.map decode_json_reply reply.body = Some params)
+          "valid submission reply differs"
+      | _ -> fail "single submission parsed as batch")
+      [0; Rpc.max_param_depth - 2; Rpc.max_param_depth - 1; 32])
+    [(fun value -> `List [value]); (fun value -> `Assoc ["value", value])]
+
 let () =
   test_config ();
+  test_submit_config ();
+  test_submit_proto ();
+  test_submit_depth ();
+  test_submit_parity ();
   test_deadline ();
   test_frame ();
   test_proto ();

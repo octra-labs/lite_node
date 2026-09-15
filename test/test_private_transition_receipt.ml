@@ -704,14 +704,13 @@ let circle_policy_case () =
       expect (H.require_cap ["cap", `Bool cap] = Ok cap) "circle explicit mode")
     [false; true]
 
-let receipt ledger transaction transition_hash =
-  let root = Lwt_main.run (Octra_core.Ledger.hash ledger) in
+let receipt_lwt ledger transaction transition_hash =
+  let open Lwt.Syntax in
+  let* root = Octra_core.Ledger.hash ledger in
   let pre_state_hash = W.state_hash root in
+  let* source = W.source_binding ledger pre_state_hash transaction in
   let state =
-    match
-      Lwt_main.run
-        (W.source_binding ledger pre_state_hash transaction)
-    with
+    match source with
     | Ok state ->
       {
         state with
@@ -728,8 +727,11 @@ let receipt ledger transaction transition_hash =
       ~reason:""
       transaction
   with
-  | Ok value -> value
+  | Ok value -> Lwt.return value
   | Error e -> fail e
+
+let receipt ledger transaction transition_hash =
+  Lwt_main.run (receipt_lwt ledger transaction transition_hash)
 
 let env =
   E.{
@@ -744,21 +746,26 @@ let env =
     ready_max_lag = 0;
   }
 
-let process proof_mode store ledger transaction receipt =
+let process_lwt ?(artifacts = []) ?(keys = [])
+    ?(before = fun () -> Lwt.return_unit)
+    ?(field_policy = PL.Unique_fields)
+    ?(result_policy = Octra_core.Private_result_policy.Recoverable)
+    proof_mode store ledger transaction receipt =
+  let open Lwt.Syntax in
   let gate =
     Octra_core.Preverify_commit.create [receipt]
+    |> Octra_core.Preverify_commit.with_artifacts artifacts
+    |> Octra_core.Preverify_commit.with_keys keys
+  in
+  let* checked =
+    Octra_core.Preverify_commit.check_bound ledger gate [transaction]
   in
   begin
-    match
-      Lwt_main.run
-        (Octra_core.Preverify_commit.check_bound
-           ledger
-           gate
-           [transaction])
-    with
+    match checked with
     | Ok () -> ()
     | Error e -> fail e
   end;
+  let* () = before () in
   let transition =
     Octra_core.Private_transition.create
       ~preverify:(Some gate)
@@ -766,20 +773,332 @@ let process proof_mode store ledger transaction receipt =
       ~epoch_id:env.epoch_id
       ~owner_migration_mode:Octra_core.Rule_graph.Active
       ~proof_mode
-      ~field_policy:Octra_core.Private_ledger.Unique_fields
-      ~result_policy:Octra_core.Private_result_policy.Recoverable
+      ~field_policy
+      ~result_policy
       ~legacy_replay
       ~limits:Octra_core.Private_transition.{
         max_fhe = 1;
         max_stealth = 1;
       }
   in
+  Octra_core.Private_transition.process
+    transition
+    ~backend:(E.make_live_backend store ledger)
+    ~env
+    transaction
+
+let process ?artifacts ?keys ?field_policy ?result_policy
+    proof_mode store ledger transaction receipt =
   Lwt_main.run
-    (Octra_core.Private_transition.process
-       transition
-       ~backend:(E.make_live_backend store ledger)
-       ~env
-       transaction)
+    (process_lwt ?artifacts ?keys ?field_policy ?result_policy
+       proof_mode store ledger transaction receipt)
+
+let switch_reuse () =
+  let path, store, ledger, pk, sk = setup "switch_reuse" in
+  Fun.protect
+    ~finally:(fun () ->
+      Lwt_main.run (Octra_core.Store_irmin.close store);
+      clear_case path)
+    (fun () ->
+      let module L = Octra_core.Ledger in
+      let module Pool = Octra_node_runtime.Consensus_key_switch_preverify in
+      let next_pk, next_sk = P.keygen_from_seed (P.default_params ()) (bytes '\049') in
+      let amount = 17L in
+      let source = P.enc_value_seeded pk sk amount (bytes '\050') in
+      let next = P.enc_value_seeded next_pk next_sk amount (bytes '\051') in
+      let blind = bytes '\052' in
+      let b64 value = Base64.encode_exn (Bytes.to_string value) in
+      let proof pk sk cipher =
+        P.make_zero_proof_bound pk sk cipher amount blind |> FB.encode_zero_proof
+      in
+      let source_bytes = FB.encode_cipher source in
+      let payload = Yojson.Safe.to_string (`Assoc [
+        "new_pubkey", `String (b64 (P.serialize_pubkey next_pk));
+        "aes_kat", `String (FB.aes_kat_hex ());
+        "new_cipher", `String (FB.encode_cipher next);
+        "old_zero_proof", `String (proof pk sk source);
+        "new_zero_proof", `String (proof next_pk next_sk next);
+        "amount_commitment", `String (b64 (P.pedersen_commit_amount amount blind));
+        "source_cipher_hash", `String Digestif.SHA256.(digest_string source_bytes |> to_hex);
+      ]) in
+      let transaction = { (tx payload) with T.op_type = T.KeySwitch; amount = Z.zero } in
+      expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "switch source";
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      let pool = Pool.create ~field_policy:(fun () -> PL.Unique_fields)
+        ~strict:(fun () -> true) ledger in
+      let prepared = match Lwt_main.run (Pool.await pool transaction) with
+        | Octra_core.Preverify_availability.Ready plan -> plan
+        | _ -> fail "switch pool did not verify plan"
+      in
+      let keys = Pool.artifacts pool [transaction] in
+      expect (List.length keys = 1) "switch artifact missing";
+      let hash = PL.hash_prepared prepared in
+      let root = Lwt_main.run (L.hash ledger) in
+      let old_key = Lwt_main.run (L.get_pvac_pubkey ledger addr) in
+      let prior = match Lwt_main.run
+          (PL.preverify_key_switch_artifact ~field_policy:PL.Unique_fields
+             ~strict:false ledger transaction) with
+        | Ok artifact -> [T.hash transaction, artifact]
+        | Error e -> fail e.PL.reason
+      in
+      let run ?(fields = PL.Unique_fields) ?(mode = Octra_core.Rule_graph.Active)
+          ?(cipher = source_bytes) ?(key = old_key) step keys tx hash =
+        let open Lwt.Syntax in
+        Lwt_main.run (Octra_core.State_preview.with_state
+          ~base_store:store ~base_ledger:ledger ~epoch_id:1 ~proposal_id:"switch_reuse"
+          (fun store ledger ->
+            expect (L.credit ledger "octOther" (Z.of_int step) = Ok ()) "other credit";
+            expect (L.update_enc_balance ledger addr cipher = Ok ()) "preview source";
+            let* () = match key with
+              | Some key -> L.set_pvac_pubkey ledger addr key
+              | None -> L.delete_pvac_pubkey ledger addr
+            in
+            let* () = L.flush_dirty_lwt ledger in
+            let* changed = L.hash ledger in
+            expect (changed <> root) "preview root did not change";
+            let* cert = receipt_lwt ledger tx hash in
+            let* result = process_lwt ~keys ~field_policy:fields mode store ledger tx cert in
+            let* key = L.get_pvac_pubkey ledger addr in
+            let account = L.find_opt ledger addr in
+            let* () = L.flush_dirty_lwt ledger in
+            let* root = L.hash ledger in
+            Lwt.return_ok (result, account, key, root)))
+      in
+      let timed f =
+        let start = Mtime_clock.elapsed_ns () in
+        let value = f () in
+        value, Int64.to_float (Int64.sub (Mtime_clock.elapsed_ns ()) start) /. 1_000_000.
+      in
+      let expected, full_ms = timed (fun () -> run 1 [] transaction hash) in
+      begin match expected with
+      | Ok (Ok fee, Some account, Some _, _) ->
+        expect (Z.equal fee Z.one && account.nonce = 1) "switch fee and nonce";
+        expect (account.encrypted_balance = Some (FB.encode_cipher next)) "switch value"
+      | _ -> fail "direct switch did not apply"
+      end;
+      let open Lwt.Syntax in
+      let prior_check = Lwt_main.run (Octra_core.State_preview.with_state
+        ~base_store:store ~base_ledger:ledger ~epoch_id:1 ~proposal_id:"switch_prior"
+        (fun store ledger ->
+          let cipher = FB.encode_cipher (P.enc_value_seeded pk sk 18L (bytes '\054')) in
+          let transaction = { transaction with T.nonce = 3 } in
+          let check hash reason =
+            expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "restore prior source";
+            let account = L.find ledger addr in
+            let* cert = receipt_lwt ledger transaction hash in
+            let before () =
+              expect (L.update_enc_balance ledger addr cipher = Ok ()) "change prior source";
+              let* current = L.hash ledger in
+              expect (current = root) "prior store root changed";
+              Lwt.return_unit
+            in
+            let* result = process_lwt ~before ~field_policy:PL.First_field
+              Octra_core.Rule_graph.Prior store ledger transaction cert in
+            expect (result = Error reason) "prior refusal order differs";
+            let* key = L.get_pvac_pubkey ledger addr in
+            expect (key = old_key) "prior refusal changed key";
+            expect (L.find_opt ledger addr = Some { account with encrypted_balance = Some cipher })
+              "prior refusal changed account";
+            Lwt.return_unit
+          in
+          let* () = check hash ("key_switch_rejected",
+            "encrypted balance changed before key switch verification") in
+          expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "restore pool source";
+          let pool = Pool.create ~field_policy:(fun () -> PL.First_field)
+            ~strict:(fun () -> false) ledger in
+          let* prepared = Pool.await pool transaction in
+          begin match prepared with
+          | Octra_core.Preverify_availability.Ready plan ->
+            expect (PL.hash_prepared plan = hash) "prior receipt bytes differ"
+          | _ -> fail "prior pool did not verify plan"
+          end;
+          let* () = check hash ("key_switch_rejected",
+            "encrypted balance changed during key switch verification") in
+          let* () = check (String.make 64 'f') ("preverify_transition_mismatch",
+            "private transition does not match the certified receipt") in
+          Lwt.return_ok ())) in
+      expect (prior_check = Ok ()) "prior check failed";
+      let worker = VW.worker_path () |> Option.get in
+      Fun.protect ~finally:(fun () -> Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker)
+        (fun () ->
+          Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" "runtime_data/private_transition_receipt/absent_worker";
+          let needs_worker name f =
+            expect (try ignore (f ()); false with PL.Worker_retry _ -> true)
+              ("switch source requires verification: " ^ name)
+          in
+          begin match Lwt_main.run
+              (PL.key_switch_plan ~field_policy:PL.Unique_fields
+                 ~strict:true ledger transaction) with
+          | Error error when PL.key_switch_failure_retryable error -> ()
+          | _ -> fail "artifact binding populated the plan cache"
+          end;
+          needs_worker "missing" (fun () -> run 2 [] transaction hash);
+          let actual, reuse_ms = timed (fun () -> run 1 keys transaction hash) in
+          expect (actual = expected) "switch replay result and root";
+          Printf.printf
+            "event = plan_sample case = switch_reuse full_ms = %.3f reuse_ms = %.3f\n%!"
+            full_ms reuse_ms;
+          begin match run 2 keys transaction hash, expected with
+          | Ok (result, account, key, _), Ok (full, original, target, _) ->
+            expect ((result, account, key) = (full, original, target)) "switch after other credit"
+          | _ -> fail "switch artifact not carried"
+          end;
+          needs_worker "mode" (fun () -> run 3 prior transaction hash);
+          needs_worker "fields" (fun () -> run ~fields:PL.First_field 4 keys transaction hash);
+          let changed = { transaction with T.nonce = 2 } in
+          let wrong = List.map (fun (_, artifact) -> T.hash changed, artifact) keys in
+          needs_worker "transaction" (fun () -> run 5 wrong changed hash);
+          needs_worker "key" (fun () -> run ~key:(Some (Bytes.to_string (P.serialize_pubkey next_pk)))
+            6 keys transaction hash);
+          let cipher = FB.encode_cipher (P.enc_value_seeded pk sk 18L (bytes '\053')) in
+          expect (run ~cipher 7 keys transaction hash = run ~cipher 7 [] transaction hash)
+            "changed cipher refusal differs";
+          begin match run 8 keys transaction (String.make 64 'f') with
+          | Ok (Error ("preverify_transition_mismatch", _), Some account, key, _) ->
+            expect (account.nonce = 0 && key = old_key) "receipt mismatch changed state"
+          | _ -> fail "switch receipt mismatch accepted"
+          end;
+          expect (run ~mode:Octra_core.Rule_graph.Prior 9 keys transaction hash
+            = run ~mode:Octra_core.Rule_graph.Prior 9 [] transaction hash) "prior switch differs");
+      expect (Lwt_main.run (L.hash ledger) = root) "switch preview changed base";
+      expect (Lwt_main.run (L.get_pvac_pubkey ledger addr) = old_key) "switch preview changed key")
+
+let reuse_case decrypt =
+  let name = if decrypt then "decrypt_reuse" else "encrypt_reuse" in
+  let path, store, ledger, pk, sk = setup name in
+  Fun.protect
+    ~finally:(fun () ->
+      Lwt_main.run (Octra_core.Store_irmin.close store);
+      clear_case path)
+    (fun () ->
+      let source = P.enc_value_seeded pk sk 20L (bytes '\004') in
+      let source = FB.encode_cipher source in
+      let set_cipher cipher =
+        match Octra_core.Ledger.update_enc_balance ledger addr cipher with
+        | Ok () -> ()
+        | Error e -> fail e
+      in
+      set_cipher source;
+      let transaction = tx (payload pk sk true) in
+      let transaction =
+        if not decrypt then transaction
+        else
+          let delta = P.enc_value_seeded pk sk 10L (bytes '\002') in
+          let current = P.enc_value_seeded pk sk 20L (bytes '\004') in
+          let remaining = P.ct_sub pk current delta in
+          let range =
+            P.make_zero_proof_bound_range pk sk remaining 10L (bytes '\007')
+            |> FB.encode_bound_range_proof
+          in
+          let fields =
+            transaction.T.encrypted_data
+            |> Option.get
+            |> Yojson.Safe.from_string
+            |> Yojson.Safe.Util.to_assoc
+          in
+          { transaction with
+            T.op_type = T.DecryptOp;
+            encrypted_data = Some (Yojson.Safe.to_string
+              (`Assoc (("range_proof_balance", `String range) :: fields)));
+          }
+      in
+      let make_artifact strict =
+        match Lwt_main.run
+          (PL.preverify_private_artifact
+             ~field_policy:PL.Unique_fields
+             ~strict
+             ledger
+             transaction)
+        with
+        | Ok artifact -> artifact
+        | Error e -> fail e.PL.reason
+      in
+      let module Pool = Octra_node_runtime.Consensus_private_preverify in
+      let pool = Pool.create
+        ~field_policy:(fun () -> PL.Unique_fields)
+        ~strict:(fun () -> true)
+        ~result_policy:(fun () -> Octra_core.Private_result_policy.Recoverable)
+        ledger
+      in
+      let prepared =
+        match Lwt_main.run (Pool.await pool transaction) with
+        | Octra_core.Preverify_availability.Ready plan -> plan
+        | _ -> fail "private pool did not verify plan"
+      in
+      let artifact =
+        match Pool.artifacts pool [transaction] with
+        | [hash, artifact] when hash = T.hash transaction -> artifact
+        | _ -> fail "private pool did not return artifact"
+      in
+      let prior = make_artifact false in
+      let plan_hash = PL.hash_prepared prepared in
+      let run ?field_policy ?result_policy artifacts tx hash =
+        let receipt = receipt ledger tx hash in
+        expect (Octra_core.Ledger.begin_journal ledger = Ok ()) "journal start";
+        Fun.protect
+          ~finally:(fun () ->
+            expect (Octra_core.Ledger.abort_journal ledger = Ok ()) "journal end")
+          (fun () ->
+            let result = process ~artifacts ?field_policy ?result_policy
+              Octra_core.Rule_graph.Active store ledger tx receipt in
+            result, Octra_core.Ledger.find_opt ledger addr)
+      in
+      let timed f =
+        let start = Mtime_clock.elapsed_ns () in
+        let result = f () in
+        let elapsed = Int64.sub (Mtime_clock.elapsed_ns ()) start in
+        result, Int64.to_float elapsed /. 1_000_000.
+      in
+      let expected, full_ms = timed (fun () -> run [] transaction plan_hash) in
+      expect (fst expected = Ok Z.one) "direct plan result";
+      let entries tx artifact = [T.hash tx, artifact] in
+      let worker = VW.worker_path () |> Option.get in
+      Fun.protect
+        ~finally:(fun () -> Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker)
+        (fun () ->
+          Unix.putenv "OCTRA_PVAC_VERIFY_WORKER"
+            "runtime_data/private_transition_receipt/absent_worker";
+          let actual, reuse_ms = timed (fun () ->
+            run (entries transaction artifact) transaction plan_hash) in
+          expect (actual = expected) "reused plan result";
+          Printf.printf
+            "event = plan_sample case = %s full_ms = %.3f reuse_ms = %.3f\n%!"
+            name full_ms reuse_ms;
+          let mismatch =
+            run (entries transaction artifact) transaction (String.make 64 'f')
+          in
+          expect
+            (fst mismatch = Error ("preverify_transition_mismatch",
+              "private transition does not match the certified receipt"))
+            "reused plan receipt mismatch";
+          let needs_worker ?field_policy ?result_policy entries tx =
+            let retried =
+              try ignore (run ?field_policy ?result_policy entries tx plan_hash); false
+              with PL.Worker_retry _ -> true
+            in
+            expect retried "changed inputs require verification"
+          in
+          needs_worker [] transaction;
+          needs_worker (entries transaction prior) transaction;
+          needs_worker ~field_policy:PL.First_field
+            (entries transaction artifact) transaction;
+          needs_worker ~result_policy:Octra_core.Private_result_policy.Legacy
+            (entries transaction artifact) transaction;
+          let changed = { transaction with T.nonce = 2 } in
+          needs_worker (entries changed artifact) changed;
+          set_cipher (FB.encode_cipher
+            (P.enc_value_seeded pk sk 21L (bytes '\005')));
+          needs_worker (entries transaction artifact) transaction;
+          set_cipher source;
+          let other_pk, _ = P.keygen_from_seed (P.default_params ()) (bytes '\006') in
+          let set_key key = Lwt_main.run
+            (Octra_core.Ledger.set_pvac_pubkey ledger addr
+               (P.serialize_pubkey key |> Bytes.to_string)) in
+          Fun.protect
+            ~finally:(fun () -> set_key pk)
+            (fun () ->
+              set_key other_pk;
+              needs_worker (entries transaction artifact) transaction)))
 
 let valid_case () =
   let path, store, ledger, pk, sk = setup "valid" in
@@ -1250,6 +1569,13 @@ let () =
   | [_; "valid"] ->
     valid_case ();
     print_endline "status = pass test = private_transition_receipt case = valid"
+  | [_; "reuse"] ->
+    reuse_case false;
+    reuse_case true;
+    print_endline "status = pass test = private_transition_receipt case = reuse"
+  | [_; "switch_reuse"] ->
+    switch_reuse ();
+    print_endline "status = pass test = private_transition_receipt case = switch_reuse"
   | [_] ->
     migration_case ();
     circle_policy_case ();
@@ -1268,5 +1594,8 @@ let () =
     worker_retry_case ();
     circle_reject_case ();
     recovery_case ();
+    reuse_case false;
+    reuse_case true;
+    switch_reuse ();
     print_endline "status = pass test = private_transition_receipt"
-  | _ -> fail "expected cache_key, migration, circle_policy or valid"
+  | _ -> fail "expected cache_key, migration, circle_policy, valid, reuse or switch_reuse"

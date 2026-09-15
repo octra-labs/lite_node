@@ -107,17 +107,17 @@ def require_admission_active(values):
 def next_nonce(values, wallet):
     value = call(
         local_rpc(values),
-        "octra_account",
-        [wallet["address"], 1],
+        "octra_balance",
+        [wallet["address"]],
     )
     if not isinstance(value, dict):
         raise ValidatorError("invalid local account response")
-    try:
-        nonce = int(value["nonce"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValidatorError("local account has no valid nonce") from error
-    if nonce < 0:
-        raise ValidatorError("local account nonce is negative")
+    nonce = optional_nonnegative_integer(value.get("nonce"), "nonce")
+    pending = optional_nonnegative_integer(value.get("pending_nonce"), "pending nonce")
+    if nonce is None or pending is None or pending < nonce:
+        raise ValidatorError("local account has no valid nonce view")
+    if pending != nonce:
+        raise ValidatorError("account has pending transactions; wait before enrollment")
     return nonce + 1
 
 def exact_member(entries, wallet):
@@ -186,8 +186,9 @@ def optional_nonnegative_integer(value, name):
 def optional_epoch(value, name):
     return optional_nonnegative_integer(value, name)
 
-def committed_enrollment(values, wallet):
-    value = call(local_rpc(values), "octra_validatorEnrollment", [])
+def committed_enrollment(values, wallet, value=None):
+    if value is None:
+        value = call(local_rpc(values), "octra_validatorEnrollment", [])
     if not isinstance(value, dict):
         raise ValidatorError("invalid committed validator enrollment")
     if value.get("address") != wallet["address"]:
@@ -209,7 +210,7 @@ def committed_enrollment(values, wallet):
         raise ValidatorError("committed validator head epoch is missing")
     local_head, _ = node_status(local_rpc(values))
     if head_epoch != local_head:
-        raise ValidatorError("committed validator enrollment is stale")
+        raise ValidatorError("committed validator enrollment head changed")
     if state is EnrollmentState.ABSENT:
         if any(item is not None for item in (bond, bonded_epoch, ready_epoch, exit_epoch)):
             raise ValidatorError("absent validator enrollment carries state")
@@ -245,6 +246,39 @@ def join_step(member, enrollment):
         return JoinStep.SUBMIT_READY
     return JoinStep.WAIT_SELECTION
 
+def ready_message(value, values, wallet):
+    ready = value.get("ready")
+    if not isinstance(ready, dict):
+        raise ValidatorError("node does not expose readiness parameters; upgrade required")
+    epoch = optional_epoch(value.get("head_epoch"), "head epoch")
+    head = optional_epoch(ready.get("head_epoch"), "ready head")
+    catchup = optional_epoch(ready.get("catchup_head_epoch"), "catchup head")
+    if epoch is None or head != epoch or catchup != epoch:
+        raise ValidatorError("readiness head differs from committed enrollment")
+    if ready.get("chain_id") != values["OCTRA_CHAIN_ID"]:
+        raise ValidatorError("readiness chain differs from configuration")
+    if ready.get("consensus_pubkey") != wallet["pub"]:
+        raise ValidatorError("readiness public key differs from wallet")
+    for name, lengths in (("config_hash", (64,)), ("state_root", (64, 128))):
+        field = ready.get(name)
+        if not isinstance(field, str) or len(field) not in lengths or any(
+            char not in "0123456789abcdef" for char in field
+        ):
+            raise ValidatorError(f"invalid readiness {name}")
+    return {
+        "consensus_pubkey": wallet["pub"],
+        "head_epoch": str(epoch),
+        "state_root": ready["state_root"],
+        "chain_id": values["OCTRA_CHAIN_ID"],
+        "config_hash": ready["config_hash"],
+        "catchup_head_epoch": str(epoch),
+    }
+
+def control_error(result):
+    raw = (result.stderr or result.stdout or "no error detail").strip()
+    detail = json.dumps(raw[:2048], ensure_ascii=True)
+    return f"control transaction failed exit = {result.returncode} detail = {detail}"
+
 def control_result(
     values,
     wallet,
@@ -252,6 +286,8 @@ def control_result(
     operation,
     amount=0,
     message=None,
+    rpc=None,
+    head=None,
 ):
     binary = Path(values["OCTRA_OPERATOR_CONTROL_BINARY"])
     if sha256_file(binary) != values["OCTRA_OPERATOR_CONTROL_BINARY_HASH"]:
@@ -261,7 +297,7 @@ def control_result(
         "--wallet",
         str(wallet_path),
         "--rpc",
-        values["OCTRA_OPERATOR_RPC_URL"],
+        rpc or values["OCTRA_OPERATOR_RPC_URL"],
         "--chain-id",
         values["OCTRA_CHAIN_ID"],
         "--op",
@@ -276,13 +312,21 @@ def control_result(
             "--message",
             json.dumps(message, separators=(",", ":"), sort_keys=True),
         ])
-    result = subprocess.run(
-        command,
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    if head is not None and node_status(local_rpc(values)) != head:
+        raise ValidatorError("readiness head changed before submission; nothing sent")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValidatorError("submission result unknown; inspect account before retrying") from error
+    if result.returncode != 0:
+        raise ValidatorError(control_error(result))
     try:
         payload = json.loads(result.stdout.strip())
         tx_hash = payload["tx_hash"]
@@ -290,6 +334,10 @@ def control_result(
         raise ValidatorError("invalid validator control response") from error
     if payload.get("status") not in {"accepted", "pending"}:
         raise ValidatorError("validator control transaction was not accepted")
+    if not isinstance(tx_hash, str) or len(tx_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in tx_hash
+    ):
+        raise ValidatorError("validator control transaction hash is invalid")
     return tx_hash
 
 def wait_confirmed(values, tx_hash, args):
@@ -355,7 +403,8 @@ def submit_bond(config, values, wallet, wallet_path, amount, args):
     return tx_hash
 
 def submit_ready(config, values, wallet, wallet_path, args):
-    enrollment = committed_enrollment(values, wallet)
+    value = call(local_rpc(values), "octra_validatorEnrollment", [])
+    enrollment = committed_enrollment(values, wallet, value=value)
     if enrollment.state is EnrollmentState.ABSENT:
         raise ValidatorError("validator bond is absent from committed state")
     if enrollment.state is EnrollmentState.EXITING:
@@ -367,22 +416,23 @@ def submit_ready(config, values, wallet, wallet_path, args):
             epoch=enrollment.ready_epoch,
         )
         return None
-    head_epoch, state_root = node_status(local_rpc(values))
-    message = {
-        "consensus_pubkey": wallet["pub"],
-        "head_epoch": str(head_epoch),
-        "state_root": state_root,
-    }
+    message = ready_message(value, values, wallet)
+    head_epoch = enrollment.head_epoch
     tx_hash = control_result(
         values,
         wallet,
         wallet_path,
         "validator_ready",
         message=message,
+        rpc=local_rpc(values),
+        head=(head_epoch, message["state_root"]),
     )
     record_transaction(config, "ready", tx_hash)
-    emit(event="ready", status="submitted", tx=tx_hash, head_epoch=head_epoch)
+    emit(event="ready", status="submitted", tx=tx_hash, head_epoch=head_epoch, rpc=local_rpc(values))
     wait_confirmed(values, tx_hash, args)
+    if not args.no_wait:
+        current = committed_enrollment(values, wallet)
+        emit(event="readiness", state=current.state.value, ready_epoch=current.ready_epoch)
     return tx_hash
 
 def submit_self(config, values, wallet, wallet_path, operation, args):
@@ -495,7 +545,7 @@ def parser():
     value.add_argument("--no-restart", action="store_true")
     value.add_argument("--no-wait", action="store_true")
     value.add_argument("--poll-seconds", type=float, default=2.0)
-    value.add_argument("--rpc")
+    value.add_argument("--rpc", help="Submission endpoint; readiness always uses local RPC")
     value.add_argument("--wait-seconds", type=float, default=3600.0)
     return value
 

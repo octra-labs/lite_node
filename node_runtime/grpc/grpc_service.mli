@@ -13,6 +13,7 @@ type reply = {
 }
 
 val paths : string list
+val submit_path : string
 
 val reply :
   ?body:string ->
@@ -21,6 +22,7 @@ val reply :
   reply
 
 val invoke :
+  ?submit:call ->
   call:call ->
   meta:Rpc_http.meta ->
   path:string ->

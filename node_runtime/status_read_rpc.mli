@@ -5,6 +5,9 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
 type enrollment_snapshot = {
   head_epoch : int;
+  state_root : string;
+  chain_id : string;
+  config_hash : string;
   candidate : Octra_core.Validator_admission.candidate option;
 }
 
@@ -81,6 +84,8 @@ val load_validator_enrollment :
   store:Octra_core.Store_irmin.t ->
   head:Octra_core.Head_manifest.t option ->
   validator_address:string ->
+  chain_id:string ->
+  config_hash:string ->
   (enrollment_snapshot, string) result Lwt.t
 
 val validator_enrollment :

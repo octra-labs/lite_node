@@ -59,16 +59,19 @@ from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
 from validator_enroll import exact_member
 from validator_enroll import committed_enrollment
+from validator_enroll import control_result
 from validator_enroll import Enrollment
 from validator_enroll import EnrollmentState
 from validator_enroll import join_step
 from validator_enroll import JoinStep
 from validator_enroll import membership
 from validator_enroll import next_nonce
+from validator_enroll import ready_message
 from validator_enroll import require_admission_active
 from validator_enroll import resume_join_transaction
 from validator_enroll import set_validator_mode
 from validator_enroll import submit_bond
+from validator_enroll import submit_ready
 from validator_enroll import wait_active_commit
 from validator_enroll import wait_scheduled
 from validator_guard import require_hashed_file
@@ -3013,13 +3016,157 @@ class ValidatorToolsTest(unittest.TestCase):
         values = {"OCTRA_API_PORT": "8080"}
         with mock.patch(
             "validator_enroll.call",
-            return_value={"nonce": 41},
+            return_value={"nonce": 41, "pending_nonce": 41},
         ) as invoke:
             self.assertEqual(next_nonce(values, wallet), 42)
         self.assertEqual(
             invoke.call_args.args,
-            ("http://127.0.0.1:8080/rpc", "octra_account", [wallet["address"], 1]),
+            ("http://127.0.0.1:8080/rpc", "octra_balance", [wallet["address"]]),
         )
+
+    def test_enrollment_pending(self):
+        wallet = {"address": identity()[0]}
+        values = {"OCTRA_API_PORT": "8080"}
+        cases = [
+            {"nonce": 41, "pending_nonce": 42},
+            {"nonce": 41, "pending_nonce": 40},
+            {"nonce": 41},
+            {"nonce": True, "pending_nonce": 1},
+            {"nonce": 41.5, "pending_nonce": 41},
+            {"nonce": -1, "pending_nonce": -1},
+        ]
+        for case in cases:
+            with self.subTest(case=case), mock.patch(
+                "validator_enroll.call", return_value=case,
+            ):
+                with self.assertRaises(ValidatorError):
+                    next_nonce(values, wallet)
+
+    def test_ready_message(self):
+        values = {"OCTRA_CHAIN_ID": "octra-test"}
+        wallet = {"pub": identity()[1]}
+        ready = {
+            "consensus_pubkey": wallet["pub"],
+            "head_epoch": "1503093",
+            "state_root": "c" * 64,
+            "chain_id": "octra-test",
+            "config_hash": "a" * 64,
+            "catchup_head_epoch": "1503093",
+        }
+        value = {"head_epoch": 1503093, "ready": ready}
+        self.assertEqual(ready_message(value, values, wallet), ready)
+        wide = {**ready, "state_root": "b" * 128}
+        self.assertEqual(ready_message({**value, "ready": wide}, values, wallet), wide)
+        for field in ready:
+            missing = {key: item for key, item in ready.items() if key != field}
+            with self.subTest(field=field), self.assertRaises(ValidatorError):
+                ready_message({**value, "ready": missing}, values, wallet)
+        for field, item in (
+            ("chain_id", "another-chain"),
+            ("consensus_pubkey", identity()[1]),
+            ("head_epoch", "1503092"),
+            ("catchup_head_epoch", "1503094"),
+            ("head_epoch", True),
+            ("head_epoch", 1503093.0),
+            ("state_root", "c" * 63),
+            ("state_root", "g" * 64),
+            ("config_hash", "a" * 128),
+            ("config_hash", None),
+        ):
+            with self.subTest(field=field, item=item), self.assertRaises(ValidatorError):
+                ready_message({**value, "ready": {**ready, field: item}}, values, wallet)
+        with self.assertRaisesRegex(ValidatorError, "upgrade required"):
+            ready_message({"head_epoch": 1503093}, values, wallet)
+
+    def test_ready_submit(self):
+        wallet = {"address": identity()[0], "pub": identity()[1]}
+        values = {"OCTRA_CHAIN_ID": "octra-test", "OCTRA_API_PORT": "8080"}
+        ready = {
+            "consensus_pubkey": wallet["pub"],
+            "head_epoch": "1503093",
+            "state_root": "c" * 64,
+            "chain_id": "octra-test",
+            "config_hash": "a" * 64,
+            "catchup_head_epoch": "1503093",
+        }
+        value = {"head_epoch": 1503093, "ready": ready}
+        bonded = Enrollment(EnrollmentState.BONDED, 1503093, 1000000, 1501965, None, None)
+        args = mock.Mock(no_wait=False)
+        with mock.patch("validator_enroll.call", return_value=value), mock.patch(
+            "validator_enroll.committed_enrollment", return_value=bonded,
+        ), mock.patch("validator_enroll.control_result", return_value="d" * 64) as control, mock.patch(
+            "validator_enroll.record_transaction",
+        ) as record, mock.patch("validator_enroll.wait_confirmed") as wait, mock.patch(
+            "validator_enroll.emit",
+        ) as emit:
+            self.assertEqual(submit_ready(WORK / "node.env", values, wallet, WORK / "wallet.json", args), "d" * 64)
+        self.assertEqual(control.call_args.kwargs, {
+            "message": ready,
+            "rpc": "http://127.0.0.1:8080/rpc",
+            "head": (1503093, "c" * 64),
+        })
+        record.assert_called_once_with(WORK / "node.env", "ready", "d" * 64)
+        wait.assert_called_once_with(values, "d" * 64, args)
+        self.assertEqual(emit.call_args.kwargs, {"event": "readiness", "state": "bonded", "ready_epoch": None})
+
+    def test_ready_control(self):
+        values = {
+            "OCTRA_OPERATOR_CONTROL_BINARY": str(WORK / "control"),
+            "OCTRA_OPERATOR_CONTROL_BINARY_HASH": "b" * 64,
+            "OCTRA_OPERATOR_RPC_URL": "https://external.example/rpc",
+            "OCTRA_CHAIN_ID": "octra-test",
+            "OCTRA_API_PORT": "8080",
+        }
+        wallet = {"address": identity()[0]}
+        options = {"rpc": "http://127.0.0.1:8080/rpc", "head": (42, "a" * 64)}
+        result = subprocess.CompletedProcess([], 0, json.dumps({"status": "accepted", "tx_hash": "c" * 64}), "")
+        with mock.patch("validator_enroll.sha256_file", return_value="b" * 64), mock.patch(
+            "validator_enroll.next_nonce", return_value=78,
+        ), mock.patch("validator_enroll.node_status", return_value=options["head"]), mock.patch(
+            "validator_enroll.subprocess.run", return_value=result,
+        ) as run:
+            self.assertEqual(control_result(values, wallet, WORK / "wallet.json", "validator_ready", **options), "c" * 64)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--rpc") + 1], options["rpc"])
+        self.assertEqual(command[command.index("--nonce") + 1], "78")
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        with mock.patch("validator_enroll.sha256_file", return_value="b" * 64), mock.patch(
+            "validator_enroll.next_nonce", return_value=78,
+        ), mock.patch("validator_enroll.node_status", return_value=(43, "d" * 64)), mock.patch(
+            "validator_enroll.subprocess.run",
+        ) as run:
+            with self.assertRaisesRegex(ValidatorError, "nothing sent"):
+                control_result(values, wallet, WORK / "wallet.json", "validator_ready", **options)
+        run.assert_not_called()
+
+    def test_control_errors(self):
+        values = {
+            "OCTRA_OPERATOR_CONTROL_BINARY": str(WORK / "control"),
+            "OCTRA_OPERATOR_CONTROL_BINARY_HASH": "b" * 64,
+            "OCTRA_OPERATOR_RPC_URL": "https://external.example/rpc",
+            "OCTRA_CHAIN_ID": "octra-test",
+        }
+        for detail in ('{"code":102,"message":"invalid nonce"}', "error\n" * 1000):
+            result = subprocess.CompletedProcess([], 1, "", detail)
+            with mock.patch("validator_enroll.sha256_file", return_value="b" * 64), mock.patch(
+                "validator_enroll.next_nonce", return_value=78,
+            ), mock.patch("validator_enroll.subprocess.run", return_value=result) as run:
+                with self.assertRaises(ValidatorError) as error:
+                    control_result(values, {}, WORK / "wallet.json", "validator_ready")
+            text = str(error.exception)
+            self.assertIn("exit = 1", text)
+            self.assertNotIn("wallet.json", text)
+            self.assertNotIn("\n", text)
+            self.assertLess(len(text), 4200)
+            if "invalid nonce" in detail:
+                self.assertIn("invalid nonce", text)
+            run.assert_called_once()
+        with mock.patch("validator_enroll.sha256_file", return_value="b" * 64), mock.patch(
+            "validator_enroll.next_nonce", return_value=78,
+        ), mock.patch("validator_enroll.subprocess.run", side_effect=subprocess.TimeoutExpired([], 30)) as run:
+            with self.assertRaisesRegex(ValidatorError, "result unknown"):
+                control_result(values, {}, WORK / "wallet.json", "validator_ready")
+        run.assert_called_once()
 
     def test_admission_epoch(self):
         values = {

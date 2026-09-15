@@ -10,6 +10,8 @@ service Node {
   rpc Account(AddressRequest) returns (JsonReply);
   rpc Transaction(HashRequest) returns (JsonReply);
   rpc Epoch(EpochRequest) returns (JsonReply);
+  rpc Epochs(EpochPageRequest) returns (EpochPageReply);
+  rpc Submit(SubmitRequest) returns (JsonReply);
 }
 
 message Empty {}
@@ -28,4 +30,44 @@ message EpochRequest {
 
 message JsonReply {
   bytes json = 1;
+}
+
+message SubmitRequest {
+  bytes transaction_json = 1;
+}
+
+message EpochAnchor {
+  string chain_id = 1;
+  uint64 epoch = 2;
+  string state_root = 3;
+}
+
+message EpochPageRequest {
+  uint64 start = 1;
+  optional uint32 limit = 2;
+  EpochAnchor anchor = 3;
+  string previous_root = 4;
+}
+
+message EpochRow {
+  uint64 epoch = 1;
+  string state_root = 2;
+  string prev_state_root = 3;
+  uint64 start_txid = 4;
+  uint64 tx_count = 5;
+  double finalized_at = 6;
+}
+
+enum EpochPageStop {
+  EPOCH_PAGE_STOP_UNSPECIFIED = 0;
+  EPOCH_PAGE_COMPLETE = 1;
+  EPOCH_PAGE_MORE = 2;
+  EPOCH_PAGE_GAP = 3;
+}
+
+message EpochPageReply {
+  EpochAnchor anchor = 1;
+  repeated EpochRow epochs = 2;
+  uint64 next_epoch = 3;
+  EpochPageStop stop = 4;
 }

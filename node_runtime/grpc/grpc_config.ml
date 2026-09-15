@@ -5,6 +5,7 @@ type t = {
   host : string;
   port : int;
   max_request_bytes : int;
+  submit_bytes : int option;
   max_response_bytes : int;
   max_streams : int;
   default_deadline_s : float;
@@ -17,8 +18,8 @@ type setting =
 
 let ( let* ) = Result.bind
 
-let bool_value name = function
-  | None -> Ok false
+let bool_value ~default name = function
+  | None -> Ok default
   | Some raw ->
     match String.lowercase_ascii (String.trim raw) with
     | "1" | "true" | "yes" -> Ok true
@@ -86,6 +87,18 @@ let enabled env =
       16_777_216
       max_response_bytes
   in
+  let* submit_enabled =
+    bool_value ~default:true "OCTRA_GRPC_SUBMIT_ENABLE" (env "OCTRA_GRPC_SUBMIT_ENABLE")
+  in
+  let* submit_bytes =
+    if not submit_enabled then Ok None
+    else
+      let name = "OCTRA_GRPC_MAX_SUBMIT_BYTES" in
+      let limit = Octra_net.P2p_tx_gossip.max_tx_json + 5 in
+      let* size = int_value env name limit in
+      let* size = in_range name 1 limit size in
+      Ok (Some size)
+  in
   let* max_streams = int_value env "OCTRA_GRPC_MAX_STREAMS" 32 in
   let* max_streams = in_range "OCTRA_GRPC_MAX_STREAMS" 1 128 max_streams in
   let* default_deadline_ms =
@@ -109,6 +122,7 @@ let enabled env =
        host;
        port;
        max_request_bytes;
+       submit_bytes;
        max_response_bytes;
        max_streams;
        default_deadline_s = float_of_int default_deadline_ms /. 1000.0;
@@ -116,7 +130,7 @@ let enabled env =
      })
 
 let of_env env =
-  match bool_value "OCTRA_GRPC_ENABLE" (env "OCTRA_GRPC_ENABLE") with
+  match bool_value ~default:false "OCTRA_GRPC_ENABLE" (env "OCTRA_GRPC_ENABLE") with
   | Error _ as error -> error
   | Ok false -> Ok Disabled
   | Ok true -> enabled env

@@ -7,6 +7,27 @@
 #include <caml/unixsupport.h>
 #include <errno.h>
 #include <poll.h>
+#include <caml/alloc.h>
+
+CAMLprim value octra_accept_codes(value unit)
+{
+  CAMLparam1(unit);
+  CAMLlocal2(result, entry);
+  result = Val_emptylist;
+#ifdef EPROTO
+  entry = caml_alloc_small(2, 0);
+  Field(entry, 0) = Val_int(EPROTO);
+  Field(entry, 1) = result;
+  result = entry;
+#endif
+#ifdef ENONET
+  entry = caml_alloc_small(2, 0);
+  Field(entry, 0) = Val_int(ENONET);
+  Field(entry, 1) = result;
+  result = entry;
+#endif
+  CAMLreturn(result);
+}
 
 CAMLprim value octra_io_wait(value input, value output, value error, value mask)
 {
