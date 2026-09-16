@@ -124,6 +124,8 @@ from validator_rejoin import sync_state
 from validator_rejoin import vote_state
 from validator_status import promotion_readiness
 from validator_status import round_view
+from validator_status import recent_heads
+from validator_status import peer_lags
 from validator_store import data_dir
 from validator_store import prior_scan
 from validator_store import pack_bytes
@@ -1010,7 +1012,7 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(recovery_installed("validator", state, release_value()))
         self.assertEqual(
             deadline_result("validator", state, release_value()),
-            ("installed", "network_not_finalizing", "leave_running", 0),
+            ("installed", "peer_head_unavailable", "leave_running", 0),
         )
         self.assertFalse(
             recovery_installed(
@@ -2598,14 +2600,45 @@ class ValidatorToolsTest(unittest.TestCase):
     def test_rejoin_head_invalid(self):
         payload = {
             "peers": [
-                {"head_epoch": "41"},
-                {"head_epoch": 39},
+                {"head_epoch": "41", "age_sec": 1},
+                {"head_epoch": 39, "age_sec": 120},
                 {"head_epoch": "bad"},
                 {},
             ],
         }
         self.assertEqual(peer_head(payload), 41)
         self.assertIsNone(peer_head({"peers": []}))
+
+    def test_peer_head_age(self):
+        rows = [{"head_epoch": 41, "age_sec": age} for age in
+                [None, -1, 121, float("nan"), float("inf"), True, "bad"]]
+        rows += [{"head_epoch": epoch, "age_sec": 1} for epoch in
+                 [None, -1, True, 1.5, "bad"]]
+        rows += [None, [], {}, {"head_epoch": 41}]
+        payload = {"peers": rows}
+        self.assertEqual(recent_heads(payload), [])
+        self.assertIsNone(peer_head(payload))
+        self.assertIsNone(upgrade_tool.peer_head(payload))
+        self.assertEqual(peer_lags(payload, 44)["peer_max_lag"], "unavailable")
+
+    def test_peer_head_and_round(self):
+        payload = {
+            "peers": [
+                {"head_epoch": "41", "age_sec": 2},
+                {"head_epoch": "20", "age_sec": 900},
+                {"head_epoch": "999", "age_sec": 900},
+            ],
+            "round_peers": [{"epoch_id": "44", "round": 0, "age_sec": 1}],
+        }
+        self.assertEqual(peer_head(payload), 41)
+        self.assertEqual(upgrade_tool.peer_head(payload), 41)
+        self.assertEqual(peer_lags(payload, 44), {
+            "peer_heads_recent": 1,
+            "peer_heads_unknown": 2,
+            "peer_head_max_age": 120.0,
+            "peer_max_lag": 3,
+        })
+        self.assertEqual(recent_heads({"round_peers": payload["round_peers"]}), [])
 
     def test_rejoin_reads_vote_state(self):
         self.assertEqual(vote_state({"voting": True}), (True, None))
@@ -2717,7 +2750,7 @@ class ValidatorToolsTest(unittest.TestCase):
             },
         }]
         peers = {
-            "peers": [{"head_epoch": "41"}],
+            "peers": [{"head_epoch": "41", "age_sec": 1.0}],
             "round_state": {"epoch_id": "42", "round": 18},
             "round_agreed": False,
             "round_peers": [{"epoch_id": "42", "round": 18, "age_sec": 1.0}],

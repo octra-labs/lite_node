@@ -196,7 +196,7 @@ let open_store ?(fresh=false) ?(readonly=false) path =
   let config = Irmin_pack.Conf.init
     ~fresh
     ~readonly
-    ~lru_size:100_000
+    ~lru_max_memory:(Some 67_108_864)
     ~index_log_size:2_500_000
     ~indexing_strategy:Irmin_pack.Indexing_strategy.minimal
     ~use_fsync:true
@@ -265,10 +265,24 @@ let write t path value =
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e);
        Lwt.fail (Irmin_write_failed msg))
 
+let read_value tree path =
+  let* leaf = Store.Tree.find_tree tree path in
+  match leaf with
+  | None -> Lwt.return_none
+  | Some leaf ->
+    match Store.Tree.destruct leaf with
+    | `Node _ -> Lwt.return_none
+    | `Contents (contents, _) ->
+      let* value = Store.Tree.find leaf [] in
+      Store.Tree.Contents.clear contents;
+      Lwt.return value
+
 let read t path =
   match t.batch_tree with
-  | Some tree -> Store.Tree.find tree path
-  | None -> Store.find t.store path
+  | Some tree -> read_value tree path
+  | None ->
+    let* tree = Store.tree t.store in
+    read_value tree path
 
 let read_tree t path =
   match t.batch_tree with
@@ -541,7 +555,7 @@ let capture_read_snapshot_epoch t ~epoch_id =
            })
 
 let read_snapshot (snapshot : read_snapshot) path =
-  Store.Tree.find snapshot.tree path
+  read_value snapshot.tree path
 
 let prove_tree t tree path =
   let* key = tree_key t tree in

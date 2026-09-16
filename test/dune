@@ -26,6 +26,11 @@
  (libraries octra_core zarith unix))
 
 (test
+ (name test_bft_finalize_hold)
+ (modules test_bft_finalize_hold)
+ (libraries octra_consensus octra_net lwt.unix mirage-crypto-rng.unix))
+
+(test
  (name test_admit)
  (modules test_admit)
  (libraries octra_core octra_node_runtime zarith unix yojson lwt.unix))
@@ -113,6 +118,11 @@
  (name test_store_growth)
  (modules test_store_growth)
  (libraries octra_core digestif irmin-pack lwt.unix zarith))
+
+(test
+ (name test_store_heap)
+ (modules test_store_heap)
+ (libraries octra_core octra_test_workspace irmin-pack lwt.unix))
 
 (test
  (name test_program_compile)

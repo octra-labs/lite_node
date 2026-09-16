@@ -211,6 +211,26 @@ let check_pending_nonce () =
   check "removed pending nonce" (Tx_staging.pending_nonce from 214 = 214);
   check "empty confirmed floor" (Tx_staging.pending_nonce from 218 = 218)
 
+let check_duty_nonce () =
+  Tx_staging.clear ();
+  let from = sender 707 in
+  let duty nonce = transaction ~op_type:Transaction.ValidatorReady from nonce in
+  let tail = List.init 5 (fun index -> duty (436 + index)) in
+  List.iter add tail;
+  let nonce = Tx_staging.first_missing_nonce from 349 in
+  check "duty fills confirmed gap" (nonce = 350);
+  check "pending maximum is not next duty nonce"
+    (Tx_staging.pending_nonce from 349 = 440);
+  add (duty nonce);
+  check "duty does not replace occupied nonce"
+    (Tx_staging.first_missing_nonce from 349 = 351);
+  check "duty retains existing transactions"
+    (List.for_all (fun tx ->
+      Tx_staging.find_by_hash (Transaction.hash tx) = Some tx) tail);
+  check "duty follows committed nonce"
+    (Tx_staging.first_missing_nonce from 440 = 441);
+  Tx_staging.clear ()
+
 let check_recent_order () =
   Tx_staging.clear ();
   let first = transaction ~timestamp:2. (sender 710) 1 in
@@ -349,6 +369,7 @@ let () =
   check_pool_eviction ();
   check_queue_state ();
   check_pending_nonce ();
+  check_duty_nonce ();
   check_recent_order ();
   check_ready_gap ();
   check_ready_cost ();

@@ -3172,7 +3172,8 @@ let rec process_outputs_once t =
                   false
                 | Ok () ->
                   (match
-                     C_vote_log.prune t.vote_log ~through_epoch:epoch_id
+                     C_vote_log.prune t.vote_log
+                       ~through_epoch:(Int64.pred epoch_id)
                    with
                    | Ok () -> true
                    | Error reason ->

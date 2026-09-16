@@ -1575,7 +1575,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         | _, None -> Lwt.return_error "validator set fold account is unavailable"
         | Some state_root, Some account ->
           let nonce =
-            Staging.pending_nonce wallet.address account.Ledger.nonce + 1
+            Staging.first_missing_nonce wallet.address account.Ledger.nonce
           in
           let draft = Transaction.{
             from = wallet.address;

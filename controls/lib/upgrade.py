@@ -35,6 +35,7 @@ from validator_recover import recover
 from validator_rejoin import place_floor
 from validator_status import rpc_method
 from validator_status import rpc_status
+from validator_status import recent_heads
 from sync_need import Need
 from sync_need import choose as choose_need
 from sync_need import make
@@ -403,15 +404,7 @@ def inspect_votes(data_dir):
     return faults
 
 def peer_head(payload):
-    if not isinstance(payload, dict):
-        return None
-    values = []
-    for record in payload.get("peers") or []:
-        try:
-            values.append(int(record["head_epoch"]))
-        except (KeyError, TypeError, ValueError):
-            pass
-    return max(values) if values else None
+    return max(recent_heads(payload), default=None)
 
 def round_value(payload, key):
     if not isinstance(payload, dict):
@@ -632,7 +625,7 @@ def recovery_installed(role, state, release):
 
 def deadline_result(role, state, release):
     if recovery_installed(role, state, release):
-        return "installed", "network_not_finalizing", "leave_running", 0
+        return "installed", "peer_head_unavailable", "leave_running", 0
     return "pending", "health_deadline", "do_not_restart", 2
 
 def current(sup, rows, entries):

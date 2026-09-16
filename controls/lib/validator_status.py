@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -19,6 +20,44 @@ from validator_common import sha256_file
 from validator_common import state_ready
 from validator_enroll import committed_enrollment
 from validator_enroll import membership
+
+HEAD_AGE_SECONDS = 120.0
+
+def recent_heads(payload):
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("peers")
+    if not isinstance(rows, list):
+        return []
+    def read(row):
+        if not isinstance(row, dict):
+            return None
+        epoch = row.get("head_epoch")
+        age = row.get("age_sec")
+        if isinstance(epoch, bool) or isinstance(age, bool):
+            return None
+        if not isinstance(epoch, (str, int)):
+            return None
+        try:
+            epoch = int(epoch)
+            age = float(age)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if epoch < 0 or not math.isfinite(age) or not 0 <= age <= HEAD_AGE_SECONDS:
+            return None
+        return epoch
+    return [epoch for row in rows if (epoch := read(row)) is not None]
+
+def peer_lags(payload, local_epoch):
+    heads = recent_heads(payload)
+    records = payload.get("peers") if isinstance(payload, dict) else None
+    count = len(records) if isinstance(records, list) else 0
+    return {
+        "peer_heads_recent": len(heads),
+        "peer_heads_unknown": count - len(heads),
+        "peer_head_max_age": HEAD_AGE_SECONDS,
+        "peer_max_lag": max((max(0, local_epoch - head) for head in heads), default="unavailable"),
+    }
 
 def emit(key, value):
     print(f"{key} = {value}")
@@ -232,10 +271,10 @@ def main():
         emit("p2p_connected", diagnostics.get("connected", 0))
         emit("p2p_known", diagnostics.get("known", 0))
         emit("consensus_peers", len(records))
-        if status and records:
+        if status:
             local_epoch = int(status.get("head_epoch") or status.get("current_epoch") or 0)
-            lags = [max(0, local_epoch - int(record.get("head_epoch", 0))) for record in records]
-            emit("peer_max_lag", max(lags))
+            for key, value in peer_lags(peers, local_epoch).items():
+                emit(key, value)
     try:
         validator_state = membership(values, wallet)
         emit("validator_active", str(validator_state["active"]).lower())

@@ -26,6 +26,7 @@ from validator_process import node_owners
 from validator_process import pm2_entries
 from validator_status import rpc_method
 from validator_status import rpc_status
+from validator_status import recent_heads
 
 ROUND_AGE_SECONDS = 30.0
 MEET_AGE_SECONDS = 150.0
@@ -414,22 +415,7 @@ def number(payload, key):
     return value
 
 def peer_head(payload):
-    if not isinstance(payload, dict):
-        return None
-    records = payload.get("peers")
-    if not isinstance(records, list):
-        return None
-    heads = []
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        try:
-            head = int(record["head_epoch"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if head >= 0:
-            heads.append(head)
-    return max(heads) if heads else None
+    return max(recent_heads(payload), default=None)
 
 def round_value(row, key):
     if not isinstance(row, dict):

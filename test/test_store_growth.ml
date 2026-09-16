@@ -73,6 +73,16 @@ let rec suffix_bytes path =
     Int64.of_int stat.Unix.st_size
   | _ -> 0L
 
+let wait_disk path before =
+  let rec sample () =
+    let bytes = disk_bytes path in
+    if bytes < before then Lwt.return bytes
+    else
+      let* () = Lwt_unix.sleep 0.01 in
+      sample ()
+  in
+  Lwt_main.run (Lwt_unix.with_timeout 5.0 sample)
+
 let address id =
   let hash =
     Digestif.SHA256.digest_string (string_of_int id)
@@ -245,7 +255,7 @@ let gc_case root =
       expect "completed pack estimate was retained" (reported_need = None);
       expect "pack collection changed root"
         (String.equal expected_root (head store));
-      let after = disk_bytes path in
+      let after = wait_disk path before in
       expect "pack collection did not reduce disk" (after < before);
       Printf.printf
         "event = store_growth mode = gc before = %Ld after = %Ld need = %Ld\n%!"
