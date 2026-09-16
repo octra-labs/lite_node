@@ -51,9 +51,13 @@ val set_open_activation : t -> activation option
 val object_cost_activation : t -> activation option
 val account_pack_activation : t -> activation option
 val standard_activation : t -> activation option
+val set_plan_activation : t -> activation option
+val math_activation : t -> activation option
 val ready_config_hash : t -> string option
 
-val consensus_id : chain_id:string -> string
+val consensus_id : chain_id:string -> epoch:int -> string
+
+val profile_epochs : chain_id:string -> int list
 
 val root_after_floor :
   chain_id:string ->
@@ -140,5 +144,13 @@ val standard_at :
   chain_id:string ->
   epoch:int ->
   mode
+
+val set_plan : t -> epoch:int -> (mode, fault) result
+
+val set_plan_at : chain_id:string -> epoch:int -> mode
+
+val math : t -> epoch:int -> (mode, fault) result
+
+val math_at : chain_id:string -> epoch:int -> mode
 
 val fault_message : fault -> string

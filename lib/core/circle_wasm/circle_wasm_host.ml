@@ -650,6 +650,7 @@ let execute_with_profile
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -740,6 +741,7 @@ let execute_with_profile
             `Null
         end;
         "hfhe_strict", `Bool hfhe_strict;
+        "math", `Bool math;
         "hfhe_receipt_mode",
         `String (Circle_hfhe_transcript.mode_name hfhe_mode);
         "hfhe_receipt_entries",
@@ -921,6 +923,7 @@ let execute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -940,6 +943,7 @@ let execute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -965,6 +969,7 @@ let execute_compute_with_storage_inner
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -982,6 +987,7 @@ let execute_compute_with_storage_inner
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -1006,6 +1012,7 @@ let execute_compute_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1025,6 +1032,7 @@ let execute_compute_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -1045,6 +1053,7 @@ let execute_compute_isolated_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1064,6 +1073,7 @@ let execute_compute_isolated_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -1082,6 +1092,7 @@ let execute_compute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1100,6 +1111,7 @@ let execute_compute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit

@@ -1509,16 +1509,21 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
     if propose.epoch_id <= 0L then Ok None
     else
       match deps.previous_epoch_ts (Int64.pred propose.epoch_id) with
-      | None -> Error "previous epoch time unavailable"
+      | None -> Error `Pending
       | Some value ->
         begin
           match Octra_consensus.Epoch_time.of_seconds value with
           | Ok time -> Ok (Some time)
-          | Error reason -> Error reason
+          | Error reason -> Error (`Invalid reason)
         end
   in
   match previous with
-  | Error reason ->
+  | Error `Pending ->
+    Octra_log.info "consensus"
+      "event = proposal_wait epoch = %Ld round = %d reason = previous_epoch_time_unavailable"
+      propose.epoch_id propose.round;
+    Lwt.return wait
+  | Error (`Invalid reason) ->
     Octra_log.warn "consensus"
       "reject proposal reason = invalid_epoch_time detail = %s"
       reason;

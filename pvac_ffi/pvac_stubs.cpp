@@ -372,13 +372,13 @@ static bool verify_range_any_safe(
     pvac::PubKey& pk,
     pvac::Cipher& ct,
     const pvac_ser::RangeProofAny& proof,
-    bool strict) {
+    bool strict, pvac::ScalarRule rule) {
     try {
         if (proof.format != pvac_ser::RP_BOUND)
             return false;
         return strict
-            ? pvac::verify_zero_bound_range(pk, ct, proof.bound_proof)
-            : pvac::verify_range_amount_prior(pk, ct, proof.bound_proof);
+            ? pvac::verify_zero_bound_range(pk, ct, proof.bound_proof, rule)
+            : pvac::verify_range_amount_prior(pk, ct, proof.bound_proof, rule);
     } catch (const std::exception& e) {
         return false;
     } catch (...) {
@@ -746,8 +746,9 @@ CAMLprim value caml_pvac_ct_sub(value v_pk, value v_a, value v_b) {
     CAMLreturn(wrap_cipher(ct));
 }
 
-CAMLprim value caml_pvac_ct_mul_seeded(value v_pk, value v_a, value v_b, value v_seed) {
-    CAMLparam4(v_pk, v_a, v_b, v_seed);
+CAMLprim value caml_pvac_ct_mul_seeded_math(value v_math, value v_pk, value v_a, value v_b, value v_seed) {
+    CAMLparam5(v_math, v_pk, v_a, v_b, v_seed);
+    const bool math = Bool_val(v_math);
     DBG_ENTER("ct_mul_seeded");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -769,7 +770,7 @@ CAMLprim value caml_pvac_ct_mul_seeded(value v_pk, value v_a, value v_b, value v
     char err_buf[256] = {0};
     caml_release_runtime_system();
     try {
-        *ct = pvac::ct_mul_seeded(pk, a, b, seed);
+        *ct = pvac::ct_mul_seeded(pk, a, b, seed, 8, math);
     } catch (const std::exception& e) {
         snprintf(err_buf, sizeof(err_buf), "%s", e.what());
     } catch (...) {
@@ -787,8 +788,9 @@ CAMLprim value caml_pvac_ct_mul_seeded(value v_pk, value v_a, value v_b, value v
     CAMLreturn(wrap_cipher(ct));
 }
 
-CAMLprim value caml_pvac_ct_scale(value v_pk, value v_ct, value v_scalar) {
-    CAMLparam3(v_pk, v_ct, v_scalar);
+CAMLprim value caml_pvac_ct_scale_math(value v_math, value v_pk, value v_ct, value v_scalar) {
+    CAMLparam4(v_math, v_pk, v_ct, v_scalar);
+    const bool math = Bool_val(v_math);
     DBG_ENTER("ct_scale");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -796,7 +798,7 @@ CAMLprim value caml_pvac_ct_scale(value v_pk, value v_ct, value v_scalar) {
     int64_t scalar = Int64_val(v_scalar);
     DBG_SIZE("ct.edges", ct.E.size());
 
-    pvac::Fp s = pvac::fp_from_u64(static_cast<uint64_t>(scalar));
+    pvac::Fp s = math ? pvac::detail::fp_from_i64(scalar) : pvac::fp_from_u64(static_cast<uint64_t>(scalar));
     pvac::Cipher* result = new pvac::Cipher();
     try {
         *result = pvac::ct_scale(pk, ct, s);
@@ -809,8 +811,9 @@ CAMLprim value caml_pvac_ct_scale(value v_pk, value v_ct, value v_scalar) {
     CAMLreturn(wrap_cipher(result));
 }
 
-CAMLprim value caml_pvac_ct_add_const(value v_pk, value v_ct, value v_lo, value v_hi) {
-    CAMLparam4(v_pk, v_ct, v_lo, v_hi);
+CAMLprim value caml_pvac_ct_add_const_math(value v_math, value v_pk, value v_ct, value v_lo, value v_hi) {
+    CAMLparam5(v_math, v_pk, v_ct, v_lo, v_hi);
+    const bool math = Bool_val(v_math);
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
@@ -822,14 +825,21 @@ CAMLprim value caml_pvac_ct_add_const(value v_pk, value v_ct, value v_lo, value 
     k.hi = hi;
 
     pvac::Cipher* result = copy_cipher(ct);
-    for (size_t j = 0; j < result->c0.size(); ++j)
-        result->c0[j] = pvac::fp_add(result->c0[j], k);
+    try {
+        if (math && result->c0.empty()) result->c0 = pvac::field::Op::zeros(result->slots);
+        for (size_t j = 0; j < result->c0.size(); ++j)
+            result->c0[j] = pvac::fp_add(result->c0[j], k);
+    } catch (...) {
+        delete result;
+        caml_failwith("pvac: cipher addition failed");
+    }
 
     CAMLreturn(wrap_cipher(result));
 }
 
-CAMLprim value caml_pvac_ct_sub_const(value v_pk, value v_ct, value v_k) {
-    CAMLparam3(v_pk, v_ct, v_k);
+CAMLprim value caml_pvac_ct_sub_const_math(value v_math, value v_pk, value v_ct, value v_k) {
+    CAMLparam4(v_math, v_pk, v_ct, v_k);
+    const bool math = Bool_val(v_math);
 
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
     uint64_t k = Int64_val(v_k);
@@ -837,8 +847,14 @@ CAMLprim value caml_pvac_ct_sub_const(value v_pk, value v_ct, value v_k) {
     pvac::Fp neg_k = pvac::fp_neg(pvac::fp_from_u64(k));
 
     pvac::Cipher* result = copy_cipher(ct);
-    for (size_t j = 0; j < result->c0.size(); ++j)
-        result->c0[j] = pvac::fp_add(result->c0[j], neg_k);
+    try {
+        if (math && result->c0.empty()) result->c0 = pvac::field::Op::zeros(result->slots);
+        for (size_t j = 0; j < result->c0.size(); ++j)
+            result->c0[j] = pvac::fp_add(result->c0[j], neg_k);
+    } catch (...) {
+        delete result;
+        caml_failwith("pvac: cipher subtraction failed");
+    }
 
     CAMLreturn(wrap_cipher(result));
 }
@@ -868,8 +884,9 @@ CAMLprim value caml_pvac_ct_div_const(value v_pk, value v_ct, value v_lo, value 
     CAMLreturn(wrap_cipher(result));
 }
 
-CAMLprim value caml_pvac_ct_square_seeded(value v_pk, value v_ct, value v_seed) {
-    CAMLparam3(v_pk, v_ct, v_seed);
+CAMLprim value caml_pvac_ct_square_seeded_math(value v_math, value v_pk, value v_ct, value v_seed) {
+    CAMLparam4(v_math, v_pk, v_ct, v_seed);
+    const bool math = Bool_val(v_math);
     DBG_ENTER("ct_square_seeded");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -882,7 +899,7 @@ CAMLprim value caml_pvac_ct_square_seeded(value v_pk, value v_ct, value v_seed) 
 
     pvac::Cipher* result = new pvac::Cipher();
     try {
-        *result = pvac::ct_square_seeded(pk, ct, seed);
+        *result = pvac::ct_square_seeded(pk, ct, seed, 8, math);
     } catch (const std::exception& e) {
         delete result;
         caml_failwith(e.what());
@@ -1525,8 +1542,10 @@ CAMLprim value caml_pvac_deserialize_seckey(value v_bytes) {
     CAMLreturn(wrap_seckey(sk));
 }
 
-CAMLprim value caml_pvac_make_zero_proof(value v_pk, value v_sk, value v_ct) {
-    CAMLparam3(v_pk, v_sk, v_ct);
+CAMLprim value caml_pvac_make_zero_proof_math(value v_math, value v_pk, value v_sk, value v_ct) {
+    CAMLparam4(v_math, v_pk, v_sk, v_ct);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("make_zero_proof");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1537,7 +1556,7 @@ CAMLprim value caml_pvac_make_zero_proof(value v_pk, value v_sk, value v_ct) {
 
     pvac::ZeroProof* zp = new pvac::ZeroProof();
     try {
-        *zp = pvac::make_zero_proof(pk, sk, ct);
+        *zp = pvac::make_zero_proof(pk, sk, ct, rule);
     } catch (const std::exception& e) {
         delete zp;
         caml_failwith(e.what());
@@ -1548,8 +1567,10 @@ CAMLprim value caml_pvac_make_zero_proof(value v_pk, value v_sk, value v_ct) {
     CAMLreturn(wrap_zero_proof(zp));
 }
 
-CAMLprim value caml_pvac_verify_zero(value v_pk, value v_ct, value v_proof) {
-    CAMLparam3(v_pk, v_ct, v_proof);
+CAMLprim value caml_pvac_verify_zero_math(value v_math, value v_pk, value v_ct, value v_proof) {
+    CAMLparam4(v_math, v_pk, v_ct, v_proof);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("verify_zero");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1562,7 +1583,7 @@ CAMLprim value caml_pvac_verify_zero(value v_pk, value v_ct, value v_proof) {
     bool ok = false;
     caml_release_runtime_system();
     try {
-        ok = pvac::verify_zero(pk, ct, proof);
+        ok = pvac::verify_zero(pk, ct, proof, rule);
     } catch (const std::exception& e) {
         ok = false;
     } catch (...) {
@@ -1574,9 +1595,11 @@ CAMLprim value caml_pvac_verify_zero(value v_pk, value v_ct, value v_proof) {
     CAMLreturn(Val_bool(ok));
 }
 
-CAMLprim value caml_pvac_make_zero_proof_bound(value v_pk, value v_sk, value v_ct,
-                                                value v_amount, value v_blinding) {
-    CAMLparam5(v_pk, v_sk, v_ct, v_amount, v_blinding);
+CAMLprim value caml_pvac_make_zero_proof_bound_math(value v_math, value v_pk, value v_sk, value v_ct, value v_amount, value v_blinding) {
+    CAMLparam5(v_math, v_pk, v_sk, v_ct, v_amount);
+    CAMLxparam1(v_blinding);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("make_zero_proof_bound");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1588,7 +1611,7 @@ CAMLprim value caml_pvac_make_zero_proof_bound(value v_pk, value v_sk, value v_c
 
     pvac::ZeroProof* zp = new pvac::ZeroProof();
     try {
-        *zp = pvac::make_zero_proof_bound(pk, sk, ct, amount, blind);
+        *zp = pvac::make_zero_proof_bound(pk, sk, ct, amount, blind, rule);
     } catch (const std::exception& e) {
         delete zp;
         caml_failwith(e.what());
@@ -1600,9 +1623,14 @@ CAMLprim value caml_pvac_make_zero_proof_bound(value v_pk, value v_sk, value v_c
     CAMLreturn(wrap_zero_proof(zp));
 }
 
-CAMLprim value caml_pvac_verify_zero_bound(value v_pk, value v_ct, value v_proof,
-                                            value v_commitment) {
-    CAMLparam4(v_pk, v_ct, v_proof, v_commitment);
+CAMLprim value caml_pvac_make_zero_proof_bound_bytecode(value* argv, int) {
+    return caml_pvac_make_zero_proof_bound_math(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]);
+}
+
+CAMLprim value caml_pvac_verify_zero_bound_math(value v_math, value v_pk, value v_ct, value v_proof, value v_commitment) {
+    CAMLparam5(v_math, v_pk, v_ct, v_proof, v_commitment);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("verify_zero_bound");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1621,7 +1649,7 @@ CAMLprim value caml_pvac_verify_zero_bound(value v_pk, value v_ct, value v_proof
     bool ok = false;
     caml_release_runtime_system();
     try {
-        ok = pvac::verify_zero_bound(pk, ct, proof, commitment);
+        ok = pvac::verify_zero_bound(pk, ct, proof, commitment, rule);
     } catch (const std::exception& e) {
         ok = false;
     } catch (...) {
@@ -1634,6 +1662,7 @@ CAMLprim value caml_pvac_verify_zero_bound(value v_pk, value v_ct, value v_proof
 }
 
 static value caml_pvac_verify_zero_amount_prior_impl(
+    value v_math,
     value v_pk,
     value v_ct,
     value v_proof,
@@ -1642,9 +1671,11 @@ static value caml_pvac_verify_zero_amount_prior_impl(
         const pvac::PubKey&,
         const pvac::Cipher&,
         const pvac::ZeroProof&,
-        const pvac::RistrettoPoint&)
+        const pvac::RistrettoPoint&,
+        pvac::ScalarRule)
 ) {
-    CAMLparam4(v_pk, v_ct, v_proof, v_commitment);
+    CAMLparam5(v_math, v_pk, v_ct, v_proof, v_commitment);
+    const auto rule = Bool_val(v_math) ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
     pvac::ZeroProof& proof = *Handle_val(pvac::ZeroProof, v_proof);
@@ -1658,7 +1689,7 @@ static value caml_pvac_verify_zero_amount_prior_impl(
     bool ok = false;
     caml_release_runtime_system();
     try {
-        ok = verify(pk, ct, proof, commitment);
+        ok = verify(pk, ct, proof, commitment, rule);
     } catch (...) {
         ok = false;
     }
@@ -1666,13 +1697,9 @@ static value caml_pvac_verify_zero_amount_prior_impl(
     CAMLreturn(Val_bool(ok));
 }
 
-CAMLprim value caml_pvac_verify_zero_amount_prior(
-    value v_pk,
-    value v_ct,
-    value v_proof,
-    value v_commitment
-) {
+CAMLprim value caml_pvac_verify_zero_amount_prior_math(value v_math, value v_pk, value v_ct, value v_proof, value v_commitment) {
     return caml_pvac_verify_zero_amount_prior_impl(
+        v_math,
         v_pk,
         v_ct,
         v_proof,
@@ -1680,13 +1707,10 @@ CAMLprim value caml_pvac_verify_zero_amount_prior(
         pvac::verify_zero_amount_prior);
 }
 
-CAMLprim value caml_pvac_verify_zero_bound_key_switch(
-    value v_pk,
-    value v_ct,
-    value v_proof,
-    value v_commitment
-) {
-    CAMLparam4(v_pk, v_ct, v_proof, v_commitment);
+CAMLprim value caml_pvac_verify_zero_bound_key_switch_math(value v_math, value v_pk, value v_ct, value v_proof, value v_commitment) {
+    CAMLparam5(v_math, v_pk, v_ct, v_proof, v_commitment);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("verify_zero_bound_key_switch");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1705,7 +1729,7 @@ CAMLprim value caml_pvac_verify_zero_bound_key_switch(
     bool ok = false;
     caml_release_runtime_system();
     try {
-        ok = pvac::verify_zero_bound_key_switch(pk, ct, proof, commitment);
+        ok = pvac::verify_zero_bound_key_switch(pk, ct, proof, commitment, rule);
     } catch (...) {
         ok = false;
     }
@@ -1715,13 +1739,9 @@ CAMLprim value caml_pvac_verify_zero_bound_key_switch(
     CAMLreturn(Val_bool(ok));
 }
 
-CAMLprim value caml_pvac_verify_zero_amount_key_switch_prior(
-    value v_pk,
-    value v_ct,
-    value v_proof,
-    value v_commitment
-) {
+CAMLprim value caml_pvac_verify_zero_amount_key_switch_prior_math(value v_math, value v_pk, value v_ct, value v_proof, value v_commitment) {
     return caml_pvac_verify_zero_amount_prior_impl(
+        v_math,
         v_pk,
         v_ct,
         v_proof,
@@ -1729,14 +1749,11 @@ CAMLprim value caml_pvac_verify_zero_amount_key_switch_prior(
         pvac::verify_zero_amount_key_switch_prior);
 }
 
-CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration(
-    value v_pk,
-    value v_sk,
-    value v_ct,
-    value v_amount,
-    value v_blinding
-) {
-    CAMLparam5(v_pk, v_sk, v_ct, v_amount, v_blinding);
+CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration_math(value v_math, value v_pk, value v_sk, value v_ct, value v_amount, value v_blinding) {
+    CAMLparam5(v_math, v_pk, v_sk, v_ct, v_amount);
+    CAMLxparam1(v_blinding);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
     pvac::SecKey& sk = *Handle_val(pvac::SecKey, v_sk);
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
@@ -1754,7 +1771,7 @@ CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration(
             sk,
             ct,
             amount,
-            blind);
+            blind, rule);
     } catch (const std::exception& error) {
         delete proof;
         caml_failwith(error.what());
@@ -1762,13 +1779,14 @@ CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration(
     CAMLreturn(wrap_zero_proof(proof));
 }
 
-CAMLprim value caml_pvac_verify_zero_bound_historical_migration(
-    value v_pk,
-    value v_ct,
-    value v_proof,
-    value v_commitment
-) {
-    CAMLparam4(v_pk, v_ct, v_proof, v_commitment);
+CAMLprim value caml_pvac_make_zero_proof_bound_historical_migration_bytecode(value* argv, int) {
+    return caml_pvac_make_zero_proof_bound_historical_migration_math(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]);
+}
+
+CAMLprim value caml_pvac_verify_zero_bound_historical_migration_math(value v_math, value v_pk, value v_ct, value v_proof, value v_commitment) {
+    CAMLparam5(v_math, v_pk, v_ct, v_proof, v_commitment);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
     pvac::ZeroProof& proof = *Handle_val(pvac::ZeroProof, v_proof);
@@ -1786,7 +1804,7 @@ CAMLprim value caml_pvac_verify_zero_bound_historical_migration(
             pk,
             ct,
             proof,
-            commitment);
+            commitment, rule);
     } catch (...) {
         ok = false;
     }
@@ -1794,13 +1812,9 @@ CAMLprim value caml_pvac_verify_zero_bound_historical_migration(
     CAMLreturn(Val_bool(ok));
 }
 
-CAMLprim value caml_pvac_verify_zero_amount_historical_prior(
-    value v_pk,
-    value v_ct,
-    value v_proof,
-    value v_commitment
-) {
+CAMLprim value caml_pvac_verify_zero_amount_historical_prior_math(value v_math, value v_pk, value v_ct, value v_proof, value v_commitment) {
     return caml_pvac_verify_zero_amount_prior_impl(
+        v_math,
         v_pk,
         v_ct,
         v_proof,
@@ -1808,9 +1822,11 @@ CAMLprim value caml_pvac_verify_zero_amount_historical_prior(
         pvac::verify_zero_amount_historical_prior);
 }
 
-CAMLprim value caml_pvac_make_zero_proof_bound_range(value v_pk, value v_sk, value v_ct,
-                                                     value v_amount, value v_blinding) {
-    CAMLparam5(v_pk, v_sk, v_ct, v_amount, v_blinding);
+CAMLprim value caml_pvac_make_zero_proof_bound_range_math(value v_math, value v_pk, value v_sk, value v_ct, value v_amount, value v_blinding) {
+    CAMLparam5(v_math, v_pk, v_sk, v_ct, v_amount);
+    CAMLxparam1(v_blinding);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("make_zero_proof_bound_range");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1824,7 +1840,7 @@ CAMLprim value caml_pvac_make_zero_proof_bound_range(value v_pk, value v_sk, val
 
     pvac::ZeroProof* zp = new pvac::ZeroProof();
     try {
-        *zp = pvac::make_zero_proof_bound_range(pk, sk, ct, amount, blind);
+        *zp = pvac::make_zero_proof_bound_range(pk, sk, ct, amount, blind, rule);
     } catch (const std::exception& e) {
         delete zp;
         caml_failwith(e.what());
@@ -1834,6 +1850,10 @@ CAMLprim value caml_pvac_make_zero_proof_bound_range(value v_pk, value v_sk, val
     DBG_SIZE("proof.is_bound", zp->is_bound);
     DBG_EXIT("make_zero_proof_bound_range");
     CAMLreturn(wrap_zero_proof(zp));
+}
+
+CAMLprim value caml_pvac_make_zero_proof_bound_range_bytecode(value* argv, int) {
+    return caml_pvac_make_zero_proof_bound_range_math(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]);
 }
 
 CAMLprim value caml_pvac_pedersen_commit_amount(value v_amount, value v_blinding) {
@@ -1899,8 +1919,10 @@ CAMLprim value caml_pvac_pedersen_sub(value v_a, value v_b) {
     return caml_pvac_pedersen_binop(v_a, v_b, false);
 }
 
-CAMLprim value caml_pvac_make_range_proof(value v_pk, value v_sk, value v_ct, value v_value) {
-    CAMLparam4(v_pk, v_sk, v_ct, v_value);
+CAMLprim value caml_pvac_make_range_proof_math(value v_math, value v_pk, value v_sk, value v_ct, value v_value) {
+    CAMLparam5(v_math, v_pk, v_sk, v_ct, v_value);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("make_range_proof");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1911,7 +1933,7 @@ CAMLprim value caml_pvac_make_range_proof(value v_pk, value v_sk, value v_ct, va
     DBG_SIZE("ct.edges", ct.E.size());
     pvac::RangeProof* rp = new pvac::RangeProof();
     try {
-        *rp = pvac::make_range_proof(pk, sk, ct, val);
+        *rp = pvac::make_range_proof(pk, sk, ct, val, rule);
     } catch (const std::exception& e) {
         delete rp;
         caml_failwith(e.what());
@@ -1923,8 +1945,10 @@ CAMLprim value caml_pvac_make_range_proof(value v_pk, value v_sk, value v_ct, va
     CAMLreturn(wrap_range_proof(rp));
 }
 
-CAMLprim value caml_pvac_verify_range(value v_pk, value v_ct, value v_proof) {
-    CAMLparam3(v_pk, v_ct, v_proof);
+CAMLprim value caml_pvac_verify_range_math(value v_math, value v_pk, value v_ct, value v_proof) {
+    CAMLparam4(v_math, v_pk, v_ct, v_proof);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("verify_range");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -1938,7 +1962,7 @@ CAMLprim value caml_pvac_verify_range(value v_pk, value v_ct, value v_proof) {
     bool ok = false;
     caml_release_runtime_system();
     try {
-        ok = pvac::verify_range(pk, ct, proof);
+        ok = pvac::verify_range(pk, ct, proof, rule);
     } catch (const std::exception& e) {
         ok = false;
     } catch (...) {
@@ -2087,8 +2111,10 @@ CAMLprim value caml_pvac_deserialize_range_proof(value v_bytes) {
     CAMLreturn(wrap_range_proof(rp));
 }
 
-CAMLprim value caml_pvac_make_aggregated_range_proof(value v_pk, value v_sk, value v_ct, value v_value) {
-    CAMLparam4(v_pk, v_sk, v_ct, v_value);
+CAMLprim value caml_pvac_make_aggregated_range_proof_math(value v_math, value v_pk, value v_sk, value v_ct, value v_value) {
+    CAMLparam5(v_math, v_pk, v_sk, v_ct, v_value);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("make_aggregated_range_proof");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -2098,7 +2124,7 @@ CAMLprim value caml_pvac_make_aggregated_range_proof(value v_pk, value v_sk, val
 
     pvac::AggregatedRangeProof* arp = new pvac::AggregatedRangeProof();
     try {
-        *arp = pvac::make_aggregated_range_proof(pk, sk, ct, val);
+        *arp = pvac::make_aggregated_range_proof(pk, sk, ct, val, rule);
     } catch (const std::exception& e) {
         delete arp;
         caml_failwith(e.what());
@@ -2131,12 +2157,10 @@ CAMLprim value caml_pvac_serialize_agg_range_proof(value v_arp) {
     CAMLreturn(v_bytes);
 }
 
-CAMLprim value caml_pvac_verify_range_any(
-    value v_pk,
-    value v_ct,
-    value v_proof_bytes,
-    value v_strict) {
-    CAMLparam4(v_pk, v_ct, v_proof_bytes, v_strict);
+CAMLprim value caml_pvac_verify_range_any_math(value v_math, value v_pk, value v_ct, value v_proof_bytes, value v_strict) {
+    CAMLparam5(v_math, v_pk, v_ct, v_proof_bytes, v_strict);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     DBG_ENTER("verify_range_any");
 
     pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
@@ -2150,7 +2174,7 @@ CAMLprim value caml_pvac_verify_range_any(
     bool ok = false;
     caml_release_runtime_system();
     if (parse_range_any_safe(input.data(), input.size(), proof)) {
-        ok = verify_range_any_safe(pk, ct, proof, strict);
+        ok = verify_range_any_safe(pk, ct, proof, strict, rule);
     }
     caml_acquire_runtime_system();
 
@@ -2158,13 +2182,10 @@ CAMLprim value caml_pvac_verify_range_any(
     CAMLreturn(Val_bool(ok));
 }
 
-CAMLprim value caml_pvac_verify_range_bound(
-    value v_pk,
-    value v_ct,
-    value v_proof_bytes,
-    value v_commitment
-) {
-    CAMLparam4(v_pk, v_ct, v_proof_bytes, v_commitment);
+CAMLprim value caml_pvac_verify_range_bound_math(value v_math, value v_pk, value v_ct, value v_proof_bytes, value v_commitment) {
+    CAMLparam5(v_math, v_pk, v_ct, v_proof_bytes, v_commitment);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     if (bytes_len(v_commitment) != 32)
         CAMLreturn(Val_bool(false));
 
@@ -2189,7 +2210,7 @@ CAMLprim value caml_pvac_verify_range_bound(
                     pk,
                     ct,
                     proof.bound_proof,
-                    commitment);
+                    commitment, rule);
         } catch (...) {
             ok = false;
         }
@@ -2198,13 +2219,10 @@ CAMLprim value caml_pvac_verify_range_bound(
     CAMLreturn(Val_bool(ok));
 }
 
-CAMLprim value caml_pvac_verify_range_amount_prior(
-    value v_pk,
-    value v_ct,
-    value v_proof_bytes,
-    value v_commitment
-) {
-    CAMLparam4(v_pk, v_ct, v_proof_bytes, v_commitment);
+CAMLprim value caml_pvac_verify_range_amount_prior_math(value v_math, value v_pk, value v_ct, value v_proof_bytes, value v_commitment) {
+    CAMLparam5(v_math, v_pk, v_ct, v_proof_bytes, v_commitment);
+    const bool math = Bool_val(v_math);
+    const auto rule = math ? pvac::ScalarRule::Wide : pvac::ScalarRule::Prior;
     if (bytes_len(v_commitment) != 32)
         CAMLreturn(Val_bool(false));
 
@@ -2229,7 +2247,7 @@ CAMLprim value caml_pvac_verify_range_amount_prior(
                     pk,
                     ct,
                     proof.bound_proof,
-                    commitment);
+                    commitment, rule);
         } catch (...) {
             ok = false;
         }

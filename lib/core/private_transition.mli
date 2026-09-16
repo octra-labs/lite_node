@@ -21,6 +21,7 @@ val create :
   epoch_id:int ->
   owner_migration_mode:Rule_graph.mode ->
   proof_mode:Rule_graph.mode ->
+  math:bool ->
   field_policy:Private_ledger.field_policy ->
   result_policy:Private_result_policy.t ->
   limits:limits ->

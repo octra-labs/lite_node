@@ -6,6 +6,7 @@ type t
 val create :
   field_policy:(unit -> Octra_core.Private_ledger.field_policy) ->
   strict:(unit -> bool) ->
+  math:(unit -> bool) ->
   Octra_core.Ledger.t ->
   t
 

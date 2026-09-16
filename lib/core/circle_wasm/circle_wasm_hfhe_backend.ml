@@ -39,19 +39,19 @@ let verification_value = function
   | Error (VW.Proof_rejected _) -> Ok false
   | Error failure -> Error (VW.verification_failure_message failure)
 
-let verify_zero_worker ~pubkey ~cipher ~proof =
-  VW.try_verify_zero_sync_classified ~pubkey ~cipher ~proof
+let verify_zero_worker ~math ~pubkey ~cipher ~proof =
+  VW.try_verify_zero_sync_classified ~math ~pubkey ~cipher ~proof
 
-let verify_range_worker ~strict ~pubkey ~cipher ~proof ~commitment =
-  VW.try_verify_range_bound_sync_classified
+let verify_range_worker ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  VW.try_verify_range_bound_sync_classified ~math
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment
 
-let verify_bound_worker ~strict ~pubkey ~cipher ~proof ~commitment =
-  VW.try_verify_claim_sync_classified
+let verify_bound_worker ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  VW.try_verify_claim_sync_classified ~math
     ~strict
     ~pubkey
     ~cipher
@@ -240,10 +240,10 @@ let decode_range_proof_cap value =
     with _ ->
       Error "invalid range proof"
 
-let verify_zero_cap ~cap pk ciphertext proof =
+let verify_zero_cap ~math ~cap pk ciphertext proof =
   match decode_verifier_cipher ~cap ciphertext, decode_zero_proof_cap proof with
   | Ok cipher, Ok _ ->
-    verify_zero_worker
+    verify_zero_worker ~math
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof
@@ -251,14 +251,14 @@ let verify_zero_cap ~cap pk ciphertext proof =
   | _ ->
     Ok false
 
-let verify_range_cap ~strict ~cap pk ciphertext proof amount_commitment =
+let verify_range_cap ~math ~strict ~cap pk ciphertext proof amount_commitment =
   match
     decode_verifier_cipher ~cap ciphertext,
     decode_range_proof_cap proof,
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok range_proof, Ok commitment ->
-    verify_range_worker
+    verify_range_worker ~math
       ~strict
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
@@ -270,14 +270,14 @@ let verify_range_cap ~strict ~cap pk ciphertext proof amount_commitment =
   | _ ->
     Ok false
 
-let verify_bound_cap ~strict ~cap pk ciphertext proof amount_commitment =
+let verify_bound_cap ~math ~strict ~cap pk ciphertext proof amount_commitment =
   match
     decode_verifier_cipher ~cap ciphertext,
     decode_zero_proof_cap proof,
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok _, Ok commitment ->
-    verify_bound_worker
+    verify_bound_worker ~math
       ~strict
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
@@ -287,7 +287,7 @@ let verify_bound_cap ~strict ~cap pk ciphertext proof amount_commitment =
   | _ ->
     Ok false
 
-let run_action_cap ~cap fields =
+let run_action_cap ~math ~cap fields =
   let open Crypto.FheBalance in
   match List.assoc_opt "action" fields with
   | Some (`String "encrypt_value_seeded") ->
@@ -368,7 +368,7 @@ let run_action_cap ~cap fields =
         begin
           match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
-            value_json (`String (encode_cipher (Pvac_ffi.ct_scale pk ct factor)))
+            value_json (`String (encode_cipher (Pvac_ffi.ct_scale ~math pk ct factor)))
           | Error e ->
             error_json e
         end
@@ -384,7 +384,11 @@ let run_action_cap ~cap fields =
         begin
           match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
-            value_json (`String (encode_cipher (Pvac_ffi.ct_add_const pk ct amount 0L)))
+            let lo, hi =
+              if math && amount < 0L then Int64.pred amount, Int64.max_int
+              else amount, 0L
+            in
+            value_json (`String (encode_cipher (Pvac_ffi.ct_add_const ~math pk ct lo hi)))
           | Error e ->
             error_json e
         end
@@ -400,7 +404,12 @@ let run_action_cap ~cap fields =
         begin
           match decode_cipher_cap ~cap ciphertext with
           | Ok ct ->
-            value_json (`String (encode_cipher (Pvac_ffi.ct_sub_const pk ct amount)))
+            let result =
+              if math && amount < 0L then
+                Pvac_ffi.ct_add_const ~math pk ct (Int64.neg amount) 0L
+              else Pvac_ffi.ct_sub_const ~math pk ct amount
+            in
+            value_json (`String (encode_cipher result))
           | Error e ->
             error_json e
         end
@@ -461,7 +470,7 @@ let run_action_cap ~cap fields =
         begin
           match
             with_verifier_lane
-              (fun () -> verify_zero_cap ~cap pk ciphertext proof)
+              (fun () -> verify_zero_cap ~math ~cap pk ciphertext proof)
           with
           | Ok value -> value_json (`Bool value)
           | Error e -> unavailable_json e
@@ -485,7 +494,7 @@ let run_action_cap ~cap fields =
           match
             with_verifier_lane
               (fun () ->
-                verify_range_cap
+                verify_range_cap ~math
                   ~strict
                   ~cap
                   pk
@@ -517,7 +526,7 @@ let run_action_cap ~cap fields =
           match
             with_verifier_lane
               (fun () ->
-                verify_bound_cap
+                verify_bound_cap ~math
                   ~strict
                   ~cap
                   pk
@@ -541,9 +550,15 @@ let run_action_cap ~cap fields =
     error_json "missing action"
 
 let run_action fields =
-  match require_cap fields with
-  | Ok cap -> run_action_cap ~cap fields
-  | Error e -> error_json e
+  let math =
+    match List.filter (fun (name, _) -> name = "math") fields with
+    | [] -> Ok false
+    | [_, `Bool math] -> Ok math
+    | _ -> Error "invalid math"
+  in
+  match require_cap fields, math with
+  | Ok cap, Ok math -> run_action_cap ~math ~cap fields
+  | Error e, _ | _, Error e -> error_json e
 
 let call_json input_json =
   let output_json =

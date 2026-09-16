@@ -368,9 +368,9 @@ module FheBalance = struct
       else Ok (Pvac_ffi.deserialize_zero_proof (Bytes.of_string raw))
     with e -> Error (Printexc.to_string e)
 
-  let verify_zero pk cipher_str zero_proof_str =
+  let verify_zero ?(math = false) pk cipher_str zero_proof_str =
     match decode_cipher cipher_str, decode_zero_proof zero_proof_str with
-    | Ok ct, Ok zp -> Pvac_ffi.verify_zero pk ct zp
+    | Ok ct, Ok zp -> Pvac_ffi.verify_zero ~math pk ct zp
     | _ -> false
 
   let encode_agg_range_proof arp =
@@ -381,7 +381,7 @@ module FheBalance = struct
     let blob = Pvac_ffi.serialize_bound_range_proof proof in
     range_proof_prefix ^ Base64.encode_exn (Bytes.to_string blob)
 
-  let verify_range_any ~strict pk cipher_str range_proof_str =
+  let verify_range_any ?(math = false) ~strict pk cipher_str range_proof_str =
     if String.length range_proof_str <= range_proof_prefix_len
        || String.sub range_proof_str 0 range_proof_prefix_len <> range_proof_prefix
     then false
@@ -390,12 +390,12 @@ module FheBalance = struct
                   (String.length range_proof_str - range_proof_prefix_len) in
       let raw = Base64.decode_exn b64 in
       match decode_cipher ~strict ~cap:strict cipher_str with
-      | Ok ct -> Pvac_ffi.verify_range_any pk ct (Bytes.of_string raw) strict
+      | Ok ct -> Pvac_ffi.verify_range_any ~math pk ct (Bytes.of_string raw) strict
       | Error _ -> false
     with _ -> false
 
-  let verify_range ~strict pk cipher_str range_proof_str =
-    verify_range_any ~strict pk cipher_str range_proof_str
+  let verify_range ?(math = false) ~strict pk cipher_str range_proof_str =
+    verify_range_any ~math ~strict pk cipher_str range_proof_str
 
   let ct_sub_encoded ?(cap = true) pk cipher_a_str cipher_b_str =
     match decode_cipher ~cap cipher_a_str, decode_cipher ~cap cipher_b_str with
@@ -422,19 +422,20 @@ module FheBalance = struct
     | Error e, _ -> Error ("bad claim cipher: " ^ e)
     | _, Error e -> Error ("bad zero proof: " ^ e)
 
-  let verify_claim_amount_v5 ~strict =
+  let verify_claim_amount_v5 ?(math = false) ~strict pk =
     verify_claim_amount_with
       ~strict
-      (if strict then Pvac_ffi.verify_zero_bound
-       else Pvac_ffi.verify_zero_amount_prior)
+      (if strict then Pvac_ffi.verify_zero_bound ~math
+       else Pvac_ffi.verify_zero_amount_prior ~math) pk
 
-  let verify_key_switch_claim_amount ~strict =
+  let verify_key_switch_claim_amount ?(math = false) ~strict pk =
     verify_claim_amount_with
       ~strict
-      (if strict then Pvac_ffi.verify_zero_bound_key_switch
-       else Pvac_ffi.verify_zero_amount_key_switch_prior)
+      (if strict then Pvac_ffi.verify_zero_bound_key_switch ~math
+       else Pvac_ffi.verify_zero_amount_key_switch_prior ~math) pk
 
   let verify_encrypt_proof
+      ?(math = false)
       ~strict
       pk
       cipher_str
@@ -463,8 +464,8 @@ module FheBalance = struct
             if not (Pvac_ffi.cipher_is_wrapped_scalar ct) then
               Error "amount cipher must be a wrapped scalar"
             else if
-              (if strict then Pvac_ffi.verify_zero_bound
-               else Pvac_ffi.verify_zero_amount_prior)
+              (if strict then Pvac_ffi.verify_zero_bound ~math
+               else Pvac_ffi.verify_zero_amount_prior ~math)
                 pk
                 ct
                 zp

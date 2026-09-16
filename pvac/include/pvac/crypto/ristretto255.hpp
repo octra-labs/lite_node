@@ -265,7 +265,9 @@ inline void sc_tobytes(uint8_t s[32], const Scalar& a) {
     }
 }
 
-inline Scalar sc_reduce512(const uint64_t w[8]) {
+enum class ScalarRule { Prior, Wide };
+
+inline Scalar sc_reduce512(const uint64_t w[8], ScalarRule rule = ScalarRule::Prior) {
 
     uint64_t r[5] = {0, 0, 0, 0, 0};
 
@@ -273,7 +275,9 @@ inline Scalar sc_reduce512(const uint64_t w[8]) {
 
         r[4] = r[3]; r[3] = r[2]; r[2] = r[1]; r[1] = r[0]; r[0] = w[i];
 
-        uint64_t hi = (r[3] >> 60) | (r[4] << 4);
+        const u128 hi = rule == ScalarRule::Wide
+            ? (u128(r[3]) >> 60) | (u128(r[4]) << 4)
+            : u128((r[3] >> 60) | (r[4] << 4));
 
         r[3] &= 0x0FFFFFFFFFFFFFFFULL;
         r[4] = 0;
@@ -375,7 +379,7 @@ inline Scalar sc_sub(const Scalar& a, const Scalar& b) {
     return sc_reduce512(w);
 }
 
-inline Scalar sc_mul(const Scalar& a, const Scalar& b) {
+inline Scalar sc_mul(const Scalar& a, const Scalar& b, ScalarRule rule = ScalarRule::Prior) {
 
     uint64_t w[8] = {0};
     for (int i = 0; i < 4; i++) {
@@ -387,7 +391,7 @@ inline Scalar sc_mul(const Scalar& a, const Scalar& b) {
         }
         w[i+4] = (uint64_t)carry;
     }
-    return sc_reduce512(w);
+    return sc_reduce512(w, rule);
 }
 
 inline Scalar sc_neg(const Scalar& a) {
@@ -403,13 +407,13 @@ inline Scalar sc_from_fp_signed(const Fp& x) {
     return sc_from_fp(x);
 }
 
-inline Scalar sc_random() {
+inline Scalar sc_random(ScalarRule rule = ScalarRule::Prior) {
     uint64_t r[8];
     for (int i = 0; i < 8; i++) r[i] = csprng_u64();
-    return sc_reduce512(r);
+    return sc_reduce512(r, rule);
 }
 
-inline Scalar sc_inv(const Scalar& a) {
+inline Scalar sc_inv(const Scalar& a, ScalarRule rule = ScalarRule::Prior) {
 
     uint64_t exp[4] = {
         SC_L[0] - 2, SC_L[1], SC_L[2], SC_L[3]
@@ -420,11 +424,22 @@ inline Scalar sc_inv(const Scalar& a) {
 
     for (int i = 0; i < 256; i++) {
         if ((exp[i >> 6] >> (i & 63)) & 1)
-            result = sc_mul(result, base);
-        base = sc_mul(base, base);
+            result = sc_mul(result, base, rule);
+        base = sc_mul(base, base, rule);
     }
     return result;
 }
+
+struct ScalarOps {
+    const ScalarRule rule;
+
+    explicit ScalarOps(ScalarRule value = ScalarRule::Prior) : rule(value) {}
+
+    Scalar mul(const Scalar& a, const Scalar& b) const { return sc_mul(a, b, rule); }
+    Scalar inv(const Scalar& a) const { return sc_inv(a, rule); }
+    Scalar random() const { return sc_random(rule); }
+    Scalar reduce(const uint64_t w[8]) const { return sc_reduce512(w, rule); }
+};
 
 struct ExtPoint {
     Fe25519 X, Y, Z, T;

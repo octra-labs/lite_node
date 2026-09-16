@@ -41,6 +41,8 @@ type t = {
   object_cost_activation : activation option;
   account_pack_activation : activation option;
   standard_activation : activation option;
+  set_plan_activation : activation option;
+  math_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -101,6 +103,13 @@ let devnet_standard_activation = {
   anchor_state_root =
     "20de716a0d578300de77508718d213db14c4164e229a5850eb0595324566c90e";
   activation_epoch = 1_500_000;
+}
+
+let devnet_set_plan_activation = {
+  anchor_epoch = 1_504_440;
+  anchor_state_root =
+    "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d";
+  activation_epoch = 1_510_000;
 }
 
 let devnet_set_open_activation = {
@@ -188,6 +197,30 @@ let standard_activation_for_chain chain_id =
   else
     None
 
+let set_plan_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_set_plan_activation
+  else
+    None
+
+let math_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some {
+      anchor_epoch = 1_504_440;
+      anchor_state_root =
+        "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d";
+      activation_epoch = 1_510_000;
+    }
+  else
+    None
+
+let profile_epochs ~chain_id =
+  [standard_activation_for_chain chain_id;
+   set_plan_activation_for_chain chain_id;
+   math_activation_for_chain chain_id]
+  |> List.filter_map (Option.map (fun value -> value.activation_epoch))
+  |> List.sort_uniq Int.compare
+
 let validator_quorum_activation_for_chain chain_id : activation option =
   match Octra_consensus.C_quorum_policy.activation_for_chain chain_id with
   | None -> None
@@ -217,8 +250,8 @@ let activation_id = function
       string_of_int value.activation_epoch;
     ]
 
-let consensus_id ~chain_id =
-  [
+let consensus_id ~chain_id ~epoch =
+  let plans = [
     circle_activation_for_chain chain_id;
     wasm_compute_activation_for_chain chain_id;
     validator_quorum_activation_for_chain chain_id;
@@ -234,7 +267,18 @@ let consensus_id ~chain_id =
     object_cost_activation_for_chain chain_id;
     account_pack_activation_for_chain chain_id;
     standard_activation_for_chain chain_id;
-  ]
+  ] in
+  let plans =
+    match set_plan_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans
+  in
+  let plans =
+    match math_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans
+  in
+  plans
   |> List.map activation_id
   |> String.concat "|"
 
@@ -258,6 +302,8 @@ let make ~ready_config_hash ~chain_id ~root_at =
     object_cost_activation = object_cost_activation_for_chain chain_id;
     account_pack_activation = account_pack_activation_for_chain chain_id;
     standard_activation = standard_activation_for_chain chain_id;
+    set_plan_activation = set_plan_activation_for_chain chain_id;
+    math_activation = math_activation_for_chain chain_id;
     root_at;
   }
 
@@ -282,6 +328,8 @@ let set_open_activation t = t.set_open_activation
 let object_cost_activation t = t.object_cost_activation
 let account_pack_activation t = t.account_pack_activation
 let standard_activation t = t.standard_activation
+let set_plan_activation t = t.set_plan_activation
+let math_activation t = t.math_activation
 let ready_config_hash t = t.ready_config_hash
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
@@ -305,6 +353,8 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       object_cost_activation_for_chain chain_id;
       account_pack_activation_for_chain chain_id;
       standard_activation_for_chain chain_id;
+      set_plan_activation_for_chain chain_id;
+      math_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -405,6 +455,22 @@ let set_open t ~epoch =
 
 let standard t ~epoch =
   mode t t.standard_activation ~epoch
+
+let set_plan t ~epoch =
+  mode t t.set_plan_activation ~epoch
+
+let math t ~epoch =
+  mode t t.math_activation ~epoch
+
+let math_at ~chain_id ~epoch =
+  match math_activation_for_chain chain_id with
+  | Some activation when epoch >= activation.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let set_plan_at ~chain_id ~epoch =
+  match set_plan_activation_for_chain chain_id with
+  | Some activation when epoch >= activation.activation_epoch -> Active
+  | Some _ | None -> Prior
 
 let object_cost t ~epoch =
   mode t t.object_cost_activation ~epoch

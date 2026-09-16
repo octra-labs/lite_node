@@ -309,7 +309,7 @@ let network key =
     (Octra_vm.Program_trust.keys actual = Octra_vm.Program_trust.keys trust);
   let config_hash = Octra_consensus.C_config.network_hash ~chain_id
     ~runtime_profile_hash:(N.Consensus_profile.standard_hash
-      ~chain_id (getenv sample)) ()
+      ~chain_id ~epoch:1_500_000 (getenv sample)) ()
     |> Octra_bootstrap.State_sync_checkpoint.raw_to_hex in
   reject "replay network identity differs from checkpoint"
     (A.network ~getenv:(getenv sample) ~chain_id ~config_hash ~configured_hash:config_hash);

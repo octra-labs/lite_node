@@ -9,6 +9,8 @@ type policy = {
   open_mode : Octra_core.Rule_graph.mode;
   account_mode : Octra_core.Rule_graph.mode;
   standard_mode : Octra_core.Rule_graph.mode;
+  plan_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
 

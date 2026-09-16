@@ -92,11 +92,11 @@ inline RistrettoPoint multi_scalar_mul(
     return rist_encode(result);
 }
 
-inline Scalar inner_product(const std::vector<Scalar>& a, const std::vector<Scalar>& b) {
+inline Scalar inner_product(const std::vector<Scalar>& a, const std::vector<Scalar>& b, const ScalarOps& ops = ScalarOps()) {
     assert(a.size() == b.size());
     Scalar result = sc_zero();
     for (size_t i = 0; i < a.size(); i++)
-        result = sc_add(result, sc_mul(a[i], b[i]));
+        result = sc_add(result, ops.mul(a[i], b[i]));
     return result;
 }
 
@@ -108,6 +108,7 @@ inline InnerProductProof ipp_prove(
     std::vector<RistrettoPoint> G_vec,
     std::vector<RistrettoPoint> H_vec
 ) {
+    const auto& ops = transcript.ops;
     size_t n = a.size();
     assert(n == b.size());
     assert(n == G_vec.size());
@@ -125,8 +126,8 @@ inline InnerProductProof ipp_prove(
         Scalar c_L = sc_zero();
         Scalar c_R = sc_zero();
         for (size_t i = 0; i < half; i++) {
-            c_L = sc_add(c_L, sc_mul(a[i], b[half + i]));
-            c_R = sc_add(c_R, sc_mul(a[half + i], b[i]));
+            c_L = sc_add(c_L, ops.mul(a[i], b[half + i]));
+            c_R = sc_add(c_R, ops.mul(a[half + i], b[i]));
         }
 
         {
@@ -172,7 +173,7 @@ inline InnerProductProof ipp_prove(
         transcript.append_point("L", proof.L[k]);
         transcript.append_point("R", proof.R[k]);
         Scalar u_k = transcript.challenge_scalar("u");
-        Scalar u_k_inv = sc_inv(u_k);
+        Scalar u_k_inv = ops.inv(u_k);
 
         std::vector<Scalar> a_new(half);
         std::vector<Scalar> b_new(half);
@@ -180,8 +181,8 @@ inline InnerProductProof ipp_prove(
         std::vector<RistrettoPoint> H_new(half);
 
         for (size_t i = 0; i < half; i++) {
-            a_new[i] = sc_add(sc_mul(a[i], u_k), sc_mul(a[half + i], u_k_inv));
-            b_new[i] = sc_add(sc_mul(b[i], u_k_inv), sc_mul(b[half + i], u_k));
+            a_new[i] = sc_add(ops.mul(a[i], u_k), ops.mul(a[half + i], u_k_inv));
+            b_new[i] = sc_add(ops.mul(b[i], u_k_inv), ops.mul(b[half + i], u_k));
 
             G_new[i] = multi_scalar_mul(
                 {u_k_inv, u_k},
@@ -208,19 +209,20 @@ inline InnerProductProof ipp_prove(
 }
 
 inline std::vector<Scalar> ipp_verification_scalars(
-    const std::vector<Scalar>& challenges
+    const std::vector<Scalar>& challenges,
+    const ScalarOps& ops = ScalarOps()
 ) {
     size_t lg = challenges.size();
     size_t n = 1ULL << lg;
 
     std::vector<Scalar> u_inv(lg);
     for (size_t k = 0; k < lg; k++)
-        u_inv[k] = sc_inv(challenges[k]);
+        u_inv[k] = ops.inv(challenges[k]);
 
     std::vector<Scalar> s(n);
     s[0] = Scalar{{1, 0, 0, 0}};
     for (size_t k = 0; k < lg; k++)
-        s[0] = sc_mul(s[0], u_inv[k]);
+        s[0] = ops.mul(s[0], u_inv[k]);
 
     for (size_t i = 1; i < n; i++) {
 
@@ -229,28 +231,28 @@ inline std::vector<Scalar> ipp_verification_scalars(
         while (tmp >>= 1) k++;
 
         size_t challenge_idx = lg - 1 - k;
-        Scalar u_sq = sc_mul(challenges[challenge_idx], challenges[challenge_idx]);
-        s[i] = sc_mul(s[i ^ (1ULL << k)], u_sq);
+        Scalar u_sq = ops.mul(challenges[challenge_idx], challenges[challenge_idx]);
+        s[i] = ops.mul(s[i ^ (1ULL << k)], u_sq);
     }
 
     return s;
 }
 
-inline std::vector<Scalar> batch_sc_inv(const std::vector<Scalar>& vals) {
+inline std::vector<Scalar> batch_sc_inv(const std::vector<Scalar>& vals, const ScalarOps& ops = ScalarOps()) {
     size_t n = vals.size();
     if (n == 0) return {};
 
     std::vector<Scalar> prefix(n);
     prefix[0] = vals[0];
     for (size_t i = 1; i < n; i++)
-        prefix[i] = sc_mul(prefix[i-1], vals[i]);
+        prefix[i] = ops.mul(prefix[i-1], vals[i]);
 
-    Scalar inv_all = sc_inv(prefix[n-1]);
+    Scalar inv_all = ops.inv(prefix[n-1]);
 
     std::vector<Scalar> result(n);
     for (size_t i = n - 1; i > 0; i--) {
-        result[i] = sc_mul(inv_all, prefix[i-1]);
-        inv_all = sc_mul(inv_all, vals[i]);
+        result[i] = ops.mul(inv_all, prefix[i-1]);
+        inv_all = ops.mul(inv_all, vals[i]);
     }
     result[0] = inv_all;
 
@@ -264,6 +266,7 @@ inline bool ipp_verify(
     const InnerProductProof& proof,
     size_t n
 ) {
+    const auto& ops = transcript.ops;
     size_t lg = proof.L.size();
     if (proof.R.size() != lg) return false;
     if ((1ULL << lg) != n) return false;
@@ -275,25 +278,25 @@ inline bool ipp_verify(
         challenges[k] = transcript.challenge_scalar("u");
     }
 
-    auto s = ipp_verification_scalars(challenges);
+    auto s = ipp_verification_scalars(challenges, ops);
 
-    auto s_inv = batch_sc_inv(s);
+    auto s_inv = batch_sc_inv(s, ops);
 
     std::vector<Scalar> scalars;
     std::vector<RistrettoPoint> points;
     scalars.reserve(2 * n + 2 * lg + 2);
     points.reserve(2 * n + 2 * lg + 2);
 
-    Scalar ab = sc_mul(proof.a, proof.b);
+    Scalar ab = ops.mul(proof.a, proof.b);
 
     const auto& gen = generators();
     for (size_t i = 0; i < n; i++) {
-        scalars.push_back(sc_mul(proof.a, s[i]));
+        scalars.push_back(ops.mul(proof.a, s[i]));
         points.push_back(gen.G(i));
     }
 
     for (size_t i = 0; i < n; i++) {
-        scalars.push_back(sc_mul(proof.b, s_inv[i]));
+        scalars.push_back(ops.mul(proof.b, s_inv[i]));
         points.push_back(gen.H(i));
     }
 
@@ -302,8 +305,8 @@ inline bool ipp_verify(
 
     std::vector<Scalar> u_sqs(lg);
     for (size_t k = 0; k < lg; k++)
-        u_sqs[k] = sc_mul(challenges[k], challenges[k]);
-    auto u_inv_sqs = batch_sc_inv(u_sqs);
+        u_sqs[k] = ops.mul(challenges[k], challenges[k]);
+    auto u_inv_sqs = batch_sc_inv(u_sqs, ops);
 
     for (size_t k = 0; k < lg; k++) {
         scalars.push_back(sc_neg(u_sqs[k]));

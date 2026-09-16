@@ -88,7 +88,9 @@ let deps (context : context) ~(cursor : R.J.cursor)
     R.get (N.Set_rule.bind context.rules ~chain_id:context.chain_id
       ~parent:parent_commit ~epoch)
   in
-  let proof_mode = (R.get (fold epoch)).X.standard_mode in
+  let policy = R.get (fold epoch) in
+  let proof_mode = policy.X.standard_mode in
+  let math = policy.math in
   let rule select =
     select context.rules ~epoch |> Result.map_error G.fault_message |> R.get
   in
@@ -103,12 +105,14 @@ let deps (context : context) ~(cursor : R.J.cursor)
     N.Consensus_key_switch_preverify.create
       ~field_policy:(fun () -> field_policy)
       ~strict:(fun () -> proof_mode = G.Active)
+      ~math:(fun () -> math)
       context.ledger
   in
   let private_pool =
     N.Consensus_private_preverify.create
       ~field_policy:(fun () -> field_policy)
       ~strict:(fun () -> proof_mode = G.Active)
+      ~math:(fun () -> math)
       ~result_policy:(fun () -> context.result_policy epoch)
       context.ledger
   in
@@ -185,6 +189,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
             } in
             let* batch =
               R.W.run_many
+                ~math
                 ~prepared:(fun tx ->
                   if tx.R.T.op_type = R.T.KeySwitch then
                     N.Consensus_key_switch_preverify.await key_pool tx
@@ -231,10 +236,10 @@ let deps (context : context) ~(cursor : R.J.cursor)
         if not (R.T.bft_consensus_admits_op tx.op_type) then
           failwith (R.T.bft_reject_reason tx.op_type)) prepared.txs;
       let backend =
-        X.make_live_backend ~proof_mode ~fold context.store context.ledger
+        X.make_live_backend ~proof_mode ~math ~fold context.store context.ledger
       in
       let private_transition =
-        Octra_core.Private_transition.create
+        Octra_core.Private_transition.create ~math
           ~preverify:(Some preverify)
           ~legacy_replay:context.legacy_replay
           ~ledger:context.ledger

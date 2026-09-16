@@ -22,10 +22,18 @@ type policy = {
   open_mode : Octra_core.Rule_graph.mode;
   account_mode : Octra_core.Rule_graph.mode;
   standard_mode : Octra_core.Rule_graph.mode;
+  plan_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
 
 let policy rules epoch =
+  let ( let* ) = Result.bind in
+  let* math =
+    Octra_core.Rule_graph.math rules ~epoch
+    |> Result.map (fun mode -> mode = Octra_core.Rule_graph.Active)
+    |> Result.map_error Octra_core.Rule_graph.fault_message
+  in
   match
     Octra_core.Rule_graph.validator_ready rules ~epoch,
     Octra_core.Rule_graph.ready_ref rules ~epoch,
@@ -33,18 +41,20 @@ let policy rules epoch =
     Octra_core.Rule_graph.set_fold_cap rules ~epoch,
     Octra_core.Rule_graph.set_open rules ~epoch,
     Octra_core.Rule_graph.account_pack rules ~epoch,
-    Octra_core.Rule_graph.standard rules ~epoch
+    Octra_core.Rule_graph.standard rules ~epoch,
+    Octra_core.Rule_graph.set_plan rules ~epoch
   with
-  | Error fault, _, _, _, _, _, _
-  | _, Error fault, _, _, _, _, _
-  | _, _, Error fault, _, _, _, _
-  | _, _, _, Error fault, _, _, _
-  | _, _, _, _, Error fault, _, _
-  | _, _, _, _, _, Error fault, _
-  | _, _, _, _, _, _, Error fault ->
+  | Error fault, _, _, _, _, _, _, _
+  | _, Error fault, _, _, _, _, _, _
+  | _, _, Error fault, _, _, _, _, _
+  | _, _, _, Error fault, _, _, _, _
+  | _, _, _, _, Error fault, _, _, _
+  | _, _, _, _, _, Error fault, _, _
+  | _, _, _, _, _, _, Error fault, _
+  | _, _, _, _, _, _, _, Error fault ->
     Error (Octra_core.Rule_graph.fault_message fault)
   | Ok ready_mode, Ok ready_ref_mode, Ok live_mode, Ok seat_mode, Ok open_mode,
-    Ok account_mode, Ok standard_mode ->
+    Ok account_mode, Ok standard_mode, Ok plan_mode ->
     let cap_mode =
       match seat_mode with
       | Octra_core.Rule_graph.Prior -> Octra_core.Set_fold.Reject
@@ -58,6 +68,8 @@ let policy rules epoch =
       open_mode;
       account_mode;
       standard_mode;
+      plan_mode;
+      math;
       cap_mode;
     }
 
@@ -75,6 +87,8 @@ let resolve rules ~chain_id ~parent epoch =
       open_mode = policy.open_mode;
       account_mode = policy.account_mode;
       standard_mode = policy.standard_mode;
+      plan_mode = policy.plan_mode;
+      math = policy.math;
       cap_mode = policy.cap_mode;
       ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
       start = start rules;
@@ -100,6 +114,8 @@ let resolve rules ~chain_id ~parent epoch =
               open_mode = policy.open_mode;
               account_mode = policy.account_mode;
               standard_mode = policy.standard_mode;
+              plan_mode = policy.plan_mode;
+              math = policy.math;
               cap_mode = policy.cap_mode;
               ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
               start = start rules;

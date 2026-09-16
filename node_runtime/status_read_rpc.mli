@@ -51,6 +51,7 @@ val node_version :
 
 val runtime_version :
   chain_id:string ->
+  epoch:int ->
   validator_address:string ->
   program_trust_hash:string option ->
   runtime_profile_hash:string option ->

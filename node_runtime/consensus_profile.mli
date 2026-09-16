@@ -9,6 +9,7 @@ val compat_wire_rules_id : string
 
 val standard_hash :
   chain_id:string ->
+  epoch:int ->
   (string -> string option) ->
   string
 

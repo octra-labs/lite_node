@@ -329,11 +329,11 @@ inline Cipher ct_sub(const PubKey& pk, const Cipher& A, const Cipher& B) {
     return ct_add(pk, A, ct_neg(pk, B));
 }
 
-inline Cipher ct_mul(const PubKey& pk, const Cipher& A, const Cipher& B, size_t S = 8) {
+inline Cipher ct_mul(const PubKey& pk, const Cipher& A, const Cipher& B, size_t S = 8, bool math = false) {
     if (A.slots != B.slots)
         throw std::runtime_error("pvac: ct_mul: slot count mismatch between operands");
-    auto a0 = A.c0;
-    auto b0 = B.c0;
+    auto a0 = math && A.c0.empty() ? field::Op::zeros(A.slots) : A.c0;
+    auto b0 = math && B.c0.empty() ? field::Op::zeros(B.slots) : B.c0;
 
     Cipher A_g = A;
     Cipher B_g = B;
@@ -364,8 +364,8 @@ inline Cipher ct_mul(const PubKey& pk, const Cipher& A, const Cipher& B, size_t 
     return C;
 }
 
-inline Cipher ct_square(const PubKey& pk, const Cipher& A, size_t S = 8) {
-    auto a0 = A.c0;
+inline Cipher ct_square(const PubKey& pk, const Cipher& A, size_t S = 8, bool math = false) {
+    auto a0 = math && A.c0.empty() ? field::Op::zeros(A.slots) : A.c0;
 
     Cipher A_g = A;
     A_g.c0 = field::Op::zeros(A.slots);
@@ -394,12 +394,12 @@ inline Cipher ct_square(const PubKey& pk, const Cipher& A, size_t S = 8) {
     return C;
 }
 
-inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, const uint8_t seed[32], size_t S = 8) {
+inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, const uint8_t seed[32], size_t S = 8, bool math = false) {
     if (A.slots != B.slots)
         throw std::runtime_error("pvac: ct_mul: slot count mismatch between operands");
     SeedableRng rng = make_seeded_rng(seed);
-    auto a0 = A.c0;
-    auto b0 = B.c0;
+    auto a0 = math && A.c0.empty() ? field::Op::zeros(A.slots) : A.c0;
+    auto b0 = math && B.c0.empty() ? field::Op::zeros(B.slots) : B.c0;
 
     Cipher A_g = A;
     Cipher B_g = B;
@@ -430,9 +430,9 @@ inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, 
     return C;
 }
 
-inline Cipher ct_square_seeded(const PubKey& pk, const Cipher& A, const uint8_t seed[32], size_t S = 8) {
+inline Cipher ct_square_seeded(const PubKey& pk, const Cipher& A, const uint8_t seed[32], size_t S = 8, bool math = false) {
     SeedableRng rng = make_seeded_rng(seed);
-    auto a0 = A.c0;
+    auto a0 = math && A.c0.empty() ? field::Op::zeros(A.slots) : A.c0;
 
     Cipher A_g = A;
     A_g.c0 = field::Op::zeros(A.slots);
@@ -476,28 +476,28 @@ inline Cipher ct_mul_const(const PubKey& pk, const Cipher& A, int64_t k) {
     return ct_scale(pk, A, detail::fp_from_i64(k));
 }
 
-inline Cipher ct_add_const(const PubKey&, const Cipher& A, uint64_t k) {
+inline Cipher ct_add_const(const PubKey&, const Cipher& A, const Fp& v, bool math = false) {
     Cipher C = A;
-    Fp v = fp_from_u64(k);
+    if (math && C.c0.empty()) C.c0 = field::Op::zeros(C.slots);
     for (size_t j = 0; j < C.c0.size(); ++j)
         C.c0[j] = fp_add(C.c0[j], v);
     return C;
 }
 
-inline Cipher ct_add_const(const PubKey&, const Cipher& A, int64_t k) {
-    Cipher C = A;
-    Fp v = detail::fp_from_i64(k);
-    for (size_t j = 0; j < C.c0.size(); ++j)
-        C.c0[j] = fp_add(C.c0[j], v);
-    return C;
+inline Cipher ct_add_const(const PubKey& pk, const Cipher& A, uint64_t k, bool math = false) {
+    return ct_add_const(pk, A, fp_from_u64(k), math);
 }
 
-inline Cipher ct_sub_const(const PubKey& pk, const Cipher& A, uint64_t k) {
-    return ct_add_const(pk, A, -static_cast<int64_t>(k));
+inline Cipher ct_add_const(const PubKey& pk, const Cipher& A, int64_t k, bool math = false) {
+    return ct_add_const(pk, A, detail::fp_from_i64(k), math);
 }
 
-inline Cipher ct_sub_const(const PubKey& pk, const Cipher& A, int64_t k) {
-    return ct_add_const(pk, A, -k);
+inline Cipher ct_sub_const(const PubKey& pk, const Cipher& A, uint64_t k, bool math = false) {
+    return ct_add_const(pk, A, fp_neg(fp_from_u64(k)), math);
+}
+
+inline Cipher ct_sub_const(const PubKey& pk, const Cipher& A, int64_t k, bool math = false) {
+    return ct_add_const(pk, A, fp_neg(detail::fp_from_i64(k)), math);
 }
 
 }

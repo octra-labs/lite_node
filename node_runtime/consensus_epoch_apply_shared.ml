@@ -50,6 +50,7 @@ type runtime = {
   object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :
     epoch:int ->
@@ -195,6 +196,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
         ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id
         ~owner_migration_mode:runtime.owner_migration_mode
         ~proof_mode:runtime.proof_mode
+        ~math:runtime.math
         ~field_policy:runtime.private_field_policy
         ~result_policy:
           (runtime.private_result_policy
@@ -422,9 +424,9 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
       | Ok fold -> fold
       | Error error -> failwith error
     in
-    let proof_mode =
+    let proof_mode, math =
       match fold epoch_id with
-      | Ok ctx -> ctx.Octra_core.Epoch_exec.standard_mode
+      | Ok ctx -> ctx.Octra_core.Epoch_exec.standard_mode, ctx.math
       | Error error -> failwith error
     in
     let* () =
@@ -445,6 +447,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         backend = (fun () ->
           Epoch_exec.make_live_backend
             ~proof_mode
+            ~math
             ~fold
             runtime.store
             runtime.ledger);
@@ -463,6 +466,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         object_cost;
         owner_migration_mode;
         proof_mode;
+        math;
         private_field_policy;
         legacy_replay = runtime.legacy_replay;
         private_result_policy = runtime.private_result_policy;
@@ -472,6 +476,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
           let backend =
             Epoch_exec.make_live_backend
               ~proof_mode
+              ~math
               ~fold
               runtime.store
               runtime.ledger

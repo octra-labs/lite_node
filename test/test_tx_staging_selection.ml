@@ -192,6 +192,25 @@ let check_queue_state () =
     (Tx_staging.expiry_reason ~confirmed:1322 ~received:1323
      = "TTL exceeded: transaction was not included")
 
+let check_pending_nonce () =
+  Tx_staging.clear ();
+  let from = sender 705 in
+  let first = transaction from 215 in
+  let last = transaction from 217 in
+  check "empty pending nonce" (Tx_staging.pending_nonce from 214 = 214);
+  add first;
+  check "inserted pending nonce" (Tx_staging.pending_nonce from 214 = 215);
+  add last;
+  add (transaction (sender 706) 300);
+  check "sender pending maximum" (Tx_staging.pending_nonce from 214 = 217);
+  check "pending confirmed floor" (Tx_staging.pending_nonce from 218 = 218);
+  check "pending read preserves entries" (Tx_staging.pending_nonce from 214 = 217);
+  check "remove highest nonce" (Tx_staging.remove_by_hash (Transaction.hash last));
+  check "remaining pending nonce" (Tx_staging.pending_nonce from 214 = 215);
+  check "remove final nonce" (Tx_staging.remove_by_hash (Transaction.hash first));
+  check "removed pending nonce" (Tx_staging.pending_nonce from 214 = 214);
+  check "empty confirmed floor" (Tx_staging.pending_nonce from 218 = 218)
+
 let check_recent_order () =
   Tx_staging.clear ();
   let first = transaction ~timestamp:2. (sender 710) 1 in
@@ -329,6 +348,7 @@ let () =
   check_insertion_independence ();
   check_pool_eviction ();
   check_queue_state ();
+  check_pending_nonce ();
   check_recent_order ();
   check_ready_gap ();
   check_ready_cost ();

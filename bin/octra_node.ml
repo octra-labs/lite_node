@@ -530,14 +530,21 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok Rule_graph.Prior -> false
       | Error fault -> failwith (Rule_graph.fault_message fault)
     in
+    let math_at epoch =
+      match Rule_graph.math rules ~epoch with
+      | Ok mode -> mode = Rule_graph.Active
+      | Error fault -> failwith (Rule_graph.fault_message fault)
+    in
     let key_switch_preverify =
       Consensus_key_switch_preverify.create
+        ~math:(fun () -> math_at !current_epoch)
         ~field_policy:(fun () -> private_field_policy !current_epoch)
         ~strict:(fun () -> private_proof_strict !current_epoch)
         ledger
     in
     let private_preverify =
       Consensus_private_preverify.create
+        ~math:(fun () -> math_at !current_epoch)
         ~field_policy:(fun () -> private_field_policy !current_epoch)
         ~strict:(fun () -> private_proof_strict !current_epoch)
         ~result_policy:(fun () -> private_result_policy !current_epoch)
@@ -1314,6 +1321,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let stealth_preverify =
       Preverify_submit.{
         strict = (fun () -> private_proof_strict !current_epoch);
+        math = (fun () -> math_at !current_epoch);
         get_pvac_pubkey =
           (fun addr -> Ledger.get_pvac_pubkey ledger addr);
         sender_enc =
@@ -1321,10 +1329,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             Option.value
               ~default:"0"
               (Ledger.find ledger addr).encrypted_balance);
-        start_task = Preverify_cache.start_task;
+        start_task = (fun ~math -> Preverify_cache.start_task ~math);
         verify_ranges =
-          (fun ~strict ~pubkey_blob ~sender_enc ptd ->
+          (fun ~math ~strict ~pubkey_blob ~sender_enc ptd ->
             Octra_node_runtime.Tx_view.preverify_stealth_ranges
+              ~math
               ~strict
               ~pubkey_blob
               ~sender_enc
@@ -1661,6 +1670,21 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let run_preverify prepared root txs =
       let open Lwt.Syntax in
+      let epoch = !current_epoch in
+      let math =
+        match Rule_graph.math rules ~epoch with
+        | Ok mode -> mode = Rule_graph.Active
+        | Error fault -> failwith (Rule_graph.fault_message fault)
+      in
+      let lookup tx =
+        if !current_epoch <> epoch then
+          Lwt.return Octra_core.Preverify_availability.Unmanaged
+        else
+          let* result = prepared tx in
+          Lwt.return
+            (if !current_epoch = epoch then result
+             else Octra_core.Preverify_availability.Unmanaged)
+      in
       let id =
         txs
         |> List.map Octra_core.Transaction.hash
@@ -1672,26 +1696,27 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Octra_core.State_preview.with_state
           ~base_store:store
           ~base_ledger:ledger
-          ~epoch_id:!current_epoch
+          ~epoch_id:epoch
           ~proposal_id:("pv-" ^ String.sub id 0 12)
           ~expected_prev_root:root
           (fun _ ledger ->
             let* batch =
               Octra_core.Preverify_worker.run_many
-                ~field_policy:(private_field_policy !current_epoch)
-                ~strict:(private_proof_strict !current_epoch)
+                ~math
+                ~field_policy:(private_field_policy epoch)
+                ~strict:(private_proof_strict epoch)
                 ~ledger
-                ~result_policy:(private_result_policy !current_epoch)
+                ~result_policy:(private_result_policy epoch)
                 ~circle_preverify:
                   (Consensus_circle_preverify.run circle_preverify)
                 ~circle_cell_preverify:
                   (Consensus_circle_cell_preverify.run circle_cell_preverify)
                 ~legacy_replay:(fun ~address ~cipher ->
                   legacy_replay
-                    ~epoch:!current_epoch
+                    ~epoch
                     ~address
                     ~cipher)
-                ~prepared
+                ~prepared:lookup
                 txs
             in
             Lwt.return_ok batch)

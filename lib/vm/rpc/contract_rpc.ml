@@ -1115,7 +1115,7 @@ let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
     response
   end
 
-let make_view_ctx ?running ~store ~ledger ~current_epoch ~get_fhe_pubkey () =
+let make_view_ctx ?running ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_pubkey () =
   let get_balance addr =
     match Ledger.find_opt ledger addr with
     | Some account -> account.Ledger.balance
@@ -1128,6 +1128,7 @@ let make_view_ctx ?running ~store ~ledger ~current_epoch ~get_fhe_pubkey () =
     get_fhe_pubkey;
     allow_fhe_capability;
     int_work = Int_work.Active;
+    math;
     current_epoch;
     do_transfer = (fun _ _ _ -> false);
     deploy_contract = (fun _ _ _ _ _ -> Error "deploy in view context");
@@ -1179,7 +1180,7 @@ let call_result ~store ~addr ~include_storage ~storage_json value =
   else
     ok_lwt (`Assoc ["result", value])
 
-let call ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
+let call ~math ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
     ~addr ~method_name ~call_params ~caller_addr ~include_storage =
   let open Lwt.Syntax in
   if String.equal method_name "balance_of" then
@@ -1201,7 +1202,7 @@ let call ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
       err_lwt (Rpc.invalid_params "balance_of expects exactly one address parameter")
   else
     let running, stop = view_clock () in
-    let view_ctx = make_view_ctx ~running ~store ~ledger ~current_epoch ~get_fhe_pubkey () in
+    let view_ctx = make_view_ctx ~math ~running ~store ~ledger ~current_epoch ~get_fhe_pubkey () in
     let* executed =
       run_view ~stop (fun () ->
         Contract.execute_view_call
@@ -1228,7 +1229,7 @@ let call ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
       else
         err_lwt (Rpc.err (-32000) (Receipt_view.view_error result.error) None)
 
-let call_params ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json params =
+let call_params ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json params =
   match Rpc.require_address params 0 "address",
         Rpc.require_string params 1 "method" with
   | Error e, _ | _, Error e ->
@@ -1242,6 +1243,7 @@ let call_params ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json para
         ~include_storage:(Rpc.param_json params 4)
     in
     call
+      ~math
       ~store
       ~ledger
       ~current_epoch

@@ -129,8 +129,8 @@ let () =
   need
     (String.equal Transcript.consensus_id "receipt_mode:amount_link_v1")
     "circle hfhe consensus id changed";
-  let prior_context = Exec.hfhe_context_hash ~strict:false [] [] None in
-  let active_context = Exec.hfhe_context_hash ~strict:true [] [] None in
+  let prior_context = Exec.hfhe_context_hash ~math:false ~strict:false [] [] None in
+  let active_context = Exec.hfhe_context_hash ~math:false ~strict:true [] [] None in
   need
     (String.equal
        prior_context

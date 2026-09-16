@@ -150,7 +150,7 @@ let make_swarm ~chain_id ~addr =
     binary_hash = String.make 32 '\x00';
     require_binary_hash = false;
     upgrade_plan = None;
-    profile = None;
+    profile_plan = [];
     allowed_pubkeys = [];
     bootstrap_peers = [];
     max_peers = 0;
@@ -256,11 +256,11 @@ let check_profile_switch () =
         binary_hash;
         require_binary_hash = true;
         upgrade_plan = plan;
-        profile = Some {
+        profile_plan = [{
           epoch = 20L;
           config_hash = new_hash;
           profile_hash = String.make 32 '\x0f';
-        };
+        }];
         allowed_pubkeys = [];
         bootstrap_peers = [];
         max_peers = 0;
@@ -321,6 +321,125 @@ let check_profile_switch () =
   assert_msg
     (String.equal repeated first)
     "profile switch is idempotent"
+
+let check_profile_plan () =
+  let module W = Octra_net.P2p_swarm in
+  let module H = Octra_net.P2p_handshake in
+  let module C = Octra_net.P2p_conn in
+  let chain_id = "profile-plan-test" in
+  let old_hash = String.make 32 'a' in
+  let first = W.{
+    epoch = 1_500_000L;
+    config_hash = String.make 32 'b';
+    profile_hash = String.make 32 'c';
+  } in
+  let second = W.{
+    epoch = 1_510_000L;
+    config_hash = String.make 32 'd';
+    profile_hash = String.make 32 'e';
+  } in
+  let key = Mirage_crypto_ec.Ed25519.priv_of_octets (String.make 32 'f')
+    |> Result.get_ok in
+  let pubkey_raw = Mirage_crypto_ec.Ed25519.pub_of_priv key
+    |> Mirage_crypto_ec.Ed25519.pub_to_octets in
+  let sign_fn value = Mirage_crypto_ec.Ed25519.sign ~key value in
+  let base = make_swarm ~chain_id ~addr:"octProfile" in
+  let run offered reverse =
+    let head = ref 1_499_999L in
+    let local = W.create { base.W.config with
+      listen_port = 1;
+      consensus_config_hash = old_hash;
+      profile_plan = [first; second];
+      max_peers = 2;
+      best_epoch_fn = (fun () -> !head);
+    } in
+    let remote = W.create { base.W.config with
+      listen_port = 2;
+      node_id = H.node_id_of_pubkey pubkey_raw;
+      pubkey_raw;
+      consensus_config_hash = old_hash;
+      binary_hash = String.make 32 'g';
+      profile_plan = offered;
+      sign_fn;
+    } in
+    let hello = W.make_my_hello remote in
+    let fd, writer = Lwt_unix.pipe () in
+    let conn = C.create ~peer_class:Octra_net.P2p_frame_budget.Validator
+      fd ~peer_id:hello.node_id ~addr:"profile-peer" ~direction:C.Inbound in
+    Fun.protect
+      ~finally:(fun () ->
+        Lwt_main.run (Lwt.join [C.close conn; Lwt_unix.close writer]))
+      (fun () ->
+        assert_msg (W.add_peer local conn hello) "prior profile accepts peer";
+        assert_msg (W.wire_epoch local = 1_499_999L) "future profile not selected";
+        let frames =
+          let open Lwt.Syntax in
+          let* _, frames = Lwt.both
+            (W.send_profile remote conn)
+            (Lwt_list.map_s (fun _ -> Lwt_mvar.take conn.C.write_queue) offered)
+          in
+          Lwt.return frames
+        in
+        let frames = Lwt_main.run (Lwt.pick [
+          frames;
+          (let open Lwt.Syntax in
+           let* () = Lwt_unix.sleep 1.0 in
+           Lwt.fail_with "profile frames missing");
+        ]) in
+        assert_msg
+          (List.map (fun frame ->
+             assert_msg (frame.Octra_net.P2p_frame.msg_type = Octra_net.P2p_frame.msg_profile)
+               "profile frame type";
+             let value = H.decode_profile frame.payload in
+             value.H.epoch, value.config_hash) frames
+           = List.map (fun profile -> profile.W.epoch, profile.config_hash) offered)
+          "profile frames preserve plan";
+        let deliver frames = Lwt_main.run (Lwt_list.iter_s (fun frame ->
+          W.handle_profile local conn frame.Octra_net.P2p_frame.payload) frames) in
+        deliver (if reverse then List.rev frames else frames);
+        deliver [List.hd frames];
+        let extra = H.make_profile ~chain_id ~node_id:hello.node_id
+          ~epoch:1_510_001L ~config_hash:old_hash ~sign_fn in
+        Lwt_main.run (W.handle_profile local conn (H.encode_profile extra));
+        let peer = Hashtbl.find local.W.profiles hello.node_id in
+        assert_msg
+          (List.sort compare peer.W.offered
+           = List.map (fun profile -> profile.W.epoch, profile.config_hash) offered)
+          "offers retain each epoch without duplicates";
+        let switch epoch = W.switch_profile local ~epoch |> Lwt_main.run in
+        assert_msg (switch first.epoch = Ok first.profile_hash) "first profile selected";
+        assert_msg (switch first.epoch = Ok first.profile_hash) "first profile repeat";
+        assert_msg (C.is_connected conn) "first offer keeps peer";
+        assert_msg (W.wire_epoch local = first.epoch) "first wire epoch advances";
+        assert_msg (not (W.hello_current local hello)) "prior hello rejected after switch";
+        let middle = W.make_my_hello local in
+        assert_msg (W.hello_current local middle) "first profile hello accepted";
+        head := 1_509_998L;
+        assert_msg (W.wire_epoch local = !head) "second wire epoch waits";
+        head := 1_509_999L;
+        assert_msg (switch second.epoch = Ok second.profile_hash) "second profile selected";
+        assert_msg (W.config_hash local = second.config_hash) "second network hash selected";
+        let keep = List.length offered = 2 in
+        assert_msg (C.is_connected conn = keep) "second offer decides peer retention";
+        assert_msg (W.peer_ids local = if keep then [hello.node_id] else [])
+          "second profile peer set";
+        assert_msg (W.wire_epoch local = second.epoch) "second wire epoch advances";
+        assert_msg (not (W.hello_current local middle)) "first hello rejected after switch";
+        assert_msg (switch second.epoch = Ok second.profile_hash) "second profile repeat";
+        assert_msg
+          (switch first.epoch = Error "profile switch precedes active profile")
+          "earlier profile rejected";
+        assert_msg (Result.is_error (switch 1_510_001L)) "unknown profile rejected";
+        assert_msg (W.config_hash local = second.config_hash) "rejection preserves profile";
+        assert_msg (C.is_connected conn = keep) "rejection preserves peer";
+        head := 1_510_001L;
+        assert_msg (W.wire_epoch local = !head) "wire epoch follows committed head";
+        assert_msg (W.hello_current local (W.make_my_hello local))
+          "second profile hello accepted")
+  in
+  run [first; second] false;
+  run [first; second] true;
+  run [first] false
 
 let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch =
   let cfg = Driver.{
@@ -684,6 +803,7 @@ let () =
   check_future_validator_cutoff ();
   check_profile_offer ();
   check_profile_switch ();
+  check_profile_plan ();
   check_activation_restart ();
   check_live_plan ();
   check_start_height_set ();

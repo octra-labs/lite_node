@@ -21,5 +21,5 @@ val map2_checked : (t -> t -> t) -> t array -> t array -> t array option
 val elementwise_mul : t array -> t array -> t array option
 val residual_add : t array -> t array -> t array option
 val attention : t array -> t array -> t array -> int -> int -> int -> int -> t array option
-val layer : t array -> t array -> t array -> t array option
-val rms : t array -> t array -> t array option
+val layer : ?math:bool -> t array -> t array -> t array -> t array option
+val rms : ?math:bool -> t array -> t array -> t array option

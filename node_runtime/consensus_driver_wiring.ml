@@ -595,6 +595,7 @@ let verify_proposal_deps (deps : deps) =
     cached_bundle = cached_proposal_bundle deps;
     validate_preverify_once = (fun ~state_root ~tx_hashes txs ->
       Consensus_bundle_cache.run_preverify_once
+        ~epoch:(deps.current_epoch ())
         deps.proposal_bundles
         ~purpose:Consensus_bundle_cache.Validate_proposal
         ~state_root
@@ -648,6 +649,7 @@ let make_proposal_deps (deps : deps) =
            tx.Transaction.op_type);
     build_preverify_once = (fun ~state_root ~tx_hashes txs ->
       Consensus_bundle_cache.run_preverify_once
+        ~epoch:(deps.current_epoch ())
         deps.proposal_bundles
         ~purpose:Consensus_bundle_cache.Build_proposal
         ~state_root

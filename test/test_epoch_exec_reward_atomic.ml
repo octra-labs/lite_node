@@ -102,6 +102,8 @@ let fold standard_mode =
     open_mode = Octra_core.Rule_graph.Active;
     account_mode = Octra_core.Rule_graph.Active;
     standard_mode;
+    plan_mode = Octra_core.Rule_graph.Prior;
+    math = false;
     cap_mode = Octra_core.Set_fold.Prune;
     ready_config_hash = Some "ready";
     start = 1_334_000L;
@@ -403,9 +405,9 @@ let test_validator_unbond () =
 let test_consensus_standard () =
   let getenv _ = None in
   let compat = P.compat_hash getenv in
-  let first = P.standard_hash ~chain_id:"standard-a" getenv in
-  let repeated = P.standard_hash ~chain_id:"standard-a" getenv in
-  let other = P.standard_hash ~chain_id:"standard-b" getenv in
+  let first = P.standard_hash ~chain_id:"standard-a" ~epoch:0 getenv in
+  let repeated = P.standard_hash ~chain_id:"standard-a" ~epoch:0 getenv in
+  let other = P.standard_hash ~chain_id:"standard-b" ~epoch:0 getenv in
   expect "consensus standard name"
     (String.equal P.standard "octra_consensus");
   expect "compat hash golden"
@@ -424,7 +426,7 @@ let test_consensus_cutover () =
   let chain_id = "octra-devnet-9871-cluster" in
   let getenv _ = None in
   let compat = P.compat_hash getenv in
-  let full = P.standard_hash ~chain_id getenv in
+  let full = P.standard_hash ~chain_id ~epoch:1_500_000 getenv in
   expect "wire hashes differ" (not (String.equal compat full));
   expect "wire hash stays compatible before activation"
     (String.equal
@@ -487,6 +489,7 @@ let test_integer_work_gate () =
           store;
           get_fhe_pubkey = (fun _ -> None);
           proof_mode;
+          math = false;
           object_cost = false;
           current_epoch = 0;
           epoch_time_ms = 0L;
@@ -585,7 +588,7 @@ let test_upgrade_ready_refresh () =
     binary_hash;
     require_binary_hash = true;
     upgrade_plan = Some plan;
-    profile = None;
+    profile_plan = [];
     handshake_allowed_pubkeys = [];
     validator_pubkeys = [];
   } in

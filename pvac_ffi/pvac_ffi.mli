@@ -31,12 +31,12 @@ val dec_values : pubkey -> seckey -> cipher -> int64 array
 
 val ct_add : pubkey -> cipher -> cipher -> cipher
 val ct_sub : pubkey -> cipher -> cipher -> cipher
-val ct_mul_seeded : pubkey -> cipher -> cipher -> bytes -> cipher
-val ct_scale : pubkey -> cipher -> int64 -> cipher
-val ct_add_const : pubkey -> cipher -> int64 -> int64 -> cipher
-val ct_sub_const : pubkey -> cipher -> int64 -> cipher
+val ct_mul_seeded : ?math:bool -> pubkey -> cipher -> cipher -> bytes -> cipher
+val ct_scale : ?math:bool -> pubkey -> cipher -> int64 -> cipher
+val ct_add_const : ?math:bool -> pubkey -> cipher -> int64 -> int64 -> cipher
+val ct_sub_const : ?math:bool -> pubkey -> cipher -> int64 -> cipher
 val ct_div_const : pubkey -> cipher -> int64 -> int64 -> cipher
-val ct_square_seeded : pubkey -> cipher -> bytes -> cipher
+val ct_square_seeded : ?math:bool -> pubkey -> cipher -> bytes -> cipher
 val ct_recrypt_seeded : pubkey -> evalkey -> cipher -> bytes -> cipher
 
 val commit_ct : pubkey -> cipher -> bytes
@@ -49,49 +49,49 @@ val pubkey_is_key_bound_extension : pubkey -> pubkey -> bool
 val pubkey_supports_alias_rejection : pubkey -> bool
 val cipher_is_key_bound_extension : cipher -> cipher -> bool
 
-val make_zero_proof : pubkey -> seckey -> cipher -> zero_proof
+val make_zero_proof : ?math:bool -> pubkey -> seckey -> cipher -> zero_proof
 
-val verify_zero : pubkey -> cipher -> zero_proof -> bool
+val verify_zero : ?math:bool -> pubkey -> cipher -> zero_proof -> bool
 
-val make_zero_proof_bound : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+val make_zero_proof_bound : ?math:bool -> pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
 
-val verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
+val verify_zero_bound : ?math:bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
 
-val verify_zero_amount_prior : pubkey -> cipher -> zero_proof -> bytes -> bool
+val verify_zero_amount_prior : ?math:bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val verify_zero_bound_key_switch :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
+  ?math:bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val verify_zero_amount_key_switch_prior :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
+  ?math:bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val make_zero_proof_bound_historical_migration :
-  pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+  ?math:bool -> pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
 
 val verify_zero_bound_historical_migration :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
+  ?math:bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
 
 val verify_zero_amount_historical_prior :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
+  ?math:bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
 
-val make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+val make_zero_proof_bound_range : ?math:bool -> pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
 
 val pedersen_commit_amount : int64 -> bytes -> bytes
 val pedersen_identity : unit -> bytes
 val pedersen_add : bytes -> bytes -> bytes
 val pedersen_sub : bytes -> bytes -> bytes
 
-val make_range_proof : pubkey -> seckey -> cipher -> int64 -> range_proof
+val make_range_proof : ?math:bool -> pubkey -> seckey -> cipher -> int64 -> range_proof
 
-val verify_range : pubkey -> cipher -> range_proof -> bool
+val verify_range : ?math:bool -> pubkey -> cipher -> range_proof -> bool
 
 type agg_range_proof
-val make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> agg_range_proof
+val make_aggregated_range_proof : ?math:bool -> pubkey -> seckey -> cipher -> int64 -> agg_range_proof
 val serialize_agg_range_proof : agg_range_proof -> bytes
 
-val verify_range_any : pubkey -> cipher -> bytes -> bool -> bool
-val verify_range_bound : pubkey -> cipher -> bytes -> bytes -> bool
-val verify_range_amount_prior : pubkey -> cipher -> bytes -> bytes -> bool
+val verify_range_any : ?math:bool -> pubkey -> cipher -> bytes -> bool -> bool
+val verify_range_bound : ?math:bool -> pubkey -> cipher -> bytes -> bytes -> bool
+val verify_range_amount_prior : ?math:bool -> pubkey -> cipher -> bytes -> bytes -> bool
 
 val serialize_cipher : cipher -> bytes
 val serialize_cipher_public : cipher -> bytes

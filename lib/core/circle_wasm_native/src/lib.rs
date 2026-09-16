@@ -225,6 +225,7 @@ struct Payload {
     hfhe_pubkeys: Option<Vec<HfhePubkeyJson>>,
     hfhe_active_key: Option<HfheActiveKey>,
     hfhe_strict: Option<bool>,
+    math: Option<bool>,
     hfhe_receipt_mode: Option<String>,
     hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
     public_reads: Option<Vec<PublicReadJson>>,
@@ -343,6 +344,7 @@ struct HostState {
     hfhe_pubkeys: HashMap<String, String>,
     hfhe_active_key: Option<HfheActiveKey>,
     hfhe_strict: bool,
+    math: bool,
     hfhe_receipt_mode: String,
     hfhe_receipt_expected: Vec<HfheReceiptEntryJson>,
     hfhe_receipt_entries: Vec<HfheReceiptEntryJson>,
@@ -1405,6 +1407,7 @@ impl HostState {
             hfhe_pubkeys,
             hfhe_active_key: payload.hfhe_active_key.clone(),
             hfhe_strict,
+            math: payload.math.unwrap_or(false),
             hfhe_receipt_mode,
             hfhe_receipt_expected,
             hfhe_receipt_entries: Vec::new(),
@@ -6067,6 +6070,7 @@ fn execute_hfhe_direct(
         )));
     }
     let strict = caller.data().hfhe_strict;
+    let math = caller.data().math;
     let cap = caller.data().is_view || strict;
     let params = request.params;
     match request.method.as_str() {
@@ -6099,6 +6103,7 @@ fn execute_hfhe_direct(
                 "amount": amount,
                 "seed_b64": seed_b64,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6117,6 +6122,7 @@ fn execute_hfhe_direct(
                 "seckey_b64": active.seckey_b64,
                 "seed_b64": seed_b64,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6135,6 +6141,7 @@ fn execute_hfhe_direct(
                 "seckey_b64": active.seckey_b64,
                 "ciphertext": ciphertext,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_int(expect_backend_string(value)?))
         }
@@ -6148,6 +6155,7 @@ fn execute_hfhe_direct(
                 "lhs_ciphertext": lhs_ciphertext,
                 "rhs_ciphertext": rhs_ciphertext,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6161,6 +6169,7 @@ fn execute_hfhe_direct(
                 "lhs_ciphertext": lhs_ciphertext,
                 "rhs_ciphertext": rhs_ciphertext,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6174,6 +6183,7 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "factor": factor,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6187,6 +6197,7 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "amount": amount,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6200,6 +6211,7 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "amount": amount,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6211,6 +6223,7 @@ fn execute_hfhe_direct(
                 "amount": amount,
                 "blinding_b64": blinding_b64,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6222,6 +6235,7 @@ fn execute_hfhe_direct(
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6235,6 +6249,7 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "amount": amount,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_string(expect_backend_string(value)?))
         }
@@ -6248,6 +6263,7 @@ fn execute_hfhe_direct(
                 "ciphertext": ciphertext,
                 "proof": proof,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -6264,6 +6280,7 @@ fn execute_hfhe_direct(
                 "amount_commitment": amount_commitment,
                 "strict": strict,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -6280,6 +6297,7 @@ fn execute_hfhe_direct(
                 "amount_commitment": amount_commitment,
                 "strict": strict,
                 "cap": cap,
+                "math": math,
             }))?;
             Ok(frame_bool(expect_backend_bool(value)?))
         }
@@ -6537,6 +6555,26 @@ mod tests {
                 assert_eq!((state.hfhe_strict, state.is_view), (strict, view));
             }
         }
+    }
+
+    #[test]
+    fn math_mode() {
+        for math in [false, true] {
+            let payload: Payload = serde_json::from_value(json!({
+                "hfhe_strict": true,
+                "is_view": true,
+                "math": math
+            }))
+            .unwrap();
+            assert_eq!(HostState::from_payload(&payload, false).unwrap().math, math);
+        }
+        let payload: Payload = serde_json::from_value(json!({
+            "hfhe_strict": true,
+            "is_view": true
+        }))
+        .unwrap();
+        assert!(!HostState::from_payload(&payload, false).unwrap().math);
+        assert!(serde_json::from_value::<Payload>(json!({"math": "true"})).is_err());
     }
 
     fn entry(

@@ -8,11 +8,12 @@ module Tx_view = Octra_node_runtime.Tx_view
 let fail msg =
   failwith ("test_node_runtime_preverify_cache: " ^ msg)
 
-let result strict sender_enc_snapshot =
+let result ?(math=false) strict sender_enc_snapshot =
   C.{
     delta_ok = true;
     balance_ok = false;
     strict;
+    math;
     sender_enc_snapshot;
   }
 
@@ -41,6 +42,23 @@ let test_ready_result () =
   end;
   C.remove hash;
   expect_state C.Missing hash
+
+let test_math_cache () =
+  let hash = "math-cache" in
+  C.remove hash;
+  let prior, wake = Lwt.wait () in
+  if C.start_task ~math:false hash (fun () -> prior) <> Preverify_submit.Started then
+    fail "prior task did not start";
+  if C.start_task ~math:true hash
+      (fun () -> Lwt.return (C.Checked (result ~math:true false "cipher")))
+     <> Preverify_submit.Started then fail "math task reused prior task";
+  Lwt.wakeup wake (C.Checked (result false "cipher"));
+  ignore (Lwt_main.run (Lwt.pause ()));
+  if Option.is_some (C.ready_result ~math:false hash ~strict:false ~sender_enc_snapshot:"cipher") then
+    fail "prior reused math result";
+  if Option.is_none (C.ready_result ~math:true hash ~strict:false ~sender_enc_snapshot:"cipher") then
+    fail "prior completion replaced math result";
+  C.remove hash
 
 let test_pending_remove () =
   let hash = "test-preverify-cache-pending" in
@@ -178,6 +196,7 @@ let test_config_limits () =
 
 let () =
   test_ready_result ();
+  test_math_cache ();
   test_pending_remove ();
   test_unavailable_state ();
   test_retain ();

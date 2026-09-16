@@ -36,6 +36,7 @@ let context ~program_trust ~object_cost backend env
       store = backend.Epoch_exec.store;
       get_fhe_pubkey = Vm.live_fhe_pubkey backend.store;
       proof_mode = backend.proof_mode;
+      math = backend.math;
       object_cost;
       current_epoch = env.Epoch_exec.epoch_id;
       epoch_time_ms =
@@ -295,6 +296,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         reject "malformed_transaction" reason);
       max_multi_exec_calls = Vm.max_multi_exec_calls ~env:Sys.getenv_opt;
       proof_mode = backend.proof_mode;
+      math = backend.math;
       epoch = env.epoch_id;
       now = (fun () -> env.epoch_ts);
     }

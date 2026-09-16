@@ -48,6 +48,7 @@ type runtime = {
   object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   private_field_policy : Octra_core.Private_ledger.field_policy;
   legacy_replay :
     epoch:int ->

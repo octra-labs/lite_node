@@ -192,7 +192,7 @@ let activation_graph_hash ~chain_id =
     Octra_net.Oce1.put_string buf standard;
     Octra_net.Oce1.put_string buf chain_id;
     Octra_net.Oce1.put_string buf
-      (Octra_core.Rule_graph.consensus_id ~chain_id))
+      (Octra_core.Rule_graph.consensus_id ~chain_id ~epoch:max_int))
 
 let compat_hash getenv =
   let env = runtime_env getenv in
@@ -250,7 +250,7 @@ let put_standard_component buf name value =
   Octra_net.Oce1.put_string buf name;
   Octra_net.Oce1.put_string buf value
 
-let standard_hash ~chain_id getenv =
+let standard_hash ~chain_id ~epoch getenv =
   let validator_policy = Octra_core.Validator_policy.of_env_exn getenv in
   let schedule = emission_schedule getenv in
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
@@ -258,7 +258,7 @@ let standard_hash ~chain_id getenv =
     Octra_net.Oce1.put_string buf chain_id;
     put_standard_component buf "runtime_compatibility" (compat_hash getenv);
     put_standard_component buf "activation_graph"
-      (Octra_core.Rule_graph.consensus_id ~chain_id);
+      (Octra_core.Rule_graph.consensus_id ~chain_id ~epoch);
     put_standard_component buf "quorum"
       (Octra_consensus.C_quorum_policy.consensus_id ~chain_id);
     put_standard_component buf "set_fold_bootstrap"
@@ -286,18 +286,23 @@ let standard_hash ~chain_id getenv =
     put_standard_component buf "program_compiler" Octra_vm.Program_package.standard_id;
     put_standard_component buf "vm_undo" "nested_commit";
     put_standard_component buf "proposal_protocol"
-      (Octra_consensus.C_protocol.consensus_id getenv))
+      (Octra_consensus.C_protocol.consensus_id getenv);
+    begin
+      match Octra_core.Rule_graph.set_plan_at ~chain_id ~epoch with
+      | Octra_core.Rule_graph.Prior -> ()
+      | Octra_core.Rule_graph.Active ->
+        put_standard_component buf "set_plan" "retain_until_activation"
+    end;
+    match Octra_core.Rule_graph.math_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "math" "scalar65_field_signed_cipher_zero_q16")
 
 let hash ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with
   | Octra_core.Rule_graph.Prior -> compat_hash getenv
-  | Octra_core.Rule_graph.Active -> standard_hash ~chain_id getenv
+  | Octra_core.Rule_graph.Active -> standard_hash ~chain_id ~epoch getenv
 
 let switch_after ~chain_id ~applied_epoch =
   applied_epoch < max_int
-  && Octra_core.Rule_graph.standard_at ~chain_id ~epoch:applied_epoch
-     = Octra_core.Rule_graph.Prior
-  && Octra_core.Rule_graph.standard_at
-       ~chain_id
-       ~epoch:(applied_epoch + 1)
-     = Octra_core.Rule_graph.Active
+  && List.mem (applied_epoch + 1) (Octra_core.Rule_graph.profile_epochs ~chain_id)

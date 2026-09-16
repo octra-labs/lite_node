@@ -921,7 +921,7 @@ let test_stealth_delta_layer_limit () =
   begin
     match
       Lwt_main.run
-        (Tx_view.preverify_stealth_ranges
+        (Tx_view.preverify_stealth_ranges ~math:false
            ~strict:false
            ~pubkey_blob
            ~sender_enc:scalar
@@ -975,7 +975,7 @@ let test_preverify_stealth_payload () =
     begin
       match
         Lwt_main.run
-          (Tx_view.preverify_stealth_ranges
+          (Tx_view.preverify_stealth_ranges ~math:false
            ~strict:false
              ~pubkey_blob
              ~sender_enc:cipher
@@ -1028,6 +1028,7 @@ let test_preverify_saturation () =
           balance_ok = true;
           sender_enc_snapshot = string_of_int value;
           strict = false;
+          math = false;
         }
       in
       if Lwt.is_sleeping completed then Lwt.wakeup resolve_completed result;
@@ -1083,6 +1084,7 @@ let test_preverify_saturation () =
 let test_preverify_submit_result () =
   let ok =
     Preverify_submit.result_of_ranges
+      ~math:false
       ~strict:false
       ~sender_enc_snapshot:"cipher-a"
       (Ok (true, false)) in
@@ -1097,6 +1099,7 @@ let test_preverify_submit_result () =
   end;
   let bad =
     Preverify_submit.result_of_ranges
+      ~math:false
       ~strict:false
       ~sender_enc_snapshot:"cipher-b"
       (Error (Tx_view.Preverify_invalid "bad pubkey")) in
@@ -1111,6 +1114,7 @@ let test_preverify_submit_result () =
   end;
   match
     Preverify_submit.result_of_ranges
+      ~math:false
       ~strict:false
       ~sender_enc_snapshot:"cipher-c"
       (Error
@@ -1128,13 +1132,14 @@ let test_preverify_tx_launch () =
   let launcher : Preverify_submit.launcher = {
     get_pvac_pubkey = (fun _ -> Lwt.return (Some "pk"));
     sender_enc = (fun addr -> "cipher:" ^ addr);
-    start_task = (fun hash f ->
+    start_task = (fun ~math:_ hash f ->
       incr launches;
       inserts := hash :: !inserts;
       ignore (f ());
       Preverify_submit.Started);
     strict = (fun () -> false);
-    verify_ranges = (fun ~strict:_ ~pubkey_blob:_ ~sender_enc ptd ->
+    math = (fun () -> false);
+    verify_ranges = (fun ~math:_ ~strict:_ ~pubkey_blob:_ ~sender_enc ptd ->
       sender_snapshots := sender_enc :: !sender_snapshots;
       Lwt.return (Ok (ptd.Octra_core.Crypto.PrivateTransferV4.version = 5, false)));
     now = (fun () -> 1.0);
@@ -1165,7 +1170,7 @@ let test_preverify_tx_launch () =
   if !sender_snapshots <> ["cipher:octfrom"] then fail "stealth preverify sender snapshot mismatch";
   let busy_launcher = {
     launcher with
-    Preverify_submit.start_task = (fun _ _ -> Preverify_submit.Busy);
+    Preverify_submit.start_task = (fun ~math:_ _ _ -> Preverify_submit.Busy);
   } in
   match
     Preverify_submit.launch_for_tx

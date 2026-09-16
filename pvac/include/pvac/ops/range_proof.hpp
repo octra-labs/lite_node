@@ -87,7 +87,8 @@ inline RangeProof make_range_proof(
     const PubKey& pk,
     const SecKey& sk,
     const Cipher& ct_value,
-    uint64_t value
+    uint64_t value,
+    ScalarRule rule = ScalarRule::Prior
 ) {
     if (!range_value_cipher_ok(pk, ct_value))
         throw std::runtime_error("pvac: range proof value rejected");
@@ -103,24 +104,24 @@ inline RangeProof make_range_proof(
         for (size_t i = 0; i < RANGE_BITS; ++i) {
             uint64_t b_i = (value >> i) & 1;
             rp.ct_bit[i] = enc_value(pk, sk, b_i);
-            auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1);
+            auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1, rule == ScalarRule::Wide);
             uint8_t mul_seed[32];
             for (int k = 0; k < 32; ++k)
                 mul_seed[k] = (uint8_t)((i * 37 + k * 13 + 0xA0) & 0xFF);
-            auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed);
-            rp.bit_proofs[i] = make_zero_proof(pk, sk, ct_check);
+            auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed, 8, rule == ScalarRule::Wide);
+            rp.bit_proofs[i] = make_zero_proof(pk, sk, ct_check, rule);
         }
     } else {
         auto worker = [&](size_t from, size_t to) {
             for (size_t i = from; i < to; ++i) {
                 uint64_t b_i = (value >> i) & 1;
                 rp.ct_bit[i] = enc_value(pk, sk, b_i);
-                auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1);
+                auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1, rule == ScalarRule::Wide);
                 uint8_t mul_seed[32];
                 for (int k = 0; k < 32; ++k)
                     mul_seed[k] = (uint8_t)((i * 37 + k * 13 + 0xA0) & 0xFF);
-                auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed);
-                rp.bit_proofs[i] = make_zero_proof(pk, sk, ct_check);
+                auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed, 8, rule == ScalarRule::Wide);
+                rp.bit_proofs[i] = make_zero_proof(pk, sk, ct_check, rule);
             }
         };
 
@@ -145,7 +146,7 @@ inline RangeProof make_range_proof(
 
     auto ct_lc_diff = ct_sub(pk, ct_sum, ct_value);
 
-    rp.lc_proof = make_zero_proof(pk, sk, ct_lc_diff);
+    rp.lc_proof = make_zero_proof(pk, sk, ct_lc_diff, rule);
 
     return rp;
 }
@@ -153,7 +154,8 @@ inline RangeProof make_range_proof(
 inline bool verify_range(
     const PubKey& pk,
     const Cipher& ct_value,
-    const RangeProof& rp
+    const RangeProof& rp,
+    ScalarRule rule = ScalarRule::Prior
 ) {
     if (!range_value_cipher_ok(pk, ct_value)) return false;
 
@@ -173,23 +175,23 @@ inline bool verify_range(
 
     if (n_threads <= 1) {
         for (size_t i = 0; i < RANGE_BITS; ++i) {
-            auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1);
+            auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1, rule == ScalarRule::Wide);
             uint8_t mul_seed[32];
             for (int k = 0; k < 32; ++k)
                 mul_seed[k] = (uint8_t)((i * 37 + k * 13 + 0xA0) & 0xFF);
-            auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed);
-            if (!verify_zero(pk, ct_check, rp.bit_proofs[i]))
+            auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed, 8, rule == ScalarRule::Wide);
+            if (!verify_zero(pk, ct_check, rp.bit_proofs[i], rule))
                 return false;
         }
     } else {
         auto worker = [&](size_t from, size_t to) {
             for (size_t i = from; i < to; ++i) {
-                auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1);
+                auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1, rule == ScalarRule::Wide);
                 uint8_t mul_seed[32];
                 for (int k = 0; k < 32; ++k)
                     mul_seed[k] = (uint8_t)((i * 37 + k * 13 + 0xA0) & 0xFF);
-                auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed);
-                results[i] = verify_zero(pk, ct_check, rp.bit_proofs[i]);
+                auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed, 8, rule == ScalarRule::Wide);
+                results[i] = verify_zero(pk, ct_check, rp.bit_proofs[i], rule);
             }
         };
 
@@ -216,7 +218,7 @@ inline bool verify_range(
 
     auto ct_lc_diff = ct_sub(pk, ct_sum, ct_value);
 
-    if (!verify_zero(pk, ct_lc_diff, rp.lc_proof)) {
+    if (!verify_zero(pk, ct_lc_diff, rp.lc_proof, rule)) {
         return false;
     }
 
@@ -328,7 +330,8 @@ inline AggregatedRangeProof make_aggregated_range_proof(
     const PubKey& pk,
     const SecKey& sk,
     const Cipher& ct_value,
-    uint64_t value
+    uint64_t value,
+    ScalarRule rule = ScalarRule::Prior
 ) {
     if (!range_value_cipher_ok(pk, ct_value))
         throw std::runtime_error("pvac: aggregated range value rejected");
@@ -359,7 +362,7 @@ inline AggregatedRangeProof make_aggregated_range_proof(
     detail::BitPrepData lc_data;
     detail::prepare_lc(pk, sk, ct_lc_diff, lc_data);
 
-    bp::R1CSProver prover;
+    bp::R1CSProver prover(rule);
     for (size_t i = 0; i < RANGE_BITS; ++i) {
         detail::build_circuit(prover, bit_data[i].ct_check,
                               bit_data[i].A, bit_data[i].bases,
@@ -369,7 +372,7 @@ inline AggregatedRangeProof make_aggregated_range_proof(
                           lc_data.A, lc_data.bases,
                           &lc_data.rinv, &sk);
 
-    bp::Transcript transcript("pvac.range_proof.aggregated");
+    bp::Transcript transcript("pvac.range_proof.aggregated", rule);
     detail::append_transcript_params(transcript, bit_data, lc_data);
 
     arp.proof = prover.prove(transcript);

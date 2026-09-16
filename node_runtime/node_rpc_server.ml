@@ -302,10 +302,16 @@ let fhe_pubkey_loader store addr =
     | Ok pk -> Some pk
     | Error _ -> None
 
-let make_view_ctx store ledger current_epoch_ref =
+let math_mode ctx =
+  match Octra_core.Rule_graph.math ctx.rules ~epoch:!(ctx.current_epoch) with
+  | Ok mode -> mode = Octra_core.Rule_graph.Active
+  | Error fault -> failwith (Octra_core.Rule_graph.fault_message fault)
+
+let make_view_ctx ~math store ledger current_epoch_ref =
   let running, stop = Octra_vm.Contract_rpc.view_clock () in
   let ctx =
     Octra_vm.Contract_rpc.make_view_ctx
+      ~math
       ~running
       ~store
       ~ledger
@@ -317,6 +323,7 @@ let make_view_ctx store ledger current_epoch_ref =
 
 let contract_call params ctx =
   Octra_vm.Contract_rpc.call_params
+    ~math:(math_mode ctx)
     ~store:ctx.store
     ~ledger:ctx.ledger
     ~current_epoch:!(ctx.current_epoch)
@@ -325,14 +332,16 @@ let contract_call params ctx =
     params
 
 let circle_view params ctx =
-  let view_ctx, running, stop = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
+  let view_ctx, running, stop =
+    make_view_ctx ~math:(math_mode ctx) ctx.store ctx.ledger ctx.current_epoch in
   Circle_read_rpc.view_call_public_params
     ~running ~stop
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
     ctx.store params ~view_ctx
 
 let circle_view_auth params ctx =
-  let view_ctx, running, stop = make_view_ctx ctx.store ctx.ledger ctx.current_epoch in
+  let view_ctx, running, stop =
+    make_view_ctx ~math:(math_mode ctx) ctx.store ctx.ledger ctx.current_epoch in
   Circle_read_rpc.view_call_auth
     ~running ~stop
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)

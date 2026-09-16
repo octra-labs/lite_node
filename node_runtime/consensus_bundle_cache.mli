@@ -25,9 +25,11 @@ type stats = {
   misses : int;
   evictions : int;
   cache_size : int;
+  cache_bytes : int;
   fifo_size : int;
   preverify_size : int;
   preverify_queue : int;
+  preverify_bytes : int;
 }
 
 type cached =
@@ -63,6 +65,7 @@ val create : cap:int -> t
 
 val create_with_limits :
   cap:int ->
+  check_limit:int ->
   shared_cap:int ->
   shared_limit:int ->
   t
@@ -141,12 +144,14 @@ type preverify_purpose =
   | Validate_proposal
 
 val preverify_item_key :
+  epoch:int ->
   purpose:preverify_purpose ->
   state_root:string ->
   tx_hash:string ->
   string
 
 val run_preverify_once :
+  ?epoch:int ->
   t ->
   purpose:preverify_purpose ->
   state_root:string ->

@@ -245,11 +245,9 @@ let apply_gc_config config =
 
 let log_gc_snapshot () =
   let s = Gc.quick_stat () in
-  let live_mb = (s.live_words * (Sys.word_size / 8)) / 1_048_576 in
   let heap_mb = (s.heap_words * (Sys.word_size / 8)) / 1_048_576 in
   Octra_log.info "gc"
-    "live_mb = %d heap_mb = %d minor_collections = %d major_collections = %d compactions = %d"
-    live_mb
+    "live_mb = unavailable heap_mb = %d minor_collections = %d major_collections = %d compactions = %d"
     heap_mb
     s.minor_collections
     s.major_collections

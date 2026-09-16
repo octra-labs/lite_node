@@ -357,6 +357,7 @@ val run_preverify_compute :
   ('a, preverify_unavailable) result Lwt.t
 
 val preverify_stealth_ranges :
+  math:bool ->
   strict:bool ->
   pubkey_blob:string ->
   sender_enc:string ->

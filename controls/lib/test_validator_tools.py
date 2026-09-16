@@ -82,6 +82,7 @@ from validator_process import remaining_owners
 from validator_process import active_data_owners
 from validator_process import data_pids
 from validator_process import entry_data
+from validator_process import node_owners
 from validator_process import pm2_entries
 from validator_process import wait_stopped
 from validator_recover import recover
@@ -146,6 +147,27 @@ from upgrade import sync_target
 
 RUNTIME_DATA_ROOT = CONFIG_ROOT / "runtime_data"
 WORK = RUNTIME_DATA_ROOT / "validator_tools_test"
+
+def worker_case():
+    root = WORK / "proc"
+    worker = WORK / "worker"
+    worker.write_bytes(b"verify worker")
+    for pid in (17, 18):
+        process = root / str(pid)
+        process.mkdir(parents=True)
+        (process / "environ").write_bytes(
+            b"OCTRA_DATA_DIR=" + os.fsencode(str(WORK)) + b"\0"
+        )
+    (root / "18/stat").write_text("18 (verify worker) S 17 " + "0 " * 17 + "10\n")
+    (root / "18/exe").symlink_to(worker)
+    return root, {
+        "OCTRA_DATA_DIR": str(WORK),
+        "OCTRA_OPERATOR_PM2_NAME": "octra-test",
+        "OCTRA_OPERATOR_ROLE": "validator",
+        "OCTRA_API_PORT": "8080",
+        "OCTRA_PVAC_VERIFY_WORKER": str(worker),
+        "OCTRA_PVAC_VERIFY_WORKER_HASH": hashlib.sha256(worker.read_bytes()).hexdigest(),
+    }
 
 def identity():
     key = SigningKey.generate()
@@ -1188,7 +1210,46 @@ class ValidatorToolsTest(unittest.TestCase):
                     supervisor,
                     (41, 8),
                 )
-        self.assertEqual(calls, ["start"])
+        self.assertEqual(calls, [])
+
+    def test_upgrade_stop_owners(self):
+        values = {
+            "OCTRA_DATA_DIR": str(WORK),
+            "OCTRA_OPERATOR_BINARY": str(WORK / "octra_node.exe"),
+            "OCTRA_CHAIN_ID": "octra-devnet-test",
+        }
+        supervisor = {"kind": "pm2", "pid": 0, "config": WORK / "node.env"}
+        read_state = mock.Mock()
+        restore = mock.Mock()
+        start = mock.Mock()
+        stop = mock.Mock()
+        with mock.patch.multiple(
+            upgrade_tool,
+            release_target=mock.Mock(return_value=("a" * 40, "b" * 40)),
+            preflight=mock.Mock(),
+            verify_unit=mock.Mock(return_value=None),
+            git_update=mock.Mock(return_value=("a" * 40, "b" * 40, False)),
+            verify_release_tree=mock.Mock(),
+            release_sync_values=mock.Mock(return_value=values),
+            sync_head=mock.Mock(return_value=None),
+            sync_plan=mock.Mock(return_value=None),
+            read_need=mock.Mock(return_value=None),
+            call=mock.Mock(),
+            parse_env=mock.Mock(return_value=values),
+            inspect_pending=mock.Mock(return_value=[]),
+            inspect_votes=mock.Mock(return_value=[]),
+            stop=stop,
+            data_pids=mock.Mock(return_value=[18]),
+            disk_state=read_state,
+            restore_cycle=restore,
+            start=start,
+        ):
+            with self.assertRaisesRegex(ValidatorError, "active after stop: 18"):
+                upgrade_tool.apply(WORK, supervisor, values, mock.Mock(sudo=False), release_value())
+        stop.assert_called_once()
+        read_state.assert_not_called()
+        restore.assert_not_called()
+        start.assert_not_called()
 
     def test_upgrade_hash_pins(self):
         release = release_value()
@@ -2047,6 +2108,22 @@ class ValidatorToolsTest(unittest.TestCase):
                     confirmed_node(values, WORK, 17)
         binary.assert_called_once_with(17)
 
+    def test_rejoin_stop_owners(self):
+        with mock.patch("validator_rejoin.confirmed_node"), mock.patch(
+            "validator_rejoin.pause_node",
+        ), mock.patch("validator_rejoin.resume_node"), mock.patch(
+            "validator_rejoin.checked_floor",
+        ), mock.patch("validator_rejoin.stop"), mock.patch(
+            "validator_rejoin.data_pids", return_value=[18],
+        ), mock.patch("validator_rejoin.place_floor") as floor, mock.patch(
+            "validator_rejoin.launch",
+        ) as launch_node:
+            with self.assertRaises(MeetError) as raised:
+                meet_stage(WORK, WORK / "node.env", {}, {}, WORK, 41, 17, 10)
+        self.assertEqual(raised.exception.state, "process_present")
+        floor.assert_not_called()
+        launch_node.assert_not_called()
+
     def test_rejoin_stage_failure(self):
         values = {"OCTRA_CHAIN_ID": "octra-devnet-test"}
         address, public_key = identity()
@@ -2235,11 +2312,7 @@ class ValidatorToolsTest(unittest.TestCase):
         launch_node.assert_called_once_with(WORK, WORK / "node.env")
 
     def test_rejoin_check_running(self):
-        values = {
-            "OCTRA_DATA_DIR": str(WORK),
-            "OCTRA_OPERATOR_ROLE": "validator",
-            "OCTRA_OPERATOR_PM2_NAME": "octra-test",
-        }
+        root, values = worker_case()
         address, public_key = identity()
         wallet = {"address": address, "pub": public_key}
         entries = [{
@@ -2251,7 +2324,10 @@ class ValidatorToolsTest(unittest.TestCase):
             },
         }]
         before = {"round_epoch": 42, "round": 7, "peer_round": 9}
-        with mock.patch("validator_rejoin.require_root"):
+        with mock.patch("validator_rejoin.require_root"), mock.patch(
+            "validator_rejoin.node_owners",
+            side_effect=lambda pids, pid, config: node_owners(pids, pid, config, root=root),
+        ):
             with mock.patch("validator_rejoin.private_mode"):
                 with mock.patch("validator_rejoin.parse_env", return_value=values):
                     with mock.patch("validator_rejoin.state_ready", return_value=True):
@@ -2265,7 +2341,7 @@ class ValidatorToolsTest(unittest.TestCase):
                             ):
                                 with mock.patch(
                                     "validator_rejoin.data_pids",
-                                    return_value=[17],
+                                    return_value=[17, 18],
                                 ):
                                     with mock.patch(
                                         "validator_rejoin.pm2_entries",
@@ -3041,6 +3117,19 @@ class ValidatorToolsTest(unittest.TestCase):
             ):
                 with self.assertRaises(ValidatorError):
                     next_nonce(values, wallet)
+
+    def test_enrollment_nonce_guard(self):
+        wallet = {"address": identity()[0]}
+        values = {"OCTRA_API_PORT": "8080"}
+        with mock.patch(
+            "validator_enroll.call",
+            return_value={"nonce": 214, "pending_nonce": 215},
+        ):
+            with self.assertRaisesRegex(
+                ValidatorError,
+                "wait before enrollment; nonce = 214 pending_nonce = 215",
+            ):
+                next_nonce(values, wallet)
 
     def test_ready_message(self):
         values = {"OCTRA_CHAIN_ID": "octra-test"}
@@ -4557,6 +4646,113 @@ class ValidatorToolsTest(unittest.TestCase):
             b"PATH=/usr/bin\0OCTRA_DATA_DIR=" + os.fsencode(str(data.resolve())) + b"\0"
         )
         self.assertEqual(data_pids(data, root=root), [41])
+
+    def test_worker_owners(self):
+        root, values = worker_case()
+        pids = data_pids(WORK, root=root)
+        self.assertEqual(pids, [17, 18])
+        self.assertTrue(node_owners(pids, 17, values, root=root))
+        self.assertTrue(node_owners([17], 17, {}, root=root))
+        for owners, pid in (([], 17), ([18], 17), (pids, 0), (pids + [19], 17)):
+            with self.subTest(owners=owners, pid=pid):
+                self.assertFalse(node_owners(owners, pid, values, root=root))
+        self.assertEqual(data_pids(WORK, root=root), [17, 18])
+
+    def test_worker_identity(self):
+        root, values = worker_case()
+        path = root / "18/stat"
+        original = path.read_text()
+        for text in ("", "invalid", original.replace("S 17", "S 19")):
+            with self.subTest(text=text):
+                path.write_text(text)
+                self.assertFalse(node_owners([17, 18], 17, values, root=root))
+        path.write_text(original)
+        cases = [
+            {},
+            {**values, "OCTRA_PVAC_VERIFY_WORKER": "worker"},
+            {**values, "OCTRA_PVAC_VERIFY_WORKER_HASH": ""},
+            {**values, "OCTRA_PVAC_VERIFY_WORKER_HASH": "0" * 64},
+            {**values, "OCTRA_PVAC_VERIFY_WORKER_HASH": "z" * 64},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertFalse(node_owners([17, 18], 17, case, root=root))
+        other = WORK / "other/worker"
+        other.parent.mkdir()
+        other.write_bytes(Path(values["OCTRA_PVAC_VERIFY_WORKER"]).read_bytes())
+        (root / "18/exe").unlink()
+        (root / "18/exe").symlink_to(other)
+        self.assertFalse(node_owners([17, 18], 17, values, root=root))
+        (root / "18/exe").unlink()
+        self.assertFalse(node_owners([17, 18], 17, values, root=root))
+
+    def test_worker_process_change(self):
+        root, values = worker_case()
+        path = root / "18/stat"
+        original = path.read_text()
+        digest = values["OCTRA_PVAC_VERIFY_WORKER_HASH"]
+        with mock.patch("validator_process.sha256_file", return_value="0" * 64) as hashed:
+            self.assertFalse(node_owners([17, 18], 17, values, root=root))
+        hashed.assert_called_once_with(root / "18/exe")
+        for changed in (original.replace("S 17", "S 19"), original.replace("10\n", "11\n")):
+            def change(_):
+                path.write_text(changed)
+                return digest
+
+            path.write_text(original)
+            with self.subTest(changed=changed), mock.patch(
+                "validator_process.sha256_file", side_effect=change,
+            ):
+                self.assertFalse(node_owners([17, 18], 17, values, root=root))
+        path.write_text(original)
+        with mock.patch("validator_process.sha256_file", side_effect=PermissionError):
+            self.assertFalse(node_owners([17, 18], 17, values, root=root))
+
+    def test_upgrade_worker_owners(self):
+        root, values = worker_case()
+        check = lambda pids, pid, config: node_owners(pids, pid, config, root=root)
+        with mock.patch.object(
+            upgrade_tool, "node_owners", side_effect=check,
+        ), mock.patch.object(
+            upgrade_tool, "data_pids", return_value=[17, 18],
+        ) as owners, mock.patch.object(
+            upgrade_tool.shutil, "disk_usage", return_value=mock.Mock(free=8 * 1024 ** 3),
+        ), mock.patch.object(upgrade_tool, "emit"):
+            for kind in ("pm2", "systemd"):
+                supervisor = {"kind": kind, "pid": 17}
+                upgrade_tool.preflight(WORK, supervisor, values, False)
+                owners.return_value = [17, 18, 19]
+                with self.assertRaisesRegex(ValidatorError, "unexpected processes: 17,18,19"):
+                    upgrade_tool.preflight(WORK, supervisor, values, False)
+                owners.return_value = [17, 18]
+            with self.assertRaisesRegex(ValidatorError, "unexpected processes"):
+                upgrade_tool.preflight(WORK, {"kind": "pm2", "pid": 0}, values, False)
+
+    def test_rejoin_worker_owners(self):
+        root, values = worker_case()
+        entries = [{
+            "name": "octra-test",
+            "pid": 17,
+            "pm2_env": {"OCTRA_DATA_DIR": str(WORK), "status": "online"},
+        }]
+        check = lambda pids, pid, config: node_owners(pids, pid, config, root=root)
+        with mock.patch(
+            "validator_rejoin.node_owners", side_effect=check,
+        ), mock.patch(
+            "validator_rejoin.pm2_entries", return_value=entries,
+        ), mock.patch(
+            "validator_rejoin.data_pids", return_value=[17, 18],
+        ) as owners, mock.patch(
+            "validator_rejoin.running_binary", return_value=WORK / "octra_node.exe",
+        ), mock.patch("validator_rejoin.rpc_status", return_value=None):
+            confirmed_node(values, WORK, 17)
+            self.assertEqual(snapshot(values, WORK)["state"], "waiting_rpc")
+            for pids in ([18], [17, 18, 19]):
+                owners.return_value = pids
+                with self.assertRaisesRegex(ValidatorError, "unexpected processes"):
+                    confirmed_node(values, WORK, 17)
+                with self.assertRaisesRegex(ValidatorError, "unexpected processes"):
+                    snapshot(values, WORK)
 
     def test_pm2_optional(self):
         with mock.patch("validator_process.shutil.which", return_value=None):

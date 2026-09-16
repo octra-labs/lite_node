@@ -22,6 +22,7 @@ from validator_common import state_ready
 from validator_common import validate_checkpoint
 from validator_enroll import membership
 from validator_process import entry_data
+from validator_process import node_owners
 from validator_process import pm2_entries
 from validator_status import rpc_method
 from validator_status import rpc_status
@@ -245,7 +246,7 @@ def confirmed_node(values, data_dir, pid):
     )
     if current != pid:
         raise ValidatorError("validator process changed before meet stage")
-    if data_pids(data_dir) != [pid]:
+    if not node_owners(data_pids(data_dir), pid, values):
         raise ValidatorError("data directory is used by unexpected processes")
     running_binary(pid)
 
@@ -561,7 +562,7 @@ def snapshot(values, data_dir):
         data_dir,
     )
     pids = data_pids(data_dir)
-    if pids != [pid]:
+    if not node_owners(pids, pid, values):
         raise ValidatorError(
             "data directory is used by unexpected processes: "
             + ",".join(str(value) for value in pids)
@@ -835,12 +836,8 @@ def rejoin(
         raise ValidatorError("meet round requires stage or start")
     if prior:
         entries = pm2_entries()
-        known = {
-            entry.get("pid")
-            for entry in entries
-            if entry_data(entry) == str(data_dir)
-        }
-        if any(pid not in known for pid in prior):
+        pid = online_entry(entries, values["OCTRA_OPERATOR_PM2_NAME"], data_dir)
+        if not node_owners(prior, pid, values):
             raise ValidatorError("data directory is used outside PM2")
     if values["OCTRA_OPERATOR_ROLE"] == "validator":
         if start:

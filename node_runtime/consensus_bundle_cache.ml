@@ -6,6 +6,12 @@ module C_types = Octra_consensus.C_types
 module C_engine = Octra_consensus.C_engine
 module C_hash = Octra_consensus.C_hash
 
+module Text : Weak.S with type data = string = Weak.Make (struct
+  type t = string
+  let equal = String.equal
+  let hash = Hashtbl.hash
+end)
+
 type encoded = string list * string list * string list
 
 type decoded = {
@@ -28,9 +34,11 @@ type stats = {
   misses : int;
   evictions : int;
   cache_size : int;
+  cache_bytes : int;
   fifo_size : int;
   preverify_size : int;
   preverify_queue : int;
+  preverify_bytes : int;
 }
 
 type cached =
@@ -41,12 +49,18 @@ type cached =
 type check_job = {
   ticket : unit ref;
   result : Octra_core.Preverify_worker.checked Lwt.t;
+  mutable bytes : int;
 }
 
 type t = {
-  cache : (string, encoded) Hashtbl.t;
+  cache : (string, encoded * int) Hashtbl.t;
+  texts : Text.t;
   fifo : string Queue.t;
   cap : int;
+  mutable cache_bytes : int;
+  check_limit : int;
+  mutable check_bytes : int;
+  mutable check_root : string option;
   shared : (string, Transaction.t * int) Hashtbl.t;
   shared_fifo : string Queue.t;
   shared_cap : int;
@@ -76,11 +90,16 @@ type node_runtime = {
   lookup_raw : string -> encoded option;
 }
 
-let create_with_limits ~cap ~shared_cap ~shared_limit =
+let create_with_limits ~cap ~check_limit ~shared_cap ~shared_limit =
   {
     cache = Hashtbl.create 8;
+    texts = Text.create 16;
     fifo = Queue.create ();
-    cap;
+    cap = max 0 cap;
+    cache_bytes = 0;
+    check_limit = max 0 check_limit;
+    check_bytes = 0;
+    check_root = None;
     shared = Hashtbl.create 16;
     shared_fifo = Queue.create ();
     shared_cap = max 1 shared_cap;
@@ -98,6 +117,7 @@ let create_with_limits ~cap ~shared_cap ~shared_limit =
 let create ~cap =
   create_with_limits
     ~cap
+    ~check_limit:(32 * 1024 * 1024)
     ~shared_cap:1024
     ~shared_limit:(32 * 1024 * 1024)
 
@@ -108,9 +128,11 @@ let stats t =
     misses = t.misses;
     evictions = t.evictions;
     cache_size = Hashtbl.length t.cache;
+    cache_bytes = t.cache_bytes;
     fifo_size = Queue.length t.fifo;
     preverify_size = Hashtbl.length t.preverify;
     preverify_queue = Queue.length t.preverify_fifo;
+    preverify_bytes = t.check_bytes;
   }
 
 let encode_txs txs =
@@ -121,6 +143,18 @@ let encode_txs txs =
 let tx_bytes tx =
   Yojson.Safe.to_string (Transaction.to_yojson tx)
   |> String.length
+
+let string_bytes value =
+  let word = Sys.word_size / 8 in
+  ((String.length value / word) + 2) * word
+
+let list_bytes values =
+  List.fold_left
+    (fun total value -> total + (3 * (Sys.word_size / 8)) + string_bytes value)
+    0 values
+
+let encoded_bytes pid (hashes, txs, receipts) =
+  string_bytes pid + list_bytes hashes + list_bytes txs + list_bytes receipts
 
 let evict_shared t =
   let rec loop () =
@@ -169,8 +203,11 @@ let evict_excess t =
     if Hashtbl.length t.cache > t.cap then
       match Queue.take_opt t.fifo with
       | Some old_pid ->
-        if Hashtbl.mem t.cache old_pid then begin
+        begin match Hashtbl.find_opt t.cache old_pid with
+        | None -> ()
+        | Some (_, bytes) ->
           Hashtbl.remove t.cache old_pid;
+          t.cache_bytes <- t.cache_bytes - bytes;
           t.evictions <- t.evictions + 1
         end;
         loop ()
@@ -179,20 +216,25 @@ let evict_excess t =
   loop ()
 
 let store t ~pid ~tx_hashes ~txs ~receipts_json =
-  let txs_json = encode_txs txs in
-  let is_new = not (Hashtbl.mem t.cache pid) in
+  let share = List.map (Text.merge t.texts) in
+  let txs_json = encode_txs txs |> share in
+  let raw = share tx_hashes, txs_json, share receipts_json in
+  let bytes = encoded_bytes pid raw in
+  let old = Hashtbl.find_opt t.cache pid in
+  let is_new = Option.is_none old in
   if is_new then Queue.push pid t.fifo;
-  Hashtbl.replace t.cache pid (tx_hashes, txs_json, receipts_json);
+  t.cache_bytes <- t.cache_bytes + bytes - Option.fold ~none:0 ~some:snd old;
+  Hashtbl.replace t.cache pid (raw, bytes);
   t.stores <- t.stores + 1;
   evict_excess t;
   if t.stores mod 50 = 0 then Some (stats t) else None
 
 let peek_raw t pid =
-  Hashtbl.find_opt t.cache pid
+  Option.map fst (Hashtbl.find_opt t.cache pid)
 
 let lookup_raw t pid =
   match Hashtbl.find_opt t.cache pid with
-  | Some raw ->
+  | Some (raw, _) ->
     t.hits <- t.hits + 1;
     Some raw
   | None ->
@@ -267,9 +309,10 @@ let pid_label pid =
 
 let log_summary (stats : stats) =
   Octra_log.info "bundle_cache"
-    "summary stores = %d hits = %d misses = %d evictions = %d cache_size = %d fifo_size = %d preverify_size = %d preverify_queue = %d"
+    "summary stores = %d hits = %d misses = %d evictions = %d cache_size = %d fifo_size = %d preverify_size = %d preverify_queue = %d cache_bytes = %d preverify_bytes = %d"
     stats.stores stats.hits stats.misses stats.evictions
     stats.cache_size stats.fifo_size stats.preverify_size stats.preverify_queue
+    stats.cache_bytes stats.preverify_bytes
 
 let store_with_log t ~pid ~tx_hashes ~txs ~receipts_json =
   match store t ~pid ~tx_hashes ~txs ~receipts_json with
@@ -349,33 +392,63 @@ let preverify_purpose_tag = function
   | Build_proposal -> "build"
   | Validate_proposal -> "validate"
 
-let preverify_item_key ~purpose ~state_root ~tx_hash =
+let preverify_item_key ~epoch ~purpose ~state_root ~tx_hash =
   let buffer = Buffer.create 256 in
   add_key_part buffer (preverify_purpose_tag purpose);
   add_key_part buffer state_root;
   add_key_part buffer tx_hash;
+  if epoch <> 0 then add_key_part buffer (string_of_int epoch);
   Octra_net.Hash_domain.hash
     "octra:consensus_preverify_item_cache:v1"
     (Buffer.contents buffer)
 
 let forget_preverify t key ticket =
   match Hashtbl.find_opt t.preverify key with
-  | Some current when current.ticket == ticket -> Hashtbl.remove t.preverify key
+  | Some current when current.ticket == ticket ->
+    t.check_bytes <- t.check_bytes - current.bytes;
+    Hashtbl.remove t.preverify key
   | Some _ | None -> ()
 
 let evict_preverify t =
-  let rec loop () =
-    if Queue.length t.preverify_fifo > max 0 t.cap then
+  let rec loop remaining =
+    let over_count = Queue.length t.preverify_fifo > t.cap in
+    if remaining > 0 && (over_count || t.check_bytes > t.check_limit) then
       match Queue.take_opt t.preverify_fifo with
       | Some (key, ticket) ->
-        forget_preverify t key ticket;
-        loop ()
+        begin match Hashtbl.find_opt t.preverify key with
+        | Some job when job.ticket == ticket && not over_count
+                        && Lwt.is_sleeping job.result ->
+          Queue.push (key, ticket) t.preverify_fifo
+        | Some _ | None -> forget_preverify t key ticket
+        end;
+        loop (remaining - 1)
       | None -> ()
   in
-  loop ()
+  loop (Queue.length t.preverify_fifo)
 
-let run_preverify_item_once t ~purpose ~state_root ~tx_hash verify =
-  let key = preverify_item_key ~purpose ~state_root ~tx_hash in
+let checked_bytes = function
+  | Octra_core.Preverify_worker.Checked_ready item ->
+    tx_bytes item.tx
+    + Option.fold ~none:0
+        ~some:(fun receipt ->
+          Octra_core.Preverify_receipt.canonical receipt |> String.length)
+        item.receipt
+  | Octra_core.Preverify_worker.Checked_skip item ->
+    tx_bytes item.tx + String.length item.reason
+
+let use_root t state_root =
+  if t.check_root <> Some state_root then begin
+    Hashtbl.reset t.preverify;
+    Queue.clear t.preverify_fifo;
+    t.check_bytes <- 0;
+    t.check_root <- Some state_root
+  end
+
+let run_preverify_item_once t ~epoch ~purpose ~state_root ~tx_hash verify =
+  if t.check_root <> Some state_root then
+    (try verify () with exn -> Lwt.fail exn)
+  else
+  let key = preverify_item_key ~epoch ~purpose ~state_root ~tx_hash in
   match Hashtbl.find_opt t.preverify key with
   | Some job ->
     Lwt.protected job.result
@@ -384,23 +457,34 @@ let run_preverify_item_once t ~purpose ~state_root ~tx_hash verify =
     let job =
       try verify () with exn -> Lwt.fail exn
     in
-    Hashtbl.add t.preverify key { ticket; result = job };
+    Hashtbl.add t.preverify key { ticket; result = job; bytes = 0 };
     Queue.push (key, ticket) t.preverify_fifo;
     Lwt.on_success job (fun checked ->
-      if not (Octra_core.Preverify_worker.checked_cacheable checked) then
-        forget_preverify t key ticket);
+      match Hashtbl.find_opt t.preverify key with
+      | Some current when current.ticket == ticket ->
+        if not (Octra_core.Preverify_worker.checked_cacheable checked) then
+          forget_preverify t key ticket
+        else begin
+          let bytes = checked_bytes checked in
+          t.check_bytes <- t.check_bytes + bytes - current.bytes;
+          current.bytes <- bytes;
+          evict_preverify t
+        end
+      | Some _ | None -> ());
     Lwt.on_failure job (fun _ -> forget_preverify t key ticket);
     evict_preverify t;
     Lwt.protected job
 
-let run_preverify_once t ~purpose ~state_root ~tx_hashes ~txs verify =
+let run_preverify_once ?(epoch=0) t ~purpose ~state_root ~tx_hashes ~txs verify =
   let recomputed = List.map Transaction.hash txs in
   if recomputed <> tx_hashes then
     Lwt.fail_with "consensus preverify hash mismatch"
-  else
+  else begin
+    use_root t state_root;
     let verify_item tx =
       let tx_hash = Transaction.hash tx in
       run_preverify_item_once
+        ~epoch
         t
         ~purpose
         ~state_root
@@ -413,3 +497,4 @@ let run_preverify_once t ~purpose ~state_root ~tx_hashes ~txs verify =
           | Error reason -> Lwt.fail_with reason)
     in
     Octra_core.Preverify_worker.run_checked verify_item txs
+  end

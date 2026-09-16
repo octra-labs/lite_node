@@ -31,12 +31,37 @@ external dec_values : pubkey -> seckey -> cipher -> int64 array = "caml_pvac_dec
 
 external ct_add : pubkey -> cipher -> cipher -> cipher = "caml_pvac_ct_add"
 external ct_sub : pubkey -> cipher -> cipher -> cipher = "caml_pvac_ct_sub"
-external ct_mul_seeded : pubkey -> cipher -> cipher -> bytes -> cipher = "caml_pvac_ct_mul_seeded"
-external ct_scale : pubkey -> cipher -> int64 -> cipher = "caml_pvac_ct_scale"
-external ct_add_const : pubkey -> cipher -> int64 -> int64 -> cipher = "caml_pvac_ct_add_const"
-external ct_sub_const : pubkey -> cipher -> int64 -> cipher = "caml_pvac_ct_sub_const"
+external ct_mul_seeded_raw : bool -> pubkey -> cipher -> cipher -> bytes -> cipher
+  = "caml_pvac_ct_mul_seeded_math"
+
+let ct_mul_seeded ?(math = false) key left right seed =
+  ct_mul_seeded_raw math key left right seed
+
+external ct_scale_raw : bool -> pubkey -> cipher -> int64 -> cipher
+  = "caml_pvac_ct_scale_math"
+
+let ct_scale ?(math = false) key cipher scalar =
+  ct_scale_raw math key cipher scalar
+
+external ct_add_const_raw : bool -> pubkey -> cipher -> int64 -> int64 -> cipher
+  = "caml_pvac_ct_add_const_math"
+
+let ct_add_const ?(math = false) key cipher lo hi =
+  ct_add_const_raw math key cipher lo hi
+
+external ct_sub_const_raw : bool -> pubkey -> cipher -> int64 -> cipher
+  = "caml_pvac_ct_sub_const_math"
+
+let ct_sub_const ?(math = false) key cipher scalar =
+  ct_sub_const_raw math key cipher scalar
+
 external ct_div_const : pubkey -> cipher -> int64 -> int64 -> cipher = "caml_pvac_ct_div_const"
-external ct_square_seeded : pubkey -> cipher -> bytes -> cipher = "caml_pvac_ct_square_seeded"
+external ct_square_seeded_raw : bool -> pubkey -> cipher -> bytes -> cipher
+  = "caml_pvac_ct_square_seeded_math"
+
+let ct_square_seeded ?(math = false) key cipher seed =
+  ct_square_seeded_raw math key cipher seed
+
 external ct_recrypt_seeded : pubkey -> evalkey -> cipher -> bytes -> cipher = "caml_pvac_ct_recrypt_seeded"
 
 external commit_ct : pubkey -> cipher -> bytes = "caml_pvac_commit_ct"
@@ -49,32 +74,71 @@ external pubkey_is_key_bound_extension : pubkey -> pubkey -> bool = "caml_pvac_p
 external pubkey_supports_alias_rejection : pubkey -> bool = "caml_pvac_pubkey_supports_alias_rejection"
 external cipher_is_key_bound_extension : cipher -> cipher -> bool = "caml_pvac_cipher_is_key_bound_extension"
 
-external make_zero_proof : pubkey -> seckey -> cipher -> zero_proof = "caml_pvac_make_zero_proof"
-external verify_zero : pubkey -> cipher -> zero_proof -> bool = "caml_pvac_verify_zero"
+external make_zero_proof_raw : bool -> pubkey -> seckey -> cipher -> zero_proof
+  = "caml_pvac_make_zero_proof_math"
 
-external make_zero_proof_bound : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
-  = "caml_pvac_make_zero_proof_bound"
-external verify_zero_bound : pubkey -> cipher -> zero_proof -> bytes -> bool
-  = "caml_pvac_verify_zero_bound"
-external verify_zero_amount_prior : pubkey -> cipher -> zero_proof -> bytes -> bool
-  = "caml_pvac_verify_zero_amount_prior"
-external verify_zero_bound_key_switch :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
-  = "caml_pvac_verify_zero_bound_key_switch"
-external verify_zero_amount_key_switch_prior :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
-  = "caml_pvac_verify_zero_amount_key_switch_prior"
-external make_zero_proof_bound_historical_migration :
-  pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
-  = "caml_pvac_make_zero_proof_bound_historical_migration"
-external verify_zero_bound_historical_migration :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
-  = "caml_pvac_verify_zero_bound_historical_migration"
-external verify_zero_amount_historical_prior :
-  pubkey -> cipher -> zero_proof -> bytes -> bool
-  = "caml_pvac_verify_zero_amount_historical_prior"
-external make_zero_proof_bound_range : pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
-  = "caml_pvac_make_zero_proof_bound_range"
+let make_zero_proof ?(math = false) key secret cipher =
+  make_zero_proof_raw math key secret cipher
+
+external verify_zero_raw : bool -> pubkey -> cipher -> zero_proof -> bool
+  = "caml_pvac_verify_zero_math"
+
+let verify_zero ?(math = false) key cipher proof =
+  verify_zero_raw math key cipher proof
+
+external make_zero_proof_bound_raw : bool -> pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+  = "caml_pvac_make_zero_proof_bound_bytecode" "caml_pvac_make_zero_proof_bound_math"
+
+let make_zero_proof_bound ?(math = false) key secret cipher amount blind =
+  make_zero_proof_bound_raw math key secret cipher amount blind
+
+external verify_zero_bound_raw : bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_bound_math"
+
+let verify_zero_bound ?(math = false) key cipher proof commitment =
+  verify_zero_bound_raw math key cipher proof commitment
+
+external verify_zero_amount_prior_raw : bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_amount_prior_math"
+
+let verify_zero_amount_prior ?(math = false) key cipher proof commitment =
+  verify_zero_amount_prior_raw math key cipher proof commitment
+
+external verify_zero_bound_key_switch_raw : bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_bound_key_switch_math"
+
+let verify_zero_bound_key_switch ?(math = false) key cipher proof commitment =
+  verify_zero_bound_key_switch_raw math key cipher proof commitment
+
+external verify_zero_amount_key_switch_prior_raw : bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_amount_key_switch_prior_math"
+
+let verify_zero_amount_key_switch_prior ?(math = false) key cipher proof commitment =
+  verify_zero_amount_key_switch_prior_raw math key cipher proof commitment
+
+external make_zero_proof_bound_historical_migration_raw : bool -> pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+  = "caml_pvac_make_zero_proof_bound_historical_migration_bytecode" "caml_pvac_make_zero_proof_bound_historical_migration_math"
+
+let make_zero_proof_bound_historical_migration ?(math = false) key secret cipher amount blind =
+  make_zero_proof_bound_historical_migration_raw math key secret cipher amount blind
+
+external verify_zero_bound_historical_migration_raw : bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_bound_historical_migration_math"
+
+let verify_zero_bound_historical_migration ?(math = false) key cipher proof commitment =
+  verify_zero_bound_historical_migration_raw math key cipher proof commitment
+
+external verify_zero_amount_historical_prior_raw : bool -> pubkey -> cipher -> zero_proof -> bytes -> bool
+  = "caml_pvac_verify_zero_amount_historical_prior_math"
+
+let verify_zero_amount_historical_prior ?(math = false) key cipher proof commitment =
+  verify_zero_amount_historical_prior_raw math key cipher proof commitment
+
+external make_zero_proof_bound_range_raw : bool -> pubkey -> seckey -> cipher -> int64 -> bytes -> zero_proof
+  = "caml_pvac_make_zero_proof_bound_range_bytecode" "caml_pvac_make_zero_proof_bound_range_math"
+
+let make_zero_proof_bound_range ?(math = false) key secret cipher amount blind =
+  make_zero_proof_bound_range_raw math key secret cipher amount blind
 
 external pedersen_commit_amount : int64 -> bytes -> bytes
   = "caml_pvac_pedersen_commit_amount"
@@ -82,21 +146,45 @@ external pedersen_identity : unit -> bytes = "caml_pvac_pedersen_identity"
 external pedersen_add : bytes -> bytes -> bytes = "caml_pvac_pedersen_add"
 external pedersen_sub : bytes -> bytes -> bytes = "caml_pvac_pedersen_sub"
 
-external make_range_proof : pubkey -> seckey -> cipher -> int64 -> range_proof = "caml_pvac_make_range_proof"
-external verify_range : pubkey -> cipher -> range_proof -> bool = "caml_pvac_verify_range"
+external make_range_proof_raw : bool -> pubkey -> seckey -> cipher -> int64 -> range_proof
+  = "caml_pvac_make_range_proof_math"
+
+let make_range_proof ?(math = false) key secret cipher amount =
+  make_range_proof_raw math key secret cipher amount
+
+external verify_range_raw : bool -> pubkey -> cipher -> range_proof -> bool
+  = "caml_pvac_verify_range_math"
+
+let verify_range ?(math = false) key cipher proof =
+  verify_range_raw math key cipher proof
 
 type agg_range_proof
-external make_aggregated_range_proof : pubkey -> seckey -> cipher -> int64 -> agg_range_proof
-  = "caml_pvac_make_aggregated_range_proof"
+external make_aggregated_range_proof_raw : bool -> pubkey -> seckey -> cipher -> int64 -> agg_range_proof
+  = "caml_pvac_make_aggregated_range_proof_math"
+
+let make_aggregated_range_proof ?(math = false) key secret cipher amount =
+  make_aggregated_range_proof_raw math key secret cipher amount
+
 external serialize_agg_range_proof : agg_range_proof -> bytes
   = "caml_pvac_serialize_agg_range_proof"
 
-external verify_range_any : pubkey -> cipher -> bytes -> bool -> bool
-  = "caml_pvac_verify_range_any"
-external verify_range_bound : pubkey -> cipher -> bytes -> bytes -> bool
-  = "caml_pvac_verify_range_bound"
-external verify_range_amount_prior : pubkey -> cipher -> bytes -> bytes -> bool
-  = "caml_pvac_verify_range_amount_prior"
+external verify_range_any_raw : bool -> pubkey -> cipher -> bytes -> bool -> bool
+  = "caml_pvac_verify_range_any_math"
+
+let verify_range_any ?(math = false) key cipher proof strict =
+  verify_range_any_raw math key cipher proof strict
+
+external verify_range_bound_raw : bool -> pubkey -> cipher -> bytes -> bytes -> bool
+  = "caml_pvac_verify_range_bound_math"
+
+let verify_range_bound ?(math = false) key cipher proof commitment =
+  verify_range_bound_raw math key cipher proof commitment
+
+external verify_range_amount_prior_raw : bool -> pubkey -> cipher -> bytes -> bytes -> bool
+  = "caml_pvac_verify_range_amount_prior_math"
+
+let verify_range_amount_prior ?(math = false) key cipher proof commitment =
+  verify_range_amount_prior_raw math key cipher proof commitment
 
 external serialize_cipher : cipher -> bytes = "caml_pvac_serialize_cipher"
 external serialize_cipher_public : cipher -> bytes = "caml_pvac_serialize_cipher_public"

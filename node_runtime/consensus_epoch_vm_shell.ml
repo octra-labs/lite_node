@@ -45,6 +45,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   point_ops : bool;
+  math : bool;
   object_cost : bool;
   int_work : Octra_vm.Int_work.mode;
   current_epoch : int;
@@ -231,6 +232,7 @@ type vm_tx_deps = {
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   epoch : int;
   now : unit -> float;
 }
@@ -248,6 +250,7 @@ type live_vm_tx_args = {
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   epoch : int;
   now : unit -> float;
 }
@@ -272,6 +275,7 @@ type live_contract_ctx_args = {
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
@@ -307,6 +311,7 @@ type live_sender_vm_tx_args = {
   tx : Transaction.t;
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
   pre_state_hash : string;
@@ -435,6 +440,7 @@ let make_contract_ctx deps =
       get_fhe_keypair = (fun _ -> None);
       allow_fhe_capability = (fun _ -> true);
       point_ops = deps.point_ops;
+      math = deps.math;
       object_cost = deps.object_cost;
       int_work = deps.int_work;
       current_epoch = deps.current_epoch;
@@ -472,6 +478,7 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
           ~journal:args.program_journal ~ctx ~depth
           ~params args.store ~deployer ~bytecode_raw ~nonce);
       get_fhe_pubkey = args.get_fhe_pubkey;
+      math = args.math;
       point_ops =
         (match args.proof_mode with
          | Octra_core.Rule_graph.Prior -> false
@@ -1042,6 +1049,7 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
     reject_malformed = args.reject_malformed;
     max_multi_exec_calls = args.max_multi_exec_calls;
     proof_mode = args.proof_mode;
+    math = args.math;
     epoch = args.epoch;
     now = args.now;
   }
@@ -1120,6 +1128,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         store = args.store;
         get_fhe_pubkey = live_fhe_pubkey args.store;
         proof_mode = args.proof_mode;
+        math = args.math;
         object_cost = args.object_cost;
         current_epoch = args.current_epoch ();
         epoch_time_ms = args.epoch_time_ms;
@@ -1156,6 +1165,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
       args.reject "malformed_transaction" reason);
     max_multi_exec_calls = max_multi_exec_calls ~env:Sys.getenv_opt;
     proof_mode = args.proof_mode;
+    math = args.math;
     epoch = args.current_epoch ();
     now = Unix.gettimeofday;
   }

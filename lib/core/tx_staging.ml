@@ -291,8 +291,10 @@ let get_expected_nonce addr =
   | Some n -> n + 1 | None -> 1
 
 let pending_nonce addr confirmed =
-  match Hashtbl.find_opt virtual_nonces addr with
-  | Some n -> n | None -> confirmed
+  sender_entries addr
+  |> List.fold_left
+    (fun nonce entry -> max nonce entry.tx.Transaction.nonce)
+    confirmed
 
 let better_rate fee cost entry =
   Z.gt

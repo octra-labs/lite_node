@@ -86,6 +86,10 @@ let weight_for_pid vs pid =
   | Some weight -> weight
   | None -> Z.zero
 
+let nil_quorum votes ~chain_id ~epoch_id ~validator_set =
+  C_types.quorum_reached_at ~chain_id ~epoch_id validator_set
+    ~signer_count:votes.count_nil ~signed_weight:votes.weight_nil
+
 let add_vote vs (v : vote) ~validator_set =
   if Hashtbl.mem vs.votes v.validator then `Duplicate
   else
@@ -99,7 +103,9 @@ let add_vote vs (v : vote) ~validator_set =
       if is_nil then begin
         vs.count_nil <- vs.count_nil + 1;
         vs.weight_nil <- Z.add vs.weight_nil weight;
-        if C_types.quorum_reached_at
+        if nil_quorum vs ~chain_id:v.chain_id ~epoch_id:v.epoch_id ~validator_set then
+          `QuorumOf v.proposal_id
+        else if C_types.quorum_reached_at
              ~chain_id:v.chain_id
              ~epoch_id:v.epoch_id
              validator_set
@@ -974,6 +980,8 @@ let quorum_result votes ~chain_id ~epoch_id ~validator_set =
   in
   match proposal_id with
   | Some pid -> `QuorumOf pid
+  | None when nil_quorum votes ~chain_id ~epoch_id ~validator_set ->
+    `QuorumOf Octra_net.Hash_domain.nil_hash
   | None when
       C_types.quorum_reached_at
         ~chain_id
@@ -1017,6 +1025,20 @@ let finalize_quorum t proposal_id =
       ~proposal_id
       ~round:t.state.round
 
+let precommit_nil t ~sign_fn =
+  if local_voting_allowed t
+     && t.state.step = PrevoteStep
+     && nil_quorum t.prevotes ~chain_id:t.chain_id ~epoch_id:t.state.height
+          ~validator_set:t.vs then begin
+    t.state <- { t.state with step = PrecommitStep };
+    match cast_local_vote t ~sign_fn ~vote_type:Precommit
+            ~proposal_id:Octra_net.Hash_domain.nil_hash with
+    | LocalVoteCast _
+    | LocalVoteAlreadySame
+    | LocalVoteDeferred -> schedule_step_timeout t PrecommitStep
+    | LocalVoteConflict _ -> ()
+  end
+
 let resume_voting t ~sign_fn =
   if not (local_voting_allowed t) then ()
   else begin
@@ -1038,6 +1060,7 @@ let resume_voting t ~sign_fn =
      | Some _ ->
        t.pending_prevote <- None
      | None -> ());
+    precommit_nil t ~sign_fn;
     (match
        quorum_result
          t.prevotes
@@ -1344,8 +1367,8 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
             delay_ms = timeout_ms ~round:t.state.round ~step:PrecommitStep;
             generation = t.generation;
           }))
-      end else
-        match prevote_outcome with
+      end else begin
+        (match prevote_outcome with
         | LocalVoteCast _
         | LocalVoteAlreadySame ->
           emit t (ScheduleTimeout {
@@ -1354,7 +1377,9 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
             generation = t.generation;
           })
         | LocalVoteConflict _
-        | LocalVoteDeferred -> ()
+        | LocalVoteDeferred -> ());
+        precommit_nil t ~sign_fn
+      end
     end
   end
   end
@@ -1503,9 +1528,9 @@ let on_vote t (v : vote) ~sign_fn =
             end)
        | `QuorumAny when t.state.step = PrevoteStep ->
          emit t (ScheduleTimeout {
-           step = PrecommitStep;
+           step = PrevoteStep;
            round = t.state.round;
-           delay_ms = timeout_ms ~round:t.state.round ~step:PrecommitStep;
+           delay_ms = timeout_ms ~round:t.state.round ~step:PrevoteStep;
            generation = t.generation;
          })
        | _ -> ())
@@ -1610,7 +1635,8 @@ let on_timeout t ~step ~round ~generation ~sign_fn =
            generation = t.generation;
          })
        | LocalVoteConflict _
-       | LocalVoteDeferred -> ())
+       | LocalVoteDeferred -> ());
+      precommit_nil t ~sign_fn
     | PrevoteStep when local_voting_allowed t ->
       t.state <- { t.state with step = PrecommitStep };
       (match cast_local_vote t ~sign_fn ~vote_type:Precommit

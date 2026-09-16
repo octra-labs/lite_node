@@ -433,8 +433,8 @@ let prepare ~store ~ledger ~current_epoch tx =
         end
     end
 
-let verify_classified ~strict plan =
-  Pvac_verify_worker.classified_result
+let verify_classified ?(math=false) ~strict plan =
+  Pvac_verify_worker.classified_result ~math
     (P.Circle_cell {
        pubkey = plan.pubkey;
        cipher = plan.cipher;
@@ -445,9 +445,9 @@ let verify_classified ~strict plan =
        strict;
      })
 
-let verify ~strict plan =
+let verify ?(math=false) ~strict plan =
   let open Lwt.Syntax in
-  let* result = verify_classified ~strict plan in
+  let* result = verify_classified ~math ~strict plan in
   Lwt.return
     (Result.map_error
        Pvac_verify_worker.verification_failure_message

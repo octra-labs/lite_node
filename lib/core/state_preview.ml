@@ -84,7 +84,7 @@ let with_state ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id:_ ~proposal_
         if unchanged then Lwt.return result
         else Lwt.return_error "preview_state_changed"
 
-let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode
+let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode ?(math=false)
     ~fold ~epoch_id ~proposal_id
     ?(expected_prev_root : string option) f =
   with_state
@@ -105,6 +105,7 @@ let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode
           Sender_key_policy.activation_epoch_exn Sys.getenv_opt;
         validator_policy = Validator_policy.of_env_exn Sys.getenv_opt;
         proof_mode;
+        math;
         fold;
         begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
         commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "preview");

@@ -92,6 +92,7 @@ let node_backend
                         ~base_store:store
                         ~base_ledger:ledger
                         ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
+                        ~math:fold_ctx.math
                         ~fold
                         ~epoch_id
                         ~proposal_id
@@ -104,6 +105,7 @@ let node_backend
                     ~epoch_id
                     ~owner_migration_mode
                     ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
+                    ~math:fold_ctx.math
                     ~field_policy:
                       (Octra_core.Private_ledger.field_policy_of_mode
                          private_payload_mode)

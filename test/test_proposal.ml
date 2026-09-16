@@ -1804,10 +1804,29 @@ let test_verify_missing_prev_time () =
   let deps, _, _, _, _, _, _, _ =
     verify_proposal_deps ~previous_epoch_ts:None ()
   in
-  expect "missing previous time accepted"
-    (verdict_rejects
+  expect "missing previous time did not wait"
+    (verdict_waits
        (Lwt_main.run
           (C.verify_proposal deps ~chain_id:"octra-test" proposal)))
+
+let test_prev_time_retry () =
+  let item = tx 1 in
+  let proposal = proposal_for_txs [item] in
+  let previous = ref None in
+  let deps, quarantines, _, _, _, stores, set_proposals, previews =
+    verify_proposal_deps ~staging:[item] ()
+  in
+  let deps = C.{ deps with previous_epoch_ts = (fun _ -> !previous) } in
+  let verify () = Lwt_main.run (C.verify_proposal deps ~chain_id:"octra-test" proposal) in
+  expect "missing time waits" (verdict_waits (verify ()));
+  expect "missing time no store" (!stores = []);
+  expect "missing time no proposal" (!set_proposals = []);
+  expect "missing time no preview" (!previews = []);
+  previous := Some nan;
+  expect "invalid time rejects" (verdict_rejects (verify ()));
+  previous := Some 89.;
+  expect "available time accepts" (verdict_accepts (verify ()));
+  expect "time read no quarantine" (!quarantines = [])
 
 let test_verify_missing_bundle_wait () =
   let proposal = proposal_for_txs [tx 1] in
@@ -2800,6 +2819,7 @@ let () =
   test_verify_txid_hi_mismatch ();
   test_verify_prev_root_quarantine ();
   test_verify_missing_prev_time ();
+  test_prev_time_retry ();
   test_verify_missing_bundle_wait ();
   test_verify_local_preview ();
   test_verify_staging_lookup ();

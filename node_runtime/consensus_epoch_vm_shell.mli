@@ -37,6 +37,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
     (ContractVM.spawn_result, string) result;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   point_ops : bool;
+  math : bool;
   object_cost : bool;
   int_work : Octra_vm.Int_work.mode;
   current_epoch : int;
@@ -223,6 +224,7 @@ type vm_tx_deps = {
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   epoch : int;
   now : unit -> float;
 }
@@ -245,6 +247,7 @@ type live_vm_tx_args = {
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   epoch : int;
   now : unit -> float;
 }
@@ -269,6 +272,7 @@ type live_contract_ctx_args = {
   store : Octra_core.Store_irmin.t;
   get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   object_cost : bool;
   current_epoch : int;
   epoch_time_ms : int64;
@@ -304,6 +308,7 @@ type live_sender_vm_tx_args = {
   tx : Transaction.t;
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
+  math : bool;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
   pre_state_hash : string;

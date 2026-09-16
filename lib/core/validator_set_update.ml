@@ -37,6 +37,10 @@ type ready_ext = {
 let pending_meta_key = "bft.validator_set.pending"
 let active_meta_key = "bft.validator_set.active"
 
+let snapshot_slot ~epoch = function
+  | Some pending -> Int64.compare pending.activate_epoch epoch <= 0
+  | None -> true
+
 let ready_meta_key ~fingerprint ~address =
   "bft.validator_set.ready." ^ fingerprint ^ "." ^ address
 

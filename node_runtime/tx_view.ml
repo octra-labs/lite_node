@@ -902,11 +902,12 @@ let max_proof_queue_waits = 40
 
 let max_proof_worker_retries = 1
 
-let preverify_range ~strict ~pubkey ~cipher ~proof =
+let preverify_range ~math ~strict ~pubkey ~cipher ~proof =
   let rec verify queue_waits worker_retries =
     let open Lwt.Syntax in
     let* result =
       Octra_core.Pvac_verify_worker.verify_range_classified_with_priority
+        ~math
         Octra_core.Compute_pool.Speculative
         ~strict
         ~pubkey
@@ -938,7 +939,7 @@ let preverify_range ~strict ~pubkey ~cipher ~proof =
   in
   verify 0 0
 
-let preverify_stealth_ranges ~strict ~pubkey_blob ~sender_enc ptd =
+let preverify_stealth_ranges ~math ~strict ~pubkey_blob ~sender_enc ptd =
   let open Lwt.Syntax in
   let delta_cipher = ptd.Crypto.PrivateTransferV4.delta_cipher in
   if not (stealth_delta_cipher_allowed delta_cipher) then
@@ -958,6 +959,7 @@ let preverify_stealth_ranges ~strict ~pubkey_blob ~sender_enc ptd =
     | Ok (Ok new_enc) ->
       let* delta =
         preverify_range
+          ~math
           ~strict
           ~pubkey:pubkey_blob
           ~cipher:delta_cipher
@@ -969,6 +971,7 @@ let preverify_stealth_ranges ~strict ~pubkey_blob ~sender_enc ptd =
         | Ok delta ->
           let* balance =
             preverify_range
+              ~math
               ~strict
               ~pubkey:pubkey_blob
               ~cipher:new_enc

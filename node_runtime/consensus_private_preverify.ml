@@ -16,7 +16,7 @@ let eligible tx =
   | Transaction.ClaimOp -> true
   | _ -> false
 
-let create ~field_policy ~strict ~result_policy ledger =
+let create ~field_policy ~strict ~math ~result_policy ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
@@ -29,7 +29,7 @@ let create ~field_policy ~strict ~result_policy ledger =
         let fields = field_policy () in
         let policy = result_policy () in
         let* result =
-          Private_ledger.preverify_private_artifact
+          Private_ledger.preverify_private_artifact ~math:(math ())
             ~field_policy:fields
             ~strict:(strict ())
             ~worker_priority:priority
@@ -42,7 +42,7 @@ let create ~field_policy ~strict ~result_policy ledger =
           | Error failure -> Lwt.return_error failure.Private_ledger.reason
           | Ok artifact ->
             let* binding =
-              Private_ledger.bind_private_artifact
+              Private_ledger.bind_private_artifact ~math:(math ())
                 ~field_policy:(field_policy ())
                 ~strict:(strict ())
                 ~result_policy:(result_policy ())
@@ -64,7 +64,7 @@ let create ~field_policy ~strict ~result_policy ledger =
       bind = (fun tx artifact ->
         let open Lwt.Syntax in
         let* binding =
-          Private_ledger.bind_private_artifact
+          Private_ledger.bind_private_artifact ~math:(math ())
             ~field_policy:(field_policy ())
             ~strict:(strict ())
             ~result_policy:(result_policy ())

@@ -279,7 +279,7 @@ let test_source_program_verify () =
     let ledger = Octra_core.Ledger.create store in
     match
       Lwt_main.run
-        (Octra_vm.Contract_rpc.call
+        (Octra_vm.Contract_rpc.call ~math:false
            ~store
            ~ledger
            ~current_epoch:0

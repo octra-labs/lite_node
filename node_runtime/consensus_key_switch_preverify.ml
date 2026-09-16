@@ -15,7 +15,7 @@ let eligible_with field_policy tx =
           ~field_policy
           tx)
 
-let create ~field_policy ~strict ledger =
+let create ~field_policy ~strict ~math ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
@@ -27,7 +27,7 @@ let create ~field_policy ~strict ledger =
         let open Lwt.Syntax in
         let fields = field_policy () in
         let* result =
-          Private_ledger.preverify_key_switch_artifact
+          Private_ledger.preverify_key_switch_artifact ~math:(math ())
             ~field_policy:fields
             ~strict:(strict ())
             ~worker_priority:priority
@@ -40,7 +40,7 @@ let create ~field_policy ~strict ledger =
             Lwt.return_error failure.Private_ledger.reason
           | Ok artifact ->
             let* binding =
-              Private_ledger.bind_key_switch_artifact
+              Private_ledger.bind_key_switch_artifact ~math:(math ())
                 ~field_policy:(field_policy ())
                 ~strict:(strict ())
                 ledger
@@ -60,7 +60,7 @@ let create ~field_policy ~strict ledger =
       bind = (fun tx artifact ->
         let open Lwt.Syntax in
         let* binding =
-          Private_ledger.bind_key_switch_artifact
+          Private_ledger.bind_key_switch_artifact ~math:(math ())
             ~field_policy:(field_policy ())
             ~strict:(strict ())
             ledger

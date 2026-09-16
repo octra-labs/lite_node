@@ -27,6 +27,7 @@ from validator_common import state_sync_sources
 from validator_common import validate_checkpoint
 from validator_enroll import membership
 from validator_process import entry_data
+from validator_process import node_owners
 from validator_process import process_alive
 from validator_process import wait_stopped
 from validator_recover import read_need
@@ -672,13 +673,13 @@ def install_floor(root, sup, values, args, live, target):
     wallet = load_wallet(data_dir / "wallet.json")
     place_floor(root, values, wallet, data_dir, head, round_id, check=True)
     stop(live, args.sudo)
+    owners = data_pids(data_dir)
+    if owners:
+        raise ValidatorError(
+            "state directory is active after stop: "
+            + ",".join(map(str, owners))
+        )
     try:
-        owners = data_pids(data_dir)
-        if owners:
-            raise ValidatorError(
-                "state directory is active after stop: "
-                + ",".join(map(str, owners))
-            )
         place_floor(root, values, wallet, data_dir, head, round_id)
     except Exception:
         start(root, sup, sup["config"], args.sudo)
@@ -794,7 +795,7 @@ def restore_cycle(root, sup, values, args, before, plan, min_epoch):
 
 def preflight(root, sup, values, use_sudo):
     owners = data_pids(values["OCTRA_DATA_DIR"])
-    if owners and owners != ([sup["pid"]] if sup["pid"] else []):
+    if owners and not node_owners(owners, sup["pid"], values):
         raise ValidatorError(
             "data directory is used by unexpected processes: "
             + ",".join(map(str, owners))
@@ -1038,6 +1039,11 @@ def apply(root, sup, values, args, release):
             emit(fault=fault[0], path=fault[1], action="do_not_delete")
         raise ValidatorError("pending WAL is unreadable; node was not stopped")
     stop(sup, args.sudo)
+    owners = data_pids(values["OCTRA_DATA_DIR"])
+    if owners:
+        raise ValidatorError(
+            "state directory is active after stop: " + ",".join(map(str, owners))
+        )
     before = disk_state(values, sup["config"])
     restored = restore_cycle(
         root,

@@ -10,6 +10,11 @@
  (libraries octra_consensus unix))
 
 (test
+ (name test_bundle_cache)
+ (modules test_bundle_cache)
+ (libraries octra_node_runtime octra_core octra_consensus octra_net zarith yojson lwt.unix))
+
+(test
  (name test_bft_validator_transition)
  (modules test_bft_validator_transition)
  (libraries octra_consensus octra_net lwt lwt.unix mirage-crypto-ec
@@ -34,6 +39,22 @@
  (name test_account_pack)
  (modules test_account_pack)
  (libraries octra_core base64 zarith lwt.unix unix))
+
+(test
+ (name test_validator_lifecycle)
+ (modules test_validator_lifecycle)
+ (libraries octra_core zarith base64 yojson lwt.unix unix
+  mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
+ (name test_lock_rule)
+ (modules test_lock_rule)
+ (libraries octra_net octra_consensus))
+
+(test
+ (name test_weighted_bft)
+ (modules test_weighted_bft)
+ (libraries octra_consensus octra_net zarith))
 
 (test
  (name test_epoch_exec_reward_atomic)
@@ -175,6 +196,16 @@
  (modules test_pvac_verify_worker)
  (deps ../bin/octra_pvac_worker.exe)
  (libraries octra_core lwt lwt.unix unix))
+
+(test
+ (name test_fixed_q16)
+ (modules test_fixed_q16)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_circle_wasm_hfhe_policy)
+ (modules test_circle_wasm_hfhe_policy)
+ (libraries octra_core pvac_ffi))
 
 (test
  (name test_contract_rpc_guard)

@@ -90,12 +90,12 @@ const resolveHfheHelperPath = () => {
   throw new Error('circle hfhe helper not found; set OCTRA_CIRCLE_HFHE_HOST')
 }
 
-const callHfheHelper = (action, payload) => {
+const callHfheHelper = (math, action, payload) => {
   const helperPath = resolveHfheHelperPath()
   const raw = execFileSync(
     helperPath,
     {
-      input: JSON.stringify({action, ...payload}),
+      input: JSON.stringify({action, ...payload, math}),
       encoding: 'utf8',
       maxBuffer: 1024 * 1024,
     }
@@ -599,7 +599,7 @@ const consumeHfheReceiptEntry = (state, entry) => {
   state.captured.push(entry)
 }
 
-const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
+const executeHfheDirect = (math, hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
   const request = parseRequestFrame(reqBytes)
   const capability = hfheCapabilityName(request.method)
   if (!capability || !hfheCaps.has(capability)) {
@@ -621,7 +621,7 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
       }
       const amount = parseIntParam(params, 0, 'amount')
       const seedB64 = parseStringParam(params, 1, 'seed_b64')
-      const value = callHfheHelper('encrypt_value_seeded', {
+      const value = callHfheHelper(math, 'encrypt_value_seeded', {
         pubkey_b64: hfheActiveKey.pubkey_b64,
         seckey_b64: hfheActiveKey.seckey_b64,
         amount: amount.toString(),
@@ -634,7 +634,7 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
         throw new Error('hfhe active key unavailable')
       }
       const seedB64 = parseStringParam(params, 0, 'seed_b64')
-      const value = callHfheHelper('encrypt_zero_seeded', {
+      const value = callHfheHelper(math, 'encrypt_zero_seeded', {
         pubkey_b64: hfheActiveKey.pubkey_b64,
         seckey_b64: hfheActiveKey.seckey_b64,
         seed_b64: seedB64,
@@ -646,7 +646,7 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
         throw new Error('hfhe active key unavailable')
       }
       const ciphertext = parseStringParam(params, 0, 'ciphertext')
-      const value = callHfheHelper('decrypt_value', {
+      const value = callHfheHelper(math, 'decrypt_value', {
         pubkey_b64: hfheActiveKey.pubkey_b64,
         seckey_b64: hfheActiveKey.seckey_b64,
         ciphertext,
@@ -657,61 +657,61 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const lhsCiphertext = parseStringParam(params, 1, 'lhs_ciphertext')
       const rhsCiphertext = parseStringParam(params, 2, 'rhs_ciphertext')
-      const value = callHfheHelper('cipher_add', {pubkey_b64: pubkeyB64, lhs_ciphertext: lhsCiphertext, rhs_ciphertext: rhsCiphertext})
+      const value = callHfheHelper(math, 'cipher_add', {pubkey_b64: pubkeyB64, lhs_ciphertext: lhsCiphertext, rhs_ciphertext: rhsCiphertext})
       return responseString(String(value))
     }
     case 'fhe_sub': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const lhsCiphertext = parseStringParam(params, 1, 'lhs_ciphertext')
       const rhsCiphertext = parseStringParam(params, 2, 'rhs_ciphertext')
-      const value = callHfheHelper('cipher_sub', {pubkey_b64: pubkeyB64, lhs_ciphertext: lhsCiphertext, rhs_ciphertext: rhsCiphertext})
+      const value = callHfheHelper(math, 'cipher_sub', {pubkey_b64: pubkeyB64, lhs_ciphertext: lhsCiphertext, rhs_ciphertext: rhsCiphertext})
       return responseString(String(value))
     }
     case 'fhe_scale': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const factor = parseIntParam(params, 2, 'factor')
-      const value = callHfheHelper('cipher_scale', {pubkey_b64: pubkeyB64, ciphertext, factor: factor.toString()})
+      const value = callHfheHelper(math, 'cipher_scale', {pubkey_b64: pubkeyB64, ciphertext, factor: factor.toString()})
       return responseString(String(value))
     }
     case 'fhe_add_const': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const amount = parseIntParam(params, 2, 'amount')
-      const value = callHfheHelper('cipher_add_const', {pubkey_b64: pubkeyB64, ciphertext, amount: amount.toString()})
+      const value = callHfheHelper(math, 'cipher_add_const', {pubkey_b64: pubkeyB64, ciphertext, amount: amount.toString()})
       return responseString(String(value))
     }
     case 'fhe_sub_const': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const amount = parseIntParam(params, 2, 'amount')
-      const value = callHfheHelper('cipher_sub_const', {pubkey_b64: pubkeyB64, ciphertext, amount: amount.toString()})
+      const value = callHfheHelper(math, 'cipher_sub_const', {pubkey_b64: pubkeyB64, ciphertext, amount: amount.toString()})
       return responseString(String(value))
     }
     case 'fhe_pedersen': {
       const amount = parseIntParam(params, 0, 'amount')
       const blindingB64 = parseStringParam(params, 1, 'blinding_b64')
-      const value = callHfheHelper('pedersen_commit', {amount: amount.toString(), blinding_b64: blindingB64})
+      const value = callHfheHelper(math, 'pedersen_commit', {amount: amount.toString(), blinding_b64: blindingB64})
       return responseString(String(value))
     }
     case 'fhe_commit': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
-      const value = callHfheHelper('commit_cipher', {pubkey_b64: pubkeyB64, ciphertext})
+      const value = callHfheHelper(math, 'commit_cipher', {pubkey_b64: pubkeyB64, ciphertext})
       return responseString(String(value))
     }
     case 'fhe_bound_commitment': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const amount = parseIntParam(params, 2, 'amount')
-      const value = callHfheHelper('bound_commitment', {pubkey_b64: pubkeyB64, ciphertext, amount: amount.toString()})
+      const value = callHfheHelper(math, 'bound_commitment', {pubkey_b64: pubkeyB64, ciphertext, amount: amount.toString()})
       return responseString(String(value))
     }
     case 'fhe_verify_zero': {
       const pubkeyB64 = parseStringParam(params, 0, 'pubkey_b64')
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const proof = parseStringParam(params, 2, 'proof')
-      const value = callHfheHelper('verify_zero', {pubkey_b64: pubkeyB64, ciphertext, proof})
+      const value = callHfheHelper(math, 'verify_zero', {pubkey_b64: pubkeyB64, ciphertext, proof})
       return responseBool(Boolean(value))
     }
     case 'fhe_verify_range': {
@@ -719,7 +719,7 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const proof = parseStringParam(params, 2, 'proof')
       const amountCommitment = parseStringParam(params, 3, 'amount_commitment')
-      const value = callHfheHelper('verify_range', {pubkey_b64: pubkeyB64, ciphertext, proof, amount_commitment: amountCommitment})
+      const value = callHfheHelper(math, 'verify_range', {pubkey_b64: pubkeyB64, ciphertext, proof, amount_commitment: amountCommitment})
       return responseBool(Boolean(value))
     }
     case 'fhe_verify_bound': {
@@ -727,7 +727,7 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
       const ciphertext = parseStringParam(params, 1, 'ciphertext')
       const proof = parseStringParam(params, 2, 'proof')
       const amountCommitment = parseStringParam(params, 3, 'amount_commitment')
-      const value = callHfheHelper('verify_bound', {pubkey_b64: pubkeyB64, ciphertext, proof, amount_commitment: amountCommitment})
+      const value = callHfheHelper(math, 'verify_bound', {pubkey_b64: pubkeyB64, ciphertext, proof, amount_commitment: amountCommitment})
       return responseBool(Boolean(value))
     }
     default:
@@ -735,7 +735,7 @@ const executeHfheDirect = (hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes) => {
   }
 }
 
-const executeHfheInvoke = (hfheCaps, hfhePubkeys, hfheActiveKey, isView, receiptState, reqBytes) => {
+const executeHfheInvoke = (math, hfheCaps, hfhePubkeys, hfheActiveKey, isView, receiptState, reqBytes) => {
   const request = parseRequestFrame(reqBytes)
   const capability = hfheCapabilityName(request.method)
   if (!capability || !hfheCaps.has(capability)) {
@@ -772,7 +772,7 @@ const executeHfheInvoke = (hfheCaps, hfhePubkeys, hfheActiveKey, isView, receipt
   } else if (!isView && isVerify && receiptState.mode !== 'capture') {
     throw new Error(`hfhe proof verification requires a preverified receipt: ${request.method}`)
   }
-  const response = executeHfheDirect(hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes)
+  const response = executeHfheDirect(math, hfheCaps, hfhePubkeys, hfheActiveKey, reqBytes)
   const entry = hfheReceiptEntry(request.method, reqBytes, response)
   if (receiptState.mode === 'capture') {
     receiptState.captured.push(entry)
@@ -1517,6 +1517,8 @@ const instantiate = async (wasmBytes, payload) => {
   }
 
   const storage = buildStorage(payload.storage_pairs || [])
+  const math = payload.math ?? false
+  if (typeof math !== 'boolean') throw new Error('invalid math')
   const hfheCaps = new Set(payload.hfhe_caps || [])
   const hfhePubkeys = new Map(
     Array.isArray(payload.hfhe_pubkeys)
@@ -1628,6 +1630,7 @@ const instantiate = async (wasmBytes, payload) => {
       host_hfhe_invoke_len(reqPtr, reqLen) {
         const requestBytes = readGuestBytes(reqPtr, reqLen)
         const responseBytes = executeHfheInvoke(
+          math,
           hfheCaps,
           hfhePubkeys,
           hfheActiveKey,
@@ -1646,6 +1649,7 @@ const instantiate = async (wasmBytes, payload) => {
           hfheInvokeCache && hfheInvokeToken === requestToken
             ? hfheInvokeCache
             : executeHfheInvoke(
+                math,
                 hfheCaps,
                 hfhePubkeys,
                 hfheActiveKey,

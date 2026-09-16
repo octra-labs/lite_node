@@ -5,6 +5,7 @@ type result = {
   delta_ok : bool;
   balance_ok : bool;
   strict : bool;
+  math : bool;
   sender_enc_snapshot : string;
 }
 
@@ -39,10 +40,12 @@ type io = {
   sender : string;
   ptd : Octra_core.Crypto.PrivateTransferV4.t;
   strict : bool;
+  math : bool;
   get_pvac_pubkey : string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : string -> (unit -> task_result Lwt.t) -> admit;
+  start_task : math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
+    math:bool ->
     strict:bool ->
     pubkey_blob:string ->
     sender_enc:string ->
@@ -53,10 +56,12 @@ type io = {
 
 type launcher = {
   strict : unit -> bool;
+  math : unit -> bool;
   get_pvac_pubkey : string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : string -> (unit -> task_result Lwt.t) -> admit;
+  start_task : math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
+    math:bool ->
     strict:bool ->
     pubkey_blob:string ->
     sender_enc:string ->
@@ -115,16 +120,16 @@ let hard_cap_plan ~max_entries entries =
   else
     { hard_cap_drop = []; hard_cap_requested_drop = 0 }
 
-let result_of_ranges ~strict ~sender_enc_snapshot = function
+let result_of_ranges ~math ~strict ~sender_enc_snapshot = function
   | Error (Tx_view.Preverify_invalid _) ->
-    Checked { delta_ok = false; balance_ok = false; strict; sender_enc_snapshot }
+    Checked { delta_ok = false; balance_ok = false; strict; math; sender_enc_snapshot }
   | Error (Tx_view.Preverify_unavailable reason) ->
     Unavailable reason
   | Ok (delta_ok, balance_ok) ->
-    Checked { delta_ok; balance_ok; strict; sender_enc_snapshot }
+    Checked { delta_ok; balance_ok; strict; math; sender_enc_snapshot }
 
 let launch (io : io) =
-  io.start_task io.tx_hash (fun () ->
+  io.start_task ~math:io.math io.tx_hash (fun () ->
     let open Lwt.Syntax in
     let t0 = io.now () in
     Log.info "pre_verify" "start tx = %s from = %s" (short16 io.tx_hash) io.sender;
@@ -136,7 +141,7 @@ let launch (io : io) =
         (io.now () -. t0);
       let sender_enc = io.sender_enc io.sender in
       let* ranges =
-        io.verify_ranges ~strict:io.strict ~pubkey_blob ~sender_enc io.ptd in
+        io.verify_ranges ~math:io.math ~strict:io.strict ~pubkey_blob ~sender_enc io.ptd in
       begin
         match ranges with
         | Error (Tx_view.Preverify_invalid e) ->
@@ -152,14 +157,14 @@ let launch (io : io) =
             (io.now () -. t0)
       end;
       Lwt.return
-        (result_of_ranges
+        (result_of_ranges ~math:io.math
            ~strict:io.strict
            ~sender_enc_snapshot:sender_enc
            ranges)
     | None ->
       Log.warn "pre_verify" "no pvac pubkey addr = %s" io.sender;
       Lwt.return
-        (result_of_ranges
+        (result_of_ranges ~math:io.math
            ~strict:io.strict
            ~sender_enc_snapshot:(io.sender_enc io.sender)
            (Error (Tx_view.Preverify_invalid "pvac pubkey missing"))))
@@ -170,11 +175,13 @@ let launch_for_tx (launcher : launcher) ~tx_hash tx =
     Unmanaged
   | Some ptd ->
     let strict = launcher.strict () in
+    let math = launcher.math () in
     launch {
       tx_hash;
       sender = tx.Octra_core.Transaction.from;
       ptd;
       strict;
+      math;
       get_pvac_pubkey = launcher.get_pvac_pubkey;
       sender_enc = launcher.sender_enc;
       start_task = launcher.start_task;

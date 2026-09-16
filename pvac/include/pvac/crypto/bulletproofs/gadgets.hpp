@@ -24,8 +24,8 @@ inline Scalar sc_mersenne_p() {
     return Scalar{{UINT64_MAX, 0x7FFFFFFFFFFFFFFFULL, 0, 0}};
 }
 
-inline Scalar sc_mersenne_p_inv() {
-    return sc_inv(sc_mersenne_p());
+inline Scalar sc_mersenne_p_inv(const ScalarOps& ops = ScalarOps()) {
+    return ops.inv(sc_mersenne_p());
 }
 
 inline void range_check(
@@ -61,7 +61,7 @@ inline void range_check(
         prover.constrain(sum_lc);
 
         reconstruction += LinearCombination(left, power_of_2);
-        power_of_2 = sc_mul(power_of_2, two);
+        power_of_2 = prover.ops.mul(power_of_2, two);
     }
 
     reconstruction -= LinearCombination(v_var);
@@ -75,7 +75,7 @@ inline void reject_mersenne_modulus_alias(
 ) {
     const Scalar one = sc_from_u64(1);
     const Scalar delta = sc_sub(sc_mersenne_p(), v_val);
-    const Scalar inverse = sc_inv(delta);
+    const Scalar inverse = prover.ops.inv(delta);
     auto [delta_var, inverse_var, product_var] = prover.allocate(delta, inverse);
 
     LinearCombination delta_lc(delta_var);
@@ -139,25 +139,25 @@ inline FpMulResult fp_mul_gadget(
 
     auto [p00_l, p00_r, p00_out] = prover.multiply(
         LinearCombination(a0_var), LinearCombination(b0_var));
-    Scalar p00_val = sc_mul(a0_val, b0_val);
+    Scalar p00_val = prover.ops.mul(a0_val, b0_val);
 
     auto [p01_l, p01_r, p01_out] = prover.multiply(
         LinearCombination(a0_var), LinearCombination(b1_var));
-    Scalar p01_val = sc_mul(a0_val, b1_val);
+    Scalar p01_val = prover.ops.mul(a0_val, b1_val);
 
     auto [p10_l, p10_r, p10_out] = prover.multiply(
         LinearCombination(a1_var), LinearCombination(b0_var));
-    Scalar p10_val = sc_mul(a1_val, b0_val);
+    Scalar p10_val = prover.ops.mul(a1_val, b0_val);
 
     auto [p11_l, p11_r, p11_out] = prover.multiply(
         LinearCombination(a1_var), LinearCombination(b1_var));
-    Scalar p11_val = sc_mul(a1_val, b1_val);
+    Scalar p11_val = prover.ops.mul(a1_val, b1_val);
 
     Scalar pow2_64 = sc_pow2_64();
     Scalar two = sc_from_u64(2);
     Scalar T_red_val = sc_add(
-        sc_add(p00_val, sc_mul(pow2_64, sc_add(p01_val, p10_val))),
-        sc_mul(two, p11_val)
+        sc_add(p00_val, prover.ops.mul(pow2_64, sc_add(p01_val, p10_val))),
+        prover.ops.mul(two, p11_val)
     );
 
     Fp a_fp = {a_val.v[0], a_val.v[1]};
@@ -167,7 +167,7 @@ inline FpMulResult fp_mul_gadget(
 
     Scalar p_sc = sc_mersenne_p();
     Scalar T_minus_c = sc_sub(T_red_val, c_val);
-    Scalar q_val = sc_mul(T_minus_c, sc_inv(p_sc));
+    Scalar q_val = prover.ops.mul(T_minus_c, prover.ops.inv(p_sc));
 
     auto [c_var, c_r, c_o] = prover.allocate(c_val, one_sc);
     auto [q_var, q_r, q_o] = prover.allocate(q_val, one_sc);
@@ -296,7 +296,8 @@ struct FpFoldedTerm {
 
 inline FpFoldedTerm fp_mul_const_var_folded(
     const Fp& A_const,
-    const FpLimbs& x_limbs
+    const FpLimbs& x_limbs,
+    const ScalarOps& ops = ScalarOps()
 ) {
 
     Scalar A0 = sc_from_u64(A_const.lo);
@@ -308,17 +309,17 @@ inline FpFoldedTerm fp_mul_const_var_folded(
 
     lc += LinearCombination(x_limbs.x0_var, A0);
 
-    lc += LinearCombination(x_limbs.x1_var, sc_mul(pow2_64, A0));
+    lc += LinearCombination(x_limbs.x1_var, ops.mul(pow2_64, A0));
 
-    lc += LinearCombination(x_limbs.x0_var, sc_mul(pow2_64, A1));
+    lc += LinearCombination(x_limbs.x0_var, ops.mul(pow2_64, A1));
 
-    lc += LinearCombination(x_limbs.x1_var, sc_mul(two, A1));
+    lc += LinearCombination(x_limbs.x1_var, ops.mul(two, A1));
 
     Scalar x0 = x_limbs.x0_val;
     Scalar x1 = x_limbs.x1_val;
     Scalar T_val = sc_add(
-        sc_add(sc_mul(A0, x0), sc_mul(sc_mul(pow2_64, A0), x1)),
-        sc_add(sc_mul(sc_mul(pow2_64, A1), x0), sc_mul(sc_mul(two, A1), x1))
+        sc_add(ops.mul(A0, x0), ops.mul(ops.mul(pow2_64, A0), x1)),
+        sc_add(ops.mul(ops.mul(pow2_64, A1), x0), ops.mul(ops.mul(two, A1), x1))
     );
 
     return {lc, T_val};

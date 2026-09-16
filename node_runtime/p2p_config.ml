@@ -6,7 +6,7 @@ type t = {
   binary_hash : string;
   require_binary_hash : bool;
   upgrade_plan : Octra_net.P2p_upgrade_plan.t option;
-  profile : Octra_net.P2p_swarm.profile option;
+  profile_plan : Octra_net.P2p_swarm.profile list;
   handshake_allowed_pubkeys : string list;
   validator_pubkeys : string list;
 }
@@ -169,7 +169,7 @@ let build ~chain_id:_ ~consensus_config_hash ~allowed_pubkeys
       binary_hash;
       require_binary_hash;
       upgrade_plan;
-      profile = None;
+      profile_plan = [];
       handshake_allowed_pubkeys;
       validator_pubkeys = allowed_pubkeys;
     }
@@ -223,16 +223,10 @@ let upgrade_log_message = function
       (Octra_consensus.C_config.short row.binary_hash)
       (Octra_consensus.C_config.short row.config_hash)
 
-let standard_profile ~chain_id ?program_trust_hash getenv =
-  let graph =
-    Octra_core.Rule_graph.create
-      ~chain_id
-      ~root_at:(fun _ -> Octra_core.Rule_graph.Missing)
-  in
-  match Octra_core.Rule_graph.standard_activation graph with
-  | None -> None
-  | Some activation ->
-    let profile_hash = Consensus_profile.standard_hash ~chain_id getenv in
+let standard_profiles ~chain_id ?program_trust_hash getenv =
+  Octra_core.Rule_graph.profile_epochs ~chain_id
+  |> List.map (fun epoch ->
+    let profile_hash = Consensus_profile.hash ~chain_id ~epoch getenv in
     let wire_hash =
       Octra_consensus.C_config.network_hash
         ~chain_id
@@ -240,13 +234,13 @@ let standard_profile ~chain_id ?program_trust_hash getenv =
         ~runtime_profile_hash:profile_hash
         ()
     in
-    Some Octra_net.P2p_swarm.{
-      epoch = Int64.of_int activation.activation_epoch;
+    Octra_net.P2p_swarm.{
+      epoch = Int64.of_int epoch;
       config_hash = wire_hash;
       profile_hash;
-    }
+    })
 
-let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile
+let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile_plan
     ~current_entries ~next_entries ~chain_pending_entries
     ~next_activation_epoch ?program_trust_hash
     ?runtime_profile_hash ?active_raw ?pending_raw () =
@@ -300,7 +294,7 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile
     | Ok handshake ->
       let handshake = {
         handshake with
-        profile;
+        profile_plan;
         validator_pubkeys =
           List.map
             (fun validator ->
@@ -345,8 +339,8 @@ let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
           ~epoch:(Int64.to_int (Int64.succ current_height))
           getenv
       in
-      let profile =
-        standard_profile
+      let profile_plan =
+        standard_profiles
           ~chain_id
           ?program_trust_hash
           getenv
@@ -362,7 +356,7 @@ let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
         ~next_activation_epoch:(Validators.activation_epoch_int64 ())
         ?program_trust_hash
         ~runtime_profile_hash
-        ~profile
+        ~profile_plan
         ?active_raw:chain_active_raw
         ?pending_raw:chain_pending_raw
         ()
@@ -494,7 +488,7 @@ let swarm_config (params : swarm_params) =
     binary_hash = params.handshake.binary_hash;
     require_binary_hash = params.handshake.require_binary_hash;
     upgrade_plan = params.handshake.upgrade_plan;
-    profile = params.handshake.profile;
+    profile_plan = params.handshake.profile_plan;
     allowed_pubkeys = params.handshake.handshake_allowed_pubkeys;
     bootstrap_peers = params.bootstrap_peers;
     max_peers = params.max_peers;

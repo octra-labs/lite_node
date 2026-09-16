@@ -12,6 +12,7 @@ from pathlib import Path
 
 from validator_common import ValidatorError
 from validator_common import parse_env
+from validator_common import sha256_file
 
 ACTIVE = frozenset({"launching", "online", "stopping"})
 
@@ -119,6 +120,38 @@ def data_pids(data_dir, root=Path("/proc")):
         if b"OCTRA_DATA_DIR=" + expected in values:
             result.append(int(item.name))
     return sorted(result)
+
+def worker_owned(pid, parent, values, root=Path("/proc")):
+    try:
+        worker = Path(values["OCTRA_PVAC_VERIFY_WORKER"]).expanduser()
+        digest = values["OCTRA_PVAC_VERIFY_WORKER_HASH"]
+        if not worker.is_absolute() or len(digest) != 64:
+            return False
+        if any(char not in "0123456789abcdef" for char in digest):
+            return False
+        process = root / str(pid)
+        before = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        if int(before[1]) != parent:
+            return False
+        expected = worker.resolve(strict=True)
+        executable = process / "exe"
+        if executable.resolve(strict=True) != expected:
+            return False
+        actual = sha256_file(executable)
+        after = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        return (
+            actual == digest
+            and (before[1], before[19]) == (after[1], after[19])
+            and executable.resolve(strict=True) == expected
+        )
+    except (KeyError, IndexError, OSError, ValueError, TypeError, RuntimeError):
+        return False
+
+def node_owners(pids, pid, values, root=Path("/proc")):
+    return isinstance(pid, int) and pid > 0 and pid in pids and all(
+        owner == pid or worker_owned(owner, pid, values, root=root)
+        for owner in pids
+    )
 
 def pm2_entries(required=True):
     if shutil.which("pm2") is None:

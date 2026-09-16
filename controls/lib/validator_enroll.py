@@ -117,7 +117,10 @@ def next_nonce(values, wallet):
     if nonce is None or pending is None or pending < nonce:
         raise ValidatorError("local account has no valid nonce view")
     if pending != nonce:
-        raise ValidatorError("account has pending transactions; wait before enrollment")
+        raise ValidatorError(
+            "account has pending transactions; wait before enrollment; "
+            f"nonce = {nonce} pending_nonce = {pending}"
+        )
     return nonce + 1
 
 def exact_member(entries, wallet):

@@ -295,8 +295,8 @@ let preview_request_of_call method_name params =
   | _ ->
     None
 
-let preview_cache_key circle_id caller prompt_csv =
-  circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv
+let preview_cache_key ~math circle_id caller prompt_csv =
+  circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv ^ (if math then "|math" else "")
 
 let preview_cache_store key result_csv =
   match parse_csv_tokens result_csv with
@@ -392,7 +392,7 @@ let public_reads_hash snapshots =
   |> List.map Octra_core.Circle_wasm_public_read.yojson_of_snapshot
   |> fun values -> hash_json "octra:circle_public_reads:v1" (`List values)
 
-let hfhe_context_hash ~strict caps pubkeys active_key =
+let hfhe_context_hash ~math ~strict caps pubkeys active_key =
   let caps =
     caps
     |> List.sort_uniq String.compare
@@ -421,11 +421,11 @@ let hfhe_context_hash ~strict caps pubkeys active_key =
        "octra:circle_hfhe_context:standard:v1"
      else
        "octra:circle_hfhe_context:v1")
-    (`Assoc [
+    (`Assoc ([
       "caps", `List caps;
       "pubkeys", `List pubkeys;
       "active_key", active_key;
-    ])
+    ] @ if math then ["math", `Bool true] else []))
 
 let hfhe_binding loaded circle_id public_reads_hash context_hash transcript = {
   circle_id;
@@ -999,6 +999,7 @@ let execute_wasm_view
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~math
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1018,6 +1019,7 @@ let execute_wasm_view
       ~hfhe_pubkeys
       ~hfhe_active_key
       ~hfhe_strict
+      ~math
       ~hfhe_mode
       ~public_reads
       ~fuel_limit:(wasm_fuel_limit fuel_limit)
@@ -1025,6 +1027,7 @@ let execute_wasm_view
       ~update_policy:false
   | Circle_program.Compute ->
     Octra_core.Circle_wasm_host.execute_compute
+      ~math
       ~code_b64
       ~export_name
       ~request_bytes
@@ -1230,6 +1233,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                             ~hfhe_caps
                             ~hfhe_pubkeys
                             ~hfhe_active_key
+                            ~math:runtime_hfhe.exec_ctx.math
                             ~hfhe_strict:true
                             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
                             ~public_reads:public_reads.snapshots
@@ -1285,7 +1289,7 @@ and maybe_prefetch_preview ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0)
       ()
     else
       let next_prompt_csv = append_csv prompt_csv delivered_csv in
-      let next_key = preview_cache_key circle_id caller next_prompt_csv in
+      let next_key = preview_cache_key ~math:ctx.math circle_id caller next_prompt_csv in
       let prefetch_n = min preview_prefetch_tokens remaining in
       if prefetch_n <= 0 then
         ()
@@ -1336,7 +1340,7 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
       params
       caller
   | Some (prompt_csv, prompt_tokens, n_tokens) ->
-    let cache_key = preview_cache_key circle_id caller prompt_csv in
+    let cache_key = preview_cache_key ~math:ctx.math circle_id caller prompt_csv in
     begin
       match preview_cache_lookup cache_key n_tokens with
       | Some result_csv ->
@@ -1503,7 +1507,7 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                           loaded
                           circle_id
                           (public_reads_hash [])
-                          (hfhe_context_hash ~strict:hfhe_strict [] [] None)
+                          (hfhe_context_hash ~math:ctx.math ~strict:hfhe_strict [] [] None)
                           [];
                     }
                 end
@@ -1564,6 +1568,7 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                         else
                           let* wasm_result =
                             Octra_core.Circle_wasm_host.execute
+                              ~math:runtime_hfhe.exec_ctx.math
                               ~code_b64:wasm.code_b64
                               ~export_name:"octra_update"
                               ~request_bytes
@@ -1627,7 +1632,7 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                                       loaded
                                       circle_id
                                       (public_reads_hash public_reads.snapshots)
-                                      (hfhe_context_hash
+                                      (hfhe_context_hash ~math:ctx.math
                                          ~strict:hfhe_strict
                                          hfhe_caps
                                          hfhe_pubkeys

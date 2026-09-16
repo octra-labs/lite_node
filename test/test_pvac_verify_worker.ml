@@ -107,6 +107,30 @@ let protocol_roundtrip () =
     (P.request_hash historical_migration_request <>
      P.request_hash key_switch_request)
 
+let math_protocol () =
+  List.iter (fun value ->
+    request_roundtrip "math" (P.Math value);
+    check "math request hash reused"
+      (P.request_hash value <> P.request_hash (P.Math value));
+    let json = P.request_bytes value |> Yojson.Safe.from_string in
+    match json with
+    | `Assoc fields ->
+      check "math false changed prior bytes"
+        (match P.request_of_json (`Assoc (("math", `Bool false) :: fields)) with
+         | Ok parsed -> P.request_bytes parsed = P.request_bytes value
+         | Error _ -> false);
+      List.iter (fun extra ->
+        check "invalid math accepted"
+          (Result.is_error (P.request_of_json (`Assoc (extra @ fields)))))
+        [["math", `String "true"]; ["math", `Bool true; "math", `Bool false]]
+    | _ -> failwith "request object required")
+    [P.Ping; request; key_switch_request; circle_request];
+  List.iter (fun value ->
+    let response = D.response value in
+    check "math response hash differs" (response.request_hash = P.request_hash value);
+    check "math ping rejected" response.accepted)
+    [P.Ping; P.Math P.Ping; P.Ping; P.Math P.Ping]
+
 let rss_status_parser () =
   check "tab separated RSS rejected"
     (W.rss_mb_of_status_line "VmRSS:\t65537 kB" = Some 65);
@@ -391,6 +415,7 @@ let () =
     run_sample mode
   | None ->
     run "protocol_roundtrip" protocol_roundtrip;
+    run "math_protocol" math_protocol;
     run "rss_status_parser" rss_status_parser;
     run "worker_capacity_disjoint" worker_capacity_disjoint;
     run "health_succeeds" health_succeeds;

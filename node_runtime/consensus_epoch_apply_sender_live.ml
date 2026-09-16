@@ -116,9 +116,9 @@ let run deps sender_txs =
         tag
         reason
     in
-    let proof_mode =
+    let proof_mode, math =
       match deps.fold (deps.current_epoch ()) with
-      | Ok fold -> fold.Octra_core.Epoch_exec.standard_mode
+      | Ok fold -> fold.Octra_core.Epoch_exec.standard_mode, fold.math
       | Error reason -> failwith reason
     in
     let vm_tx_deps =
@@ -133,6 +133,7 @@ let run deps sender_txs =
           tx;
           object_cost = deps.object_cost;
           proof_mode;
+          math;
           current_epoch = deps.current_epoch;
           epoch_time_ms =
             (match Octra_consensus.Epoch_time.of_seconds
@@ -157,6 +158,7 @@ let run deps sender_txs =
           Octra_core.Epoch_exec.make_live_backend
             ~fold:deps.fold
             ~proof_mode
+            ~math
             deps.store
             deps.ledger)
         ~standard_env:deps.standard_env
@@ -236,7 +238,7 @@ let run deps sender_txs =
                 (balance_op_deps
                    ~gate:fhe_gate
                    ~plan:(fun () ->
-                     Octra_core.Private_ledger.apply_encrypt
+                     Octra_core.Private_ledger.apply_encrypt ~math
                        ~field_policy:deps.private_field_policy
                        ~strict:(proof_mode = Octra_core.Rule_graph.Active)
                        ~result_policy:
@@ -263,7 +265,7 @@ let run deps sender_txs =
                        fhe_gate ();
                      ])
                    ~plan:(fun () ->
-                     Octra_core.Private_ledger.apply_decrypt
+                     Octra_core.Private_ledger.apply_decrypt ~math
                        ~field_policy:deps.private_field_policy
                        ~strict:(proof_mode = Octra_core.Rule_graph.Active)
                        ~result_policy:
@@ -278,6 +280,7 @@ let run deps sender_txs =
                   ledger = deps.ledger;
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
+                  math;
                   legacy_replay = (fun address ->
                     let cipher =
                       match Octra_core.Ledger.find_opt deps.ledger address with
@@ -310,6 +313,7 @@ let run deps sender_txs =
                   ledger = deps.ledger;
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
+                  math;
                   stealth_count = !(deps.stealth_in_epoch_counter);
                   max_stealth_per_epoch = deps.max_stealth_per_epoch;
                   max_stealth_defer = deps.max_stealth_defer;
@@ -344,6 +348,7 @@ let run deps sender_txs =
                   ledger = deps.ledger;
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
+                  math;
                   private_result_policy = deps.private_result_policy;
                   current_epoch = deps.current_epoch;
                   trace_cipher = trace_enc_balance ~short:deps.short_addr;

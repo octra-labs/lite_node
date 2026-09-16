@@ -218,7 +218,7 @@ let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
            | `Assoc fields -> Ok (`Assoc (fields @ ["ready", ready]))
            | _ -> Error (Octra_core.Rpc.err (-32000) "invalid enrollment result" None)))
 
-let runtime_version ~chain_id ~validator_address ~program_trust_hash
+let runtime_version ~chain_id ~epoch ~validator_address ~program_trust_hash
     ~runtime_profile_hash ~validator_set_ref ~scheduled_validator_set_ref =
   let _, _, config_hash =
     current_validator_config
@@ -234,7 +234,7 @@ let runtime_version ~chain_id ~validator_address ~program_trust_hash
        ~binary_hash:(release_hash "OCTRA_BINARY_HASH" 64)
        ~consensus_standard:Consensus_profile.standard
        ~consensus_standard_hash:
-         (Consensus_profile.standard_hash ~chain_id Sys.getenv_opt)
+         (Consensus_profile.standard_hash ~chain_id ~epoch Sys.getenv_opt)
        ~activation_graph_hash:
          (Consensus_profile.activation_graph_hash ~chain_id)
        ~compat_wire_profile:Consensus_profile.compat_wire_profile
@@ -362,6 +362,7 @@ let node_version_params _params _ctx =
 let runtime_version_params _params ctx =
   runtime_version
     ~chain_id:ctx.chain_id
+    ~epoch:!(ctx.current_epoch)
     ~validator_address:ctx.validator_address
     ~program_trust_hash:ctx.program_trust_hash
     ~runtime_profile_hash:ctx.runtime_profile_hash

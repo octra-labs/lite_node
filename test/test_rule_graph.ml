@@ -66,7 +66,111 @@ let standard_activation graph =
 let graph root_at =
   Graph.create ~chain_id:"octra-devnet-9871-cluster" ~root_at
 
+let test_set_plan () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let root = "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d" in
+  let seed = graph (fun _ -> fail "set plan read before activation") in
+  let plan = Option.get (Graph.set_plan_activation seed) in
+  require
+    (plan.anchor_epoch = 1_504_440
+     && plan.anchor_state_root = root
+     && plan.activation_epoch = 1_510_000)
+    "set plan activation changed";
+  require
+    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000])
+    "profile epochs changed";
+  List.iter (fun epoch ->
+    require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
+      "set plan active before activation";
+    require (Graph.set_plan_at ~chain_id ~epoch = Graph.Prior)
+      "set plan profile active before activation")
+    [0; 1_500_000; 1_507_999; 1_508_000; 1_508_001; 1_509_999];
+  let matching = graph (fun epoch ->
+    require (epoch = 1_504_440) "set plan read wrong anchor";
+    Graph.Root root) in
+  List.iter (fun epoch ->
+    require (Graph.set_plan matching ~epoch = Ok Graph.Active)
+      "set plan inactive after activation";
+    require (Graph.set_plan_at ~chain_id ~epoch = Graph.Active)
+      "set plan profile inactive after activation";
+    require
+      (Graph.set_plan (graph (fun _ -> Graph.Missing)) ~epoch
+       = Error (Graph.Anchor_missing 1_504_440))
+      "set plan accepted missing anchor";
+    require
+      (match Graph.set_plan (graph (fun _ -> Graph.Root "other")) ~epoch with
+       | Error (Graph.Anchor_mismatch fault) ->
+         fault.epoch = 1_504_440 && fault.expected = root && fault.actual = "other"
+       | _ -> false)
+      "set plan accepted different anchor";
+    require
+      (match Graph.set_plan (graph (fun _ -> Graph.Unreadable "read")) ~epoch with
+       | Error (Graph.Anchor_unreadable fault) ->
+         fault.epoch = 1_504_440 && fault.reason = "read"
+       | _ -> false)
+      "set plan accepted unreadable anchor")
+    [1_510_000; 1_510_001; max_int];
+  List.iter (fun (floor_epoch, expected) ->
+    require
+      (Graph.root_after_floor ~chain_id ~floor_epoch ~epoch:1_504_440 = expected)
+      "set plan floor root differs")
+    [1_504_439, None; 1_504_440, Some root; 1_510_001, Some root];
+  let pruned = graph (fun epoch ->
+    match Graph.root_after_floor ~chain_id ~floor_epoch:1_510_001 ~epoch with
+    | Some root -> Graph.Root root
+    | None -> Graph.Missing) in
+  require (Graph.set_plan pruned ~epoch:1_510_001 = Ok Graph.Active)
+    "set plan rejected verified floor";
+  let prior = Graph.consensus_id ~chain_id ~epoch:1_500_000 in
+  require (Graph.consensus_id ~chain_id ~epoch:1_509_999 = prior)
+    "set plan changed prior graph";
+  let entry = "|1504440:" ^ root ^ ":1510000" in
+  let active = prior ^ entry ^ entry in
+  List.iter (fun epoch ->
+    require (Graph.consensus_id ~chain_id ~epoch = active)
+      "set plan graph differs") [1_510_000; 1_510_001; max_int];
+  let chain_id = "other" in
+  let other = Graph.create ~chain_id ~root_at:(fun _ -> fail "other anchor read") in
+  require (Graph.set_plan_activation other = None) "other set plan present";
+  require (Graph.profile_epochs ~chain_id = []) "other profile epochs present";
+  require
+    (Graph.root_after_floor ~chain_id ~floor_epoch:max_int ~epoch:1_504_440 = None)
+    "other floor accepted devnet anchor";
+  List.iter (fun epoch ->
+    require (Graph.set_plan other ~epoch = Ok Graph.Prior)
+      "other set plan active";
+    require (Graph.set_plan_at ~chain_id ~epoch = Graph.Prior)
+      "other set plan profile active") [0; 1_510_000; 1_510_001; max_int]
+
+let test_math () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let missing = graph (fun _ -> Graph.Missing) in
+  let plan = Option.get (Graph.math_activation missing) in
+  require (plan.activation_epoch = 1_510_000) "math activation differs";
+  let matching = graph (fun epoch ->
+    require (epoch = plan.anchor_epoch) "math anchor epoch differs";
+    Graph.Root plan.anchor_state_root) in
+  List.iter (fun epoch ->
+    let expected = if epoch < plan.activation_epoch then Graph.Prior else Graph.Active in
+    require (Graph.math_at ~chain_id ~epoch = expected) "math profile differs";
+    require (Graph.math matching ~epoch = Ok expected) "math rule differs";
+    if expected = Graph.Active then begin
+      require (Graph.math missing ~epoch = Error (Graph.Anchor_missing plan.anchor_epoch))
+        "math missing anchor accepted";
+      List.iter (fun root ->
+        require (Result.is_error (Graph.math (graph (fun _ -> root)) ~epoch))
+          "math invalid anchor accepted")
+        [Graph.Root "other"; Graph.Unreadable "read"]
+    end else
+      require (Graph.math missing ~epoch = Ok Graph.Prior) "math read before activation")
+    [0; 1_500_000; 1_507_999; 1_508_000; 1_508_001;
+     1_509_999; 1_510_000; 1_510_001; max_int];
+  let other = Graph.create ~chain_id:"other" ~root_at:(fun _ -> fail "other math read") in
+  require (Graph.math other ~epoch:max_int = Ok Graph.Prior) "other math enabled"
+
 let () =
+  test_math ();
+  test_set_plan ();
   let seed = graph (fun _ -> Graph.Unreadable "unused") in
   let plan = activation seed in
   let matching =

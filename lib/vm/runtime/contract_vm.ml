@@ -217,6 +217,7 @@ type exec_ctx = {
   circle_hfhe_intent_id : string option;
   circle_hfhe_active_relay_id : string option;
   point_ops : bool;
+  math : bool;
   object_cost : bool;
   int_work : Int_work.mode;
   current_epoch : int;
@@ -240,6 +241,7 @@ let default_ctx = {
   circle_hfhe_intent_id = None;
   circle_hfhe_active_relay_id = None;
   point_ops = false;
+  math = false;
   object_cost = false;
   int_work = Int_work.Prior;
   current_epoch = 0;
@@ -1945,7 +1947,7 @@ let exec_one st op =
          (match read_q16 st addr n, read_q16 st gamma_addr n,
                 read_q16 st beta_addr n with
           | Some values, Some gamma, Some beta ->
-            (match Fixed_q16.layer values gamma beta with
+            (match Fixed_q16.layer ~math:st.ctx.math values gamma beta with
              | Some result -> write_q16 st addr result; true
              | None -> revert st)
           | _ -> revert st)
@@ -2038,7 +2040,7 @@ let exec_one st op =
        else
          (match read_q16 st addr n, read_q16 st gamma_addr n with
           | Some values, Some gamma ->
-            (match Fixed_q16.rms values gamma with
+            (match Fixed_q16.rms ~math:st.ctx.math values gamma with
              | Some result -> write_q16 st addr result; true
              | None -> revert st)
           | _ -> revert st)
@@ -2936,7 +2938,7 @@ let exec_one st op =
                 string_of_int st.pc;
                 string_of_int rd;
               ] in
-              setr st rd (VCipher (Pvac_ffi.ct_mul_seeded pk a b seed)); true
+              setr st rd (VCipher (Pvac_ffi.ct_mul_seeded ~math:st.ctx.math pk a b seed)); true
             with _ -> revert st)
        | _ -> revert st)
   | FHE_SCALE (rd, rpk, rct, rscalar) ->
@@ -2947,7 +2949,7 @@ let exec_one st op =
        | Some pk, Some ct ->
          (try
             let s = Z.to_int64 (to_z (getr st rscalar)) in
-            setr st rd (VCipher (Pvac_ffi.ct_scale pk ct s)); true
+            setr st rd (VCipher (Pvac_ffi.ct_scale ~math:st.ctx.math pk ct s)); true
           with _ -> revert st)
        | _ -> revert st)
   | FHE_DIV_CONST (rd, rpk, rct, rdivisor) ->
@@ -2973,7 +2975,12 @@ let exec_one st op =
        | Some pk, Some ct ->
          (try
             let c = Z.to_int64 (to_z (getr st rconst)) in
-            setr st rd (VCipher (Pvac_ffi.ct_add_const pk ct c 0L)); true
+            let lo, hi =
+              if st.ctx.math && Int64.compare c 0L < 0 then
+                Int64.pred c, Int64.max_int
+              else c, 0L
+            in
+            setr st rd (VCipher (Pvac_ffi.ct_add_const ~math:st.ctx.math pk ct lo hi)); true
           with _ -> revert st)
        | _ -> revert st)
   | FHE_SUB_CONST (rd, rpk, rct, rconst) ->
@@ -2984,7 +2991,12 @@ let exec_one st op =
        | Some pk, Some ct ->
          (try
             let c = Z.to_int64 (to_z (getr st rconst)) in
-            setr st rd (VCipher (Pvac_ffi.ct_sub_const pk ct c)); true
+            let result =
+              if st.ctx.math && Int64.compare c 0L < 0 then
+                Pvac_ffi.ct_add_const ~math:true pk ct (Int64.neg c) 0L
+              else Pvac_ffi.ct_sub_const ~math:st.ctx.math pk ct c
+            in
+            setr st rd (VCipher result); true
           with _ -> revert st)
        | _ -> revert st)
   | FHE_VERIFY_ZERO (rd, rpk, rct, rproof) ->
@@ -3007,6 +3019,7 @@ let exec_one st op =
                | None -> Fhe_rejected
                | Some proof ->
                  Octra_core.Pvac_verify_worker.try_verify_zero_sync_classified
+                   ~math:st.ctx.math
                    ~pubkey:(encoded_worker_pubkey pk)
                    ~cipher:(encoded_worker_cipher ct)
                    ~proof
@@ -3034,6 +3047,7 @@ let exec_one st op =
              | None -> Fhe_rejected
              | Some proof ->
                Octra_core.Pvac_verify_worker.try_verify_range_sync_classified
+                 ~math:st.ctx.math
                  ~strict:true
                  ~pubkey:(encoded_worker_pubkey pk)
                  ~cipher:(encoded_worker_cipher ct)
@@ -3103,6 +3117,7 @@ let exec_one st op =
                with
                | Some proof, Some commitment ->
                  Octra_core.Pvac_verify_worker.try_verify_claim_sync_classified
+                   ~math:st.ctx.math
                    ~strict:true
                    ~pubkey:(encoded_worker_pubkey pk)
                    ~cipher:(encoded_worker_cipher ct)

@@ -74,6 +74,8 @@ type fold_ctx = {
   open_mode : Rule_graph.mode;
   account_mode : Rule_graph.mode;
   standard_mode : Rule_graph.mode;
+  plan_mode : Rule_graph.mode;
+  math : bool;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
   start : int64;
@@ -120,6 +122,7 @@ type backend = {
   sender_key_activation_epoch : int option;
   validator_policy : Validator_policy.t;
   proof_mode : Rule_graph.mode;
+  math : bool;
   fold : int -> (fold_ctx, string) result;
   begin_batch : Rule_graph.mode -> unit Lwt.t;
   commit_batch : unit -> unit Lwt.t;
@@ -146,6 +149,8 @@ let prior_fold _ =
     open_mode = Rule_graph.Prior;
     account_mode = Rule_graph.Prior;
     standard_mode = Rule_graph.Prior;
+    plan_mode = Rule_graph.Prior;
+    math = false;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
     start = 0L;
@@ -156,7 +161,7 @@ let prior_fold _ =
 
 let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
     ?sender_key_activation_epoch ?validator_policy
-    ?(proof_mode=Rule_graph.Active) ?(fold=prior_fold)
+    ?(proof_mode=Rule_graph.Active) ?(math=false) ?(fold=prior_fold)
     store ledger = {
   store;
   ledger;
@@ -174,6 +179,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
   proof_mode;
+  math;
   fold;
   begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch");
@@ -184,7 +190,7 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
 
 let make_overlay_backend ?emission_policy ?emission_schedule
     ?legacy_total_supply ?sender_key_activation_epoch ?validator_policy
-    ?(proof_mode=Rule_graph.Active) ?(fold=prior_fold) store ledger overlay = {
+    ?(proof_mode=Rule_graph.Active) ?(math=false) ?(fold=prior_fold) store ledger overlay = {
   store;
   ledger;
   ops = overlay_ops overlay;
@@ -201,6 +207,7 @@ let make_overlay_backend ?emission_policy ?emission_schedule
       validator_policy
       ~default:(Validator_policy.of_env_exn Sys.getenv_opt);
   proof_mode;
+  math;
   fold;
   begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch_overlay");
@@ -1592,7 +1599,7 @@ let circle_cell_plan ~backend ~current_epoch ~expected_transition_hash tx =
         Lwt.return_ok plan
       | Ok plan ->
         let* verified =
-          Circle_cell_transition.verify_classified ~strict:true plan
+          Circle_cell_transition.verify_classified ~math:backend.math ~strict:true plan
         in
         begin
           match verified with
@@ -3329,6 +3336,25 @@ let schedule_validator_snapshot ?active ~backend ~env () =
   match activate_epoch with
   | None -> Lwt.return_unit
   | Some activate_epoch ->
+    let* slot =
+      match ctx.plan_mode with
+      | Rule_graph.Prior -> Lwt.return_true
+      | Rule_graph.Active ->
+        let* stored =
+          Store_irmin.get_meta backend.store Validator_set_update.pending_meta_key
+        in
+        let pending =
+          match stored with
+          | None -> None
+          | Some raw ->
+            match Validator_set_update.of_string raw with
+            | Ok update -> Some update
+            | Error error -> failwith ("pending validator set corrupt: " ^ error)
+        in
+        Lwt.return (Validator_set_update.snapshot_slot ~epoch:source_epoch pending)
+    in
+    if not slot then Lwt.return_unit
+    else
     let* registry_result = load_validator_registry backend in
     begin
       match registry_result with

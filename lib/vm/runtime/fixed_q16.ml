@@ -241,7 +241,7 @@ let mean values =
   if n = 0 then None
   else Some (Z.div (Array.fold_left Z.add Z.zero values) (Z.of_int n))
 
-let layer values gamma beta =
+let layer ?(math = true) values gamma beta =
   let n = Array.length values in
   if n = 0 || Array.length gamma <> n || Array.length beta <> n ||
      not (Array.for_all in_range values) ||
@@ -262,11 +262,13 @@ let layer values gamma beta =
       (match inv_sqrt (Z.add variance Z.one) with
        | None -> None
        | Some inv ->
-         Some (Array.mapi (fun i value ->
+         let result = Array.mapi (fun i value ->
            let normalized = trunc_mul (Z.sub value avg) inv in
-           Z.add (trunc_mul gamma.(i) normalized) beta.(i)) values))
+           Z.add (trunc_mul gamma.(i) normalized) beta.(i)) values in
+         if math && not (Array.for_all in_range result) then None
+         else Some result)
 
-let rms values gamma =
+let rms ?(math = true) values gamma =
   let n = Array.length values in
   if n = 0 || Array.length gamma <> n ||
      not (Array.for_all in_range values) ||
@@ -280,5 +282,7 @@ let rms values gamma =
     match inv_sqrt (Z.add mean_sq Z.one) with
     | None -> None
     | Some inv ->
-      Some (Array.mapi (fun i value ->
-        trunc_mul gamma.(i) (trunc_mul value inv)) values)
+      let result = Array.mapi (fun i value ->
+        trunc_mul gamma.(i) (trunc_mul value inv)) values in
+      if math && not (Array.for_all in_range result) then None
+      else Some result

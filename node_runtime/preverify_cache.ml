@@ -5,6 +5,7 @@ type result = Preverify_submit.result = {
   delta_ok : bool;
   balance_ok : bool;
   strict : bool;
+  math : bool;
   sender_enc_snapshot : string;
 }
 
@@ -32,7 +33,9 @@ type gate =
     status : string;
   }
 
-let cache : (string, task_result Lwt.t) Hashtbl.t = Hashtbl.create 100
+type entry = { math : bool; task : task_result Lwt.t }
+
+let cache : (string, entry) Hashtbl.t = Hashtbl.create 100
 
 let cache_ts : (string, float) Hashtbl.t = Hashtbl.create 100
 
@@ -91,7 +94,7 @@ let gc_on_finish () =
     true
 
 let find hash =
-  Hashtbl.find_opt cache hash
+  Option.map (fun entry -> entry.task) (Hashtbl.find_opt cache hash)
 
 let remove hash =
   begin
@@ -148,7 +151,7 @@ let prune ?(ttl = -1.0) ?(max_entries = -1) () =
       ttl
       (Hashtbl.length cache)
 
-let insert_with_cap hash result_promise =
+let insert_with_cap ?(math=false) hash result_promise =
   let now = now () in
   let max_entries = configured_max_entries () in
   let plan =
@@ -164,11 +167,12 @@ let insert_with_cap hash result_promise =
       plan.hard_cap_requested_drop
       (Hashtbl.length cache_ts)
   end;
-  Hashtbl.replace cache hash result_promise;
+  Hashtbl.replace cache hash { math; task = result_promise };
   Hashtbl.replace cache_ts hash now
 
-let start_task hash f =
-  if Hashtbl.mem cache hash then
+let start_task ?(math=false) hash f =
+  if Option.fold ~none:false ~some:(fun entry -> entry.math = math)
+      (Hashtbl.find_opt cache hash) then
     Preverify_submit.Existing
   else if not (has_capacity ()) then
     Preverify_submit.Busy
@@ -184,7 +188,7 @@ let start_task hash f =
           if gc_on_finish () then Gc.major ();
           Lwt.return_unit)
     in
-    insert_with_cap hash task;
+    insert_with_cap ~math hash task;
     Preverify_submit.Started
   end
 
@@ -230,13 +234,13 @@ let gate ~state ~defer_count ~max_defer =
       | Pending -> Defer_gate { next_count; status = "pending" }
       | Ready | Failed _ -> Defer_gate { next_count; status = "unexpected" }
 
-let ready_result hash ~strict ~sender_enc_snapshot =
+let ready_result ?(math=false) hash ~strict ~sender_enc_snapshot =
   match find hash with
   | Some task ->
     begin
       match Lwt.state task with
       | Lwt.Return (Checked result)
-        when Bool.equal result.strict strict
+        when Bool.equal result.math math && Bool.equal result.strict strict
           && String.equal result.sender_enc_snapshot sender_enc_snapshot ->
         Some result
       | _ ->

@@ -457,6 +457,7 @@ let cache_mode_case () =
     delta_ok = true;
     balance_ok = true;
     strict = false;
+    math = false;
     sender_enc_snapshot;
   } in
   PC.remove hash;
@@ -666,14 +667,46 @@ let setup name =
 let cache_key_mode_case () =
   let path, store, ledger, _, _ = setup "cache_key_mode" in
   let transaction = { (tx "switch") with T.op_type = T.KeySwitch } in
-  let key cap =
-    Lwt_main.run (PL.key_switch_cache_key PL.Unique_fields cap ledger transaction)
+  let key ?(math = false) cap =
+    Lwt_main.run (PL.key_switch_cache_key ~math PL.Unique_fields cap ledger transaction)
   in
   expect (String.equal (key false) (key false)) "prior cache key stable";
   expect (String.equal (key true) (key true)) "active cache key stable";
   expect (not (String.equal (key false) (key true))) "cache key mode isolation";
+  List.iter (fun cap ->
+    expect (key ~math:false cap <> key ~math:true cap) "cache arithmetic isolation";
+    expect (key cap = key ~math:false cap) "cache prior arithmetic") [false; true];
   Lwt_main.run (Octra_core.Store_irmin.close store);
   clear_case path
+
+let math_artifact () =
+  let path, store, ledger, pk, sk = setup "math_artifact" in
+  Fun.protect
+    ~finally:(fun () ->
+      Lwt_main.run (Octra_core.Store_irmin.close store);
+      clear_case path)
+    (fun () ->
+      let valid = tx (payload pk sk true) in
+      let invalid = { valid with T.amount = Z.of_int 11 } in
+      List.iter (fun math ->
+        List.iter (fun (transaction, accepted) ->
+          let artifact =
+            match Lwt_main.run (PL.preverify_private_artifact ~math
+                ~field_policy:PL.Unique_fields ~strict:true ledger transaction) with
+            | Ok artifact -> artifact
+            | Error error -> fail error.PL.reason
+          in
+          let bind math = Lwt_main.run (PL.bind_private_artifact ~math
+            ~field_policy:PL.Unique_fields ~strict:true ledger transaction artifact) in
+          expect
+            (match bind math with
+             | PL.Private_bound _ -> accepted
+             | PL.Private_artifact_invalid _ -> not accepted
+             | PL.Private_source_changed -> false)
+            "artifact same arithmetic";
+          expect (bind (not math) = PL.Private_source_changed)
+            "artifact crossed arithmetic activation")
+          [valid, true; invalid, false]) [false; true])
 
 let migration_case () =
   let module M = Octra_core.Pvac_migration in
@@ -746,7 +779,7 @@ let env =
     ready_max_lag = 0;
   }
 
-let process_lwt ?(artifacts = []) ?(keys = [])
+let process_lwt ?(math = false) ?(artifacts = []) ?(keys = [])
     ?(before = fun () -> Lwt.return_unit)
     ?(field_policy = PL.Unique_fields)
     ?(result_policy = Octra_core.Private_result_policy.Recoverable)
@@ -767,7 +800,7 @@ let process_lwt ?(artifacts = []) ?(keys = [])
   end;
   let* () = before () in
   let transition =
-    Octra_core.Private_transition.create
+    Octra_core.Private_transition.create ~math
       ~preverify:(Some gate)
       ~ledger
       ~epoch_id:env.epoch_id
@@ -783,14 +816,14 @@ let process_lwt ?(artifacts = []) ?(keys = [])
   in
   Octra_core.Private_transition.process
     transition
-    ~backend:(E.make_live_backend store ledger)
+    ~backend:(E.make_live_backend ~math store ledger)
     ~env
     transaction
 
-let process ?artifacts ?keys ?field_policy ?result_policy
+let process ?math ?artifacts ?keys ?field_policy ?result_policy
     proof_mode store ledger transaction receipt =
   Lwt_main.run
-    (process_lwt ?artifacts ?keys ?field_policy ?result_policy
+    (process_lwt ?math ?artifacts ?keys ?field_policy ?result_policy
        proof_mode store ledger transaction receipt)
 
 let switch_reuse () =
@@ -824,7 +857,7 @@ let switch_reuse () =
       let transaction = { (tx payload) with T.op_type = T.KeySwitch; amount = Z.zero } in
       expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "switch source";
       Lwt_main.run (L.flush_dirty_lwt ledger);
-      let pool = Pool.create ~field_policy:(fun () -> PL.Unique_fields)
+      let pool = Pool.create ~math:(fun () -> false) ~field_policy:(fun () -> PL.Unique_fields)
         ~strict:(fun () -> true) ledger in
       let prepared = match Lwt_main.run (Pool.await pool transaction) with
         | Octra_core.Preverify_availability.Ready plan -> plan
@@ -841,7 +874,7 @@ let switch_reuse () =
         | Ok artifact -> [T.hash transaction, artifact]
         | Error e -> fail e.PL.reason
       in
-      let run ?(fields = PL.Unique_fields) ?(mode = Octra_core.Rule_graph.Active)
+      let run ?(math = false) ?(fields = PL.Unique_fields) ?(mode = Octra_core.Rule_graph.Active)
           ?(cipher = source_bytes) ?(key = old_key) step keys tx hash =
         let open Lwt.Syntax in
         Lwt_main.run (Octra_core.State_preview.with_state
@@ -857,7 +890,7 @@ let switch_reuse () =
             let* changed = L.hash ledger in
             expect (changed <> root) "preview root did not change";
             let* cert = receipt_lwt ledger tx hash in
-            let* result = process_lwt ~keys ~field_policy:fields mode store ledger tx cert in
+            let* result = process_lwt ~math ~keys ~field_policy:fields mode store ledger tx cert in
             let* key = L.get_pvac_pubkey ledger addr in
             let account = L.find_opt ledger addr in
             let* () = L.flush_dirty_lwt ledger in
@@ -904,7 +937,7 @@ let switch_reuse () =
           let* () = check hash ("key_switch_rejected",
             "encrypted balance changed before key switch verification") in
           expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "restore pool source";
-          let pool = Pool.create ~field_policy:(fun () -> PL.First_field)
+          let pool = Pool.create ~math:(fun () -> false) ~field_policy:(fun () -> PL.First_field)
             ~strict:(fun () -> false) ledger in
           let* prepared = Pool.await pool transaction in
           begin match prepared with
@@ -944,6 +977,7 @@ let switch_reuse () =
           | _ -> fail "switch artifact not carried"
           end;
           needs_worker "mode" (fun () -> run 3 prior transaction hash);
+          needs_worker "math" (fun () -> run ~math:true 3 keys transaction hash);
           needs_worker "fields" (fun () -> run ~fields:PL.First_field 4 keys transaction hash);
           let changed = { transaction with T.nonce = 2 } in
           let wrong = List.map (fun (_, artifact) -> T.hash changed, artifact) keys in
@@ -1014,7 +1048,7 @@ let reuse_case decrypt =
         | Error e -> fail e.PL.reason
       in
       let module Pool = Octra_node_runtime.Consensus_private_preverify in
-      let pool = Pool.create
+      let pool = Pool.create ~math:(fun () -> false)
         ~field_policy:(fun () -> PL.Unique_fields)
         ~strict:(fun () -> true)
         ~result_policy:(fun () -> Octra_core.Private_result_policy.Recoverable)
@@ -1032,14 +1066,14 @@ let reuse_case decrypt =
       in
       let prior = make_artifact false in
       let plan_hash = PL.hash_prepared prepared in
-      let run ?field_policy ?result_policy artifacts tx hash =
+      let run ?math ?field_policy ?result_policy artifacts tx hash =
         let receipt = receipt ledger tx hash in
         expect (Octra_core.Ledger.begin_journal ledger = Ok ()) "journal start";
         Fun.protect
           ~finally:(fun () ->
             expect (Octra_core.Ledger.abort_journal ledger = Ok ()) "journal end")
           (fun () ->
-            let result = process ~artifacts ?field_policy ?result_policy
+            let result = process ?math ~artifacts ?field_policy ?result_policy
               Octra_core.Rule_graph.Active store ledger tx receipt in
             result, Octra_core.Ledger.find_opt ledger addr)
       in
@@ -1071,15 +1105,16 @@ let reuse_case decrypt =
             (fst mismatch = Error ("preverify_transition_mismatch",
               "private transition does not match the certified receipt"))
             "reused plan receipt mismatch";
-          let needs_worker ?field_policy ?result_policy entries tx =
+          let needs_worker ?math ?field_policy ?result_policy entries tx =
             let retried =
-              try ignore (run ?field_policy ?result_policy entries tx plan_hash); false
+              try ignore (run ?math ?field_policy ?result_policy entries tx plan_hash); false
               with PL.Worker_retry _ -> true
             in
             expect retried "changed inputs require verification"
           in
           needs_worker [] transaction;
           needs_worker (entries transaction prior) transaction;
+          needs_worker ~math:true (entries transaction artifact) transaction;
           needs_worker ~field_policy:PL.First_field
             (entries transaction artifact) transaction;
           needs_worker ~result_policy:Octra_core.Private_result_policy.Legacy
@@ -1563,6 +1598,9 @@ let () =
   | [_; "migration"] ->
     migration_case ();
     print_endline "status = pass test = private_transition_receipt case = migration"
+  | [_; "math"] ->
+    math_artifact ();
+    print_endline "status = pass test = private_transition_receipt case = math"
   | [_; "circle_policy"] ->
     circle_policy_case ();
     print_endline "status = pass test = private_transition_receipt case = circle_policy"
@@ -1585,6 +1623,7 @@ let () =
     protocol_mode_case ();
     cache_mode_case ();
     cache_key_mode_case ();
+    math_artifact ();
     amount_link_case ();
     pending_case ();
     prior_receipt_case ();
@@ -1598,4 +1637,4 @@ let () =
     reuse_case true;
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt"
-  | _ -> fail "expected cache_key, migration, circle_policy, valid, reuse or switch_reuse"
+  | _ -> fail "expected cache_key, migration, math, circle_policy, valid, reuse or switch_reuse"

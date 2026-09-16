@@ -24,6 +24,9 @@ let compat_golden =
 let empty_compat_golden =
   "cf3813dc7d75a9df5b696817677f7aafc94cbbb737cef9f9a64edb1b2d04006b"
 
+let plan_golden =
+  "20cb24dc201d8d065e22915ca4692c06fe9d863d13fea6c0ea88c6631502e636"
+
 let sample = [
   "OCTRA_BFT_PROPOSAL_MAX_TXS", "800";
   "OCTRA_BFT_PROPOSAL_MAX_BYTES", "4000000";
@@ -65,7 +68,7 @@ let devnet = [
     "35a5ff289c799e701f315d31355d1007f8ab9c9825a8df67de380ddcf85640a8";
 ]
 
-let components getenv =
+let components ~epoch getenv =
   let validator_policy = Octra_core.Validator_policy.of_env_exn getenv in
   let schedule =
     match Octra_core.Emission_schedule.of_env getenv with
@@ -74,7 +77,7 @@ let components getenv =
   in
   [
     "runtime_compatibility", P.compat_hash getenv;
-    "activation_graph", Octra_core.Rule_graph.consensus_id ~chain_id;
+    "activation_graph", Octra_core.Rule_graph.consensus_id ~chain_id ~epoch;
     "quorum", Octra_consensus.C_quorum_policy.consensus_id ~chain_id;
     "set_fold_bootstrap",
       Octra_core.Set_fold.consensus_id Octra_core.Set_fold.standard;
@@ -98,8 +101,14 @@ let components getenv =
     "vm_undo", "nested_commit";
     "proposal_protocol", Octra_consensus.C_protocol.consensus_id getenv;
   ]
+  @ (match Octra_core.Rule_graph.set_plan_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["set_plan", "retain_until_activation"])
+  @ (match Octra_core.Rule_graph.math_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["math", "scalar65_field_signed_cipher_zero_q16"])
 
-let derived getenv =
+let derived ~epoch getenv =
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
     Octra_net.Oce1.put_string buf P.standard;
     Octra_net.Oce1.put_string buf chain_id;
@@ -107,11 +116,11 @@ let derived getenv =
       (fun (name, value) ->
         Octra_net.Oce1.put_string buf name;
         Octra_net.Oce1.put_string buf value)
-      (components getenv))
+      (components ~epoch getenv))
 
 let () =
   expect "profile validates" (P.validate getenv = Ok ());
-  let standard = P.standard_hash ~chain_id getenv in
+  let standard = P.standard_hash ~chain_id ~epoch:1_500_000 getenv in
   let compat = P.compat_hash getenv in
   Printf.printf
     "event = consensus_profile_golden standard = %s compat = %s\n"
@@ -122,8 +131,8 @@ let () =
   expect "empty env compat hash golden"
     (String.equal (raw_hex (P.compat_hash (fun _ -> None))) empty_compat_golden);
   expect "standard hash binds every component"
-    (String.equal standard (derived getenv));
-  expect "component count" (List.length (components getenv) = 19);
+    (String.equal standard (derived ~epoch:1_500_000 getenv));
+  expect "component count" (List.length (components ~epoch:1_500_000 getenv) = 19);
   List.iter
     (fun epoch ->
       expect "prior epoch selects compat"
@@ -135,9 +144,11 @@ let () =
         (String.equal (P.hash ~chain_id ~epoch getenv) standard);
       expect "no additional profile switch"
         (not (P.switch_after ~chain_id ~applied_epoch:epoch)))
-    [1_500_000; 1_500_001; 1_550_000; max_int];
+    [1_500_000; 1_500_001; 1_507_999; 1_508_000; 1_508_001; 1_509_998];
   expect "announced profile switch retained"
     (P.switch_after ~chain_id ~applied_epoch:1_499_999);
+  expect "set plan prior sample preserved"
+    (P.hash ~chain_id ~epoch:1_509_999 getenv = standard);
   let devnet_env name = List.assoc_opt name devnet in
   let prior_hash =
     "14bac4b24aa67795bcaecf618b6c10a6ef0f3b2a113ded7f5f9117362375cee6"
@@ -151,7 +162,35 @@ let () =
       expect "marker 12 profile" (String.equal actual expected);
       Printf.printf "event = devnet_profile epoch = %d hash = %s\n" epoch actual)
     [1_499_999, prior_hash; 1_500_000, active_hash;
-     1_500_001, active_hash; 1_550_000, active_hash];
+     1_500_001, active_hash; 1_507_999, active_hash;
+     1_508_000, active_hash; 1_508_001, active_hash; 1_509_999, active_hash];
+  expect "set plan profile switches at the agreed epoch"
+    (P.switch_after ~chain_id ~applied_epoch:1_509_999);
+  List.iter (fun epoch ->
+    let value = P.hash ~chain_id ~epoch getenv in
+    expect "math component count" (List.length (components ~epoch getenv) = 21);
+    expect "set plan hash binds components" (value = derived ~epoch getenv);
+    expect "set plan hash differs" (value <> standard);
+    expect "set plan switch occurs once" (not (P.switch_after ~chain_id ~applied_epoch:epoch));
+    let actual = raw_hex (P.hash ~chain_id ~epoch devnet_env) in
+    expect "devnet profile binds components" (actual = raw_hex (derived ~epoch devnet_env));
+    Printf.printf "event = set_plan_profile epoch = %d hash = %s\n"
+      epoch actual;
+    expect "set plan hash golden" (actual = plan_golden))
+    [1_510_000; 1_510_001; max_int];
+  List.iter (fun (applied_epoch, expected) ->
+    expect "profile switch epoch"
+      (P.switch_after ~chain_id ~applied_epoch = expected))
+    [0, false; 1_499_998, false; 1_499_999, true;
+     1_500_000, false; 1_500_001, false; 1_507_999, false;
+     1_508_000, false; 1_508_001, false; 1_509_998, false;
+     1_509_999, true; 1_510_000, false; 1_510_001, false; max_int, false];
+  List.iter (fun epoch ->
+    expect "other chain profile preserved"
+      (P.hash ~chain_id:"octra-mainnet" ~epoch getenv = compat);
+    expect "other chain does not switch"
+      (not (P.switch_after ~chain_id:"octra-mainnet" ~applied_epoch:epoch)))
+    [0; 1_499_999; 1_500_000; 1_509_999; 1_510_000; 1_510_001; max_int];
   expect "standard binds chain"
-    (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" getenv)));
+    (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" ~epoch:1_500_000 getenv)));
   print_endline "status = pass test = consensus_profile_golden"

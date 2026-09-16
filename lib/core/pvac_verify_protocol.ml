@@ -18,6 +18,7 @@ type circle_cell = {
 }
 
 type request =
+  | Math of request
   | Ping
   | Encrypt of {
       pubkey : string;
@@ -150,7 +151,7 @@ let circle_proof_of_name = function
   | "range" -> Ok Circle_range
   | _ -> Error "proof_kind_invalid"
 
-let request_fields request =
+let rec request_fields request =
   let common op pubkey =
     [
       "schema", `String schema;
@@ -163,6 +164,8 @@ let request_fields request =
     else []
   in
   match request with
+  | Math (Math _) -> invalid_arg "nested math request"
+  | Math value -> request_fields value @ ["math", `Bool true]
   | Ping ->
     [
       "schema", `String schema;
@@ -239,7 +242,7 @@ let parse_amount fields =
 let parse_value name fields =
   bind (string_field name fields) (bounded name max_value_bytes)
 
-let request_of_json = function
+let call_of_json = function
   | `Assoc fields ->
     bind (string_field "schema" fields) (fun parsed_schema ->
     if parsed_schema <> schema then Error "schema_invalid"
@@ -355,6 +358,17 @@ let request_of_json = function
           Error "op_invalid"))
   | _ ->
     Error "request_invalid"
+
+let request_of_json json =
+  bind (call_of_json json) (fun request ->
+    match json with
+    | `Assoc fields ->
+      begin match List.filter (fun (name, _) -> String.equal name "math") fields with
+      | [] | ["math", `Bool false] -> Ok request
+      | ["math", `Bool true] -> Ok (Math request)
+      | _ -> Error "math_invalid"
+      end
+    | _ -> Error "request_invalid")
 
 let request_of_string raw =
   if String.length raw > max_request_bytes then Error "request_too_large"
