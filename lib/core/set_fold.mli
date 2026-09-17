@@ -31,6 +31,11 @@ type counts = {
   allowed : int;
 }
 
+type receipt = {
+  marked : int64 list;
+  pulse : int64 option;
+}
+
 type cap_mode = Reject | Prune
 
 val meta_key : string
@@ -52,6 +57,7 @@ val lock :
   t ->
   ((t * bool), string) result
 val seats : t -> int option
+val receipt : address:string -> t -> receipt
 val delay : cfg -> at:int64 -> t -> (t, string) result
 val note_final :
   ?cap_mode:cap_mode ->

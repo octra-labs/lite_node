@@ -102,11 +102,7 @@ let apply_action ~current_epoch ~clear_trigger ~store_empty_bundle
 
 let plan ~consensus_mode ~epoch_duration ~elapsed ~finalized_state =
   if consensus_mode then
-    let planned = consensus_action finalized_state in
-    let action =
-      if should_apply planned && elapsed < epoch_duration then Wait
-      else planned
-    in
+    let action = consensus_action finalized_state in
     {
       action;
       log_tick = should_apply action;

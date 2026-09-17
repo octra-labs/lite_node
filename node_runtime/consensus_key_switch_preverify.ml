@@ -80,6 +80,7 @@ let observe = Pool.observe
 let await = Pool.await
 let retain = Pool.retain
 let stats = Pool.stats
+let collect = Pool.collect
 
 let artifacts t txs =
   List.filter_map

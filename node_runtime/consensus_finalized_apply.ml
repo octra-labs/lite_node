@@ -60,6 +60,7 @@ type node_deps = {
     proposal_id:string ->
     (string list * Octra_core.Transaction.t list * string list) option;
   cached_bundle_len : proposal_id:string -> int;
+  wait_bundle : proposal_id:string -> unit Lwt.t;
   header_has_empty_bundle : C_types.epoch_header -> bool;
   store_empty_bundle : C_types.epoch_header -> unit;
   driver : unit -> C_driver.t option;
@@ -93,12 +94,15 @@ let node_deps input =
       match input.driver () with
       | None -> Lwt.return_none
       | Some driver ->
-        C_driver.query_bundle
-          driver
-          ~epoch_id
-          ~proposal_id
-          ~timeout_seconds:5.0
-          ~validate);
+        let query =
+          C_driver.query_bundle
+            driver
+            ~epoch_id
+            ~proposal_id
+            ~timeout_seconds:5.0
+            ~validate
+        in
+        Bundle_fetch.join ~ready:(input.wait_bundle ~proposal_id) query);
     store_accepted_bundle = (fun ~proposal_id accepted ->
       let bundle = accepted.Bundle_fetch.bundle in
       input.set_proposal bundle.txs bundle.tx_hashes;

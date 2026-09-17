@@ -48,12 +48,15 @@ let parent epoch =
 
 let settle () = Lwt_unix.sleep 0.02
 
+let unread ~epoch:_ = Lwt.return_ok Octra_core.Set_fold.{ marked = []; pulse = None }
+
 let check_flow () =
   let sample = ref Actor.{ epoch = 100L; active = false; bonded = true } in
   let sent = ref [] in
   let actor =
     Actor.create Actor.{
       sample = (fun () -> !sample);
+      read = unread;
       peers = (fun () -> 1);
       send = (fun ~epoch action ->
         expect "send keeps sampled epoch" (epoch = !sample.epoch);
@@ -96,6 +99,7 @@ let check_overload () =
   let actor =
     Actor.create Actor.{
       sample = (fun () -> { epoch = 1L; active = false; bonded = true });
+      read = unread;
       peers = (fun () -> 1);
       send = (fun ~epoch:_ _ -> wait);
       warn = (fun _ -> ());
@@ -122,6 +126,7 @@ let check_effect_failure () =
   let actor =
     Actor.create Actor.{
       sample = (fun () -> !sample);
+      read = unread;
       peers = (fun () -> 1);
       send = (fun ~epoch:_ _ ->
         if !fail then Lwt.fail (Failure "planned send failure")
@@ -173,6 +178,7 @@ let check_send_resume () =
     let warnings = ref [] in
     let actor = Actor.create Actor.{
       sample = (fun () -> { epoch = !point.epoch; active = appeal; bonded = true });
+      read = unread;
       peers = (fun () -> 1);
       send = (fun ~epoch action ->
         match Actor.plan ~epoch !point with
@@ -192,14 +198,121 @@ let check_send_resume () =
     ignore (Actor.wake actor ~head:100);
     Lwt_main.run (settle ());
     let stats = Lwt_main.run (Actor.stats actor) in
-    expect "committed head resumes action" (stats.sent = 1L && stats.appeals = 0);
+    expect "committed head resumes action"
+      (stats.sent = 1L && stats.appeals = if appeal then 1 else 0);
     expect "resumed action is preserved" (match appeal, !sent with
       | true, [Actor.Appeal proof, head] -> proof.vote.epoch_id = 97L && head = 100L
       | false, [Actor.Pulse, head] -> head = 100L
       | _ -> false);
     Lwt_main.run (Actor.shutdown actor)) [false; true]
 
+let check_ack () =
+  let sample = ref Actor.{ epoch = 102L; active = true; bonded = true } in
+  let receipt = ref Octra_core.Set_fold.{ marked = []; pulse = None } in
+  let sent = ref [] in
+  let actor = Actor.create Actor.{
+    sample = (fun () -> !sample);
+    read = (fun ~epoch:_ -> Lwt.return_ok !receipt);
+    peers = (fun () -> 1);
+    send = (fun ~epoch action -> sent := (epoch, action) :: !sent; Lwt.return_ok ());
+    warn = (fun reason -> failwith reason);
+  } in
+  let notify epoch event =
+    sample := { !sample with epoch };
+    ignore (Actor.notify actor ~epoch event);
+    Lwt_main.run (settle ())
+  in
+  notify 102L (Some (vote 100L, parent 100L));
+  expect "local admission keeps proof" ((Lwt_main.run (Actor.stats actor)).appeals = 1);
+  notify 102L (Some (vote 101L, parent 101L));
+  expect "one submission per epoch" (List.length !sent = 1);
+  notify 103L None;
+  expect "unconfirmed proof retried first"
+    (match !sent with (103L, Actor.Appeal proof) :: _ -> proof.vote.epoch_id = 100L | _ -> false);
+  receipt := { !receipt with marked = [100L] };
+  notify 104L None;
+  expect "confirmed proof advances queue"
+    (match !sent with (104L, Actor.Appeal proof) :: _ -> proof.vote.epoch_id = 101L | _ -> false);
+  expect "only unconfirmed proof retained" ((Lwt_main.run (Actor.stats actor)).appeals = 1);
+  receipt := { !receipt with marked = [100L; 101L] };
+  notify 105L None;
+  expect "committed marks acknowledge proofs" ((Lwt_main.run (Actor.stats actor)).appeals = 0);
+  notify 106L (Some (vote 100L, parent 100L));
+  expect "duplicate confirmed proof not resent" (List.length !sent = 3);
+  notify 117L (Some (vote 100L, parent 100L));
+  expect "expired proof not retried" ((Lwt_main.run (Actor.stats actor)).appeals = 0);
+  Lwt_main.run (Actor.shutdown actor)
+
+let check_pulse_ack () =
+  let sample = ref Actor.{ epoch = 100L; active = false; bonded = true } in
+  let receipt = ref Octra_core.Set_fold.{ marked = []; pulse = None } in
+  let sent = ref [] in
+  let actor = Actor.create Actor.{
+    sample = (fun () -> !sample);
+    read = (fun ~epoch:_ -> Lwt.return_ok !receipt);
+    peers = (fun () -> 1);
+    send = (fun ~epoch action -> sent := (epoch, action) :: !sent; Lwt.return_ok ());
+    warn = (fun reason -> failwith reason);
+  } in
+  let tick epoch =
+    sample := { !sample with epoch };
+    ignore (Actor.wake actor ~head:(Int64.to_int epoch - 1));
+    Lwt_main.run (settle ())
+  in
+  tick 100L;
+  tick 100L;
+  tick 101L;
+  expect "unconfirmed pulse retried once per epoch" (List.length !sent = 2);
+  receipt := { !receipt with pulse = Some 101L };
+  tick 102L;
+  tick 104L;
+  expect "confirmed pulse starts interval" (List.length !sent = 2);
+  tick 105L;
+  expect "next pulse due from committed epoch" (List.length !sent = 3);
+  Lwt_main.run (Actor.shutdown actor)
+
+let check_read () =
+  let sample = ref Actor.{ epoch = 102L; active = true; bonded = true } in
+  let mode = ref 0 in
+  let sent = ref 0 in
+  let warnings = ref [] in
+  let actor = Actor.create Actor.{
+    sample = (fun () -> !sample);
+    read = (fun ~epoch:_ ->
+      if !mode = 0 then Lwt.return_error "committed read unavailable"
+      else if !mode = 1 then begin
+        sample := { !sample with epoch = 103L };
+        Lwt.return_ok Octra_core.Set_fold.{ marked = [100L]; pulse = None }
+      end else unread ~epoch:!sample.epoch);
+    peers = (fun () -> 1);
+    send = (fun ~epoch:_ _ -> incr sent; Lwt.return_ok ());
+    warn = (fun reason -> warnings := reason :: !warnings);
+  } in
+  let tick () =
+    ignore (Actor.notify actor ~epoch:!sample.epoch (Some (vote 100L, parent 100L)));
+    Lwt_main.run (settle ())
+  in
+  tick ();
+  expect "read failure retains proof"
+    (!sent = 0 && (Lwt_main.run (Actor.stats actor)).appeals = 1);
+  expect "read failure reported" (!warnings = ["committed read unavailable"]);
+  mode := 1;
+  tick ();
+  expect "changed head retains proof"
+    (!sent = 0 && (Lwt_main.run (Actor.stats actor)).appeals = 1);
+  mode := 2;
+  tick ();
+  expect "fresh read resumes proof" (!sent = 1);
+  sample := { !sample with epoch = 117L };
+  tick ();
+  expect "challenge expires after last valid epoch"
+    (!sent = 1 && (Lwt_main.run (Actor.stats actor)).appeals = 0);
+  Lwt_main.run (Actor.shutdown actor)
+
 let () =
+  check_ack ();
+  check_pulse_ack ();
+  check_read ();
   check_phase ();
   check_send_resume ();
   check_flow ();

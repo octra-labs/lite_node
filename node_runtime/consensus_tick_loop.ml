@@ -89,7 +89,8 @@ let step (deps : deps) ~consensus_mode =
          "tick epoch = %d elapsed = %.2fs next_in = %.2fs"
          current_epoch
          elapsed
-         (max 0. (effective_duration -. elapsed)));
+         (if consensus_mode then 0.
+          else max 0. (effective_duration -. elapsed)));
   Lwt.bind
     (if Plan.should_apply tick_plan.action then
        deps.apply ~finalize:prepared.finalize ~now ~elapsed

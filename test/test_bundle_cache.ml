@@ -617,7 +617,102 @@ let test_check_aba () =
     run_preverify cache ~state_root:"a" [item] verify |> Lwt_main.run |> ignore;
     expect "aba retained result" (!calls = 1)) [`Failure; `Deferred; `Ready]
 
+let test_bundle_wait () =
+  let cache = C.create ~cap:2 in
+  let runtime = C.node_runtime cache in
+  let pending = runtime.wait_bundle ~proposal_id:"a" in
+  expect "wait initially pending" (Lwt.is_sleeping pending);
+  runtime.store_empty_proposal ~proposal_id:"b";
+  Lwt_main.run (Lwt.pause ());
+  expect "other proposal stays pending" (Lwt.is_sleeping pending);
+  runtime.store_empty_proposal ~proposal_id:"a";
+  Lwt_main.run pending;
+  Lwt_main.run (runtime.wait_bundle ~proposal_id:"a");
+  ignore (C.store cache ~pid:"bad" ~tx_hashes:["missing"] ~txs:[] ~receipts_json:[]);
+  let invalid = runtime.wait_bundle ~proposal_id:"bad" in
+  expect "invalid data stays pending" (Lwt.is_sleeping invalid);
+  runtime.store_empty_proposal ~proposal_id:"b";
+  Lwt_main.run (Lwt.pause ());
+  expect "other data cannot validate entry" (Lwt.is_sleeping invalid);
+  runtime.store_empty_proposal ~proposal_id:"bad";
+  Lwt_main.run invalid;
+  let cancelled = runtime.wait_bundle ~proposal_id:"c" in
+  Lwt.cancel cancelled;
+  runtime.store_empty_proposal ~proposal_id:"c";
+  expect "cancelled wait is not revived"
+    (match Lwt.state cancelled with Lwt.Fail Lwt.Canceled -> true | _ -> false)
+
+let test_bundle_join () =
+  let module F = Octra_node_runtime.Consensus_bundle_fetch in
+  let cache = C.create ~cap:2 in
+  let runtime = C.node_runtime cache in
+  let query, resolve = Lwt.task () in
+  let pending = F.join ~ready:(runtime.wait_bundle ~proposal_id:"a") query in
+  expect "join waits without data" (Lwt.is_sleeping pending);
+  runtime.store_empty_proposal ~proposal_id:"a";
+  expect "local result wins" (Lwt_main.run pending = None);
+  expect "network job is retained" (Lwt.is_sleeping query);
+  Lwt.wakeup_later resolve (Some "peer");
+  expect "network cleanup can finish" (Lwt_main.run query = Some "peer");
+  let ready = runtime.wait_bundle ~proposal_id:"b" in
+  let query, resolve = Lwt.task () in
+  let pending = F.join ~ready query in
+  Lwt.wakeup_later resolve (Some "peer");
+  expect "peer result wins" (Lwt_main.run pending = Some "peer");
+  expect "unused waiter is cancelled"
+    (match Lwt.state ready with Lwt.Fail Lwt.Canceled -> true | _ -> false)
+
+let test_finalized_wake () =
+  let module F = Octra_node_runtime.Consensus_bundle_fetch in
+  let cache = C.create ~cap:2 in
+  let runtime = C.node_runtime cache in
+  let query, resolve = Lwt.task () in
+  let deps = F.{
+    cached_bundle = (fun () -> Option.is_some (runtime.cached_bundle "a"));
+    header_has_empty_bundle = (fun () -> false);
+    store_empty_bundle = (fun () -> failwith "unexpected empty bundle");
+    validate_bundle = (fun _ -> None);
+    query_bundle = (fun ~validate:_ ->
+      F.join ~ready:(runtime.wait_bundle ~proposal_id:"a") query);
+    store_accepted_bundle = (fun _ -> failwith "unexpected peer bundle");
+  } in
+  let pending = F.ensure_finalized deps ~epoch_id:1L in
+  expect "finalized waits for bundle" (Lwt.is_sleeping pending);
+  runtime.store_empty_proposal ~proposal_id:"other";
+  Lwt_main.run (Lwt.pause ());
+  expect "finalized ignores other proposal" (Lwt.is_sleeping pending);
+  runtime.store_empty_proposal ~proposal_id:"a";
+  expect "finalized uses local bundle"
+    (Lwt_main.run pending = F.Finalized_ready);
+  expect "finalized leaves query cleanup" (Lwt.is_sleeping query);
+  Lwt.wakeup_later resolve None;
+  ignore (Lwt_main.run query)
+
+let test_bundle_cancel () =
+  let module F = Octra_node_runtime.Consensus_bundle_fetch in
+  let cache = C.create ~cap:2 in
+  let runtime = C.node_runtime cache in
+  let ready = runtime.wait_bundle ~proposal_id:"a" in
+  let query, resolve = Lwt.task () in
+  let pending = F.join ~ready query in
+  Lwt.cancel pending;
+  expect "cancel keeps network owner" (Lwt.is_sleeping query);
+  expect "cancel releases cache waiter"
+    (match Lwt.state ready with Lwt.Fail Lwt.Canceled -> true | _ -> false);
+  Lwt.wakeup_later resolve None;
+  ignore (Lwt_main.run query);
+  let ready = runtime.wait_bundle ~proposal_id:"b" in
+  let result = F.join ~ready (Lwt.fail (Failure "query failed")) in
+  expect "query failure is retained"
+    (match Lwt.state result with Lwt.Fail (Failure reason) -> reason = "query failed" | _ -> false);
+  expect "failed query releases waiter"
+    (match Lwt.state ready with Lwt.Fail Lwt.Canceled -> true | _ -> false)
+
 let () =
+  test_bundle_wait ();
+  test_bundle_join ();
+  test_finalized_wake ();
+  test_bundle_cancel ();
   test_text_sharing ();
   test_cache_bytes ();
   test_check_bytes ();

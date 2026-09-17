@@ -66,6 +66,11 @@ val artifact :
   Octra_core.Transaction.t ->
   'artifact option
 
+val collect :
+  ('artifact, 'prepared) t ->
+  Octra_core.Transaction.t list ->
+  (string * 'artifact) list Lwt.t
+
 val stats :
   ('artifact, 'prepared) t ->
   stats

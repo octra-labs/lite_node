@@ -41,6 +41,7 @@ type t
 
 type node_runtime = {
   cached_bundle : string -> (string list * Transaction.t list * string list) option;
+  wait_bundle : proposal_id:string -> unit Lwt.t;
   store_bundle :
     proposal_id:string ->
     tx_hashes:string list ->

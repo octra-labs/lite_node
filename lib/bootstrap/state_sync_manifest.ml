@@ -685,35 +685,33 @@ let make_exporter_signature ~wallet manifest =
         signature;
       }
 
-let read_chunk channel buffer =
-  let capacity = Bytes.length buffer in
-  let rec fill offset =
-    if offset = capacity then offset
-    else
-      let read = input channel buffer offset (capacity - offset) in
-      if read = 0 then offset else fill (offset + read)
-  in
-  fill 0
+let hash_slice = 64 * 1024
 
-let hash_file_chunks ~chunk_size path =
+let hash_file_chunks ?(yield = fun _ -> Thread.yield ()) ~chunk_size path =
+  if chunk_size <= 0 then invalid_arg "snapshot chunk size must be positive";
   let channel = open_in_bin path in
-  let buffer = Bytes.create chunk_size in
+  let buffer = Bytes.create (min hash_slice chunk_size) in
   Fun.protect
     ~finally:(fun () -> close_in_noerr channel)
     (fun () ->
+      let rec fill size chunk_hash file_hash =
+        if size = chunk_size then size, chunk_hash, file_hash
+        else
+          let read = input channel buffer 0 (min (Bytes.length buffer) (chunk_size - size)) in
+          if read = 0 then size, chunk_hash, file_hash
+          else
+            let chunk_hash = Digestif.SHA256.feed_bytes chunk_hash ~off:0 ~len:read buffer in
+            let file_hash = Digestif.SHA256.feed_bytes file_hash ~off:0 ~len:read buffer in
+            yield read;
+            fill (size + read) chunk_hash file_hash
+      in
       let rec loop index offset file_hash chunks =
-        let read = read_chunk channel buffer in
+        let read, chunk_hash, file_hash = fill 0 (Digestif.SHA256.init ()) file_hash in
         if read = 0 then
           Digestif.SHA256.get file_hash |> Digestif.SHA256.to_hex,
           List.rev chunks
         else
-          let chunk_hash =
-            Digestif.SHA256.digest_bytes ~off:0 ~len:read buffer
-            |> Digestif.SHA256.to_hex
-          in
-          let file_hash =
-            Digestif.SHA256.feed_bytes file_hash ~off:0 ~len:read buffer
-          in
+          let chunk_hash = Digestif.SHA256.get chunk_hash |> Digestif.SHA256.to_hex in
           let chunk = { index; offset; size = read; sha256 = chunk_hash } in
           loop
             (index + 1)

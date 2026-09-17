@@ -31,6 +31,7 @@ type node_deps = {
   cached_bundle_for_pid :
     string ->
     (string list * Octra_core.Transaction.t list * string list) option;
+  wait_bundle : proposal_id:string -> unit Lwt.t;
   header_has_empty_bundle : Octra_consensus.C_types.epoch_header -> bool;
   store_empty_bundle : Octra_consensus.C_types.epoch_header -> unit;
   driver : unit -> Octra_consensus.C_driver.t option;
@@ -188,6 +189,7 @@ let create_node deps =
           header_has_empty_bundle = deps.header_has_empty_bundle;
           store_empty_bundle = deps.store_empty_bundle;
           driver = deps.driver;
+          wait_bundle = deps.wait_bundle;
           set_proposal = deps.set_proposal;
           store_proposal_bundle = deps.store_proposal_bundle;
           sleep = deps.sleep;
@@ -269,6 +271,7 @@ let node_deps_of_runtime runtime =
     chaos_after_finality_log = (fun () ->
       Octra_core.Chaos.inject "after_finality_log");
     cached_bundle_for_pid = runtime.bundles.cached_bundle;
+    wait_bundle = runtime.bundles.wait_bundle;
     header_has_empty_bundle = runtime.bundles.header_has_empty_bundle;
     store_empty_bundle = runtime.bundles.store_empty_bundle;
     driver = (fun () -> !(runtime.driver_ref));

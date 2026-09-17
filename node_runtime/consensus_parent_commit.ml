@@ -58,7 +58,7 @@ let load source ~epoch_id =
     missing source epoch_id "parent commit unavailable at genesis"
   else
     let expected_epoch = Int64.pred epoch_id in
-    match Finality_log.last source.data_dir with
+    match Finality_log.last_entry_fast source.data_dir with
     | None ->
       begin
         match floor_parent source expected_epoch with

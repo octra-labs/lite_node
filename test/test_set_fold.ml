@@ -251,6 +251,21 @@ let check_window_and_proof () =
       restored
   in
   expect "omitted vote restores signer" (names allowed = addresses);
+  let encoded = Fold.to_string restored in
+  expect "receipt reads committed appeal"
+    ((Fold.receipt ~address:"octA" restored).marked = [150L]);
+  expect "receipt reads certificate mark"
+    ((Fold.receipt ~address:"octB" restored).marked = [150L]);
+  expect "absent member has no receipt"
+    (Fold.receipt ~address:"missing" restored = Fold.{ marked = []; pulse = None });
+  let pulse = Fold.note_pulse Fold.standard ~epoch:161L ~active:false
+    ~address:"octA" restored |> Result.get_ok in
+  expect "receipt reads confirmed pulse"
+    (Fold.receipt ~address:"octA" pulse = Fold.{ marked = [150L]; pulse = Some 161L });
+  expect "receipt does not mutate state" (Fold.to_string restored = encoded);
+  expect "receipt survives codec"
+    (Fold.receipt ~address:"octA" (Fold.of_string (Fold.to_string pulse) |> Result.get_ok)
+     = Fold.receipt ~address:"octA" pulse);
   expect "expired proof rejected"
     (Result.is_error
        (Fold.apply_proof

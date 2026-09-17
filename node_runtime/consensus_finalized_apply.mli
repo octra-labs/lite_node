@@ -57,6 +57,7 @@ type node_deps = {
     proposal_id:string ->
     (string list * Octra_core.Transaction.t list * string list) option;
   cached_bundle_len : proposal_id:string -> int;
+  wait_bundle : proposal_id:string -> unit Lwt.t;
   header_has_empty_bundle : C_types.epoch_header -> bool;
   store_empty_bundle : C_types.epoch_header -> unit;
   driver : unit -> C_driver.t option;

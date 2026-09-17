@@ -151,6 +151,11 @@
  (libraries octra_bootstrap octra_node_runtime unix))
 
 (test
+ (name test_state_sync_manifest)
+ (modules test_state_sync_manifest)
+ (libraries octra_bootstrap octra_core octra_consensus unix base64 digestif digestif.c mirage-crypto-ec))
+
+(test
  (name test_grpc)
  (modules test_grpc)
  (libraries octra_core octra_node_runtime lwt.unix yojson pbrt))
@@ -282,3 +287,24 @@
  (name test_set_actor)
  (modules test_set_actor)
  (libraries octra_node_runtime octra_core octra_consensus lwt.unix zarith))
+
+(test
+ (name test_tick_plan)
+ (modules test_tick_plan)
+ (libraries octra_node_runtime octra_consensus))
+
+(test
+ (name test_tick_loop)
+ (modules test_tick_loop)
+ (libraries octra_node_runtime octra_consensus lwt.unix))
+
+(test
+ (name test_parent_commit)
+ (modules test_parent_commit)
+ (libraries octra_test_workspace octra_node_runtime octra_core octra_consensus
+  base64 zarith mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
+ (name test_preverify_pool)
+ (modules test_preverify_pool)
+ (libraries octra_node_runtime octra_core lwt.unix zarith))

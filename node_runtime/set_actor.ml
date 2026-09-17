@@ -32,6 +32,7 @@ type stats = {
 
 type deps = {
   sample : unit -> sample;
+  read : epoch:int64 -> (Octra_core.Set_fold.receipt, string) result Lwt.t;
   peers : unit -> int;
   send : epoch:int64 -> action -> (unit, string) result Lwt.t;
   warn : string -> unit;
@@ -45,7 +46,7 @@ type appeal = {
 
 type state = {
   appeals : appeal String_map.t;
-  last_pulse : int64 option;
+  last_send : int64 option;
   sent : int64;
 }
 
@@ -107,7 +108,7 @@ let reason = function
 
 let empty = {
   appeals = String_map.empty;
-  last_pulse = None;
+  last_send = None;
   sent = 0L;
 }
 
@@ -163,9 +164,13 @@ let ingest notice state =
 
 let ready_appeal epoch appeals =
   String_map.bindings appeals
-  |> List.find_opt (fun (_, (appeal : appeal)) ->
+  |> List.filter (fun (_, (appeal : appeal)) ->
     Int64.compare epoch appeal.ready >= 0
     && Int64.compare epoch appeal.expires <= 0)
+  |> List.sort (fun (left_key, left) (right_key, right) ->
+    let order = Int64.compare left.expires right.expires in
+    if order = 0 then String.compare left_key right_key else order)
+  |> function [] -> None | first :: _ -> Some first
 
 let pulse_due epoch = function
   | None -> true
@@ -175,20 +180,24 @@ let pulse_due epoch = function
       pulse_step
     >= 0
 
-let decide (sample : sample) state =
-  if not sample.bonded then None
+let acknowledge epoch (receipt : Octra_core.Set_fold.receipt) state =
+  let appeals =
+    prune epoch state.appeals
+    |> String_map.filter (fun _ (appeal : appeal) ->
+      not (List.mem appeal.proof.vote.epoch_id receipt.marked))
+  in
+  { state with appeals }
+
+let decide (sample : sample) (receipt : Octra_core.Set_fold.receipt) state =
+  if not sample.bonded || state.last_send = Some sample.epoch then None
+  else if not sample.active && pulse_due sample.epoch receipt.pulse then Some Pulse
   else
     match ready_appeal sample.epoch state.appeals with
-    | Some (key, appeal) -> Some (key, Appeal appeal.proof)
-    | None when not sample.active && pulse_due sample.epoch state.last_pulse ->
-      Some ("", Pulse)
+    | Some (_, appeal) -> Some (Appeal appeal.proof)
     | None -> None
 
-let settle epoch key action state =
-  let state = { state with sent = Int64.succ state.sent } in
-  match action with
-  | Pulse -> { state with last_pulse = Some epoch }
-  | Appeal _ -> { state with appeals = String_map.remove key state.appeals }
+let settle epoch state =
+  { state with sent = Int64.succ state.sent; last_send = Some epoch }
 
 let actor_stats t = {
   queued = Queue.length t.stream;
@@ -234,22 +243,30 @@ let handle_notice t notice =
   let open Lwt.Syntax in
   t.state <- ingest notice t.state;
   let sample = t.deps.sample () in
-  match decide sample t.state with
-  | None -> Lwt.return_unit
-  | Some _ when t.deps.peers () <= 0 ->
-    t.deps.warn "validator set fold transport has no peers";
-    Lwt.return_unit
-  | Some (key, action) ->
-    let* result = t.deps.send ~epoch:sample.epoch action in
-    begin
-      match result with
-      | Ok () ->
-        t.state <- settle sample.epoch key action t.state;
+  if not sample.bonded then Lwt.return_unit
+  else
+    let* receipt = t.deps.read ~epoch:sample.epoch in
+    match receipt with
+    | Error error -> t.deps.warn error; Lwt.return_unit
+    | Ok _ when (t.deps.sample ()).epoch <> sample.epoch -> Lwt.return_unit
+    | Ok receipt ->
+      t.state <- acknowledge sample.epoch receipt t.state;
+      match decide sample receipt t.state with
+      | None -> Lwt.return_unit
+      | Some _ when t.deps.peers () <= 0 ->
+        t.deps.warn "validator set fold transport has no peers";
         Lwt.return_unit
-      | Error error ->
-        t.deps.warn error;
-        Lwt.return_unit
-    end
+      | Some action ->
+        let* result = t.deps.send ~epoch:sample.epoch action in
+        begin
+          match result with
+          | Ok () ->
+            t.state <- settle sample.epoch t.state;
+            Lwt.return_unit
+          | Error error ->
+            t.deps.warn error;
+            Lwt.return_unit
+        end
 
 let rec loop t =
   match take t with

@@ -664,6 +664,30 @@ let setup name =
   Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
   path, store, ledger, pk, sk
 
+let collect_ops () =
+  let path, store, ledger, _, _ = setup "collect" in
+  let module Pool = Octra_node_runtime.Consensus_private_preverify in
+  Fun.protect
+    ~finally:(fun () ->
+      Lwt_main.run (Octra_core.Store_irmin.close store);
+      clear_case path)
+    (fun () ->
+      List.iter (fun (op_type, waits) ->
+        let pool = Pool.create ~math:(fun () -> false)
+          ~field_policy:(fun () -> PL.Unique_fields)
+          ~strict:(fun () -> true)
+          ~result_policy:(fun () -> Octra_core.Private_result_policy.Recoverable)
+          ledger in
+        let transaction = { (tx "{}") with T.op_type } in
+        ignore (Pool.admit pool transaction);
+        let collected = Pool.collect pool [transaction] in
+        expect (Lwt.is_sleeping collected = waits) "collection operation filter";
+        if not waits then
+          expect (Lwt.state collected = Lwt.Return []) "unused collection is immediate";
+        ignore (Lwt_main.run (Pool.await pool transaction));
+        expect (Lwt_main.run collected = []) "invalid input has no artifact")
+        [T.StealthOp, false; T.ClaimOp, false; T.EncryptOp, true; T.DecryptOp, true])
+
 let cache_key_mode_case () =
   let path, store, ledger, _, _ = setup "cache_key_mode" in
   let transaction = { (tx "switch") with T.op_type = T.KeySwitch } in
@@ -1064,6 +1088,11 @@ let reuse_case decrypt =
         | [hash, artifact] when hash = T.hash transaction -> artifact
         | _ -> fail "private pool did not return artifact"
       in
+      expect
+        (match Lwt_main.run (Pool.collect pool [transaction]) with
+         | [hash, collected] -> hash = T.hash transaction && collected == artifact
+         | _ -> false)
+        "collection preserves the balance artifact";
       let prior = make_artifact false in
       let plan_hash = PL.hash_prepared prepared in
       let run ?math ?field_policy ?result_policy artifacts tx hash =
@@ -1592,6 +1621,9 @@ let () =
     Unix.mkdir "runtime_data/private_transition_receipt" 0o755;
   Unix.putenv "OCTRA_BFT_CRYPTO_PROFILE" "private_v1";
   match Array.to_list Sys.argv with
+  | [_; "collect"] ->
+    collect_ops ();
+    print_endline "status = pass test = private_transition_receipt case = collect"
   | [_; "cache_key"] ->
     cache_key_mode_case ();
     print_endline "status = pass test = private_transition_receipt case = cache_key"
@@ -1615,6 +1647,7 @@ let () =
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt case = switch_reuse"
   | [_] ->
+    collect_ops ();
     migration_case ();
     circle_policy_case ();
     cipher_depth_case ();
@@ -1637,4 +1670,4 @@ let () =
     reuse_case true;
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt"
-  | _ -> fail "expected cache_key, migration, math, circle_policy, valid, reuse or switch_reuse"
+  | _ -> fail "expected collect, cache_key, migration, math, circle_policy, valid, reuse or switch_reuse"

@@ -890,21 +890,29 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       epoch_env;
     } = start in
 
-    let preverify =
+    let* preverify =
       match
         Octra_core.Preverify_commit.gate_of_strings
           ~required:consensus_mode
           preverify_receipts_json
       with
-      | Ok gate ->
-        Option.map
-          (fun gate ->
-            Octra_core.Preverify_commit.with_artifacts
-              (Consensus_private_preverify.artifacts private_preverify ordered_txs)
-              gate
-            |> Octra_core.Preverify_commit.with_keys
-                 (Consensus_key_switch_preverify.artifacts key_switch_preverify ordered_txs))
-          gate
+      | Ok None -> Lwt.return_none
+      | Ok (Some gate) ->
+        let* artifacts =
+          if private_proof_strict !current_epoch then
+            Consensus_private_preverify.collect private_preverify ordered_txs
+          else
+            Lwt.return (Consensus_private_preverify.artifacts private_preverify ordered_txs)
+        in
+        let* keys =
+          if private_proof_strict !current_epoch then
+            Consensus_key_switch_preverify.collect key_switch_preverify ordered_txs
+          else
+            Lwt.return (Consensus_key_switch_preverify.artifacts key_switch_preverify ordered_txs)
+        in
+        Octra_core.Preverify_commit.with_artifacts artifacts gate
+        |> Octra_core.Preverify_commit.with_keys keys
+        |> Lwt.return_some
       | Error reason ->
         failwith ("finalized preverify receipt parse failed: " ^ reason)
     in
@@ -1621,6 +1629,29 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let fold_actor =
       Set_actor.create Set_actor.{
+        read = (fun ~epoch ->
+          let open Lwt.Syntax in
+          match Octra_core.Head_manifest.get_cached () with
+          | Some head when Int64.of_int head.epoch_id = Int64.pred epoch ->
+            begin
+              match head.ledger_state_root with
+              | None -> Lwt.return_error "validator duty ledger root is unavailable"
+              | Some state_root ->
+                let* snapshot = Store_irmin.capture_read_snapshot_at
+                  store ~epoch_id:(Int64.pred epoch) ~state_root in
+                match snapshot with
+                | Error _ as error -> Lwt.return error
+                | Ok snapshot ->
+                  let* raw = Store_irmin.read_snapshot snapshot
+                    ["meta"; Octra_core.Set_fold.meta_key] in
+                  match raw with
+                  | None -> Lwt.return_error "committed validator duty is unavailable"
+                  | Some raw ->
+                    Octra_core.Set_fold.of_string raw
+                    |> Result.map (Octra_core.Set_fold.receipt ~address:wallet.address)
+                    |> Lwt.return
+            end
+          | _ -> Lwt.return_error "validator duty head is not committed");
         sample = (fun () ->
           let epoch = !current_epoch in
           {

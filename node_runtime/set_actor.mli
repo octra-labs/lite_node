@@ -29,6 +29,7 @@ type stats = {
 
 type deps = {
   sample : unit -> sample;
+  read : epoch:int64 -> (Octra_core.Set_fold.receipt, string) result Lwt.t;
   peers : unit -> int;
   send : epoch:int64 -> action -> (unit, string) result Lwt.t;
   warn : string -> unit;

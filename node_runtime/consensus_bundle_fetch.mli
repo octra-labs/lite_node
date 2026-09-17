@@ -63,6 +63,8 @@ val finalized :
   bundle:Bundle.accepted option ->
   finalized
 
+val join : ready:unit Lwt.t -> 'a option Lwt.t -> 'a option Lwt.t
+
 val proposal :
   response:Octra_consensus.C_driver.bundle_response_record option ->
   bundle:Bundle.accepted option ->

@@ -83,6 +83,9 @@ let proposal_bundle_of_accepted bundle =
     rejections = bundle.rejections;
   }
 
+let join ~ready query =
+  Lwt.pick [Lwt.protected query; Lwt.map (fun () -> None) ready]
+
 let fetch_finalized (deps : finalized_deps) ~epoch_id =
   let open Lwt.Syntax in
   Log.warn "consensus"
@@ -98,6 +101,7 @@ let fetch_finalized (deps : finalized_deps) ~epoch_id =
   in
   let* response = deps.query_bundle ~validate in
   match finalized ~response ~bundle:!bundle_holder with
+  | Finalized_missing when deps.cached_bundle () -> Lwt.return_unit
   | Finalized_missing ->
     Log.error "consensus"
       "event = finalized_bundle_fetch epoch = %Ld result = failed reason = no_valid_response"

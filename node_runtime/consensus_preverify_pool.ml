@@ -529,6 +529,40 @@ and await_result t tx source_restarts = function
 let await t tx =
   await_with_restarts t tx 0
 
+let rec join t tx =
+  match Hashtbl.find_opt t.entries (Transaction.hash tx) with
+  | None -> Lwt.return_none
+  | Some (Complete _) -> Lwt.return (artifact t tx)
+  | Some (Queued queued) ->
+    let queued = promote_required t queued in
+    schedule t;
+    let open Lwt.Syntax in
+    let* () = Lwt.protected queued.activated in
+    join t tx
+  | Some (Running running) ->
+    Lwt.catch
+      (fun () ->
+        let open Lwt.Syntax in
+        let* result = Lwt.protected running.job in
+        complete t tx running result;
+        Lwt.return (match result with
+          | Ok (Verification_ready artifact) -> Some artifact
+          | Ok (Verification_rejected _ | Verification_stale) | Error _ -> None))
+      (function
+        | Lwt.Canceled -> Lwt.fail Lwt.Canceled
+        | exn -> fail t tx running exn; Lwt.return_none)
+
+let collect t txs =
+  List.iter (fun tx ->
+    match Hashtbl.find_opt t.entries (Transaction.hash tx) with
+    | Some (Queued queued) -> ignore (promote_required t queued)
+    | Some (Running _ | Complete _) | None -> ()) txs;
+  schedule t;
+  Lwt_list.filter_map_s (fun tx ->
+    let open Lwt.Syntax in
+    let* result = join t tx in
+    Lwt.return (Option.map (fun artifact -> Transaction.hash tx, artifact) result)) txs
+
 let retain t keep =
   let removed =
     Hashtbl.fold

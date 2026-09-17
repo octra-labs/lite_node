@@ -54,6 +54,7 @@ type check_job = {
 
 type t = {
   cache : (string, encoded * int) Hashtbl.t;
+  changed : unit Lwt_condition.t;
   texts : Text.t;
   fifo : string Queue.t;
   cap : int;
@@ -77,6 +78,7 @@ type t = {
 
 type node_runtime = {
   cached_bundle : string -> (string list * Transaction.t list * string list) option;
+  wait_bundle : proposal_id:string -> unit Lwt.t;
   store_bundle :
     proposal_id:string ->
     tx_hashes:string list ->
@@ -93,6 +95,7 @@ type node_runtime = {
 let create_with_limits ~cap ~check_limit ~shared_cap ~shared_limit =
   {
     cache = Hashtbl.create 8;
+    changed = Lwt_condition.create ();
     texts = Text.create 16;
     fifo = Queue.create ();
     cap = max 0 cap;
@@ -227,6 +230,7 @@ let store t ~pid ~tx_hashes ~txs ~receipts_json =
   Hashtbl.replace t.cache pid (raw, bytes);
   t.stores <- t.stores + 1;
   evict_excess t;
+  Lwt_condition.broadcast t.changed ();
   if t.stores mod 50 = 0 then Some (stats t) else None
 
 let peek_raw t pid =
@@ -303,6 +307,14 @@ let cached t pid =
     | Ok bundle -> Cached bundle
     | Error e -> Decode_error e
 
+let rec wait t pid =
+  match Option.map decode (peek_raw t pid) with
+  | Some (Ok _) -> Lwt.return_unit
+  | None | Some (Error _) ->
+    let open Lwt.Syntax in
+    let* () = Lwt_condition.wait t.changed in
+    wait t pid
+
 let pid_label pid =
   Digestif.SHA256.(to_hex (of_raw_string pid))
   |> fun hex -> String.sub hex 0 16
@@ -343,6 +355,7 @@ let store_empty_header_with_log t header =
 
 let node_runtime t =
   {
+    wait_bundle = (fun ~proposal_id -> wait t proposal_id);
     cached_bundle = (fun pid ->
       cached_with_log t pid
       |> Option.map (fun (bundle : decoded) ->

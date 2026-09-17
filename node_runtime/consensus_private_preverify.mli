@@ -41,3 +41,8 @@ val artifacts :
   t ->
   Octra_core.Transaction.t list ->
   (string * Octra_core.Private_ledger.private_artifact) list
+
+val collect :
+  t ->
+  Octra_core.Transaction.t list ->
+  (string * Octra_core.Private_ledger.private_artifact) list Lwt.t

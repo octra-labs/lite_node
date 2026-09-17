@@ -62,6 +62,11 @@ type counts = {
   allowed : int;
 }
 
+type receipt = {
+  marked : int64 list;
+  pulse : int64 option;
+}
+
 type cap_mode = Reject | Prune
 
 type final_step =
@@ -344,6 +349,27 @@ let lock cfg ~active state =
     end
 
 let seats state = state.seats
+
+let receipt ~address state =
+  match List.find_opt (fun member -> member.address = address) state.members with
+  | None -> { marked = []; pulse = None }
+  | Some member ->
+    let rec collect index items =
+      if index < 0 then items
+      else
+        let items =
+          if Z.testbit member.marks.bits index then
+            Int64.add member.marks.floor (Int64.of_int index) :: items
+          else items
+        in
+        collect (index - 1) items
+    in
+    let pulse =
+      match member.phase with
+      | Live _ | Shadow None -> None
+      | Shadow (Some pulse) -> Some pulse.last
+    in
+    { marked = collect (Z.numbits member.marks.bits - 1) []; pulse }
 
 let delay cfg ~at state =
   match validate_cfg cfg with
