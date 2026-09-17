@@ -71,19 +71,20 @@ and run t =
       in
       t.busy <- false;
       begin
-        match result with
-        | Ok () ->
+        match t.item with
+        | Some current when current.hash = item.hash ->
           begin
-            match t.item with
-            | Some current when current.hash = item.hash -> clear t
-            | _ -> arm t
+            match result with
+            | Ok () -> clear t
+            | Error reason ->
+              if t.deps.landed item.tx || not (t.deps.staged item.hash) then
+                clear t
+              else begin
+                t.deps.warn reason;
+                arm t
+              end
           end
-        | Error reason ->
-          if t.deps.landed item.tx then clear t
-          else begin
-            t.deps.warn reason;
-            arm t
-          end
+        | _ -> run t
       end;
       Lwt.return_unit)
 

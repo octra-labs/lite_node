@@ -243,6 +243,51 @@ let check_recent_order () =
   in
   check "recent transaction order" (actual = [3.; 2.; 1.])
 
+let check_duty_head () =
+  Tx_staging.clear ();
+  let from = sender 708 in
+  let duty epoch nonce =
+    let message = Yojson.Safe.to_string (`Assoc [
+      "consensus_pubkey", `String "key";
+      "head_epoch", `String (Int64.to_string epoch);
+      "state_root", `String (String.make 64 'a');
+    ]) in
+    transaction ~op_type:Transaction.ValidatorReady ~message from nonce
+  in
+  let old = duty 99L 1 in
+  let current = duty 100L 2 in
+  let future = duty 101L 3 in
+  let ordinary = transaction ~message:(Option.get old.message) from 4 in
+  let malformed = transaction ~op_type:Transaction.ValidatorReady from 5 in
+  let others = transaction (sender 709) 1 in
+  List.iter add [old; current; future; ordinary; malformed; others];
+  check "prior rule retains ready" (not (Tx_staging.duty_expired ~head:None old));
+  check "current head retained" (not (Tx_staging.duty_expired ~head:(Some 100L) current));
+  check "future head retained" (not (Tx_staging.duty_expired ~head:(Some 100L) future));
+  check "ordinary payload retained" (not (Tx_staging.duty_expired ~head:(Some 100L) ordinary));
+  check "malformed payload not guessed" (not (Tx_staging.duty_expired ~head:(Some 100L) malformed));
+  check "duty cannot queue behind occupied nonce"
+    (Tx_staging.duty_nonce from 0 = None);
+  check "prior expiry disabled" (Tx_staging.expire_duty ~head:None () = []);
+  let removed = Tx_staging.expire_duty ~head:(Some 100L) () in
+  check "only old duty expires"
+    (List.map (fun row -> row.Tx_staging.d_hash) removed = [Transaction.hash old]);
+  check "old duty absent from indices"
+    (Tx_staging.find_by_hash (Transaction.hash old) = None
+     && not (List.mem_assoc (Transaction.hash old) (Tx_staging.recent 10)));
+  check "duty uses confirmed successor" (Tx_staging.duty_nonce from 0 = Some 1);
+  let total = List.fold_left (fun total tx -> Z.add total (Transaction.ou_cost tx))
+    Z.zero [current; future; ordinary; malformed; others] in
+  check "expiry releases queue cost" (Z.equal total (Tx_staging.staging_total_ou ()));
+  check "user transactions retained"
+    (List.for_all (fun tx -> Tx_staging.find_by_hash (Transaction.hash tx) = Some tx)
+       [ordinary; malformed; others]);
+  check "expiry is idempotent" (Tx_staging.expire_duty ~head:(Some 100L) () = []);
+  check "sender expiry isolated"
+    (Tx_staging.expire_duty ~sender:(sender 709) ~head:(Some 102L) () = []);
+  check "exhausted nonce has no successor" (Tx_staging.duty_nonce from max_int = None);
+  Tx_staging.clear ()
+
 let check_selection_time () =
   let sender_count = 200 in
   let tx_count = 50 in
@@ -370,6 +415,7 @@ let () =
   check_queue_state ();
   check_pending_nonce ();
   check_duty_nonce ();
+  check_duty_head ();
   check_recent_order ();
   check_ready_gap ();
   check_ready_cost ();

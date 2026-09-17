@@ -405,7 +405,7 @@ def submit_bond(config, values, wallet, wallet_path, amount, args):
     wait_confirmed(values, tx_hash, args)
     return tx_hash
 
-def submit_ready(config, values, wallet, wallet_path, args):
+def submit_ready(config, values, wallet, wallet_path, args, *, resume=False):
     value = call(local_rpc(values), "octra_validatorEnrollment", [])
     enrollment = committed_enrollment(values, wallet, value=value)
     if enrollment.state is EnrollmentState.ABSENT:
@@ -418,6 +418,19 @@ def submit_ready(config, values, wallet, wallet_path, args):
             status="committed",
             epoch=enrollment.ready_epoch,
         )
+        return None
+    duty = value.get("duty")
+    if isinstance(duty, dict) and duty.get("automatic") is True:
+        head = optional_epoch(duty.get("head_epoch"), "duty head")
+        pulse = optional_epoch(duty.get("last_pulse"), "duty pulse")
+        if head != enrollment.head_epoch or (pulse is not None and pulse > head):
+            raise ValidatorError("validator duty differs from committed enrollment")
+        emit(
+            event="ready", status="automatic", state=enrollment.state.value,
+            head_epoch=head, last_pulse=pulse, action="leave_running",
+        )
+        return None
+    if resume and resume_join_transaction(config, values, "ready", args, missing_ok=True):
         return None
     message = ready_message(value, values, wallet)
     head_epoch = enrollment.head_epoch
@@ -625,14 +638,7 @@ def main():
             if step is JoinStep.SUBMIT_BOND:
                 raise ValidatorError("confirmed validator bond is absent from committed state")
         if step is JoinStep.SUBMIT_READY:
-            if not resume_join_transaction(
-                args.config,
-                values,
-                "ready",
-                args,
-                missing_ok=True,
-            ):
-                submit_ready(args.config, values, wallet, wallet_path, args)
+            submit_ready(args.config, values, wallet, wallet_path, args, resume=True)
             step = JoinStep.WAIT_SELECTION
         if step is JoinStep.WAIT_SELECTION:
             state = wait_scheduled(values, wallet, args)

@@ -16,6 +16,7 @@ type enrollment_snapshot = {
   chain_id : string;
   config_hash : string;
   candidate : Octra_core.Validator_admission.candidate option;
+  duty : Octra_core.Set_fold.receipt option;
 }
 
 type read_ctx = {
@@ -139,7 +140,7 @@ let validator_set_proof ~chain_id ~program_trust_hash
        ?scheduled
        validator_set)
 
-let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_hash =
+let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_hash ~automatic =
   let open Lwt.Syntax in
   match head with
   | None -> Lwt.return_error "committed head unavailable"
@@ -176,7 +177,20 @@ let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_
                 Lwt.return_error
                   ("committed validator registry invalid: " ^ error)
               | Ok registry ->
-                Lwt.return_ok {
+                let* duty =
+                  if not automatic then Lwt.return_ok None
+                  else
+                    let* raw = Store_irmin.read_snapshot snapshot
+                      ["meta"; Octra_core.Set_fold.meta_key] in
+                    match raw with
+                    | None -> Lwt.return_error "committed validator duty is unavailable"
+                    | Some raw ->
+                      Octra_core.Set_fold.of_string raw
+                      |> Result.map (fun state -> Some
+                        (Octra_core.Set_fold.receipt ~address:validator_address state))
+                      |> Lwt.return
+                in
+                Lwt.return (Result.map (fun duty -> {
                   head_epoch = head.epoch_id;
                   state_root = head.state_root;
                   chain_id;
@@ -185,7 +199,8 @@ let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_
                     Octra_core.Validator_registry.find
                       validator_address
                       registry;
-                }
+                  duty;
+                }) duty)
             end
         end
     end
@@ -200,6 +215,20 @@ let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
             error
             None))
   | Ok snapshot ->
+    let duty = match snapshot.duty with
+      | None -> `Null
+      | Some receipt ->
+        let cfg = Octra_core.Set_fold.standard in
+        `Assoc [
+          "automatic", `Bool true;
+          "head_epoch", `String (string_of_int snapshot.head_epoch);
+          "last_pulse", (match receipt.pulse with
+            | None -> `Null
+            | Some epoch -> `String (Int64.to_string epoch));
+          "required_span", `String (Int64.to_string cfg.rejoin_span);
+          "max_gap", `String (Int64.to_string cfg.pulse_gap);
+        ]
+    in
     let ready = `Assoc [
       "consensus_pubkey", `String validator_pubkey;
       "head_epoch", `String (string_of_int snapshot.head_epoch);
@@ -215,7 +244,7 @@ let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
          ~pubkey:validator_pubkey
          snapshot.candidate)
          (function
-           | `Assoc fields -> Ok (`Assoc (fields @ ["ready", ready]))
+           | `Assoc fields -> Ok (`Assoc (fields @ ["ready", ready; "duty", duty]))
            | _ -> Error (Octra_core.Rpc.err (-32000) "invalid enrollment result" None)))
 
 let runtime_version ~chain_id ~epoch ~validator_address ~program_trust_hash

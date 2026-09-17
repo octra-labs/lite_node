@@ -13,6 +13,7 @@ module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
+  duty_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;
@@ -65,7 +66,19 @@ let sweep_low_fee_stealth () =
       (Z.to_string min_ou);
   n
 
+let expire_duty ?sender runtime () =
+  let drops = Staging.expire_duty ?sender ~head:(runtime.duty_head ()) () in
+  if drops <> [] then begin
+    runtime.save_drops drops;
+    List.iter (fun drop -> Preverify_cache.remove drop.Staging.d_hash) drops;
+    Log.info "staging" "event = duty_expired count = %d" (List.length drops);
+    notify_staging_update ()
+  end
+
 let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
+  if Staging.duty_expired ~head:(runtime.duty_head ()) tx then
+    Error "validator ready head has expired"
+  else
   match Tx_view.bft_op_admission ~bft_mode tx with
   | Error (_, reason) -> Error reason
   | Ok () ->
@@ -76,6 +89,11 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
     | Error e -> Error e
     | Ok _ ->
       let tx_hash = Transaction.hash tx in
+      if tx.Transaction.op_type = Transaction.ValidatorReady then
+        expire_duty ~sender:tx.from runtime ();
+      if tx.Transaction.op_type = Transaction.ValidatorReady
+         && Option.is_some (Staging.find_by_hash tx_hash) then Ok tx_hash
+      else
       let lookup addr =
         Ledger.find_opt ledger addr
         |> Option.map (fun a -> (a.Ledger.balance, a.Ledger.nonce))

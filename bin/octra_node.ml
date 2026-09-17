@@ -1381,6 +1381,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let rest_runtime =
       Rest.{
         swarm_ref;
+        duty_head = (fun () ->
+          match Octra_core.Head_manifest.get_cached () with
+          | Some head when permissionless_validator_lifecycle
+                           && head.epoch_id < max_int ->
+            begin
+              match Rule_graph.ready_ref rules ~epoch:(head.epoch_id + 1) with
+              | Ok Rule_graph.Active -> Some (Int64.of_int head.epoch_id)
+              | Ok Rule_graph.Prior | Error _ -> None
+            end
+          | _ -> None);
         preverify_admit;
         save_drops;
         find_drop = Tx_drop.find drop_db;
@@ -1404,7 +1414,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
              ~head:(Octra_core.Head_manifest.get_cached ())
              ~validator_address:wallet.address
              ~chain_id
-             ~config_hash:ready_config_hash)
+             ~config_hash:ready_config_hash
+             ~automatic:(permissionless_validator_lifecycle && fold_enabled !current_epoch))
       in
       enrollment_ref := result;
       result
@@ -1578,13 +1589,14 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let send_fold ~epoch action =
       let send ~head_epoch state_root =
+        Rest.expire_duty ~sender:wallet.address rest_runtime ();
         match state_root, Ledger.find_opt ledger wallet.address with
         | None, _ -> Lwt.return_error "validator set fold head root is unavailable"
         | _, None -> Lwt.return_error "validator set fold account is unavailable"
         | Some state_root, Some account ->
-          let nonce =
-            Staging.first_missing_nonce wallet.address account.Ledger.nonce
-          in
+          match Staging.duty_nonce wallet.address account.Ledger.nonce with
+          | None -> Lwt.return_error "validator duty nonce is pending"
+          | Some nonce ->
           let draft = Transaction.{
             from = wallet.address;
             to_ = wallet.address;
@@ -1674,6 +1686,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       }
     in
     fold_wake := (fun ~head ->
+      Rest.expire_duty rest_runtime ();
+      Set_post.tick fold_post;
       match Set_actor.wake fold_actor ~head with
       | Set_actor.Accepted -> ()
       | Set_actor.Busy ->

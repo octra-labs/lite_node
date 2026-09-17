@@ -1418,6 +1418,7 @@ let test_ready_params () =
     state_root = hex_of_raw (raw 'r');
     chain_id;
     config_hash;
+    duty = Some Octra_core.Set_fold.{ marked = []; pulse = Some 1_503_090L };
     candidate = Some {
       Octra_core.Validator_admission.address = "oct_test";
       pubkey = raw 'p';
@@ -1436,6 +1437,15 @@ let test_ready_params () =
     | Ok value -> value
   in
   let ready = Yojson.Safe.Util.member "ready" value in
+  let duty = Yojson.Safe.Util.member "duty" value in
+  expect "ready automated duty"
+    (Yojson.Safe.Util.member "automatic" duty = `Bool true);
+  expect "ready committed pulse"
+    (Yojson.Safe.Util.member "last_pulse" duty = `String "1503090");
+  expect "ready duty head"
+    (Yojson.Safe.Util.member "head_epoch" duty = `String "1503093");
+  let disabled = read (Ok { snapshot with duty = None }) |> Result.get_ok in
+  expect "prior duty absent" (Yojson.Safe.Util.member "duty" disabled = `Null);
   let payload =
     match Octra_core.Validator_registry.ready_payload_of_message
       (Some (Yojson.Safe.to_string ready)) with

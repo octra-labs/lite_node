@@ -145,7 +145,7 @@ let decode_finalize encoded =
 
 let bundle_to_json bundle =
   `Assoc [
-    "tx_hashes", `List (List.map (fun value -> `String value) bundle.tx_hashes);
+    "tx_hashes", `List (List.map (fun value -> `String (Text.hash32_hex value)) bundle.tx_hashes);
     "txs", `List (List.map Transaction.to_yojson bundle.txs);
     "receipts_json",
       `List (List.map (fun value -> `String value) bundle.receipts_json);
@@ -178,7 +178,7 @@ let bundle_of_json json =
       json
       |> member "tx_hashes"
       |> to_list
-      |> List.map to_string;
+      |> List.map (fun value -> Text.hash32_hex (to_string value));
     txs =
       json
       |> member "txs"
@@ -249,7 +249,7 @@ let same_block left right =
        (Finality_log.of_finalize right)
 
 let same_bundle left right =
-  left.tx_hashes = right.tx_hashes
+  List.map Text.hash32_hex left.tx_hashes = List.map Text.hash32_hex right.tx_hashes
   && List.map Transaction.to_yojson left.txs
      = List.map Transaction.to_yojson right.txs
   && left.receipts_json = right.receipts_json

@@ -9,6 +9,7 @@ type enrollment_snapshot = {
   chain_id : string;
   config_hash : string;
   candidate : Octra_core.Validator_admission.candidate option;
+  duty : Octra_core.Set_fold.receipt option;
 }
 
 type read_ctx = {
@@ -87,6 +88,7 @@ val load_validator_enrollment :
   validator_address:string ->
   chain_id:string ->
   config_hash:string ->
+  automatic:bool ->
   (enrollment_snapshot, string) result Lwt.t
 
 val validator_enrollment :

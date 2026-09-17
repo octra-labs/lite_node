@@ -309,7 +309,63 @@ let check_read () =
     (!sent = 1 && (Lwt_main.run (Actor.stats actor)).appeals = 0);
   Lwt_main.run (Actor.shutdown actor)
 
+let check_post_head () =
+  let module Post = Octra_node_runtime.Set_post in
+  let module Tx = Octra_core.Transaction in
+  let clock = ref 0. in
+  let live = ref ["a"; "b"; "c"] in
+  let landed = ref [] in
+  let calls = ref [] in
+  let replies = ref [] in
+  let timers = ref [] in
+  let warnings = ref [] in
+  let tx name = Tx.{
+    from = "sender"; to_ = "sender"; amount = Z.zero; nonce = 1;
+    ou = Z.of_int 1_000; timestamp = 0.; signature = name;
+    public_key = None; message = None; op_type = ValidatorReady;
+    encrypted_data = None;
+  } in
+  let post = Post.create Post.{
+    now = (fun () -> !clock);
+    wait = (fun delay ->
+      let promise, reply = Lwt.wait () in
+      timers := (delay, reply) :: !timers;
+      promise);
+    staged = (fun hash -> List.mem hash !live);
+    landed = (fun tx -> List.mem tx.Tx.signature !landed);
+    post = (fun tx ->
+      let promise, reply = Lwt.wait () in
+      calls := tx.Tx.signature :: !calls;
+      replies := (tx.signature, reply) :: !replies;
+      promise);
+    warn = (fun reason -> warnings := reason :: !warnings);
+  } in
+  let reply name result =
+    Lwt.wakeup (List.assoc name !replies) result;
+    Lwt_main.run (Lwt.pause ())
+  in
+  Post.put post ~hash:"a" (tx "a");
+  reply "a" (Error "unavailable");
+  expect "failed post arms one timer" (List.length !timers = 1);
+  clock := 1.;
+  Post.put post ~hash:"b" (tx "b");
+  Post.put post ~hash:"c" (tx "c");
+  landed := ["b"];
+  reply "b" (Error "old reply");
+  expect "old reply cannot clear next head" (!calls = ["c"; "b"; "a"]);
+  expect "old reply not reported for next head" (!warnings = ["unavailable"]);
+  live := [];
+  reply "c" (Error "expired reply");
+  Post.tick post;
+  expect "expired post not retried" (!calls = ["c"; "b"; "a"]);
+  expect "expired post does not arm new timer" (List.length !timers = 1);
+  Post.stop post;
+  List.iter (fun (_, reply) -> Lwt.wakeup reply ()) !timers;
+  Lwt_main.run (Lwt.pause ());
+  expect "closed post timer is inert" (!calls = ["c"; "b"; "a"])
+
 let () =
+  check_post_head ();
   check_ack ();
   check_pulse_ack ();
   check_read ();

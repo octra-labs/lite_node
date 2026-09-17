@@ -289,6 +289,16 @@
  (libraries octra_node_runtime octra_core octra_consensus lwt.unix zarith))
 
 (test
+ (name test_rest_admit)
+ (modules test_rest_admit)
+ (libraries octra_node_runtime octra_core zarith lwt.unix octra_test_workspace))
+
+(test
+ (name test_journal_hash)
+ (modules test_journal_hash)
+ (libraries octra_node_runtime octra_core octra_consensus octra_test_workspace mirage-crypto-rng.unix))
+
+(test
  (name test_tick_plan)
  (modules test_tick_plan)
  (libraries octra_node_runtime octra_consensus))

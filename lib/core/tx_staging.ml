@@ -198,6 +198,25 @@ let first_missing_nonce sender confirmed =
   in
   loop (confirmed + 1) (sender_entries sender)
 
+let duty_nonce sender confirmed =
+  if confirmed < 0 || confirmed = max_int then None
+  else
+    let nonce = confirmed + 1 in
+    if List.exists (fun entry -> entry.tx.Transaction.nonce = nonce)
+         (sender_entries sender)
+    then None
+    else Some nonce
+
+let duty_expired ~head (tx : Transaction.t) =
+  match head, tx.op_type with
+  | Some head, ValidatorReady ->
+    begin
+      match Validator_registry.ready_payload_of_message tx.message with
+      | Ok ready -> Int64.compare ready.head_epoch head < 0
+      | Error _ -> false
+    end
+  | _ -> false
+
 let queue_state ~confirmed hash =
   match Hashtbl.find_opt hash_index hash with
   | None -> None
@@ -509,6 +528,26 @@ let remove_processed hashes =
     ignore (remove_by_hash h)
   ) hashes;
   clear_virtual_state touched
+
+let expire_duty ?sender ~head () =
+  match head with
+  | None -> []
+  | Some _ ->
+    let entries =
+      match sender with
+      | Some sender -> sender_entries sender
+      | None -> Index.bindings !view_index |> List.map snd
+    in
+    let expired =
+      List.filter (fun entry -> duty_expired ~head entry.tx) entries
+    in
+    let records =
+      List.map (fun entry ->
+        record_drop entry.hash entry.tx Expired
+          "validator ready head has expired") expired
+    in
+    remove_processed (List.map (fun entry -> entry.hash) expired);
+    records
 
 let expiry_reason ~confirmed ~received =
   let gap = Int64.sub (Int64.of_int received) (Int64.of_int confirmed) in

@@ -10,6 +10,7 @@ module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
+  duty_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;
@@ -42,6 +43,8 @@ val add_tx_to_staging :
   Ledger.t ->
   Transaction.t ->
   (string, string) result
+
+val expire_duty : ?sender:string -> runtime -> unit -> unit
 
 val max_timestamp_drift :
   float

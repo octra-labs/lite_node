@@ -794,6 +794,72 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(ready("validator", observer))
         self.assertFalse(ready("observer", {**observer, "binary_match": False}))
 
+    def test_upgrade_admission(self):
+        state = {
+            "process": "online", "rpc": "ready", "binary_match": True,
+            "source_match": True, "runtime_match": True, "head_epoch": 41,
+            "peer_epoch": 41, "lag": 0, "validator_member": False,
+            "voting": True, "voting_reason": None,
+        }
+        self.assertTrue(upgrade_tool.admission_pending("validator", state))
+        self.assertFalse(ready("validator", state))
+        for field, value in (
+            ("process", "offline"), ("rpc", "unavailable"),
+            ("binary_match", False), ("source_match", False),
+            ("runtime_match", False), ("lag", 2), ("lag", None),
+            ("validator_member", True), ("validator_member", None),
+        ):
+            self.assertFalse(upgrade_tool.admission_pending("validator", {**state, field: value}))
+        self.assertFalse(upgrade_tool.admission_pending("observer", state))
+        for reason in ("role", "vote_log_bootstrap", "vote_log_corrupt", None):
+            self.assertFalse(upgrade_tool.admission_pending("validator", {
+                **state, "voting": False, "voting_reason": reason,
+            }))
+        self.assertTrue(upgrade_tool.admission_pending("validator", {
+            **state, "voting": False, "voting_reason": "not_ready",
+        }))
+
+    def test_upgrade_resume(self):
+        worker = WORK / "worker"
+        worker.write_bytes(b"worker")
+        values = {
+            "OCTRA_DATA_DIR": str(WORK / "data"),
+            "OCTRA_OPERATOR_BINARY": str(WORK / "node"),
+            "OCTRA_OPERATOR_ROLE": "validator",
+            "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
+            "OCTRA_PVAC_VERIFY_WORKER": str(worker),
+            "OCTRA_PVAC_VERIFY_WORKER_HASH": hashlib.sha256(b"worker").hexdigest(),
+        }
+        supervisor = {"kind": "pm2", "pid": 41, "config": WORK / "node.env"}
+        args = mock.Mock(sudo=False, public_commit="a" * 40, source_commit="b" * 40)
+        state = {
+            "process": "online", "rpc": "ready", "binary_match": True,
+            "source_match": True, "runtime_match": True, "head_epoch": 41,
+            "peer_epoch": 41, "lag": 0, "validator_member": False,
+            "voting": True, "voting_reason": None,
+        }
+        with mock.patch.object(upgrade_tool, "preflight"), mock.patch.object(
+            upgrade_tool, "view", return_value=state
+        ), mock.patch.object(upgrade_tool, "verify_unit"), mock.patch.object(
+            upgrade_tool, "git_update", return_value=("a" * 40, "b" * 40, False)
+        ), mock.patch.object(upgrade_tool, "verify_release_tree"), mock.patch.object(
+            upgrade_tool, "release_sync_values", return_value=values
+        ), mock.patch.object(upgrade_tool, "sync_head", return_value=None), mock.patch.object(
+            upgrade_tool, "read_need", return_value=None
+        ), mock.patch.object(upgrade_tool, "inspect_pending", return_value=[]), mock.patch.object(
+            upgrade_tool, "inspect_votes", return_value=[]
+        ), mock.patch.object(upgrade_tool, "wait_node", return_value=0) as wait, mock.patch.object(
+            upgrade_tool, "call"
+        ) as command, mock.patch.object(upgrade_tool, "stop") as stop:
+            self.assertEqual(upgrade_tool.apply(WORK, supervisor, values, args, release_value()), 0)
+            wait.assert_called_once()
+            command.assert_not_called()
+            stop.assert_not_called()
+            with mock.patch.object(upgrade_tool, "inspect_pending", return_value=[("pending_bad", "path")]):
+                with self.assertRaisesRegex(ValidatorError, "durable record"):
+                    upgrade_tool.apply(WORK, supervisor, values, args, release_value())
+            self.assertEqual(wait.call_count, 1)
+
     def test_upgrade_sync_plan(self):
         values = {
             "OCTRA_CHAIN_ID": "octra-devnet-9871-cluster",
@@ -3230,6 +3296,34 @@ class ValidatorToolsTest(unittest.TestCase):
         record.assert_called_once_with(WORK / "node.env", "ready", "d" * 64)
         wait.assert_called_once_with(values, "d" * 64, args)
         self.assertEqual(emit.call_args.kwargs, {"event": "readiness", "state": "bonded", "ready_epoch": None})
+
+    def test_ready_automatic(self):
+        wallet = {"address": identity()[0], "pub": identity()[1]}
+        values = {"OCTRA_CHAIN_ID": "octra-test", "OCTRA_API_PORT": "8080"}
+        bonded = Enrollment(EnrollmentState.BONDED, 100, 1000000, 50, None, None)
+        value = {"duty": {"automatic": True, "head_epoch": "100", "last_pulse": "97"}}
+        with mock.patch("validator_enroll.call", return_value=value), mock.patch(
+            "validator_enroll.committed_enrollment", return_value=bonded,
+        ), mock.patch("validator_enroll.control_result") as control, mock.patch(
+            "validator_enroll.resume_join_transaction",
+        ) as resume, mock.patch("validator_enroll.emit") as emit:
+            self.assertIsNone(submit_ready(
+                WORK / "node.env", values, wallet, WORK / "wallet.json", mock.Mock(), resume=True,
+            ))
+            control.assert_not_called()
+            resume.assert_not_called()
+            self.assertEqual(emit.call_args.kwargs, {
+                "event": "ready", "status": "automatic", "state": "bonded",
+                "head_epoch": 100, "last_pulse": 97, "action": "leave_running",
+            })
+            for duty in (
+                {"automatic": True, "head_epoch": "99", "last_pulse": "97"},
+                {"automatic": True, "head_epoch": "100", "last_pulse": "101"},
+            ):
+                with mock.patch("validator_enroll.call", return_value={"duty": duty}):
+                    with self.assertRaises(ValidatorError):
+                        submit_ready(WORK / "node.env", values, wallet, WORK / "wallet.json", mock.Mock())
+            control.assert_not_called()
 
     def test_ready_control(self):
         values = {

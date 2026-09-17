@@ -600,8 +600,8 @@ def view(values, pid, release):
         "activation_epoch": member["activate_epoch"],
     }
 
-def installed(role, state):
-    common = (
+def matches(state):
+    return (
         state.get("process") == "online"
         and state.get("rpc") == "ready"
         and state.get("binary_match") is True
@@ -609,12 +609,26 @@ def installed(role, state):
         and state.get("runtime_match") is True
         and isinstance(state.get("head_epoch"), int)
     )
+
+def installed(role, state):
     if role == "validator":
-        return common and state.get("validator_member") is True and state.get("voting") is True
-    return common and state.get("voting") is False and state.get("voting_reason") == "role"
+        return matches(state) and state.get("validator_member") is True and state.get("voting") is True
+    return matches(state) and state.get("voting") is False and state.get("voting_reason") == "role"
 
 def ready(role, state):
     return installed(role, state) and state.get("lag") == 0
+
+def admission_pending(role, state):
+    return (
+        role == "validator"
+        and matches(state)
+        and state.get("lag") == 0
+        and state.get("validator_member") is False
+        and (
+            state.get("voting") is True
+            or state.get("voting_reason") == "not_ready"
+        )
+    )
 
 def recovery_installed(role, state, release):
     return (
@@ -956,6 +970,8 @@ def diagnose(root, sup, values, release):
     if faults:
         emit(status="hold", reason="durable_record_requires_review", action="do_not_delete")
         return 2
+    if admission_pending(values["OCTRA_OPERATOR_ROLE"], state):
+        emit(event="validator_admission", status="pending", action="leave_running")
     emit(status="pass", gate="upgrade_diagnostic")
     return 0
 
@@ -988,6 +1004,14 @@ def apply(root, sup, values, args, release):
     plan = sync_plan(sync_values, state, sync_target(state, tip))
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
     need = choose_need(marked, plan, values["OCTRA_CHAIN_ID"])
+    if need is None and matches(state):
+        worker = Path(values.get("OCTRA_PVAC_VERIFY_WORKER", "")).expanduser()
+        if worker.is_file() and sha256_file(worker) == values.get("OCTRA_PVAC_VERIFY_WORKER_HASH"):
+            faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
+            if faults:
+                raise ValidatorError("durable record requires review; node was not stopped")
+            emit(event="upgrade_resume", action="wait", restart=False, build=False)
+            return wait_node(root, sup, values, args, release, prior_binary)
     fresh = (
         sync_wait(sync_values, need, args.wait_seconds, args.interval)
         if need is not None
@@ -1055,6 +1079,9 @@ def apply(root, sup, values, args, release):
             head=restored.head,
             target=restored.target or "none",
         )
+    return wait_node(root, sup, values, args, release, prior_binary)
+
+def wait_node(root, sup, values, args, release, prior_binary):
     deadline = time.monotonic() + args.wait_seconds
     marker = None
     floor_restored = False
@@ -1086,6 +1113,14 @@ def apply(root, sup, values, args, release):
         if ready(values["OCTRA_OPERATOR_ROLE"], state):
             result = "validator_active" if values["OCTRA_OPERATOR_ROLE"] == "validator" else "observer_synced"
             emit(status=result, **state)
+            return 0
+        if admission_pending(values["OCTRA_OPERATOR_ROLE"], state):
+            emit(
+                status="installed",
+                reason="validator_admission_pending",
+                action="leave_running",
+                **state,
+            )
             return 0
         if time.monotonic() >= deadline:
             status, reason, action, code = deadline_result(
