@@ -664,6 +664,7 @@ let proposal_head state_root =
   }
 
 let make_proposal_deps ?(state_attested = true) ?(quarantine_active = false)
+    ?(current = fun () -> true)
     ?(current_epoch = 12) ?(round = 3) ?frozen ?(staging = [])
     ?(now = 99.0) ?(previous_epoch_ts = Some 89.0)
     ?(ledger_root = raw 'p') ?(cached_head = None)
@@ -689,6 +690,7 @@ let make_proposal_deps ?(state_attested = true) ?(quarantine_active = false)
     frozen_writes;
   } in
   let deps = C.{
+    current;
     start_height = (fun height ->
       start_heights := height :: !start_heights;
       Lwt.return_unit);
@@ -733,6 +735,35 @@ let run_make_proposal deps =
        ~root_to_raw32:(fun root -> root)
        ~limits:generous_limits
        ~epoch_id:12L)
+
+let test_build_head_progress () =
+  List.iter (fun phase ->
+    let current = ref true in
+    let release, finish = Lwt.wait () in
+    let entered = ref false in
+    let pause run =
+      entered := true;
+      let open Lwt.Syntax in
+      let* () = Lwt.protected release in
+      run ()
+    in
+    let deps, probe = make_proposal_deps ~current:(fun () -> !current) ~staging:[tx 1] () in
+    let deps = match phase with
+      | `Root -> { deps with read_prev_ledger_root = (fun () -> pause deps.read_prev_ledger_root) }
+      | `Checks -> { deps with build_preverify_once = (fun ~state_root ~tx_hashes txs ->
+          pause (fun () -> deps.build_preverify_once ~state_root ~tx_hashes txs)) }
+      | `Preview -> { deps with preview = (fun request -> pause (fun () -> deps.preview request)) }
+    in
+    let result = C.make_proposal deps ~chain_id:"octra-test"
+      ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L
+    in
+    expect "build waiting" (!entered && Lwt.is_sleeping result);
+    current := false;
+    Lwt.wakeup_later finish ();
+    expect "superseded build returns no plan" (Lwt_main.run result = None);
+    expect "superseded build did not publish"
+      (!(probe.set_proposals) = [] && !(probe.stored_bundles) = [] && !(probe.frozen_writes) = []))
+    [`Root; `Checks; `Preview]
 
 let test_preverify_single_flight () =
   let item = tx 1 in
@@ -1678,6 +1709,7 @@ let proposal_for_txs txs =
   }
 
 let verify_proposal_deps ?(quarantine = false) ?(root = raw 'p')
+    ?(current = fun () -> true)
     ?(prev_streak = 0) ?(state_streak = 0)
     ?(driver_available = false) ?(staging = [])
     ?(cached_bundle = fun ~proposal_id:_ -> None)
@@ -1701,6 +1733,7 @@ let verify_proposal_deps ?(quarantine = false) ?(root = raw 'p')
   let set_proposals = ref [] in
   let previews = ref [] in
   let deps = C.{
+    current;
     now = (fun () -> now);
     previous_epoch_ts = (fun _ -> previous_epoch_ts);
     quarantine_active = (fun () -> quarantine);
@@ -1873,6 +1906,43 @@ let test_verify_local_preview () =
   expect "verify accept proposal set" (!set_proposals = [([item], [tx_hash])]);
   expect "verify accept shared" (!shared = [[item]]);
   expect "verify accept stores twice" (List.length !stores = 2)
+
+let test_verify_head_progress () =
+  List.iter (fun phase ->
+    let item = tx 1 in
+    let current = ref true in
+    let shared = ref [] in
+    let release, finish = Lwt.wait () in
+    let entered = ref false in
+    let pause run =
+      entered := true;
+      let open Lwt.Syntax in
+      let* () = Lwt.protected release in
+      run ()
+    in
+    let deps, quarantines, prev_streak, state_streak, _, _, proposals, _ =
+      verify_proposal_deps ~current:(fun () -> !current) ~staging:[item]
+        ~prev_streak:3 ~state_streak:3 ~share_txs:(fun txs -> shared := txs :: !shared)
+        ~preview_result:(fun request ->
+          exec_result ~confirmed:request.C.txs ~rejected:[] ~post_state_root:(raw 'x')) ()
+    in
+    let deps = match phase with
+      | `Root -> { deps with wait_prev_root = {
+          deps.wait_prev_root with read_root = (fun () -> pause (fun () -> Lwt.return (raw 'x'))) } }
+      | `Ledger -> { deps with read_local_ledger_root = (fun () -> pause deps.read_local_ledger_root) }
+      | `Checks -> { deps with validate_preverify_once = (fun ~state_root ~tx_hashes txs ->
+          pause (fun () -> deps.validate_preverify_once ~state_root ~tx_hashes txs)) }
+      | `Preview -> { deps with preview = (fun request -> pause (fun () -> deps.preview request)) }
+    in
+    let result = C.verify_proposal deps ~chain_id:"octra-test" (proposal_for_txs [item]) in
+    expect "verification waiting" (!entered && Lwt.is_sleeping result);
+    current := false;
+    Lwt.wakeup_later finish ();
+    expect "superseded verification waits" (verdict_waits (Lwt_main.run result));
+    expect "head progress did not quarantine" (!quarantines = []);
+    expect "head progress kept counters" (!prev_streak = 3 && !state_streak = 3);
+    expect "head progress did not publish" (!proposals = [] && !shared = []))
+    [`Root; `Ledger; `Checks; `Preview]
 
 let test_verify_staging_lookup () =
   let module S = Octra_core.Tx_staging in
@@ -2782,6 +2852,7 @@ let () =
   test_make_unattested_defer ();
   test_make_epoch_time_defer ();
   test_preverify_single_flight ();
+  test_build_head_progress ();
   test_make_reuse_frozen_bundle ();
   test_make_preview_rejections ();
   test_make_rejection_only ();
@@ -2822,6 +2893,7 @@ let () =
   test_prev_time_retry ();
   test_verify_missing_bundle_wait ();
   test_verify_local_preview ();
+  test_verify_head_progress ();
   test_verify_staging_lookup ();
   test_verify_ledger_preverify ();
   test_verify_reproduced_rejection ();

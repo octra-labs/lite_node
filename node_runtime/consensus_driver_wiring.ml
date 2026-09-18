@@ -564,11 +564,26 @@ let share_txs (deps : deps) txs =
   | Some _, []
   | None, _ -> ()
 
+let proposal_current (deps : deps) =
+  let epoch = deps.current_epoch () in
+  let round = deps.current_round () in
+  let driver = Option.map
+    (fun driver -> driver, driver.Octra_consensus.C_driver.engine.generation)
+    !(deps.driver_ref)
+  in
+  fun () ->
+    deps.current_epoch () = epoch && deps.current_round () = round
+    && match driver, !(deps.driver_ref) with
+       | Some (saved, generation), Some live ->
+         saved == live && live.running && live.engine.generation = generation
+       | None, _ | Some _, None -> false
+
 let verify_proposal_deps (deps : deps) =
   let validate_runner =
     Consensus_preverify_role.run_validate deps.validate_preverify
   in
   Consensus_proposal.{
+    current = proposal_current deps;
     now = deps.now;
     previous_epoch_ts = previous_epoch_ts deps;
     quarantine_active = deps.gates.quarantine_active;
@@ -626,6 +641,7 @@ let make_proposal_deps (deps : deps) =
     Consensus_preverify_role.run_build deps.build_preverify
   in
   Consensus_proposal.{
+    current = proposal_current deps;
     start_height = (fun target_epoch ->
       match !(deps.driver_ref) with
       | Some driver ->

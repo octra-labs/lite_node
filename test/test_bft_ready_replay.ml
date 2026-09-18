@@ -104,6 +104,7 @@ let driver
     ?scheduled_validator_set_config
     ?(load_scheduled_validator_set_config = fun () -> Lwt.return_none)
     ?(verify_proposal = fun _ -> Lwt.return C_driver.Proposal_accept)
+    ?(make_proposal = fun _ -> Lwt.return_none)
     ?(persist = fun () -> Lwt.return_true)
     chain_id =
   let config =
@@ -118,7 +119,7 @@ let driver
       verify_proposal;
       verify_parent_commit = (fun ~epoch_id:_ _ -> Ok ());
       on_finalized = (fun ~validator_set:_ _ -> Lwt.return_unit);
-      make_proposal = (fun _ -> Lwt.return_none);
+      make_proposal;
       before_precommit_broadcast =
         (fun
           ~epoch_id:_
@@ -140,7 +141,7 @@ let driver
       resource_committee_config = None;
     }
   in
-  C_driver.create
+  let value = C_driver.create
     ~config
     ~validator_set
     ~swarm:(swarm chain_id)
@@ -148,6 +149,9 @@ let driver
     ~sync_log:(C_sync_log.memory ())
     ~relief_log:(C_relief_log.memory ())
     ~vote_log:(C_vote_log.memory ())
+  in
+  value.running <- true;
+  value
 
 let future_vote chain_id validator =
   C_types.{
@@ -176,6 +180,285 @@ let signed_vote chain_id ~epoch_id ~round ~vote_type ~proposal_id validator =
     unsigned with
     signature = sign validator (C_hash.vote_sign_bytes unsigned);
   }
+
+let settle () =
+  Lwt_main.run (Lwt_list.iter_s (fun () -> Lwt.pause ()) (List.init 8 (fun _ -> ())))
+
+let certificate (value : C_types.propose) =
+  let proposal_id = C_hash.proposal_id value.header in
+  C_types.{
+    chain_id = value.chain_id;
+    epoch_id = value.epoch_id;
+    commit_round = value.round;
+    header = value.header;
+    proposal_id;
+    precommits = List.map
+      (signed_vote value.chain_id ~epoch_id:value.epoch_id ~round:value.round
+        ~vote_type:Precommit ~proposal_id) ["v1"; "v2"; "v3"];
+    parent_commit = None;
+  }
+
+let receive_finalize driver value =
+  let local, peer = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = Octra_net.P2p_conn.create
+    ~peer_class:Octra_net.P2p_frame_budget.Validator local
+    ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v1"))
+    ~addr:"finality-test" ~direction:Octra_net.P2p_conn.Inbound
+  in
+  Lwt_main.run (Lwt.finalize
+    (fun () -> C_driver.on_p2p_message driver conn Octra_net.P2p_frame.{
+      msg_type = msg_cons_finalize;
+      payload = C_codec.encode_finalize (certificate value);
+    })
+    (fun () ->
+      let open Lwt.Syntax in
+      let* () = Octra_net.P2p_conn.close conn in
+      Lwt_unix.close peer))
+
+let test_work_slot () =
+  let open C_work_slot in
+  let first, effects = step empty (Submit "first") in
+  let id = match effects with [Run (id, "first")] -> id | _ -> assert false in
+  let repeat, effects = step first (Submit "second") in
+  assert (repeat = first && effects = []);
+  let wrong, effects = step first (Finish (id + 1, 9)) in
+  assert (wrong = first && effects = []);
+  let done_, effects = step first (Finish (id, 7)) in
+  assert (ready done_ && effects = [Complete "first"]);
+  let repeat, effects = step done_ (Finish (id, 9)) in
+  assert (repeat = done_ && effects = []);
+  let vacant, effects = step repeat Take in
+  assert (idle vacant && effects = [Deliver ("first", 7)]);
+  let vacant, effects = step vacant Take in
+  assert (idle vacant && effects = []);
+  let closed, effects = step first Close in
+  assert (not (idle closed) && effects = []);
+  let closed, effects = step closed (Finish (id, 8)) in
+  assert (not (ready closed) && effects = []);
+  let opened, _ = step closed Open in
+  let next, effects = step opened (Submit "next") in
+  assert (effects = [Run (id + 1, "next")]);
+  let ignored, effects = step next (Finish (id, 8)) in
+  assert (ignored = next && effects = [])
+
+let test_check_flow () =
+  List.iter (fun mode ->
+    let chain_id = "octra-test-check-flow" in
+    let result, finish = Lwt.wait () in
+    let calls = ref 0 in
+    let verify_proposal _ = incr calls; Lwt.protected result in
+    let driver = driver ~verify_proposal chain_id in
+    let value = proposal chain_id ~epoch_id:1L ~round:0 in
+    Hashtbl.replace driver.pending_proposals (C_driver.proposal_round_key 1L 0) value;
+    Lwt_main.run (C_driver.process_outputs driver);
+    assert (!calls = 1 && Lwt.is_sleeping result);
+    List.iter (fun _ -> Lwt_main.run (C_driver.process_outputs driver)) (List.init 4 Fun.id);
+    assert (!calls = 1);
+    let passed = match mode with
+      | `Finalize ->
+        receive_finalize driver value;
+        driver.engine.state.height = 2L
+      | `Vote ->
+        C_engine.on_timeout driver.engine ~step:C_types.ProposeStep ~round:0
+          ~generation:driver.engine.generation ~sign_fn:(sign "v0");
+        Lwt_main.run (C_driver.process_outputs driver);
+        C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+          ~epoch_id:1L ~round:0 ~vote_type:C_types.Prevote
+          ~proposal_id:Octra_net.Hash_domain.nil_hash
+        |> Result.get_ok |> Option.is_some
+      | `Round ->
+        let generation = driver.engine.generation in
+        C_engine.start_round driver.engine 1;
+        assert (driver.engine.generation = generation);
+        true
+      | `Stop ->
+        Lwt_main.run (C_driver.stop driver);
+        driver.proposal_verify = None
+    in
+    let height = driver.engine.state.height in
+    let round = driver.engine.state.round in
+    let waiting = Lwt.is_sleeping result in
+    Lwt.wakeup_later finish C_driver.Proposal_accept;
+    settle ();
+    let pid = C_hash.proposal_id value.header in
+    let voted = C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+      ~epoch_id:1L ~round:0 ~vote_type:C_types.Prevote ~proposal_id:pid
+      |> Result.get_ok |> Option.is_some
+    in
+    Lwt_main.run (C_driver.stop driver);
+    if not passed || not waiting then failwith "proposal check held driver progress";
+    if voted || driver.engine.state.height <> height || driver.engine.state.round <> round then
+      failwith "late check changed driver state") [`Finalize; `Vote; `Round; `Stop]
+
+let test_build_flow () =
+  List.iter (fun mode ->
+    let chain_id = "octra-test-build-flow" in
+    let height = List.init 32 (fun i -> Int64.of_int (i + 1))
+      |> List.find (fun epoch_id ->
+        (C_engine.leader_of validator_set ~epoch_id ~round:0).address = "v0")
+    in
+    let result, finish = Lwt.wait () in
+    let calls = ref 0 in
+    let make_proposal requested =
+      if requested = height then begin incr calls; Lwt.protected result end
+      else Lwt.return_none
+    in
+    let driver = driver ~make_proposal chain_id in
+    C_engine.start_height driver.engine height;
+    Lwt_main.run (C_driver.process_outputs driver);
+    assert (!calls = 1 && Lwt.is_sleeping result);
+    let value = proposal chain_id ~epoch_id:height ~round:0 in
+    let passed = match mode with
+      | `Finalize ->
+        receive_finalize driver value;
+        driver.engine.state.height = Int64.succ height
+      | `Round ->
+        let generation = driver.engine.generation in
+        C_engine.start_round driver.engine 1;
+        assert (driver.engine.generation = generation);
+        true
+      | `Stop ->
+        Lwt_main.run (C_driver.stop driver);
+        driver.proposal_build = None
+    in
+    let generation = driver.engine.generation in
+    let waiting = Lwt.is_sleeping result in
+    Lwt.wakeup_later finish (Some C_driver.{
+      header = value.header; tx_hashes = []; parent_commit = None });
+    settle ();
+    let voted = C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+      ~epoch_id:height ~round:0 ~vote_type:C_types.Prevote
+      ~proposal_id:(C_hash.proposal_id value.header)
+      |> Result.get_ok |> Option.is_some
+    in
+    Lwt_main.run (C_driver.stop driver);
+    if not passed || not waiting || voted || driver.engine.generation <> generation then
+      failwith "proposal build held or changed driver progress") [`Finalize; `Round; `Stop]
+
+let test_check_handoff () =
+  let chain_id = "octra-test-check-handoff" in
+  let first, finish_first = Lwt.wait () in
+  let second, finish_second = Lwt.wait () in
+  let calls = ref 0 in
+  let verify_proposal _ =
+    incr calls;
+    Lwt.protected (if !calls = 1 then first else second)
+  in
+  let driver = driver ~verify_proposal chain_id in
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let direct = C_driver.admit_current_proposal driver
+    ~route:C_driver.Publish_verified_proposal value
+  in
+  assert (!calls = 1);
+  Hashtbl.replace driver.pending_proposals (C_driver.proposal_round_key 1L 0) value;
+  Lwt_main.run (C_driver.process_outputs driver);
+  assert (!calls = 1 && driver.proposal_verify <> None);
+  Lwt.wakeup_later finish_first C_driver.Proposal_wait;
+  settle ();
+  let held = !calls = 2 && driver.proposal_verify <> None in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt.wakeup_later finish_second C_driver.Proposal_wait;
+  settle ();
+  Lwt_main.run direct;
+  if not held then failwith "prior check cleared running work"
+
+let test_check_invalid () =
+  let chain_id = "octra-test-check-invalid" in
+  let calls = ref 0 in
+  let driver = driver ~verify_proposal:(fun _ -> incr calls; Lwt.return C_driver.Proposal_accept)
+    chain_id
+  in
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let value = { value with signature = String.make 64 '\x00' } in
+  C_driver.retain_proposal_wait driver ~route:C_driver.Publish_verified_proposal value;
+  Lwt_main.run (C_driver.process_outputs driver);
+  let cleared = driver.proposal_wait = None in
+  Lwt_main.run (C_driver.stop driver);
+  if not cleared || !calls <> 0 then failwith "invalid waiting proposal repeated"
+
+let test_reply_grace () =
+  let chain_id = "octra-test-reply-grace" in
+  let result, finish = Lwt.wait () in
+  let driver = driver ~verify_proposal:(fun _ -> Lwt.protected result) chain_id in
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let job = C_driver.check_work driver value C_driver.Publish_verified_proposal in
+  let direct = C_driver.admit_current_proposal driver
+    ~route:C_driver.Publish_verified_proposal value
+  in
+  let mark = driver.proposal_verify in
+  assert (mark <> None && Lwt.is_sleeping direct);
+  Lwt_main.run (C_driver.finish_proposal_work driver job
+    (C_driver.Checked_proposal None));
+  let kept = driver.proposal_verify = mark in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt.wakeup_later finish C_driver.Proposal_wait;
+  settle ();
+  Lwt_main.run direct;
+  if not kept then failwith "delivered reply cleared another check"
+
+let test_work_timer () =
+  List.iter (fun mode ->
+    let chain_id = "octra-test-work-timer" in
+    let height = List.init 32 (fun i -> Int64.of_int (i + 1))
+      |> List.find (fun epoch_id ->
+        (C_engine.leader_of validator_set ~epoch_id ~round:0).address = "v0")
+    in
+    let check, finish_check = Lwt.wait () in
+    let build, finish_build = Lwt.wait () in
+    let driver = driver
+      ~verify_proposal:(fun _ -> Lwt.protected check)
+      ~make_proposal:(fun _ -> Lwt.protected build) chain_id
+    in
+    C_engine.start_height driver.engine height;
+    if mode = `Check then
+      Hashtbl.replace driver.pending_proposals (C_driver.proposal_round_key height 0)
+        (proposal chain_id ~epoch_id:height ~round:0);
+    Lwt_main.run (C_driver.process_outputs driver);
+    let expire (work : C_driver.proposal_build) =
+      { work with started_at = Int64.sub (Mtime_clock.elapsed_ns ()) 301_000_000_000L }
+    in
+    (match mode with
+     | `Check ->
+       assert (driver.proposal_verify <> None);
+       driver.proposal_verify <- Option.map expire driver.proposal_verify
+     | `Build ->
+       assert (driver.proposal_build <> None);
+       driver.proposal_build <- Option.map expire driver.proposal_build);
+    C_engine.emit driver.engine (C_engine.ScheduleTimeout {
+      step = C_types.ProposeStep; round = 0; delay_ms = 0;
+      generation = driver.engine.generation });
+    Lwt_main.run (C_driver.process_outputs driver);
+    Lwt_main.run (Lwt_unix.sleep 0.02);
+    let voted = C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+      ~epoch_id:height ~round:0 ~vote_type:C_types.Prevote
+      ~proposal_id:Octra_net.Hash_domain.nil_hash
+      |> Result.get_ok |> Option.is_some
+    in
+    let waiting = Lwt.is_sleeping check && Lwt.is_sleeping build in
+    Lwt_main.run (C_driver.stop driver);
+    Lwt.wakeup_later finish_check C_driver.Proposal_accept;
+    Lwt.wakeup_later finish_build None;
+    settle ();
+    if not voted || not waiting then failwith "running work held expired timer") [`Check; `Build]
+
+let test_build_error () =
+  let chain_id = "octra-test-build-error" in
+  let height = List.init 32 (fun i -> Int64.of_int (i + 1))
+    |> List.find (fun epoch_id ->
+      (C_engine.leader_of validator_set ~epoch_id ~round:0).address = "v0")
+  in
+  let calls = ref 0 in
+  let driver = driver ~make_proposal:(fun _ -> incr calls; Lwt.fail_with "local build error")
+    chain_id
+  in
+  C_engine.start_height driver.engine height;
+  Lwt_main.run (C_driver.process_outputs driver);
+  let cleared = driver.proposal_build = None && driver.proposal_retry <> None in
+  receive_finalize driver (proposal chain_id ~epoch_id:height ~round:0);
+  let progressed = driver.engine.state.height = Int64.succ height in
+  Lwt_main.run (C_driver.stop driver);
+  if not cleared || not progressed || !calls = 0 then
+    failwith "proposal error stopped driver progress"
 
 let test_pace_votes () =
   let chain_id = "octra-test-pace-votes" in
@@ -696,6 +979,14 @@ let test_proposal_verify_error_waits_without_penalty () =
   Lwt_main.run (Lwt_unix.close remote_fd)
 
 let () =
+  test_work_slot ();
+  test_check_handoff ();
+  test_reply_grace ();
+  test_check_flow ();
+  test_build_flow ();
+  test_work_timer ();
+  test_check_invalid ();
+  test_build_error ();
   test_pace_votes ();
   test_qc_vote ();
   test_deferred_proposal_replays_after_round_skip ();

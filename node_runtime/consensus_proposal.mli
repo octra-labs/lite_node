@@ -165,6 +165,7 @@ type build_preview_request = {
 }
 
 type make_proposal_deps = {
+  current : unit -> bool;
   start_height : int64 -> unit Lwt.t;
   current_epoch : unit -> int;
   state_attested : unit -> bool;
@@ -206,6 +207,7 @@ type make_proposal_deps = {
 }
 
 type verify_proposal_deps = {
+  current : unit -> bool;
   now : unit -> float;
   previous_epoch_ts : int64 -> float option;
   quarantine_active : unit -> bool;

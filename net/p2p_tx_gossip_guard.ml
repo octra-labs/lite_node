@@ -17,7 +17,10 @@ type bucket = {
   mutable last_seen : float;
 }
 
-type t = (string, bucket) Hashtbl.t
+type t = {
+  peers : (string, bucket) Hashtbl.t;
+  mutable seen : P2p_tx_seen.t;
+}
 
 type verdict =
   | Accept
@@ -37,7 +40,12 @@ let bucket_ttl_s = 300.0
 let max_buckets = 4096
 
 let create () =
-  Hashtbl.create 64
+  { peers = Hashtbl.create 64; seen = P2p_tx_seen.empty }
+
+let remember t ~now key =
+  let seen, fresh = P2p_tx_seen.step t.seen ~now key in
+  t.seen <- seen;
+  fresh
 
 let reset b now =
   b.start <- now;
@@ -53,6 +61,7 @@ let rec take n xs =
     | x :: rest -> x :: take (n - 1) rest
 
 let prune ?(ttl = bucket_ttl_s) ?(max_entries = max_buckets) t ~now =
+  let t = t.peers in
   Hashtbl.fold
     (fun peer b acc ->
       if now -. b.last_seen > ttl then peer :: acc else acc)
@@ -72,10 +81,11 @@ let prune ?(ttl = bucket_ttl_s) ?(max_entries = max_buckets) t ~now =
     |> List.iter (fun (_, peer) -> Hashtbl.remove t peer)
 
 let size t =
-  Hashtbl.length t
+  Hashtbl.length t.peers
 
 let get_bucket t peer now =
   prune t ~now;
+  let t = t.peers in
   match Hashtbl.find_opt t peer with
   | Some b ->
     b.last_seen <- now;

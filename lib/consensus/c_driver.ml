@@ -190,6 +190,15 @@ type proposal_wait = {
   retry_at : int64;
 }
 
+type proposal_job =
+  | Check_proposal of proposal_build * C_types.propose * verified_proposal_route
+  | Build_proposal of proposal_build
+
+type proposal_reply =
+  | Checked_proposal of proposal_verdict option
+  | Built_proposal of proposal_plan option
+  | Proposal_failed of string
+
 type proposal_fetch = {
   height : int64;
   round : int;
@@ -285,6 +294,7 @@ type t = {
   mutable proposal_wait : proposal_wait option;
   mutable round_spread_warned_at : float;
   proposal_work_gate : C_proposal_work_gate.t;
+  mutable proposal_slot : (proposal_job, proposal_reply) C_work_slot.t;
   mutable on_validator_set_activated :
     C_types.validator_set -> string -> unit Lwt.t;
   mutable on_validator_set_relief :
@@ -493,6 +503,7 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
     proposal_wait = None;
     round_spread_warned_at = 0.0;
     proposal_work_gate = C_proposal_work_gate.create ();
+    proposal_slot = C_work_slot.empty;
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
     on_validator_set_relief =
@@ -2609,8 +2620,7 @@ let maybe_activate_resource_committee t ~target_epoch =
                         (String.sub root_hex 0 (min 16 (String.length root_hex)));
                       cfg.on_committee_selected snapshot
 
-let try_current_leader_proposal t =
-  let open Lwt.Syntax in
+let leader_work t =
   if t.running
      && vote_allowed t
      && pace_left t = 0L
@@ -2621,75 +2631,54 @@ let try_current_leader_proposal t =
     let round = t.engine.state.round in
     let step = t.engine.state.step in
     if proposal_retry_pending t ~gen ~height ~round ~step then
-      Lwt.return_false
+      None
     else begin
-      t.proposal_retry <- None;
       match t.proposal_build with
-      | Some _ ->
-        Lwt.return_false
+      | Some _ -> None
       | None ->
-        let work = {
+        Some {
           gen;
           height;
           round;
           step;
           started_at = Mtime_clock.elapsed_ns ();
-        } in
-        t.proposal_build <- Some work;
-        let* proposal_opt =
-          Lwt.finalize
-            (fun () ->
-              C_proposal_work_gate.run
-                t.proposal_work_gate
-                ~relevant:(fun () ->
-                  t.running
-                  && vote_allowed t
-                  && C_engine.am_i_leader t.engine
-                  && proposal_work_current t work)
-                (fun () -> t.config.make_proposal height))
-            (fun () ->
-              clear_proposal_build t ~gen ~height ~round ~step;
-              Lwt.return_unit)
-        in
-        if t.engine.generation = gen
-           && t.engine.state.height = height
-           && t.engine.state.round = round
-           && t.engine.state.step = step then
-          match proposal_opt with
-          | Some plan ->
-            C_engine.do_propose
-              ?parent_commit:plan.parent_commit
-              t.engine
-              plan.header
-              plan.tx_hashes
-              ~sign_fn:t.config.sign_fn;
-            Lwt.return (t.engine.state.step <> step)
-          | None ->
-            t.proposal_retry <- Some {
-              work with
-              started_at = Mtime_clock.elapsed_ns ();
-            };
-            log_node t.config.my_addr
-              "event = make_proposal_none height = %Ld round = %d"
-              height
-              round;
-            Lwt.return_false
-        else begin
-          log_node t.config.my_addr
-            "event = make_proposal_stale old_generation = %d new_generation = %d old_height = %Ld new_height = %Ld old_round = %d new_round = %d old_step = %s new_step = %s"
-            gen
-            t.engine.generation
-            height
-            t.engine.state.height
-            round
-            t.engine.state.round
-            (round_step_label step)
-            (round_step_label t.engine.state.step);
-          Lwt.return_false
-        end
+        }
     end
-  end else
-    Lwt.return_false
+  end else None
+
+let finish_build t work plan =
+  if not t.running || not (proposal_work_current t work) then false
+  else
+    match plan with
+    | Some plan when vote_allowed t && C_engine.am_i_leader t.engine ->
+      C_engine.do_propose ?parent_commit:plan.parent_commit t.engine
+        plan.header plan.tx_hashes ~sign_fn:t.config.sign_fn;
+      t.engine.state.step <> work.step
+    | Some _ -> false
+    | None ->
+      t.proposal_retry <- Some { work with started_at = Mtime_clock.elapsed_ns () };
+      log_node t.config.my_addr "event = make_proposal_none height = %Ld round = %d"
+        work.height work.round;
+      false
+
+let try_current_leader_proposal t =
+  let open Lwt.Syntax in
+  match leader_work t with
+  | None -> Lwt.return_false
+  | Some work ->
+    t.proposal_retry <- None;
+    t.proposal_build <- Some work;
+    let* plan = Lwt.finalize
+      (fun () -> C_proposal_work_gate.run t.proposal_work_gate
+        ~relevant:(fun () -> t.running && vote_allowed t
+          && C_engine.am_i_leader t.engine && proposal_work_current t work)
+        (fun () -> t.config.make_proposal work.height))
+      (fun () ->
+        clear_proposal_build t ~gen:work.gen ~height:work.height
+          ~round:work.round ~step:work.step;
+        Lwt.return_unit)
+    in
+    Lwt.return (finish_build t work plan)
 
 let admit_resource_attestation t attestation =
   match t.config.resource_committee_config with
@@ -2791,8 +2780,7 @@ let retain_proposal_wait t ~route (p : C_types.propose) =
       p.round
       attempt
 
-let admit_current_proposal t ~route (p : C_types.propose) =
-  let open Lwt.Syntax in
+let check_proposal_frame t (p : C_types.propose) =
   let signature_valid =
     match C_types.pubkey_of_addr t.engine.vs p.proposer with
     | None -> false
@@ -2807,13 +2795,33 @@ let admit_current_proposal t ~route (p : C_types.propose) =
     && C_hash.parent_commit_hash_opt p.parent_commit
        = p.header.parent_commit_hash
   in
-  if not signature_valid
-     || not envelope_valid
-     || not
-          (proposal_verify_relevant
-             ~current_round:t.engine.state.round
-             ~current_step:t.engine.state.step
-             ~proposal_round:p.round)
+  signature_valid && envelope_valid && proposal_verify_current t p
+
+let finish_check t ~route (p : C_types.propose) preview =
+  match preview with
+  | None ->
+    clear_proposal_wait t p;
+    Lwt.return_unit
+  | Some _ when not t.running || not (check_proposal_frame t p) ->
+    clear_proposal_wait t p;
+    Lwt.return_unit
+  | Some Proposal_wait ->
+    retain_proposal_wait t ~route p;
+    Lwt.return_unit
+  | Some verdict ->
+    clear_proposal_wait t p;
+    let accepted = verdict = Proposal_accept in
+    if accepted && p.round > t.engine.state.round then
+      defer_verified_proposal t p;
+    ignore (C_engine.on_propose t.engine p
+      ~verify_fn:(verify_engine_signature t)
+      ~execute_fn:(fun _ -> accepted) ~sign_fn:t.config.sign_fn);
+    if accepted then send_verified_proposal t route p
+    else Lwt.return_unit
+
+let admit_current_proposal t ~route (p : C_types.propose) =
+  let open Lwt.Syntax in
+  if not (check_proposal_frame t p)
   then
     begin
       clear_proposal_wait t p;
@@ -2848,35 +2856,23 @@ let admit_current_proposal t ~route (p : C_types.propose) =
           in
           Lwt.return_some verdict)
     in
-    match preview with
-    | None ->
-      Lwt.return_unit
-    | Some _ when not (proposal_verify_current t p) ->
-      clear_proposal_wait t p;
-      Lwt.return_unit
-    | Some Proposal_wait ->
-      retain_proposal_wait t ~route p;
-      Lwt.return_unit
-    | Some verdict ->
-      clear_proposal_wait t p;
-      let accepted = verdict = Proposal_accept in
-      if accepted && p.round > t.engine.state.round then
-        defer_verified_proposal t p;
-      ignore
-        (C_engine.on_propose
-           t.engine
-           p
-           ~verify_fn:(verify_engine_signature t)
-           ~execute_fn:(fun _ -> accepted)
-           ~sign_fn:t.config.sign_fn);
-      if accepted then send_verified_proposal t route p
-      else Lwt.return_unit
+    finish_check t ~route p preview
 
-let replay_waiting_proposal t =
+let check_work t proposal route =
+  let work = {
+    gen = t.engine.generation;
+    height = t.engine.state.height;
+    round = t.engine.state.round;
+    step = t.engine.state.step;
+    started_at = Mtime_clock.elapsed_ns ();
+  } in
+  Check_proposal (work, proposal, route)
+
+let waiting_work t =
   match t.proposal_wait with
   | Some wait when not (proposal_verify_current t wait.proposal) ->
     t.proposal_wait <- None;
-    Lwt.return_unit
+    None
   | Some wait when Int64.compare
                      (Mtime_clock.elapsed_ns ())
                      wait.retry_at >= 0 ->
@@ -2885,11 +2881,11 @@ let replay_waiting_proposal t =
       wait.proposal.epoch_id
       wait.proposal.round
       wait.attempt;
-    admit_current_proposal t ~route:wait.route wait.proposal
+    Some (check_work t wait.proposal wait.route)
   | Some _
-  | None -> Lwt.return_unit
+  | None -> None
 
-let replay_pending_proposal t =
+let pending_work t =
   let height = t.engine.state.height in
   let round = t.engine.state.round in
   Hashtbl.filter_map_inplace
@@ -2898,14 +2894,80 @@ let replay_pending_proposal t =
     t.pending_proposals;
   let key = proposal_round_key height round in
   match Hashtbl.find_opt t.pending_proposals key with
-  | None -> Lwt.return_unit
+  | None -> None
   | Some p ->
     Hashtbl.remove t.pending_proposals key;
     log_node t.config.my_addr
       "event = replay_pending_proposal epoch = %Ld round = %d"
       height
       round;
-    admit_current_proposal t ~route:Publish_verified_proposal p
+    Some (check_work t p Publish_verified_proposal)
+
+let next_proposal_work t =
+  if not t.running || not (C_work_slot.idle t.proposal_slot) then None
+  else
+    match waiting_work t with
+    | Some _ as work -> work
+    | None ->
+      match pending_work t with
+      | Some _ as work -> work
+      | None -> Option.map (fun work -> Build_proposal work) (leader_work t)
+
+let move_proposal_slot t message =
+  let slot, effects = C_work_slot.step t.proposal_slot message in
+  t.proposal_slot <- slot;
+  effects
+
+let run_proposal_work t job =
+  let open Lwt.Syntax in
+  Lwt.catch
+    (fun () ->
+      match job with
+      | Check_proposal (work, p, _) ->
+        let+ verdict = C_proposal_work_gate.run t.proposal_work_gate
+          ~relevant:(fun () -> t.running && work.gen = t.engine.generation
+            && check_proposal_frame t p)
+          (fun () ->
+            t.proposal_verify <- Some work;
+            let+ result = t.config.verify_proposal p in Some result)
+        in
+        Checked_proposal verdict
+      | Build_proposal work ->
+        let+ plan = C_proposal_work_gate.run t.proposal_work_gate
+          ~relevant:(fun () -> t.running && vote_allowed t
+            && C_engine.am_i_leader t.engine && proposal_work_current t work)
+          (fun () -> t.config.make_proposal work.height)
+        in
+        Built_proposal plan)
+    (fun exn -> Lwt.return (Proposal_failed (Printexc.to_string exn)))
+
+let finish_proposal_work t job reply =
+  match job with
+  | Check_proposal (work, p, route) ->
+    if not t.running || work.gen <> t.engine.generation then Lwt.return_unit
+    else
+      (match reply with
+       | Checked_proposal verdict -> finish_check t ~route p verdict
+       | Proposal_failed reason ->
+         warn_node t.config.my_addr
+           "event = proposal_verify_wait epoch = %Ld round = %d reason = %s"
+           p.epoch_id p.round reason;
+         finish_check t ~route p (Some Proposal_wait)
+       | Built_proposal _ -> Lwt.fail_with "proposal reply type differs")
+  | Build_proposal work ->
+    clear_proposal_build t ~gen:work.gen ~height:work.height
+      ~round:work.round ~step:work.step;
+    (match reply with
+     | Built_proposal plan ->
+       ignore (finish_build t work plan);
+       Lwt.return_unit
+     | Proposal_failed reason ->
+       warn_node t.config.my_addr
+         "event = make_proposal_failed height = %Ld round = %d reason = %s"
+         work.height work.round reason;
+       ignore (finish_build t work None);
+       Lwt.return_unit
+     | Checked_proposal _ -> Lwt.fail_with "proposal reply type differs")
 
 let vote_type_rank = function
   | C_types.Prevote -> 0
@@ -3000,9 +3062,14 @@ let notify_fold t ~next_epoch event =
 let rec process_outputs_once t =
   let open Lwt.Syntax in
   let* () = maybe_activate_relief t in
+  let* () = Lwt_list.iter_s
+    (function
+      | C_work_slot.Deliver (job, reply) -> finish_proposal_work t job reply
+      | C_work_slot.Run _ | C_work_slot.Complete _ ->
+        Lwt.fail_with "proposal completion started work")
+    (move_proposal_slot t C_work_slot.Take)
+  in
   C_engine.on_ready t.engine ~sign_fn:t.config.sign_fn;
-  let* () = replay_waiting_proposal t in
-  let* () = replay_pending_proposal t in
   let replayed_evidence = replay_future_votes t in
   let* () =
     Lwt_list.iter_s
@@ -3034,12 +3101,6 @@ let rec process_outputs_once t =
       Some pending
   ) t.pending_finalizes;
   let outputs = C_engine.drain_outputs t.engine in
-  let has_finalized =
-    List.exists (function
-      | C_engine.Finalized _ -> true
-      | _ -> false
-    ) outputs
-  in
   List.iter (fun o ->
     let name = match o with
       | C_engine.SendPropose _ -> "SendPropose"
@@ -3126,7 +3187,6 @@ let rec process_outputs_once t =
                       ~round
                       ~generation
                       ~sign_fn:t.config.sign_fn;
-                    let* _ = try_current_leader_proposal t in
                     process_outputs t
                   end
                 in
@@ -3322,15 +3382,45 @@ let rec process_outputs_once t =
                        end)
                      (function Lwt.Canceled -> Lwt.return_unit | exn -> Lwt.fail exn))
                | Some _ | None -> t.epoch_start_mono <- now_ns);
-              let* _ = try_current_leader_proposal t in
               let* () = process_outputs t in
               Lwt.return_unit)
       outputs
   in
-  if has_finalized then Lwt.return_unit
-  else
-    let* proposed = try_current_leader_proposal t in
-    if proposed then process_outputs t else Lwt.return_unit
+  (match next_proposal_work t with
+   | None -> ()
+   | Some job ->
+     List.iter
+       (function
+         | C_work_slot.Run (id, job) ->
+           (match job with
+            | Check_proposal (work, _, _) -> t.proposal_verify <- Some work
+            | Build_proposal work ->
+              t.proposal_retry <- None;
+              t.proposal_build <- Some work);
+           let finish reply =
+             List.iter (function
+               | C_work_slot.Complete (Check_proposal (work, _, _)) ->
+                 if t.proposal_verify = Some work then t.proposal_verify <- None
+               | C_work_slot.Complete (Build_proposal work) ->
+                 if t.proposal_build = Some work then t.proposal_build <- None
+               | C_work_slot.Run _ | C_work_slot.Deliver _ ->
+                 failwith "proposal finish produced work")
+               (move_proposal_slot t (C_work_slot.Finish (id, reply)));
+             if t.running && C_work_slot.ready t.proposal_slot then
+               Lwt.async (fun () -> Lwt.catch
+                 (fun () -> process_outputs t)
+                 (fun exn ->
+                   error_node t.config.my_addr
+                     "event = proposal_delivery_failed reason = %s"
+                     (Printexc.to_string exn);
+                   Lwt.return_unit))
+           in
+           Lwt.on_any (run_proposal_work t job) finish
+             (fun exn -> finish (Proposal_failed (Printexc.to_string exn)))
+         | C_work_slot.Deliver _ | C_work_slot.Complete _ ->
+           failwith "proposal submit delivered a reply")
+       (move_proposal_slot t (C_work_slot.Submit job)));
+  Lwt.return_unit
 and process_outputs t =
   let open Lwt.Syntax in
   let actor, request = C_output_actor.request t.output_actor in
@@ -3399,7 +3489,6 @@ let accept_finality_proof t finalize =
                   "event = finality_proof status = repaired epoch = %Ld"
                   finalize.epoch_id;
                 let* () = broadcast_round_sync t ~request:true in
-                let* _ = try_current_leader_proposal t in
                 process_outputs t
               end
           end)
@@ -5162,7 +5251,6 @@ let try_propose ?parent_commit t ~header ~tx_hashes =
 let wake_ready t =
   let open Lwt.Syntax in
   let* () = broadcast_round_sync t ~request:true in
-  let* _ = try_current_leader_proposal t in
   process_outputs t
 
 let clear_local_transients t =
@@ -5263,6 +5351,7 @@ let realign_progress t ~height ~round =
     wake_ready t
 
 let start t =
+  ignore (move_proposal_slot t C_work_slot.Open);
   C_engine.set_round_skip_ready
     t.engine
     (fun () -> not (proposal_work_active t));
@@ -5320,11 +5409,14 @@ let start t =
     Lwt.async (fun () ->
       recover_finality_proof t);
   let* () = broadcast_round_sync t ~request:true in
-  let* _ = try_current_leader_proposal t in
   process_outputs t
 
 let stop t =
   t.running <- false;
+  ignore (move_proposal_slot t C_work_slot.Close);
+  t.proposal_build <- None;
+  t.proposal_verify <- None;
+  t.proposal_retry <- None;
   clear_pace t;
   Lwt.return_unit
 

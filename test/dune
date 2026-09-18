@@ -259,6 +259,17 @@
  (libraries octra_node_runtime octra_core zarith base64 mirage-crypto-ec mirage-crypto-rng.unix))
 
 (test
+ (name test_node_runtime_p2p_tx_handler)
+ (modules test_node_runtime_p2p_tx_handler)
+ (libraries octra_node_runtime octra_net octra_core yojson zarith base64
+  mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
+ (name test_p2p_tx_gossip)
+ (modules test_p2p_tx_gossip)
+ (libraries octra_net))
+
+(test
  (name test_aml_profile)
  (modules test_aml_profile)
  (libraries octra_vm base64 digestif zarith))

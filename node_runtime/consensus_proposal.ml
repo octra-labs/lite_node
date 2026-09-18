@@ -166,6 +166,7 @@ type build_preview_request = {
 }
 
 type make_proposal_deps = {
+  current : unit -> bool;
   start_height : int64 -> unit Lwt.t;
   current_epoch : unit -> int;
   state_attested : unit -> bool;
@@ -207,6 +208,7 @@ type make_proposal_deps = {
 }
 
 type verify_proposal_deps = {
+  current : unit -> bool;
   now : unit -> float;
   previous_epoch_ts : int64 -> float option;
   quarantine_active : unit -> bool;
@@ -1488,12 +1490,13 @@ let time_verify (propose : Octra_consensus.C_types.propose) pid step run =
       write (match exn with Lwt.Canceled -> "cancelled" | _ -> "exception");
       Lwt.fail exn)
 
-let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
+let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
   let accept = Octra_consensus.C_driver.Proposal_accept in
   let reject = Octra_consensus.C_driver.Proposal_reject in
   let wait = Octra_consensus.C_driver.Proposal_wait in
+  if not (deps.current ()) then Lwt.return wait else
   match
     deps.verify_parent_commit
       ~epoch_id:propose.epoch_id
@@ -1573,6 +1576,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         ~max_tries:deps.max_prev_root_wait_tries
         ~delay_seconds:deps.prev_root_wait_delay_seconds
     in
+    if not (deps.current ()) then Lwt.return wait else
     let initial_our = root_sample.initial_root in
     let our_root = root_sample.current_root in
     match
@@ -1634,6 +1638,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
         Lwt.return reject
       | Tx_hash_ok tx_hashes_hex ->
         let* local_ledger_root_for_preview = deps.read_local_ledger_root () in
+        if not (deps.current ()) then Lwt.return wait else
         let pid = Octra_consensus.C_hash.proposal_id propose.header in
         let staging_snapshot = deps.staging_txs () in
         let tx_list_local =
@@ -1708,6 +1713,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
             ~hashes_empty:
               (Consensus_bundle_cache.header_has_empty_bundle propose.header))
         in
+        if not (deps.current ()) then Lwt.return wait else
         match bundle_state with
         | Consensus_bundle_fetch.Proposal_wait ->
           Lwt.return wait
@@ -1742,11 +1748,14 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
               ~tx_hashes:candidate_hashes
               verified.candidates)
           in
-          if local_candidates.skipped_count > 0 then
-            Octra_log.warn "consensus"
-              "verify_proposal candidate_preverify_skipped = %d sample = %s"
-              local_candidates.skipped_count
-              local_candidates.skipped_sample;
+          if not (deps.current ()) then Lwt.return wait else
+          let () =
+            if local_candidates.skipped_count > 0 then
+              Octra_log.warn "consensus"
+                "verify_proposal candidate_preverify_skipped = %d sample = %s"
+                local_candidates.skipped_count
+                local_candidates.skipped_sample
+          in
           let local_candidate_hashes =
             List.map Transaction.hash local_candidates.ready_txs
           in
@@ -1820,6 +1829,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                      ~rejections
                      result)
             in
+            if not (deps.current ()) then Lwt.return wait else
             match rejection_partition with
             | Error reason ->
               Octra_log.warn "consensus"
@@ -1842,6 +1852,7 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
                 txs = tx_list;
               })
             in
+            if not (deps.current ()) then Lwt.return wait else
             match
               verify_preview_partition
                 ~candidates:tx_list
@@ -1928,8 +1939,9 @@ let verify_proposal deps ~chain_id (propose : Octra_consensus.C_types.propose) =
               Lwt.return reject
             end
 
-let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
+let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~epoch_id =
   let open Lwt.Syntax in
+  if not (deps.current ()) then Lwt.return_none else
   let* proposal_admission =
     handle_proposal_admission
       ~start_height:deps.start_height
@@ -1939,6 +1951,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
       ~quarantine_active:(deps.quarantine_active ())
       ~quarantine_reason:(deps.quarantine_reason ())
   in
+  if not (deps.current ()) then Lwt.return_none else
   match proposal_admission with
   | Proposal_defer ->
     Lwt.return_none
@@ -1971,6 +1984,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
         Lwt.return_none
       | Ok parent_commit ->
     let* prev_ledger_root_opt = deps.read_prev_ledger_root () in
+    if not (deps.current ()) then Lwt.return_none else
     let roots =
       proposal_roots
         ~root_to_raw32
@@ -2019,7 +2033,8 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
           ~limits
           tx_list_admitted
       in
-      log_build_skipped ~epoch_id pre_shape;
+      if not (deps.current ()) then Lwt.return_none else
+      let () = log_build_skipped ~epoch_id pre_shape in
       let tx_list = pre_shape.txs in
       log_build_preverify
         ~epoch_id
@@ -2034,7 +2049,8 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
       let validator_pubkeys = deps.validator_pubkeys epoch_id in
       let epoch_ts = deps.now () in
       let rec preview_until_stable attempt candidates remaining accumulated =
-        if attempt > (2 * List.length tx_list) + 1 then
+        if not (deps.current ()) then Lwt.return_error "proposal context changed"
+        else if attempt > (2 * List.length tx_list) + 1 then
           Lwt.return_error "preview_retry_limit"
         else
           let remaining_hashes = List.map Transaction.hash remaining in
@@ -2058,6 +2074,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
               txs = remaining;
             }
           in
+          if not (deps.current ()) then Lwt.return_error "proposal context changed" else
           match preview_result with
           | Stdlib.Error error ->
             Lwt.return_error error
@@ -2133,6 +2150,7 @@ let make_proposal deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
             end
       in
       let* stable_preview = preview_until_stable 1 tx_list tx_list [] in
+      if not (deps.current ()) then Lwt.return_none else
       match stable_preview with
       | Stdlib.Error error ->
         Octra_log.warn "consensus"

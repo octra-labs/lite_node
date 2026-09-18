@@ -29,6 +29,8 @@ let handle_tx io tx =
   if io.has_tx tx_hash then ()
   else
     let now = io.now () in
+    if not (Octra_net.P2p_tx_gossip_guard.remember io.guard ~now tx_hash) then ()
+    else
     let sender_pk = io.sender_pk tx in
     let h12 = Text.hash_short tx_hash in
     match P2p_tx_admit.admit ~now ~max_drift:io.max_drift ~sender_pk tx with
