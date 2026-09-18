@@ -6,8 +6,8 @@ from typing import Optional
 
 from validator_common import ValidatorError
 
-SCHEMA = "octra_sync_need_v1"
-CAUSES = frozenset({"root", "journal", "range"})
+SCHEMA = "octra_sync_need_v2"
+CAUSES = frozenset({"root", "journal", "range", "conflict"})
 FIELDS = frozenset({"schema", "chain_id", "cause", "epoch", "head", "target"})
 MAX_BYTES = 4096
 
@@ -38,11 +38,14 @@ def make(chain, cause, epoch, head, target):
 def decode(value, chain):
     if not isinstance(value, dict) or set(value) != FIELDS:
         raise ValidatorError("recovery marker fields are invalid")
-    if value.get("schema") != SCHEMA or value.get("chain_id") != chain:
+    if value.get("schema") not in (SCHEMA, "octra_sync_need_v1") or value.get("chain_id") != chain:
         raise ValidatorError("recovery marker binding differs")
+    cause = value["cause"]
+    if value["schema"] == "octra_sync_need_v1" and cause == "journal":
+        cause = "conflict"
     return make(
         chain,
-        value["cause"],
+        cause,
         value["epoch"],
         value["head"],
         value["target"],

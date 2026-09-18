@@ -66,8 +66,7 @@ def move_state(source, target):
 def need_of(value, chain):
     return decode(value, chain)
 
-def read_need(data_path, chain):
-    path = data_path / "recovery/sync_need.json"
+def read_marker(path, chain):
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -99,6 +98,14 @@ def read_need(data_path, chain):
         raise ValidatorError("recovery marker is unreadable") from error
     finally:
         os.close(descriptor)
+
+def read_need(data_path, chain):
+    marked = read_marker(data_path / "recovery/sync_conflict.json", chain)
+    if marked is not None:
+        if marked.cause != "conflict":
+            raise ValidatorError("conflict marker cause is invalid")
+        return marked
+    return read_marker(data_path / "recovery/sync_need.json", chain)
 
 def preserve_state(identity_path, data_path, head):
     data_wallet = data_path / "wallet.json"
@@ -137,12 +144,13 @@ def recover(config, replace_state=False, plan=None, min_epoch=None):
         else None
     )
     if ready and need is not None and not replace_state:
+        held = need.cause == "conflict" or head["epoch"] < need.head
         emit(
             event="recovery",
-            status="verify",
+            status="held" if held else "verify",
             cause=need.cause,
             epoch=need.epoch,
-            action="start_observer",
+            action="signed_snapshot_required" if held else "start_observer",
         )
         return
     if ready and not replace_state:

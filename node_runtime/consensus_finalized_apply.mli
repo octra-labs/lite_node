@@ -11,7 +11,8 @@ type deps = {
   persist_finality_certificate :
     validator_set:C_types.validator_set ->
     C_types.finalize ->
-    unit;
+    C_types.finalize;
+  store_proposer : C_types.finalize -> unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -46,7 +47,8 @@ type node_deps = {
   persist_finality_certificate :
     validator_set:C_types.validator_set ->
     C_types.finalize ->
-    unit;
+    C_types.finalize;
+  store_proposer : C_types.finalize -> unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->

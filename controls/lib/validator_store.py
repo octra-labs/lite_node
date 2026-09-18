@@ -220,13 +220,23 @@ def report(values):
             max_epoch=gc.get("max_epoch", "unknown"),
         )
 
+def require_clear(data_path):
+    for name in ("sync_need.json", "sync_conflict.json"):
+        path = data_path / "recovery" / name
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValidatorError("recovery marker inspection failed") from error
+        raise ValidatorError("recovery marker is present")
+
 def live_state(values, config):
     data_path = data_dir(values)
     if data_path.parent == data_path or not data_path.is_dir():
         raise ValidatorError("data directory is invalid")
     head = validate_checkpoint(data_path, values, allow_progress=True)
-    if (data_path / "recovery/sync_need.json").exists():
-        raise ValidatorError("recovery marker is present")
+    require_clear(data_path)
     status = rpc_status(values["OCTRA_API_PORT"])
     if not isinstance(status, dict):
         raise ValidatorError("local RPC is unavailable")
@@ -276,12 +286,14 @@ def prior_plan(data_path, identity):
     return plan, skipped
 
 def remove_prior(data_path, identity):
+    require_clear(data_path)
     plan, skipped = prior_plan(data_path, identity)
     for path, reason in skipped:
         emit(event="prior_skipped", path=path, reason=reason)
     removed = 0
     total = 0
     for path, size in plan:
+        require_clear(data_path)
         staged = path.with_name(path.name + f".removing-{os.getpid()}")
         path.replace(staged)
         shutil.rmtree(staged)

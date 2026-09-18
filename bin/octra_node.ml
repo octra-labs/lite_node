@@ -727,17 +727,18 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         (fun ~head ~root ->
           set_state_attested ~head ~root;
           match
-            Sync_mark.consume_journal
+            Sync_mark.finish_journal
               ~data_dir
               ~chain:startup_network.chain_id
               ~verified_head:head
               need
           with
-          | Ok () ->
+          | Ok false -> ()
+          | Ok true ->
             Log.warn "init"
               "event = sync_recovery status = consumed cause = journal head = %d action = restart"
               head;
-            exit_success ()
+            exit Sync_mark.restart_code
           | Error reason ->
             Log.fatal "init"
               "event = sync_recovery status = rejected cause = journal reason = %s"
@@ -758,7 +759,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               Log.warn "init"
                 "event = sync_recovery status = consumed cause = root head = %d action = restart"
                 head;
-              exit_success ()
+              exit Sync_mark.restart_code
             | Error reason ->
               Log.fatal "init"
                 "event = sync_recovery status = rejected cause = root reason = %s"

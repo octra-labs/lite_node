@@ -675,7 +675,6 @@ let finalized_deps (deps : deps) =
       Consensus_bundle_cache.prune_frozen
         deps.proposal_bundles
         ~finalized_epoch);
-    store_proposer = deps.finality.store_flow_proposer;
     store_expected_root = deps.finality.store_expected_root;
     store_finalized = deps.finality.store_finalized_with_set;
     remove_finalized = deps.finality.remove_finalized;

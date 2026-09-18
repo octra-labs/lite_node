@@ -30,6 +30,12 @@ type seed_result =
   | Seeded
   | Seed_current
 
+type seed_fault =
+  | Seed_pending
+  | Seed_invalid of string
+  | Seed_conflict of string
+  | Seed_io of string
+
 type conflict =
   | History
   | Committed
@@ -40,6 +46,8 @@ type conflict =
 val classify_conflict : exn -> conflict option
 
 val conflict_label : conflict -> string
+
+val guard : string -> Octra_consensus.C_types.finalize -> (unit -> 'a) -> 'a
 
 val history_limit : int64
 
@@ -75,7 +83,7 @@ val seed :
   validator_set:Octra_consensus.C_types.validator_set ->
   finalize:Octra_consensus.C_types.finalize ->
   string ->
-  (seed_result, string) result
+  (seed_result, seed_fault) result
 
 val read_committed_validated :
   chain_id:string ->
@@ -211,6 +219,30 @@ val promote_applied :
   epoch:int64 ->
   state_root:string ->
   unit
+
+val resume_join :
+  chain_id:string ->
+  set_hash:(int64 -> (string, string) result) ->
+  head:int ->
+  root:string ->
+  txid:int64 ->
+  string ->
+  unit
+
+val prepare :
+  string ->
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  Octra_consensus.C_types.finalize ->
+  Octra_consensus.C_types.finalize
+
+val stage :
+  string ->
+  chain_id:string ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  bundle:bundle ->
+  Octra_consensus.C_types.finalize ->
+  Octra_consensus.C_types.finalize
 
 val committed :
   string ->

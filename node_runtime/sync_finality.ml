@@ -15,14 +15,24 @@ type outcome =
   | Advanced
   | Current
   | Seeded
+  | Pending
 
 type fault =
   | Root of string
   | Journal of string
+  | Conflict of string
 
 let reason = function
   | Root value
-  | Journal value -> value
+  | Journal value
+  | Conflict value -> value
+
+let recovery ~head = function
+  | Root _ when head >= 0 && head < max_int ->
+    Some (Sync_need.root ~epoch:(head + 1) ~head)
+  | Conflict _ when head >= 0 && head < max_int ->
+    Some (Sync_need.conflict ~epoch:(head + 1) ~head)
+  | Root _ | Conflict _ | Journal _ -> None
 
 let ( let* ) value next =
   match value with
@@ -45,7 +55,8 @@ let anchor_file path =
   | Unix.Unix_error (Unix.ENOENT, _, _) -> Ok false
   | exn -> root (Printexc.to_string exn)
 
-let preflight_log data_dir entry =
+let preflight_log data_dir finalize =
+  let entry = Finality_log.of_finalize finalize in
   try
     match Finality_log.last_entry_fast data_dir with
     | None -> Ok false
@@ -53,10 +64,18 @@ let preflight_log data_dir entry =
       Ok false
     | Some prior when Finality_log.same_commitment prior entry ->
       Ok true
+    | Some prior when Finality_log.can_upgrade_catchup_placeholder prior entry ->
+      Ok false
+    | Some prior when prior.Finality_log.height > entry.Finality_log.height ->
+      journal "finality log is ahead of checkpoint"
     | Some _ ->
-      journal "finality log conflicts with checkpoint"
+      Journal.guard data_dir finalize (fun () ->
+        failwith "conflicting finality at committed height")
   with exn ->
-    journal (Printexc.to_string exn)
+    let detail = Printexc.to_string exn in
+    match Journal.classify_conflict exn with
+    | Some _ -> Error (Conflict detail)
+    | None -> journal detail
 
 let local_head ~raw_to_hex ~head ~cached ~epoch_root =
   match cached with
@@ -133,8 +152,17 @@ let seed ~data_dir ~chain_id ~floor ~head ~root:local_root ~txid
                 root "state sync active validator set mismatch"
               else
                 let finalize = Anchor.finality anchor in
+                let finalize =
+                  match Journal.read_committed_epoch_validated ~chain_id
+                    ~validator_set:active ~epoch:finalize.epoch_id data_dir with
+                  | Journal.Valid record when Journal.same_block record.finalize finalize ->
+                    record.finalize
+                  | Journal.Valid _ | Journal.Missing | Journal.Invalid _ -> finalize
+                in
                 let entry = Finality_log.of_finalize finalize in
-                let* log_current = preflight_log data_dir entry in
+                if Journal.pending data_dir then Ok Pending
+                else
+                let* log_current = preflight_log data_dir finalize in
                 begin
                   match
                     Journal.seed
@@ -143,7 +171,9 @@ let seed ~data_dir ~chain_id ~floor ~head ~root:local_root ~txid
                       ~finalize
                       data_dir
                   with
-                  | Error reason -> journal reason
+                  | Error Journal.Seed_pending -> Ok Pending
+                  | Error (Journal.Seed_conflict reason) -> Error (Conflict reason)
+                  | Error (Journal.Seed_invalid reason | Journal.Seed_io reason) -> journal reason
                   | Ok journal_state ->
                     begin
                       try

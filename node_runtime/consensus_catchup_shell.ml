@@ -155,7 +155,7 @@ type record_apply_deps = {
   put_expected_root : int -> string -> unit;
   activate_gap : unit -> unit;
   point_source : apply_point_source;
-  write_finality : validated_record -> unit;
+  write_finality : validated_record -> validated_record;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   advance_height : int64 -> unit Lwt.t;
@@ -192,7 +192,7 @@ type target_wiring = {
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_expected_root : int -> string -> unit;
   activate_gap : unit -> unit;
-  write_finality : validated_record -> unit;
+  write_finality : validated_record -> validated_record;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   advance_height : int64 -> unit Lwt.t;
@@ -228,7 +228,7 @@ type node_target_wiring = {
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
   queue : Consensus_catchup_queue.t;
-  write_finality : validated_record -> unit;
+  write_finality : validated_record -> validated_record;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   advance_height : int64 -> unit Lwt.t;
@@ -255,7 +255,7 @@ type driver_runner_wiring = {
   cached_head : unit -> cached_apply_head;
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
-  write_finality : validated_record -> unit;
+  write_finality : validated_record -> validated_record;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   base_eic : unit -> string;
@@ -284,7 +284,7 @@ type driver_runner_node_wiring = {
   cached_root : unit -> Consensus_driver_read.cached_root;
   next_txid : unit -> int64;
   finality : Consensus_finality_state.callbacks;
-  write_finality : validated_record -> unit;
+  write_finality : validated_record -> validated_record;
   promote_finality : validated_record -> unit;
   apply_record : validated_record -> unit Lwt.t;
   base_eic : unit -> string;
@@ -719,6 +719,8 @@ let bind_finality validated finalized =
               epoch_ts = header.ts;
               creator_addr = proposer.creator_addr;
               commit_round = proposer.commit_round;
+              finality = Option.map (fun value -> { value with
+                Octra_consensus.C_codec.finalize = finalized }) record.finality;
             };
             proposer = Some proposer;
             reward;
@@ -802,7 +804,6 @@ let apply_validated_record (deps : record_apply_deps) ~head_before_record
     | Error error ->
       failwith error
   in
-  store_record_metadata deps validated;
   let advance () =
     deps.advance_height
       (Int64.succ validated.record.Octra_consensus.C_codec.epoch_id)
@@ -814,11 +815,13 @@ let apply_validated_record (deps : record_apply_deps) ~head_before_record
   | Record_skip_applied ->
     let* point = read_apply_point deps.point_source in
     assert_already_applied ~head_before_record validated point;
-    deps.write_finality validated;
+    let validated = deps.write_finality validated in
+    store_record_metadata deps validated;
     deps.promote_finality validated;
     advance ()
   | Record_apply ->
-    deps.write_finality validated;
+    let validated = deps.write_finality validated in
+    store_record_metadata deps validated;
     let* () = deps.apply_record validated in
     assert_post_apply validated (cached_apply_point deps.point_source);
     deps.promote_finality validated;

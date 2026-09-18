@@ -12,6 +12,21 @@ type write =
 
 val path : string -> string
 
+val conflict_path : string -> string
+
+val restart_code : int
+
+val write_new : string -> string -> (bool, string) result
+
+val journal_ready : verified_head:int -> Sync_need.t -> (bool, string) result
+
+val finish_journal :
+  data_dir:string ->
+  chain:string ->
+  verified_head:int ->
+  Sync_need.t ->
+  (bool, string) result
+
 val read : data_dir:string -> chain:string -> state
 
 val need : state -> (Sync_need.t option, string) result

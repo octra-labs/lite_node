@@ -22,7 +22,7 @@ type node_deps = {
   persist_finality_certificate :
     validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->
-    unit;
+    Octra_consensus.C_types.finalize;
   persist_finality_bundle :
     Octra_consensus.C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -176,6 +176,9 @@ let create_node deps =
           check_finality = deps.check_finality;
           write_finality = deps.write_finality;
           persist_finality_certificate = deps.persist_finality_certificate;
+          store_proposer = (fun finalize ->
+            Consensus_epoch_apply_proposer.proposer_from_finalized finalize
+            |> Option.iter (deps.finality.store_proposer (Int64.to_int finalize.epoch_id)));
           persist_finality_bundle = deps.persist_finality_bundle;
           chaos_after_finality_log = deps.chaos_after_finality_log;
           cached_bundle = (fun ~proposal_id ->
@@ -241,7 +244,7 @@ let create_node deps =
               epoch;
             let epoch = Int64.to_int epoch in
             deps.require_sync
-              (Sync_need.journal ~epoch ~head:(max 0 (epoch - 1)))
+              (Sync_need.conflict ~epoch ~head:(max 0 (epoch - 1)))
         | _ -> deps.fatal_exit ()
       end;
       stop_after_fatal ())
@@ -252,15 +255,18 @@ let node_deps_of_runtime runtime =
   in
   {
     check_finality = (fun finalize ->
-      Octra_consensus.Finality_log.check_write
-        runtime.data_dir
-        (Octra_consensus.Finality_log.of_finalize finalize));
+      Consensus_finality_journal.guard runtime.data_dir finalize (fun () ->
+        Octra_consensus.Finality_log.check_write
+          runtime.data_dir
+          (Octra_consensus.Finality_log.of_finalize finalize)));
     write_finality = (fun finalize ->
-      Octra_consensus.Finality_log.write runtime.data_dir
-        (Octra_consensus.Finality_log.of_finalize finalize));
+      Consensus_finality_journal.guard runtime.data_dir finalize (fun () ->
+        Octra_consensus.Finality_log.write runtime.data_dir
+          (Octra_consensus.Finality_log.of_finalize finalize)));
     persist_finality_certificate = (fun ~validator_set finalize ->
-      Consensus_finality_journal.persist_certificate
+      Consensus_finality_journal.prepare
         runtime.data_dir
+        ~chain_id:finalize.Octra_consensus.C_types.chain_id
         ~validator_set
         finalize);
     persist_finality_bundle = (fun finalize bundle ->

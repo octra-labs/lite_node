@@ -14,7 +14,8 @@ type deps = {
   persist_finality_certificate :
     validator_set:C_types.validator_set ->
     C_types.finalize ->
-    unit;
+    C_types.finalize;
+  store_proposer : C_types.finalize -> unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -49,7 +50,8 @@ type node_deps = {
   persist_finality_certificate :
     validator_set:C_types.validator_set ->
     C_types.finalize ->
-    unit;
+    C_types.finalize;
+  store_proposer : C_types.finalize -> unit;
   persist_finality_bundle :
     C_types.finalize ->
     Consensus_finality_journal.bundle ->
@@ -83,6 +85,7 @@ let node_deps input =
     check_finality = input.check_finality;
     write_finality = input.write_finality;
     persist_finality_certificate = input.persist_finality_certificate;
+    store_proposer = input.store_proposer;
     persist_finality_bundle = input.persist_finality_bundle;
     chaos_after_finality_log = input.chaos_after_finality_log;
     cached_bundle = input.cached_bundle;
@@ -192,11 +195,12 @@ let rec await_bundle (deps : deps) header proposal_id delay remaining quarantine
 
 let run (deps : deps) ~validator_set finalize =
   let open Lwt.Syntax in
+  deps.check_finality finalize;
+  let finalize = deps.persist_finality_certificate ~validator_set finalize in
+  deps.store_proposer finalize;
   let header = finalize.C_types.header in
   let round = finalize.C_types.commit_round in
   let proposal_id = C_hash.proposal_id header in
-  deps.check_finality finalize;
-  deps.persist_finality_certificate ~validator_set finalize;
   let bundle_persisted =
     persist_available_bundle deps finalize proposal_id
   in

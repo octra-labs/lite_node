@@ -225,6 +225,11 @@ type vote_fault = {
   reason : string;
 }
 
+type pace_wait = {
+  plan : C_pace.t;
+  wait : unit Lwt.t;
+}
+
 type t = {
   mutable n_validators : int;
   config : config;
@@ -235,6 +240,7 @@ type t = {
   historical_replays : C_seen.t;
   mutable running : bool;
   mutable epoch_start_mono : int64;
+  mutable pace : pace_wait option;
   epoch_root_responses : (int64, epoch_root_response_record list) Hashtbl.t;
   bundle_responses : (string, bundle_response_record list) Hashtbl.t;
   catchup_responses : (string, catchup_range_response_record list) Hashtbl.t;
@@ -443,6 +449,7 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
     seen = C_seen.create ~capacity:10_000; running = false;
     historical_replays = C_seen.create ~capacity:4_096;
     epoch_start_mono = Mtime_clock.elapsed_ns ();
+    pace = None;
     epoch_root_responses = Hashtbl.create 16;
     bundle_responses = Hashtbl.create 16;
     catchup_responses = Hashtbl.create 8;
@@ -865,6 +872,19 @@ let queue_future_finalize t (f : C_types.finalize) =
 let vote_still_relevant t (v : C_types.vote) =
   Int64.compare v.epoch_id t.engine.state.height = 0
   && Int64.compare v.epoch_id t.engine.finalized_height > 0
+
+let finalized_vote ~height ~address pending (vote : C_types.vote) =
+  match pending with
+  | None -> false
+  | Some (value : C_types.finalize) ->
+    vote.validator = address
+    && vote.vote_type = C_types.Precommit
+    && not (Octra_net.Hash_domain.is_nil vote.proposal_id)
+    && vote.epoch_id = height
+    && vote.epoch_id = value.epoch_id
+    && vote.chain_id = value.chain_id
+    && vote.round = value.commit_round
+    && vote.proposal_id = value.proposal_id
 
 let hold_vote_fault t (v : C_types.vote) reason =
   t.vote_fault <- Some { epoch_id = v.epoch_id; round = v.round; reason };
@@ -1969,7 +1989,18 @@ let replay_deferred_proposal t =
       ~execute_fn:(fun _ -> true)
       ~sign_fn:t.config.sign_fn
 
+let clear_pace t =
+  let prior = t.pace in
+  t.pace <- None;
+  Option.iter (fun pending -> Lwt.cancel pending.wait) prior
+
+let pace_left t =
+  C_pace.remaining (Option.map (fun pending -> pending.plan) t.pace)
+    ~height:t.engine.state.height ~generation:t.engine.generation
+    ~now:(Mtime_clock.elapsed_ns ())
+
 let clear_round_sync_jump t ~height ~round =
+  clear_pace t;
   t.proposal_build <- None;
   t.proposal_retry <- None;
   t.proposal_verify <- None;
@@ -2582,6 +2613,7 @@ let try_current_leader_proposal t =
   let open Lwt.Syntax in
   if t.running
      && vote_allowed t
+     && pace_left t = 0L
      && C_engine.am_i_leader t.engine
      && t.engine.state.step = C_types.ProposeStep then begin
     let gen = t.engine.generation in
@@ -3055,9 +3087,14 @@ let rec process_outputs_once t =
             | C_engine.RequestRoundEvidence round ->
               broadcast_round_sync_at t ~round
             | C_engine.ScheduleTimeout { step; round; delay_ms; generation } ->
+              let pace_s =
+                if step = C_types.ProposeStep && generation = t.engine.generation then
+                  Int64.to_float (pace_left t) /. 1e9
+                else 0.0
+              in
               Lwt.async (fun () ->
                 let* () =
-                  Lwt_unix.sleep (float_of_int delay_ms /. 1000.0)
+                  Lwt_unix.sleep (pace_s +. float_of_int delay_ms /. 1000.0)
                 in
                 let rec fire () =
                   if not t.running then Lwt.return_unit
@@ -3101,7 +3138,14 @@ let rec process_outputs_once t =
               in
               if step = C_types.ProposeStep then ask_past t else Lwt.return_unit
             | C_engine.SendVote (v, proposal) ->
-              if not (vote_still_relevant t v) then begin
+              if finalized_vote ~height:t.engine.state.height
+                ~address:t.config.my_addr t.engine.pending_finalized v then begin
+                let* stored = saved_vote ?proposal t v in
+                log_node t.config.my_addr
+                  "event = finalized_vote epoch = %Ld round = %d stored = %b"
+                  v.epoch_id v.round (Option.is_some stored);
+                Lwt.return_unit
+              end else if not (vote_still_relevant t v) then begin
                 log_node t.config.my_addr
                   "event = drop_stale_vote_output type = %s epoch = %Ld round = %d height = %Ld"
                   (vote_step_label v.vote_type)
@@ -3249,12 +3293,35 @@ let rec process_outputs_once t =
                 next
                 carry_ms
                 wait_ms;
-              let* () =
-                if remaining_ns > 100_000_000L then
-                  Lwt_unix.sleep (Int64.to_float remaining_ns /. 1e9)
-                else Lwt.return_unit
+              clear_pace t;
+              let plan = C_pace.make ~height:next
+                ~generation:t.engine.generation ~now:now_ns
+                ~started:t.epoch_start_mono ~interval:slot_ns
+                ~delay:epoch_time_remaining_ns
               in
-              t.epoch_start_mono <- Mtime_clock.elapsed_ns ();
+              (match plan with
+               | Some plan when t.running ->
+                 let wait = Lwt_unix.sleep (Int64.to_float remaining_ns /. 1e9) in
+                 t.pace <- Some { plan; wait };
+                 Lwt.async (fun () ->
+                   Lwt.catch
+                     (fun () ->
+                       let* () = wait in
+                       if Option.map (fun pending -> pending.plan) t.pace <> Some plan then
+                         Lwt.return_unit
+                       else begin
+                         t.pace <- None;
+                         if not t.running || not (C_pace.current plan
+                           ~height:t.engine.state.height
+                           ~generation:t.engine.generation) then
+                           Lwt.return_unit
+                         else begin
+                           t.epoch_start_mono <- Mtime_clock.elapsed_ns ();
+                           process_outputs t
+                         end
+                       end)
+                     (function Lwt.Canceled -> Lwt.return_unit | exn -> Lwt.fail exn))
+               | Some _ | None -> t.epoch_start_mono <- now_ns);
               let* _ = try_current_leader_proposal t in
               let* () = process_outputs t in
               Lwt.return_unit)
@@ -5099,6 +5166,7 @@ let wake_ready t =
   process_outputs t
 
 let clear_local_transients t =
+  clear_pace t;
   t.proposal_build <- None;
   t.proposal_verify <- None;
   Hashtbl.clear t.pending_votes;
@@ -5257,6 +5325,7 @@ let start t =
 
 let stop t =
   t.running <- false;
+  clear_pace t;
   Lwt.return_unit
 
 let current_height t = t.engine.state.height

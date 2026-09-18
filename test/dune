@@ -31,6 +31,11 @@
  (libraries octra_consensus octra_net lwt.unix mirage-crypto-rng.unix))
 
 (test
+ (name test_bft_ready_replay)
+ (modules test_bft_ready_replay)
+ (libraries octra_consensus octra_net lwt lwt.unix mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
  (name test_admit)
  (modules test_admit)
  (libraries octra_core octra_node_runtime zarith unix yojson lwt.unix))
@@ -92,12 +97,12 @@
 (test
  (name test_join_rpc)
  (modules test_join_rpc)
- (libraries octra_node_runtime octra_core octra_consensus octra_net octra_bootstrap zarith lwt.unix))
+ (libraries octra_node_runtime octra_core octra_consensus octra_net octra_bootstrap octra_test_workspace zarith lwt.unix))
 
 (test
  (name test_catchup_shell)
  (modules test_catchup_shell)
- (libraries octra_node_runtime lwt lwt.unix))
+ (libraries octra_node_runtime octra_test_workspace lwt lwt.unix))
 
 (test
  (name test_proposal)
@@ -108,6 +113,11 @@
  (name test_driver_boot)
  (modules test_driver_boot)
  (libraries octra_node_runtime))
+
+(test
+ (name test_sync_mark)
+ (modules test_sync_mark)
+ (libraries octra_node_runtime octra_test_workspace))
 
 (test
  (name test_net_boot)

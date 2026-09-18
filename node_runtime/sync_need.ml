@@ -4,6 +4,7 @@
 type cause =
   | Root
   | Journal
+  | Conflict
   | Range
 
 type t = {
@@ -16,11 +17,13 @@ type t = {
 let label = function
   | Root -> "root"
   | Journal -> "journal"
+  | Conflict -> "conflict"
   | Range -> "range"
 
 let cause = function
   | "root" -> Some Root
   | "journal" -> Some Journal
+  | "conflict" -> Some Conflict
   | "range" -> Some Range
   | _ -> None
 
@@ -29,6 +32,9 @@ let root ~epoch ~head =
 
 let journal ~epoch ~head =
   { cause = Journal; epoch; head; target = None }
+
+let conflict ~epoch ~head =
+  { cause = Conflict; epoch; head; target = None }
 
 let lost ~head ~target =
   if head >= 0
@@ -55,6 +61,7 @@ let valid value =
   &&
   match value.cause, value.target with
   | Root, None
+  | Conflict, None
   | Journal, None -> true
   | Range, Some target -> Int64.compare target (Int64.of_int value.head) > 0
   | _ -> false

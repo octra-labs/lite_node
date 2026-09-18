@@ -7,7 +7,6 @@ module Log = Octra_log
 
 type 'driver deps = {
   prune_frozen : finalized_epoch:int64 -> unit;
-  store_proposer : Flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
   store_finalized :
     epoch:int ->
@@ -57,12 +56,6 @@ let remove_stashed deps epoch =
 let record_finalized deps validator_set finalize (header : C_types.epoch_header)
     header_epoch =
   deps.prune_frozen ~finalized_epoch:header.C_types.epoch_id;
-  (match Flow.proposer_info
-           ~epoch:header_epoch
-           ~creator_addr:header.C_types.creator_addr
-           ~commit_round:finalize.C_types.commit_round with
-   | Some info -> deps.store_proposer info
-   | None -> ());
   (match Flow.expected_root header.C_types.proposed_state_root with
    | Some root -> deps.store_expected_root ~epoch:header_epoch ~root
    | None -> ());

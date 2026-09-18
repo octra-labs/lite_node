@@ -7,6 +7,7 @@ module C_types = Octra_consensus.C_types
 module Range_part = Octra_bootstrap.Range_part
 
 exception Fetch_retry of string
+exception Journal_error of exn
 
 type apply =
   txs:Transaction.t list ->
@@ -126,7 +127,7 @@ type apply_deps = {
   current_epoch : unit -> int;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  stage_finality : prepared -> unit;
+  stage_finality : prepared -> prepared;
   promote_finality : unit -> unit;
   apply : apply;
   root : unit -> string;
@@ -166,7 +167,7 @@ type node_deps = {
   next_txid : unit -> int64;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  stage_finality : prepared -> unit;
+  stage_finality : prepared -> prepared;
   promote_finality : unit -> unit;
   apply : apply;
   local_eic : unit -> string option;
@@ -384,6 +385,7 @@ let fetch call =
       | Out_of_memory
       | Stack_overflow
       | Sys.Break -> Lwt.fail exn
+      | Journal_error _ -> Lwt.fail exn
       | Fetch_retry error -> Lwt.return (Error error)
       | _ -> Lwt.return (Error (Printexc.to_string exn)))
 
@@ -795,16 +797,16 @@ let finality_entry ~chain_id prepared =
 
 let apply_prepared (deps : apply_deps) prepared =
   let open Lwt.Syntax in
-  let record = prepared.record in
   if prepared.epoch_int <> deps.current_epoch () then
     failwith
       (Printf.sprintf
          "join local epoch mismatch local = %d record = %d"
          (deps.current_epoch ())
          prepared.epoch_int);
+  let prepared = deps.stage_finality prepared in
+  let record = prepared.record in
   Option.iter (deps.put_proposer prepared.epoch_int) prepared.proposer_info;
   deps.put_root prepared.epoch_int record.state_root;
-  deps.stage_finality prepared;
   let* () =
     deps.apply
       ~txs:prepared.txs
@@ -1131,6 +1133,17 @@ let write_ready_marker
     marker
 
 let node_deps_of_runtime (deps : node_runtime_deps) =
+  let journal action =
+    try
+      begin match Sync_mark.read ~data_dir:deps.data_dir ~chain:deps.chain_id with
+      | Sync_mark.Ready need when need.Sync_need.cause = Sync_need.Conflict ->
+        failwith "finality conflict requires signed recovery"
+      | Sync_mark.Invalid reason -> failwith reason
+      | Sync_mark.Ready _ | Sync_mark.Missing -> ()
+      end;
+      action ()
+    with exn -> raise (Journal_error exn)
+  in
   let ready_marker_config = {
     data_dir = deps.data_dir;
     consensus_role = deps.consensus_role;
@@ -1153,23 +1166,27 @@ let node_deps_of_runtime (deps : node_runtime_deps) =
       deps.put_root_raw epoch (Runtime_text.hex_to_raw32_lossy root));
     stage_finality = (fun prepared ->
       let finality = prepared.record.finality in
-      let entry = finality_entry ~chain_id:deps.chain_id prepared in
-      Octra_consensus.Finality_log.check_write deps.data_dir entry;
-      Consensus_finality_journal.persist_certificate
-        deps.data_dir
-        ~validator_set:finality.validator_set
-        finality.finalize;
-      Consensus_finality_journal.persist_bundle
-        deps.data_dir
-        finality.finalize
-        Consensus_finality_journal.{
+      journal (fun () ->
+      Consensus_finality_journal.guard deps.data_dir finality.finalize (fun () ->
+      let saved = Consensus_finality_journal.stage deps.data_dir
+        ~chain_id:deps.chain_id ~validator_set:finality.validator_set
+        ~bundle:Consensus_finality_journal.{
           tx_hashes = prepared.record.tx_hashes;
           txs = prepared.txs;
           receipts_json = prepared.record.receipts_json;
-        };
-      deps.write_entry entry);
+        } finality.finalize in
+      let prepared = { prepared with
+        record = { prepared.record with
+          finality = { finality with finalize = saved };
+          commit_round = saved.commit_round };
+        proposer_info = Consensus_epoch_apply_proposer.proposer_from_finalized saved;
+      } in
+      let entry = finality_entry ~chain_id:deps.chain_id prepared in
+      Octra_consensus.Finality_log.check_write deps.data_dir entry;
+      deps.write_entry entry;
+      prepared)));
     promote_finality = (fun () ->
-      Consensus_finality_journal.promote deps.data_dir);
+      journal (fun () -> Consensus_finality_journal.promote deps.data_dir));
     apply = deps.apply;
     local_eic = (fun () -> local_eic_from_head (deps.head ()));
     write_ready = write_ready_marker ready_marker_config;
@@ -1202,7 +1219,24 @@ let node_runtime_deps (deps : node_runtime_wiring) =
 
 let run_configured_node_catchup (deps : node_runtime_deps) =
   let open Lwt.Syntax in
-  let rec run = function
+  let network = Startup_process_shell.network_config ~env:deps.env in
+  let sources = configured_sources deps.env in
+  let rec recover sources =
+    match deps.head () with
+    | None -> Lwt.fail_with "join recovery requires committed head"
+    | Some head when deps.current_epoch () <> head.epoch_id + 1 ->
+      Lwt.fail_with "join recovery head differs from runtime"
+    | Some head ->
+      Consensus_finality_journal.resume_join
+        ~chain_id:deps.chain_id ~set_hash:deps.expected_validator_set_hash
+        ~head:head.epoch_id
+        ~root:(Runtime_text.hex_to_raw32_lossy head.state_root)
+        ~txid:head.txid_hi deps.data_dir;
+      fetch sources
+  and fetch = function
+    | [] when network.consensus_port <= 0
+              && Consensus_finality_journal.pending deps.data_dir ->
+      Lwt.fail_with "join sources did not complete pending finality"
     | [] ->
       Octra_log.warn "join"
         "event = join_sources_unavailable action = continue_unattested";
@@ -1210,11 +1244,29 @@ let run_configured_node_catchup (deps : node_runtime_deps) =
     | base :: rest ->
       let* outcome = run_node_catchup (node_deps_of_runtime deps) base in
       match outcome with
+      | Synced _ when Consensus_finality_journal.pending deps.data_dir -> run rest
       | Synced _ as synced -> Lwt.return_some synced
       | Leader_stale _
       | Source_unavailable _ -> run rest
+  and run sources =
+    match Sync_mark.read ~data_dir:deps.data_dir ~chain:deps.chain_id with
+    | Sync_mark.Invalid reason -> Lwt.fail_with reason
+    | Sync_mark.Ready need ->
+      Octra_log.warn "join"
+        "event = join_deferred cause = %s action = recover"
+        (Sync_need.label need.cause);
+      Lwt.return_none
+    | Sync_mark.Missing when Consensus_finality_journal.pending deps.data_dir ->
+      if network.consensus_port <= 0 then recover sources
+      else begin
+        Octra_log.info "join"
+          "event = join_deferred cause = pending_finality action = recover";
+        Lwt.return_none
+      end
+    | Sync_mark.Missing ->
+      fetch sources
   in
-  match configured_sources deps.env with
+  match sources with
   | [] -> Lwt.return_none
   | sources -> run sources
 

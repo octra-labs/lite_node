@@ -56,11 +56,12 @@ let trusted_validator_set_hash =
   Octra_consensus.C_config.validator_set_hash finality_validator_set
 
 let finality_json
+    ?(round = 4)
     ~epoch
     ~proto_version
     ~prev
     ~state
-    ~tx_hashes =
+    ~tx_hashes () =
   let header = Octra_consensus.C_types.{
     proto_version;
     chain_id = "octra-test";
@@ -81,7 +82,7 @@ let finality_json
   let unsigned_vote = Octra_consensus.C_types.{
     chain_id = "octra-test";
     epoch_id = epoch;
-    round = 4;
+    round;
     vote_type = Precommit;
     proposal_id;
     validator = "oct_creator";
@@ -97,7 +98,7 @@ let finality_json
   let finalize = Octra_consensus.C_types.{
     chain_id = "octra-test";
     epoch_id = epoch;
-    commit_round = 4;
+    commit_round = round;
     header;
     proposal_id;
     precommits = [vote];
@@ -142,6 +143,7 @@ let legacy_reward_source =
   |> Result.get_ok
 
 let record_json
+    ?(round = 4)
     ?(epoch = 12L)
     ?(prev = raw 'p')
     ?(state = raw 's')
@@ -168,10 +170,10 @@ let record_json
     "txs_json", `List (List.map (fun s -> `String s) txs_json);
     "epoch_ts", `Float 120.25;
     "creator_addr", `String "oct_creator";
-    "commit_round", `Int 4;
+    "commit_round", `Int round;
     "reward_source",
       Octra_consensus.C_reward_source.to_yojson source;
-    "finality", finality_json ~epoch ~proto_version ~prev ~state ~tx_hashes;
+    "finality", finality_json ~round ~epoch ~proto_version ~prev ~state ~tx_hashes ();
   ]
 
 let cursor () =
@@ -599,7 +601,8 @@ let test_apply_records_success () =
     put_root = (fun epoch state_root ->
       events := Printf.sprintf "root:%d:%s" epoch state_root :: !events);
     stage_finality = (fun prepared ->
-      events := Printf.sprintf "stage:%d" prepared.Join.epoch_int :: !events);
+      events := Printf.sprintf "stage:%d" prepared.Join.epoch_int :: !events;
+      prepared);
     promote_finality = (fun () ->
       events := "promote" :: !events);
     apply = (fun ~txs ~receipts_json ~proposer_info ~reward:_ ~epoch_ts
@@ -621,9 +624,9 @@ let test_apply_records_success () =
   expect "apply next cursor" (next = prepared.next_cursor);
   expect "apply event"
     (List.rev !events = [
+      "stage:12";
       "proposer:12:oct_creator";
       "root:12:" ^ prepared.record.state_root;
-      "stage:12";
       "apply";
       "promote";
     ])
@@ -638,7 +641,7 @@ let test_apply_root_mismatch () =
     current_epoch = (fun () -> 12);
     put_proposer = (fun _ _ -> ());
     put_root = (fun _ _ -> ());
-    stage_finality = (fun _ -> ());
+    stage_finality = Fun.id;
     promote_finality = (fun () -> ());
     apply = (fun ~txs:_ ~receipts_json:_ ~proposer_info:_ ~reward:_ ~epoch_ts:_
         ~validator_set:_ ~parent_commit:_ ->
@@ -1195,7 +1198,8 @@ let test_node_catchup_apply () =
     put_root = (fun epoch root ->
       events := Printf.sprintf "root:%d:%s" epoch root :: !events);
     stage_finality = (fun prepared ->
-      events := Printf.sprintf "stage:%d" prepared.Join.epoch_int :: !events);
+      events := Printf.sprintf "stage:%d" prepared.Join.epoch_int :: !events;
+      prepared);
     promote_finality = (fun () ->
       events := "promote" :: !events);
     apply = (fun ~txs ~receipts_json ~proposer_info ~reward:_ ~epoch_ts
@@ -1235,9 +1239,9 @@ let test_node_catchup_apply () =
     ]);
   expect "node apply events"
     (List.rev !events = [
+      "stage:12";
       "proposer:12:oct_creator";
       "root:12:" ^ hex_of_raw (raw 's');
-      "stage:12";
       "apply";
       "promote";
     ]);
@@ -1341,6 +1345,190 @@ let test_node_deps_finality () =
     (Octra_node_runtime.Consensus_finality_state.find_expected_root state 15 =
      Some (raw 'z'));
   expect "runtime finality no unrelated effect" (not !touched)
+
+let test_pending_start () =
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let module Mark = Octra_node_runtime.Sync_mark in
+  let dir = Test_workspace.unique_dir "join-pending" in
+  let touched = ref false in
+  let encoded = finality_json ~epoch:12L
+    ~proto_version:Octra_consensus.C_types.proto_version_current
+    ~prev:(raw 'r') ~state:(raw 's') ~tx_hashes:[] () in
+  let cert = Yojson.Safe.Util.(encoded |> member "finalize" |> to_string)
+    |> Base64.decode_exn |> Octra_consensus.C_codec.decode_finalize in
+  Journal.persist_certificate dir ~validator_set:finality_validator_set cert;
+  Journal.persist_bundle dir cert { tx_hashes = []; txs = []; receipts_json = [] };
+  let runtime = { (runtime_deps touched) with
+    data_dir = dir;
+    current_epoch = (fun () -> 13);
+    env = (function
+      | "OCTRA_JOIN_RPC" -> Some "http://primary"
+      | "OCTRA_CONSENSUS_PORT" -> Some "19000"
+      | _ -> None);
+  } in
+  expect "join yields to pending journal"
+    (Lwt_main.run (Join.run_configured_node_catchup runtime) = None && not !touched);
+  expect "join creates no conflict"
+    (Mark.read ~data_dir:dir ~chain:"octra-test" = Mark.Missing);
+  let module Recovery = Octra_node_runtime.Consensus_finality_journal_recovery in
+  let unused () = fail "applied journal must not execute again" in
+  let recovered = Recovery.run {
+    read_journal = (fun () -> Journal.read_validated
+      ~chain_id:"octra-test" ~validator_set:finality_validator_set dir);
+    read_pending_epoch = (fun () -> Journal.read_pending_epoch dir);
+    drop_invalid_unapplied = (fun ~head_epoch:_ -> unused ());
+    head_epoch = (fun () -> 12);
+    root_at_epoch = (fun epoch -> if epoch = 12 then Some (raw 's') else None);
+    current_root = (fun () -> Some (raw 's'));
+    write_finality = (fun _ -> unused ());
+    store_finalized = (fun ~epoch:_ ~validator_set:_ _ -> unused ());
+    store_proposer = (fun _ -> unused ());
+    store_expected_root = (fun ~epoch:_ ~root:_ -> unused ());
+    store_bundle = (fun ~proposal_id:_ ~tx_hashes:_ ~txs:_ ~receipts_json:_ -> unused ());
+    set_proposal = (fun _ _ -> unused ());
+    reset_proposal_state = unused;
+    set_consensus_finalized = (fun _ -> unused ());
+    clear_state_attested = unused;
+    commit_journal = (fun ~epoch ~state_root ->
+      Journal.promote_applied dir ~epoch ~state_root);
+    mark_quarantine = (fun _ -> unused ());
+    require_sync = (fun _ -> unused ());
+  } in
+  expect "startup recovers applied journal" (recovered = Recovery.Continue);
+  ignore (Lwt_main.run (Join.run_configured_node_catchup runtime));
+  expect "join resumes after promotion" !touched
+
+let test_join_conflict () =
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let module Mark = Octra_node_runtime.Sync_mark in
+  let module Log = Octra_consensus.Finality_log in
+  List.iter (fun phase ->
+    let dir = Test_workspace.unique_dir "join-conflict" in
+    let encoded = finality_json ~epoch:12L
+      ~proto_version:Octra_consensus.C_types.proto_version_current
+      ~prev:(raw 'p') ~state:(raw 'z') ~tx_hashes:[] () in
+    let cert = Yojson.Safe.Util.(encoded |> member "finalize" |> to_string)
+      |> Base64.decode_exn |> Octra_consensus.C_codec.decode_finalize in
+    if phase = "promote" then begin
+      Journal.persist_certificate dir ~validator_set:finality_validator_set cert;
+      Journal.persist_bundle dir cert { tx_hashes = []; txs = []; receipts_json = [] };
+      Journal.promote dir
+    end else Log.write dir (Log.of_finalize cert);
+    if phase = "record" then begin
+      Unix.mkdir (Filename.concat dir "finality/conflict.json") 0o750
+    end;
+    let fetched = ref [] in
+    let paused = ref 0 in
+    let applied = ref 0 in
+    let height = ref 12 in
+    let prepared = Join.prepare_record ~chain_id:"octra-test"
+      ~expected_validator_set_hash:trusted_validator_set_hash
+      ~cursor:(cursor ()) (parse_one_record ()) in
+    let runtime = { (runtime_deps (ref false)) with
+      data_dir = dir;
+      env = (function "OCTRA_JOIN_RPC" -> Some "http://primary,http://secondary" | _ -> None);
+      current_epoch = (fun () -> !height);
+      head = (fun () ->
+        Some { (head ~state_root:(hex_of_raw (raw (if !height = 12 then 'p' else 's'))) ()) with
+          epoch_id = !height - 1;
+          txid_hi = 8L;
+          epoch_index_root = if !height = 12 then None else Some prepared.expected_eic });
+      fetch_json = (fun url ->
+        fetched := url :: !fetched;
+        Lwt.return (if String.contains url '?' then
+          `Assoc ["status", `String "ok"; "records", `List [record_json ()]]
+        else `Assoc ["head_epoch", `String "12"; "state_root", `String (hex_of_raw (raw 's'))]));
+      sleep = (fun _ -> incr paused; Lwt.return_unit);
+      apply = (fun ~txs:_ ~receipts_json:_ ~proposer_info:_ ~reward:_ ~epoch_ts:_
+          ~validator_set:_ ~parent_commit:_ ->
+        incr applied; height := 13; Lwt.return_unit);
+      write_entry = Log.write dir;
+    } in
+    let refused =
+      try ignore (Lwt_main.run (Join.run_configured_node_catchup runtime)); false
+      with _ -> true
+    in
+    expect "local conflict stops join" refused;
+    expect "local conflict is not retried" (!paused = 0 && List.length !fetched = 2);
+    expect "conflict checked before apply" (!applied = 0);
+    expect "conflict checked before pending write" (not (Journal.pending dir));
+    expect "ready not published" (not (Sys.file_exists (Filename.concat dir "ready_to_vote.json")));
+    expect "conflict remains held"
+      (match Mark.read ~data_dir:dir ~chain:"octra-test" with
+       | Mark.Ready need -> need.cause = Octra_node_runtime.Sync_need.Conflict
+       | _ -> false);
+    ignore (Lwt_main.run (Join.run_configured_node_catchup runtime));
+    expect "held join performs no more requests" (List.length !fetched = 2)
+  ) ["stage"; "promote"; "record"]
+
+let test_http_pending () =
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let module Mark = Octra_node_runtime.Sync_mark in
+  let module Log = Octra_consensus.Finality_log in
+  List.iter (fun (applied_before, round) ->
+    let dir = Test_workspace.unique_dir "join-http-pending" in
+    let record = parse_one_record () in
+    let prepared = Join.prepare_record ~chain_id:"octra-test"
+      ~expected_validator_set_hash:trusted_validator_set_hash
+      ~cursor:(cursor ()) record in
+    let cert = record.finality.finalize in
+    Journal.persist_certificate dir ~validator_set:finality_validator_set cert;
+    Journal.persist_bundle dir cert {
+      tx_hashes = record.tx_hashes; txs = prepared.txs;
+      receipts_json = record.receipts_json;
+    };
+    Log.write dir (Log.of_finalize cert);
+    let height = ref (if applied_before then 13 else 12) in
+    let applied = ref 0 in
+    let requests = ref 0 in
+    let saved_round = ref None in
+    let runtime = { (runtime_deps (ref false)) with
+      data_dir = dir;
+      env = (function
+        | "OCTRA_JOIN_RPC" -> Some "http://primary"
+        | "OCTRA_CONSENSUS_PORT" -> Some "0"
+        | _ -> None);
+      current_epoch = (fun () -> !height);
+      head = (fun () ->
+        Some { (head ~state_root:(hex_of_raw (raw (if !height = 12 then 'p' else 's'))) ()) with
+          epoch_id = !height - 1;
+          txid_hi = 8L;
+          epoch_index_root = if !height = 12 then None else Some prepared.expected_eic });
+      fetch_json = (fun url ->
+        incr requests;
+        Lwt.return (if String.contains url '?' then
+          `Assoc ["status", `String "ok"; "records", `List [record_json ~round ()]]
+        else `Assoc ["head_epoch", `String "12"; "state_root", `String (hex_of_raw (raw 's'))]));
+      next_txid = (fun () -> 7L);
+      put_proposer = (fun _ _ -> ());
+      put_root_raw = (fun _ _ -> ());
+      sleep = (fun _ -> fail "local recovery must not retry");
+      apply = (fun ~txs:_ ~receipts_json:_ ~proposer_info ~reward:_ ~epoch_ts:_
+          ~validator_set:_ ~parent_commit:_ ->
+        saved_round := Option.map (fun value -> value.Octra_core.Epochlog.commit_round) proposer_info;
+        incr applied; height := 13; Lwt.return_unit);
+      write_entry = Log.write dir;
+    } in
+    expect "HTTP-only pending resumes"
+      (match Lwt_main.run (Join.run_configured_node_catchup runtime) with
+       | Some (Join.Synced _) -> true | _ -> false);
+    expect "only unapplied pending executes" (!applied = if applied_before then 0 else 1);
+    expect "pending promotion completes" (not (Journal.pending dir));
+    expect "recovery has no false conflict"
+      (Mark.read ~data_dir:dir ~chain:"octra-test" = Mark.Missing);
+    expect "HTTP join reaches source" (!requests > 0);
+    expect "ready marker follows new application"
+      (applied_before || Sys.file_exists (Filename.concat dir "ready_to_vote.json"));
+    expect "application round matches retained proof" (applied_before || !saved_round = Some 4);
+    expect "log round matches retained proof"
+      (Option.map (fun entry -> entry.Log.round) (Log.last_entry_fast dir) = Some 4);
+    match Journal.read_committed_epoch ~chain_id:"octra-test" ~epoch:12L dir with
+    | Journal.Valid stored ->
+      let record = { record with finality = { record.finality with finalize = stored.finalize } } in
+      ignore (Join.prepare_record ~chain_id:"octra-test"
+        ~expected_validator_set_hash:trusted_validator_set_hash ~cursor:(cursor ()) record)
+    | _ -> fail "committed proof is missing"
+  ) [false, 4; true, 4; false, 5]
 
 let test_catchup_no_env () =
   let touched = ref false in
@@ -1477,6 +1665,9 @@ let test_ready_params () =
   expect "ready params identity" (Result.is_error (read (Ok { snapshot with candidate = other })))
 
 let () =
+  test_pending_start ();
+  test_http_pending ();
+  test_join_conflict ();
   test_ready_params ();
   test_normalize_base ();
   test_http_get_json ();

@@ -1,0 +1,710 @@
+(* SPDX-License-Identifier: BSD-3-Clause *)
+(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
+
+open Octra_consensus
+
+let () = Mirage_crypto_rng_unix.use_default ()
+
+let keys = Hashtbl.create 8
+
+let keypair address =
+  match Hashtbl.find_opt keys address with
+  | Some pair -> pair
+  | None ->
+    let private_key, public_key = Mirage_crypto_ec.Ed25519.generate () in
+    let pair = private_key, Mirage_crypto_ec.Ed25519.pub_to_octets public_key in
+    Hashtbl.add keys address pair;
+    pair
+
+let public_key address =
+  snd (keypair address)
+
+let sign address message =
+  Mirage_crypto_ec.Ed25519.sign ~key:(fst (keypair address)) message
+
+let verify address message signature =
+  match Mirage_crypto_ec.Ed25519.pub_of_octets (public_key address) with
+  | Ok key -> Mirage_crypto_ec.Ed25519.verify ~key ~msg:message signature
+  | Error _ -> false
+
+let validators =
+  ["v0"; "v1"; "v2"; "v3"]
+
+let validator_set =
+  C_engine.make_validator_set
+    (List.map
+       (fun address ->
+         C_types.{ address; pubkey = public_key address })
+       validators)
+
+let proposal chain_id ~epoch_id ~round =
+  let proposer =
+    (C_engine.leader_of validator_set ~epoch_id ~round).address
+  in
+  let header =
+    C_types.{
+      proto_version = C_protocol.version_for_epoch epoch_id;
+      chain_id;
+      epoch_id;
+      prev_state_root = String.make 32 '\x00';
+      tx_list_hash = C_engine.tx_list_hash_for_header [];
+      receipt_root = C_hash.receipt_root [];
+      proposed_state_root =
+        Octra_net.Hash_domain.hash
+          "test:ready:root"
+          (Int64.to_string epoch_id);
+      parent_commit_hash = Octra_net.Hash_domain.nil_hash;
+      creator_addr = proposer;
+      txid_hi = 0L;
+      ts = 1.0;
+    }
+  in
+  let unsigned =
+    C_types.{
+      chain_id;
+      epoch_id;
+      round;
+      valid_round = None;
+      header;
+      tx_hashes = [];
+      parent_commit = None;
+      proposer;
+      signature = String.make 64 '\x00';
+    }
+  in
+  {
+    unsigned with
+    signature = sign proposer (C_hash.propose_sign_bytes unsigned);
+  }
+
+let swarm chain_id =
+  let address = "v0" in
+  let public_key = public_key address in
+  Octra_net.P2p_swarm.create
+    Octra_net.P2p_swarm.{
+      listen_port = 0;
+      chain_id;
+      node_id = Octra_net.P2p_handshake.node_id_of_pubkey public_key;
+      node_addr = address;
+      pubkey_raw = public_key;
+      consensus_config_hash = String.make 32 '\x00';
+      binary_hash = String.make 32 '\x00';
+      require_binary_hash = false;
+      upgrade_plan = None;
+      profile_plan = [];
+      allowed_pubkeys = [];
+      bootstrap_peers = [];
+      max_peers = 0;
+      sign_fn = sign address;
+      best_epoch_fn = (fun () -> 0L);
+      best_root_fn = (fun () -> String.make 32 '\x00');
+    }
+
+let driver
+    ?scheduled_validator_set_config
+    ?(load_scheduled_validator_set_config = fun () -> Lwt.return_none)
+    ?(verify_proposal = fun _ -> Lwt.return C_driver.Proposal_accept)
+    ?(persist = fun () -> Lwt.return_true)
+    chain_id =
+  let config =
+    C_driver.{
+      chain_id;
+      my_addr = "v0";
+      sign_fn = sign "v0";
+      verify_fn = verify;
+      role_can_vote = (fun () -> true);
+      can_vote = (fun () -> true);
+      execute_fn = (fun _ -> true);
+      verify_proposal;
+      verify_parent_commit = (fun ~epoch_id:_ _ -> Ok ());
+      on_finalized = (fun ~validator_set:_ _ -> Lwt.return_unit);
+      make_proposal = (fun _ -> Lwt.return_none);
+      before_precommit_broadcast =
+        (fun
+          ~epoch_id:_
+          ~round:_
+          ~proposal_id:_
+          ~proposed_state_root:_
+          ~txid_hi:_
+          ~proposal_wire:_
+          ~vote_wire:_ ->
+          persist ());
+      lookup_epoch_root = (fun _ -> None);
+      local_head_epoch = (fun () -> 0L);
+      lookup_bundle = (fun _ -> None);
+      lookup_catchup_range =
+        (fun ~from_epoch:_ ~max_epochs:_ -> `NotFound);
+      on_resource_attestation = (fun _ -> Lwt.return_unit);
+      scheduled_validator_set_config;
+      load_scheduled_validator_set_config;
+      resource_committee_config = None;
+    }
+  in
+  C_driver.create
+    ~config
+    ~validator_set
+    ~swarm:(swarm chain_id)
+    ~start_height:1L
+    ~sync_log:(C_sync_log.memory ())
+    ~relief_log:(C_relief_log.memory ())
+    ~vote_log:(C_vote_log.memory ())
+
+let future_vote chain_id validator =
+  C_types.{
+    chain_id;
+    epoch_id = 1L;
+    round = 1;
+    vote_type = Prevote;
+    proposal_id = String.make 32 '\x01';
+    validator;
+    signature = String.make 64 '\x00';
+  }
+
+let signed_vote chain_id ~epoch_id ~round ~vote_type ~proposal_id validator =
+  let unsigned =
+    C_types.{
+      chain_id;
+      epoch_id;
+      round;
+      vote_type;
+      proposal_id;
+      validator;
+      signature = String.make 64 '\x00';
+    }
+  in
+  {
+    unsigned with
+    signature = sign validator (C_hash.vote_sign_bytes unsigned);
+  }
+
+let test_pace_votes () =
+  let chain_id = "octra-test-pace-votes" in
+  let driver = driver chain_id in
+  driver.running <- true;
+  driver.epoch_start_mono <-
+    Int64.add (Mtime_clock.elapsed_ns ()) 60_000_000_000L;
+  let first = proposal chain_id ~epoch_id:1L ~round:0 in
+  let value = C_types.{
+    chain_id;
+    epoch_id = 1L;
+    commit_round = 0;
+    header = first.header;
+    proposal_id = C_hash.proposal_id first.header;
+    precommits = [];
+    parent_commit = None;
+  } in
+  assert (C_engine.emit_finalized ~send:false driver.engine value);
+  let pending = C_driver.process_outputs driver in
+  let next = proposal chain_id ~epoch_id:2L ~round:0 in
+  let pid = C_hash.proposal_id next.header in
+  Lwt_main.run (C_driver.admit_current_proposal driver
+    ~route:C_driver.Publish_verified_proposal next);
+  Lwt_main.run (C_driver.process_outputs driver);
+  Lwt_main.run (Lwt_list.iter_s (fun _ -> Lwt.pause ()) (List.init 4 Fun.id));
+  let saved vote_type =
+    C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+      ~epoch_id:2L ~round:0 ~vote_type ~proposal_id:pid
+    |> Result.get_ok
+  in
+  let prevote = saved C_types.Prevote in
+  List.iter (fun address ->
+    C_engine.on_vote driver.engine
+      (signed_vote chain_id ~epoch_id:2L ~round:0
+        ~vote_type:C_types.Prevote ~proposal_id:pid address)
+      ~sign_fn:(sign "v0")) ["v1"; "v2"];
+  Lwt_main.run (C_driver.process_outputs driver);
+  let precommit = saved C_types.Precommit in
+  let waiting = C_driver.pace_left driver > 0L in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt.cancel pending;
+  if not waiting then failwith "pace vote test lost its wait";
+  List.iter (fun vote ->
+    match vote with
+    | Some value when C_hash.verify_vote ~pubkey_raw:(public_key "v0") value -> ()
+    | _ -> failwith "pace held local durable vote") [prevote; precommit]
+
+let test_qc_vote () =
+  List.iter (fun durable ->
+    let chain_id = "octra-test-qc-vote" in
+    let writes = ref 0 in
+    let driver = driver ~persist:(fun () -> incr writes; Lwt.return durable) chain_id in
+    driver.running <- true;
+    driver.epoch_start_mono <-
+      Int64.sub (Mtime_clock.elapsed_ns ()) 60_000_000_000L;
+    let value = proposal chain_id ~epoch_id:1L ~round:0 in
+    let pid = C_hash.proposal_id value.header in
+    Lwt_main.run (C_driver.admit_current_proposal driver
+      ~route:C_driver.Publish_verified_proposal value);
+    let vote vote_type address = signed_vote chain_id ~epoch_id:1L ~round:0
+      ~vote_type ~proposal_id:pid address
+    in
+    List.iter (fun address -> C_engine.on_vote driver.engine
+      (vote C_types.Prevote address) ~sign_fn:(sign "v0")) ["v1"; "v2"];
+    let finalized = C_types.{
+      chain_id;
+      epoch_id = 1L;
+      commit_round = 0;
+      header = value.header;
+      proposal_id = pid;
+      precommits = List.map (vote Precommit) ["v1"; "v2"; "v3"];
+      parent_commit = None;
+    } in
+    if not (C_engine.accept_finalize_batch driver.engine finalized) then
+      failwith "valid peer certificate refused";
+    Lwt_main.run (C_driver.process_outputs driver);
+    let parent = C_types.{
+      validator_set;
+      certificate = certificate_of_finalize finalized;
+    } in
+    let proof = C_driver.fold_event driver { finalized with parent_commit = Some parent } in
+    let height = driver.engine.state.height in
+    let pending = driver.engine.pending_finalized in
+    Lwt_main.run (C_driver.stop driver);
+    if height <> 2L || pending <> None then
+      failwith "vote storage blocked accepted finality";
+    if !writes <> 1 then failwith "finalized vote did not use durable path";
+    match durable, proof with
+    | true, Some (vote, parent) when
+        vote.proposal_id = pid
+        && vote.round = parent.certificate.commit_round
+        && C_hash.verify_vote ~pubkey_raw:(public_key "v0") vote -> ()
+    | false, None -> ()
+    | _ -> failwith "finalized vote appeal did not match durability") [true; false]
+
+let test_deferred_proposal_replays_after_round_skip () =
+  let chain_id = "octra-test-ready-replay" in
+  let driver = driver chain_id in
+  let proposal = proposal chain_id ~epoch_id:1L ~round:1 in
+  C_driver.defer_verified_proposal driver proposal;
+  C_engine.on_vote
+    driver.engine
+    (future_vote chain_id "v1")
+    ~sign_fn:(sign "v0");
+  C_engine.on_vote
+    driver.engine
+    (future_vote chain_id "v2")
+    ~sign_fn:(sign "v0");
+  if driver.engine.state.round <> 1 then
+    failwith "round did not advance";
+  Lwt_main.run (C_driver.process_outputs driver);
+  let local_vote =
+    Hashtbl.find_opt driver.engine.prevotes.votes "v0"
+  in
+  let expected = C_hash.proposal_id proposal.header in
+  (match local_vote with
+   | Some vote when vote.proposal_id = expected -> ()
+   | _ -> failwith "deferred proposal was not prevoted");
+  if Hashtbl.length driver.deferred_proposals <> 0 then
+    failwith "deferred proposal was not consumed";
+  let vote_count = Hashtbl.length driver.engine.prevotes.votes in
+  Lwt_main.run (C_driver.process_outputs driver);
+  if Hashtbl.length driver.engine.prevotes.votes <> vote_count then
+    failwith "deferred proposal replayed more than once"
+
+let test_pending_proposal_replays_after_height_advance () =
+  let chain_id = "octra-test-pending-proposal" in
+  let driver = driver chain_id in
+  let next_proposal = proposal chain_id ~epoch_id:2L ~round:0 in
+  if not (C_driver.defer_pending_proposal driver next_proposal) then
+    failwith "next-height proposal was not retained";
+  if
+    C_driver.defer_pending_proposal
+      driver
+      (proposal chain_id ~epoch_id:3L ~round:0)
+  then
+    failwith "far-future proposal was retained";
+  C_engine.start_height driver.engine 2L;
+  Lwt_main.run (C_driver.process_outputs driver);
+  let local_vote =
+    Hashtbl.find_opt driver.engine.prevotes.votes "v0"
+  in
+  let expected = C_hash.proposal_id next_proposal.header in
+  (match local_vote with
+   | Some vote when vote.proposal_id = expected -> ()
+   | _ -> failwith "pending proposal was not prevoted");
+  if Hashtbl.length driver.pending_proposals <> 0 then
+    failwith "pending proposal was not consumed"
+
+let test_unretained_proposal_reenters_after_height_advance () =
+  let chain_id = "octra-test-proposal-reentry" in
+  let driver = driver chain_id in
+  driver.running <- true;
+  let early = proposal chain_id ~epoch_id:3L ~round:0 in
+  let frame = Octra_net.P2p_frame.{
+    msg_type = msg_cons_propose;
+    payload = C_codec.encode_propose early;
+  } in
+  let local_fd, remote_fd =
+    Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
+  in
+  let conn =
+    Octra_net.P2p_conn.create
+      ~peer_class:Octra_net.P2p_frame_budget.Validator
+      local_fd
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v1"))
+      ~addr:"198.51.100.21:19000"
+      ~direction:Octra_net.P2p_conn.Inbound
+  in
+  Lwt_main.run (C_driver.on_p2p_message driver conn frame);
+  if Hashtbl.length driver.pending_proposals <> 0 then
+    failwith "far-future proposal was retained";
+  C_engine.start_height driver.engine 2L;
+  Lwt_main.run (C_driver.on_p2p_message driver conn frame);
+  if Hashtbl.length driver.pending_proposals <> 1 then
+    failwith "proposal id was consumed before retention";
+  C_engine.start_height driver.engine 3L;
+  Lwt_main.run (C_driver.process_outputs driver);
+  let expected = C_hash.proposal_id early.header in
+  (match Hashtbl.find_opt driver.engine.prevotes.votes "v0" with
+   | Some vote when vote.proposal_id = expected -> ()
+   | _ -> failwith "reentered proposal was not prevoted");
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close remote_fd)
+
+let test_future_votes_replay_after_height_advance () =
+  let chain_id = "octra-test-future-votes" in
+  let driver = driver chain_id in
+  let next_proposal = proposal chain_id ~epoch_id:2L ~round:0 in
+  let proposal_id = C_hash.proposal_id next_proposal.header in
+  if not (C_driver.defer_pending_proposal driver next_proposal) then
+    failwith "next-height proposal was not retained";
+  List.iter
+    (fun vote_type ->
+      List.iter
+        (fun validator ->
+          let vote =
+            signed_vote
+              chain_id
+              ~epoch_id:2L
+              ~round:0
+              ~vote_type
+              ~proposal_id
+              validator
+          in
+          match C_driver.defer_future_vote driver vote with
+          | C_driver.Future_vote_deferred -> ()
+          | _ -> failwith "next-height vote was not retained")
+        ["v1"; "v2"; "v3"])
+    [C_types.Prevote; C_types.Precommit];
+  (match
+    C_driver.defer_future_vote
+      driver
+      (signed_vote
+         chain_id
+         ~epoch_id:3L
+         ~round:0
+         ~vote_type:C_types.Prevote
+         ~proposal_id
+         "v1")
+   with
+   | C_driver.Future_vote_not_applicable -> ()
+   | _ -> failwith "far-future vote was retained");
+  C_engine.start_height driver.engine 2L;
+  Lwt_main.run (C_driver.process_outputs driver);
+  if driver.engine.finalized_height <> 2L then
+    failwith "retained votes did not finalize next height";
+  if Hashtbl.length driver.future_votes <> 0 then
+    failwith "retained votes were not consumed";
+  match C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+    ~epoch_id:2L ~round:0 ~vote_type:C_types.Precommit ~proposal_id with
+  | Ok (Some vote) when C_hash.verify_vote ~pubkey_raw:(public_key "v0") vote -> ()
+  | _ -> failwith "finalized output lost local appeal vote"
+
+let test_future_vote_conflict_is_retained () =
+  let chain_id = "octra-test-future-vote-conflict" in
+  let queued_driver = driver chain_id in
+  let first =
+    signed_vote
+      chain_id
+      ~epoch_id:2L
+      ~round:0
+      ~vote_type:C_types.Prevote
+      ~proposal_id:(String.make 32 '\x01')
+      "v1"
+  in
+  let second =
+    signed_vote
+      chain_id
+      ~epoch_id:2L
+      ~round:0
+      ~vote_type:C_types.Prevote
+      ~proposal_id:(String.make 32 '\x02')
+      "v1"
+  in
+  (match C_driver.defer_future_vote queued_driver first with
+   | C_driver.Future_vote_deferred -> ()
+   | _ -> failwith "first future vote was not retained");
+  (match C_driver.defer_future_vote queued_driver first with
+   | C_driver.Future_vote_same -> ()
+   | _ -> failwith "same future vote was not classified");
+  (match C_driver.defer_future_vote queued_driver second with
+   | C_driver.Future_vote_conflict prior
+     when prior.proposal_id = first.proposal_id -> ()
+   | _ -> failwith "future vote conflict was not attributed");
+  if Hashtbl.length queued_driver.future_votes <> 1 then
+    failwith "future vote conflict changed retained votes";
+  let replay_driver = driver chain_id in
+  (match C_driver.defer_future_vote replay_driver first with
+   | C_driver.Future_vote_deferred -> ()
+   | _ -> failwith "replay future vote was not retained");
+  C_engine.start_height replay_driver.engine 2L;
+  C_engine.on_vote
+    replay_driver.engine
+    second
+    ~sign_fn:replay_driver.config.sign_fn;
+  let evidence = C_driver.replay_future_votes replay_driver in
+  if List.length evidence <> 1 then
+    failwith "replay conflict did not produce evidence";
+  if List.length (C_driver.vote_evidence replay_driver) <> 1 then
+    failwith "replay conflict evidence was not retained";
+  if Hashtbl.length replay_driver.future_votes <> 0 then
+    failwith "replayed conflict remained queued"
+
+let test_activation_vote_reenters_after_set_resolution () =
+  let chain_id = "octra-test-activation-vote-reentry" in
+  let next_set =
+    C_engine.make_validator_set
+      (List.map
+         (fun address ->
+           C_types.{ address; pubkey = public_key address })
+         ["r0"; "r1"; "r2"; "r3"])
+  in
+  let scheduled = C_driver.{
+    activate_epoch = 2L;
+    validator_set = next_set;
+    fingerprint = "activation-vote-reentry";
+  } in
+  let plan = ref None in
+  let driver =
+    driver
+      ~load_scheduled_validator_set_config:(fun () -> Lwt.return !plan)
+      chain_id
+  in
+  driver.running <- true;
+  let value =
+    signed_vote
+      chain_id
+      ~epoch_id:2L
+      ~round:0
+      ~vote_type:C_types.Prevote
+      ~proposal_id:(String.make 32 '\x33')
+      "r1"
+  in
+  let frame = Octra_net.P2p_frame.{
+    msg_type = msg_cons_vote;
+    payload = C_codec.encode_vote value;
+  } in
+  let local_fd, remote_fd =
+    Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
+  in
+  let conn =
+    Octra_net.P2p_conn.create
+      ~peer_class:Octra_net.P2p_frame_budget.Validator
+      local_fd
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v2"))
+      ~addr:"198.51.100.23:19000"
+      ~direction:Octra_net.P2p_conn.Inbound
+  in
+  Lwt_main.run (C_driver.on_p2p_message driver conn frame);
+  if Hashtbl.length driver.future_votes <> 0 then
+    failwith "vote entered before its validator set resolved";
+  if Octra_net.P2p_swarm.peer_scores driver.swarm <> [] then
+    failwith "unresolved vote penalized its relay";
+  plan := Some scheduled;
+  Lwt_main.run (C_driver.on_p2p_message driver conn frame);
+  if Hashtbl.length driver.future_votes <> 1 then
+    failwith "vote id was consumed before validator set resolution";
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close remote_fd)
+
+let test_activation_vote_evidence_targets_signer () =
+  let chain_id = "octra-test-activation-evidence" in
+  let next_addresses = ["n0"; "n1"; "n2"; "n3"] in
+  let next_set =
+    C_engine.make_validator_set
+      (List.map
+         (fun address ->
+           C_types.{ address; pubkey = public_key address })
+         next_addresses)
+  in
+  let scheduled_validator_set_config = C_driver.{
+    activate_epoch = 2L;
+    validator_set = next_set;
+    fingerprint = "activation-evidence";
+  } in
+  let source = driver ~scheduled_validator_set_config chain_id in
+  source.running <- true;
+  let relay_id =
+    Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v2")
+  in
+  let local_fd, remote_fd =
+    Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
+  in
+  let conn =
+    Octra_net.P2p_conn.create
+      ~peer_class:Octra_net.P2p_frame_budget.Validator
+      local_fd
+      ~peer_id:relay_id
+      ~addr:"198.51.100.22:19000"
+      ~direction:Octra_net.P2p_conn.Inbound
+  in
+  let vote proposal_id =
+    signed_vote
+      chain_id
+      ~epoch_id:2L
+      ~round:0
+      ~vote_type:C_types.Prevote
+      ~proposal_id
+      "n1"
+  in
+  let send target value =
+    C_driver.on_p2p_message
+      target
+      conn
+      Octra_net.P2p_frame.{
+        msg_type = msg_cons_vote;
+        payload = C_codec.encode_vote value;
+      }
+  in
+  Lwt_main.run (send source (vote (String.make 32 '\x11')));
+  Lwt_main.run (send source (vote (String.make 32 '\x22')));
+  let evidence =
+    match C_driver.vote_evidence source with
+    | [value] -> value
+    | _ -> failwith "next-set equivocation evidence was not retained"
+  in
+  let signer_id =
+    Octra_net.P2p_handshake.node_id_of_pubkey (public_key "n1")
+  in
+  let signer_key = Octra_net.P2p_peer_guard.identity_key signer_id in
+  let relay_key = Octra_net.P2p_peer_guard.identity_key relay_id in
+  let source_scores = Octra_net.P2p_swarm.peer_scores source.swarm in
+  if not (List.exists (fun row -> row.Octra_net.P2p_peer_guard.key = signer_key) source_scores) then
+    failwith "equivocation was not attributed to its signer";
+  if List.exists (fun row -> row.Octra_net.P2p_peer_guard.key = relay_key) source_scores then
+    failwith "equivocation was attributed to its relay";
+  let receiver = driver ~scheduled_validator_set_config chain_id in
+  receiver.running <- true;
+  Lwt_main.run
+    (C_driver.on_p2p_message
+       receiver
+       conn
+       Octra_net.P2p_frame.{
+         msg_type = msg_vote_evidence;
+         payload = C_evidence.encode_vote_conflict evidence;
+       });
+  if List.length (C_driver.vote_evidence receiver) <> 1 then
+    failwith "next-height evidence was rejected at the prior height";
+  let receiver_scores = Octra_net.P2p_swarm.peer_scores receiver.swarm in
+  if not (List.exists (fun row -> row.Octra_net.P2p_peer_guard.key = signer_key) receiver_scores) then
+    failwith "received evidence did not identify its signer";
+  if List.exists (fun row -> row.Octra_net.P2p_peer_guard.key = relay_key) receiver_scores then
+    failwith "received evidence penalized its relay";
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close remote_fd)
+
+let test_waiting_proposal_retries_without_penalty () =
+  let chain_id = "octra-test-proposal-wait" in
+  let ready = ref false in
+  let calls = ref 0 in
+  let verify_proposal _ =
+    incr calls;
+    Lwt.return
+      (if !ready then C_driver.Proposal_accept
+       else C_driver.Proposal_wait)
+  in
+  let driver = driver ~verify_proposal chain_id in
+  driver.running <- true;
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let local_fd, remote_fd =
+    Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
+  in
+  let conn =
+    Octra_net.P2p_conn.create
+      ~peer_class:Octra_net.P2p_frame_budget.Observer
+      local_fd
+      ~peer_id:"proposal-wait-peer"
+      ~addr:"198.51.100.28:19000"
+      ~direction:Octra_net.P2p_conn.Inbound
+  in
+  Lwt_main.run
+    (C_driver.on_p2p_message
+       driver
+       conn
+       Octra_net.P2p_frame.{
+         msg_type = msg_cons_propose;
+         payload = C_codec.encode_propose value;
+       });
+  if !calls <> 2 then
+    failwith "proposal wait did not run one immediate retry";
+  if driver.proposal_wait = None then
+    failwith "proposal wait was not retained";
+  if Hashtbl.length driver.engine.prevotes.votes <> 0 then
+    failwith "proposal wait emitted a vote";
+  if Octra_net.P2p_swarm.peer_scores driver.swarm <> [] then
+    failwith "proposal wait penalized its relay";
+  ready := true;
+  Lwt_main.run
+    (let open Lwt.Syntax in
+     let* () = Lwt_unix.sleep 0.6 in
+     C_driver.process_outputs driver);
+  if !calls <> 3 then
+    failwith "proposal retry did not rerun verification";
+  if driver.proposal_wait <> None then
+    failwith "accepted proposal wait was retained";
+  let expected = C_hash.proposal_id value.header in
+  (match Hashtbl.find_opt driver.engine.prevotes.votes "v0" with
+   | Some vote when vote.proposal_id = expected -> ()
+   | _ -> failwith "proposal retry did not emit the local vote");
+  if Octra_net.P2p_swarm.peer_scores driver.swarm <> [] then
+    failwith "accepted proposal retry penalized its relay";
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close remote_fd)
+
+let test_proposal_verify_error_waits_without_penalty () =
+  let chain_id = "octra-test-proposal-error" in
+  let verify_proposal _ = Lwt.fail_with "local verify error" in
+  let driver = driver ~verify_proposal chain_id in
+  driver.running <- true;
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let local_fd, remote_fd =
+    Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
+  in
+  let conn =
+    Octra_net.P2p_conn.create
+      ~peer_class:Octra_net.P2p_frame_budget.Observer
+      local_fd
+      ~peer_id:"proposal-error-peer"
+      ~addr:"198.51.100.29:19000"
+      ~direction:Octra_net.P2p_conn.Inbound
+  in
+  Lwt_main.run
+    (C_driver.on_p2p_message
+       driver
+       conn
+       Octra_net.P2p_frame.{
+         msg_type = msg_cons_propose;
+         payload = C_codec.encode_propose value;
+       });
+  if driver.proposal_wait = None then
+    failwith "proposal verify error was not retained";
+  if Hashtbl.length driver.engine.prevotes.votes <> 0 then
+    failwith "proposal verify error emitted a vote";
+  if Octra_net.P2p_swarm.peer_scores driver.swarm <> [] then
+    failwith "proposal verify error penalized its relay";
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close remote_fd)
+
+let () =
+  test_pace_votes ();
+  test_qc_vote ();
+  test_deferred_proposal_replays_after_round_skip ();
+  test_pending_proposal_replays_after_height_advance ();
+  test_unretained_proposal_reenters_after_height_advance ();
+  test_future_votes_replay_after_height_advance ();
+  test_future_vote_conflict_is_retained ();
+  test_activation_vote_reenters_after_set_resolution ();
+  test_activation_vote_evidence_targets_signer ();
+  test_waiting_proposal_retries_without_penalty ();
+  test_proposal_verify_error_waits_without_penalty ();
+  Printf.printf "status = pass test = bft_ready_replay\n%!"

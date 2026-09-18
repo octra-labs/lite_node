@@ -131,6 +131,7 @@ from validator_store import prior_scan
 from validator_store import pack_bytes
 from validator_store import report
 from validator_store import remove_prior
+from validator_store import require_clear
 from validator_store import snapshot_stats
 from validator_store import suffix_bytes
 from validator_store import tree_bytes
@@ -231,7 +232,7 @@ def write_need(data, chain, cause="root", epoch=100, head=99, target=None):
     path = data / "recovery/sync_need.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
-        "schema": "octra_sync_need_v1",
+        "schema": "octra_sync_need_v2",
         "chain_id": chain,
         "cause": cause,
         "epoch": epoch,
@@ -264,6 +265,46 @@ class ValidatorToolsTest(unittest.TestCase):
         if WORK.exists():
             shutil.rmtree(WORK)
         WORK.mkdir(parents=True)
+
+    def test_store_recovery_hold(self):
+        data = WORK / "active"
+        recovery = data / "recovery"
+        recovery.mkdir(parents=True)
+        require_clear(data)
+        for name in ("sync_need.json", "sync_conflict.json"):
+            for kind in ("file", "directory", "link"):
+                path = recovery / name
+                if kind == "file":
+                    path.write_text("invalid")
+                elif kind == "directory":
+                    path.mkdir()
+                else:
+                    path.symlink_to(recovery / "absent")
+                with self.subTest(name=name, kind=kind), mock.patch(
+                    "validator_store.prior_plan"
+                ) as plan, self.assertRaises(ValidatorError):
+                    remove_prior(data, {})
+                plan.assert_not_called()
+                path.rmdir() if kind == "directory" else path.unlink()
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError), self.assertRaises(
+            ValidatorError
+        ):
+            require_clear(data)
+
+    def test_store_recovery_race(self):
+        data = WORK / "active"
+        recovery = data / "recovery"
+        recovery.mkdir(parents=True)
+        prior = WORK / "active.prior-10"
+        prior.mkdir()
+        def plan(*args):
+            (recovery / "sync_conflict.json").write_text("held")
+            return [(prior, 0)], []
+        with mock.patch("validator_store.prior_plan", side_effect=plan), self.assertRaises(
+            ValidatorError
+        ):
+            remove_prior(data, {})
+        self.assertTrue(prior.is_dir())
 
     def test_store_prior_paths(self):
         data = WORK / "devnet"
@@ -565,6 +606,32 @@ class ValidatorToolsTest(unittest.TestCase):
                 Path("/etc/octra/extra.env").resolve(),
             ],
         )
+
+    def test_restart_policy(self):
+        from upgrade import restart_notice, restart_ready, RESTART_CODE
+        self.assertEqual(RESTART_CODE, 75)
+        cases = [
+            ({"Restart": "on-failure"}, True),
+            ({"Restart": "always"}, True),
+            ({"Restart": "on-success"}, False),
+            ({"Restart": "on-abnormal"}, False),
+            ({"Restart": "no"}, False),
+            ({}, False),
+            ({"Restart": "always", "RestartPreventExitStatus": "75"}, False),
+            ({"Restart": "on-failure", "SuccessExitStatus": "75"}, False),
+            ({"Restart": "on-success", "SuccessExitStatus": "75"}, True),
+            ({"Restart": "no", "RestartForceExitStatus": "75"}, True),
+            ({"Restart": "no", "RestartForceExitStatus": "75",
+              "RestartPreventExitStatus": "75"}, False),
+        ]
+        for policy, expected in cases:
+            with self.subTest(policy=policy):
+                self.assertEqual(restart_ready(policy), expected)
+        with mock.patch("upgrade.emit") as emitted:
+            restart_notice({"kind": "systemd", "name": "octra.service",
+                            "restart": {"Restart": "no"}})
+        self.assertEqual(emitted.call_args.kwargs["status"], "warning")
+        self.assertEqual(emitted.call_args.kwargs["exit_code"], 75)
 
     def test_upgrade_signature(self):
         marker = signed_release_value()
@@ -4033,6 +4100,32 @@ class ValidatorToolsTest(unittest.TestCase):
         marker.mkdir()
         with self.assertRaisesRegex(ValidatorError, "not a regular file"):
             read_need(data, "octra-devnet-bft-v1")
+
+    def test_recovery_legacy(self):
+        data = WORK / "data"
+        chain = "octra-devnet-bft-v1"
+        marker = write_need(data, chain, cause="journal")
+        value = json.loads(marker.read_text())
+        value["schema"] = "octra_sync_need_v1"
+        marker.write_text(json.dumps(value))
+        self.assertEqual(read_need(data, chain).cause, "conflict")
+        self.assertTrue(marker.is_file())
+
+    def test_recovery_conflict(self):
+        data = WORK / "data"
+        chain = "octra-devnet-bft-v1"
+        marker = write_need(data, chain, cause="journal")
+        value = json.loads(marker.read_text())
+        value["cause"] = "conflict"
+        conflict = marker.with_name("sync_conflict.json")
+        conflict.write_text(json.dumps(value))
+        self.assertEqual(read_need(data, chain).cause, "conflict")
+        value["cause"] = "journal"
+        conflict.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValidatorError, "conflict marker cause"):
+            read_need(data, chain)
+        self.assertTrue(marker.is_file())
+        self.assertTrue(conflict.is_file())
 
     def test_recovery_marker_fields(self):
         value = {

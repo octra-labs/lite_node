@@ -20,7 +20,7 @@ type node_deps = {
   persist_finality_certificate :
     validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->
-    unit;
+    Octra_consensus.C_types.finalize;
   persist_finality_bundle :
     Octra_consensus.C_types.finalize ->
     Consensus_finality_journal.bundle ->

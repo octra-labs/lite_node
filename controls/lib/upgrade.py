@@ -46,6 +46,7 @@ PENDING = re.compile(r"^[0-9]{10}_[0-9]{4}\.pending$")
 VOTE = re.compile(r"^[0-9]{20}_[0-9]{8}_[0-9a-f]{64}\.vote$")
 SYNC_LIMIT = 65_536
 CERT_LIMIT = 33_554_432
+RESTART_CODE = 75
 SYNC_HEADERS = {
     "Accept": "application/json",
     "User-Agent": "octra-upgrade/1",
@@ -191,7 +192,7 @@ def props(scope, unit):
         "show",
         unit,
         "--no-pager",
-        "--property=Id,LoadState,ActiveState,SubState,MainPID,User,ExecStart,EnvironmentFiles,WorkingDirectory",
+        "--property=Id,LoadState,ActiveState,SubState,MainPID,User,ExecStart,EnvironmentFiles,WorkingDirectory,Restart,SuccessExitStatus,RestartPreventExitStatus,RestartForceExitStatus",
     ))
     values = {}
     for line in raw.splitlines():
@@ -353,8 +354,39 @@ def unit_sup(config, values, rows, explicit=None):
                 "config": config,
                 "exec": command,
                 "env_files": files,
+                "restart": {
+                    key: info.get(key, "") for key in (
+                        "Restart", "SuccessExitStatus",
+                        "RestartPreventExitStatus", "RestartForceExitStatus",
+                    )
+                },
             })
     return matches
+
+def restart_ready(policy):
+    codes = {str(RESTART_CODE), "TEMPFAIL", "EX_TEMPFAIL"}
+    has = lambda key: bool(codes.intersection(policy.get(key, "").split()))
+    if has("RestartPreventExitStatus"):
+        return False
+    if has("RestartForceExitStatus"):
+        return True
+    mode = policy.get("Restart", "")
+    success = has("SuccessExitStatus")
+    return mode == "always" or (mode == "on-success" if success else mode == "on-failure")
+
+def restart_notice(sup):
+    if sup["kind"] != "systemd":
+        return
+    policy = sup.get("restart", {})
+    ready = restart_ready(policy)
+    emit(
+        event="recovery_restart",
+        status="automatic" if ready else "warning",
+        unit=sup["name"],
+        policy=policy.get("Restart") or "unknown",
+        exit_code=RESTART_CODE,
+        action="none" if ready else "review_unit_restart_policy",
+    )
 
 def supervisor(config, values, rows, entries, unit=None):
     candidates = pm2_sup(config, values, entries)
@@ -1184,6 +1216,7 @@ def main():
     config = config_path(root, args.config, rows, entries)
     values = parse_env(config)
     sup = supervisor(config, values, rows, entries, unit=args.unit)
+    restart_notice(sup)
     if args.apply:
         return apply(root, sup, values, args, marker)
     if values.get("OCTRA_CHAIN_ID") != marker["chain_id"]:

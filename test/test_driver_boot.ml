@@ -61,6 +61,12 @@ let test_sync_guard () =
   let cases = [
     6, Mark.Missing, Ok None;
     6, Mark.Ready (Need.journal ~epoch:7 ~head:6), Ok None;
+    5, Mark.Ready (Need.journal ~epoch:7 ~head:6),
+      Ok (Some (Need.journal ~epoch:7 ~head:6));
+    6, Mark.Ready (Need.conflict ~epoch:7 ~head:6),
+      Ok (Some (Need.conflict ~epoch:7 ~head:6));
+    20, Mark.Ready (Need.conflict ~epoch:7 ~head:6),
+      Ok (Some (Need.conflict ~epoch:7 ~head:6));
     6, Mark.Ready { Need.cause = Need.Range; epoch = 7; head = 6;
       target = Some 20L }, Ok None;
     5, Mark.Ready root, Ok (Some root);
@@ -75,10 +81,25 @@ let test_sync_guard () =
         (S.sync_plan ~head state = expected))
     cases
 
+let test_seed_fault () =
+  let module F = Octra_node_runtime.Sync_finality in
+  let module N = Octra_node_runtime.Sync_need in
+  expect "disk error is not conflict"
+    (F.recovery ~head:12 (F.Journal "read failed") = None);
+  expect "checkpoint mismatch needs root recovery"
+    (F.recovery ~head:12 (F.Root "root differs")
+     = Some (N.root ~epoch:13 ~head:12));
+  expect "contradictory finality stays held"
+    (F.recovery ~head:12 (F.Conflict "different block")
+     = Some (N.conflict ~epoch:13 ~head:12));
+  expect "invalid height cannot make marker"
+    (F.recovery ~head:max_int (F.Conflict "different block") = None)
+
 let () =
   test_enabled ();
   test_validator_state_height ();
   test_committed_reads_open ();
   test_committed_reads_closed ();
   test_sync_guard ();
+  test_seed_fault ();
   print_endline "status = pass test = node_runtime_consensus_driver_boot_shell"

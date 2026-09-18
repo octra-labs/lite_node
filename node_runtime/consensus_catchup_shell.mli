@@ -149,7 +149,7 @@ type record_apply_deps = {
   point_source : apply_point_source;
   write_finality :
     validated_record ->
-    unit;
+    validated_record;
   promote_finality :
     validated_record ->
     unit;
@@ -192,7 +192,7 @@ type target_wiring = {
   activate_gap : unit -> unit;
   write_finality :
     validated_record ->
-    unit;
+    validated_record;
   promote_finality :
     validated_record ->
     unit;
@@ -234,7 +234,7 @@ type node_target_wiring = {
   queue : Consensus_catchup_queue.t;
   write_finality :
     validated_record ->
-    unit;
+    validated_record;
   promote_finality :
     validated_record ->
     unit;
@@ -267,7 +267,7 @@ type driver_runner_wiring = {
   finality : Consensus_finality_state.callbacks;
   write_finality :
     validated_record ->
-    unit;
+    validated_record;
   promote_finality :
     validated_record ->
     unit;
@@ -302,7 +302,7 @@ type driver_runner_node_wiring = {
   finality : Consensus_finality_state.callbacks;
   write_finality :
     validated_record ->
-    unit;
+    validated_record;
   promote_finality :
     validated_record ->
     unit;

@@ -5,7 +5,6 @@ module C_types = Octra_consensus.C_types
 
 type 'driver deps = {
   prune_frozen : finalized_epoch:int64 -> unit;
-  store_proposer : Consensus_finalized_flow.proposer_info -> unit;
   store_expected_root : epoch:int -> root:string -> unit;
   store_finalized :
     epoch:int ->

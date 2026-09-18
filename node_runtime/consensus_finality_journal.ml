@@ -39,6 +39,12 @@ type seed_result =
   | Seeded
   | Seed_current
 
+type seed_fault =
+  | Seed_pending
+  | Seed_invalid of string
+  | Seed_conflict of string
+  | Seed_io of string
+
 type conflict =
   | History
   | Committed
@@ -234,13 +240,9 @@ let read_record target =
   | Some encoded ->
     Some (record_of_json (Yojson.Safe.from_string encoded))
 
-let same_finalize left right =
-  C_codec.encode_finalize left = C_codec.encode_finalize right
-
 let same_block left right =
   String.equal left.C_types.chain_id right.C_types.chain_id
   && Int64.equal left.epoch_id right.epoch_id
-  && left.commit_round = right.commit_round
   && String.equal left.proposal_id right.proposal_id
   && C_hash.parent_commit_hash_opt left.parent_commit
      = C_hash.parent_commit_hash_opt right.parent_commit
@@ -255,14 +257,13 @@ let same_bundle left right =
   && left.receipts_json = right.receipts_json
 
 let same_record left right =
-  same_finalize left.finalize right.finalize
+  same_block left.finalize right.finalize
   && C_config.validator_set_hash left.validator_set
      = C_config.validator_set_hash right.validator_set
   &&
   match left.bundle, right.bundle with
-  | None, None -> true
   | Some left, Some right -> same_bundle left right
-  | _ -> false
+  | None, _ | _, None -> true
 
 let staged_counter = ref 0
 
@@ -313,33 +314,68 @@ let write_record base record =
   ensure_dir base;
   write_encoded (path base) (bytes record)
 
-let archive_record base record =
-  ensure_history_dir base;
-  let compact = { record with bundle = None } in
-  let epoch = compact.finalize.C_types.epoch_id in
-  let target = history_path base epoch in
-  if Sys.file_exists target then begin
-    match read_record target with
-    | Some prior
-      when Finality_log.same_commitment
-             (Finality_log.of_finalize prior.finalize)
-             (Finality_log.of_finalize compact.finalize)
-           && C_config.validator_set_hash prior.validator_set
-              = C_config.validator_set_hash compact.validator_set ->
-      ()
-    | Some _
-    | None ->
-      failwith "conflicting finality history"
-  end else
-    write_encoded target (bytes compact);
-  let expired = Int64.sub epoch history_limit in
-  if Int64.compare expired 0L >= 0 then begin
-    let stale = history_path base expired in
-    if Sys.file_exists stale then begin
-      Unix.unlink stale;
-      fsync_directory (history_dir base)
+let retain_conflict base reason finalize =
+  let epoch = finalize.C_types.epoch_id in
+  if Int64.compare epoch 0L <= 0
+     || Int64.compare epoch (Int64.of_int max_int) > 0 then
+    failwith "finality conflict height is invalid";
+  let epoch = Int64.to_int epoch in
+  let need = Sync_need.conflict ~epoch ~head:(epoch - 1) in
+  begin match Sync_mark.write ~data_dir:base ~chain:finalize.chain_id need with
+  | Ok _ -> ()
+  | Error error -> failwith ("finality conflict marker: " ^ error)
+  end;
+  ensure_dir base;
+  let read target =
+    try match read_record target with
+    | None -> `Null
+    | Some record -> record_to_json { record with bundle = None }
+    with exn -> `Assoc ["error", `String (Printexc.to_string exn)]
+  in
+  let prior =
+    try match Finality_log.last_entry_fast base with
+    | None -> `Null
+    | Some entry -> Yojson.Safe.from_string (Finality_log.line entry)
+    with exn -> `Assoc ["error", `String (Printexc.to_string exn)]
+  in
+  let value = `Assoc [
+    "schema", `String "octra_finality_conflict_v1";
+    "reason", `String reason;
+    "incoming", `String (encode_finalize finalize);
+    "pending", read (path base);
+    "committed", read (committed_path base);
+    "history", read (history_path base finalize.epoch_id);
+    "entry", prior;
+  ] in
+  let target = Filename.concat (dir base) "conflict.json" in
+  match Sync_mark.write_new target (Yojson.Safe.to_string value ^ "\n") with
+  | Ok true -> ()
+  | Ok false ->
+    begin match read_bytes target with
+    | None -> failwith "finality conflict record disappeared"
+    | Some raw ->
+      let open Yojson.Safe.Util in
+      let saved = Yojson.Safe.from_string raw in
+      if saved |> member "schema" |> to_string <> "octra_finality_conflict_v1" then
+        failwith "finality conflict schema differs";
+      ignore (saved |> member "incoming" |> to_string |> decode_finalize)
     end
-  end
+  | Error error -> failwith ("finality conflict record: " ^ error)
+
+let refuse base reason finalize =
+  retain_conflict base reason finalize;
+  failwith reason
+
+let guard base finalize action =
+  try action () with exn ->
+    match classify_conflict exn with
+    | None -> raise exn
+    | Some _ ->
+      let reason = match exn with
+        | Failure reason -> reason
+        | _ -> Printexc.to_string exn
+      in
+      refuse base reason finalize
 
 let proof_path base record =
   Filename.concat
@@ -357,7 +393,7 @@ let archive_proof base record =
     | Some prior when same_record prior record -> ()
     | Some _
     | None ->
-      failwith "conflicting finality proof history"
+      refuse base "conflicting finality proof history" record.finalize
   end else
     write_encoded target (bytes record)
 
@@ -365,23 +401,27 @@ let persist_certificate base ~validator_set finalize =
   match read_record (path base) with
   | None ->
     write_record base { finalize; validator_set; bundle = None }
+  | Some prior when not (Int64.equal prior.finalize.epoch_id finalize.C_types.epoch_id) ->
+    failwith "finality journal has another pending height"
   | Some prior
     when same_block prior.finalize finalize
          && C_config.validator_set_hash prior.validator_set
             = C_config.validator_set_hash validator_set ->
     ()
   | Some _ ->
-    failwith "conflicting finality journal certificate"
+    refuse base "conflicting finality journal certificate" finalize
 
 let persist_bundle base finalize bundle =
   match read_record (path base) with
   | None ->
     failwith "finality journal bundle requires certificate"
+  | Some prior when not (Int64.equal prior.finalize.epoch_id finalize.C_types.epoch_id) ->
+    failwith "finality journal has another pending height"
   | Some prior when not (same_block prior.finalize finalize) ->
-    failwith "conflicting finality journal certificate"
+    refuse base "conflicting finality journal certificate" finalize
   | Some { bundle = Some existing; _ } ->
     if not (same_bundle existing bundle) then
-      failwith "conflicting finality journal bundle"
+      refuse base "conflicting finality journal bundle" finalize
   | Some prior ->
     write_record base { prior with bundle = Some bundle }
 
@@ -424,6 +464,44 @@ let validate_record ~chain_id record =
     | None -> Ok ()
     | Some bundle -> validate_bundle record.finalize bundle
 
+let history_valid ~chain_id ~validator_set record =
+  match validate_record ~chain_id record with
+  | Ok () -> Ok ()
+  | Error _ -> validate_record ~chain_id { record with validator_set }
+
+let history_copy record = function
+  | Some prior when not (same_block prior.finalize record.finalize) ->
+    Error "conflicting finality history"
+  | Some prior when C_config.validator_set_hash prior.validator_set
+                    = C_config.validator_set_hash record.validator_set ->
+    Ok None
+  | Some prior ->
+    let chain_id = record.finalize.C_types.chain_id in
+    Result.bind (validate_record ~chain_id record) (fun () ->
+      Result.map (fun () -> Some { record with bundle = None })
+        (history_valid ~chain_id ~validator_set:record.validator_set prior))
+  | None -> Ok (Some { record with bundle = None })
+
+let check_history base record =
+  guard base record.finalize (fun () ->
+    match history_copy record (read_record (history_path base record.finalize.epoch_id)) with
+    | Ok next -> next
+    | Error reason -> failwith reason)
+
+let archive_record base record =
+  ensure_history_dir base;
+  let epoch = record.finalize.C_types.epoch_id in
+  Option.iter (fun next -> write_encoded (history_path base epoch) (bytes next))
+    (check_history base record);
+  let expired = Int64.sub epoch history_limit in
+  if Int64.compare expired 0L >= 0 then begin
+    let old = history_path base expired in
+    if Sys.file_exists old then begin
+      Unix.unlink old;
+      fsync_directory (history_dir base)
+    end
+  end
+
 let validate ~chain_id ~validator_set record =
   if
     C_config.validator_set_hash validator_set
@@ -464,23 +542,41 @@ let check_seed ~chain_id ~validator_set ~finalize label = function
   | Some record ->
     begin
       match validate ~chain_id ~validator_set record with
-      | Error reason -> Error (label ^ " is invalid: " ^ reason)
-      | Ok () when not (same_finalize record.finalize finalize) ->
-        Error (label ^ " conflicts with checkpoint")
+      | Error reason -> Error (Seed_invalid (label ^ " is invalid: " ^ reason))
+      | Ok () when not (Int64.equal record.finalize.epoch_id finalize.C_types.epoch_id) ->
+        Error (Seed_invalid (label ^ " has another height"))
+      | Ok () when not (same_block record.finalize finalize) ->
+        Error (Seed_conflict (label ^ " conflicts with checkpoint"))
       | Ok () -> Ok true
     end
+
+let check_seed_history record prior =
+  let checked = match prior with
+    | None -> Ok ()
+    | Some prior ->
+      match history_valid ~chain_id:record.finalize.chain_id
+        ~validator_set:record.validator_set prior with
+      | Ok () -> Ok ()
+      | Error reason -> Error (Seed_invalid reason)
+  in
+  Result.bind checked (fun () ->
+    match history_copy record prior with
+    | Ok None -> Ok true
+    | Ok (Some _) -> Ok false
+    | Error "conflicting finality history" ->
+      Error (Seed_conflict "committed finality history conflicts with checkpoint")
+    | Error reason -> Error (Seed_invalid reason))
 
 let seed ~chain_id ~validator_set ~finalize base =
   try
     let record = { finalize; validator_set; bundle = None } in
     match validate ~chain_id ~validator_set record with
-    | Error reason -> Error reason
+    | Error reason -> Error (Seed_invalid reason)
     | Ok () ->
       begin
-        match read_pending_epoch base with
-        | Error reason -> Error reason
-        | Ok (Some _) -> Error "pending finality journal blocks checkpoint seed"
-        | Ok None ->
+        match read_record (path base) with
+        | Some _ -> Error Seed_pending
+        | None ->
           let epoch = finalize.C_types.epoch_id in
           let current = read_record (committed_path base) in
           let history = read_record (history_path base epoch) in
@@ -492,13 +588,12 @@ let seed ~chain_id ~validator_set ~finalize base =
                 ~finalize
                 "committed finality journal"
                 current,
-              check_seed
-                ~chain_id
-                ~validator_set
-                ~finalize
-                "committed finality history"
-                history
+              check_seed_history record history
             with
+            | Error (Seed_conflict reason), _
+            | _, Error (Seed_conflict reason) ->
+              retain_conflict base reason finalize;
+              Error (Seed_conflict reason)
             | Error reason, _
             | _, Error reason -> Error reason
             | Ok has_current, Ok has_history ->
@@ -509,8 +604,10 @@ let seed ~chain_id ~validator_set ~finalize base =
               else Ok Seeded
           end
       end
-  with exn ->
-    Error (Printexc.to_string exn)
+  with
+  | (Unix.Unix_error _ | Sys_error _) as exn ->
+    Error (Seed_io (Printexc.to_string exn))
+  | exn -> Error (Seed_invalid (Printexc.to_string exn))
 
 let committed_matches entry record =
   Finality_log.same_commitment
@@ -588,9 +685,15 @@ let rebind_committed ~chain_id ~validator_set ~entry base =
                 C_config.validator_set_hash record.validator_set
                 = C_config.validator_set_hash validator_set
               then
-                Ok Unchanged
+                begin
+                  archive_record base record;
+                  Ok Unchanged
+                end
               else begin
-                write_encoded target (bytes { record with validator_set });
+                let replacement = { record with validator_set } in
+                ignore (check_history base replacement);
+                write_encoded target (bytes replacement);
+                archive_record base replacement;
                 Ok Rebound
               end
       end
@@ -620,6 +723,9 @@ let proof_needed ~chain_id ~validator_set ~entry base =
 
 let check_proof ~chain_id ~validator_set ~entry ~finalize base =
   try
+    if finalize.C_types.commit_round <> entry.Finality_log.round then
+      Error "finality proof round mismatch"
+    else
     match committed_record_path base (Int64.of_int entry.Finality_log.height) with
     | None ->
       Error "committed finality journal is missing"
@@ -645,7 +751,7 @@ let check_proof ~chain_id ~validator_set ~entry ~finalize base =
                   if
                     C_config.validator_set_hash record.validator_set
                     = C_config.validator_set_hash validator_set
-                    && not (same_finalize record.finalize finalize)
+                    && not (same_block record.finalize finalize)
                   then
                     Error "finality proof validator set already current"
                   else
@@ -658,6 +764,9 @@ let check_proof ~chain_id ~validator_set ~entry ~finalize base =
 
 let repair_committed ~chain_id ~validator_set ~entry ~finalize base =
   try
+    if finalize.C_types.commit_round <> entry.Finality_log.round then
+      Error "finality proof round mismatch"
+    else
     match committed_record_path base (Int64.of_int entry.Finality_log.height) with
     | None ->
       Error "committed finality journal is missing"
@@ -684,13 +793,18 @@ let repair_committed ~chain_id ~validator_set ~entry ~finalize base =
                     C_config.validator_set_hash record.validator_set
                     = C_config.validator_set_hash validator_set
                   then
-                    if same_finalize record.finalize finalize then
-                      Ok Proof_current
+                    if same_block record.finalize finalize then
+                      begin
+                        archive_record base record;
+                        Ok Proof_current
+                      end
                     else
                       Error "finality proof validator set already current"
                   else begin
+                    ignore (check_history base replacement);
                     archive_proof base record;
                     write_encoded target (bytes replacement);
+                    archive_record base replacement;
                     Ok Proof_repaired
                   end
               end
@@ -978,7 +1092,7 @@ let promote_record base ~allow_gap pending_record =
         failwith "finality journal promotion height regression"
       else if Int64.equal pending_epoch committed_epoch
               && not (same_record pending_record committed_record) then
-        failwith "conflicting committed finality journal"
+        refuse base "conflicting committed finality journal" pending_record.finalize
       else if Int64.compare pending_epoch committed_epoch > 0
               && not allow_gap
               && not
@@ -1018,6 +1132,85 @@ let promote_applied base ~epoch ~state_root =
       failwith "finality journal applied root mismatch";
     promote_record base ~allow_gap:true pending_record
   end
+
+let resume_join ~chain_id ~set_hash ~head ~root ~txid base =
+  match read_record (path base) with
+  | None -> ()
+  | Some record ->
+    let epoch = record.finalize.C_types.epoch_id in
+    let expected = match set_hash epoch with
+      | Ok hash -> hash
+      | Error reason -> failwith reason in
+    if C_config.validator_set_hash record.validator_set <> expected then
+      failwith "finality journal validator set mismatch";
+    begin match validate_record ~chain_id record with
+    | Error reason -> failwith reason
+    | Ok () -> ()
+    end;
+    if Int64.equal epoch (Int64.of_int head) then begin
+      if root = zero_root || record.finalize.header.proposed_state_root <> root then
+        failwith "finality journal applied root mismatch";
+      if record.finalize.header.txid_hi <> txid then
+        failwith "finality journal applied txid mismatch";
+      begin match replayable record with
+      | Error reason -> failwith reason
+      | Ok { bundle = Some bundle; _ } -> persist_bundle base record.finalize bundle
+      | Ok { bundle = None; _ } -> failwith "finality journal bundle is missing"
+      end;
+      guard base record.finalize (fun () ->
+        Finality_log.write base (Finality_log.of_finalize record.finalize));
+      promote_applied base ~epoch ~state_root:root
+    end
+    else if Int64.equal epoch (Int64.succ (Int64.of_int head)) then begin
+      if record.finalize.header.prev_state_root <> root then
+        failwith "finality journal previous root mismatch"
+    end else
+      failwith "finality journal requires local recovery"
+
+let prepare base ~chain_id ~validator_set finalize =
+  begin match validate_qc ~chain_id ~validator_set finalize with
+  | Ok () -> ()
+  | Error reason -> failwith reason
+  end;
+  let committed =
+    match read_committed_epoch_validated ~chain_id ~validator_set
+      ~epoch:finalize.C_types.epoch_id base with
+    | Valid record when same_block record.finalize finalize -> Some record.finalize
+    | Valid _ -> refuse base "conflicting committed finality journal" finalize
+    | Missing -> None
+    | Invalid reason -> failwith reason
+  in
+  let prior = read_record (path base) in
+  let selected = match prior with
+    | None -> { finalize = Option.value committed ~default:finalize;
+        validator_set; bundle = None }
+    | Some record when record.finalize.epoch_id <> finalize.epoch_id ->
+      failwith "finality journal has another pending height"
+    | Some record ->
+      begin match validate ~chain_id ~validator_set record with
+      | Error reason -> failwith reason
+      | Ok () when not (same_block record.finalize finalize) ->
+        refuse base "conflicting finality journal certificate" finalize
+      | Ok () ->
+        { record with finalize = Option.value committed ~default:record.finalize }
+      end
+  in
+  guard base finalize (fun () ->
+    Finality_log.check_write base (Finality_log.of_finalize selected.finalize));
+  begin match prior with
+  | Some record when bytes record = bytes selected -> ()
+  | _ -> write_record base selected
+  end;
+  selected.finalize
+
+let stage base ~chain_id ~validator_set ~bundle finalize =
+  let selected = prepare base ~chain_id ~validator_set finalize in
+  begin match validate_bundle selected bundle with
+  | Ok () -> ()
+  | Error reason -> failwith reason
+  end;
+  persist_bundle base selected bundle;
+  selected
 
 let committed base =
   Sys.file_exists (committed_path base)

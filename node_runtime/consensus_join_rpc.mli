@@ -121,7 +121,7 @@ type apply_deps = {
   current_epoch : unit -> int;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  stage_finality : prepared -> unit;
+  stage_finality : prepared -> prepared;
   promote_finality : unit -> unit;
   apply : apply;
   root : unit -> string;
@@ -161,7 +161,7 @@ type node_deps = {
   next_txid : unit -> int64;
   put_proposer : int -> Octra_core.Epochlog.proposer_info -> unit;
   put_root : int -> string -> unit;
-  stage_finality : prepared -> unit;
+  stage_finality : prepared -> prepared;
   promote_finality : unit -> unit;
   apply : apply;
   local_eic : unit -> string option;

@@ -10,7 +10,8 @@ type write =
   | Stored
   | Present of Sync_need.t
 
-let schema = "octra_sync_need_v1"
+let schema = "octra_sync_need_v2"
+let restart_code = 75
 let max_bytes = 4096
 let staged_serial = ref 0
 let fields = ["cause"; "chain_id"; "epoch"; "head"; "schema"; "target"]
@@ -20,6 +21,9 @@ let dir base =
 
 let path base =
   Filename.concat (dir base) "sync_need.json"
+
+let conflict_path base =
+  Filename.concat (dir base) "sync_conflict.json"
 
 let fsync_dir target =
   let fd = Unix.openfile target [Unix.O_RDONLY] 0 in
@@ -71,7 +75,8 @@ let decode chain raw =
     in
     if names <> fields then
       Error "recovery marker fields differ"
-    else if value |> member "schema" |> to_string <> schema then
+    else if not (List.mem (value |> member "schema" |> to_string)
+                   [schema; "octra_sync_need_v1"]) then
       Error "recovery marker schema differs"
     else if value |> member "chain_id" |> to_string <> chain then
       Error "recovery marker chain differs"
@@ -79,6 +84,11 @@ let decode chain raw =
       match value |> member "cause" |> to_string |> Sync_need.cause with
       | None -> Error "recovery marker cause is invalid"
       | Some parsed ->
+          let parsed =
+            if value |> member "schema" |> to_string = "octra_sync_need_v1"
+               && parsed = Sync_need.Journal then Sync_need.Conflict
+            else parsed
+          in
           let epoch = value |> member "epoch" |> to_int in
           let head = value |> member "head" |> to_int in
           let target =
@@ -100,8 +110,7 @@ let rec read_all fd bytes offset =
     if count <= 0 then failwith "recovery marker ended early"
     else read_all fd bytes (offset + count)
 
-let read ~data_dir ~chain =
-  let target = path data_dir in
+let read_path ~chain target =
   match
     try Ok (Some (Unix.lstat target)) with
     | Unix.Unix_error (Unix.ENOENT, _, _) -> Ok None
@@ -134,6 +143,13 @@ let read ~data_dir ~chain =
                 | Error reason -> Invalid reason)
       with exn ->
         Invalid (Printexc.to_string exn)
+
+let read ~data_dir ~chain =
+  match read_path ~chain (conflict_path data_dir) with
+  | Missing -> read_path ~chain (path data_dir)
+  | Ready need when need.Sync_need.cause <> Sync_need.Conflict ->
+    Invalid "conflict marker cause is invalid"
+  | state -> state
 
 let need = function
   | Missing -> Ok None
@@ -196,9 +212,17 @@ let write_new target raw =
         Error (Printexc.to_string exn)
 
 let write ~data_dir ~chain need =
+  let target =
+    if need.Sync_need.cause = Sync_need.Conflict then conflict_path data_dir
+    else path data_dir
+  in
+  let prior () =
+    if need.Sync_need.cause = Sync_need.Conflict then read_path ~chain target
+    else read ~data_dir ~chain
+  in
   if not (Sync_need.valid need) then
     Error "recovery plan is invalid"
-  else match read ~data_dir ~chain with
+  else match prior () with
   | Ready prior -> Ok (Present prior)
   | Invalid reason -> Error reason
   | Missing ->
@@ -209,11 +233,11 @@ let write ~data_dir ~chain need =
             try
               let raw = Yojson.Safe.to_string (json chain need) ^ "\n" in
               begin
-                match write_new (path data_dir) raw with
+                match write_new target raw with
                 | Error _ as error -> error
                 | Ok true -> Ok Stored
                 | Ok false ->
-                    match read ~data_dir ~chain with
+                    match prior () with
                     | Ready prior -> Ok (Present prior)
                     | Missing -> Error "recovery marker publication disappeared"
                     | Invalid reason -> Error reason
@@ -240,7 +264,9 @@ let rec link_consumed target attempt =
     | exn -> Error (Printexc.to_string exn)
 
 let consume ~data_dir ~chain expected =
-  match read ~data_dir ~chain with
+  if expected.Sync_need.cause = Sync_need.Conflict then
+    Error "finality conflict requires signed recovery"
+  else match read ~data_dir ~chain with
   | Missing -> Ok ()
   | Invalid reason -> Error reason
   | Ready current when not (Sync_need.equal current expected) ->
@@ -274,19 +300,38 @@ let consume ~data_dir ~chain expected =
           else Ok ()
     end
 
-let consume_journal ~data_dir ~chain ~verified_head expected =
+let journal_ready ~verified_head expected =
   if expected.Sync_need.cause <> Sync_need.Journal then
     Error "only a journal recovery marker can be consumed"
+  else if not (Sync_need.valid expected) then
+    Error "journal recovery plan is invalid"
   else if verified_head < 0 || verified_head = max_int then
     Error "verified journal head is invalid"
-  else if expected.head <> verified_head || expected.epoch <> verified_head + 1 then
-    Error "verified journal head differs from recovery marker"
-  else
-    consume ~data_dir ~chain expected
+  else Ok (verified_head >= expected.head)
+
+let consume_journal ~data_dir ~chain ~verified_head expected =
+  match journal_ready ~verified_head expected with
+  | Error _ as error -> error
+  | Ok false -> Error "verified journal head is below recovery head"
+  | Ok true -> consume ~data_dir ~chain expected
+
+let finish_journal ~data_dir ~chain ~verified_head expected =
+  match journal_ready ~verified_head expected with
+  | Error _ as error -> error
+  | Ok false ->
+    begin match read ~data_dir ~chain with
+    | Ready need when Sync_need.equal need expected -> Ok false
+    | Invalid reason -> Error reason
+    | _ -> Error "recovery marker changed before waiting"
+    end
+  | Ok true ->
+    Result.map (fun () -> true) (consume ~data_dir ~chain expected)
 
 let consume_root ~data_dir ~chain ~verified_head expected =
   if expected.Sync_need.cause <> Sync_need.Root then
     Error "only a root recovery marker can be consumed"
+  else if not (Sync_need.valid expected) then
+    Error "root recovery plan is invalid"
   else if verified_head < expected.epoch || verified_head = max_int then
     Error "verified root head is below recovery epoch"
   else

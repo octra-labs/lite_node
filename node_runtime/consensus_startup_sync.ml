@@ -192,7 +192,16 @@ let seed_epoch ~validator = function
 let run (deps : deps) =
   let open Lwt.Syntax in
   let* () = run_replay deps in
-  let* joined = run_join deps in
+  let* joined =
+    Lwt.catch
+      (fun () -> run_join deps)
+      (fun exn ->
+        Octra_log.fatal "join"
+          "event = join_failed reason = %s"
+          (Printexc.to_string exn);
+        deps.exit_error ();
+        Lwt.fail exn)
+  in
   match seed_epoch
           ~validator:(String.equal deps.consensus_role "validator")
           joined

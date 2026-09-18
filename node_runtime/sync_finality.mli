@@ -6,12 +6,19 @@ type outcome =
   | Advanced
   | Current
   | Seeded
+  | Pending
 
 type fault =
   | Root of string
   | Journal of string
+  | Conflict of string
 
 val reason : fault -> string
+
+val recovery : head:int -> fault -> Sync_need.t option
+
+val preflight_log :
+  string -> Octra_consensus.C_types.finalize -> (bool, fault) result
 
 val local_head :
   raw_to_hex:(string -> string) ->

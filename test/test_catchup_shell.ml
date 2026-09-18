@@ -46,7 +46,7 @@ let trusted_validator_set_hash =
   }]
   |> Octra_consensus.C_config.validator_set_hash
 
-let record ?(epoch = 11L) ?(prev = base_root) ?(root = next_root)
+let record ?(epoch = 11L) ?(round = 0) ?(prev = base_root) ?(root = next_root)
     ?(creator = "oct_creator") ?reward_creator ?reward_public_key ?parent () =
   let reward_creator = Option.value ~default:creator reward_creator in
   let reward_source =
@@ -87,7 +87,7 @@ let record ?(epoch = 11L) ?(prev = base_root) ?(root = next_root)
   let unsigned_vote = Octra_consensus.C_types.{
     chain_id = "octra-test";
     epoch_id = epoch;
-    round = 0;
+    round;
     vote_type = Precommit;
     proposal_id;
     validator = creator;
@@ -105,7 +105,7 @@ let record ?(epoch = 11L) ?(prev = base_root) ?(root = next_root)
       finalize = {
         Octra_consensus.C_types.chain_id = "octra-test";
         epoch_id = epoch;
-        commit_round = 0;
+        commit_round = round;
         header;
         proposal_id;
         precommits = [vote];
@@ -125,7 +125,7 @@ let record ?(epoch = 11L) ?(prev = base_root) ?(root = next_root)
     receipts_json = [];
     epoch_ts;
     creator_addr = creator;
-    commit_round = 0;
+    commit_round = round;
     reward_source;
     finality;
   }
@@ -814,7 +814,8 @@ let apply_deps events ~head_before_record ~point =
       add events
         (Printf.sprintf
            "write:%Ld"
-           validated.S.record.Octra_consensus.C_codec.epoch_id));
+           validated.S.record.Octra_consensus.C_codec.epoch_id);
+      validated);
     promote_finality = (fun validated ->
       add events
         (Printf.sprintf
@@ -877,6 +878,58 @@ let test_apply_chunk_records_apply () =
   assert_true "height advanced" (has "advance:12" events);
   assert_true "post point" (has "cached_point" events);
   assert_true "final point" (has "read_point" events)
+
+let test_saved_round () =
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let module Log = Octra_consensus.Finality_log in
+  List.iter (fun committed ->
+    let dir = Test_workspace.unique_dir "catchup-round" in
+    let first = record () in
+    let finality = Option.get first.Octra_consensus.C_codec.finality in
+    Journal.persist_certificate dir ~validator_set:finality.validator_set finality.finalize;
+    if committed then begin
+      Journal.persist_bundle dir finality.finalize { tx_hashes = []; txs = []; receipts_json = [] };
+      Log.write dir (Log.of_finalize finality.finalize);
+      Journal.promote dir
+    end;
+    let incoming = record ~round:1 () in
+    let height = if committed then 11 else 10 in
+    let checked = validated_or_fail ~head_before_record:height incoming in
+    let point = apply_point ~epoch:11L ~root:incoming.state_root
+      ~eic:checked.expected_eic ~txid:checked.expected_txid () in
+    let seen = ref None in
+    let applied = ref None in
+    let deps = { (apply_deps (ref []) ~head_before_record:height ~point) with
+      write_finality = (fun value ->
+        let cert = Option.get value.S.record.finality in
+        let saved = Journal.stage dir ~chain_id:"octra-test"
+          ~validator_set:cert.validator_set
+          ~bundle:{ tx_hashes = value.record.tx_hashes; txs = value.parsed_txs;
+            receipts_json = value.record.receipts_json } cert.finalize in
+        Log.write dir (Log.of_finalize saved);
+        S.bind_finality value saved |> Result.get_ok);
+      put_proposer = (fun _ proposer -> seen := Some proposer.Octra_core.Epochlog.commit_round);
+      apply_record = (fun value -> applied := Some value.S.record; Lwt.return_unit);
+      promote_finality = (fun value -> Journal.promote_applied dir
+        ~epoch:value.S.record.epoch_id ~state_root:value.record.state_root);
+    } in
+    let result = run (S.apply_chunk_records deps ~prev_eic:"eic0" ~start_txid:4L
+      (chunk ~records:[incoming] ())) in
+    assert_true "round recovery completes" (Result.is_ok result);
+    assert_true "retained round reaches metadata" (!seen = Some 0);
+    assert_true "applied record uses retained round"
+      (committed || Option.map (fun value -> value.Octra_consensus.C_codec.commit_round) !applied = Some 0);
+    let stored = match Journal.read_committed_epoch ~chain_id:"octra-test" ~epoch:11L dir with
+      | Journal.Valid value -> value
+      | _ -> failwith "committed proof missing" in
+    let exported = { first with finality = Some { finality with finalize = stored.finalize } } in
+    assert_true "range accepts retained proof and metadata"
+      (Result.is_ok (Octra_consensus.C_catchup.verify_record_finality
+        ~chain_id:"octra-test" ~expected_validator_set_hash:trusted_validator_set_hash
+        ~expected_txid:checked.expected_txid ~record:exported));
+    assert_true "log round matches metadata"
+      (Option.map (fun value -> value.Log.round) (Log.last_entry_fast dir) = Some 0)
+  ) [false; true]
 
 let test_apply_chunk_records_skip () =
   let recd = record ~root:(String.make 32 's') () in
@@ -1051,7 +1104,8 @@ let target_wiring ?answer events ~head ~point =
       add events
         (Printf.sprintf
            "write:%Ld"
-           validated.S.record.Octra_consensus.C_codec.epoch_id));
+           validated.S.record.Octra_consensus.C_codec.epoch_id);
+      validated);
     promote_finality = (fun validated ->
       add events
         (Printf.sprintf
@@ -1457,7 +1511,8 @@ let test_run_driver_wired_success () =
       add events
         (Printf.sprintf
            "write:%Ld"
-           validated.S.record.Octra_consensus.C_codec.epoch_id));
+           validated.S.record.Octra_consensus.C_codec.epoch_id);
+      validated);
     promote_finality = (fun validated ->
       add events
         (Printf.sprintf
@@ -1586,7 +1641,8 @@ let test_target_finality_gap () =
           add events
             (Printf.sprintf
                "write:%Ld"
-               validated.S.record.Octra_consensus.C_codec.epoch_id));
+               validated.S.record.Octra_consensus.C_codec.epoch_id);
+          validated);
         promote_finality = (fun validated ->
           add events
             (Printf.sprintf
@@ -1650,7 +1706,7 @@ let test_driver_runtime_fields () =
         cached_root = (fun () -> cached_root);
         next_txid = (fun () -> 44L);
         finality;
-        write_finality = ignore;
+        write_finality = Fun.id;
         promote_finality = ignore;
         apply_record = (fun _ -> Lwt.return_unit);
         base_eic = (fun () -> "base");
@@ -1802,6 +1858,7 @@ let tests = [
   "record parent reward", test_record_parent_reward;
   "record retry action", test_record_retry_action;
   "bind finality", test_bind_finality;
+  "saved round", test_saved_round;
   "finality root mismatch", test_finality_root_mismatch;
   "finality parent reward", test_finality_parent_reward;
   "finality reward mismatch", test_finality_reward_mismatch;

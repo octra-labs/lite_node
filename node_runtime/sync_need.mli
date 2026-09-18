@@ -4,6 +4,7 @@
 type cause =
   | Root
   | Journal
+  | Conflict
   | Range
 
 type t = {
@@ -20,6 +21,8 @@ val cause : string -> cause option
 val root : epoch:int -> head:int -> t
 
 val journal : epoch:int -> head:int -> t
+
+val conflict : epoch:int -> head:int -> t
 
 val lost : head:int -> target:int64 -> t option
 
