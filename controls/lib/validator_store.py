@@ -268,7 +268,7 @@ def live_state(values, config):
         raise ValidatorError("local RPC head is invalid") from error
     if rpc_epoch < int(head["epoch"]):
         raise ValidatorError("local RPC is behind the stored head")
-    identity = load_wallet(validator_config.IDENTITY_WALLET)
+    _, identity = validator_config.operator_wallet(config)
     if load_wallet(data_path / "wallet.json") != identity:
         raise ValidatorError("operator identity and state wallet mismatch")
     return data_path, identity

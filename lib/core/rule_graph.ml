@@ -116,7 +116,7 @@ let devnet_set_plan_activation = {
 }
 
 let devnet_exit_activation = {
-  devnet_set_plan_activation with activation_epoch = 1_567_000;
+  devnet_set_plan_activation with activation_epoch = 1_572_000;
 }
 
 let devnet_set_open_activation = {

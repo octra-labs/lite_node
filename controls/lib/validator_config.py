@@ -78,6 +78,20 @@ CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
 RUSTUP_HOME = TOOLCHAIN_ROOT / "rustup"
 OPAM_SWITCH = TOOLCHAIN_ROOT / "ocaml"
 
+def operator_wallet(config):
+    local = Path(config).expanduser().resolve().parent / "wallet.json"
+    paths = (local,) if local == IDENTITY_WALLET else (local, IDENTITY_WALLET)
+    found = []
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        found.append((path, load_wallet(path)))
+    if not found:
+        raise ValidatorError("operator identity wallet is missing")
+    if any(wallet != found[0][1] for _, wallet in found[1:]):
+        raise ValidatorError("operator identity wallets differ")
+    return found[0]
+
 def operator_pm2_name(name):
     return name if name.startswith("octra-") else f"octra-{name}"
 

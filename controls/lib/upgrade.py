@@ -39,6 +39,7 @@ from validator_status import recent_heads
 from sync_need import Need
 from sync_need import choose as choose_need
 from sync_need import make
+from validator_config import operator_wallet
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 ACTIVE = frozenset({"launching", "online", "stopping"})
@@ -757,7 +758,7 @@ def disk_state(values, config):
     if not state_ready(data):
         raise ValidatorError("restart state is incomplete")
     head = validate_checkpoint(data, values, allow_progress=True)
-    identity = load_wallet(Path(config).parent / "wallet.json")
+    _, identity = operator_wallet(config)
     wallet = load_wallet(data / "wallet.json")
     if wallet != identity:
         raise ValidatorError("restart state identity differs")

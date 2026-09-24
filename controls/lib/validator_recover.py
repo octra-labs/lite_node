@@ -173,7 +173,7 @@ def restore_prior(config, values, prior):
         head = validate_checkpoint(saved, values, allow_progress = True)
         if head["epoch"] != epoch:
             raise ValidatorError("preserved state epoch differs from its path")
-        if load_wallet(validator_config.IDENTITY_WALLET) != load_wallet(saved / "wallet.json"):
+        if validator_config.operator_wallet(config)[1] != load_wallet(saved / "wallet.json"):
             raise ValidatorError("operator identity and preserved wallet mismatch")
         rejected = rollback_state(data, saved, head["epoch"])
         emit(event = "recovery", status = "resumed", epoch = head["epoch"],
@@ -200,7 +200,8 @@ def recover_state(config, values, replace_state, plan, min_epoch):
         wallet = data_path / "wallet.json"
         if not os.path.lexists(wallet):
             raise ValidatorError("state identity is missing; restore preserved state with --prior")
-        if load_wallet(validator_config.IDENTITY_WALLET) != load_wallet(wallet):
+        identity_path, identity = validator_config.operator_wallet(config)
+        if identity != load_wallet(wallet):
             raise ValidatorError("operator identity and state wallet mismatch")
     head = (
         validate_checkpoint(data_path, values, allow_progress=True)
@@ -228,6 +229,8 @@ def recover_state(config, values, replace_state, plan, min_epoch):
     ):
         raise ValidatorError("preserved state requires recovery with --prior")
     require_idle([data_ref, data_path])
+    if not ready:
+        identity_path, _ = validator_config.operator_wallet(config)
     bundle = Path(values["OCTRA_OPERATOR_NETWORK_BUNDLE"])
     _, _, network = load_network(
         bundle,
@@ -246,8 +249,6 @@ def recover_state(config, values, replace_state, plan, min_epoch):
         floor = max(floor, need.epoch)
     if min_epoch is not None:
         floor = max(floor, int(min_epoch))
-    identity_path = validator_config.IDENTITY_WALLET
-    load_wallet(identity_path)
     preserved = None
     if ready:
         preserved = preserve_state(identity_path, data_path, head)

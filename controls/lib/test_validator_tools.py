@@ -35,6 +35,7 @@ from validator_common import validate_checkpoint
 from validator_common import validate_network
 from validator_common import write_env
 from validator_config import operator_pm2_name
+from validator_config import operator_wallet
 from validator_config import adopt_network
 from validator_config import BUILD_WORK
 from validator_config import build_node
@@ -142,6 +143,7 @@ from validator_status import recent_heads
 from validator_status import peer_lags
 from validator_status import pm2_process
 from validator_store import data_dir
+from validator_store import live_state
 from validator_store import state_scan
 from validator_store import pack_bytes
 from validator_store import report
@@ -284,6 +286,31 @@ class ValidatorToolsTest(unittest.TestCase):
         identity = mock.patch("validator_config.IDENTITY_WALLET", WORK / "wallet.json")
         identity.start()
         self.addCleanup(identity.stop)
+
+    def test_store_external_wallet(self):
+        data, config, wallet, _ = self.recovery_identity("store-external")
+        values = parse_env(config) | {"OCTRA_API_PORT": "8080"}
+        with (
+            mock.patch("validator_config.IDENTITY_WALLET", WORK / "absent.json"),
+            mock.patch("validator_store.rpc_status", return_value={"head_epoch": 99}),
+        ):
+            self.assertEqual(live_state(values, config), (data, wallet))
+            other = config.parent / "other.json"
+            ensure_wallet(other)
+            copy_private(other, data / "wallet.json")
+            with self.assertRaisesRegex(ValidatorError, "identity.*mismatch"):
+                live_state(values, config)
+
+    def test_wallet_conflict(self):
+        config = WORK / "keys" / "node.env"
+        write_env(config, {"OCTRA_DATA_DIR": str(WORK / "data")})
+        ensure_wallet(config.parent / "wallet.json")
+        root = WORK / "wallet.json"
+        wallet = ensure_wallet(root)
+        with self.assertRaisesRegex(ValidatorError, "identity wallets differ"):
+            operator_wallet(config)
+        copy_private(root, config.parent / "wallet.json")
+        self.assertEqual(operator_wallet(config), (config.parent / "wallet.json", wallet))
 
     def test_store_recovery_hold(self):
         data = WORK / "active"
@@ -5018,9 +5045,12 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_recovery_identity(self):
         data, config, wallet, install = self.recovery_identity("identity")
-        with mock.patch("validator_recover.pm2_entries", return_value=[]):
-            with mock.patch("validator_recover.sync_snapshot", side_effect=install):
-                recover(config, replace_state=True)
+        with (
+            mock.patch("validator_config.IDENTITY_WALLET", WORK / "absent.json"),
+            mock.patch("validator_recover.pm2_entries", return_value=[]),
+            mock.patch("validator_recover.sync_snapshot", side_effect=install),
+        ):
+            recover(config, replace_state=True)
         preserved = preserved_state_path(data, 99)
         self.assertTrue((preserved / "HEAD.json").is_file())
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
@@ -5242,12 +5272,26 @@ class ValidatorToolsTest(unittest.TestCase):
         custom = data.parent / "settings" / "node.env"
         custom.parent.mkdir()
         copy_private(config, custom)
-        with mock.patch("validator_config.IDENTITY_WALLET", config.parent / "wallet.json"), mock.patch(
-            "validator_recover.emit",
-        ) as output:
+        with mock.patch("validator_recover.emit") as output:
             recover(custom)
         self.assertEqual(output.call_args.kwargs["status"], "ready")
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
+        values = parse_env(custom) | {"OCTRA_API_PORT": "8080"}
+        with mock.patch("validator_store.rpc_status", return_value={"head_epoch": 99}):
+            self.assertEqual(live_state(values, custom), (data, wallet))
+        self.assertEqual(upgrade_tool.disk_state(values, custom).address, wallet["address"])
+
+    def test_recovery_external_prior(self):
+        data, config, wallet, _ = self.recovery_identity("external-prior")
+        saved = preserved_state_path(data, 99)
+        data.replace(saved)
+        with (
+            mock.patch("validator_config.IDENTITY_WALLET", WORK / "absent.json"),
+            mock.patch("validator_recover.pm2_entries", return_value=[]),
+        ):
+            recover(config, prior=saved)
+        self.assertEqual(load_wallet(data / "wallet.json"), wallet)
+        self.assertFalse(saved.exists())
 
     def test_recovery_data_link(self):
         home = WORK / "home"

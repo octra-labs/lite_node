@@ -635,7 +635,8 @@ let test_program_switch () =
     let _, balance, nonce = first in
     expect "activated deployment fees differ" (Z.equal balance (Z.of_int 980));
     expect "activated deployment nonce differs" (nonce = 2))
-    [1_566_999; 1_567_000; 1_567_001; 1_567_063; 1_567_064];
+    [1_566_999; 1_567_000; 1_571_999; 1_572_000; 1_572_001;
+     1_572_063; 1_572_064];
   List.iter (fun epoch ->
     let result = run_source_deploy ~submitted:Program_package.Protocol ~epoch
       ("program_overlap_" ^ string_of_int epoch) in
@@ -645,7 +646,7 @@ let test_program_switch () =
     let _, balance, nonce = result in
     expect "cross-epoch deployment fee differs" (Z.equal balance (Z.of_int 980));
     expect "cross-epoch deployment nonce differs" (nonce = 2))
-    [1_567_000; 1_567_063]
+    [1_572_000; 1_572_063]
 
 type circle_result = {
   circle_root : string;

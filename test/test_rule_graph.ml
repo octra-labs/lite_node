@@ -89,7 +89,7 @@ let test_set_plan () =
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
   require
-    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_567_000])
+    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
@@ -141,7 +141,8 @@ let test_set_plan () =
   List.iter (fun epoch ->
     require (Graph.consensus_id ~chain_id ~epoch = active)
       "set plan graph differs")
-    [1_510_000; 1_510_001; 1_541_999; 1_542_000; 1_542_001; 1_566_999];
+    [1_510_000; 1_510_001; 1_541_999; 1_542_000; 1_542_001;
+     1_566_999; 1_567_000; 1_571_999];
   let chain_id = "other" in
   let other = Graph.create ~chain_id ~root_at:(fun _ -> fail "other anchor read") in
   require (Graph.set_plan_activation other = None) "other set plan present";
@@ -186,13 +187,13 @@ let test_exit () =
   let missing = graph (fun _ -> Graph.Missing) in
   let plan = Option.get (Graph.exit_activation missing) in
   let epoch = plan.activation_epoch in
-  require (epoch = 1_567_000) "exit activation differs";
+  require (epoch = 1_572_000) "exit activation differs";
   List.iter (fun epoch ->
     require (Graph.exit missing ~epoch = Ok Graph.Prior) "old exit switch active";
     require (Graph.ready_exec missing ~epoch = Ok Graph.Prior) "old ready switch active";
     require (Graph.exit_at ~chain_id ~epoch = Graph.Prior) "old exit profile active";
     require (Graph.ready_exec_at ~chain_id ~epoch = Graph.Prior) "old ready profile active")
-    [1_541_999; 1_542_000; 1_542_001; epoch - 1];
+    [1_541_999; 1_542_000; 1_542_001; 1_567_000; epoch - 1];
   let good = graph (fun key ->
     require (key = plan.anchor_epoch) "exit anchor epoch differs";
     Graph.Root plan.anchor_state_root) in
@@ -219,13 +220,13 @@ let test_program_rule () =
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = Option.get (Graph.program_source_activation_for_chain chain_id) in
   let epoch = plan.activation_epoch in
-  require (epoch = 1_567_000) "program activation differs";
+  require (epoch = 1_572_000) "program activation differs";
   let unread = graph (fun _ -> fail "program anchor read before activation") in
   List.iter (fun epoch ->
     require (Graph.program_source unread ~epoch = Ok Graph.Prior)
       "program source selected before activation";
     require (Graph.program_source_at ~chain_id ~epoch = Graph.Prior)
-      "program RPC selected before activation") [0; epoch - 2; epoch - 1];
+      "program RPC selected before activation") [0; 1_567_000; epoch - 2; epoch - 1];
   let good = graph (fun at ->
     require (at = plan.anchor_epoch) "program anchor height differs";
     Graph.Root plan.anchor_state_root) in

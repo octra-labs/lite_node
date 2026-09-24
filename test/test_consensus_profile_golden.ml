@@ -28,7 +28,7 @@ let plan_golden =
   "20cb24dc201d8d065e22915ca4692c06fe9d863d13fea6c0ea88c6631502e636"
 
 let exit_golden =
-  "4fcb797044feff89af203d505acd3762f624fae315fe515cfcc991a1319d13a7"
+  "d2c2ff435a1cbf3f46022495fce1b5eac2898219e9c5b1ca61c7009aaabeab7e"
 
 let sample = [
   "OCTRA_BFT_PROPOSAL_MAX_TXS", "800";
@@ -184,7 +184,7 @@ let () =
     expect "set plan hash binds components" (value = derived ~epoch getenv);
     expect "set plan hash differs" (value <> standard);
     expect "exit switch follows last prior epoch"
-      (P.switch_after ~chain_id ~applied_epoch:epoch = (epoch = 1_566_999));
+      (P.switch_after ~chain_id ~applied_epoch:epoch = (epoch = 1_571_999));
     let actual = raw_hex (P.hash ~chain_id ~epoch devnet_env) in
     expect "devnet profile binds components" (actual = raw_hex (derived ~epoch devnet_env));
     Printf.printf "event = set_plan_profile epoch = %d hash = %s\n"
@@ -192,8 +192,9 @@ let () =
     expect "set plan hash golden" (actual = plan_golden))
     [1_510_000; 1_510_001; 1_541_998; 1_541_999; 1_542_000;
      1_542_001; 1_548_999; 1_549_000; 1_549_001; 1_552_203;
-     1_562_999; 1_563_000; 1_563_001; 1_566_998; 1_566_999];
-  let epoch = 1_567_000 in
+     1_562_999; 1_563_000; 1_563_001; 1_566_998; 1_566_999;
+     1_567_000; 1_567_001; 1_571_998; 1_571_999];
+  let epoch = 1_572_000 in
   expect "exit activation switches profile" (P.switch_after ~chain_id ~applied_epoch:(epoch - 1));
   let current = P.hash ~chain_id ~epoch devnet_env in
   expect "exit profile differs" (raw_hex current <> plan_golden);
@@ -216,7 +217,8 @@ let () =
     expect "other chain does not switch"
       (not (P.switch_after ~chain_id:"octra-mainnet" ~applied_epoch:epoch)))
     [0; 1_499_999; 1_500_000; 1_509_999; 1_510_000; 1_510_001;
-     1_566_999; 1_567_000; 1_567_001; max_int];
+     1_566_999; 1_567_000; 1_567_001; 1_571_999;
+     1_572_000; 1_572_001; max_int];
   expect "standard binds chain"
     (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" ~epoch:1_500_000 getenv)));
   print_endline "status = pass test = consensus_profile_golden"
