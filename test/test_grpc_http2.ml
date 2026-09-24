@@ -839,7 +839,11 @@ let test_listen_stop mode =
   Lwt.on_cancel work (fun () -> Lwt.wakeup stop ());
   let rpc meta request =
     if request.Rpc.method_ <> "node_status" then call meta request
-    else begin Lwt.wakeup enter (); work end
+    else begin
+      if mode = `During then Lwt.wakeup finish ();
+      Lwt.wakeup enter ();
+      work
+    end
   in
   let listener = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   let server = Grpc.serve ~socket:listener { config with port } ~call:rpc ~http in
@@ -870,6 +874,7 @@ let test_listen_stop mode =
       Body.Writer.close writer;
       let* () = entered in
       let* () = match mode with
+        | `During -> Lwt.return_unit
         | `Close -> Lwt.wakeup finish (); Lwt.return_unit
         | `Fail -> Lwt.wakeup_exn finish (Failure "http stopped"); Lwt.return_unit
         | `Cancel -> Lwt.cancel server; Lwt.return_unit
@@ -884,7 +889,8 @@ let test_listen_stop mode =
       let* () = Lwt.catch
         (fun () ->
           let* () = server in
-          if mode <> `Close && mode <> `Accept then fail "listener failure was hidden";
+          if mode <> `Close && mode <> `During && mode <> `Accept then
+            fail "listener failure was hidden";
           Lwt.return_unit)
         (function
           | Failure message when mode = `Fail && message = "http stopped" -> Lwt.return_unit
@@ -892,8 +898,16 @@ let test_listen_stop mode =
           | exn -> Lwt.fail exn)
       in
       if Lwt.is_sleeping http then fail "listener cancellation left HTTP running";
-      if Lwt.state work <> Lwt.Fail Lwt.Canceled then
-        fail "listener stopped with active request";
+      if Lwt.state work <> Lwt.Fail Lwt.Canceled then begin
+        let mode = match mode with
+          | `During -> "during"
+          | `Close -> "close"
+          | `Fail -> "fail"
+          | `Cancel -> "cancel"
+          | `Accept -> "accept"
+        in
+        fail ("listener stopped with active request mode = " ^ mode)
+      end;
       if Lwt_unix.state listener <> Lwt_unix.Closed then
         fail "listener socket remained open";
       let* () = Client.shutdown client in
@@ -937,6 +951,7 @@ let main () =
   let* () = test_submit_result () in
   let* () = test_submit_depth () in
   let* () = test_listen_busy () in
+  let* () = test_listen_stop `During in
   let* () = test_listen_stop `Close in
   let* () = test_listen_stop `Fail in
   let* () = test_listen_stop `Cancel in
@@ -953,6 +968,8 @@ let () =
     | [| _ |] -> main ()
     | [| _; "flow" |] -> test_response_flow ()
     | [| _; "expire" |] -> test_response_expire ()
+    | [| _; "stop" |] ->
+      Lwt_list.iter_s test_listen_stop [`During; `Close; `Fail; `Cancel; `Accept]
     | _ -> Lwt.fail_with "test_grpc_http2: unknown case"
   in
   Lwt_main.run (Lwt.pick [run; limit]);

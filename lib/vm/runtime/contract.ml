@@ -69,7 +69,9 @@ let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
     | Ok admitted ->
       Some { code = Admission.code admitted; profile = Admission.profile admitted }
     | Error _ -> None
-  with _ -> None
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> None
 
 let decode_loaded_for_admission ?(trusted = []) ?(point_ops = false) admission raw =
   if String.equal admission "source" then
@@ -81,7 +83,9 @@ let decode_loaded_for_admission ?(trusted = []) ?(point_ops = false) admission r
           profile = Admission.profile admitted;
         }
       | Error _ -> None
-    with _ -> None
+    with
+    | (Stack_overflow | Out_of_memory) as error -> raise error
+    | _ -> None
   else
     decode_loaded ~trusted ~point_ops raw
 
@@ -99,7 +103,9 @@ let load_loaded ?(trusted = []) ?(point_ops = false) store contract_addr =
          ~point_ops
          admission
          (Base64.decode_exn b64)
-     with _ -> None)
+     with
+     | (Stack_overflow | Out_of_memory) as error -> raise error
+     | _ -> None)
   | None -> None
 
 let load_bytecode ?(trusted = []) ?(point_ops = false) store contract_addr =
@@ -249,7 +255,7 @@ let entry_kinds facts target =
 
 let runtime_params profile target params =
   match profile with
-  | Admission.Legacy -> Ok (List.map parse_param params)
+  | Admission.Legacy -> Ok (List.rev (List.rev_map parse_param params))
   | Admission.Program facts -> Program_input.parse (entry_kinds facts target) params
 
 let runtime_values profile target values =
@@ -307,7 +313,7 @@ let setup_call_state_values ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limi
 let setup_call_state ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
     ~caller ~address ~value ~storage_tbl ~method_name ~params () =
   setup_call_state_values ~ctx ~depth ~limit ~caller ~address ~value ~storage_tbl
-    ~method_name ~params:(List.map parse_param params) ()
+    ~method_name ~params:(List.rev (List.rev_map parse_param params)) ()
 
 let run_fixed_from_dispatcher ?running state fixed =
   let run () =
@@ -551,7 +557,9 @@ let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store 
          ~point_ops
          upgrade.admission
          (Base64.decode_exn upgrade.bytecode_b64)
-     with _ -> None)
+     with
+     | (Stack_overflow | Out_of_memory) as error -> raise error
+     | _ -> None)
   | None ->
     match Program_journal.find_deploy journal program_addr with
     | Some deploy ->
@@ -561,7 +569,9 @@ let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store 
            ~point_ops
            deploy.admission
            (Base64.decode_exn deploy.bytecode_b64)
-       with _ -> None)
+       with
+       | (Stack_overflow | Out_of_memory) as error -> raise error
+       | _ -> None)
     | None -> load_loaded ~trusted ~point_ops store program_addr
 
 let load_bytecode_with_overlay ?(trusted = []) ?(point_ops = false) journal store program_addr =

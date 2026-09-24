@@ -62,6 +62,8 @@ type epoch_normalizer_runtime = {
 }
 
 type node_standard_adapter_runtime = {
+  chain_id : string;
+  duty_state : Octra_core.Head_manifest.t -> (Octra_core.Set_fold.t, string) result;
   getenv : string -> string option;
   get_meta : string -> string option;
   wallet_addr : string;
@@ -385,7 +387,8 @@ let normalize_next_epoch_for_head (runtime : epoch_normalizer_runtime) ~source =
       runtime.current_epoch := expected_next
   end
 
-let node_standard_adapters runtime =
+let node_standard_adapters
+    ?(parent = fun ~epoch_id:_ -> Error "parent reference unavailable") runtime =
   {
     layera_diag_live = (fun () ->
       runtime.getenv "OCTRA_LAYERA_DIAG" = Some "1");
@@ -413,7 +416,35 @@ let node_standard_adapters runtime =
     read_prev_ledger_root = runtime.read_prev_ledger_root;
     staging_txs = Staging.all;
     staging_epoch_txs = (fun () ->
+      let accept = match runtime.cached_head () with
+        | Some head when head.epoch_id < max_int
+          && Octra_core.Rule_graph.ready_exec_at ~chain_id:runtime.chain_id
+               ~epoch:(head.epoch_id + 1) = Octra_core.Rule_graph.Active ->
+          let epoch = Int64.of_int (head.epoch_id + 1) in
+          let reference =
+            Result.bind (runtime.duty_state head) (fun state ->
+              Result.bind (parent ~epoch_id:epoch) (function
+                | Some parent when parent.Octra_consensus.C_types.certificate.epoch_id = Int64.pred epoch
+                    && parent.certificate.chain_id = runtime.chain_id
+                    && parent.certificate.header.proposed_state_root
+                       = Consensus_epoch_apply_guard.raw32_of_pre_root head.state_root ->
+                  Ok (state, Some parent)
+                | _ -> Error "parent reference does not match head"))
+          in
+          (fun tx ->
+            tx.Transaction.op_type <> Transaction.ValidatorReady
+            || (not (Staging.duty_expired ~mode:Octra_core.Rule_graph.Active
+                    ~head:(Some (Int64.pred epoch)) tx)
+                && match Octra_core.Validator_registry.ready_payload_of_message tx.message with
+                   | Ok ready ->
+                     Result.is_ok (Result.bind reference (fun (state, parent) ->
+                       Octra_core.Validator_ready_policy.reference ~epoch
+                         ~head:ready.head_epoch ~proposal:ready.head_proposal_id ~parent ~state))
+                   | Error _ -> false))
+        | _ -> (fun _ -> true)
+      in
       Staging.ready_epoch_txs
+        ~accept
         ~capacity:runtime.staging_epoch_capacity
         ~confirmed_nonce:(fun sender ->
           Option.map
@@ -852,7 +883,10 @@ let config_with_standard (input : config_with_standard_input) =
 let node_driver_config (runtime : node_driver_config_runtime) =
   config_with_standard
     {
-      standard = node_standard_adapters runtime.standard;
+      standard = node_standard_adapters ~parent:(fun ~epoch_id ->
+        Result.bind (runtime.load_parent_commit ~epoch_id) (fun parent ->
+          Result.map (fun () -> parent) (runtime.verify_parent_commit ~epoch_id parent)))
+        runtime.standard;
       chain_id = runtime.chain_id;
       my_addr = runtime.my_addr;
       sign_fn = runtime.sign_fn;

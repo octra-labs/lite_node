@@ -1603,10 +1603,12 @@ let test_ready_params () =
   let config_hash = hex_of_raw (raw 'c') in
   let snapshot : R.enrollment_snapshot = {
     head_epoch = 1_503_093;
+    head_proposal_id = None;
     state_root = hex_of_raw (raw 'r');
     chain_id;
     config_hash;
     duty = Some Octra_core.Set_fold.{ marked = []; pulse = Some 1_503_090L };
+    sets = None, None;
     candidate = Some {
       Octra_core.Validator_admission.address = "oct_test";
       pubkey = raw 'p';
@@ -1626,6 +1628,12 @@ let test_ready_params () =
   in
   let ready = Yojson.Safe.Util.member "ready" value in
   let duty = Yojson.Safe.Util.member "duty" value in
+  expect "enrollment carries committed root"
+    (Yojson.Safe.Util.member "state_root" value = `String snapshot.state_root);
+  expect "enrollment missing set is unknown"
+    (Yojson.Safe.Util.member "membership" value = `Null);
+  expect "enrollment corrupt set is refused"
+    (Result.is_error (read (Ok { snapshot with sets = Some "invalid", None })));
   expect "ready automated duty"
     (Yojson.Safe.Util.member "automatic" duty = `Bool true);
   expect "ready committed pulse"

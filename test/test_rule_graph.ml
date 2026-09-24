@@ -66,6 +66,18 @@ let standard_activation graph =
 let graph root_at =
   Graph.create ~chain_id:"octra-devnet-9871-cluster" ~root_at
 
+let test_live_chain () =
+  require (Graph.live_chain ~chain_id:"octra-devnet-9871-cluster")
+    "devnet plan rejected";
+  List.iter (fun chain_id ->
+    require (not (Graph.live_chain ~chain_id)) "missing live plan accepted";
+    let prior = Graph.create ~chain_id ~root_at:(fun _ -> fail "anchor read") in
+    require (Graph.standard prior ~epoch:max_int = Ok Graph.Prior)
+      "historical standard mode changed")
+    [""; "octra-mainnet"; "octra-test"; "octra-test-4node"; "octra-devnet";
+     "OCTRA-DEVNET-9871-CLUSTER"; "octra-devnet-9871-cluster ";
+     "octra-devnet-9871-cluster\n"]
+
 let test_set_plan () =
   let chain_id = "octra-devnet-9871-cluster" in
   let root = "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d" in
@@ -77,7 +89,7 @@ let test_set_plan () =
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
   require
-    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000])
+    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_567_000])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
@@ -128,7 +140,8 @@ let test_set_plan () =
   let active = prior ^ entry ^ entry in
   List.iter (fun epoch ->
     require (Graph.consensus_id ~chain_id ~epoch = active)
-      "set plan graph differs") [1_510_000; 1_510_001; max_int];
+      "set plan graph differs")
+    [1_510_000; 1_510_001; 1_541_999; 1_542_000; 1_542_001; 1_566_999];
   let chain_id = "other" in
   let other = Graph.create ~chain_id ~root_at:(fun _ -> fail "other anchor read") in
   require (Graph.set_plan_activation other = None) "other set plan present";
@@ -168,7 +181,115 @@ let test_math () =
   let other = Graph.create ~chain_id:"other" ~root_at:(fun _ -> fail "other math read") in
   require (Graph.math other ~epoch:max_int = Ok Graph.Prior) "other math enabled"
 
+let test_exit () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let missing = graph (fun _ -> Graph.Missing) in
+  let plan = Option.get (Graph.exit_activation missing) in
+  let epoch = plan.activation_epoch in
+  require (epoch = 1_567_000) "exit activation differs";
+  List.iter (fun epoch ->
+    require (Graph.exit missing ~epoch = Ok Graph.Prior) "old exit switch active";
+    require (Graph.ready_exec missing ~epoch = Ok Graph.Prior) "old ready switch active";
+    require (Graph.exit_at ~chain_id ~epoch = Graph.Prior) "old exit profile active";
+    require (Graph.ready_exec_at ~chain_id ~epoch = Graph.Prior) "old ready profile active")
+    [1_541_999; 1_542_000; 1_542_001; epoch - 1];
+  let good = graph (fun key ->
+    require (key = plan.anchor_epoch) "exit anchor epoch differs";
+    Graph.Root plan.anchor_state_root) in
+  require (Graph.exit missing ~epoch:(epoch - 1) = Ok Graph.Prior) "exit active too soon";
+  List.iter (fun epoch ->
+    require (Graph.exit good ~epoch = Ok Graph.Active) "exit inactive";
+    require (Graph.exit_at ~chain_id ~epoch = Graph.Active) "exit profile inactive";
+    List.iter (fun root ->
+      require (Result.is_error (Graph.exit (graph (fun _ -> root)) ~epoch))
+        "exit accepted invalid anchor")
+      [Graph.Missing; Graph.Root "wrong"; Graph.Unreadable "read"])
+    [epoch; epoch + 1; max_int];
+  let pruned = graph (fun epoch ->
+    match Graph.root_after_floor ~chain_id ~floor_epoch:plan.activation_epoch ~epoch with
+    | None -> Graph.Missing
+    | Some root -> Graph.Root root) in
+  require (Graph.exit pruned ~epoch = Graph.exit good ~epoch) "exit snapshot differs";
+  List.iter (fun chain_id ->
+    let other = Graph.create ~chain_id ~root_at:(fun _ -> fail "other exit anchor read") in
+    require (Graph.exit other ~epoch:max_int = Ok Graph.Prior) "other exit active")
+    ["octra-mainnet"; "other"]
+
+let test_program_rule () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (Graph.program_source_activation_for_chain chain_id) in
+  let epoch = plan.activation_epoch in
+  require (epoch = 1_567_000) "program activation differs";
+  let unread = graph (fun _ -> fail "program anchor read before activation") in
+  List.iter (fun epoch ->
+    require (Graph.program_source unread ~epoch = Ok Graph.Prior)
+      "program source selected before activation";
+    require (Graph.program_source_at ~chain_id ~epoch = Graph.Prior)
+      "program RPC selected before activation") [0; epoch - 2; epoch - 1];
+  let good = graph (fun at ->
+    require (at = plan.anchor_epoch) "program anchor height differs";
+    Graph.Root plan.anchor_state_root) in
+  let snapshot = graph (fun epoch ->
+    match Graph.root_after_floor ~chain_id ~floor_epoch:plan.anchor_epoch ~epoch with
+    | None -> Graph.Missing
+    | Some root -> Graph.Root root) in
+  List.iter (fun epoch ->
+    require (Graph.program_source good ~epoch = Ok Graph.Active)
+      "program source inactive";
+    require (Graph.program_source_at ~chain_id ~epoch = Graph.Active)
+      "program RPC inactive";
+    require (Graph.program_source snapshot ~epoch = Graph.program_source good ~epoch)
+      "program snapshot mode differs";
+    List.iter (fun (root, expected) ->
+      require (Graph.program_source (graph (fun _ -> root)) ~epoch = Error expected)
+        "program anchor refusal differs")
+      [Graph.Missing, Graph.Anchor_missing plan.anchor_epoch;
+       Graph.Unreadable "read", Graph.Anchor_unreadable {
+         epoch = plan.anchor_epoch; reason = "read" };
+       Graph.Root "wrong", Graph.Anchor_mismatch {
+         epoch = plan.anchor_epoch; expected = plan.anchor_state_root; actual = "wrong" }])
+    [epoch; epoch + 1; max_int];
+  List.iter (fun chain_id ->
+    let other = Graph.create ~chain_id ~root_at:(fun _ -> fail "other program read") in
+    require (Graph.program_source other ~epoch:max_int = Ok Graph.Prior)
+      "other chain program mode changed";
+    require (Graph.program_source_at ~chain_id ~epoch:max_int = Graph.Prior)
+      "other chain RPC mode changed") ["octra-mainnet"; "other"]
+
+let readme_ok epoch text =
+  let words = String.map (function '\n' | '\r' | '\t' -> ' ' | ch -> ch) text
+    |> String.split_on_char ' ' |> List.filter (( <> ) "") in
+  let rec epochs = function
+    | "The" :: "proposed" :: "devnet" :: "switch" :: "is" :: "epoch" :: value :: rest ->
+      value :: epochs rest
+    | _ :: rest -> epochs rest
+    | [] -> [] in
+  epochs words = [Printf.sprintf "%d;" epoch]
+
+let test_readme path =
+  let plan = Option.get (Graph.exit_activation (graph (fun _ -> Graph.Missing))) in
+  let sentence epoch = Printf.sprintf "The proposed devnet switch is epoch %d; deployment requires" epoch in
+  let text = sentence plan.activation_epoch in
+  require (readme_ok plan.activation_epoch text) "README sentence refused";
+  List.iter (fun space ->
+    require (readme_ok plan.activation_epoch (String.concat space (String.split_on_char ' ' text)))
+      "README reflow refused") ["\n"; "\r\n"; "\t"; "  "];
+  List.iter (fun text ->
+    require (not (readme_ok plan.activation_epoch text)) "README invalid height accepted")
+    [""; sentence (plan.activation_epoch - 1); sentence (plan.activation_epoch + 1);
+     text ^ "\n" ^ text; "The proposed devnet switch is epoch unknown;"];
+  let input = open_in path in
+  let text = Fun.protect ~finally:(fun () -> close_in_noerr input) (fun () ->
+    really_input_string input (in_channel_length input)) in
+  require (readme_ok plan.activation_epoch text) "README exit epoch differs from rule plan"
+
 let () =
+  (match Array.to_list Sys.argv with
+   | [_; path] -> test_readme path
+   | _ -> fail "expected README path");
+  test_exit ();
+  test_program_rule ();
+  test_live_chain ();
   test_math ();
   test_set_plan ();
   let seed = graph (fun _ -> Graph.Unreadable "unused") in

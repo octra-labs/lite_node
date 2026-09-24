@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -148,30 +149,36 @@ def parse_env(path, allowed=None):
     return values
 
 def write_env(path, values):
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = target.with_name(target.name + ".new")
     body = "".join(f"{key}={shlex.quote(str(values[key]))}\n" for key in sorted(values))
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    with private_writer(path) as handle:
         handle.write(body)
+
+@contextmanager
+def private_writer(path, mode = "w"):
+    target = Path(path)
+    target.parent.mkdir(parents = True, exist_ok = True, mode = 0o700)
+    staged = target.with_name(target.name + ".new")
+    try:
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    except OSError as error:
+        raise ValidatorError(f"private staging open refused; inspect path = {staged}") from error
+    with os.fdopen(descriptor, mode, encoding = None if "b" in mode else "utf-8") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or (
+            info.st_mode & 0o077 or info.st_nlink != 1
+        ):
+            raise ValidatorError(f"private staging file is unsafe; inspect path = {staged}")
+        os.ftruncate(handle.fileno(), 0)
+        yield handle
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, target)
+    os.replace(staged, target)
     os.chmod(target, 0o600)
 
 def write_private_json(path, payload):
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = target.with_name(target.name + ".new")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+    with private_writer(path) as handle:
+        json.dump(payload, handle, separators = (",", ":"), sort_keys = True)
         handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, target)
-    os.chmod(target, 0o600)
 
 def base58_encode(payload):
     value = int.from_bytes(payload, "big")
@@ -453,30 +460,18 @@ def ensure_wallet(path):
         "pub": base64.b64encode(public_key).decode("ascii"),
         "address": address_from_pubkey(public_key),
     }
-    temporary = wallet_path.with_name(wallet_path.name + ".new")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"))
+    with private_writer(wallet_path) as handle:
+        json.dump(payload, handle, separators = (",", ":"))
         handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, wallet_path)
-    os.chmod(wallet_path, 0o600)
     return load_wallet(wallet_path)
 
 def copy_private(source, target):
-    source_path = Path(source)
-    target_path = Path(target)
-    target_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = target_path.with_name(target_path.name + ".new")
-    with source_path.open("rb") as reader:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "wb") as writer:
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as reader:
+        if not stat.S_ISREG(os.fstat(reader.fileno()).st_mode):
+            raise ValidatorError(f"private copy source is not a regular file: {source}")
+        with private_writer(target, "wb") as writer:
             shutil.copyfileobj(reader, writer)
-            writer.flush()
-            os.fsync(writer.fileno())
-    os.replace(temporary, target_path)
-    os.chmod(target_path, 0o600)
 
 def read_digest(path):
     try:

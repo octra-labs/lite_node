@@ -131,8 +131,8 @@ def update_ref(root):
     except (OSError, subprocess.CalledProcessError):
         pass
     remotes = capture(["git", "remote"], cwd=root).splitlines()
-    candidates = ["origin"] if "origin" in remotes else remotes
-    return choose("git release remote", candidates), "refs/heads/main"
+    choices = ["origin"] if "origin" in remotes else remotes
+    return choose("git release remote", choices), "refs/heads/main"
 
 def choose(label, values):
     unique = []
@@ -286,20 +286,20 @@ def config_path(root, explicit, rows, entries):
         if not valid_config(path):
             raise ValidatorError(f"node configuration is invalid: {path}")
         return path
-    candidates = []
+    paths = []
     local = root / ".keys/validator/node.env"
     if valid_config(local):
-        candidates.append(local.resolve())
+        paths.append(local.resolve())
     for _, _, info in rows:
-        candidates.extend(
+        paths.extend(
             path for path in env_paths(info.get("EnvironmentFiles"))
             if valid_config(path)
         )
     for entry in entries:
         value = entry_env(entry).get("OCTRA_OPERATOR_CONFIG")
         if isinstance(value, str) and valid_config(Path(value)):
-            candidates.append(Path(value).expanduser().resolve())
-    return choose("node configuration", candidates)
+            paths.append(Path(value).expanduser().resolve())
+    return choose("node configuration", paths)
 
 def pm2_sup(config, values, entries):
     data = str(Path(values["OCTRA_DATA_DIR"]).resolve())
@@ -389,9 +389,9 @@ def restart_notice(sup):
     )
 
 def supervisor(config, values, rows, entries, unit=None):
-    candidates = pm2_sup(config, values, entries)
-    candidates.extend(unit_sup(config, values, rows, explicit=unit))
-    return choose("node supervisor", candidates)
+    supervisors = pm2_sup(config, values, entries)
+    supervisors.extend(unit_sup(config, values, rows, explicit = unit))
+    return choose("node supervisor", supervisors)
 
 def inspect_pending(data_dir):
     wal = Path(data_dir) / "wal"
@@ -931,7 +931,7 @@ def verify_unit(sup, values):
         raise ValidatorError("systemd unit is not bound to the selected config")
     if sup["exec"] != binary and proc_exe(sup["pid"]) != binary:
         raise ValidatorError(
-            "systemd ExecStart does not select the candidate binary: " + str(sup["exec"])
+            "systemd ExecStart does not select the node binary: " + str(sup["exec"])
         )
     return binary
 
@@ -1076,11 +1076,11 @@ def apply(root, sup, values, args, release):
         "--config",
         str(sup["config"]),
     ], cwd=root)
-    rebound_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
-    if unit_binary is not None and rebound_binary != unit_binary:
-        raise ValidatorError("systemd candidate binary path changed during rebind")
-    if sup["kind"] == "pm2" and prior_binary.parent != rebound_binary.parent:
-        emit(event="candidate_path", prior=prior_binary, current=rebound_binary)
+    next_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
+    if unit_binary is not None and next_binary != unit_binary:
+        raise ValidatorError("systemd binary path changed during rebind")
+    if sup["kind"] == "pm2" and prior_binary.parent != next_binary.parent:
+        emit(event = "runtime_path", prior = prior_binary, current = next_binary)
     faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
     unsafe = [fault for fault in faults if fault[0].startswith("pending_")]
     if unsafe:

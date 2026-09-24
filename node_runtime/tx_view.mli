@@ -192,6 +192,12 @@ val staging_submit_admission :
   Octra_core.Transaction.t ->
   (unit, string) result
 
+val duty_nonce_admission :
+  head:int64 option ->
+  confirmed_nonce:int ->
+  Octra_core.Transaction.t ->
+  (unit, string) result
+
 type staging_submit_effects = {
   total_txs : int;
   total_ou : Z.t;
@@ -304,7 +310,15 @@ val bft_op_admission :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
+val duty_retry :
+  now:float ->
+  duty:(int64 * Octra_core.Rule_graph.mode) option ->
+  bft_mode:bool ->
+  Octra_core.Transaction.t ->
+  bool
+
 val pre_route_admission :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
   now:float ->
   max_timestamp_drift:float ->
   observer_rpc_mode:bool ->
@@ -323,6 +337,7 @@ val sender_admission :
   (unit, string * string) result
 
 val submit_pre_signature_admission :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
   now:float ->
   max_timestamp_drift:float ->
   observer_rpc_mode:bool ->

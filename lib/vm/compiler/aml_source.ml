@@ -39,9 +39,9 @@ let owns source =
             | _ -> false))
       | Oct_lang.TkLParen ->
         outer && (prior = Oct_lang.TkConstructor
-          || (match before, prior with
-            | (Oct_lang.TkEvent | Oct_lang.TkFn | Oct_lang.TkError),
-                Oct_lang.TkIdent _ -> true
+          || (match before with
+            | Oct_lang.TkEvent | Oct_lang.TkFn | Oct_lang.TkError ->
+              Oct_parse.ident prior
             | _ -> false))
       | Oct_lang.TkColon ->
         outer && (match before, prior with
@@ -128,7 +128,26 @@ let body_empty ast =
     && ast.funcs = []
     && ast.forms = []
 
-let compile_ast ast =
+let shape syntax ast =
+  let total items size = List.fold_left (fun n item -> n + size item) 0 items in
+  if syntax <> Oct_gen.Source then Ok ()
+  else if List.length ast.Oct_lang.imports > Program_limits.max_imports then
+    Error "Program import count exceeds compiler limit"
+  else if total ast.imports (fun item -> List.length item.Oct_lang.imp_names)
+      > Program_limits.max_import_names then
+    Error "Program import name count exceeds compiler limit"
+  else if List.length ast.interfaces > Program_limits.max_interfaces then
+    Error "Program interface count exceeds compiler limit"
+  else if total ast.interfaces (fun item -> List.length item.Oct_lang.if_methods)
+      > Program_limits.max_interface_methods then
+    Error "Program interface method count exceeds compiler limit"
+  else match repeated (List.map (fun item -> item.Oct_lang.if_name) ast.interfaces) with
+    | Some name -> Error ("duplicate interface name = " ^ name)
+    | None -> Ok ()
+
+let compile_ast ~syntax ast =
+  let ( let* ) = Result.bind in
+  let* () = shape syntax ast in
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
   let functions = List.length ast.funcs + List.length ast.forms in
   let interfaces =
@@ -144,7 +163,7 @@ let compile_ast ast =
       match Oct_form.link ast with
       | Error reason -> Error reason
       | Ok (ast, direct, calls) ->
-        let code, seals = Oct_gen.generate ~direct ~calls ast in
+        let code, seals = Oct_gen.generate ~syntax ~direct ~calls ast in
         if program && Array.length code > Program_limits.max_instructions then
           Error "program instruction count exceeds capacity"
         else
@@ -220,16 +239,15 @@ let caught ?source action =
   | Oct_gen.GenError (message, line, column) ->
     let column = if column < 1 then None else Some column in
     Error (diagnostic source line column message)
-  | Stack_overflow -> Error "stack capacity exceeded"
-  | Out_of_memory -> Error "memory capacity exceeded"
+  | (Stack_overflow | Out_of_memory) as error -> raise error
   | Failure message | Invalid_argument message -> Error message
 
-let compile source =
+let compile ~syntax source =
   caught (fun () ->
     let ast = Oct_parse.parse source in
-    compile_ast ast)
+    compile_ast ~syntax ast)
 
-let compile_multi resolver main_path =
+let compile_multi ~syntax resolver main_path =
   let cache = Hashtbl.create 16 in
   let load path =
     match Hashtbl.find_opt cache path with
@@ -247,7 +265,9 @@ let compile_multi resolver main_path =
     match load path with
     | Error reason -> Error reason
     | Ok source ->
-      caught ~source:path (fun () -> Ok (Oct_parse.parse source))
+      caught ~source:path (fun () ->
+        let ast = Oct_parse.parse source in
+        Result.map (fun () -> ast) (shape syntax ast))
   in
   let select path parsed names =
     let rec loop out = function
@@ -292,6 +312,6 @@ let compile_multi resolver main_path =
       | Error reason -> Error reason
       | Ok interfaces ->
         caught ~source:main_path (fun () ->
-          compile_ast
+          compile_ast ~syntax
             { main with Oct_lang.interfaces = interfaces @ main.interfaces })
     end

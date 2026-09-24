@@ -613,6 +613,75 @@ let rec mkdir_p path =
     Unix.mkdir path 0o755
   end
 
+let test_journal_tail root manifest_hash (file : Manifest.file) chunk =
+  let write path bytes =
+    let output = open_out_bin path in
+    Fun.protect ~finally:(fun () -> close_out_noerr output)
+      (fun () -> output_string output bytes)
+  in
+  let read path =
+    let input = open_in_bin path in
+    Fun.protect ~finally:(fun () -> close_in_noerr input)
+      (fun () -> really_input_string input (in_channel_length input))
+  in
+  let header = Yojson.Safe.to_string (Journal.header_json manifest_hash) in
+  let key = Journal.chunk_key file.path chunk in
+  let completed = Yojson.Safe.to_string (Journal.chunk_json key) in
+  let dropped = Yojson.Safe.to_string (Journal.drop_json key) in
+  List.iteri (fun index (bytes, present) ->
+    let path = Filename.concat root (Printf.sprintf "tail-%d.jsonl" index) in
+    write path bytes;
+    let journal = expect_ok (Journal.open_journal ~path ~manifest_hash) in
+    if Journal.is_completed journal file.path chunk <> present then
+      fail "journal tail changed completed prefix";
+    if present then Journal.record_invalid journal file.path chunk
+    else Journal.record_completed journal file.path chunk;
+    let journal = expect_ok (Journal.open_journal ~path ~manifest_hash) in
+    if Journal.is_completed journal file.path chunk = present then
+      fail "journal append after tail repair was lost"
+  ) [
+    header, false;
+    header ^ "\n" ^ completed, true;
+    header ^ "\n" ^ completed ^ "\n" ^ dropped, false;
+    header ^ "\n" ^ completed ^ "\n{", true;
+  ];
+  let cuts = Filename.concat root "cuts.jsonl" in
+  for cut = 0 to String.length dropped do
+    write cuts (header ^ "\n" ^ completed ^ "\n" ^ String.sub dropped 0 cut);
+    let journal = expect_ok (Journal.open_journal ~path:cuts ~manifest_hash) in
+    let present = cut < String.length dropped in
+    if Journal.is_completed journal file.path chunk <> present then
+      fail "journal cut changed prefix";
+    if present then Journal.record_invalid journal file.path chunk
+    else Journal.record_completed journal file.path chunk;
+    let next = expect_ok (Journal.open_journal ~path:cuts ~manifest_hash) in
+    if Journal.is_completed next file.path chunk = present then
+      fail "journal cut prevented continuation"
+  done;
+  let invalid = Filename.concat root "invalid.jsonl" in
+  List.iter (fun bytes ->
+    write invalid bytes;
+    expect_error (Journal.open_journal ~path:invalid ~manifest_hash);
+    if read invalid <> bytes then fail "invalid journal was modified"
+  ) [
+    "{\"version\":";
+    header ^ "\n{\n";
+    header ^ "\n{\n" ^ completed;
+    header ^ "\n" ^ header;
+  ];
+  let bytes = header ^ "\n" ^ completed ^ "\n{" in
+  write invalid bytes;
+  expect_error (Journal.open_journal ~path:invalid ~manifest_hash:(sha "other"));
+  if read invalid <> bytes then fail "foreign manifest journal was modified";
+  let meta = Unix.stat invalid in
+  write invalid (bytes ^ "more");
+  expect_error (Journal.repair_tail invalid meta 0);
+  if read invalid <> bytes ^ "more" then fail "changed journal was truncated";
+  let alias = Filename.concat root "alias.jsonl" in
+  Unix.symlink "invalid.jsonl" alias;
+  expect_error (Journal.open_journal ~path:alias ~manifest_hash);
+  if read invalid <> bytes ^ "more" then fail "journal link target was modified"
+
 let test_journal () =
   let root =
     Filename.concat
@@ -652,6 +721,15 @@ let test_journal () =
   let recovered = expect_ok (Journal.open_journal ~path:torn_path ~manifest_hash) in
   if not (Journal.is_completed recovered file.path chunk) then
     fail "journal did not ignore torn final entry";
+  Journal.record_invalid recovered file.path chunk;
+  let continued = expect_ok (Journal.open_journal ~path:torn_path ~manifest_hash) in
+  if Journal.is_completed continued file.path chunk then
+    fail "journal lost invalidation after tail repair";
+  Journal.record_completed continued file.path chunk;
+  let resumed = expect_ok (Journal.open_journal ~path:torn_path ~manifest_hash) in
+  if not (Journal.is_completed resumed file.path chunk) then
+    fail "journal lost completion after tail repair";
+  test_journal_tail root manifest_hash file chunk;
   remove_tree root
 
 let test_snapshot_roots () =

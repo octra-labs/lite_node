@@ -53,9 +53,21 @@ val account_pack_activation : t -> activation option
 val standard_activation : t -> activation option
 val set_plan_activation : t -> activation option
 val math_activation : t -> activation option
+val exit_activation : t -> activation option
+val exit_activation_for_chain : string -> activation option
+val ready_exec_activation_for_chain : string -> activation option
+val ready_exec : t -> epoch:int -> (mode, fault) result
+val ready_exec_at : chain_id:string -> epoch:int -> mode
+val program_source_activation_for_chain : string -> activation option
+val program_source : t -> epoch:int -> (mode, fault) result
+val program_overlap_epochs : int
+val program_overlap : t -> epoch:int -> (bool, fault) result
+val program_source_at : chain_id:string -> epoch:int -> mode
 val ready_config_hash : t -> string option
 
 val consensus_id : chain_id:string -> epoch:int -> string
+
+val live_chain : chain_id:string -> bool
 
 val profile_epochs : chain_id:string -> int list
 
@@ -152,5 +164,8 @@ val set_plan_at : chain_id:string -> epoch:int -> mode
 val math : t -> epoch:int -> (mode, fault) result
 
 val math_at : chain_id:string -> epoch:int -> mode
+
+val exit : t -> epoch:int -> (mode, fault) result
+val exit_at : chain_id:string -> epoch:int -> mode
 
 val fault_message : fault -> string

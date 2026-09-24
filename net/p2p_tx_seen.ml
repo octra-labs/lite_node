@@ -20,6 +20,12 @@ let lifetime = 1.0
 let empty = { keys = Keys.empty; times = Times.empty; last = neg_infinity }
 let size t = Keys.cardinal t.keys
 
+let recent t ~now key =
+  Float.is_finite now && now >= t.last
+  && match Keys.find_opt key t.keys with
+    | Some stamp -> now -. stamp < lifetime
+    | None -> false
+
 let remove t (stamp, key) =
   { t with keys = Keys.remove key t.keys; times = Times.remove (stamp, key) t.times }
 

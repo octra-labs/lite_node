@@ -95,9 +95,18 @@ let self_test_of_json = function
 let host_result =
   Result.map_error Octra_core.Circle_wasm_host.error_message
 
-let native_self_test () =
-  let* result = Octra_core.Circle_wasm_host.compute_self_test () in
-  Lwt.return (self_test_of_json (host_result result))
+let native_accelerator = function
+  | Resource_compute_provider_config.Cpu -> Ok ()
+  | accelerator ->
+    Error ("resource compute accelerator unavailable: " ^
+      Resource_compute_provider_config.accelerator_name accelerator)
+
+let native_self_test ?(accelerator = Resource_compute_provider_config.Cpu) () =
+  match native_accelerator accelerator with
+  | Error _ as error -> Lwt.return error
+  | Ok () ->
+    let* result = Octra_core.Circle_wasm_host.compute_self_test () in
+    Lwt.return (self_test_of_json (host_result result))
 
 let graph_limits memory_bytes =
   let max_cache_bytes =
@@ -321,8 +330,11 @@ let native_deps ~limits ~store ~state_root_at =
              Ok entries));
     load_model = native_load_model limits state_root_at store;
     drop_model = native_drop_model;
-    self_test = native_self_test;
-    execute = native_execute;
+    self_test = native_self_test ~accelerator:limits.accelerator;
+    execute = (fun ~model ~program ~storage request ->
+      match native_accelerator limits.accelerator with
+      | Error _ as error -> Lwt.return error
+      | Ok () -> native_execute ~model ~program ~storage request);
   }
 
 let create ~limits ~deps =

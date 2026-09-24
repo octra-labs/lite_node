@@ -190,9 +190,15 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
           (backend.ops.find_opt current.Transaction.from));
       deploy_and_save = (fun _ ~admitted ~params ~bytecode ~bytecode_raw ->
         deploy_and_save ~admitted ~params ~bytecode ~bytecode_raw);
-      program_prepare =
-        Vm.prepare_program_package
-          ~point_ops:(backend.proof_mode = Rule_graph.Active);
+      program_prepare = (fun current ->
+        match backend.fold env.Epoch_exec.epoch_id with
+        | Error reason -> Lwt.return_error reason
+        | Ok fold ->
+          Vm.prepare_program_package
+            ~overlap:fold.program_overlap
+            ~program_mode:fold.program_mode
+            ~point_ops:(backend.proof_mode = Rule_graph.Active)
+            current);
       ensure_account = (fun address ->
         match Tx_effects.ensure_account effects address with
         | Ok () -> ()
@@ -327,6 +333,8 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
       (fun error ->
         discard ();
         match error with
+        | Stack_overflow
+        | Out_of_memory
         | Circle_receipt_mismatch _
         | Circle_exec.Execution_unavailable _ -> Lwt.fail error
         | _ when hfhe_mode = Transcript.Capture -> Lwt.fail error

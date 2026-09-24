@@ -115,7 +115,7 @@ let test_crash () =
         reject = (fun _ -> fail "unexpected reject");
         crash = (fun meta error ->
           crashed := meta.R.exception_type = "program_exec_exception"
-            && String.length error > 0;
+            && error = Failure "boom";
           Lwt.return_unit);
       });
   ok "crash" !crashed
@@ -152,7 +152,31 @@ let test_commit_failure_bubbles () =
   ok "commit failure bubbled" bubbled;
   ok "commit failure bypassed crash" (not !crashed)
 
+let test_resource_failures () =
+  List.iter (fun error ->
+    List.iter (fun pending ->
+      let saved = ref false in
+      let charged = ref false in
+      let raised = try
+        Lwt_main.run (D.run (spec ()) {
+          apply = ignore;
+          exec = (fun _ -> if pending then Lwt.fail error else raise error);
+          receipt = (fun r -> r);
+          save = (fun _ _ -> saved := true);
+          ok = (fun _ _ _ -> fail "unexpected ok");
+          fail = (fun _ _ _ -> fail "unexpected fail");
+          reject = (fun _ -> fail "unexpected reject");
+          crash = (fun _ _ -> charged := true; Lwt.return_unit);
+        });
+        false
+      with actual when actual = error -> true in
+      ok "resource exception preserved" raised;
+      ok "resource exception has no receipt" (not !saved);
+      ok "resource exception has no charge" (not !charged))
+      [false; true]) [Stack_overflow; Out_of_memory]
+
 let () =
+  test_resource_failures ();
   test_success ();
   test_failed_receipt ();
   test_reject ();

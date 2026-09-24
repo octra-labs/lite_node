@@ -47,6 +47,8 @@ let remember t ~now key =
   t.seen <- seen;
   fresh
 
+let recent t ~now key = P2p_tx_seen.recent t.seen ~now key
+
 let reset b now =
   b.start <- now;
   b.msgs <- 0;

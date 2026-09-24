@@ -120,33 +120,40 @@ let is_valid_cipher = function
   | Some "" -> true
   | Some s -> String.length s >= 7 && String.sub s 0 7 = "hfhe_v1"
 
+let can_load_cipher cipher =
+  cipher = Some "0" || is_valid_cipher cipher
+
 let is_active_account acc =
   Z.gt acc.Ledger_types.balance Z.zero
 
 let create_from_store store =
   let accounts = run_s (Store_irmin.load_all_accounts store) in
+  if not (List.for_all (fun (_, acc) ->
+    can_load_cipher acc.Ledger_types.encrypted_balance) accounts) then
+    failwith "ledger cipher format unsupported; run fhe_audit on a data copy";
   let cache = Hashtbl.create (max 100 (List.length accounts)) in
   let dirty_addrs = Hashtbl.create 64 in
   let total_supply = ref Z.zero in
   let active_accounts = ref 0 in
-  let sanitized = ref 0 in
+  let zeros = ref 0 in
   List.iter (fun (addr, acc) ->
     let acc =
-      if is_valid_cipher acc.Ledger_types.encrypted_balance then acc
-      else begin
-        incr sanitized;
+      match acc.Ledger_types.encrypted_balance with
+      | Some "0" ->
+        incr zeros;
         Hashtbl.replace dirty_addrs addr ();
         { acc with encrypted_balance = None }
-      end in
+      | _ -> acc
+    in
     Hashtbl.replace cache addr acc;
     total_supply := Z.add !total_supply acc.Ledger_types.balance;
     if is_active_account acc then incr active_accounts
   ) accounts;
-  if !sanitized > 0 then
+  if !zeros > 0 then
     Octra_log.warn "ledger"
-      "event = legacy_cipher_sanitized count = %d persistence = pending"
-      !sanitized;
-  { store; cache; dirty_addrs; dirty = !sanitized > 0; total_supply = !total_supply;
+      "event = zero_cipher_cleared count = %d persistence = pending"
+      !zeros;
+  { store; cache; dirty_addrs; dirty = !zeros > 0; total_supply = !total_supply;
     active_accounts = !active_accounts;
     spent_nonces = Hashtbl.create 1000;
     epoch_journals = [] }

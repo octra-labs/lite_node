@@ -191,10 +191,12 @@ type preview_session_entry = {
   updated_at : float;
 }
 
-let preview_session_cache : (string, preview_session_entry) Hashtbl.t =
+let preview_session_cache :
+    (Octra_vm.Program_attestation.key list * string, preview_session_entry) Hashtbl.t =
   Hashtbl.create 128
 
-let preview_session_inflight : (string, unit) Hashtbl.t =
+let preview_session_inflight :
+    (Octra_vm.Program_attestation.key list * string, unit) Hashtbl.t =
   Hashtbl.create 64
 
 let preview_session_ttl_secs = 300.0
@@ -295,8 +297,8 @@ let preview_request_of_call method_name params =
   | _ ->
     None
 
-let preview_cache_key ~math circle_id caller prompt_csv =
-  circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv ^ (if math then "|math" else "")
+let preview_cache_key ~trusted ~math circle_id caller prompt_csv =
+  trusted, circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv ^ (if math then "|math" else "")
 
 let preview_cache_store key result_csv =
   match parse_csv_tokens result_csv with
@@ -1276,7 +1278,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
     end
     end
 
-and maybe_prefetch_preview ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+and maybe_prefetch_preview ~trusted ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     store circle_id caller prompt_csv prompt_tokens delivered_csv =
   if Option.is_some running then () else
   match parse_csv_tokens delivered_csv with
@@ -1289,7 +1291,7 @@ and maybe_prefetch_preview ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0)
       ()
     else
       let next_prompt_csv = append_csv prompt_csv delivered_csv in
-      let next_key = preview_cache_key ~math:ctx.math circle_id caller next_prompt_csv in
+      let next_key = preview_cache_key ~trusted ~math:ctx.math circle_id caller next_prompt_csv in
       let prefetch_n = min preview_prefetch_tokens remaining in
       if prefetch_n <= 0 then
         ()
@@ -1305,6 +1307,7 @@ and maybe_prefetch_preview ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0)
               let* receipt =
                 execute_view_call_with_execution
                   Circle_program.Standard
+                  ~trusted
                   ~ctx
                   ~depth
                   ~limit
@@ -1340,11 +1343,12 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
       params
       caller
   | Some (prompt_csv, prompt_tokens, n_tokens) ->
-    let cache_key = preview_cache_key ~math:ctx.math circle_id caller prompt_csv in
+    let cache_key = preview_cache_key ~trusted ~math:ctx.math circle_id caller prompt_csv in
     begin
       match preview_cache_lookup cache_key n_tokens with
       | Some result_csv ->
         maybe_prefetch_preview
+          ~trusted
           ?running
           ~ctx
           ~depth
@@ -1361,6 +1365,7 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
           execute_view_call_with_execution
             Circle_program.Standard
             ?running
+            ~trusted
             ~ctx
             ~depth
             ~limit
@@ -1374,6 +1379,7 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
           | Some result_csv ->
             preview_cache_store cache_key result_csv;
             maybe_prefetch_preview
+              ~trusted
               ?running
               ~ctx
               ~depth

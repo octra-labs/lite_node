@@ -7,7 +7,10 @@ exception GenError of string * int * int
 
 let gerr ?(column = 1) line msg = raise (GenError (msg, line, column))
 
+type syntax = Forms | Source
+
 type env = {
+  syntax : syntax;
   structs : struct_def list;
   enums : enum_def list;
   consts : const_def list;
@@ -35,7 +38,8 @@ type env = {
   declaration : declaration;
 }
 
-let make_env declaration structs enums consts state events errors funcs forms direct = {
+let make_env syntax declaration structs enums consts state events errors funcs forms direct = {
+  syntax;
   structs; enums; consts; state; events; errors; funcs; forms; direct;
   func_labels = Hashtbl.create 16;
   locals = [];
@@ -343,6 +347,26 @@ let gen_storage_loaded_value env r typ =
   if is_int_storage env typ then gen_int_from_storage env r
   else if typ = TBool then gen_bool_from_storage env r
   else r
+
+let emit_equality env typ op dest left right =
+  let saved = env.next_reg in
+  let left, right =
+    match env.syntax, typ with
+    | Source, (TAddress | TBytes | TBytes32) ->
+      let a = alloc_reg env in
+      let b = alloc_reg env in
+      emit env (Contract_vm.LDI (a, VString ""));
+      emit env (Contract_vm.CONCAT (a, a, left));
+      emit env (Contract_vm.LDI (b, VString ""));
+      emit env (Contract_vm.CONCAT (b, b, right));
+      a, b
+    | _ -> left, right
+  in
+  (match op with
+   | Eq -> emit env (Contract_vm.EQ (dest, left, right))
+   | Neq -> emit env (Contract_vm.NEQ (dest, left, right))
+   | _ -> gerr env.line "comparison is not equality");
+  env.next_reg <- saved
 
 let gen_dynamic_key env prefix key_r suffix =
   let prefix_r = alloc_reg env in
@@ -826,11 +850,10 @@ let rec typ_of_expr_with constants env = function
      | None ->
        gerr ~column:env.column env.line
          (Printf.sprintf "undefined field: %s" name))
-  | EBinop (op, a, b) ->
-    (match op with
+  | (EBinop _ | EUnop _) as value ->
+    let binary op a b ta tb =
+      match op with
      | Add ->
-       let ta = typ_of_expr_with constants env a in
-       let tb = typ_of_expr_with constants env b in
        if Oct_types.text ta || Oct_types.text tb then TString
        else if Oct_types.numeric ta && Oct_types.numeric tb then
          Oct_types.numeric_result ta tb
@@ -840,8 +863,6 @@ let rec typ_of_expr_with constants env = function
              "addition operand type differs left = %s right = %s"
              (typ_to_string ta) (typ_to_string tb))
      | Sub | Mul | Div | Mod ->
-       let ta = typ_of_expr_with constants env a in
-       let tb = typ_of_expr_with constants env b in
        if Oct_types.numeric ta && Oct_types.numeric tb then
          Oct_types.numeric_result ta tb
        else
@@ -850,8 +871,6 @@ let rec typ_of_expr_with constants env = function
              "arithmetic operand type differs left = %s right = %s"
              (typ_to_string ta) (typ_to_string tb))
      | Eq | Neq ->
-       let ta = typ_of_expr_with constants env a in
-       let tb = typ_of_expr_with constants env b in
        let zero = function EInt value -> Z.equal value Z.zero | _ -> false in
        if not
            (Oct_types.compatible ta tb
@@ -864,8 +883,6 @@ let rec typ_of_expr_with constants env = function
              (typ_to_string ta) (typ_to_string tb));
        TBool
      | Lt | Gt | Le | Ge ->
-       let ta = typ_of_expr_with constants env a in
-       let tb = typ_of_expr_with constants env b in
        if Oct_types.numeric ta && Oct_types.numeric tb then TBool
        else
          gerr ~column:env.column env.line
@@ -873,21 +890,36 @@ let rec typ_of_expr_with constants env = function
              "comparison operand type differs left = %s right = %s"
              (typ_to_string ta) (typ_to_string tb))
      | And | Or ->
-       let ta = typ_of_expr_with constants env a in
-       let tb = typ_of_expr_with constants env b in
        require_type env "logical left operand type differs" TBool ta;
        require_type env "logical right operand type differs" TBool tb;
-       TBool)
-  | EUnop (Neg, value) ->
-    let typ = typ_of_expr_with constants env value in
-    if Oct_types.numeric typ then typ
-    else
-      gerr ~column:env.column env.line
-        ("negation operand type differs actual = " ^ typ_to_string typ)
-  | EUnop (Not, value) ->
-    let typ = typ_of_expr_with constants env value in
-    require_type env "logical negation type differs" TBool typ;
-    TBool
+       TBool
+    in
+    let unary op typ =
+      match op with
+      | Neg ->
+        if Oct_types.numeric typ then typ
+        else
+          gerr ~column:env.column env.line
+            ("negation operand type differs actual = " ^ typ_to_string typ)
+      | Not ->
+        require_type env "logical negation type differs" TBool typ;
+        TBool
+    in
+    let rec descend frames = function
+      | EBinop (op, left, right) ->
+        descend ((`Left (op, left, right)) :: frames) left
+      | EUnop (op, value) -> descend ((`Unary op) :: frames) value
+      | value -> finish frames (typ_of_expr_with constants env value)
+    and finish frames typ =
+      match frames with
+      | [] -> typ
+      | `Unary op :: rest -> finish rest (unary op typ)
+      | `Left (op, left, right) :: rest ->
+        descend ((`Right (op, left, right, typ)) :: rest) right
+      | `Right (op, left, right, ta) :: rest ->
+        finish rest (binary op left right ta typ)
+    in
+    descend [] value
   | EAction (_, value) -> typ_of_expr_with constants env value
   | EUse value ->
     let target =
@@ -938,6 +970,14 @@ let rec typ_of_expr_with constants env = function
      | Some value -> value.fn_ret
      | None ->
       match name with
+     | ("unwrap" | "is_some_opt") when env.syntax = Source ->
+       (match call_args with
+        | [value] ->
+          (match typ_of_expr_with constants env value with
+           | TOption typ -> if name = "unwrap" then typ else TBool
+           | typ -> gerr ~column:env.column env.line
+             (name ^ " requires option actual = " ^ typ_to_string typ))
+        | _ -> gerr ~column:env.column env.line (name ^ " requires one argument"))
      | "concat" | "to_string" | "fhe_ser" | "fhe_ser_pk"
      | "substr" | "sha256" | "keccak256"
      | "digest_sha256" | "digest_keccak256" | "current_tx_hash"
@@ -1035,12 +1075,23 @@ let rec typ_of_expr_with constants env = function
            | TOption typ -> typ
            | _ -> TInt)
         | _ -> TInt)
-     | "split" -> TList TString
+     | "split" -> (match env.syntax with Forms -> TList TString | Source -> TInt)
+     | "to_address" when env.syntax = Source ->
+       (match call_args with
+        | [value] ->
+          let typ = typ_of_expr_with constants env value in
+          if Oct_types.text typ then TAddress
+          else gerr ~column:env.column env.line
+            ("address input type differs actual = " ^ typ_to_string typ)
+        | _ -> gerr ~column:env.column env.line "to_address requires one argument")
      | "some" ->
        (match call_args with
         | [value] -> TOption (typ_of_expr_with constants env value)
         | _ -> TOption TVoid)
-     | "none" -> TOption TVoid
+     | "none" ->
+       if env.syntax = Source && call_args <> [] then
+         gerr ~column:env.column env.line "none requires no arguments";
+       TOption TVoid
      | "transfer" | "checkpoint" | "rollback" | "commit" | "mset"
      | "matmul" | "softmax" | "softmax_q16" | "layernorm" | "layernorm_q16"
      | "relu" | "rmsnorm" | "rmsnorm_q16" | "silu" | "silu_q16" | "elemwise_mul"
@@ -1132,7 +1183,75 @@ let gen_some_key_index env field_name key_regs =
   emit env (Contract_vm.CONCAT (kr, kr, suffix));
   kr
 
+let option_parts env value =
+  let present = alloc_reg env in
+  let payload = alloc_reg env in
+  let saved = env.next_reg in
+  let tag = alloc_reg env in
+  let zero = alloc_reg env in
+  let one = alloc_reg env in
+  let size = alloc_reg env in
+  let test = alloc_reg env in
+  let done_l = alloc_label env in
+  emit env (Contract_vm.LDI (payload, VString ""));
+  emit env (Contract_vm.LDI (tag, VString "0"));
+  emit env (Contract_vm.NEQ (present, value, tag));
+  emit env (Contract_vm.EQ (test, value, tag));
+  emit env (Contract_vm.JIF (test, done_l));
+  emit env (Contract_vm.LDI (zero, VInt Z.zero));
+  emit env (Contract_vm.LDI (one, VInt Z.one));
+  emit env (Contract_vm.SUBSTR (tag, value, zero, one));
+  emit env (Contract_vm.LDI (payload, VString "1"));
+  emit env (Contract_vm.EQ (test, tag, payload));
+  emit env (Contract_vm.ASSERT test);
+  emit env (Contract_vm.STRLEN (size, value));
+  emit env (Contract_vm.SUB (size, size, one));
+  emit env (Contract_vm.SUBSTR (payload, value, one, size));
+  emit env (Contract_vm.JDEST done_l);
+  env.next_reg <- saved;
+  present, payload
+
+let option_load env value mark =
+  let result = alloc_reg env in
+  let saved = env.next_reg in
+  let test = alloc_reg env in
+  let some_l = alloc_label env in
+  let done_l = alloc_label env in
+  emit env (Contract_vm.LDI (result, VString "true"));
+  emit env (Contract_vm.EQ (test, mark, result));
+  emit env (Contract_vm.JIF (test, some_l));
+  emit env (Contract_vm.LDI (result, VString "0"));
+  emit env (Contract_vm.EQ (test, mark, result));
+  emit env (Contract_vm.ASSERT test);
+  emit env (Contract_vm.JMP done_l);
+  emit env (Contract_vm.JDEST some_l);
+  emit env (Contract_vm.LDI (result, VString "1"));
+  emit env (Contract_vm.CONCAT (result, result, value));
+  emit env (Contract_vm.JDEST done_l);
+  env.next_reg <- saved;
+  result
+
+let option_store env key mark value =
+  let present, payload = option_parts env value in
+  let some_l = alloc_label env in
+  let done_l = alloc_label env in
+  emit env (Contract_vm.JIF (present, some_l));
+  emit env (Contract_vm.SDELK key);
+  emit env (Contract_vm.SDELK mark);
+  emit env (Contract_vm.JMP done_l);
+  emit env (Contract_vm.JDEST some_l);
+  emit env (Contract_vm.SSTOREK (key, payload));
+  emit env (Contract_vm.LDI (present, VString "true"));
+  emit env (Contract_vm.SSTOREK (mark, present));
+  emit env (Contract_vm.JDEST done_l)
+
 let rec gen_is_some env args =
+  if env.syntax = Source then begin
+    ignore (typ_of_expr env (ECall ("is_some_opt", args)));
+    match args with
+    | [value] -> fst (option_parts env (gen_expr env value))
+    | _ -> gerr env.line "is_some_opt requires one argument"
+  end else
   match args with
   | [EField name] ->
     let rd = alloc_reg env in
@@ -1154,6 +1273,17 @@ let rec gen_is_some env args =
   | _ -> gerr env.line "is_some: argument must be self.field or self.map[key]"
 
 and gen_unwrap env args =
+  if env.syntax = Source then begin
+    let typ = typ_of_expr env (ECall ("unwrap", args)) in
+    match args with
+    | [value] ->
+      let present, payload = option_parts env (gen_expr env value) in
+      emit env (Contract_vm.ASSERT present);
+      let result = gen_storage_loaded_value env payload typ in
+      emit_type_check env result typ;
+      result
+    | _ -> gerr env.line "unwrap requires one argument"
+  end else
   match args with
   | [EField name] ->
     let some_r = alloc_reg env in
@@ -1339,13 +1469,29 @@ and emit_replace_all_builtin env rd str_r old_r new_r =
 
 and gen_builtin env name args =
   match name with
+  | "to_address" when env.syntax = Source ->
+    ignore (typ_of_expr env (ECall (name, args)));
+    (match args with
+     | [value] ->
+       let rd = gen_expr env value in
+       emit env (Contract_vm.ASSERT_ADDR rd);
+       rd
+     | _ -> gerr env.line "to_address requires one argument")
   | "some" ->
     (match args with
-     | [e] -> gen_expr env e
+     | [e] ->
+       let value = gen_expr env e in
+       if env.syntax = Forms then value else
+       let result = alloc_reg env in
+       emit env (Contract_vm.LDI (result, VString "1"));
+       emit env (Contract_vm.CONCAT (result, result, value));
+       result
      | _ -> gerr env.line "Some: need exactly 1 argument")
   | "none" ->
+    if env.syntax = Source && args <> [] then
+      gerr env.line "none requires no arguments";
     let rd = alloc_reg env in
-    emit env (Contract_vm.LDI (rd, VString ""));
+    emit env (Contract_vm.LDI (rd, VString (if env.syntax = Source then "0" else "")));
     rd
   | "is_some_opt" -> gen_is_some env args
   | "unwrap" -> gen_unwrap env args
@@ -2019,7 +2165,11 @@ and gen_expr env expr =
      | Some sf ->
        let r = alloc_reg env in
        emit env (Contract_vm.SLOAD (r, storage_key_for_field name));
-       if typed_static_storage env sf.sf_typ then r
+       if env.syntax = Source && (match sf.sf_typ with TOption _ -> true | _ -> false) then begin
+         let mark = alloc_reg env in
+         emit env (Contract_vm.SLOAD (mark, gen_some_key_field name));
+         option_load env r mark
+       end else if typed_static_storage env sf.sf_typ then r
        else if is_int_storage env sf.sf_typ then gen_int_from_storage env r
        else if sf.sf_typ = TBool then begin
          let tr = alloc_reg env in
@@ -2036,7 +2186,12 @@ and gen_expr env expr =
        let r = alloc_reg env in
        emit env (Contract_vm.SLOADK (r, kr));
        let vt = map_value_type sf.sf_typ in
-       if is_int_storage env vt then gen_int_from_storage env r
+       if env.syntax = Source && (match vt with TOption _ -> true | _ -> false) then begin
+         let mark_key = gen_some_key_index env name key_regs in
+         let mark = alloc_reg env in
+         emit env (Contract_vm.SLOADK (mark, mark_key));
+         option_load env r mark
+       end else if is_int_storage env vt then gen_int_from_storage env r
        else if vt = TBool then begin
          let tr = alloc_reg env in
          emit env (Contract_vm.LDI (tr, VString "true"));
@@ -2052,7 +2207,7 @@ and gen_expr env expr =
     let left_r = gen_expr env left in
     let right_r = gen_expr env right in
     let result_r = alloc_reg env in
-    emit env (Contract_vm.EQ (result_r, left_r, right_r));
+    emit_equality env declared Eq result_r left_r right_r;
     result_r
   | ELet (name, _, declared, value, body) ->
     require_type env "local initializer type differs" declared
@@ -2162,10 +2317,34 @@ and gen_expr env expr =
     emit env (Contract_vm.MOV (result, rt));
     emit env (Contract_vm.JDEST end_label);
     result
-  | EBinop (And, l, r_expr) -> gen_short_circuit_and env l r_expr
-  | EBinop (Or, l, r_expr) -> gen_short_circuit_or env l r_expr
+  | EBinop _ as value ->
+    let rec collect ops = function
+      | EBinop (_, left, _) as value -> collect (value :: ops) left
+      | value ->
+        List.fold_left (fun r value -> gen_binary env value r)
+          (gen_expr env value) ops
+    in
+    collect [] value
+  | EUnop _ as value ->
+    let rec collect ops = function
+      | EUnop (op, value) -> collect (op :: ops) value
+      | value ->
+        List.fold_left (fun r op ->
+          let rd = alloc_reg env in
+          (match op with
+           | Neg -> emit env (Contract_vm.NEG (rd, r))
+           | Not ->
+             emit env (Contract_vm.LDI (rd, VBool true));
+             emit env (Contract_vm.NEQ (rd, r, rd)));
+          rd) (gen_expr env value) ops
+    in
+    collect [] value
+
+and gen_binary env value rl =
+  match value with
+  | EBinop (And, _, right) -> gen_short_circuit_and env rl right
+  | EBinop (Or, _, right) -> gen_short_circuit_or env rl right
   | EBinop (op, l, r_expr) as whole ->
-    let rl = gen_expr env l in
     let rr = gen_expr env r_expr in
     let rd = alloc_reg env in
     (match op with
@@ -2180,8 +2359,7 @@ and gen_expr env expr =
      | Mul -> emit env (Contract_vm.MUL (rd, rl, rr))
      | Div -> emit env (Contract_vm.DIV (rd, rl, rr))
      | Mod -> emit env (Contract_vm.MOD (rd, rl, rr))
-     | Eq -> emit env (Contract_vm.EQ (rd, rl, rr))
-     | Neq -> emit env (Contract_vm.NEQ (rd, rl, rr))
+     | Eq | Neq -> emit_equality env (typ_of_expr env l) op rd rl rr
      | Lt -> emit env (Contract_vm.LT (rd, rl, rr))
      | Gt -> emit env (Contract_vm.GT (rd, rl, rr))
      | Le ->
@@ -2197,18 +2375,9 @@ and gen_expr env expr =
      | And | Or -> assert false);
     emit_result_type_check env rd (typ_of_expr env whole);
     rd
-  | EUnop (Neg, e) ->
-    let r = gen_expr env e in
-    let rd = alloc_reg env in
-    emit env (Contract_vm.NEG (rd, r)); rd
-  | EUnop (Not, e) ->
-    let r = gen_expr env e in
-    let rd = alloc_reg env in
-    emit env (Contract_vm.LDI (rd, VBool true));
-    emit env (Contract_vm.NEQ (rd, r, rd)); rd
+  | _ -> assert false
 
-and gen_short_circuit_and env l r_expr =
-  let rl = gen_expr env l in
+and gen_short_circuit_and env rl r_expr =
   let result = alloc_reg env in
   let false_label = alloc_label env in
   let end_label = alloc_label env in
@@ -2223,8 +2392,7 @@ and gen_short_circuit_and env l r_expr =
   emit env (Contract_vm.JDEST end_label);
   result
 
-and gen_short_circuit_or env l r_expr =
-  let rl = gen_expr env l in
+and gen_short_circuit_or env rl r_expr =
   let result = alloc_reg env in
   let true_label = alloc_label env in
   let end_label = alloc_label env in
@@ -2529,6 +2697,12 @@ and gen_stmt env stmt =
        require_type env "state assignment type differs"
          sf.sf_typ (typ_of_expr env expr);
        (match sf.sf_typ with
+        | TOption _ when env.syntax = Source ->
+          let key = alloc_reg env in
+          let mark = alloc_reg env in
+          emit env (Contract_vm.LDI (key, VString (storage_key_for_field name)));
+          emit env (Contract_vm.LDI (mark, VString (gen_some_key_field name)));
+          option_store env key mark (gen_expr env expr)
         | TOption _ ->
           (match expr with
            | ECall ("none", []) ->
@@ -2573,6 +2747,11 @@ and gen_stmt env stmt =
        require_type env "indexed assignment type differs"
          vt (typ_of_expr env expr);
        (match vt with
+        | TOption _ when env.syntax = Source ->
+          let key_regs = List.map (gen_expr env) keys in
+          let key = gen_storage_key env name key_regs in
+          let mark = gen_some_key_index env name key_regs in
+          option_store env key mark (gen_expr env expr)
         | TOption _ ->
           let key_regs = List.map (gen_expr env) keys in
           (match expr with
@@ -3209,11 +3388,11 @@ let validate_depth env code =
   in
   check root_depth
 
-let generate ?(direct = []) ?(calls = []) (ct : contract) =
+let generate ~syntax ?(direct = []) ?(calls = []) (ct : contract) =
   check_interfaces ct;
   let forms = List.map (fun value -> value.fm_name) ct.forms in
   let env =
-    make_env ct.declaration ct.structs ct.enums ct.consts ct.state ct.events
+    make_env syntax ct.declaration ct.structs ct.enums ct.consts ct.state ct.events
       ct.errors ct.funcs forms direct
   in
   if forms <> [] then

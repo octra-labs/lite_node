@@ -24,28 +24,41 @@ let rec expr env = function
   | EVar "value" when not (local "value" env) -> EValue
   | ECall ("balance", [address]) when not (callable "balance" env) ->
     EBalance (expr env address)
-  | EIndex (name, keys) -> EIndex (name, List.map (expr env) keys)
-  | EBinop (op, left, right) -> EBinop (op, expr env left, expr env right)
-  | EUnop (op, value) -> EUnop (op, expr env value)
+  | EIndex (name, keys) -> EIndex (name, exprs env keys)
+  | (EBinop _ | EUnop _) as value ->
+    let rec descend frames = function
+      | EBinop (op, left, right) -> descend ((`Right (op, left)) :: frames) right
+      | EUnop (op, value) -> descend ((`Unary op) :: frames) value
+      | value -> finish frames (expr env value)
+    and finish frames value =
+      match frames with
+      | [] -> value
+      | `Unary op :: rest -> finish rest (EUnop (op, value))
+      | `Right (op, left) :: rest -> descend ((`Left (op, value)) :: rest) left
+      | `Left (op, right) :: rest -> finish rest (EBinop (op, value, right))
+    in
+    descend [] value
   | EBalance address -> EBalance (expr env address)
-  | ECall (name, args) -> ECall (name, List.map (expr env) args)
-  | EArray values -> EArray (List.map (expr env) values)
-  | ETuple values -> ETuple (List.map (expr env) values)
+  | ECall (name, args) -> ECall (name, exprs env args)
+  | EArray values -> EArray (exprs env values)
+  | ETuple values -> ETuple (exprs env values)
   | EStoragePath (name, keys, path) ->
-    EStoragePath (name, List.map (expr env) keys, path)
+    EStoragePath (name, exprs env keys, path)
   | EIndexField (name, keys, field) ->
-    EIndexField (name, List.map (expr env) keys, field)
+    EIndexField (name, exprs env keys, field)
   | ETernary (cond, yes, no) ->
     ETernary (expr env cond, expr env yes, expr env no)
   | EUse value ->
     let next = add value.ux_bind env in
     EUse {
       value with
-      ux_caps = List.map (expr env) value.ux_caps;
+      ux_caps = exprs env value.ux_caps;
       ux_arg = expr env value.ux_arg;
       ux_body = expr next value.ux_body;
     }
   | value -> value
+
+and exprs env values = List.rev (List.rev_map (expr env) values)
 
 let rec block env body = fst (statements env body)
 
@@ -60,14 +73,14 @@ and statement env = function
   | SAssign (name, value) -> SAssign (name, expr env value), env
   | SFieldSet (name, value) -> SFieldSet (name, expr env value), env
   | SIndexSet (name, keys, value) ->
-    SIndexSet (name, List.map (expr env) keys, expr env value), env
+    SIndexSet (name, exprs env keys, expr env value), env
   | SIndexUpdate (name, keys, op, value) ->
-    SIndexUpdate (name, List.map (expr env) keys, op, expr env value), env
+    SIndexUpdate (name, exprs env keys, op, expr env value), env
   | SReturn value -> SReturn (Option.map (expr env) value), env
   | SAssert value -> SAssert (expr env value), env
   | SRequire (cond, message) ->
     SRequire (expr env cond, expr env message), env
-  | SEmit (name, values) -> SEmit (name, List.map (expr env) values), env
+  | SEmit (name, values) -> SEmit (name, exprs env values), env
   | SIf (cond, yes, no) ->
     SIf (expr env cond, block env yes, Option.map (block env) no), env
   | SWhile (cond, body) -> SWhile (expr env cond, block env body), env
@@ -76,22 +89,22 @@ and statement env = function
   | SForEach (name, field, body) ->
     SForEach (name, field, block (add name env) body), env
   | SFieldCall (field, name, args) ->
-    SFieldCall (field, name, List.map (expr env) args), env
+    SFieldCall (field, name, exprs env args), env
   | SStoragePathSet (name, keys, path, value) ->
     SStoragePathSet
-      (name, List.map (expr env) keys, path, expr env value), env
+      (name, exprs env keys, path, expr env value), env
   | SStoragePathUpdate (name, keys, path, op, value) ->
     SStoragePathUpdate
-      (name, List.map (expr env) keys, path, op, expr env value), env
+      (name, exprs env keys, path, op, expr env value), env
   | SIndexFieldSet (name, keys, field, value) ->
     SIndexFieldSet
-      (name, List.map (expr env) keys, field, expr env value), env
+      (name, exprs env keys, field, expr env value), env
   | SMatch (value, arms) ->
     let arm (name, variant, body) = name, variant, block env body in
     SMatch (expr env value, List.map arm arms), env
   | SExpr value -> SExpr (expr env value), env
   | SRevertError (name, values) ->
-    SRevertError (name, List.map (expr env) values), env
+    SRevertError (name, exprs env values), env
 
 and statements env = function
   | [] -> [], env

@@ -23,6 +23,7 @@ type ready_payload = {
   consensus_pubkey_b64 : string;
   head_epoch : int64;
   state_root : string;
+  head_proposal_id : string option;
   chain_id : string option;
   binary_hash : string option;
   config_hash : string option;
@@ -668,6 +669,7 @@ let ready_payload_of_message = function
                     consensus_pubkey_b64;
                     head_epoch;
                     state_root;
+                    head_proposal_id = optional_hash fields "head_proposal_id";
                     chain_id = optional_string fields "chain_id";
                     binary_hash = optional_hash fields "binary_hash";
                     config_hash = optional_hash fields "config_hash";

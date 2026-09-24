@@ -43,7 +43,18 @@
 (test
  (name test_rule_graph)
  (modules test_rule_graph)
- (libraries octra_core))
+ (libraries octra_core)
+ (action (run %{test} %{dep:../README.md})))
+
+(test
+ (name test_ready_ref)
+ (modules test_ready_ref)
+ (libraries octra_core octra_node_runtime lwt.unix zarith))
+
+(rule
+ (alias runtest)
+ (deps test_rule_start.py)
+ (action (run python3 %{dep:test_rule_start.py} %{exe:../bin/octra_node.exe})))
 
 (test
  (name test_account_pack)
@@ -51,10 +62,52 @@
  (libraries octra_core base64 zarith lwt.unix unix))
 
 (test
+ (name test_fhe_audit)
+ (modules test_fhe_audit)
+ (libraries octra_core lwt.unix unix zarith yojson digestif octra_test_workspace)
+ (action (run %{test} %{exe:../bin/fhe_audit.exe})))
+
+(test
+ (name test_cipher_load)
+ (modules test_cipher_load)
+ (libraries octra_core lwt.unix base64 zarith yojson octra_test_workspace))
+
+(test
+ (name test_history_total)
+ (modules test_history_total)
+ (libraries octra_core base64 zarith yojson unix octra_test_workspace))
+
+(test
+ (name test_claim_history)
+ (modules test_claim_history)
+ (libraries octra_core octra_bootstrap octra_consensus pvac_ffi base64 zarith yojson digestif lwt.unix
+  mirage-crypto-ec octra_test_workspace)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{exe:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
+
+(test
+ (name test_claim_limits)
+ (modules test_claim_limits)
+ (libraries octra_core lwt.unix zarith yojson octra_test_workspace))
+
+(test
  (name test_validator_lifecycle)
  (modules test_validator_lifecycle)
  (libraries octra_core zarith base64 yojson lwt.unix unix
   mirage-crypto-ec mirage-crypto-rng.unix))
+
+(test
+ (name test_exit_replay)
+ (modules test_exit_replay exit_case exit_service exit_snapshot exit_operator)
+ (deps ../bin/bft_control_tx.exe exit_client.py python_check.py
+  ../controls/enroll.sh (source_tree ../controls/lib))
+ (action (progn
+  (run python3 %{dep:python_check.py})
+  (run %{test})))
+ (libraries octra_core octra_consensus octra_node_runtime octra_net octra_bootstrap
+  octra_test_workspace zarith base64 yojson lwt.unix unix mirage-crypto-ec
+  cohttp-lwt-unix digestif))
 
 (test
  (name test_lock_rule)
@@ -71,6 +124,12 @@
  (modules test_epoch_exec_reward_atomic)
  (libraries octra_core octra_consensus octra_net octra_node_runtime
   base64 yojson zarith lwt.unix))
+
+(test
+ (name test_private_ledger)
+ (modules test_private_ledger)
+ (deps ../bin/octra_pvac_worker.exe)
+ (libraries octra_core zarith lwt lwt.unix unix))
 
 (test
  (name test_private_transition_receipt)
@@ -140,6 +199,26 @@
  (libraries octra_core octra_vm digestif zarith base64 pvac_ffi lwt.unix unix))
 
 (test
+ (name test_byte_modes)
+ (modules test_byte_modes)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_json_tree)
+ (modules test_json_tree)
+ (libraries octra_core yojson unix))
+
+(test
+ (name test_vm_transition)
+ (modules test_vm_transition)
+ (libraries octra_node_runtime octra_core octra_vm zarith base64 lwt.unix unix))
+
+(test
+ (name test_program_abi)
+ (modules test_program_abi)
+ (libraries octra_vm yojson))
+
+(test
  (name test_prior)
  (modules test_prior)
  (deps (glob_files ../lib/vm/compiler/prior/*.ml))
@@ -164,6 +243,18 @@
  (name test_state_sync_manifest)
  (modules test_state_sync_manifest)
  (libraries octra_bootstrap octra_core octra_consensus unix base64 digestif digestif.c mirage-crypto-ec))
+
+(test
+ (name test_state_sync_client)
+ (modules test_state_sync_client)
+ (libraries octra_bootstrap octra_node_runtime octra_core octra_consensus octra_net
+  lwt.unix cohttp-lwt-unix uri base64 digestif digestif.c mirage-crypto-ec))
+
+(test
+ (name test_sync_chain)
+ (modules test_sync_chain)
+ (libraries octra_node_runtime octra_bootstrap octra_core octra_consensus
+  octra_net octra_test_workspace lwt.unix base64 zarith digestif mirage-crypto-ec))
 
 (test
  (name test_grpc)
@@ -308,6 +399,52 @@
  (name test_set_actor)
  (modules test_set_actor)
  (libraries octra_node_runtime octra_core octra_consensus lwt.unix zarith))
+
+(test
+ (name test_set_post)
+ (modules test_set_post)
+ (libraries octra_node_runtime octra_core octra_consensus lwt.unix zarith))
+
+(test
+ (name test_proposal_relay)
+ (modules test_proposal_relay)
+ (libraries octra_consensus lwt.unix))
+
+(test
+ (name test_epoch_time)
+ (modules test_epoch_time)
+ (libraries octra_consensus))
+
+(test
+ (name test_exit_status)
+ (modules test_exit_status)
+ (libraries octra_node_runtime octra_core base64 zarith lwt.unix))
+
+(test
+ (name test_validator_control)
+ (modules test_validator_control)
+ (libraries octra_core octra_node_runtime octra_test_workspace
+  lwt.unix unix base64 yojson zarith mirage-crypto-ec))
+
+(test
+ (name test_resource_compute_provider_engine)
+ (modules test_resource_compute_provider_engine)
+ (libraries octra_node_runtime base64 digestif digestif.c))
+
+(test
+ (name test_resource_path)
+ (modules test_resource_path)
+ (libraries octra_consensus))
+
+(test
+ (name test_resource_attestations_model)
+ (modules test_resource_attestations_model)
+ (libraries octra_consensus mirage-crypto-ec))
+
+(test
+ (name test_resource_compute_service)
+ (modules test_resource_compute_service)
+ (libraries octra_node_runtime octra_core octra_consensus octra_net lwt.unix base64 digestif digestif.c mirage-crypto-ec mirage-crypto-rng.unix))
 
 (test
  (name test_rest_admit)

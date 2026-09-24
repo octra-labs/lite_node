@@ -794,23 +794,32 @@ let rec typ_of_expr env = function
     (match find_state env name with
      | Some sf -> map_value_type sf.sf_typ
      | None -> gerr env.line (Printf.sprintf "undefined field: %s" name))
-  | EBinop (op, a, b) ->
-    (match op with
-     | Add ->
-       let ta = typ_of_expr env a in
-       let tb = typ_of_expr env b in
-       if ta = TString || tb = TString || ta = TAddress || tb = TAddress then TString
-       else if ta = TU256 || tb = TU256 then TU256
-       else if ta = TU128 || tb = TU128 then TU128
-       else if ta = TU64 || tb = TU64 then TU64
-       else TInt
-     | Sub | Mul | Div | Mod ->
-       let ta = typ_of_expr env a and tb = typ_of_expr env b in
-       if ta = TU256 || tb = TU256 then TU256
-       else if ta = TU128 || tb = TU128 then TU128
-       else if ta = TU64 || tb = TU64 then TU64
-       else TInt
-     | Eq | Neq | Lt | Gt | Le | Ge | And | Or -> TBool)
+  | EBinop _ as value ->
+    let merge op ta tb =
+      if op = Add && (ta = TString || tb = TString || ta = TAddress || tb = TAddress)
+      then TString
+      else if ta = TU256 || tb = TU256 then TU256
+      else if ta = TU128 || tb = TU128 then TU128
+      else if ta = TU64 || tb = TU64 then TU64
+      else TInt
+    in
+    let rec descend frames = function
+      | EBinop (Add, left, right) ->
+        descend ((`Left right) :: frames) left
+      | EBinop ((Sub | Mul | Div | Mod as op), left, right) ->
+        descend ((`Right (op, left)) :: frames) right
+      | EBinop ((Eq | Neq | Lt | Gt | Le | Ge | And | Or), _, _) ->
+        finish frames TBool
+      | value -> finish frames (typ_of_expr env value)
+    and finish frames typ =
+      match frames with
+      | [] -> typ
+      | `Left right :: rest -> descend ((`Add typ) :: rest) right
+      | `Right (op, left) :: rest -> descend ((`Op (op, typ)) :: rest) left
+      | `Add ta :: rest -> finish rest (merge Add ta typ)
+      | `Op (op, tb) :: rest -> finish rest (merge op typ tb)
+    in
+    descend [] value
   | EUnop (Neg, _) -> TInt
   | EUnop (Not, _) -> TBool
   | ECall (name, call_args) ->
@@ -1979,10 +1988,36 @@ and gen_expr env expr =
     emit env (Contract_vm.MOV (result, rt));
     emit env (Contract_vm.JDEST end_label);
     result
-  | EBinop (And, l, r_expr) -> gen_short_circuit_and env l r_expr
-  | EBinop (Or, l, r_expr) -> gen_short_circuit_or env l r_expr
+  | EBinop _ as value ->
+    let rec collect ops = function
+      | EBinop (_, left, _) as value -> collect (value :: ops) left
+      | value ->
+        List.fold_left (fun r value -> gen_binary env value r)
+          (gen_expr env value) ops
+    in
+    collect [] value
+  | EUnop _ as value ->
+    let rec collect ops = function
+      | EUnop (op, value) -> collect (op :: ops) value
+      | value ->
+        List.fold_left (fun r op ->
+          let rd = alloc_reg env in
+          (match op with
+           | Neg -> emit env (Contract_vm.NEG (rd, r))
+           | Not ->
+             emit env (Contract_vm.LDI (rd, VBool true));
+             emit env (Contract_vm.NEQ (rd, r, rd)));
+          rd) (gen_expr env value) ops
+    in
+    collect [] value
+
+  | EAction _ | EUse _ -> gerr env.line "direct form expression is unavailable"
+
+and gen_binary env value rl =
+  match value with
+  | EBinop (And, _, right) -> gen_short_circuit_and env rl right
+  | EBinop (Or, _, right) -> gen_short_circuit_or env rl right
   | EBinop (op, l, r_expr) as whole ->
-    let rl = gen_expr env l in
     let rr = gen_expr env r_expr in
     let rd = alloc_reg env in
     (match op with
@@ -2014,19 +2049,9 @@ and gen_expr env expr =
      | And | Or -> assert false);
     emit_result_type_check env rd (typ_of_expr env whole);
     rd
-  | EUnop (Neg, e) ->
-    let r = gen_expr env e in
-    let rd = alloc_reg env in
-    emit env (Contract_vm.NEG (rd, r)); rd
-  | EUnop (Not, e) ->
-    let r = gen_expr env e in
-    let rd = alloc_reg env in
-    emit env (Contract_vm.LDI (rd, VBool true));
-    emit env (Contract_vm.NEQ (rd, r, rd)); rd
-  | EAction _ | EUse _ -> gerr env.line "direct form expression is unavailable"
+  | _ -> assert false
 
-and gen_short_circuit_and env l r_expr =
-  let rl = gen_expr env l in
+and gen_short_circuit_and env rl r_expr =
   let result = alloc_reg env in
   let false_label = alloc_label env in
   let end_label = alloc_label env in
@@ -2041,8 +2066,7 @@ and gen_short_circuit_and env l r_expr =
   emit env (Contract_vm.JDEST end_label);
   result
 
-and gen_short_circuit_or env l r_expr =
-  let rl = gen_expr env l in
+and gen_short_circuit_or env rl r_expr =
   let result = alloc_reg env in
   let true_label = alloc_label env in
   let end_label = alloc_label env in

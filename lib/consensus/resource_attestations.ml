@@ -249,38 +249,40 @@ let select_committee ~size attestations =
   |> take size
 
 let sum_weight (attestations : attestation list) =
-  List.fold_left Int64.add 0L (List.map (fun attestation -> attestation.weight) attestations)
+  List.fold_left (fun total (attestation : attestation) ->
+    Z.add total (Z.of_int64 attestation.weight)) Z.zero attestations
 
 let quorum_weight total_weight =
   let open Z in
-  to_int64 (((of_int64 total_weight * of_int 2) / of_int 3) + one)
+  ((total_weight * of_int 2) / of_int 3) + one
 
 let qc_intersection_floor ~total_weight ~left_weight ~right_weight =
   let open Z in
-  let overlap = of_int64 left_weight + of_int64 right_weight - of_int64 total_weight in
-  if overlap <= zero then 0L else to_int64 overlap
+  max zero (left_weight + right_weight - total_weight)
 
 let conflicting_qc_impossible ~total_weight ~byzantine_weight =
   let quorum = quorum_weight total_weight in
-  qc_intersection_floor ~total_weight ~left_weight:quorum ~right_weight:quorum > byzantine_weight
+  Z.gt (qc_intersection_floor ~total_weight ~left_weight:quorum ~right_weight:quorum)
+    byzantine_weight
 
 let add_amount node_id amount rewards =
   let previous =
     match NodeMap.find_opt node_id rewards with
     | Some amount -> amount
-    | None -> 0L
+    | None -> Z.zero
   in
-  NodeMap.add node_id (Int64.add previous amount) rewards
+  NodeMap.add node_id (Z.add previous amount) rewards
 
 let proportional_amount budget total_weight weight =
   let open Z in
-  to_int64 ((of_int64 budget * of_int64 weight) / of_int64 total_weight)
+  (budget * of_int64 weight) / total_weight
 
 let distribute_resource_rewards ~budget (attestations : attestation list) =
   let attestations = List.filter is_well_formed attestations in
   let total_weight = sum_weight attestations in
-  if budget <= 0L || total_weight <= 0L then []
+  if budget <= 0L || Z.sign total_weight <= 0 then []
   else
+    let budget = Z.of_int64 budget in
     let rewards =
       List.fold_left
         (fun rewards (attestation : attestation) ->
@@ -288,18 +290,18 @@ let distribute_resource_rewards ~budget (attestations : attestation list) =
         NodeMap.empty
         attestations
     in
-    let spent = NodeMap.fold (fun _ amount total -> Int64.add amount total) rewards 0L in
-    let remainder = Int64.sub budget spent in
+    let spent = NodeMap.fold (fun _ amount total -> Z.add amount total) rewards Z.zero in
+    let remainder = Z.sub budget spent in
     let rec add_remainder left rewards (attestations : attestation list) =
       match left, attestations with
-      | left, _ when left <= 0L -> rewards
+      | left, _ when Z.sign left <= 0 -> rewards
       | _, [] -> rewards
       | left, attestation :: rest ->
-          add_remainder (Int64.sub left 1L) (add_amount attestation.node_id 1L rewards) rest
+          add_remainder (Z.pred left) (add_amount attestation.node_id Z.one rewards) rest
     in
     add_remainder remainder rewards (List.sort compare_attestation attestations)
     |> NodeMap.bindings
-    |> List.map (fun (node_id, amount) -> { node_id; amount })
+    |> List.map (fun (node_id, amount) -> { node_id; amount = Z.to_int64 amount })
 
 let encode_attestation attestation =
   Octra_net.Oce1.encode (fun buf ->
@@ -371,8 +373,18 @@ let pow_attempt_hash ~challenge attestation ~nonce =
     Octra_net.Oce1.put_u64 buf attestation.weight;
     Octra_net.Oce1.put_string buf nonce)
 
-let verify_pow_attestation ~challenge ~difficulty_bits attestation ~nonce =
-  attestation.kind = PoW
+let assigned ~commitment ~max_weight (attestation : attestation) =
+  commitment <> ""
+  && attestation.commitment = commitment
+  && max_weight > 0L
+  && attestation.weight > 0L
+  && attestation.weight <= max_weight
+
+let verify_pow_attestation ~challenge ~commitment ~max_weight
+    ~difficulty_bits attestation ~nonce =
+  assigned ~commitment ~max_weight attestation
+  && String.length challenge = 32
+  && attestation.kind = PoW
   && difficulty_bits >= 0
   && difficulty_bits <= 256
   && attestation.proof_hash = pow_proof_hash ~nonce
@@ -385,6 +397,21 @@ let storage_parent_hash left right =
   Octra_net.Hash_domain.hash_encoded "octra:storage_merkle_parent:v1" (fun buf ->
     Octra_net.Oce1.put_hash32 buf left;
     Octra_net.Oce1.put_hash32 buf right)
+
+let storage_path evidence =
+  let rec walk index count = function
+    | [] -> index = 0L && count = 1L
+    | step :: rest ->
+        count > 1L
+        && String.length step.sibling_hash = 32
+        && (step.side = Left) = (Int64.rem index 2L = 1L)
+        && walk (Int64.div index 2L)
+             (Int64.add (Int64.div count 2L) (Int64.rem count 2L)) rest
+  in
+  evidence.leaf_count > 0L
+  && evidence.leaf_index >= 0L
+  && evidence.leaf_index < evidence.leaf_count
+  && walk evidence.leaf_index evidence.leaf_count evidence.path
 
 let merkle_root_from_evidence evidence =
   let leaf = storage_leaf_hash evidence.chunk in
@@ -419,7 +446,7 @@ let u64_prefix digest =
   !value
 
 let storage_challenge_index ~challenge ~leaf_count attestation =
-  if leaf_count <= 0L then None
+  if leaf_count <= 0L || String.length challenge <> 32 then None
   else
     let digest =
       Octra_net.Hash_domain.hash_encoded "octra:storage_attestation_index:v1" (fun buf ->
@@ -431,14 +458,16 @@ let storage_challenge_index ~challenge ~leaf_count attestation =
     in
     Some (Int64.rem (Int64.abs (u64_prefix digest)) leaf_count)
 
-let verify_storage_attestation ~challenge attestation evidence =
-  match storage_challenge_index ~challenge ~leaf_count:evidence.leaf_count attestation with
+let verify_storage_attestation ~challenge ~commitment ~max_weight
+    ~leaf_count attestation evidence =
+  assigned ~commitment ~max_weight attestation
+  && evidence.leaf_count = leaf_count
+  && match storage_challenge_index ~challenge ~leaf_count attestation with
   | None -> false
   | Some expected_index ->
       attestation.kind = PoStorage
       && String.length attestation.commitment = 32
-      && evidence.leaf_index >= 0L
-      && evidence.leaf_index < evidence.leaf_count
+      && storage_path evidence
       && evidence.leaf_index = expected_index
       && attestation.proof_hash = storage_evidence_hash evidence
       && merkle_root_from_evidence evidence = attestation.commitment
@@ -471,8 +500,11 @@ let encode_useful_hash_chain_evidence evidence =
 let useful_hash_chain_evidence_hash evidence =
   proof_payload_hash (encode_useful_hash_chain_evidence evidence)
 
-let verify_useful_hash_chain_attestation ~challenge ~min_iterations ~max_iterations attestation evidence =
-  if evidence.iterations < min_iterations || evidence.iterations > max_iterations then
+let verify_useful_hash_chain_attestation ~challenge ~commitment ~max_weight
+    ~min_iterations ~max_iterations attestation evidence =
+  if not (assigned ~commitment ~max_weight attestation)
+     || String.length challenge <> 32 || min_iterations < 1
+     || evidence.iterations < min_iterations || evidence.iterations > max_iterations then
     false
   else
     match useful_hash_chain_result ~input:evidence.input ~iterations:evidence.iterations with
@@ -520,12 +552,17 @@ let pvac_kat_resource_hash evidence =
 let pvac_kat_evidence_hash evidence =
   proof_payload_hash (encode_pvac_kat_evidence evidence)
 
-let verify_pvac_kat_attestation ~challenge attestation (evidence : pvac_kat_evidence) =
-  attestation.kind = PoUW
+let verify_pvac_kat_attestation ~challenge ~commitment ~max_weight
+    ~output_hash attestation (evidence : pvac_kat_evidence) =
+  assigned ~commitment ~max_weight attestation
+  && nonempty_hash32 challenge
+  && nonempty_hash32 output_hash
+  && attestation.kind = PoUW
   && nonempty_hash32 evidence.pubkey_hash
   && nonempty_hash32 evidence.kat_input_hash
   && attestation_weight_fits_resource attestation evidence.work_units
-  && pvac_kat_output_hash evidence = evidence.expected_output_hash
+  && evidence.expected_output_hash = output_hash
+  && pvac_kat_output_hash evidence = output_hash
   && attestation.commitment =
      useful_plugin_task_id
        ~challenge
@@ -565,15 +602,19 @@ let fhe_receipt_resource_hash (evidence : fhe_receipt_evidence) =
     Octra_net.Oce1.put_hash32 buf evidence.input_hash;
     Octra_net.Oce1.put_hash32 buf evidence.output_hash)
 
-let verify_fhe_receipt_attestation ~challenge attestation (evidence : fhe_receipt_evidence) =
-  attestation.kind = PoUW
+let verify_fhe_receipt_attestation ~challenge ~commitment ~max_weight
+    ~verifier_pubkey attestation (evidence : fhe_receipt_evidence) =
+  assigned ~commitment ~max_weight attestation
+  && nonempty_hash32 challenge
+  && attestation.kind = PoUW
   && nonempty_hash32 evidence.input_hash
   && nonempty_hash32 evidence.output_hash
   && String.length evidence.verifier_pubkey = 32
+  && evidence.verifier_pubkey = verifier_pubkey
   && String.length evidence.receipt_signature = 64
   && attestation_weight_fits_resource attestation evidence.cost_units
   && C_hash.verify_ed25519
-       ~pubkey_raw:evidence.verifier_pubkey
+       ~pubkey_raw:verifier_pubkey
        ~msg:(fhe_receipt_sign_bytes evidence)
        ~signature:evidence.receipt_signature
   && attestation.commitment =
@@ -603,14 +644,18 @@ let circle_asset_resource_hash (evidence : circle_asset_evidence) =
 let circle_asset_evidence_hash (evidence : circle_asset_evidence) =
   proof_payload_hash (encode_circle_asset_evidence evidence)
 
-let verify_circle_asset_attestation ~challenge attestation (evidence : circle_asset_evidence) =
-  match storage_challenge_index ~challenge ~leaf_count:evidence.storage.leaf_count attestation with
+let verify_circle_asset_attestation ~challenge ~commitment ~max_weight
+    ~leaf_count attestation (evidence : circle_asset_evidence) =
+  assigned ~commitment ~max_weight attestation
+  && evidence.storage.leaf_count = leaf_count
+  && match storage_challenge_index ~challenge ~leaf_count attestation with
   | None -> false
   | Some expected_index ->
       attestation.kind = PoUW
       && evidence.circle_id <> ""
       && evidence.resource_path <> ""
       && evidence.byte_count > 0L
+      && storage_path evidence.storage
       && evidence.storage.leaf_index = expected_index
       && evidence.asset_root = merkle_root_from_evidence evidence.storage
       && attestation_weight_fits_resource attestation evidence.byte_count
@@ -643,14 +688,18 @@ let snapshot_availability_resource_hash (evidence : snapshot_availability_eviden
 let snapshot_availability_evidence_hash (evidence : snapshot_availability_evidence) =
   proof_payload_hash (encode_snapshot_availability_evidence evidence)
 
-let verify_snapshot_availability_attestation ~challenge attestation (evidence : snapshot_availability_evidence) =
-  match storage_challenge_index ~challenge ~leaf_count:evidence.storage.leaf_count attestation with
+let verify_snapshot_availability_attestation ~challenge ~commitment ~max_weight
+    ~leaf_count attestation (evidence : snapshot_availability_evidence) =
+  assigned ~commitment ~max_weight attestation
+  && evidence.storage.leaf_count = leaf_count
+  && match storage_challenge_index ~challenge ~leaf_count attestation with
   | None -> false
   | Some expected_index ->
       attestation.kind = PoUW
       && nonempty_hash32 evidence.state_root
       && evidence.range_start <= evidence.range_end
       && evidence.byte_count > 0L
+      && storage_path evidence.storage
       && evidence.storage.leaf_index = expected_index
       && evidence.snapshot_root = merkle_root_from_evidence evidence.storage
       && attestation_weight_fits_resource attestation evidence.byte_count
@@ -685,8 +734,11 @@ let encode_deterministic_trace_evidence (evidence : deterministic_trace_evidence
 let deterministic_trace_evidence_hash (evidence : deterministic_trace_evidence) =
   proof_payload_hash (encode_deterministic_trace_evidence evidence)
 
-let verify_deterministic_trace_attestation ~challenge attestation (evidence : deterministic_trace_evidence) =
-  match storage_challenge_index ~challenge ~leaf_count:evidence.sampled_step.leaf_count attestation with
+let verify_deterministic_trace_attestation ~challenge ~commitment ~max_weight
+    ~leaf_count attestation (evidence : deterministic_trace_evidence) =
+  assigned ~commitment ~max_weight attestation
+  && evidence.sampled_step.leaf_count = leaf_count
+  && match storage_challenge_index ~challenge ~leaf_count attestation with
   | None -> false
   | Some expected_index ->
       attestation.kind = PoUW
@@ -695,6 +747,7 @@ let verify_deterministic_trace_attestation ~challenge attestation (evidence : de
       && nonempty_hash32 evidence.input_hash
       && nonempty_hash32 evidence.output_hash
       && evidence.step_limit > 0L
+      && storage_path evidence.sampled_step
       && evidence.sampled_step.leaf_index = expected_index
       && evidence.trace_root = merkle_root_from_evidence evidence.sampled_step
       && attestation_weight_fits_resource attestation evidence.step_limit
@@ -807,8 +860,12 @@ let encode_perturbed_matrix_trace_evidence (evidence : perturbed_matrix_trace_ev
 let perturbed_matrix_trace_evidence_hash (evidence : perturbed_matrix_trace_evidence) =
   proof_payload_hash (encode_perturbed_matrix_trace_evidence evidence)
 
-let verify_perturbed_matrix_trace_attestation ~challenge attestation (evidence : perturbed_matrix_trace_evidence) =
-  match storage_challenge_index ~challenge ~leaf_count:evidence.sampled_tile.leaf_count attestation with
+let verify_perturbed_matrix_trace_attestation ~challenge ~commitment ~max_weight
+    ~leaf_count ~difficulty_bits attestation (evidence : perturbed_matrix_trace_evidence) =
+  assigned ~commitment ~max_weight attestation
+  && evidence.sampled_tile.leaf_count = leaf_count
+  && evidence.difficulty_bits = difficulty_bits
+  && match storage_challenge_index ~challenge ~leaf_count attestation with
   | None -> false
   | Some expected_index ->
       attestation.kind = PoUW
@@ -823,6 +880,7 @@ let verify_perturbed_matrix_trace_attestation ~challenge attestation (evidence :
       && evidence.tile_depth = int64_of_list_length evidence.perturbed_left_values
       && evidence.difficulty_bits >= 0
       && evidence.difficulty_bits <= 256
+      && storage_path evidence.sampled_tile
       && evidence.sampled_tile.leaf_index = expected_index
       && evidence.sampled_tile.chunk = perturbed_matrix_cell_chunk ~challenge evidence
       && evidence.tile_trace_root = merkle_root_from_evidence evidence.sampled_tile

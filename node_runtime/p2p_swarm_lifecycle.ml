@@ -77,6 +77,8 @@ let dispatch_tx_deps
   }
 
 let handle_frame_with_transport
+    ?duty_head
+    ?bft_mode
     ~observer
     ~peer_id
     ~(tx : tx_callbacks)
@@ -85,6 +87,8 @@ let handle_frame_with_transport
     ~on_resource_compute
     frame =
   P2p_swarm_dispatch.handle_frame
+    ?duty_head
+    ?bft_mode
     {
       observer;
       peer_id;
@@ -94,8 +98,10 @@ let handle_frame_with_transport
     }
     frame
 
-let handle_frame (deps : deps) swarm conn frame =
+let handle_frame ?duty_head ?bft_mode (deps : deps) swarm conn frame =
   handle_frame_with_transport
+    ?duty_head
+    ?bft_mode
     ~observer:deps.observer
     ~peer_id:conn.Octra_net.P2p_conn.peer_id
     ~tx:deps.tx
@@ -105,8 +111,8 @@ let handle_frame (deps : deps) swarm conn frame =
     frame;
   Lwt.return_unit
 
-let start deps swarm =
-  Octra_net.P2p_swarm.start swarm ~on_message:(handle_frame deps swarm)
+let start ?duty_head ?bft_mode deps swarm =
+  Octra_net.P2p_swarm.start swarm ~on_message:(handle_frame ?duty_head ?bft_mode deps swarm)
 
 let node_tx_callbacks (deps : node_deps) =
   {
@@ -147,5 +153,5 @@ let node_lifecycle_deps (deps : node_deps) =
     on_resource_compute = forward_resource_compute deps.resource_compute;
   }
 
-let node_task ~swarm deps =
-  Option.map (start (node_lifecycle_deps deps)) swarm
+let node_task ?duty_head ?bft_mode ~swarm deps =
+  Option.map (start ?duty_head ?bft_mode (node_lifecycle_deps deps)) swarm

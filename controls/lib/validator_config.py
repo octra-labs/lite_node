@@ -114,7 +114,7 @@ def require_runtime_files():
     ]
     missing = [str(path) for path in files if not path.is_file()]
     if missing:
-        raise ValidatorError("candidate files are missing: " + ",".join(missing))
+        raise ValidatorError("runtime files are missing: " + ",".join(missing))
 
 def require_network_binding(values, config):
     expected = values.get("OCTRA_OPERATOR_NETWORK_SHA256", "")
@@ -123,19 +123,21 @@ def require_network_binding(values, config):
     if not expected:
         raise ValidatorError("network hash is missing from node config")
     for path in (packaged, installed):
-        if not path.is_file() or sha256_file(path) != expected:
-            raise ValidatorError(f"candidate network bundle mismatch: {path}")
+        if not path.is_file():
+            raise ValidatorError(f"network bundle is missing: {path}")
+        if sha256_file(path) != expected:
+            raise ValidatorError(f"network bundle hash mismatch: {path}")
 
 def require_runtime_binding(config):
     values = parse_env(config)
     require_runtime_files()
     require_network_binding(values, config)
     expected = runtime_binding(config)
-    stale = [key for key, value in expected.items() if values.get(key) != value]
-    if stale:
+    mismatched = [key for key, value in expected.items() if values.get(key) != value]
+    if mismatched:
         raise ValidatorError(
-            "candidate paths are stale; run controls/run.sh --rebind-runtime: "
-            + ",".join(stale)
+            "runtime binding mismatch; run controls/run.sh --rebind-runtime: "
+            + ",".join(mismatched)
         )
 
 def rebind_runtime(config):
@@ -150,7 +152,7 @@ def adopt_network(config, network, expected_hash):
     values = parse_env(config)
     bundle, bundle_hash, network_values = load_network(network, expected_hash)
     if values.get("OCTRA_CHAIN_ID") != network_values["OCTRA_CHAIN_ID"]:
-        raise ValidatorError("candidate network chain mismatch")
+        raise ValidatorError("network chain mismatch")
     installed = Path(config).expanduser().resolve().parent / "network.env"
     copy_private(bundle, installed)
     updated = {
@@ -386,7 +388,7 @@ def bind_build_toolchains(environment, switch):
 def switch_exists(switch, listed):
     return switch in listed or (Path(switch) / "_opam").is_dir()
 
-def build_candidate():
+def build_node():
     if sys.platform != "linux" or os.uname().machine not in {"amd64", "x86_64", "aarch64", "arm64"}:
         raise ValidatorError("source build requires a supported Linux architecture")
     locked = ROOT / "octra_node.opam.locked"
@@ -571,7 +573,7 @@ def create_identity(data_dir, role):
     emit(event="next", command="configure_node")
 
 def load_verified_snapshot(stage, values):
-    candidates = []
+    verified = []
     for marker in sorted((Path(stage) / "snapshots").glob("*/snapshot_verified.json")):
         try:
             payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -589,10 +591,10 @@ def load_verified_snapshot(stage, values):
         data = marker.parent / "data"
         if not state_ready(data):
             continue
-        candidates.append((epoch, payload["manifest_hash"], marker.parent))
-    if not candidates:
+        verified.append((epoch, payload["manifest_hash"], marker.parent))
+    if not verified:
         raise ValidatorError("state sync completed without a verified snapshot")
-    return max(candidates)[2]
+    return max(verified)[2]
 
 def resolve_sync_stage(value, data_dir):
     target = Path(data_dir).expanduser().resolve()
@@ -838,7 +840,7 @@ def main():
     if sum(bool(mode) for mode in modes) > 1:
         raise ValidatorError("command modes are mutually exclusive")
     if args.build_only:
-        build_candidate()
+        build_node()
         emit(event="source_build", status="ready")
         return
     if args.check_runtime:
@@ -894,14 +896,15 @@ def main():
         raise ValidatorError("network bundle path is required")
     expected_hash = resolve_digest(args, network)
     bundle, bundle_hash, values = load_network(network, expected_hash)
+    source = source_commit() or ""
     binary = Path(args.binary).resolve()
     build = args.build
     if not binary.is_file() and not args.yes and not build:
-        build = ask_bool("Build candidate from source", True)
+        build = ask_bool("Build node from source", True)
     if build:
-        build_candidate()
+        build_node()
     if not binary.is_file():
-        raise ValidatorError(f"node candidate is missing: {binary}")
+        raise ValidatorError(f"node binary is missing: {binary}")
     worker = Path(args.worker).resolve()
     if not worker.is_file():
         raise ValidatorError(f"PVAC worker is missing: {worker}")
@@ -957,6 +960,7 @@ def main():
         "OCTRA_LOG_COLOR": "never",
         "OCTRA_LOG_LEVEL": "info",
         "OCTRA_BINARY_HASH": binary_hash,
+        "OCTRA_SOURCE_COMMIT": source,
         "OCTRA_OPERATOR_BINARY": str(binary),
         "OCTRA_OPERATOR_CONFIG": str(Path(args.config).resolve()),
         "OCTRA_OPERATOR_CONTROL_BINARY": str(control_binary),
@@ -981,7 +985,7 @@ def main():
     write_env(args.config, {**values, **local})
     emit(event="configured", role=role, address=wallet["address"])
     emit(event="identity", pubkey=wallet["pub"], endpoint=advertise)
-    emit(event="candidate", sha256=binary_hash)
+    emit(event = "node_binary", sha256 = binary_hash)
     emit(event="pvac_worker", sha256=worker_hash)
     emit(event="state_sync", sha256=sync_hash)
     emit(event="validator_control", sha256=control_hash)

@@ -16,3 +16,4 @@ runtime_data/
 *.wasm
 .DS_Store
 .lia.cache
+.nia.cache

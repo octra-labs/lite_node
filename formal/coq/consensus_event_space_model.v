@@ -138,16 +138,16 @@ Proof.
   exact conflict.
 Qed.
 
-Definition honest_intersection_lower_bound total quorum byzantine :=
+Definition honest_intersection_min total quorum byzantine :=
   quorum + quorum - total - byzantine.
 
 Theorem safe_quorums_have_honest_intersection :
   forall total quorum byzantine,
     total + byzantine < quorum + quorum ->
-    0 < honest_intersection_lower_bound total quorum byzantine.
+    0 < honest_intersection_min total quorum byzantine.
 Proof.
   intros total quorum byzantine safe.
-  unfold honest_intersection_lower_bound.
+  unfold honest_intersection_min.
   lia.
 Qed.
 
@@ -201,3 +201,82 @@ Proof.
   rewrite (adapted left right same_prefix).
   reflexivity.
 Qed.
+
+Section CommittedReplay.
+
+Context {Input State Output : Type}.
+Variable advance : State -> Input -> State.
+Variable observe : State -> Output.
+
+Definition replay_state initial history :=
+  fold_left advance history initial.
+
+Definition state_at count initial history :=
+  replay_state initial (firstn count history).
+
+Definition decision_at count initial history :=
+  observe (state_at count initial history).
+
+Theorem decision_uses_prefix :
+  forall count initial left right,
+    firstn count left = firstn count right ->
+    decision_at count initial left = decision_at count initial right.
+Proof.
+  intros count initial left right same_prefix.
+  unfold decision_at, state_at.
+  rewrite same_prefix.
+  reflexivity.
+Qed.
+
+Theorem future_preserves_decision :
+  forall initial history future,
+    decision_at (length history) initial (history ++ future) =
+    observe (replay_state initial history).
+Proof.
+  intros initial history future.
+  unfold decision_at, state_at.
+  rewrite firstn_app, firstn_all.
+  replace (length history - length history) with 0 by lia.
+  simpl.
+  rewrite app_nil_r.
+  reflexivity.
+Qed.
+
+Theorem replay_resumes :
+  forall initial history future,
+    replay_state initial (history ++ future) =
+    replay_state (replay_state initial history) future.
+Proof.
+  intros initial history future.
+  unfold replay_state.
+  apply fold_left_app.
+Qed.
+
+Theorem restore_preserves_future :
+  forall initial history restored future,
+    restored = replay_state initial history ->
+    replay_state restored future = replay_state initial (history ++ future).
+Proof.
+  intros initial history restored future same_state.
+  rewrite same_state, replay_resumes.
+  reflexivity.
+Qed.
+
+Theorem state_is_sufficient :
+  forall initial left right future,
+    replay_state initial left = replay_state initial right ->
+    observe (replay_state initial (left ++ future)) =
+    observe (replay_state initial (right ++ future)).
+Proof.
+  intros initial left right future same_state.
+  rewrite !replay_resumes, same_state.
+  reflexivity.
+Qed.
+
+End CommittedReplay.
+
+Print Assumptions decision_uses_prefix.
+Print Assumptions future_preserves_decision.
+Print Assumptions replay_resumes.
+Print Assumptions restore_preserves_future.
+Print Assumptions state_is_sufficient.

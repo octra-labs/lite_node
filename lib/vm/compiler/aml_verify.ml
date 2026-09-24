@@ -106,9 +106,20 @@ let rec expr_to_string = function
   | EString value -> Printf.sprintf "%S" value
   | EVar value -> value
   | EField value -> value
-  | EIndex (field, indexes) -> field ^ "[" ^ String.concat "," (List.map expr_to_string indexes) ^ "]"
-  | EBinop (op, left, right) -> expr_to_string left ^ " " ^ binop_to_string op ^ " " ^ expr_to_string right
-  | EUnop (op, value) -> unop_to_string op ^ expr_to_string value
+  | EIndex (field, indexes) -> field ^ "[" ^ String.concat "," (exprs_to_string indexes) ^ "]"
+  | (EBinop _ | EUnop _) as value ->
+    let out = Buffer.create 64 in
+    let rec emit = function
+      | [] -> Buffer.contents out
+      | `Text text :: rest -> Buffer.add_string out text; emit rest
+      | `Expr (EBinop (op, left, right)) :: rest ->
+        emit (`Expr left :: `Text (" " ^ binop_to_string op ^ " ") :: `Expr right :: rest)
+      | `Expr (EUnop (op, value)) :: rest ->
+        emit (`Text (unop_to_string op) :: `Expr value :: rest)
+      | `Expr value :: rest ->
+        Buffer.add_string out (expr_to_string value); emit rest
+    in
+    emit [`Expr value]
   | ECaller -> "caller"
   | EOrigin -> "origin"
   | ESelfAddr -> "self_addr"
@@ -119,14 +130,14 @@ let rec expr_to_string = function
   | ETreeHash -> "tree_hash"
   | ENodeId -> "node_id"
   | ETxHash -> "tx_hash"
-  | ECall (name, args) -> name ^ "(" ^ String.concat "," (List.map expr_to_string args) ^ ")"
-  | EArray values -> "[" ^ String.concat "," (List.map expr_to_string values) ^ "]"
-  | ETuple values -> "(" ^ String.concat "," (List.map expr_to_string values) ^ ")"
+  | ECall (name, args) -> name ^ "(" ^ String.concat "," (exprs_to_string args) ^ ")"
+  | EArray values -> "[" ^ String.concat "," (exprs_to_string values) ^ "]"
+  | ETuple values -> "(" ^ String.concat "," (exprs_to_string values) ^ ")"
   | EStoragePath (field, indexes, path) ->
-    field ^ "[" ^ String.concat "," (List.map expr_to_string indexes) ^ "]." ^ String.concat "." path
+    field ^ "[" ^ String.concat "," (exprs_to_string indexes) ^ "]." ^ String.concat "." path
   | EFieldProp (field, prop) -> field ^ "." ^ prop
   | EIndexField (field, indexes, prop) ->
-    field ^ "[" ^ String.concat "," (List.map expr_to_string indexes) ^ "]." ^ prop
+    field ^ "[" ^ String.concat "," (exprs_to_string indexes) ^ "]." ^ prop
   | EEnumVariant (enum_name, variant) -> enum_name ^ "." ^ variant
   | ETernary (cond, yes_value, no_value) ->
     expr_to_string cond ^ " ? " ^ expr_to_string yes_value ^ " : " ^ expr_to_string no_value
@@ -155,8 +166,10 @@ let rec expr_to_string = function
     "action[" ^ C_eff.atom_text atom ^ "](" ^ expr_to_string value ^ ")"
   | EUse use ->
     let args = use.ux_caps @ [use.ux_arg] in
-    "use " ^ use.ux_name ^ "(" ^ String.concat "," (List.map expr_to_string args)
+    "use " ^ use.ux_name ^ "(" ^ String.concat "," (exprs_to_string args)
     ^ ") in " ^ expr_to_string use.ux_body
+
+and exprs_to_string values = List.rev (List.rev_map expr_to_string values)
 
 let lowercase value =
   String.lowercase_ascii value

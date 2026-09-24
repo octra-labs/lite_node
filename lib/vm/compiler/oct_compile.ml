@@ -99,11 +99,15 @@ let flow_kind = function
   | Oct_lang.TTuple _
   | Oct_lang.TVoid -> Program_type_flow.Unknown
 
-let param_facts params =
+let param_facts ?(kind = flow_kind) params =
   params
-  |> List.mapi (fun i param -> (1001 + i, flow_kind param.Oct_lang.p_typ))
+  |> List.mapi (fun i param -> (1001 + i, kind param.Oct_lang.p_typ))
 
-let facts_of_ast ast code =
+let facts_of_ast ?(syntax = Oct_gen.Forms) ast code =
+  let kind = function
+    | Oct_lang.TOption _ when syntax = Oct_gen.Source -> Program_type_flow.String
+    | typ -> flow_kind typ
+  in
   let labels = Hashtbl.create (List.length ast.Oct_lang.funcs + 1) in
   Array.iteri
     (fun pc op ->
@@ -113,7 +117,7 @@ let facts_of_ast ast code =
     code;
   let root =
     match ast.Oct_lang.ctor with
-    | Some ctor -> param_facts ctor.Oct_lang.fn_params
+    | Some ctor -> param_facts ~kind ctor.Oct_lang.fn_params
     | None -> []
   in
   let storage =
@@ -139,7 +143,7 @@ let facts_of_ast ast code =
     |> List.mapi (fun i fn ->
       match Hashtbl.find_opt labels (200 + i * 100) with
       | Some target ->
-        Some { Program_type_flow.target; mem = param_facts fn.Oct_lang.fn_params; effects = [] }
+        Some { Program_type_flow.target; mem = param_facts ~kind fn.Oct_lang.fn_params; effects = [] }
       | None -> None)
     |> List.filter_map (fun value -> value)
   in
@@ -175,7 +179,7 @@ let facts_of_ast ast code =
              Program_type_flow.owner;
              pc;
              target;
-             kind = flow_kind fn.Oct_lang.fn_ret;
+             kind = kind fn.Oct_lang.fn_ret;
            } :: !found
          | _ -> ())
       | _ -> ())
@@ -256,7 +260,9 @@ let program_certificate raw effects facts =
         :: ("facts", facts_json facts)
         :: fields)))
     | _ -> Error "program certificate must be an object"
-  with _ -> Error "invalid program certificate"
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> Error "invalid program certificate"
 
 let certificate_json ~declaration ~source_mode ~source_material ~bytecode ~verification_json =
   let verification_hash = sha256_hex verification_json in
@@ -328,48 +334,56 @@ let abi_json declaration abi =
   in
   Printf.sprintf "{\"declaration\":%S,\"functions\":[%s],\"events\":[%s]}" declaration fns events
 
-let compile_form_ast ~source_mode ~source_material ast =
-  match Aml_source.compile_ast ast with
-  | Error reason -> error_result reason
-  | Ok compiled ->
-    let declaration =
-      Oct_lang.declaration_to_string compiled.Aml_source.declaration
-    in
-    let bytecode = compiled.octb in
-    let verification_json = verification_json compiled.ast in
-    let certificate_json =
-      certificate_json
-        ~declaration
-        ~source_mode
-        ~source_material
-        ~bytecode
-        ~verification_json
-    in
-    let program_facts = facts_of_ast compiled.ast compiled.code in
-    {
-      bytecode;
-      abi_json = Oct_gen.to_abi compiled.ast |> abi_json declaration;
-      instructions = Array.length compiled.code;
-      error = None;
-      version = lang_version;
-      verification_json;
-      certificate_json;
-      program_envelope = None;
-      program_facts = Some program_facts;
-    }
+type abi_mode = Existing_abi | Source_abi
 
-let compile_ast_ready ~checked ~source_mode ~source_material ast =
+let source_result ?(abi = Existing_abi) ?(syntax = Oct_gen.Forms)
+    ~source_mode ~source_material compiled =
+  let declaration =
+    Oct_lang.declaration_to_string compiled.Aml_source.declaration
+  in
+  let bytecode = compiled.octb in
+  let verification_json = verification_json compiled.ast in
+  let certificate_json =
+    certificate_json ~declaration ~source_mode ~source_material ~bytecode
+      ~verification_json
+  in
+  let program_facts = facts_of_ast ~syntax compiled.ast compiled.code in
+  {
+    bytecode;
+    abi_json =
+      (match abi with
+       | Existing_abi -> Oct_gen.to_abi compiled.ast |> abi_json declaration
+       | Source_abi -> Source_abi.encode compiled.ast);
+    instructions = Array.length compiled.code;
+    error = None;
+    version = lang_version;
+    verification_json;
+    certificate_json;
+    program_envelope = None;
+    program_facts = Some program_facts;
+  }
+
+let compile_form_ast ?(abi = Existing_abi) ~source_mode ~source_material ast =
+  match Aml_source.compile_ast ~syntax:Oct_gen.Forms ast with
+  | Error reason -> error_result reason
+  | Ok compiled -> source_result ~abi ~source_mode ~source_material compiled
+
+let compile_ast_ready ?(abi = Existing_abi) ~checked ~source_mode ~source_material ast =
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
   let emit () =
     if ast.Oct_lang.forms <> [] then
-      compile_form_ast ~source_mode ~source_material ast
+      compile_form_ast ~abi ~source_mode ~source_material ast
     else
       let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
       let code = Oct_emit.generate ~checked ast in
       if program && Array.length code > Program_limits.max_instructions then
         error_result "Program instruction limit exceeded"
       else
-        let abi_json = Oct_emit.to_abi ast |> abi_json declaration in
+        let abi_json =
+          match abi with
+          | Existing_abi -> Oct_emit.to_abi ast |> abi_json declaration
+          | Source_abi -> Source_abi.encode ast
+        in
         let bytecode = Bytecode.encode code in
         let verification_json = verification_json ast in
         let certificate_json =
@@ -402,10 +416,10 @@ let compile_ast_ready ~checked ~source_mode ~source_material ast =
   else
     emit ()
 
-let compile_ast ?(checked = false) ~source_mode ~source_material ast =
+let compile_ast ?(abi = Existing_abi) ?(checked = false) ~source_mode ~source_material ast =
   require_ast_shape ast;
   ignore (interface_index ast);
-  compile_ast_ready ~checked ~source_mode ~source_material ast
+  compile_ast_ready ~abi ~checked ~source_mode ~source_material ast
 
 let first_interfaces interfaces =
   interfaces
@@ -493,8 +507,7 @@ let merge_interfaces ast interfaces =
 
 let compile_exception = function
   | Compile_limit message -> error_result message
-  | Stack_overflow -> error_result "Program compiler complexity limit exceeded"
-  | Out_of_memory -> raise Out_of_memory
+  | (Stack_overflow | Out_of_memory) as error -> raise error
   | error ->
     error_result (Printf.sprintf "compile error: %s" (Printexc.to_string error))
 
@@ -575,12 +588,12 @@ let check_ast ast =
   require_ast_shape ast;
   ignore (interface_index ast)
 
-let compile_multi_mode ?(checked = false) ~program_only resolver main_path =
+let compile_multi_mode ?(abi = Existing_abi) ?(checked = false) ~program_only resolver main_path =
   compile_multi_with
     ~program_only
     ~check_ast
     ~select_interfaces:imported_interfaces
-    ~compile_ast:(compile_ast ~checked)
+    ~compile_ast:(compile_ast ~abi ~checked)
     resolver
     main_path
 
@@ -733,6 +746,10 @@ let admit_program_source source raw =
 let compile_program_multi resolver main_path =
   emit_program (compile_multi_mode ~program_only:true resolver main_path)
 
+let compile_program_described resolver main_path =
+  emit_program
+    (compile_multi_mode ~abi:Source_abi ~program_only:true resolver main_path)
+
 let compile_program_multi_first resolver main_path =
   emit_program (compile_multi_first_mode ~program_only:true resolver main_path)
 
@@ -743,3 +760,23 @@ let compile_program_multi_checked resolver main_path =
 let compile_program_multi_first_checked resolver main_path =
   emit_program
     (compile_multi_first_mode ~checked:true ~program_only:true resolver main_path)
+
+let compile_program_source resolver main_path =
+  let sources = ref [] in
+  let load path =
+    match resolver path with
+    | None -> None
+    | Some body ->
+      sources := (path, body) :: !sources;
+      Some body
+  in
+  try
+    match Aml_source.compile_multi ~syntax:Oct_gen.Source load main_path with
+    | Error reason -> error_result reason
+    | Ok compiled when compiled.declaration <> Oct_lang.ProgramDecl ->
+      error_result "Program declaration required"
+    | Ok compiled ->
+      source_result ~abi:Source_abi ~syntax:Oct_gen.Source ~source_mode:"multi"
+        ~source_material:(ordered_sources !sources) compiled
+      |> emit_program
+  with error -> compile_exception error

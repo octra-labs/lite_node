@@ -10,12 +10,16 @@ import stat
 import sys
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from pathlib import Path
+import validator_config
 
 from validator_common import ValidatorError
 from validator_common import load_wallet
 from validator_common import parse_env
 from validator_common import validate_checkpoint
+from validator_exit import command_lock
+from validator_exit import sync_directory
 from validator_process import active_data_owners
 from validator_process import data_pids
 from validator_process import pm2_entries
@@ -45,9 +49,12 @@ def tree_bytes(path, device=None, live=False):
         return sum(tree_bytes(child, device, live) for child in children)
     return meta.st_size
 
-def prior_scan(data_path):
+def state_scan(data_path, kind):
+    if kind not in {"prior", "rejected"}:
+        raise ValidatorError("unknown saved state kind")
+    suffix = r"(?:\.removing-[0-9]+)?" if kind == "prior" else ""
     pattern = re.compile(
-        re.escape(data_path.name) + r"\.prior-[0-9]+(?:-[0-9]+)?$"
+        re.escape(data_path.name + "." + kind) + r"-[0-9]+(?:-[0-9]+)?" + suffix + "$"
     )
     items = []
     for child in data_path.parent.iterdir():
@@ -164,19 +171,20 @@ def rpc_method(port, method):
 
 def report(values):
     data_path = data_dir(values)
-    states = prior_scan(data_path)
-    prior = []
-    skipped = []
-    for path, reason in states:
-        if reason:
-            skipped.append((path, reason))
-            continue
-        try:
-            prior.append((path, tree_bytes(path)))
-        except (OSError, ValidatorError):
-            skipped.append((path, "tree"))
+    saved = {kind: [] for kind in ("prior", "rejected")}
+    skipped = {kind: [] for kind in saved}
+    for kind in saved:
+        for path, reason in state_scan(data_path, kind):
+            if reason:
+                skipped[kind].append((path, reason))
+                continue
+            try:
+                saved[kind].append((path, tree_bytes(path)))
+            except (OSError, ValidatorError):
+                skipped[kind].append((path, "tree"))
     store_path = data_path / "irmin_store"
-    usage = shutil.disk_usage(store_path if store_path.exists() else data_path)
+    disk_path = store_path if store_path.exists() else data_path
+    usage = shutil.disk_usage(disk_path if disk_path.exists() else data_path.parent)
     suffix = suffix_bytes(data_path)
     pack = pack_bytes(data_path)
     snapshots = snapshot_stats(values, data_path)
@@ -187,14 +195,17 @@ def report(values):
     except (TypeError, ValueError):
         need = None
     emit(
-        event="storage",
-        data_bytes=tree_bytes(data_path, live=True) if data_path.is_dir() else 0,
-        pack_bytes=pack,
-        suffix_bytes=suffix,
-        prior_count=len(prior),
-        prior_bytes=sum(size for _, size in prior),
-        prior_skipped=len(skipped),
-        free_bytes=usage.free,
+        event = "storage",
+        data_bytes = tree_bytes(data_path, live = True) if data_path.is_dir() else 0,
+        pack_bytes = pack,
+        suffix_bytes = suffix,
+        prior_count = len(saved["prior"]),
+        prior_bytes = sum(size for _, size in saved["prior"]),
+        prior_skipped = len(skipped["prior"]),
+        rejected_count = len(saved["rejected"]),
+        rejected_bytes = sum(size for _, size in saved["rejected"]),
+        rejected_skipped = len(skipped["rejected"]),
+        free_bytes = usage.free,
         gc_need_bytes = need if need is not None else "unknown",
         gc_ready = str(usage.free >= need).lower() if need is not None else "unknown",
     )
@@ -205,10 +216,11 @@ def report(values):
         lease_files=snapshots["leased"],
         snapshot_skipped=snapshots["skipped"],
     )
-    for path, size in prior:
-        emit(event="prior_state", path=path, bytes=size)
-    for path, reason in skipped:
-        emit(event="prior_skipped", path=path, reason=reason)
+    for kind in saved:
+        for path, size in saved[kind]:
+            emit(event = kind + "_state", path = path, bytes = size)
+        for path, reason in skipped[kind]:
+            emit(event = kind + "_skipped", path = path, reason = reason)
     if isinstance(gc, dict):
         emit(
             event="pack_gc",
@@ -246,24 +258,28 @@ def live_state(values, config):
         raise ValidatorError("local RPC head is invalid") from error
     if rpc_epoch < int(head["epoch"]):
         raise ValidatorError("local RPC is behind the stored head")
-    identity = load_wallet(Path(config).parent / "wallet.json")
+    identity = load_wallet(validator_config.IDENTITY_WALLET)
     if load_wallet(data_path / "wallet.json") != identity:
         raise ValidatorError("operator identity and state wallet mismatch")
     return data_path, identity
 
 def prior_check(path, identity, entries):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        return None, "owner"
     if os.path.ismount(path):
         return None, "mount"
+    owners = active_data_owners(entries, str(path))
+    if owners or data_pids(path):
+        return None, "active"
+    if not any(path.iterdir()):
+        return 0, None
     try:
         wallet = load_wallet(path / "wallet.json")
     except (OSError, ValidatorError):
         return None, "wallet"
     if wallet != identity:
         return None, "wallet"
-    owners = active_data_owners(entries, str(path))
-    pids = data_pids(path)
-    if owners or pids:
-        return None, "active"
     try:
         return tree_bytes(path), None
     except (OSError, ValidatorError):
@@ -273,7 +289,7 @@ def prior_plan(data_path, identity):
     entries = pm2_entries(required=False)
     plan = []
     skipped = []
-    for path, reason in prior_scan(data_path):
+    for path, reason in state_scan(data_path, "prior"):
         size, reason = (
             (None, reason)
             if reason
@@ -289,36 +305,106 @@ def remove_prior(data_path, identity):
     require_clear(data_path)
     plan, skipped = prior_plan(data_path, identity)
     for path, reason in skipped:
-        emit(event="prior_skipped", path=path, reason=reason)
+        emit(event = "prior_skipped", path = path, reason = reason)
     removed = 0
     total = 0
-    for path, size in plan:
+    for path, _ in plan:
         require_clear(data_path)
-        staged = path.with_name(path.name + f".removing-{os.getpid()}")
-        path.replace(staged)
-        shutil.rmtree(staged)
+        current = path
+        try:
+            with command_lock({"OCTRA_DATA_DIR": str(path)}):
+                require_clear(data_path)
+                size, reason = prior_check(path, identity, pm2_entries(required = False))
+                if reason:
+                    raise ValidatorError(reason)
+                staged = path if re.search(r"\.removing-[0-9]+$", path.name) else (
+                    path.with_name(path.name + f".removing-{os.getpid()}")
+                )
+                lock = nullcontext() if staged == path else command_lock({"OCTRA_DATA_DIR": str(staged)})
+                with lock:
+                    if staged != path:
+                        if os.path.lexists(staged):
+                            raise ValidatorError("prior removal path already exists")
+                        path.rename(staged)
+                        current = staged
+                    sync_directory(path.parent)
+                    for child in staged.iterdir():
+                        if child.name == "wallet.json":
+                            continue
+                        shutil.rmtree(child) if child.is_dir() else child.unlink()
+                    sync_directory(staged)
+                    (staged / "wallet.json").unlink(missing_ok = True)
+                    staged.rmdir()
+        except (OSError, ValidatorError) as error:
+            skipped.append((current, str(error)))
+            emit(event = "prior_skipped", path = current, reason = str(error))
+            continue
         removed += 1
         total += size
-        emit(event="prior_removed", path=path, bytes=size)
+        emit(event = "prior_removed", path = path, bytes = size)
     return removed, total, len(skipped)
+
+def rejected_check(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValidatorError("rejected directory is not owned safely")
+    if os.path.ismount(path):
+        raise ValidatorError("rejected directory is mounted")
+    allowed = {
+        "HEAD.json", "state_root", "ready_roots", "ledger.dat", "pvac",
+        "irmin_store", "chaindata", ".state_sync", "recovery",
+    }
+    if any(child.name not in allowed for child in path.iterdir()):
+        raise ValidatorError("rejected directory contains identity or other files")
+    owners = active_data_owners(pm2_entries(required = False), str(path))
+    if owners or data_pids(path):
+        raise ValidatorError("rejected directory is active")
+    return tree_bytes(path)
+
+def remove_rejected(data_path):
+    removed, total, skipped = 0, 0, 0
+    require_clear(data_path)
+    for path, reason in state_scan(data_path, "rejected"):
+        if reason:
+            skipped += 1
+            emit(event = "rejected_skipped", path = path, reason = reason)
+            continue
+        try:
+            with command_lock({"OCTRA_DATA_DIR": str(path)}):
+                require_clear(data_path)
+                size = rejected_check(path)
+                shutil.rmtree(path)
+            removed += 1
+            total += size
+            emit(event = "rejected_removed", path = path, bytes = size)
+        except (OSError, ValidatorError) as error:
+            skipped += 1
+            emit(event = "rejected_skipped", path = path, reason = str(error))
+    return removed, total, skipped
 
 def main():
     parser = argparse.ArgumentParser(prog="storage.sh")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--prune-prior", action="store_true")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--prune-prior", action = "store_true")
+    group.add_argument("--prune-rejected", action = "store_true")
     parser.add_argument("--yes", action="store_true")
     args = parser.parse_args()
     values = parse_env(args.config)
-    if not args.prune_prior:
+    if not args.prune_prior and not args.prune_rejected:
         report(values)
         return
     if not args.yes:
-        raise ValidatorError("prior removal requires --yes")
-    data_path, identity = live_state(values, args.config)
-    removed, total, skipped = remove_prior(data_path, identity)
+        raise ValidatorError("saved state removal requires --yes")
+    with command_lock(values):
+        data_path, identity = live_state(values, args.config)
+        removed, total, skipped = (
+            remove_rejected(data_path) if args.prune_rejected
+            else remove_prior(data_path, identity)
+        )
     status = "partial" if skipped else "complete"
     emit(
-        event="prior_prune",
+        event = "rejected_prune" if args.prune_rejected else "prior_prune",
         status=status,
         removed=removed,
         skipped=skipped,

@@ -28,6 +28,30 @@ let parameters = {
   unbonding_epochs;
 }
 
+let exit_window = 4_096L
+let exit_wait = Int64.mul exit_window 2L
+
+let exit_parameters mode (value : Validator_admission.parameters) =
+  match mode with
+  | Rule_graph.Prior -> value
+  | Rule_graph.Active -> { value with unbonding_epochs = exit_wait }
+
+let evidence_age mode prior =
+  match mode with
+  | Rule_graph.Prior -> prior
+  | Rule_graph.Active -> exit_window
+
+let exit_id =
+  String.concat ":" [Int64.to_string exit_wait; Int64.to_string exit_window]
+
+let withdraw_epoch ~chain_id ~epoch candidate =
+  let mode = Rule_graph.exit_at ~chain_id ~epoch in
+  Validator_admission.withdraw_epoch (exit_parameters mode parameters) candidate
+  |> Result.map (fun due ->
+    match mode, Rule_graph.exit_activation_for_chain chain_id with
+    | Rule_graph.Active, Some plan -> Int64.max due (Int64.of_int plan.activation_epoch)
+    | _ -> due)
+
 let parse_activation raw =
   try
     let epoch = int_of_string raw in

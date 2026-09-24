@@ -48,6 +48,8 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+PYTHONDONTWRITEBYTECODE=1 python3 test/python_check.py
+
 if ! PYTHONDONTWRITEBYTECODE=1 python3 -c 'import nacl' >/dev/null 2>&1; then
   printf 'status = refused reason = python3_nacl_missing next = controls/install.sh\n' >&2
   exit 1

@@ -44,12 +44,10 @@ let nodes code (facts : Program_type_flow.facts) =
   List.map (fun target -> { target; start = target; stop = stop target }) targets
 
 let xcall_pcs code =
-  Array.to_list code
-  |> List.mapi (fun pc instr ->
-    match instr with
-    | Contract_vm.XCALL _ -> Some pc
-    | _ -> None)
-  |> List.filter_map (fun value -> value)
+  let _, pcs = Array.fold_left (fun (pc, pcs) instr ->
+    pc + 1, match instr with Contract_vm.XCALL _ -> pc :: pcs | _ -> pcs)
+    (0, []) code in
+  List.rev pcs
 
 let xcall_at (facts : Program_type_flow.facts) pc =
   List.find_opt (fun (call : Program_type_flow.xcall) -> call.pc = pc) facts.xcalls

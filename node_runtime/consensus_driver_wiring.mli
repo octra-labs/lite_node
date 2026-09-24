@@ -60,6 +60,8 @@ type epoch_normalizer_runtime = {
 }
 
 type node_standard_adapter_runtime = {
+  chain_id : string;
+  duty_state : Octra_core.Head_manifest.t -> (Octra_core.Set_fold.t, string) result;
   getenv : string -> string option;
   get_meta : string -> string option;
   wallet_addr : string;
@@ -338,6 +340,7 @@ val normalize_next_epoch_for_head :
   unit
 
 val node_standard_adapters :
+  ?parent:(epoch_id:int64 -> (Octra_consensus.C_types.parent_commit option, string) result) ->
   node_standard_adapter_runtime ->
   standard_adapters
 

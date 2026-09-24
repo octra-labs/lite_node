@@ -103,6 +103,10 @@ let fold standard_mode =
     account_mode = Octra_core.Rule_graph.Active;
     standard_mode;
     plan_mode = Octra_core.Rule_graph.Prior;
+    exit_mode = Octra_core.Rule_graph.Prior;
+    ready_exec_mode = Octra_core.Rule_graph.Prior;
+    program_mode = Octra_core.Rule_graph.Prior;
+    program_overlap = false;
     math = false;
     cap_mode = Octra_core.Set_fold.Prune;
     ready_config_hash = Some "ready";

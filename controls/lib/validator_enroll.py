@@ -21,6 +21,7 @@ from validator_common import write_private_json
 from validator_rpc import call
 from validator_rpc import transaction
 from validator_rpc import wait_transaction
+import validator_exit
 
 SOURCE = Path(__file__).resolve()
 ROOT = SOURCE.parents[2] if SOURCE.parents[1].name == "controls" else SOURCE.parents[3]
@@ -42,6 +43,14 @@ class JoinStep(Enum):
     REFUSE = "refuse"
 
 @dataclass(frozen=True)
+class MemberView:
+    active: bool
+    scheduled: bool
+    activate_epoch: int | None
+    next_set_epoch: int | None
+    validator_set_hash: str
+
+@dataclass(frozen=True)
 class Enrollment:
     state: EnrollmentState
     head_epoch: int
@@ -49,6 +58,9 @@ class Enrollment:
     bonded_epoch: int | None
     ready_epoch: int | None
     exit_epoch: int | None
+    withdraw_epoch: int | None = None
+    state_root: str | None = None
+    membership: MemberView | None = None
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
@@ -189,6 +201,32 @@ def optional_nonnegative_integer(value, name):
 def optional_epoch(value, name):
     return optional_nonnegative_integer(value, name)
 
+def committed_membership(value, head):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidatorError("invalid committed validator membership")
+    if optional_epoch(value.get("epoch"), "membership epoch") != head:
+        raise ValidatorError("committed validator membership head differs")
+    active = value.get("active")
+    scheduled = value.get("scheduled")
+    if not isinstance(active, bool) or not isinstance(scheduled, bool):
+        raise ValidatorError("invalid committed validator membership flags")
+    activate = optional_epoch(value.get("activate_epoch"), "activation epoch")
+    next_set = optional_epoch(value.get("next_set_epoch"), "next set epoch")
+    if next_set is not None and next_set <= head:
+        raise ValidatorError("committed validator next set is not in the future")
+    if (scheduled and (next_set is None or activate != next_set)) or (
+        not scheduled and activate is not None
+    ):
+        raise ValidatorError("invalid committed validator activation")
+    set_hash = value.get("validator_set_hash")
+    if not isinstance(set_hash, str) or len(set_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in set_hash
+    ):
+        raise ValidatorError("invalid committed validator set hash")
+    return MemberView(active, scheduled, activate, next_set, set_hash)
+
 def committed_enrollment(values, wallet, value=None):
     if value is None:
         value = call(local_rpc(values), "octra_validatorEnrollment", [])
@@ -209,11 +247,26 @@ def committed_enrollment(values, wallet, value=None):
     bonded_epoch = optional_epoch(value.get("bonded_epoch"), "bonded epoch")
     ready_epoch = optional_epoch(value.get("ready_epoch"), "ready epoch")
     exit_epoch = optional_epoch(value.get("exit_epoch"), "exit epoch")
+    withdraw_epoch = optional_epoch(value.get("withdraw_epoch"), "withdraw epoch")
+    if withdraw_epoch is not None and (exit_epoch is None or withdraw_epoch <= exit_epoch):
+        raise ValidatorError("invalid committed validator withdrawal epoch")
     if head_epoch is None:
         raise ValidatorError("committed validator head epoch is missing")
-    local_head, _ = node_status(local_rpc(values))
+    state_root = value.get("state_root")
+    if state_root is not None and (
+        not isinstance(state_root, str) or len(state_root) not in (64, 128)
+        or any(char not in "0123456789abcdef" for char in state_root)
+        or value.get("chain_id") != values.get("OCTRA_CHAIN_ID")
+    ):
+        raise ValidatorError("invalid committed validator snapshot identity")
+    member = committed_membership(value.get("membership"), head_epoch)
+    if member is not None and state_root is None:
+        raise ValidatorError("committed validator membership has no state root")
+    local_head, local_root = node_status(local_rpc(values))
     if head_epoch != local_head:
         raise ValidatorError("committed validator enrollment head changed")
+    if state_root is not None and state_root != local_root:
+        raise ValidatorError("committed validator enrollment root changed")
     if state is EnrollmentState.ABSENT:
         if any(item is not None for item in (bond, bonded_epoch, ready_epoch, exit_epoch)):
             raise ValidatorError("absent validator enrollment carries state")
@@ -236,6 +289,9 @@ def committed_enrollment(values, wallet, value=None):
         bonded_epoch=bonded_epoch,
         ready_epoch=ready_epoch,
         exit_epoch=exit_epoch,
+        withdraw_epoch=withdraw_epoch,
+        state_root=state_root,
+        membership=member,
     )
 
 def join_step(member, enrollment):
@@ -268,7 +324,7 @@ def ready_message(value, values, wallet):
             char not in "0123456789abcdef" for char in field
         ):
             raise ValidatorError(f"invalid readiness {name}")
-    return {
+    payload = {
         "consensus_pubkey": wallet["pub"],
         "head_epoch": str(epoch),
         "state_root": ready["state_root"],
@@ -276,6 +332,14 @@ def ready_message(value, values, wallet):
         "config_hash": ready["config_hash"],
         "catchup_head_epoch": str(epoch),
     }
+    if "head_proposal_id" in ready:
+        proposal = ready["head_proposal_id"]
+        if not isinstance(proposal, str) or len(proposal) != 64 or any(
+            char not in "0123456789abcdef" for char in proposal
+        ):
+            raise ValidatorError("invalid readiness head_proposal_id")
+        payload["head_proposal_id"] = proposal
+    return payload
 
 def control_error(result):
     raw = (result.stderr or result.stdout or "no error detail").strip()
@@ -291,10 +355,17 @@ def control_result(
     message=None,
     rpc=None,
     head=None,
+    prepare=False,
+    prior = None,
 ):
     binary = Path(values["OCTRA_OPERATOR_CONTROL_BINARY"])
     if sha256_file(binary) != values["OCTRA_OPERATOR_CONTROL_BINARY_HASH"]:
         raise ValidatorError("validator control binary hash mismatch")
+    if prepare:
+        validator_exit.require_prepare(binary)
+    nonce = next_nonce(values, wallet)
+    if prior is not None and nonce != prior["nonce"]:
+        raise ValidatorError("saved payment nonce changed before preparation; nothing signed")
     command = [
         str(binary),
         "--wallet",
@@ -308,15 +379,26 @@ def control_result(
         "--amount",
         str(amount),
         "--nonce",
-        str(next_nonce(values, wallet)),
+        str(nonce if prior is None else prior["nonce"]),
     ]
+    if prior is not None:
+        if not prepare or operation not in {"validator_bond", "validator_exit", "validator_withdraw"}:
+            raise ValidatorError("saved payment requires validator transaction preparation")
+        fee = prior.get("ou")
+        if not isinstance(fee, str) or not fee.isascii() or not fee.isdecimal():
+            raise ValidatorError("saved payment fee is invalid; nothing signed")
+        command.extend(["--ou", fee])
     if message is not None:
         command.extend([
             "--message",
             json.dumps(message, separators=(",", ":"), sort_keys=True),
         ])
-    if head is not None and node_status(local_rpc(values)) != head:
-        raise ValidatorError("readiness head changed before submission; nothing sent")
+    if prepare:
+        command.append("--prepare")
+    if head is not None:
+        current = node_status(local_rpc(values))
+        if current[0] != head[0] or (head[1] is not None and current[1] != head[1]):
+            raise ValidatorError("enrollment head changed before preparation; nothing sent")
     try:
         result = subprocess.run(
             command,
@@ -327,7 +409,9 @@ def control_result(
             timeout=30,
         )
     except subprocess.TimeoutExpired as error:
-        raise ValidatorError("submission result unknown; inspect account before retrying") from error
+        reason = ("transaction preparation timed out; nothing sent" if prepare
+                  else "submission result unknown; inspect account before retrying")
+        raise ValidatorError(reason) from error
     if result.returncode != 0:
         raise ValidatorError(control_error(result))
     try:
@@ -335,13 +419,13 @@ def control_result(
         tx_hash = payload["tx_hash"]
     except Exception as error:
         raise ValidatorError("invalid validator control response") from error
-    if payload.get("status") not in {"accepted", "pending"}:
+    if not prepare and payload.get("status") not in {"accepted", "pending"}:
         raise ValidatorError("validator control transaction was not accepted")
     if not isinstance(tx_hash, str) or len(tx_hash) != 64 or any(
         char not in "0123456789abcdef" for char in tx_hash
     ):
         raise ValidatorError("validator control transaction hash is invalid")
-    return tx_hash
+    return payload if prepare else tx_hash
 
 def wait_confirmed(values, tx_hash, args):
     if args.no_wait:
@@ -359,7 +443,7 @@ def wait_confirmed(values, tx_hash, args):
         epoch=confirmed["epoch"],
     )
 
-def resume_join_transaction(config, values, operation, args, missing_ok=False):
+def resume_join_transaction(config, values, operation, args, *, enrollment, missing_ok = False):
     record = load_state(config)["transactions"].get(operation)
     if not isinstance(record, dict):
         return False
@@ -373,11 +457,23 @@ def resume_join_transaction(config, values, operation, args, missing_ok=False):
         raise ValidatorError(f"saved {operation} transaction is unavailable: {tx_hash}")
     status = value.get("status")
     if status == "confirmed":
+        epoch = optional_epoch(value.get("epoch"), "saved transaction epoch")
+        if epoch is None or epoch > enrollment.head_epoch:
+            raise ValidatorError("saved enrollment confirmation is ahead of committed enrollment")
+        previous = (
+            operation == "bond" and enrollment.state is EnrollmentState.ABSENT
+        ) or (
+            operation == "ready" and enrollment.bonded_epoch is not None
+            and epoch < enrollment.bonded_epoch
+        )
+        if previous:
+            emit(event = operation, status = "previous_cycle", tx = tx_hash, epoch = epoch)
+            return False
         emit(
-            event=operation,
-            status="resumed",
-            tx=tx_hash,
-            epoch=value.get("epoch", "unknown"),
+            event = operation,
+            status = "resumed",
+            tx = tx_hash,
+            epoch = epoch,
         )
         return True
     if status in {"rejected", "dropped"}:
@@ -391,14 +487,36 @@ def submit_bond(config, values, wallet, wallet_path, amount, args):
     if amount < MIN_BOND:
         raise ValidatorError(f"validator bond must be at least {MIN_BOND}")
     enrollment = committed_enrollment(values, wallet)
+    url = local_rpc(values)
+    prior = validator_exit.bond_attempt(values, wallet, url, enrollment.head_epoch)
+    confirmed = prior[2] if prior is not None else None
     if enrollment.state is not EnrollmentState.ABSENT:
+        if confirmed is not None and confirmed[1] == enrollment.bonded_epoch:
+            saved = confirmed[0]
+            if saved["tx"]["amount"] != str(amount):
+                raise ValidatorError("confirmed bond amount differs; nothing signed")
+            record_transaction(config, "bond", saved["tx_hash"])
+            emit(event = "bond", status = "previously_confirmed", tx = saved["tx_hash"],
+                 epoch = confirmed[1], action = "nothing_submitted")
+            return saved["tx_hash"]
         raise ValidatorError("validator bond already exists in committed state")
-    tx_hash = control_result(
-        values,
-        wallet,
-        wallet_path,
-        "validator_bond",
-        amount=amount,
+    if prior is None and not validator_exit.can_rebond(
+        values, wallet, url, enrollment.head_epoch,
+    ) and resume_join_transaction(
+        config, values, "bond", args, enrollment = enrollment,
+    ):
+        return load_state(config)["transactions"]["bond"]["tx_hash"]
+    epoch = prior[0] if prior is not None and confirmed is None else enrollment.head_epoch
+    if confirmed is not None and enrollment.head_epoch <= confirmed[1]:
+        raise ValidatorError("new bond requires a later committed absent state")
+    validator_exit.begin_bond(values, wallet, epoch)
+    tx_hash = validator_exit.submit(
+        values, wallet, "validator_bond", epoch, url,
+        lambda prior = None: control_result(
+            values, wallet, wallet_path, "validator_bond", amount = amount, prepare = True,
+            head = (enrollment.head_epoch, enrollment.state_root), prior = prior,
+        ),
+        renew = getattr(args, "renew", False) is True, amount = amount,
     )
     record_transaction(config, "bond", tx_hash)
     emit(event="bond", status="submitted", tx=tx_hash, amount=amount)
@@ -408,6 +526,11 @@ def submit_bond(config, values, wallet, wallet_path, amount, args):
 def submit_ready(config, values, wallet, wallet_path, args, *, resume=False):
     value = call(local_rpc(values), "octra_validatorEnrollment", [])
     enrollment = committed_enrollment(values, wallet, value=value)
+    control = value.get("local_control")
+    if isinstance(control, dict) and (
+        control.get("exit_requested") is True or control.get("error") is not None
+    ):
+        raise ValidatorError("duty is paused by exit control; inspect enroll.sh status")
     if enrollment.state is EnrollmentState.ABSENT:
         raise ValidatorError("validator bond is absent from committed state")
     if enrollment.state is EnrollmentState.EXITING:
@@ -430,7 +553,9 @@ def submit_ready(config, values, wallet, wallet_path, args, *, resume=False):
             head_epoch=head, last_pulse=pulse, action="leave_running",
         )
         return None
-    if resume and resume_join_transaction(config, values, "ready", args, missing_ok=True):
+    if resume and resume_join_transaction(
+        config, values, "ready", args, enrollment = enrollment, missing_ok = True,
+    ):
         return None
     message = ready_message(value, values, wallet)
     head_epoch = enrollment.head_epoch
@@ -452,11 +577,78 @@ def submit_ready(config, values, wallet, wallet_path, args, *, resume=False):
     return tx_hash
 
 def submit_self(config, values, wallet, wallet_path, operation, args):
-    tx_hash = control_result(values, wallet, wallet_path, operation)
+    enrollment = committed_enrollment(values, wallet)
+    if enrollment.state is EnrollmentState.ABSENT:
+        completed = validator_exit.completed_withdraw(
+            values, wallet, local_rpc(values), enrollment.head_epoch,
+        ) if operation == "validator_withdraw" else None
+        if completed is not None:
+            tx_hash, bonded_epoch = completed
+            record_transaction(config, operation, tx_hash)
+            emit(event = operation, status = "previously_confirmed", tx = tx_hash,
+                 bonded_epoch = bonded_epoch, action = "nothing_submitted")
+            return tx_hash
+        raise ValidatorError("no committed validator bond")
+    if operation == "validator_exit":
+        if enrollment.state is EnrollmentState.EXITING:
+            emit(event=operation, status="confirmed", exit_epoch=enrollment.exit_epoch)
+            return None
+        validator_exit.intent(
+            values, wallet, wallet_path, enrollment.bonded_epoch,
+            local_rpc(values), "request",
+        )
+        emit(event="validator_exit_intent", status="acknowledged", duty="paused")
+        current = committed_enrollment(values, wallet)
+        if current.bonded_epoch != enrollment.bonded_epoch or current.state is EnrollmentState.ABSENT:
+            raise ValidatorError("validator registration changed; exit not signed")
+        if current.state is EnrollmentState.EXITING:
+            emit(event=operation, status="confirmed", exit_epoch=current.exit_epoch)
+            return None
+    elif operation == "validator_withdraw":
+        if enrollment.state is not EnrollmentState.EXITING:
+            raise ValidatorError("withdrawal requires a confirmed exit; run enroll.sh exit first")
+        if enrollment.withdraw_epoch is None:
+            raise ValidatorError("withdrawal epoch unavailable; update the local node")
+        remaining = max(0, enrollment.withdraw_epoch - enrollment.head_epoch)
+        if remaining:
+            raise ValidatorError(
+                f"unbonding period incomplete; withdraw_epoch = {enrollment.withdraw_epoch} "
+                f"remaining_epochs = {remaining}"
+            )
+        member = enrollment.membership
+        if enrollment.state_root is not None and member is None:
+            raise ValidatorError("committed validator set unavailable; withdrawal not signed")
+        if member is None:
+            state = membership(values, wallet)
+            occupied = state["active"] or state["scheduled"]
+        else:
+            occupied = member.active or member.scheduled
+        if occupied:
+            raise ValidatorError("withdrawal waits for removal from the validator set")
+    else:
+        raise ValidatorError("unsupported validator exit operation")
+    tx_hash = validator_exit.submit(
+        values, wallet, operation, enrollment.bonded_epoch, local_rpc(values),
+        lambda prior = None: control_result(
+            values, wallet, wallet_path, operation, prepare = True, prior = prior,
+        ),
+        renew=getattr(args, "renew", False) is True,
+    )
     record_transaction(config, operation, tx_hash)
     emit(event=operation, status="submitted", tx=tx_hash)
     wait_confirmed(values, tx_hash, args)
     return tx_hash
+
+def resume_duty(values, wallet, wallet_path):
+    enrollment = committed_enrollment(values, wallet)
+    if enrollment.state not in {EnrollmentState.BONDED, EnrollmentState.READY}:
+        raise ValidatorError("duty resume requires a bond without confirmed exit")
+    url = local_rpc(values)
+    validator_exit.allow_resume(values, wallet, enrollment.bonded_epoch, url)
+    validator_exit.intent(
+        values, wallet, wallet_path, enrollment.bonded_epoch, url, "cancel",
+    )
+    emit(event="validator_duty", status="resumed")
 
 def wait_scheduled(values, wallet, args):
     deadline = time.monotonic() + args.wait_seconds
@@ -502,13 +694,31 @@ def set_validator_mode(config, values, state, restart):
         )
 
 def transaction_status(url, tx_hash):
-    value = transaction(url, tx_hash)
+    try:
+        value = transaction(url, tx_hash)
+    except ValidatorError as error:
+        return str(error)
     return value.get("status", "missing") if isinstance(value, dict) else "missing"
 
 def show_status(config, values, wallet):
-    state = membership(values, wallet)
-    enrollment = committed_enrollment(values, wallet)
-    head_epoch, state_root = node_status(local_rpc(values))
+    emit(event = "validator_pointer", **validator_exit.pointer_status(values, wallet))
+    value = call(local_rpc(values), "octra_validatorEnrollment", [])
+    enrollment = committed_enrollment(values, wallet, value=value)
+    if enrollment.state_root is None:
+        state = membership(values, wallet)
+        head_epoch, state_root = node_status(local_rpc(values))
+        if head_epoch != enrollment.head_epoch:
+            raise ValidatorError("committed validator enrollment head changed")
+    else:
+        member = enrollment.membership
+        state = {
+            "active": member.active if member is not None else None,
+            "scheduled": member.scheduled if member is not None else None,
+            "activate_epoch": member.activate_epoch if member is not None else None,
+            "next_set_epoch": member.next_set_epoch if member is not None else None,
+            "validator_set_hash": member.validator_set_hash if member is not None else "unknown",
+        }
+        head_epoch, state_root = enrollment.head_epoch, enrollment.state_root
     emit(event="identity", address=wallet["address"], role=values["OCTRA_OPERATOR_ROLE"])
     emit(
         event="chain",
@@ -531,7 +741,18 @@ def show_status(config, values, wallet):
         bonded_epoch=enrollment.bonded_epoch,
         ready_epoch=enrollment.ready_epoch,
         exit_epoch=enrollment.exit_epoch,
+        withdraw_epoch=enrollment.withdraw_epoch,
+        remaining_epochs=(max(0, enrollment.withdraw_epoch - enrollment.head_epoch)
+                          if enrollment.withdraw_epoch is not None else None),
     )
+    control = value.get("local_control")
+    if isinstance(control, dict):
+        emit(
+            event="validator_exit_intent",
+            requested=control.get("exit_requested", "unknown"),
+            intent=control.get("intent_id"),
+            error=control.get("error"),
+        )
     saved = load_state(config)
     for operation, record in sorted(saved["transactions"].items()):
         tx_hash = record.get("tx_hash", "")
@@ -552,6 +773,8 @@ def parser():
             "exit",
             "join",
             "ready",
+            "repair-pointer",
+            "resume-duty",
             "status",
             "withdraw",
         ],
@@ -560,8 +783,11 @@ def parser():
     value.add_argument("--config", default=str(DEFAULT_CONFIG))
     value.add_argument("--no-restart", action="store_true")
     value.add_argument("--no-wait", action="store_true")
+    value.add_argument("--renew", action = "store_true",
+                       help = "Re-sign an unspent bond/exit/withdraw nonce; join renews only its bond step")
     value.add_argument("--poll-seconds", type=float, default=2.0)
     value.add_argument("--rpc", help="Submission endpoint; readiness always uses local RPC")
+    value.add_argument("--from", dest = "pointer", help = "Latest private last.json backup for repair-pointer")
     value.add_argument("--wait-seconds", type=float, default=3600.0)
     return value
 
@@ -571,6 +797,11 @@ def main():
         raise ValidatorError("wait and poll intervals must be positive")
     if args.command == "join" and args.no_wait:
         raise ValidatorError("join requires transaction confirmation")
+    if args.renew and args.command not in {"bond", "join", "exit", "withdraw"}:
+        raise ValidatorError("--renew is only valid for bond, join, exit or withdraw")
+    pointer = getattr(args, "pointer", None)
+    if (args.command == "repair-pointer") != (pointer is not None):
+        raise ValidatorError("repair-pointer requires --from with the latest private last.json backup")
     private_mode(args.config)
     values = parse_env(args.config)
     if args.rpc:
@@ -580,6 +811,16 @@ def main():
     if args.command == "status":
         show_status(args.config, values, wallet)
         return
+    with validator_exit.command_lock(values):
+        restart = run_command(args, values, wallet, wallet_path)
+    if restart:
+        subprocess.run(["sh", str(ROOT / "controls/run.sh")], cwd=ROOT, check=True)
+
+def run_command(args, values, wallet, wallet_path):
+    if args.command == "repair-pointer":
+        tx_hash = validator_exit.repair_pointer(values, wallet, args.pointer)
+        emit(event = "validator_pointer", status = "ready", tx = tx_hash, action = "nothing_submitted")
+        return False
     require_admission_active(values)
     if args.command == "bond":
         submit_bond(
@@ -597,8 +838,9 @@ def main():
             args.config,
             values,
             membership(values, wallet),
-            not args.no_restart,
+            False,
         )
+        return not args.no_restart
     elif args.command == "exit":
         submit_self(
             args.config,
@@ -617,6 +859,8 @@ def main():
             "validator_withdraw",
             args,
         )
+    elif args.command == "resume-duty":
+        resume_duty(values, wallet, wallet_path)
     else:
         state = membership(values, wallet)
         enrollment = committed_enrollment(values, wallet)
@@ -624,15 +868,7 @@ def main():
         if step is JoinStep.REFUSE:
             raise ValidatorError("validator exit is already committed")
         if step is JoinStep.SUBMIT_BOND:
-            if not resume_join_transaction(args.config, values, "bond", args):
-                submit_bond(
-                    args.config,
-                    values,
-                    wallet,
-                    wallet_path,
-                    args.amount,
-                    args,
-                )
+            submit_bond(args.config, values, wallet, wallet_path, args.amount, args)
             enrollment = committed_enrollment(values, wallet)
             step = join_step(state, enrollment)
             if step is JoinStep.SUBMIT_BOND:
@@ -650,8 +886,9 @@ def main():
             args.config,
             values,
             state,
-            not args.no_restart,
+            False,
         )
+        return not args.no_restart
 
 if __name__ == "__main__":
     try:

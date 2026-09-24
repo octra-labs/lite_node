@@ -5,14 +5,17 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
 type enrollment_snapshot = {
   head_epoch : int;
+  head_proposal_id : string option;
   state_root : string;
   chain_id : string;
   config_hash : string;
   candidate : Octra_core.Validator_admission.candidate option;
   duty : Octra_core.Set_fold.receipt option;
+  sets : string option * string option;
 }
 
 type read_ctx = {
+  data_dir : string;
   ledger : Octra_core.Ledger.t;
   store : Octra_core.Store_irmin.t;
   chaindata : Octra_core.Store_chaindata.t;
@@ -82,6 +85,17 @@ val validator_set_proof :
   scheduled_validator_set_ref:Octra_consensus.C_config.scheduled option ref ->
   rpc_result
 
+val head_proposal_id :
+  source:(Consensus_parent_commit.source, string) result ->
+  chain_id:string ->
+  head:Octra_core.Head_manifest.t ->
+  (string, string) result
+
+val duty_state :
+  store:Octra_core.Store_irmin.t ->
+  head:Octra_core.Head_manifest.t ->
+  (Octra_core.Set_fold.t, string) result Lwt.t
+
 val load_validator_enrollment :
   store:Octra_core.Store_irmin.t ->
   head:Octra_core.Head_manifest.t option ->
@@ -96,6 +110,13 @@ val validator_enrollment :
   validator_address:string ->
   validator_pubkey:string ->
   rpc_result
+
+val local_control :
+  data_dir:string ->
+  snapshot:enrollment_snapshot ->
+  address:string ->
+  pubkey:string ->
+  Yojson.Safe.t
 
 val consensus_peer_states :
   swarm:Octra_net.P2p_swarm.t option ->

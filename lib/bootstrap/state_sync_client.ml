@@ -200,6 +200,7 @@ let fetch_manifest validator_set exporter_set source =
               end
         end)
       (function
+        | Lwt.Canceled as exn -> Lwt.fail exn
         | Source_busy wait_seconds ->
             let now = Unix.gettimeofday () in
             begin
@@ -414,7 +415,9 @@ let check_manifest_chunk certificate sources =
         | source :: rest ->
             Lwt.catch
               (fun () -> probe source)
-              (fun exn -> loop (Some exn) rest)
+              (function
+                | Lwt.Canceled as exn -> Lwt.fail exn
+                | exn -> loop (Some exn) rest)
       in
       loop None sources
 
@@ -855,6 +858,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
               Source.record_success source ((Unix.gettimeofday () -. started) *. 1000.0);
               report_progress task source)
         (function
+          | Lwt.Canceled as exn -> Lwt.fail exn
           | Source_busy wait_seconds ->
               let now = Unix.gettimeofday () in
               begin
@@ -1026,14 +1030,16 @@ let sync_manifests ~max_bytes ~stage ~check ~sync candidates =
         in
         Lwt.catch
           attempt
-          (fun exn ->
-            Printf.eprintf
-              "event = sync_manifest_failed hash = %s error = %s\n%!"
-              certificate.manifest_hash
-              (Printexc.to_string exn);
-            match rest with
-            | [] -> Lwt.fail exn
-            | _ -> loop rest)
+          (function
+            | Lwt.Canceled as exn -> Lwt.fail exn
+            | exn ->
+                Printf.eprintf
+                  "event = sync_manifest_failed hash = %s error = %s\n%!"
+                  certificate.manifest_hash
+                  (Printexc.to_string exn);
+                match rest with
+                | [] -> Lwt.fail exn
+                | _ -> loop rest)
   in
   loop candidates
 
@@ -1075,12 +1081,14 @@ let run () =
       Lwt.catch
         (fun () ->
           fetch_manifest validator_set exporter_set source >|= fun result -> Some result)
-        (fun exn ->
-          Printf.eprintf
-            "event = manifest_source_rejected source = %s error = %s\n%!"
-            source.Source.url
-            (Printexc.to_string exn);
-          Lwt.return_none))
+        (function
+          | Lwt.Canceled as exn -> Lwt.fail exn
+          | exn ->
+              Printf.eprintf
+                "event = manifest_source_rejected source = %s error = %s\n%!"
+                source.Source.url
+                (Printexc.to_string exn);
+              Lwt.return_none))
     sources >>= fun results ->
   let candidates =
     results |> List.filter_map Fun.id |> select_manifests

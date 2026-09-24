@@ -93,16 +93,13 @@ let cert_text name fields =
   | _ -> None
 
 let cert_effects fields =
-  let rec read = function
-    | [] -> Some []
-    | `String value :: rest ->
-      (match read rest with
-       | Some values -> Some (value :: values)
-       | None -> None)
+  let rec read acc = function
+    | [] -> Some (List.rev acc)
+    | `String value :: rest -> read (value :: acc) rest
     | _ -> None
   in
   match cert_field "effects" fields with
-  | Some (`List values) -> read values
+  | Some (`List values) -> read [] values
   | _ -> None
 
 let fact_kind fields name =
@@ -115,6 +112,9 @@ let fact_int fields name =
   | Some (`Int value) -> Some value
   | _ -> None
 
+module Slots = Set.Make (Int)
+module Keys = Set.Make (String)
+
 let fact_pairs value key =
   match value with
   | `List values ->
@@ -122,12 +122,12 @@ let fact_pairs value key =
       | [] -> Some (List.rev acc)
       | `Assoc fields :: rest ->
         (match fact_int fields key, fact_kind fields "kind" with
-         | Some slot, Some kind when slot >= 0 && not (List.mem slot seen) ->
-           read (slot :: seen) ((slot, kind) :: acc) rest
+         | Some slot, Some kind when slot >= 0 && not (Slots.mem slot seen) ->
+           read (Slots.add slot seen) ((slot, kind) :: acc) rest
          | _ -> None)
       | _ -> None
     in
-    read [] [] values
+    read Slots.empty [] values
   | _ -> None
 
 let fact_effects value =
@@ -150,12 +150,12 @@ let fact_storage value =
         (match cert_text "key" fields, fact_kind fields "kind" with
          | Some key, Some kind
            when key <> "" && kind <> Program_type_flow.Unknown
-             && not (List.mem key seen) ->
-           read (key :: seen) ((key, kind) :: acc) rest
+             && not (Keys.mem key seen) ->
+           read (Keys.add key seen) ((key, kind) :: acc) rest
          | _ -> None)
       | _ -> None
     in
-    read [] [] values
+    read Keys.empty [] values
   | _ -> None
 
 let fact_entries value =
@@ -167,17 +167,17 @@ let fact_entries value =
         (match fact_int fields "target", cert_field "memory" fields,
                cert_field "effects" fields with
          | Some target, Some memory, Some effects
-           when target >= 0 && not (List.mem target seen) ->
+           when target >= 0 && not (Slots.mem target seen) ->
            (match fact_pairs memory "slot", fact_effects effects with
             | Some mem, Some effects ->
-              read (target :: seen)
+              read (Slots.add target seen)
                 ({ Program_type_flow.target; mem; effects } :: acc)
                 rest
             | _ -> None)
          | _ -> None)
       | _ -> None
     in
-    read [] [] values
+    read Slots.empty [] values
   | _ -> None
 
 let fact_kinds value =
@@ -218,17 +218,17 @@ let fact_xcalls value =
                cert_field "inputs" fields, fact_kind fields "output",
                cert_field "capabilities" fields with
          | Some pc, Some method_name, Some inputs, Some output, Some capabilities
-           when pc >= 0 && method_name <> "" && not (List.mem pc seen) ->
+           when pc >= 0 && method_name <> "" && not (Slots.mem pc seen) ->
            (match fact_kinds inputs, fact_capabilities capabilities with
             | Some inputs, Some capabilities ->
-              read (pc :: seen)
+              read (Slots.add pc seen)
                 ({ Program_type_flow.pc; method_name; inputs; output; capabilities } :: acc)
                 rest
             | _ -> None)
          | _ -> None)
       | _ -> None
     in
-    read [] [] values
+    read Slots.empty [] values
   | _ -> None
 
 let fact_calls value =
@@ -240,13 +240,13 @@ let fact_calls value =
         (match fact_int fields "owner", fact_int fields "pc", fact_int fields "target",
                fact_kind fields "kind" with
          | Some owner, Some pc, Some target, Some kind
-           when owner >= 0 && pc >= 0 && target >= 0 && not (List.mem pc seen) ->
-           read (pc :: seen)
+           when owner >= 0 && pc >= 0 && target >= 0 && not (Slots.mem pc seen) ->
+           read (Slots.add pc seen)
              ({ Program_type_flow.owner; pc; target; kind } :: acc) rest
          | _ -> None)
       | _ -> None
     in
-    read [] [] values
+    read Slots.empty [] values
   | _ -> None
 
 let cert_facts fields =
@@ -302,13 +302,11 @@ let valid_provenance fields =
 
 let verify_program_cert ~attested ~trusted raw_code code raw =
   try
-    match Yojson.Safe.from_string raw with
+    match Octra_core.Json_tree.read raw with
     | `Assoc fields ->
       let schema = cert_text "schema" fields in
       let declaration = cert_text "declaration" fields in
       let bytecode_hash = cert_text "bytecode_hash" fields in
-      let effects = cert_effects fields in
-      let facts = cert_facts fields in
       let facts_hash = cert_text "facts_hash" fields in
       let expected = Digestif.SHA256.(digest_string raw_code |> to_hex) in
       if schema <> Some "aml_bytecode_certificate_v2" then
@@ -323,10 +321,10 @@ let verify_program_cert ~attested ~trusted raw_code code raw =
         (match if attested then Program_attestation.verify ~trusted raw else Ok () with
          | Error error -> Error ("program compiler attestation: " ^ Program_attestation.error_message error)
          | Ok () ->
-           (match facts with
+           (match cert_facts fields with
             | None -> Error "program certificate facts mismatch"
             | Some facts ->
-              (match effects with
+              (match cert_effects fields with
                | None -> Error "program certificate effects mismatch"
                | Some effects ->
                  (match Program_policy.verify code facts effects with
@@ -335,7 +333,9 @@ let verify_program_cert ~attested ~trusted raw_code code raw =
                     if facts_hash = Some (Program_type_flow.facts_hash facts) then Ok facts
                     else Error "program certificate facts hash mismatch"))))
     | _ -> Error "program certificate must be an object"
-  with _ -> Error "invalid program certificate"
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> Error "invalid program certificate"
 
 let decode_program ?(trusted = []) ?(point_ops = false) raw =
   match Program_envelope.decode raw with

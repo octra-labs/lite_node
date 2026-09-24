@@ -107,6 +107,10 @@ let test_tx_fields () =
 let test_staging_error () =
   let cases = [
     "duplicate transaction", ("duplicate_transaction", "tx already in staging");
+    "duplicate nonce", ("duplicate_transaction", "duplicate nonce");
+    "duplicate nonce (fee rate bump < 10%)", ("duplicate_transaction", "duplicate nonce (fee rate bump < 10%)");
+    "Duplicate Nonce (fee rate bump < 10%)", ("duplicate_transaction", "Duplicate Nonce (fee rate bump < 10%)");
+    "duplicate non", ("internal_error", "duplicate non");
     "nonce too low (already used)", ("invalid_nonce", "nonce already used");
     "nonce too far ahead", ("nonce_too_far", "nonce too far ahead");
     "fee too low", ("fee_too_low", "fee too low");
@@ -195,6 +199,30 @@ let test_submit_rpc_helpers () =
   if unsupported.Octra_core.Rpc.code <> 116 then fail "submit unsupported code";
   let observer = Tx_view.submit_rpc_error "read_only_observer" "observer node is read-only" in
   if observer.Octra_core.Rpc.code <> 117 then fail "submit observer code";
+  List.iter (fun reason ->
+    let kind, detail = Tx_view.staging_error reason in
+    let error = Tx_view.submit_rpc_error kind detail in
+    let response = Octra_core.Rpc.response_json (Error_ (error, `Int 1)) in
+    match response with
+    | `Assoc fields ->
+      begin match List.assoc "error" fields with
+      | `Assoc fields when List.assoc "code" fields = `Int 106
+                           && List.assoc "data" fields = `String detail -> ()
+      | _ -> fail "duplicate RPC lost staging reason"
+      end
+    | _ -> fail "duplicate RPC response shape")
+    ["duplicate transaction"; "duplicate nonce (fee rate bump < 10%)"];
+  List.iter (fun kind ->
+    let error = Tx_view.submit_rpc_error kind "capacity unavailable" in
+    if error.Octra_core.Rpc.code <> 110 then fail "temporary verifier RPC code";
+    match Octra_core.Rpc.response_json (Error_ (error, `Int 1)) with
+    | `Assoc fields ->
+      begin match Octra_node_runtime.Set_post.rpc_failure (List.assoc "error" fields) with
+      | Retry _ -> ()
+      | _ -> fail "temporary verifier RPC retry classification"
+      end
+    | _ -> fail "RPC error response shape")
+    ["pre_verify_busy"; "pre_verify_unavailable"];
   let batch_params =
     match Tx_view.submit_batch_params (`List [`List [tx_json]]) with
     | Ok value -> value
@@ -728,6 +756,18 @@ let test_payload_admission () =
   expect_payload_error "program params html"
     ("malformed_transaction", "contract call params contain invalid characters")
     (Tx_view.payload_admission ~limits:payload_limits malicious)
+
+let test_deep_message () =
+  let deep = String.make 250_000 '[' ^ "0" ^ String.make 250_000 ']' in
+  List.iter (fun op ->
+    let tx = { (sample_tx op) with Transaction.message = Some deep } in
+    if not (Tx_view.call_params_ok tx) then fail "deep message refused";
+    if op <> Transaction.ProgramDeploy then
+      expect_payload_ok "deep message"
+        (Tx_view.payload_admission ~limits:{ payload_limits with
+          message_program_len = 10_000_000 } tx))
+    [Transaction.ContractCall; Transaction.ProgramExec; Transaction.MultiExec;
+     Transaction.ContractDeploy; Transaction.ProgramDeploy; Transaction.CircleCall]
 
 let pre_route_ok tx =
   Tx_view.pre_route_admission
@@ -1317,6 +1357,7 @@ let () =
   test_encrypted_payload_admission ();
   test_call_params_admission ();
   test_payload_admission ();
+  test_deep_message ();
   test_pre_route_admission ();
   test_bft_op_admission ();
   test_signature_admission ();

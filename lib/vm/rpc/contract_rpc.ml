@@ -40,8 +40,8 @@ let abi_result addr = function
   | None ->
     err_lwt (Rpc.not_found "program ABI not found")
 
-let derived_abi ~store ~addr =
-  match Contract.load_bytecode store addr with
+let derived_abi ~trusted ~point_ops ~store ~addr =
+  match Contract.load_bytecode ~trusted ~point_ops store addr with
   | None ->
     err_lwt (Rpc.not_found "contract not found")
   | Some bytecode ->
@@ -90,7 +90,7 @@ let current_program_record ~store ~chaindata ~addr =
         end
     end
 
-let abi ~store ~chaindata ~addr =
+let abi ~trusted ~point_ops ~store ~chaindata ~addr =
   let open Lwt.Syntax in
   let* record = current_program_record ~store ~chaindata ~addr in
   match record with
@@ -99,16 +99,16 @@ let abi ~store ~chaindata ~addr =
     begin
       match decode_real_abi (Some record.Store_chaindata.abi) with
       | Some abi_json -> abi_result addr (Some abi_json)
-      | None -> derived_abi ~store ~addr
+      | None -> derived_abi ~trusted ~point_ops ~store ~addr
     end
-  | Ok None -> derived_abi ~store ~addr
+  | Ok None -> derived_abi ~trusted ~point_ops ~store ~addr
 
-let abi_params ~store ~chaindata params =
+let abi_params ~trusted ~point_ops ~store ~chaindata params =
   match Rpc.require_address params 0 "address" with
   | Error e ->
     err_lwt e
   | Ok addr ->
-    abi ~store ~chaindata ~addr
+    abi ~trusted ~point_ops ~store ~chaindata ~addr
 
 let file_source item =
   match item with
@@ -246,56 +246,29 @@ let verified_record_response ~published record =
      @ report
      @ certificate)
 
-let aml_compile_result ~source_mode ~source_material compiled =
-  let declaration =
-    Oct_lang.declaration_to_string compiled.Aml_source.declaration
-  in
-  let bytecode = compiled.octb in
-  let verification_json = Oct_compile.verification_json compiled.ast in
-  let certificate_json =
-    Oct_compile.certificate_json
-      ~declaration
-      ~source_mode
-      ~source_material
-      ~bytecode
-      ~verification_json
-  in
-  let program_facts = Oct_compile.facts_of_ast compiled.ast compiled.code in
-  {
-    Oct_compile.bytecode;
-    abi_json = Oct_gen.to_abi compiled.ast |> Oct_compile.abi_json declaration;
-    instructions = Array.length compiled.code;
-    error = None;
-    version = Oct_compile.lang_version;
-    verification_json;
-    certificate_json;
-    program_envelope = None;
-    program_facts = Some program_facts;
-  }
-
-let aml_result source =
-  match Aml_source.compile source with
+let aml_result ~syntax source =
+  match Aml_source.compile ~syntax source with
   | Error error -> Error error
   | Ok compiled ->
     Ok
-      (aml_compile_result
+      (Oct_compile.source_result ~syntax ~abi:Oct_compile.Source_abi
          ~source_mode:"single"
          ~source_material:source
          compiled)
 
-let aml_multi_result resolver main_path sources =
-  match Aml_source.compile_multi resolver main_path with
+let aml_multi_result ~syntax resolver main_path sources =
+  match Aml_source.compile_multi ~syntax resolver main_path with
   | Error error -> Error error
   | Ok compiled ->
     Ok
-      (aml_compile_result
+      (Oct_compile.source_result ~syntax ~abi:Oct_compile.Source_abi
          ~source_mode:"multi"
          ~source_material:(Oct_compile.ordered_sources sources)
          compiled)
 
-let aml_source_result source files_json =
+let aml_source_result ~syntax source files_json =
   match files_json with
-  | None -> aml_result source
+  | None -> aml_result ~syntax source
   | Some files_json ->
     let file_map = Hashtbl.create 16 in
     List.iter
@@ -309,7 +282,7 @@ let aml_source_result source files_json =
     let sources =
       Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
     in
-    aml_multi_result resolver "main.aml" sources
+    aml_multi_result ~syntax resolver "main.aml" sources
 
 let compile_assembly_response ~bytecode_b64 ~bytecode_size ~instructions =
   `Assoc [
@@ -381,9 +354,9 @@ let source_is_program source =
   with _ ->
     false
 
-let compile_program_source ~point_ops source =
+let compile_program_source ?(compiler = Program_package.Protocol) ~point_ops source =
   match
-    Program_package.compile_for
+    Program_package.compile_with ~compiler
       ~point_ops
       ~main:"main.aml"
       ~sources:[Program_package.{ path = "main.aml"; body = source }]
@@ -400,17 +373,24 @@ let compile_program_source ~point_ops source =
          ~deploy_payload:compiled.package
          compiled.result)
 
-let compile_aml_request ~point_ops ~program:_ ~source =
+let compiler_syntax = function
+  | Program_package.Protocol -> Oct_gen.Forms
+  | Program_package.Source -> Oct_gen.Source
+
+let compile_aml_with ~compiler ~point_ops ~program:_ ~source =
   match validate_compile_input source None with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
-  | Ok () when source_is_program source -> compile_program_source ~point_ops source
+  | Ok () when source_is_program source ->
+    compile_program_source ~compiler ~point_ops source
   | Ok () ->
     begin
-      match aml_result source with
+      match aml_result ~syntax:(compiler_syntax compiler) source with
       | Error msg -> err_lwt (Rpc.err (-32000) msg None)
       | Ok result ->
       ok_lwt (compile_result_response result)
     end
+
+let compile_aml_request = compile_aml_with ~compiler:Program_package.Protocol
 
 let compile_aml ~source =
   compile_aml_request ~point_ops:true ~program:false ~source
@@ -431,7 +411,7 @@ let compile_file_map files_json =
   end;
   file_map
 
-let compile_aml_multi_for ~point_ops ~json =
+let compile_aml_multi_with ~compiler ~point_ops ~json =
   match json with
   | None ->
     err_lwt (Rpc.invalid_params "expected {files, main}")
@@ -492,7 +472,7 @@ let compile_aml_multi_for ~point_ops ~json =
           | _ -> []
         in
         begin
-          match Program_package.compile_for ~point_ops ~main:main_path ~sources with
+          match Program_package.compile_with ~compiler ~point_ops ~main:main_path ~sources with
           | Error error ->
             err_lwt
               (Rpc.err
@@ -510,15 +490,19 @@ let compile_aml_multi_for ~point_ops ~json =
           Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
         in
         begin
-          match aml_multi_result resolver main_path sources with
+          match aml_multi_result ~syntax:(compiler_syntax compiler) resolver main_path sources with
           | Error msg -> err_lwt (Rpc.err (-32000) msg None)
           | Ok result -> ok_lwt (compile_result_response result)
         end
 
+let compile_aml_multi_for ~point_ops ~json =
+  compile_aml_multi_with ~compiler:Program_package.Protocol ~point_ops ~json
+
 let compile_aml_multi ~json =
   compile_aml_multi_for ~point_ops:true ~json
 
-let compile_aml_params ?(point_ops = true) params =
+let compile_aml_params ?(compiler = Program_package.Protocol)
+    ?(point_ops = true) params =
   match Rpc.require_string params 0 "source" with
   | Error e ->
     err_lwt e
@@ -532,7 +516,7 @@ let compile_aml_params ?(point_ops = true) params =
     begin
       match program with
       | Error error -> err_lwt error
-      | Ok program -> compile_aml_request ~point_ops ~program ~source
+      | Ok program -> compile_aml_with ~compiler ~point_ops ~program ~source
     end
 
 let compute_address ~bytecode_b64 ~deployer ~nonce =
@@ -787,13 +771,15 @@ let verify_compilation ~meta ~source ~files_json =
          | None -> None))
     in
     let current = Program_package.compile ~main:"main.aml" ~sources in
+    let source_result = Program_package.compile_with ~compiler:Program_package.Source
+      ~point_ops:true ~main:"main.aml" ~sources in
     let prior = Program_package.compile_for ~point_ops:false
       ~main:"main.aml" ~sources in
     let results = List.filter_map (function
       | Ok (compiled : Program_package.compiled) ->
         Some (compiled.envelope, compiled.result)
       | Error _ -> None
-    ) [current; prior] in
+    ) [current; prior; source_result] in
     begin
       match results, current with
       | [], Error error -> Error (Program_package.error_message error)
@@ -801,12 +787,13 @@ let verify_compilation ~meta ~source ~files_json =
     end
   | Some _
   | None ->
-    let current = aml_source_result source files_json in
+    let current = aml_source_result ~syntax:Oct_gen.Source source files_json in
+    let forms = aml_source_result ~syntax:Oct_gen.Forms source files_json in
     let prior = compile_source source files_json in
     let results =
-      match current with
-      | Ok result -> [result.bytecode, result]
-      | Error _ -> []
+      List.filter_map (function
+        | Ok result -> Some (result.Oct_compile.bytecode, result)
+        | Error _ -> None) [current; forms]
     in
     let results =
       match prior.error with
@@ -1115,7 +1102,29 @@ let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
     response
   end
 
-let make_view_ctx ?running ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_pubkey () =
+type view_profile = {
+  epoch : int;
+  point_ops : bool;
+  math : bool;
+  object_cost : bool;
+  int_work : Int_work.mode;
+}
+
+let view_profile rules ~epoch =
+  let module R = Octra_core.Rule_graph in
+  let ( let* ) = Result.bind in
+  let* standard = R.standard rules ~epoch in
+  let* math = R.math rules ~epoch in
+  let* object_cost = R.object_cost rules ~epoch in
+  Ok {
+    epoch;
+    point_ops = standard = R.Active;
+    math = math = R.Active;
+    object_cost = object_cost = R.Active;
+    int_work = if standard = R.Active then Int_work.Active else Int_work.Prior;
+  }
+
+let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
   let get_balance addr =
     match Ledger.find_opt ledger addr with
     | Some account -> account.Ledger.balance
@@ -1127,9 +1136,11 @@ let make_view_ctx ?running ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_
     get_balance;
     get_fhe_pubkey;
     allow_fhe_capability;
-    int_work = Int_work.Active;
-    math;
-    current_epoch;
+    int_work = profile.int_work;
+    point_ops = profile.point_ops;
+    math = profile.math;
+    object_cost = profile.object_cost;
+    current_epoch = profile.epoch;
     do_transfer = (fun _ _ _ -> false);
     deploy_contract = (fun _ _ _ _ _ -> Error "deploy in view context");
     call_contract = (fun caller target method_name args depth ->
@@ -1137,6 +1148,7 @@ let make_view_ctx ?running ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_
       let result =
         Contract.execute_view_call
           ?running
+          ~trusted
           ~ctx:view_ctx
           ~depth
           ~limit:view_effort_limit
@@ -1180,7 +1192,7 @@ let call_result ~store ~addr ~include_storage ~storage_json value =
   else
     ok_lwt (`Assoc ["result", value])
 
-let call ~math ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
+let call ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json
     ~addr ~method_name ~call_params ~caller_addr ~include_storage =
   let open Lwt.Syntax in
   if String.equal method_name "balance_of" then
@@ -1202,11 +1214,12 @@ let call ~math ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
       err_lwt (Rpc.invalid_params "balance_of expects exactly one address parameter")
   else
     let running, stop = view_clock () in
-    let view_ctx = make_view_ctx ~math ~running ~store ~ledger ~current_epoch ~get_fhe_pubkey () in
+    let view_ctx = make_view_ctx ~trusted ~profile ~running ~store ~ledger ~get_fhe_pubkey () in
     let* executed =
       run_view ~stop (fun () ->
         Contract.execute_view_call
           ~running
+          ~trusted
           ~ctx:view_ctx
           ~limit:view_effort_limit
           store
@@ -1229,7 +1242,7 @@ let call ~math ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json
       else
         err_lwt (Rpc.err (-32000) (Receipt_view.view_error result.error) None)
 
-let call_params ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_pubkey ~storage_json params =
+let call_params ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json params =
   match Rpc.require_address params 0 "address",
         Rpc.require_string params 1 "method" with
   | Error e, _ | _, Error e ->
@@ -1243,10 +1256,10 @@ let call_params ?(math=false) ~store ~ledger ~current_epoch ~get_fhe_pubkey ~sto
         ~include_storage:(Rpc.param_json params 4)
     in
     call
-      ~math
+      ~trusted
+      ~profile
       ~store
       ~ledger
-      ~current_epoch
       ~get_fhe_pubkey
       ~storage_json
       ~addr

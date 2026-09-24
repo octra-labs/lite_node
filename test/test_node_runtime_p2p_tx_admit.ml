@@ -302,6 +302,92 @@ let test_program_package_shape () =
        ~sender_pk:(Some pub)
        (program (Base64.encode_exn compiled.package)))
 
+let test_duty_retry () =
+  let module Admit = Octra_node_runtime.P2p_tx_admit in
+  let module View = Octra_node_runtime.Tx_view in
+  let module Tx = Octra_core.Transaction in
+  let module Rule = Octra_core.Rule_graph in
+  let from, priv, pub = key () in
+  let message proposal = Yojson.Safe.to_string (`Assoc ([
+    "consensus_pubkey", `String pub;
+    "head_epoch", `String "100";
+    "state_root", `String (String.make 64 'b');
+  ] @ proposal)) in
+  let item = {
+    (tx ~from ~to_:from ~timestamp:1. ~op_type:Tx.ValidatorReady) with
+    amount = Z.zero; ou = Z.of_int 1000; public_key = Some pub;
+    message = Some (message ["head_proposal_id", `String (String.make 64 'a')]);
+  } |> signed ~priv in
+  let original = Tx.to_yojson item in
+  let admit ?(bft_mode = true) duty value =
+    Admit.admit ~duty ~bft_mode ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) value in
+  let rest ?(bft_mode = true) duty value =
+    View.pre_route_admission ~duty ~bft_mode ~now:1000. ~max_timestamp_drift:300.
+      ~observer_rpc_mode:false value in
+  List.iter (fun head ->
+    let duty = Some (head, Rule.Active) in
+    assert_verdict "active delayed P2P retry" Admit.Accept (admit duty item);
+    assert_true "active delayed REST retry" (rest duty item = Ok ());
+    assert_true "retry leaves signed transaction unchanged" (Tx.to_yojson item = original))
+    [100L; 101L; 102L];
+  let rejects ?(bft_mode = true) label duty value =
+    assert_true (label ^ ": P2P timestamp rejected")
+      (match admit ~bft_mode duty value with Admit.Timestamp_drift _ -> true | _ -> false);
+    assert_true (label ^ ": REST timestamp rejected")
+      (Result.is_error (rest ~bft_mode duty value))
+  in
+  List.iter (fun (label, duty) -> rejects label duty item)
+    ["missing duty head", None;
+     "Prior mode", Some (100L, Rule.Prior);
+     "future reference", Some (99L, Rule.Active);
+     "expired reference", Some (103L, Rule.Active)];
+  let duty = Some (102L, Rule.Active) in
+  rejects ~bft_mode:false "non-BFT mode" duty item;
+  rejects "ordinary transaction" duty
+    ({ item with op_type = Tx.Standard; message = None } |> signed ~priv);
+  rejects "missing proposal ID" duty
+    ({ item with message = Some (message []) } |> signed ~priv);
+  let malformed = { item with message = Some "invalid" } |> signed ~priv in
+  assert_true "malformed ready fails payload precheck"
+    (Result.is_error (View.payload_size_admission ~limits:View.payload_limits malformed));
+  assert_verdict "malformed ready rejected before P2P timestamp check"
+    Admit.Invalid_payload (admit duty malformed);
+  assert_true "malformed ready cannot claim retry"
+    (not (View.duty_retry ~now:1000. ~duty ~bft_mode:true malformed));
+  assert_true "malformed ready rejected by REST timestamp check"
+    (Result.is_error (rest duty malformed));
+  rejects "future timestamp beyond tolerance" duty
+    ({ item with timestamp = 1401. } |> signed ~priv);
+  List.iter (fun (label, timestamp) ->
+    rejects label duty { item with timestamp };
+    assert_true (label ^ ": timestamp cannot claim retry")
+      (not (View.duty_retry ~now:1000. ~duty ~bft_mode:true { item with timestamp })))
+    ["NaN", nan; "positive infinity", infinity; "negative infinity", neg_infinity];
+  List.iter (fun (label, now) ->
+    assert_true (label ^ ": clock cannot claim retry")
+      (not (View.duty_retry ~now ~duty ~bft_mode:true item));
+    assert_true (label ^ ": P2P clock rejected")
+      (match Admit.admit ~duty ~bft_mode:true ~now ~max_drift:300.
+        ~sender_pk:(Some pub) item with Admit.Timestamp_drift _ -> true | _ -> false);
+    assert_true (label ^ ": REST clock rejected")
+      (Result.is_error (View.pre_route_admission ~duty ~bft_mode:true ~now
+        ~max_timestamp_drift:300. ~observer_rpc_mode:false item)))
+    ["NaN", nan; "positive infinity", infinity];
+  let near_future = { item with timestamp = 1200. } |> signed ~priv in
+  assert_verdict "existing future tolerance retained" Admit.Accept (admit duty near_future);
+  assert_true "future tolerance is not a duty exemption"
+    (not (View.duty_retry ~now:1000. ~duty ~bft_mode:true near_future));
+  let bad = { item with signature = Base64.encode_exn (String.make 64 '\000') } in
+  assert_verdict "old duty still requires valid signature" Admit.Invalid_signature (admit duty bad);
+  assert_true "REST signature check remains separate and mandatory"
+    (rest duty bad = Ok ()
+     && Result.is_error (View.signature_admission ~account_public_key:(Some pub) bad));
+  assert_verdict "old duty still requires sender key" Admit.Invalid_signature
+    (Admit.admit ~duty ~bft_mode:true ~now:1000. ~max_drift:300. ~sender_pk:None item);
+  assert_true "old caller has no implicit duty exception"
+    (match Admit.admit ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) item with
+     | Admit.Timestamp_drift _ -> true | _ -> false)
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   test_accepts_standard ();
@@ -313,4 +399,5 @@ let () =
   test_reject_shared_payload ();
   test_signature_before_payload ();
   test_program_package_shape ();
+  test_duty_retry ();
   print_endline "node runtime p2p tx admit tests passed"

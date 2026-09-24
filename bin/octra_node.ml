@@ -94,6 +94,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
   let () =
     Startup_process_shell.configure_process ~exit_fatal:exit_error;
 
+    let startup_network =
+      Startup_process_shell.network_config ~env:env_opt
+    in
+    if not (Rule_graph.live_chain ~chain_id:startup_network.chain_id) then begin
+      Log.fatal "init"
+        "event = rule_plan status = rejected reason = unsupported_chain chain = %S"
+        startup_network.chain_id;
+      exit_error ()
+    end;
+
     let grpc =
       match Grpc_config.of_env env_opt with
       | Ok config -> config
@@ -128,9 +138,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~init_mode
       ~data_dir
       ~exit_fatal:exit_error;
-    let startup_network =
-      Startup_process_shell.network_config ~env:env_opt
-    in
     let recovery_need =
       match
         Sync_mark.read
@@ -1387,9 +1394,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           | Some head when permissionless_validator_lifecycle
                            && head.epoch_id < max_int ->
             begin
-              match Rule_graph.ready_ref rules ~epoch:(head.epoch_id + 1) with
-              | Ok Rule_graph.Active -> Some (Int64.of_int head.epoch_id)
-              | Ok Rule_graph.Prior | Error _ -> None
+              match Rule_graph.ready_exec rules ~epoch:(head.epoch_id + 1) with
+              | Ok Rule_graph.Active ->
+                Some (Int64.of_int head.epoch_id, Rule_graph.Active)
+              | Error _ -> None
+              | Ok Rule_graph.Prior ->
+                match Rule_graph.ready_ref rules ~epoch:(head.epoch_id + 1) with
+                | Ok Rule_graph.Active ->
+                  Some (Int64.of_int head.epoch_id, Rule_graph.Prior)
+                | Ok Rule_graph.Prior | Error _ -> None
             end
           | _ -> None);
         preverify_admit;
@@ -1407,29 +1420,53 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let enrollment_ref =
       ref (Error "committed validator enrollment unavailable")
     in
+    let validator_control = Octra_core.Validator_control.create ~data_dir in
+    let duty_parent = Octra_node_runtime.Consensus_parent_commit.create
+      ~chain_id ~data_dir ~chaindata Sys.getenv_opt in
+    let exit_identity (candidate : Octra_core.Validator_admission.candidate) =
+      Octra_core.Validator_intent.{
+        chain_id;
+        address = wallet.address;
+        pubkey = wallet.pub;
+        bonded_epoch = candidate.bonded_epoch;
+      }
+    in
     let refresh_enrollment () =
+      let head = Octra_core.Head_manifest.get_cached () in
+      let head_proposal_id = match head with
+        | Some head when head.epoch_id < max_int
+                        && Rule_graph.ready_exec rules ~epoch:(head.epoch_id + 1)
+                           = Ok Rule_graph.Active ->
+          Status_read_rpc.head_proposal_id ~source:duty_parent ~chain_id ~head
+          |> Result.to_option
+        | _ -> None
+      in
       let result =
         Rest.run_s
           (Status_read_rpc.load_validator_enrollment
              ~store
-             ~head:(Octra_core.Head_manifest.get_cached ())
+             ~head
              ~validator_address:wallet.address
              ~chain_id
              ~config_hash:ready_config_hash
              ~automatic:(permissionless_validator_lifecycle && fold_enabled !current_epoch))
       in
+      let result =
+        if Octra_core.Head_manifest.get_cached () <> head then
+          Error "committed validator enrollment head changed"
+        else Result.map (fun snapshot ->
+          { snapshot with Status_read_rpc.head_proposal_id }) result
+      in
       enrollment_ref := result;
       result
     in
     let fold_bonded () =
-      match refresh_enrollment () with
-      | Error _ -> false
-      | Ok { candidate = None; _ } -> false
-      | Ok { candidate = Some candidate; _ } ->
-        candidate.Octra_core.Validator_admission.exit_epoch = None
+      refresh_enrollment ()
+      |> Octra_node_runtime.Set_control.bonded
+        ~control:validator_control ~address:wallet.address ~pubkey:wallet.pub
     in
     ignore (refresh_enrollment ());
-    let fold_message action ~head_epoch ~state_root =
+    let fold_message action ~head_epoch ~state_root ~head_proposal_id =
       let fields = [
         "consensus_pubkey", `String wallet.pub;
         "head_epoch", `String (Int64.to_string head_epoch);
@@ -1438,6 +1475,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         "config_hash", `String ready_config_hash;
         "catchup_head_epoch", `String (Int64.to_string head_epoch);
       ] in
+      let fields = fields @ Option.fold ~none:[]
+        ~some:(fun value -> ["head_proposal_id", `String value]) head_proposal_id in
       let fields =
         match action with
         | Set_actor.Pulse -> fields
@@ -1455,7 +1494,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       in
       Yojson.Safe.to_string (`Assoc fields)
     in
-    let fold_tx = ref None in
     let read_fold_body body =
       let stream = Cohttp_lwt.Body.to_stream body in
       let buffer = Buffer.create 4096 in
@@ -1478,7 +1516,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let post_fold tx =
       match Sys.getenv_opt "OCTRA_OPERATOR_RPC_URL" with
-      | None -> Lwt.return_error "validator duty RPC is not configured"
+      | None -> Lwt.return_ok ()
       | Some url ->
         let body =
           `Assoc [
@@ -1509,32 +1547,85 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               in
               let* raw = read_fold_body response_body in
               match raw with
-              | Error _ as error -> Lwt.return error
+              | Error reason -> Lwt.return_error (Set_post.Refused reason)
               | Ok raw ->
                 let code =
                   Cohttp.Response.status response
                   |> Cohttp.Code.code_of_status
                 in
                 if code < 200 || code >= 300 then
-                  Lwt.return_error
-                    (Printf.sprintf "validator duty RPC returned HTTP %d" code)
+                  Lwt.return_error (Set_post.http_failure code)
                 else
                   match Yojson.Safe.from_string raw with
-                  | `Assoc fields when List.assoc_opt "result" fields <> None ->
-                    Lwt.return_ok ()
                   | `Assoc fields ->
                     begin
-                      match List.assoc_opt "error" fields with
-                      | Some error ->
-                        Lwt.return_error
-                          ("validator duty RPC refused transaction: "
-                           ^ Yojson.Safe.to_string error)
-                      | None ->
-                        Lwt.return_error "validator duty RPC result is absent"
+                      match List.assoc_opt "error" fields, List.assoc_opt "result" fields with
+                      | Some error, _ -> Lwt.return_error (Set_post.rpc_failure error)
+                      | None, Some _ -> Lwt.return_ok ()
+                      | None, None ->
+                        Lwt.return_error (Set_post.Retry "validator duty RPC result is absent")
                     end
                   | _ ->
-                    Lwt.return_error "validator duty RPC response is invalid"))
-          (fun exn -> Lwt.return_error (Printexc.to_string exn))
+                    Lwt.return_error (Set_post.Retry "validator duty RPC response is invalid")))
+          (fun exn -> Lwt.return_error (Set_post.Retry (Printexc.to_string exn)))
+    in
+    let fold_eligibility ~bonded_epoch tx =
+      match Octra_core.Head_manifest.get_cached () with
+      | None -> Set_post.Paused
+      | Some head ->
+        if head.epoch_id < 0 || head.epoch_id = max_int then Set_post.Paused
+        else match Rule_graph.ready_exec rules ~epoch:(head.epoch_id + 1) with
+          | Error _ -> Set_post.Paused
+          | Ok mode ->
+            Octra_node_runtime.Set_control.eligible ~mode ~head:(Int64.of_int head.epoch_id)
+              ~bonded_epoch ~snapshot:!enrollment_ref tx
+    in
+    let retry_fold ~bonded_epoch ~current tx =
+      let wait reason = Lwt.return_error (Set_post.Wait reason) in
+      match refresh_enrollment () with
+      | Error reason -> wait reason
+      | Ok { candidate = Some candidate; head_epoch; _ }
+        when candidate.bonded_epoch = bonded_epoch && candidate.exit_epoch = None ->
+        begin
+          match Octra_core.Validator_control.guard
+            validator_control (exit_identity candidate) (fun () ->
+              match Octra_core.Head_manifest.get_cached (), Ledger.find_opt ledger tx.Transaction.from with
+              | Some head, Some account when current () && head.epoch_id = head_epoch
+                  && account.Ledger.nonce < tx.nonce
+                  && fold_eligibility ~bonded_epoch tx = Set_post.Eligible ->
+                begin
+                  match Rest.add_tx_to_staging ~relay:false ~bft_mode:consensus_mode
+                    rest_runtime ledger tx with
+                  | Error reason -> Ok (wait reason)
+                  | Ok hash when hash <> Transaction.hash tx ->
+                    Ok (Lwt.return_error (Set_post.Refused "validator duty staging hash mismatch"))
+                  | Ok hash ->
+                    begin match !swarm_ref with
+                    | None -> ()
+                    | Some swarm ->
+                      let payload = Octra_net.P2p_tx_gossip.encode
+                        (Octra_net.P2p_tx_gossip.Tx {
+                          hash;
+                          tx_json = Yojson.Safe.to_string (Transaction.to_yojson tx);
+                        }) in
+                      Lwt.async (fun () ->
+                        Lwt.catch (fun () -> Octra_net.P2p_swarm.broadcast swarm
+                          Octra_net.P2p_frame.{ msg_type = msg_tx_gossip; payload })
+                          (fun exn ->
+                            Log.warn "validator" "event = set_post_failed reason = %s"
+                              (Printexc.to_string exn);
+                            Lwt.return_unit))
+                    end;
+                    Ok (post_fold tx)
+                end
+              | _ -> Ok (wait "validator duty head changed")) with
+          | Ok result -> result
+          | Error reason ->
+            Log.warn "validator" "event = %s reason = %s"
+              (Set_actor.event Set_actor.Control) reason;
+            wait reason
+        end
+      | Ok _ -> wait "validator duty enrollment changed"
     in
     let fold_post =
       Set_post.create Set_post.{
@@ -1545,35 +1636,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           match Ledger.find_opt ledger tx.Transaction.from with
           | Some account -> account.Ledger.nonce >= tx.nonce
           | None -> false);
-        post = post_fold;
+        post = (fun _ -> Lwt.return_error
+          (Set_post.Refused "validator duty retry policy is missing"));
         warn = (fun reason ->
           Log.warn "validator"
             "event = set_post_failed reason = %s"
             reason);
       }
-    in
-    let send_fold_tx conn =
-      match !fold_tx with
-      | None -> ()
-      | Some (hash, tx) ->
-        begin
-          match Staging.find_by_hash hash with
-          | None -> fold_tx := None
-          | Some _ ->
-            let tx_json =
-              Yojson.Safe.to_string (Transaction.to_yojson tx)
-            in
-            let payload =
-              Octra_net.P2p_tx_gossip.encode
-                (Octra_net.P2p_tx_gossip.Tx { hash; tx_json })
-            in
-            Lwt.async (fun () ->
-              Octra_net.P2p_conn.send conn
-                Octra_net.P2p_frame.{
-                  msg_type = msg_tx_gossip;
-                  payload;
-                })
-        end
     in
     let fold_point () =
       let epoch = !current_epoch in
@@ -1589,59 +1658,92 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       }
     in
     let send_fold ~epoch action =
-      let send ~head_epoch state_root =
-        Rest.expire_duty ~sender:wallet.address rest_runtime ();
-        match state_root, Ledger.find_opt ledger wallet.address with
-        | None, _ -> Lwt.return_error "validator set fold head root is unavailable"
-        | _, None -> Lwt.return_error "validator set fold account is unavailable"
-        | Some state_root, Some account ->
-          match Staging.duty_nonce wallet.address account.Ledger.nonce with
-          | None -> Lwt.return_error "validator duty nonce is pending"
-          | Some nonce ->
-          let draft = Transaction.{
-            from = wallet.address;
-            to_ = wallet.address;
-            amount = Z.zero;
-            nonce;
-            ou = Z.zero;
-            timestamp = Unix.gettimeofday ();
-            signature = "";
-            public_key = Some wallet.pub;
-            message = Some (fold_message action ~head_epoch ~state_root);
-            op_type = ValidatorReady;
-            encrypted_data = None;
-          } in
-          let tx = { draft with ou = Transaction.ou_cost draft } in
-          let tx = Transaction.sign_with_privkey tx wallet.priv in
-          begin
-            match
-              Rest.add_tx_to_staging
-                ~bft_mode:consensus_mode
-                rest_runtime
-                ledger
-                tx
-            with
-            | Ok hash ->
-              fold_tx := Some (hash, tx);
-              Set_post.put fold_post ~hash tx;
-              Lwt.return_ok ()
-            | Error error -> Lwt.return_error error
-          end
+      let send ~head_epoch ~head_proposal_id state_root =
+        let stage () =
+          Rest.expire_duty ~sender:wallet.address rest_runtime ();
+          match state_root, Ledger.find_opt ledger wallet.address with
+          | None, _ -> Error "validator set fold head root is unavailable"
+          | _, None -> Error "validator set fold account is unavailable"
+          | Some state_root, Some account ->
+            match Staging.duty_nonce wallet.address account.Ledger.nonce with
+            | None -> Error "validator duty nonce is pending"
+            | Some nonce ->
+              let draft = Transaction.{
+                from = wallet.address;
+                to_ = wallet.address;
+                amount = Z.zero;
+                nonce;
+                ou = Z.zero;
+                timestamp = Unix.gettimeofday ();
+                signature = "";
+                public_key = Some wallet.pub;
+                message = Some (fold_message action ~head_epoch ~state_root ~head_proposal_id);
+                op_type = ValidatorReady;
+                encrypted_data = None;
+              } in
+              let tx = { draft with ou = Transaction.ou_cost draft } in
+              let tx = Transaction.sign_with_privkey tx wallet.priv in
+              match Rest.add_tx_to_staging ~relay:false ~bft_mode:consensus_mode
+                      rest_runtime ledger tx with
+              | Ok hash -> Ok (hash, tx)
+              | Error error -> Error error
+        in
+        if Set_post.pending fold_post then Lwt.return_ok ()
+        else match !enrollment_ref with
+        | Ok { candidate = Some candidate; head_epoch = recorded; _ }
+          when Int64.of_int recorded = head_epoch && candidate.exit_epoch = None ->
+          Octra_core.Validator_control.guard
+            validator_control (exit_identity candidate) (fun () -> Ok (stage ()))
+          |> (function
+            | Error error -> Error (Set_actor.Control, error)
+            | Ok result -> Result.map_error (fun error -> Set_actor.Send, error) result)
+          |> Result.map (fun (hash, tx) ->
+            let retry = Set_post.{
+              eligible = fold_eligibility ~bonded_epoch:candidate.bonded_epoch;
+              post = retry_fold ~bonded_epoch:candidate.bonded_epoch;
+              retain = Option.is_some head_proposal_id;
+            } in
+            Set_post.put ~retry fold_post ~hash tx)
+          |> Lwt.return
+        | _ -> Lwt.return_error (Set_actor.Receipt, "validator duty enrollment changed")
       in
-      if not (fold_enabled !current_epoch) then
-        Lwt.return_error "validator set fold rule is not active"
+      if Set_post.pending fold_post then begin
+        Set_post.tick fold_post;
+        Lwt.return_ok ()
+      end else if not (fold_enabled !current_epoch) then
+        Lwt.return_error (Set_actor.Send, "validator set fold rule is not active")
       else
         match Set_actor.plan ~epoch (fold_point ()) with
-        | Error reason -> Lwt.return_error (Set_actor.reason reason)
+        | Error reason -> Lwt.return_error (Set_actor.Send, Set_actor.reason reason)
         | Ok head_epoch ->
           let open Lwt.Syntax in
-          let* state_root = ready_state_root_at (Int64.to_int head_epoch) in
-          match Set_actor.plan ~epoch (fold_point ()) with
-          | Error reason -> Lwt.return_error (Set_actor.reason reason)
-          | Ok _ -> send ~head_epoch state_root
+          match Rule_graph.ready_exec rules ~epoch:(Int64.to_int epoch) with
+          | Error reason -> Lwt.return_error (Set_actor.Send, Rule_graph.fault_message reason)
+          | Ok Rule_graph.Active ->
+            begin match refresh_enrollment () with
+            | Ok snapshot when Int64.of_int snapshot.head_epoch = head_epoch
+                               && Option.is_some snapshot.head_proposal_id ->
+              begin match Set_actor.plan ~epoch (fold_point ()) with
+              | Error reason -> Lwt.return_error (Set_actor.Send, Set_actor.reason reason)
+              | Ok _ -> send ~head_epoch ~head_proposal_id:snapshot.head_proposal_id
+                (Some snapshot.state_root)
+              end
+            | _ -> Lwt.return_error (Set_actor.Receipt, "validator duty head certificate is unavailable")
+            end
+          | Ok Rule_graph.Prior ->
+            let* state_root = ready_state_root_at (Int64.to_int head_epoch) in
+            match Set_actor.plan ~epoch (fold_point ()) with
+            | Error reason -> Lwt.return_error (Set_actor.Send, Set_actor.reason reason)
+            | Ok _ -> send ~head_epoch ~head_proposal_id:None state_root
     in
     let fold_actor =
-      Set_actor.create Set_actor.{
+      Set_actor.create ~observe:(fun (entry : Set_actor.observation) ->
+        let vote = entry.proof.vote in
+        Log.info "validator"
+          "event = set_proof stage = %s proof = %s chain = %s validator = %s vote_epoch = %Ld round = %d epoch = %Ld"
+          (Set_actor.stage_name entry.stage) (Set_actor.proof_key entry.proof)
+          vote.chain_id vote.validator vote.epoch_id vote.round entry.epoch)
+        Set_actor.{
         read = (fun ~epoch ->
           let open Lwt.Syntax in
           match Octra_core.Head_manifest.get_cached () with
@@ -1673,17 +1775,17 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               Octra_consensus.C_types.is_validator
                 !consensus_validator_set_ref
                 wallet.address;
-            bonded = fold_enabled epoch && fold_bonded ();
+            bonded = if fold_enabled epoch then fold_bonded () else Ok false;
           });
         peers = (fun () ->
           match !swarm_ref with
           | Some swarm -> Octra_net.P2p_swarm.connected_count swarm
           | None -> 0);
         send = send_fold;
-        warn = (fun reason ->
+        warn = (fun fault reason ->
           Log.warn "validator"
-            "event = set_actor_send_failed reason = %s"
-            reason);
+            "event = %s reason = %s"
+            (Set_actor.event fault) reason);
       }
     in
     fold_wake := (fun ~head ->
@@ -1829,8 +1931,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           set_swarm = (fun swarm ->
             swarm_opt := Some swarm;
             swarm_ref := Some swarm;
-            Octra_net.P2p_swarm.set_peer_hook swarm (fun conn ->
-              send_fold_tx conn;
+            Octra_net.P2p_swarm.set_peer_hook swarm (fun _ ->
               Set_post.tick fold_post;
               (!fold_wake) ~head:(max 0 (!current_epoch - 1))));
         };
@@ -1855,6 +1956,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           irmin_get_meta store Octra_core.Validator_set_update.pending_meta_key);
         read_head_hash = (fun () -> irmin_get_head_hash store);
         get_meta = irmin_get_meta store;
+        duty_state = (fun head -> Rest.run_s (Status_read_rpc.duty_state ~store ~head));
         read_persistent_pending = (fun () ->
           Store_irmin.get_meta store
             Octra_core.Validator_set_update.pending_meta_key);
@@ -1963,11 +2065,18 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             ~store
             ~state_root_at:compute_state_root_at in
         let engine = Resource_compute_engine.create ~limits ~deps in
-        Log.info "compute"
-          "event = provider status = enabled accelerator = %s lanes = %d memory_bytes = %Ld"
-          (Resource_compute_config.accelerator_name limits.accelerator)
-          limits.lanes
-          limits.memory_bytes;
+        (match Resource_compute_engine.native_accelerator limits.accelerator with
+         | Error reason ->
+           Log.warn "compute"
+             "event = provider status = unavailable accelerator = %s reason = %s"
+             (Resource_compute_config.accelerator_name limits.accelerator)
+             reason
+         | Ok () ->
+           Log.info "compute"
+             "event = provider status = enabled accelerator = %s lanes = %d memory_bytes = %Ld"
+             (Resource_compute_config.accelerator_name limits.accelerator)
+             limits.lanes
+             limits.memory_bytes);
         Some Resource_compute_service.{ limits; engine }
     in
     let compute_head () =
@@ -1991,7 +2100,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           validator_set = (fun () -> !consensus_validator_set_ref);
           head = compute_head;
           state_root_at = compute_state_root_at;
-          self_test = Resource_compute_engine.native_self_test;
+          self_test = (match compute_provider with
+            | None -> fun () -> Resource_compute_engine.native_self_test ()
+            | Some provider ->
+              fun () -> Resource_compute_engine.self_test provider.engine);
           nonce = (fun () -> Mirage_crypto_rng.generate 32);
           broadcast = (fun payload ->
             match !swarm_opt with
@@ -2023,6 +2135,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~validator_enrollment:(fun () -> !enrollment_ref)
     in
     Startup_node_launch_shell.run
+      ~duty_head:rest_runtime.duty_head
+      ~bft_mode:consensus_mode
       Startup_node_launch_shell.{
         p2p_port;
         rpc = rpc_task;

@@ -31,34 +31,27 @@ let valid_key_id value =
   && length <= 64
   && String.for_all (fun ch -> Char.code ch >= 33 && Char.code ch <= 126) value
 
-let rec canonical = function
-  | `Assoc fields ->
-    let fields =
-      fields
-      |> List.map (fun (key, value) -> key, canonical value)
-      |> List.sort (fun (left, _) (right, _) -> String.compare left right)
-    in
-    `Assoc fields
-  | `List values -> `List (List.map canonical values)
-  | value -> value
-
 let payload ~key_id cert =
   if not (valid_key_id key_id) then Error Invalid_key_id
   else
     try
-      match Yojson.Safe.from_string cert with
+      match Octra_core.Json_tree.read cert with
       | `Assoc fields ->
         let fields = List.filter (fun (key, _) -> key <> "attestation") fields in
-        Ok (domain ^ key_id ^ "\000" ^ Yojson.Safe.to_string (canonical (`Assoc fields)))
+        Ok (domain ^ key_id ^ "\000" ^ Octra_core.Json_tree.write ~sort:true (`Assoc fields))
       | _ -> Error Invalid_certificate
-    with _ -> Error Invalid_certificate
+    with
+    | (Stack_overflow | Out_of_memory) as error -> raise error
+    | _ -> Error Invalid_certificate
 
 let certificate_fields cert =
   try
-    match Yojson.Safe.from_string cert with
+    match Octra_core.Json_tree.read cert with
     | `Assoc fields -> Ok fields
     | _ -> Error Invalid_certificate
-  with _ -> Error Invalid_certificate
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> Error Invalid_certificate
 
 let field name fields =
   match List.filter (fun (key, _) -> key = name) fields with
@@ -91,7 +84,8 @@ let attach ~key_id ~private_key cert =
            "signature", `String (Base64.encode_exn signature);
          ] in
          let fields = List.filter (fun (name, _) -> name <> "attestation") fields in
-         Ok (Yojson.Safe.to_string (`Assoc (fields @ ["attestation", proof]))))
+         let fields = List.rev_append (List.rev fields) ["attestation", proof] in
+         Ok (Octra_core.Json_tree.write (`Assoc fields)))
     | Error error, _
     | _, Error error -> Error error
 
@@ -119,5 +113,7 @@ let verify ~trusted cert =
                           && Octra_ed25519.verify ~pub:key.public_key ~msg:message signature ->
                      Ok ()
                    | _ -> Error Invalid_signature
-                 with _ -> Error Invalid_signature)))
+                 with
+                 | (Stack_overflow | Out_of_memory) as error -> raise error
+                 | _ -> Error Invalid_signature)))
         | _ -> Error Invalid_signature))

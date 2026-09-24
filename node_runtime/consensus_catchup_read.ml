@@ -227,7 +227,8 @@ let finish state =
 let next_after_full_chunk ~from_epoch offset =
   Some (Int64.add from_epoch (Int64.of_int offset))
 
-let range ?(max_chunk = 16) ?(max_bytes = 4_000_000) deps ~from_epoch ~max_epochs =
+let range ?(max_chunk = Octra_consensus.C_catchup.range_epochs)
+    ?(max_bytes = 4_000_000) deps ~from_epoch ~max_epochs =
   try
     let max_chunk = min max_epochs max_chunk in
     let rec collect state =

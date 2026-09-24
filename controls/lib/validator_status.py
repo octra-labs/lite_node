@@ -65,7 +65,7 @@ def emit(key, value):
 def pm2_process(name):
     try:
         payload = subprocess.run(
-            ["pm2", "jlist"],
+            ["pm2", "jlist", "--silent"],
             check=True,
             capture_output=True,
             text=True,

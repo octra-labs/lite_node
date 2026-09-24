@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+let range_epochs = 16
+
 type peer_head = {
   responder_addr : string;
   responder_head_epoch : int64;

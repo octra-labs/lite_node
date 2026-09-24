@@ -43,6 +43,9 @@ type t = {
   standard_activation : activation option;
   set_plan_activation : activation option;
   math_activation : activation option;
+  exit_activation : activation option;
+  ready_exec_activation : activation option;
+  program_source_activation : activation option;
   root_at : int -> root_read;
 }
 
@@ -110,6 +113,10 @@ let devnet_set_plan_activation = {
   anchor_state_root =
     "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d";
   activation_epoch = 1_510_000;
+}
+
+let devnet_exit_activation = {
+  devnet_set_plan_activation with activation_epoch = 1_567_000;
 }
 
 let devnet_set_open_activation = {
@@ -214,10 +221,27 @@ let math_activation_for_chain chain_id =
   else
     None
 
+let exit_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then Some devnet_exit_activation
+  else None
+
+let ready_exec_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_exit_activation
+  else None
+
+let program_source_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some devnet_exit_activation
+  else None
+
 let profile_epochs ~chain_id =
   [standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
-   math_activation_for_chain chain_id]
+   math_activation_for_chain chain_id;
+   exit_activation_for_chain chain_id;
+   ready_exec_activation_for_chain chain_id;
+   program_source_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -250,8 +274,8 @@ let activation_id = function
       string_of_int value.activation_epoch;
     ]
 
-let consensus_id ~chain_id ~epoch =
-  let plans = [
+let base_plans chain_id =
+  [
     circle_activation_for_chain chain_id;
     wasm_compute_activation_for_chain chain_id;
     validator_quorum_activation_for_chain chain_id;
@@ -267,7 +291,20 @@ let consensus_id ~chain_id ~epoch =
     object_cost_activation_for_chain chain_id;
     account_pack_activation_for_chain chain_id;
     standard_activation_for_chain chain_id;
+  ]
+
+let live_chain ~chain_id =
+  let plans = base_plans chain_id @ [
+    set_plan_activation_for_chain chain_id;
+    math_activation_for_chain chain_id;
+    exit_activation_for_chain chain_id;
+    ready_exec_activation_for_chain chain_id;
+    program_source_activation_for_chain chain_id;
   ] in
+  List.for_all Option.is_some plans
+
+let consensus_id ~chain_id ~epoch =
+  let plans = base_plans chain_id in
   let plans =
     match set_plan_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
@@ -279,6 +316,18 @@ let consensus_id ~chain_id ~epoch =
     | Some _ | None -> plans
   in
   plans
+  |> (fun plans ->
+    match exit_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match ready_exec_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match program_source_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -304,6 +353,9 @@ let make ~ready_config_hash ~chain_id ~root_at =
     standard_activation = standard_activation_for_chain chain_id;
     set_plan_activation = set_plan_activation_for_chain chain_id;
     math_activation = math_activation_for_chain chain_id;
+    exit_activation = exit_activation_for_chain chain_id;
+    ready_exec_activation = ready_exec_activation_for_chain chain_id;
+    program_source_activation = program_source_activation_for_chain chain_id;
     root_at;
   }
 
@@ -330,6 +382,7 @@ let account_pack_activation t = t.account_pack_activation
 let standard_activation t = t.standard_activation
 let set_plan_activation t = t.set_plan_activation
 let math_activation t = t.math_activation
+let exit_activation t = t.exit_activation
 let ready_config_hash t = t.ready_config_hash
 
 let root_after_floor ~chain_id ~floor_epoch ~epoch =
@@ -355,6 +408,9 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       standard_activation_for_chain chain_id;
       set_plan_activation_for_chain chain_id;
       math_activation_for_chain chain_id;
+      exit_activation_for_chain chain_id;
+      ready_exec_activation_for_chain chain_id;
+      program_source_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -461,6 +517,35 @@ let set_plan t ~epoch =
 
 let math t ~epoch =
   mode t t.math_activation ~epoch
+
+let exit t ~epoch = mode t t.exit_activation ~epoch
+
+let ready_exec t ~epoch = mode t t.ready_exec_activation ~epoch
+
+let program_source t ~epoch = mode t t.program_source_activation ~epoch
+
+let program_overlap_epochs = 64
+
+let program_overlap t ~epoch =
+  Result.map (fun mode ->
+    match mode, t.program_source_activation with
+    | Active, Some plan -> epoch - plan.activation_epoch < program_overlap_epochs
+    | _ -> false) (program_source t ~epoch)
+
+let program_source_at ~chain_id ~epoch =
+  match program_source_activation_for_chain chain_id with
+  | Some activation when epoch >= activation.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let ready_exec_at ~chain_id ~epoch =
+  match ready_exec_activation_for_chain chain_id with
+  | Some activation when epoch >= activation.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let exit_at ~chain_id ~epoch =
+  match exit_activation_for_chain chain_id with
+  | Some activation when epoch >= activation.activation_epoch -> Active
+  | Some _ | None -> Prior
 
 let math_at ~chain_id ~epoch =
   match math_activation_for_chain chain_id with

@@ -129,6 +129,30 @@ let parse_line line =
         Error "invalid journal entry kind"
     | _ -> Error "journal entry must be an object"
 
+let repair_tail path meta cut =
+  protect (fun () ->
+    let same found =
+      found.Unix.st_kind = Unix.S_REG
+      && found.st_dev = meta.Unix.st_dev && found.st_ino = meta.st_ino
+      && found.st_size = meta.st_size && found.st_mtime = meta.st_mtime
+      && found.st_ctime = meta.st_ctime
+    in
+    if cut < 0 || cut > meta.Unix.st_size || not (same (Unix.lstat path)) then
+      invalid_arg "journal changed before tail repair";
+    let descriptor = Unix.openfile path [Unix.O_WRONLY] 0 in
+    Fun.protect
+      ~finally:(fun () -> Unix.close descriptor)
+      (fun () ->
+        if not (same (Unix.fstat descriptor)) then
+          invalid_arg "journal changed during tail repair";
+        if cut < meta.st_size then Unix.ftruncate descriptor cut
+        else begin
+          ignore (Unix.lseek descriptor 0 Unix.SEEK_END);
+          if Unix.write_substring descriptor "\n" 0 1 <> 1 then
+            failwith "journal line termination failed"
+        end;
+        Unix.fsync descriptor))
+
 let open_journal ~path ~manifest_hash =
   if not (Sys.file_exists path) then begin
     append_line path (header_json manifest_hash);
@@ -140,6 +164,7 @@ let open_journal ~path ~manifest_hash =
         Fun.protect
           ~finally:(fun () -> close_in_noerr input)
           (fun () ->
+            let meta = Unix.fstat (Unix.descr_of_in_channel input) in
             let size = in_channel_length input in
             let trailing_newline =
               if size = 0 then false
@@ -152,33 +177,41 @@ let open_journal ~path ~manifest_hash =
             let rec loop entries =
               match input_line input with
               | line -> loop (line :: entries)
-              | exception End_of_file -> List.rev entries, trailing_newline
+              | exception End_of_file -> List.rev entries, trailing_newline, meta
             in
             loop []))
     in
     match lines with
-    | [], _ -> Error "empty state sync journal"
-    | header :: entries, trailing_newline ->
+    | [], _, _ -> Error "empty state sync journal"
+    | header :: entries, trailing_newline, meta ->
         let* parsed_header = parse_line header in
         begin
           match parsed_header with
           | `Header parsed_hash when parsed_hash = manifest_hash ->
               let completed = Hashtbl.create (List.length entries + 16) in
               let entry_count = List.length entries in
-              let* () =
+              let* repair =
                 List.fold_left (fun state (index, line) ->
-                  let* () = state in
+                  let* repair = state in
                   match parse_line line with
-                  | Error _ when index = entry_count - 1 && not trailing_newline -> Ok ()
+                  | Error _ when index = entry_count - 1 && not trailing_newline ->
+                      Ok (Some (meta.Unix.st_size - String.length line))
                   | Error _ as error -> error
                   | Ok (`Chunk key) ->
                       Hashtbl.replace completed key true;
-                      Ok ()
+                      Ok repair
                   | Ok (`Drop key) ->
                       Hashtbl.remove completed key;
-                      Ok ()
+                      Ok repair
                   | Ok (`Header _) -> Error "duplicate journal header"
-                ) (Ok ()) (List.mapi (fun index line -> index, line) entries)
+                )
+                  (Ok (if trailing_newline then None else Some meta.Unix.st_size))
+                  (List.mapi (fun index line -> index, line) entries)
+              in
+              let* () =
+                match repair with
+                | None -> Ok ()
+                | Some cut -> repair_tail path meta cut
               in
               Ok { path; manifest_hash; completed }
           | `Header _ -> Error "journal manifest mismatch"

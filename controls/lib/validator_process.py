@@ -160,7 +160,7 @@ def pm2_entries(required=True):
         return []
     try:
         result = subprocess.run(
-            ["pm2", "jlist"],
+            ["pm2", "jlist", "--silent"],
             check=True,
             capture_output=True,
             text=True,
@@ -182,9 +182,9 @@ def main():
     entries = pm2_entries()
     names = process_plan(entries, name, data_dir)
     pids = process_pids(entries, names)
-    for stale in names:
+    for owner in names:
         subprocess.run(
-            ["pm2", "delete", stale],
+            ["pm2", "delete", owner],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

@@ -143,7 +143,46 @@ let validator_bond_payload ~chain_id ~address ~amount ~nonce ~pub ~priv =
 let main () =
   Mirage_crypto_rng_unix.use_default ();
   let args = Array.to_list Sys.argv |> List.tl in
+  if args = ["--capabilities"] then begin
+    print_endline (Yojson.Safe.to_string (`Assoc [
+      "exit_intent", `Bool true;
+      "prepare_transaction", `Bool true;
+    ]));
+    exit 0
+  end;
   let wallet_path = require_arg "--wallet" args in
+  let wallet = Yojson.Safe.from_file wallet_path in
+  let from = json_string "address" wallet in
+  let pub = json_string "pub" wallet in
+  let priv = json_string "priv" wallet in
+  begin match arg_value "--exit-intent" args with
+  | None -> ()
+  | Some action ->
+    let identity = Octra_core.Validator_intent.{
+      chain_id = require_arg "--chain-id" args;
+      address = from;
+      pubkey = pub;
+      bonded_epoch = Int64.of_string (require_arg "--bonded-epoch" args);
+    } in
+    let control = Octra_core.Validator_control.create
+      ~data_dir:(Filename.dirname wallet_path) in
+    let result = match action with
+      | "request" ->
+        Octra_core.Validator_control.request control identity ~privkey:priv
+        |> Result.map (fun id -> `String id)
+      | "cancel" ->
+        Octra_core.Validator_control.cancel control identity ~privkey:priv
+        |> Result.map (fun () -> `Null)
+      | _ -> Error "invalid validator exit intent action"
+    in
+    begin match result with
+    | Error reason -> fail reason
+    | Ok id ->
+      print_endline (Yojson.Safe.to_string
+        (`Assoc ["intent_id", id; "status", `String action]));
+      exit 0
+    end
+  end;
   let rpc_url = require_arg "--rpc" args in
   let op_raw = require_arg "--op" args in
   let print_only = List.mem "--print-only" args in
@@ -153,10 +192,6 @@ let main () =
     | None, Some value -> Some value
     | None, None -> None
   in
-  let wallet = Yojson.Safe.from_file wallet_path in
-  let from = json_string "address" wallet in
-  let pub = json_string "pub" wallet in
-  let priv = json_string "priv" wallet in
   let amount = Z.of_string (match arg_value "--amount" args with Some value -> value | None -> "0") in
   let op_type =
     match Octra_core.Transaction.op_type_of_string op_raw with
@@ -219,7 +254,13 @@ let main () =
     in
     let tx = { draft with Octra_core.Transaction.ou } in
     let signed = Octra_core.Transaction.sign_with_privkey tx priv in
-    if print_only then begin
+    if List.mem "--prepare" args then begin
+      print_endline (Yojson.Safe.to_string (`Assoc [
+        "tx", Octra_core.Transaction.to_yojson signed;
+        "tx_hash", `String (Octra_core.Transaction.hash signed);
+      ]));
+      Lwt.return_unit
+    end else if print_only then begin
       print_endline (Yojson.Safe.to_string (Octra_core.Transaction.to_yojson signed));
       Lwt.return_unit
     end else

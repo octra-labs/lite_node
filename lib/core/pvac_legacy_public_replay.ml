@@ -76,7 +76,7 @@ let bytes_of_b64 value =
     if Bytes.length bytes = 32 then Some bytes else None
   with _ -> None
 
-let canonical_commitment value =
+let point_of_b64 value =
   match bytes_of_b64 value with
   | None ->
     None
@@ -103,7 +103,7 @@ let stealth_effect ~addr fields =
   else if string_field fields "from" = Some addr then
     begin
       match string_field ed "amount_commitment" with
-      | Some commitment when Option.is_some (canonical_commitment commitment) ->
+      | Some commitment when Option.is_some (point_of_b64 commitment) ->
         Hidden_commitment ("stealth", -1, commitment)
       | Some _ ->
         Poisoned_flow "stealth invalid amount_commitment"
@@ -202,9 +202,9 @@ let point_op op left right =
   try Some (op left right) with _ -> None
 
 let apply_commitment acc = function
-  | Neutral
+  | Neutral -> Some acc
   | Hidden_flow _
-  | Poisoned_flow _ -> Some acc
+  | Poisoned_flow _ -> None
   | Public_encrypt amount ->
     begin
       match public_amount_commitment amount with
@@ -218,7 +218,7 @@ let apply_commitment acc = function
       | Some point -> point_op Pvac_ffi.pedersen_sub acc point
     end
   | Hidden_commitment (_, sign, commitment) ->
-    match canonical_commitment commitment with
+    match point_of_b64 commitment with
     | None -> None
     | Some point ->
       if sign >= 0 then point_op Pvac_ffi.pedersen_add acc point

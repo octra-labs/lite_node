@@ -54,12 +54,15 @@ type deps = {
 
 type t
 
+val native_accelerator :
+  Resource_compute_provider_config.accelerator -> (unit, string) result
 val native_deps :
   limits:Resource_compute_provider_config.limits ->
   store:Octra_core.Store_irmin.t ->
   state_root_at:(int64 -> string option) ->
   deps
 val native_self_test :
+  ?accelerator:Resource_compute_provider_config.accelerator ->
   unit ->
   (Resource_compute_provider_rpc.self_test, string) result Lwt.t
 val create :

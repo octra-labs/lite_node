@@ -16,12 +16,39 @@ type action =
 type sample = {
   epoch : int64;
   active : bool;
-  bonded : bool;
+  bonded : (bool, string) result;
 }
 
 type point = { epoch : int64; head : int64 option; finalized : bool }
 
 type refusal = Moved | Uncommitted | Finalized
+
+type fault = Control | Receipt | Transport | Send | Internal
+
+type stage = Available | Attempt | Marked | Expired | Unread | Capacity | Overload | Closed
+
+type observation = {
+  stage : stage;
+  epoch : int64;
+  proof : Octra_core.Set_fold.proof;
+}
+
+let stage_name = function
+  | Available -> "available"
+  | Attempt -> "attempt"
+  | Marked -> "marked"
+  | Expired -> "expired_unobserved"
+  | Unread -> "receipt_unavailable"
+  | Capacity -> "capacity"
+  | Overload -> "overload"
+  | Closed -> "closed"
+
+let event = function
+  | Control -> "set_actor_control_failed"
+  | Receipt -> "set_actor_read_failed"
+  | Transport -> "set_actor_transport_failed"
+  | Send -> "set_actor_send_failed"
+  | Internal -> "set_actor_internal_failed"
 
 type stats = {
   queued : int;
@@ -34,8 +61,8 @@ type deps = {
   sample : unit -> sample;
   read : epoch:int64 -> (Octra_core.Set_fold.receipt, string) result Lwt.t;
   peers : unit -> int;
-  send : epoch:int64 -> action -> (unit, string) result Lwt.t;
-  warn : string -> unit;
+  send : epoch:int64 -> action -> (unit, fault * string) result Lwt.t;
+  warn : fault -> string -> unit;
 }
 
 type appeal = {
@@ -48,6 +75,7 @@ type state = {
   appeals : appeal String_map.t;
   last_send : int64 option;
   sent : int64;
+  sample_error : string option;
 }
 
 type notice = {
@@ -74,6 +102,7 @@ type command = {
 
 type t = {
   deps : deps;
+  observe : observation -> unit;
   mutable state : state;
   stream : command Queue.t;
   control : command Queue.t;
@@ -110,6 +139,7 @@ let empty = {
   appeals = String_map.empty;
   last_send = None;
   sent = 0L;
+  sample_error = None;
 }
 
 let proof_key (proof : Octra_core.Set_fold.proof) =
@@ -119,6 +149,29 @@ let proof_key (proof : Octra_core.Set_fold.proof) =
     ^ vote.Octra_consensus.C_types.signature
   in
   Digestif.SHA256.digest_string raw |> Digestif.SHA256.to_hex
+
+let observe t stage epoch proof =
+  try t.observe { stage; epoch; proof } with exn ->
+    try t.deps.warn Internal (Printexc.to_string exn) with _ -> ()
+
+let removed epoch receipt before after =
+  String_map.bindings before
+  |> List.filter_map (fun (key, (appeal : appeal)) ->
+    if String_map.mem key after then None
+    else
+      let stage =
+        match receipt with
+        | Some (_, marked) when List.mem appeal.proof.vote.epoch_id marked -> Marked
+        | Some (read_epoch, _) when epoch > appeal.expires && read_epoch > appeal.expires -> Expired
+        | _ when epoch > appeal.expires -> Unread
+        | Some _ | None -> Capacity
+      in
+      Some { stage; epoch; proof = appeal.proof })
+
+let record_changes t before epoch receipt next =
+  let events = removed epoch receipt before next.appeals in
+  t.state <- next;
+  List.iter (fun entry -> observe t entry.stage entry.epoch entry.proof) events
 
 let prune epoch appeals =
   String_map.filter
@@ -136,11 +189,11 @@ let trim appeals =
         if by_expiry <> 0 then by_expiry
         else String.compare left_key right_key)
     in
-    match List.rev ordered with
+    match ordered with
     | [] -> appeals
     | (key, _) :: _ -> String_map.remove key appeals
 
-let add_proof epoch proof appeals =
+let appeal proof =
   let vote = proof.Octra_core.Set_fold.vote in
   let ready = Int64.add vote.Octra_consensus.C_types.epoch_id 2L in
   let expires =
@@ -148,17 +201,19 @@ let add_proof epoch proof appeals =
       vote.epoch_id
       Octra_core.Set_fold.standard.challenge
   in
-  if Int64.compare epoch expires > 0 then appeals
-  else
-    String_map.add (proof_key proof) { proof; ready; expires } appeals
-    |> trim
+  { proof; ready; expires }
 
-let ingest notice state =
-  let appeals = prune notice.epoch state.appeals in
+let add_proof epoch proof appeals =
+  let entry = appeal proof in
+  if epoch > entry.expires then appeals
+  else String_map.add (proof_key proof) entry appeals |> trim
+
+let ingest epoch notice state =
+  let appeals = prune epoch state.appeals in
   let appeals =
     match notice.proof with
     | None -> appeals
-    | Some proof -> add_proof notice.epoch proof appeals
+    | Some proof -> add_proof epoch proof appeals
   in
   { state with appeals }
 
@@ -189,8 +244,9 @@ let acknowledge epoch (receipt : Octra_core.Set_fold.receipt) state =
   { state with appeals }
 
 let decide (sample : sample) (receipt : Octra_core.Set_fold.receipt) state =
-  if not sample.bonded || state.last_send = Some sample.epoch then None
-  else if not sample.active && pulse_due sample.epoch receipt.pulse then Some Pulse
+  if sample.bonded <> Ok true || state.last_send = Some sample.epoch then None
+  else if not sample.active then
+    if pulse_due sample.epoch receipt.pulse then Some Pulse else None
   else
     match ready_appeal sample.epoch state.appeals with
     | Some (_, appeal) -> Some (Appeal appeal.proof)
@@ -239,32 +295,57 @@ let expired command =
   | Read_stats
   | Stop -> false
 
+let permit t (sample : sample) =
+  let error = match sample.bonded with Error reason -> Some reason | Ok _ -> None in
+  let changed = error <> t.state.sample_error in
+  t.state <- { t.state with sample_error = error };
+  if changed then Option.iter (t.deps.warn Control) error;
+  sample.bonded = Ok true
+
 let handle_notice t notice =
   let open Lwt.Syntax in
-  t.state <- ingest notice t.state;
   let sample = t.deps.sample () in
-  if not sample.bonded then Lwt.return_unit
+  let before = match notice.proof with
+    | None -> t.state.appeals
+    | Some proof -> String_map.add (proof_key proof) (appeal proof) t.state.appeals in
+  t.state <- ingest sample.epoch notice t.state;
+  let allowed = permit t sample in
+  if not allowed && String_map.is_empty before then Lwt.return_unit
   else
-    let* receipt = t.deps.read ~epoch:sample.epoch in
+    let* receipt = Lwt.catch
+      (fun () -> t.deps.read ~epoch:sample.epoch)
+      (fun exn -> Lwt.return_error (Printexc.to_string exn)) in
+    let current = t.deps.sample () in
+    let allowed = permit t current in
+    let settle_read marked next =
+      record_changes t before current.epoch marked next in
     match receipt with
-    | Error error -> t.deps.warn error; Lwt.return_unit
-    | Ok _ when (t.deps.sample ()).epoch <> sample.epoch -> Lwt.return_unit
+    | Error error ->
+      settle_read None { t.state with appeals = prune current.epoch t.state.appeals };
+      t.deps.warn Receipt error;
+      Lwt.return_unit
     | Ok receipt ->
-      t.state <- acknowledge sample.epoch receipt t.state;
-      match decide sample receipt t.state with
+      settle_read (Some (sample.epoch, receipt.marked))
+        (acknowledge current.epoch receipt t.state);
+      if current.epoch <> sample.epoch || not allowed then Lwt.return_unit else
+      match decide current receipt t.state with
       | None -> Lwt.return_unit
       | Some _ when t.deps.peers () <= 0 ->
-        t.deps.warn "validator set fold transport has no peers";
+        t.deps.warn Transport "validator set fold transport has no peers";
         Lwt.return_unit
       | Some action ->
-        let* result = t.deps.send ~epoch:sample.epoch action in
+        begin match action with
+        | Pulse -> ()
+        | Appeal proof -> observe t Attempt current.epoch proof
+        end;
+        let* result = t.deps.send ~epoch:current.epoch action in
         begin
           match result with
           | Ok () ->
-            t.state <- settle sample.epoch t.state;
+            t.state <- settle current.epoch t.state;
             Lwt.return_unit
-          | Error error ->
-            t.deps.warn error;
+          | Error (fault, error) ->
+            t.deps.warn fault error;
             Lwt.return_unit
         end
 
@@ -299,7 +380,7 @@ let rec loop t =
           Lwt.catch
             (fun () -> handle_notice t notice)
             (fun exn ->
-              t.deps.warn (Printexc.to_string exn);
+              t.deps.warn Internal (Printexc.to_string exn);
               Lwt.return_unit)
         in
         loop t
@@ -318,24 +399,31 @@ let make_command t ?response message =
   }
 
 let notify t ~epoch event =
-  if not t.open_ then Stopped
-  else if Queue.length t.stream >= stream_capacity then Busy
-  else
-    let proof =
-      Option.map
-        (fun (vote, commit) -> Octra_core.Set_fold.{ vote; commit })
-        event
-    in
+  let proof =
+    Option.map
+      (fun (vote, commit) -> Octra_core.Set_fold.{ vote; commit })
+      event
+  in
+  Option.iter (observe t Available epoch) proof;
+  if not t.open_ then begin
+    Option.iter (observe t Closed epoch) proof;
+    Stopped
+  end else if Queue.length t.stream >= stream_capacity then begin
+    Option.iter (observe t Overload epoch) proof;
+    Busy
+  end else begin
     Queue.push (make_command t (Notice { epoch; proof })) t.stream;
     Lwt_condition.signal t.ready ();
     Accepted
+  end
 
 let wake t ~head =
   notify t ~epoch:(Int64.succ (Int64.of_int head)) None
 
-let create deps =
+let create ?(observe = fun _ -> ()) deps =
   let t = {
     deps;
+    observe;
     state = empty;
     stream = Queue.create ();
     control = Queue.create ();

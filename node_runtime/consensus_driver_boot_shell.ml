@@ -54,6 +54,7 @@ type deps = {
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   get_meta : string -> string option;
+  duty_state : Octra_core.Head_manifest.t -> (Octra_core.Set_fold.t, string) result;
   read_persistent_pending : unit -> string option Lwt.t;
   root_of_head_hash : string -> string;
   root_to_raw32 : string -> string;
@@ -648,6 +649,7 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
     standard = {
       getenv = deps.env;
       get_meta = deps.get_meta;
+      duty_state = deps.duty_state;
       wallet_addr = deps.wallet.address;
       wallet_pub = deps.wallet.pub;
       find_account = deps.find_account;
@@ -657,6 +659,7 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
       proposal_state = deps.proposal_state;
       catchup_active = deps.catchup_active;
       staging_epoch_capacity = deps.proposal_capacity;
+      chain_id = deps.chain_id;
       write_pending = Octra_core.Wal.write_pending_commit deps.data_dir;
       validator_pubkeys_for_epoch = deps.validator_pubkeys_for_epoch;
     };

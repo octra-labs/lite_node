@@ -23,12 +23,24 @@ type policy = {
   account_mode : Octra_core.Rule_graph.mode;
   standard_mode : Octra_core.Rule_graph.mode;
   plan_mode : Octra_core.Rule_graph.mode;
+  exit_mode : Octra_core.Rule_graph.mode;
+  ready_exec_mode : Octra_core.Rule_graph.mode;
+  program_mode : Octra_core.Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }
 
 let policy rules epoch =
   let ( let* ) = Result.bind in
+  let* exit_mode = Octra_core.Rule_graph.exit rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
+  let* ready_exec_mode = Octra_core.Rule_graph.ready_exec rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
+  let* program_mode = Octra_core.Rule_graph.program_source rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
+  let* program_overlap = Octra_core.Rule_graph.program_overlap rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
   let* math =
     Octra_core.Rule_graph.math rules ~epoch
     |> Result.map (fun mode -> mode = Octra_core.Rule_graph.Active)
@@ -69,6 +81,10 @@ let policy rules epoch =
       account_mode;
       standard_mode;
       plan_mode;
+      exit_mode;
+      ready_exec_mode;
+      program_mode;
+      program_overlap;
       math;
       cap_mode;
     }
@@ -88,6 +104,10 @@ let resolve rules ~chain_id ~parent epoch =
       account_mode = policy.account_mode;
       standard_mode = policy.standard_mode;
       plan_mode = policy.plan_mode;
+      exit_mode = policy.exit_mode;
+      ready_exec_mode = policy.ready_exec_mode;
+      program_mode = policy.program_mode;
+      program_overlap = policy.program_overlap;
       math = policy.math;
       cap_mode = policy.cap_mode;
       ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;
@@ -115,6 +135,10 @@ let resolve rules ~chain_id ~parent epoch =
               account_mode = policy.account_mode;
               standard_mode = policy.standard_mode;
               plan_mode = policy.plan_mode;
+              exit_mode = policy.exit_mode;
+              ready_exec_mode = policy.ready_exec_mode;
+              program_mode = policy.program_mode;
+              program_overlap = policy.program_overlap;
               math = policy.math;
               cap_mode = policy.cap_mode;
               ready_config_hash = Octra_core.Rule_graph.ready_config_hash rules;

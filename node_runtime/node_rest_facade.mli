@@ -10,7 +10,7 @@ module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
-  duty_head : unit -> int64 option;
+  duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;

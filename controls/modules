@@ -1,4 +1,5 @@
 bin/bft_control_tx.ml
+bin/fhe_audit.ml
 bin/octra_node.ml
 bin/octra_pvac_worker.ml
 bin/octra_state_sync_client.ml

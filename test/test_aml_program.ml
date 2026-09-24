@@ -245,7 +245,12 @@ let legacy_check () =
   then fail "legacy golden"
 
 let legacy_state_check () =
-  let artifact = need (Source.compile legacy_state) "legacy state" in
+  let artifact = need (Source.compile ~syntax:Octra_vm.Oct_gen.Source legacy_state) "legacy state" in
+  let historical = need (Source.compile_ast ~syntax:Octra_vm.Oct_gen.Forms
+    (Octra_vm.Oct_parse.parse legacy_state)) "legacy forms" in
+  if Digestif.SHA256.(digest_string historical.octb |> to_hex)
+      <> "7aa19244c5e59ef4f46cdfbc51a838bb080895d6e172e54e2123c446d8697425" then
+    fail "legacy state image";
   if Input.storage_kinds artifact.ast <> [] then fail "legacy state schema";
   let run strict code =
     let config =
@@ -266,11 +271,17 @@ let legacy_state_check () =
     | Error reason -> fail ("legacy state OCTB reason = " ^ reason)
   in
   let octb = run false image.code in
-  let wrong = run true artifact.code in
+  let strict = run true artifact.code in
+  let relaxed = run false historical.code in
+  let wrong = run true historical.code in
   if source.stop <> Local.Returned || source.result <> Vm.VBool true then
     fail "legacy state source";
   if octb.stop <> Local.Returned || octb.result <> Vm.VBool true then
     fail "legacy state OCTB";
+  if strict.stop <> Local.Returned || strict.result <> Vm.VBool true then
+    fail "source state strict";
+  if relaxed.stop <> Local.Returned || relaxed.result <> Vm.VBool true then
+    fail "legacy state relaxed";
   if wrong.stop <> Local.Reverted then fail "legacy state strict"
 
 let mixed_check () =

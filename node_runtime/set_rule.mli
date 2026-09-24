@@ -10,6 +10,10 @@ type policy = {
   account_mode : Octra_core.Rule_graph.mode;
   standard_mode : Octra_core.Rule_graph.mode;
   plan_mode : Octra_core.Rule_graph.mode;
+  exit_mode : Octra_core.Rule_graph.mode;
+  ready_exec_mode : Octra_core.Rule_graph.mode;
+  program_mode : Octra_core.Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   cap_mode : Octra_core.Set_fold.cap_mode;
 }

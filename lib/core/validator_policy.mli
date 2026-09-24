@@ -21,6 +21,14 @@ val snapshot_interval : int64
 val unbonding_epochs : int64
 val evidence_epochs : int64
 val parameters : Validator_admission.parameters
+val exit_window : int64
+val exit_wait : int64
+val exit_parameters :
+  Rule_graph.mode -> Validator_admission.parameters -> Validator_admission.parameters
+val evidence_age : Rule_graph.mode -> int64 -> int64
+val exit_id : string
+val withdraw_epoch :
+  chain_id:string -> epoch:int -> Validator_admission.candidate -> (int64, string) result
 val of_env : (string -> string option) -> (t, string) result
 val of_env_exn : (string -> string option) -> t
 val activation_epoch : t -> int option

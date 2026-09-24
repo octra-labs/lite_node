@@ -157,6 +157,7 @@ fi
 printf 'event = install phase = packages\n'
 run_root apt-get update
 run_root apt-get install -y $PACKAGES
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/test/python_check.py"
 if ! command -v pm2 >/dev/null 2>&1; then
   run_root npm install -g pm2
 fi

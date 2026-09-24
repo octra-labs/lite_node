@@ -148,6 +148,8 @@ val p2p_listen_task :
   unit Lwt.t
 
 val node_launch_tasks :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   node_launch_deps ->
   unit Lwt.t list
 
@@ -177,11 +179,15 @@ val run_launch_tasks :
   unit Lwt.t
 
 val run_node_launch_tasks :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   node_launch_deps ->
   close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t
 
 val run_node_runtime :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   node_launch_runtime ->
   unit Lwt.t

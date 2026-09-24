@@ -75,6 +75,10 @@ type fold_ctx = {
   account_mode : Rule_graph.mode;
   standard_mode : Rule_graph.mode;
   plan_mode : Rule_graph.mode;
+  exit_mode : Rule_graph.mode;
+  ready_exec_mode : Rule_graph.mode;
+  program_mode : Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
@@ -150,6 +154,10 @@ let prior_fold _ =
     account_mode = Rule_graph.Prior;
     standard_mode = Rule_graph.Prior;
     plan_mode = Rule_graph.Prior;
+    exit_mode = Rule_graph.Prior;
+    ready_exec_mode = Rule_graph.Prior;
+    program_mode = Rule_graph.Prior;
+    program_overlap = false;
     math = false;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
@@ -575,7 +583,7 @@ let parse_circle_deploy_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.deploy_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.deploy_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -588,7 +596,7 @@ let parse_circle_program_update_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.program_update_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.program_update_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -601,7 +609,7 @@ let parse_circle_asset_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.asset_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.asset_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -614,7 +622,7 @@ let parse_circle_asset_put_encrypted_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.encrypted_asset_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.encrypted_asset_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -627,7 +635,7 @@ let parse_circle_sealed_slot_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.sealed_slot_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.sealed_slot_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -640,7 +648,7 @@ let parse_circle_slot_policy_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.slot_policy_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.slot_policy_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -653,7 +661,7 @@ let parse_circle_state_descriptor_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.state_descriptor_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.state_descriptor_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -666,7 +674,7 @@ let parse_circle_balance_cell_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circle_balance_cell.put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circle_balance_cell.put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -679,7 +687,7 @@ let parse_circle_register_cell_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circle_register_cell.put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circle_register_cell.put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -692,7 +700,7 @@ let parse_circle_transport_policy_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.transport_policy_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.transport_policy_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -705,7 +713,7 @@ let parse_circle_hfhe_policy_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.hfhe_policy_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.hfhe_policy_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -718,7 +726,7 @@ let parse_circle_key_policy_put_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.key_policy_put_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.key_policy_put_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -731,7 +739,7 @@ let parse_circle_key_grant_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.key_grant_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.key_grant_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -744,7 +752,7 @@ let parse_circle_key_extend_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.key_extend_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.key_extend_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -757,7 +765,7 @@ let parse_circle_key_revoke_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.key_revoke_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.key_revoke_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -770,7 +778,7 @@ let parse_circle_key_erase_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.key_erase_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.key_erase_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -783,7 +791,7 @@ let parse_circle_outbox_open_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.outbox_open_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.outbox_open_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -796,7 +804,7 @@ let parse_circle_relay_claim_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.relay_claim_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.relay_claim_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -809,7 +817,7 @@ let parse_circle_relay_cancel_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.relay_cancel_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.relay_cancel_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -822,7 +830,7 @@ let parse_circle_ingress_commit_payload tx =
   | Some payload_json ->
     begin
       try
-        match Circles.ingress_commit_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+        match Circles.ingress_commit_payload_of_yojson (Json_tree.read payload_json) with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
       with e ->
@@ -2546,7 +2554,7 @@ let process_validator_withdraw_tx ~backend ~env tx =
           begin
             match
               Validator_registry.withdraw
-                policy.parameters
+                (Validator_policy.exit_parameters ctx.exit_mode policy.parameters)
                 ~current_epoch:(Int64.of_int env.epoch_id)
                 ~active_addresses
                 ~address:tx.from
@@ -2639,6 +2647,8 @@ let process_validator_evidence_tx ~backend ~env tx =
          ("validator_evidence_rejected", "validator admission is inactive"))
   | Validator_policy.Bonded policy ->
     let current_epoch = Int64.of_int env.epoch_id in
+    let ctx = fold_at backend env.epoch_id in
+    let evidence_epochs = Validator_policy.evidence_age ctx.exit_mode policy.evidence_epochs in
     if env.epoch_id < policy.activation_epoch then
       Lwt.return
         (Stdlib.Error
@@ -2673,7 +2683,7 @@ let process_validator_evidence_tx ~backend ~env tx =
                     Validator_evidence.verify
                       ~chain_id:env.chain_id
                       ~current_epoch
-                      ~evidence_epochs:policy.evidence_epochs
+                      ~evidence_epochs
                       ~bonded_epoch:
                         candidate.Validator_admission.bonded_epoch
                       ~address:tx.to_
@@ -2689,7 +2699,7 @@ let process_validator_evidence_tx ~backend ~env tx =
                       match
                         Validator_registry.apply_slash
                           ~current_epoch
-                          ~evidence_epochs:policy.evidence_epochs
+                          ~evidence_epochs
                           evidence
                           registry
                       with
@@ -2789,7 +2799,7 @@ let normalize_ready_state_root value =
   else
     value
 
-let validate_validator_ready_reference ~env ~head_epoch ~state_root =
+let prior_ready_reference ~env ~head_epoch ~state_root =
   let open Lwt.Syntax in
   let current_head = env.epoch_id - 1 in
   let env_prev_state_root = normalize_ready_state_root env.prev_state_root in
@@ -2815,6 +2825,16 @@ let validate_validator_ready_reference ~env ~head_epoch ~state_root =
         Lwt.return (Error "state_root does not match referenced chain head")
       else
         Lwt.return (Ok ())
+
+let validate_validator_ready_reference ~mode ~env ~parent ~state ~proposal_id
+    ~head_epoch ~state_root =
+  match mode with
+  | Rule_graph.Prior -> prior_ready_reference ~env ~head_epoch ~state_root
+  | Rule_graph.Active ->
+    Validator_ready_policy.reference
+      ~epoch:(Int64.of_int env.epoch_id) ~head:head_epoch
+      ~proposal:proposal_id ~parent ~state
+    |> Lwt.return
 
 let validator_ready_proof ctx tx =
   match ctx.mode with
@@ -2857,7 +2877,10 @@ let validate_validator_ready_policy ~env ctx
               ~head_epoch:ready.head_epoch
               claim
           | Rule_graph.Active ->
-            let head_epoch = Int64.of_int (env.epoch_id - 1) in
+            let head_epoch = match ctx.ready_exec_mode with
+              | Rule_graph.Active -> ready.head_epoch
+              | Rule_graph.Prior -> Int64.of_int (env.epoch_id - 1)
+            in
             if not (Int64.equal ready.head_epoch head_epoch) then
               Error "head_epoch mismatch"
             else
@@ -2868,7 +2891,7 @@ let validate_validator_ready_policy ~env ctx
         end
     end
 
-let update_ready_fold ~backend ~env ~address proof =
+let update_ready_fold ~backend ~env ~head_epoch ~address proof =
   let open Lwt.Syntax in
   let ctx = fold_at backend env.epoch_id in
   match ctx.mode with
@@ -2886,6 +2909,9 @@ let update_ready_fold ~backend ~env ~address proof =
           | None ->
             Set_fold.note_pulse
               ~cap_mode:ctx.cap_mode
+              ?credit:(match ctx.ready_exec_mode with
+                | Rule_graph.Prior -> None
+                | Rule_graph.Active -> Some (Int64.succ head_epoch))
               cfg
               ~epoch:(Int64.of_int env.epoch_id)
               ~active
@@ -2927,9 +2953,20 @@ let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
     | Error error ->
       Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
     | Ok proof ->
+      let* stored = match ctx.ready_exec_mode with
+        | Rule_graph.Prior -> Lwt.return_ok Set_fold.empty
+        | Rule_graph.Active -> load_set_fold backend
+      in
       let* reference =
+        match stored with
+        | Error _ as error -> Lwt.return error
+        | Ok state ->
         validate_validator_ready_reference
+          ~mode:ctx.ready_exec_mode
           ~env
+          ~parent:ctx.parent
+          ~state
+          ~proposal_id:ready.head_proposal_id
           ~head_epoch:ready.head_epoch
           ~state_root:ready.state_root
       in
@@ -2965,6 +3002,7 @@ let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
                       update_ready_fold
                         ~backend
                         ~env
+                        ~head_epoch:ready.head_epoch
                         ~address:tx.from
                         proof
                     in
@@ -3052,9 +3090,14 @@ let process_legacy_validator_ready_tx ~backend ~env tx =
                ("validator_ready_rejected",
                 "fingerprint does not match pending validator set"))
         else
+          let ctx = fold_at backend env.epoch_id in
           let* reference =
             validate_validator_ready_reference
+              ~mode:ctx.ready_exec_mode
               ~env
+              ~parent:ctx.parent
+              ~state:Set_fold.empty
+              ~proposal_id:None
               ~head_epoch:ready.Validator_set_update.head_epoch
               ~state_root:ready.Validator_set_update.state_root
           in

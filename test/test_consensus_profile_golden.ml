@@ -27,6 +27,9 @@ let empty_compat_golden =
 let plan_golden =
   "20cb24dc201d8d065e22915ca4692c06fe9d863d13fea6c0ea88c6631502e636"
 
+let exit_golden =
+  "4fcb797044feff89af203d505acd3762f624fae315fe515cfcc991a1319d13a7"
+
 let sample = [
   "OCTRA_BFT_PROPOSAL_MAX_TXS", "800";
   "OCTRA_BFT_PROPOSAL_MAX_BYTES", "4000000";
@@ -107,6 +110,15 @@ let components ~epoch getenv =
   @ (match Octra_core.Rule_graph.math_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["math", "scalar65_field_signed_cipher_zero_q16"])
+  @ (match Octra_core.Rule_graph.exit_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["validator_exit", Octra_core.Validator_policy.exit_id])
+  @ (match Octra_core.Rule_graph.ready_exec_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["ready_reference", "proposal_delay2_inclusion_first"])
+  @ (match Octra_core.Rule_graph.program_source_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["program_source", "aml_source:oct_gen_count:source_abi:checked_address:option_values:scalar_equality:shape_limits:overlap_64"])
 
 let derived ~epoch getenv =
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
@@ -171,13 +183,26 @@ let () =
     expect "math component count" (List.length (components ~epoch getenv) = 21);
     expect "set plan hash binds components" (value = derived ~epoch getenv);
     expect "set plan hash differs" (value <> standard);
-    expect "set plan switch occurs once" (not (P.switch_after ~chain_id ~applied_epoch:epoch));
+    expect "exit switch follows last prior epoch"
+      (P.switch_after ~chain_id ~applied_epoch:epoch = (epoch = 1_566_999));
     let actual = raw_hex (P.hash ~chain_id ~epoch devnet_env) in
     expect "devnet profile binds components" (actual = raw_hex (derived ~epoch devnet_env));
     Printf.printf "event = set_plan_profile epoch = %d hash = %s\n"
       epoch actual;
     expect "set plan hash golden" (actual = plan_golden))
-    [1_510_000; 1_510_001; max_int];
+    [1_510_000; 1_510_001; 1_541_998; 1_541_999; 1_542_000;
+     1_542_001; 1_548_999; 1_549_000; 1_549_001; 1_552_203;
+     1_562_999; 1_563_000; 1_563_001; 1_566_998; 1_566_999];
+  let epoch = 1_567_000 in
+  expect "exit activation switches profile" (P.switch_after ~chain_id ~applied_epoch:(epoch - 1));
+  let current = P.hash ~chain_id ~epoch devnet_env in
+  expect "exit profile differs" (raw_hex current <> plan_golden);
+  Printf.printf "event = ready_profile epoch = %d hash = %s\n%!" epoch (raw_hex current);
+  expect "exit profile golden" (raw_hex current = exit_golden);
+  expect "exit profile commits parameters" (current = derived ~epoch devnet_env);
+  expect "exit profile stable after activation"
+    (current = P.hash ~chain_id ~epoch:max_int devnet_env);
+  Printf.printf "event = exit_profile epoch = %d hash = %s\n" epoch (raw_hex current);
   List.iter (fun (applied_epoch, expected) ->
     expect "profile switch epoch"
       (P.switch_after ~chain_id ~applied_epoch = expected))
@@ -190,7 +215,8 @@ let () =
       (P.hash ~chain_id:"octra-mainnet" ~epoch getenv = compat);
     expect "other chain does not switch"
       (not (P.switch_after ~chain_id:"octra-mainnet" ~applied_epoch:epoch)))
-    [0; 1_499_999; 1_500_000; 1_509_999; 1_510_000; 1_510_001; max_int];
+    [0; 1_499_999; 1_500_000; 1_509_999; 1_510_000; 1_510_001;
+     1_566_999; 1_567_000; 1_567_001; max_int];
   expect "standard binds chain"
     (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" ~epoch:1_500_000 getenv)));
   print_endline "status = pass test = consensus_profile_golden"

@@ -276,6 +276,17 @@ and parse_infix ts depth lhs min_bp =
   else lhs
 
 and parse_prefix ts depth =
+  let rec collect depth ops =
+    match peek_token ts with
+    | TkMinus -> eat ts; collect (depth + 1) (Neg :: ops)
+    | TkBang -> eat ts; collect (depth + 1) (Not :: ops)
+    | _ ->
+      let value = parse_prefix_tail ts depth in
+      List.fold_left (fun value op -> EUnop (op, value)) value ops
+  in
+  collect depth []
+
+and parse_prefix_tail ts depth =
   match peek_token ts with
   | TkLet -> parse_term_let ts depth
   | TkIf -> parse_term_if ts depth
@@ -294,14 +305,6 @@ and parse_prefix ts depth =
       | TkLBrack -> parse_equal ts depth
       | _ -> parse_named_tail ts "equal"
     end
-  | TkMinus ->
-    eat ts;
-    let e = parse_prefix ts (depth + 1) in
-    EUnop (Neg, e)
-  | TkBang ->
-    eat ts;
-    let e = parse_prefix ts (depth + 1) in
-    EUnop (Not, e)
   | _ -> parse_primary ts
 
 and parse_term_mult ts =

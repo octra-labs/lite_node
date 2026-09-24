@@ -24,7 +24,7 @@ let broadcast_inv io hash =
   io.broadcast_payload
     (Octra_net.P2p_tx_gossip.encode (Octra_net.P2p_tx_gossip.Inv [hash]))
 
-let handle_tx io tx =
+let handle_tx ?duty ?bft_mode io tx =
   let tx_hash = Octra_core.Transaction.hash tx in
   if io.has_tx tx_hash then ()
   else
@@ -33,7 +33,7 @@ let handle_tx io tx =
     else
     let sender_pk = io.sender_pk tx in
     let h12 = Text.hash_short tx_hash in
-    match P2p_tx_admit.admit ~now ~max_drift:io.max_drift ~sender_pk tx with
+    match P2p_tx_admit.admit ?duty ?bft_mode ~now ~max_drift:io.max_drift ~sender_pk tx with
     | P2p_tx_admit.Invalid_address ->
       Log.warn "p2p" "tx_gossip rejected: invalid_address hash = %s" h12
     | P2p_tx_admit.Invalid_payload ->
@@ -50,16 +50,19 @@ let handle_tx io tx =
       | Error e ->
         Log.warn "p2p" "tx_gossip rejected: admission hash = %s reason = %s" h12 e
 
-let handle_legacy io =
+let handle_legacy ?duty ?bft_mode io =
   let c = Octra_net.Oce1.make_cursor io.payload in
   let tx_json = Octra_net.Oce1.get_string c in
   match Octra_core.Tx_payload.decode_admit (Yojson.Safe.from_string tx_json) with
-  | Ok tx -> handle_tx io tx
+  | Ok tx -> handle_tx ?duty ?bft_mode io tx
   | Error e -> Log.warn "p2p" "tx_gossip decode failed: %s" e
 
-let handle_plan io =
+let handle_plan ?duty ?bft_mode io =
   match P2p_tx_plan.plan ~has:io.has_tx io.payload with
   | P2p_tx_plan.Request missing ->
+    let now = io.now () in
+    let missing = List.filter (fun hash ->
+      not (Octra_net.P2p_tx_gossip_guard.recent io.guard ~now hash)) missing in
     if missing <> [] then send_msg io (Octra_net.P2p_tx_gossip.Get missing)
   | P2p_tx_plan.Serve hits ->
     List.iter
@@ -79,11 +82,11 @@ let handle_plan io =
         Log.warn "p2p" "tx_gossip rejected: tx_hash_mismatch advertised = %s actual = %s"
           (Text.hash_short got.advertised)
           (Text.hash_short got.actual)
-      | P2p_tx_plan.Decoded tx -> handle_tx io tx
+      | P2p_tx_plan.Decoded tx -> handle_tx ?duty ?bft_mode io tx
     end
-  | P2p_tx_plan.Legacy -> handle_legacy io
+  | P2p_tx_plan.Legacy -> handle_legacy ?duty ?bft_mode io
 
-let handle io =
+let handle ?duty ?bft_mode io =
   match Octra_net.P2p_tx_gossip_guard.admit io.guard
     ~now:(io.now ())
     ~peer:io.peer_id
@@ -95,8 +98,8 @@ let handle io =
     io.report_bad_peer reason;
     io.close_peer ()
   | Octra_net.P2p_tx_gossip_guard.Accept ->
-    try handle_plan io
+    try handle_plan ?duty ?bft_mode io
     with _ ->
-      try handle_legacy io
+      try handle_legacy ?duty ?bft_mode io
       with exn ->
         Log.warn "p2p" "tx_gossip exception: %s" (Printexc.to_string exn)

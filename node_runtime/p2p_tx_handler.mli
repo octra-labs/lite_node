@@ -17,10 +17,18 @@ type io = {
   max_drift : float;
 }
 
-val handle_tx : io -> Octra_core.Transaction.t -> unit
+val handle_tx :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
+  ?bft_mode:bool -> io -> Octra_core.Transaction.t -> unit
 
-val handle_legacy : io -> unit
+val handle_legacy :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
+  ?bft_mode:bool -> io -> unit
 
-val handle_plan : io -> unit
+val handle_plan :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
+  ?bft_mode:bool -> io -> unit
 
-val handle : io -> unit
+val handle :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
+  ?bft_mode:bool -> io -> unit

@@ -35,7 +35,9 @@ val epoch_tags :
   gc_need:int64 option ->
   Yojson.Safe.t
 
+val enrollment_epoch : int64 option -> Yojson.Safe.t
 val validator_enrollment :
+  chain_id:string ->
   head_epoch:int ->
   address:string ->
   pubkey:string ->

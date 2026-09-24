@@ -300,7 +300,7 @@ type driver_runner_node_wiring = {
     C_driver.catchup_range_response_record option Lwt.t;
 }
 
-let range_cap = 16
+let range_cap = Octra_consensus.C_catchup.range_epochs
 
 let short_hex8 s =
   String.concat ""

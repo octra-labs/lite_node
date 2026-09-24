@@ -279,10 +279,12 @@ let test_source_program_verify () =
     let ledger = Octra_core.Ledger.create store in
     match
       Lwt_main.run
-        (Octra_vm.Contract_rpc.call ~math:false
+        (Octra_vm.Contract_rpc.call
+           ~trusted:[]
+           ~profile:{epoch = 0; math = false; point_ops = false;
+                     object_cost = false; int_work = Octra_vm.Int_work.Active}
            ~store
            ~ledger
-           ~current_epoch:0
            ~get_fhe_pubkey:(fun _ -> None)
            ~storage_json:(fun _ -> `Assoc [])
            ~addr:address
@@ -489,8 +491,10 @@ let test_nested_view_stop () =
         ~bytecode_b64:(Base64.encode_exn compiled.bytecode));
     let ledger = Octra_core.Ledger.create store in
     let run running =
-      let ctx = Octra_vm.Contract_rpc.make_view_ctx ~running ~store ~ledger
-        ~current_epoch:0 ~get_fhe_pubkey:(fun _ -> None) () in
+      let ctx = Octra_vm.Contract_rpc.make_view_ctx ~trusted:[] ~running ~store ~ledger
+        ~profile:{epoch = 0; math = false; point_ops = false;
+                  object_cost = false; int_work = Octra_vm.Int_work.Active}
+        ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
         (fun () -> ctx.call_contract address address "echo" [] 0) ())
     in
@@ -514,7 +518,92 @@ let test_token_actor_overload () =
   if Octra_vm.Token_rpc_actor.data_admitted ~queued:(-1) then
     fail "token actor admitted invalid channel state"
 
+let test_view_profile () =
+  let module R = Octra_core.Rule_graph in
+  let module V = Octra_vm.Contract_rpc in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (R.program_source_activation_for_chain chain_id) in
+  let rules = R.create ~chain_id ~root_at:(fun epoch ->
+    match R.root_after_floor ~chain_id ~floor_epoch:plan.anchor_epoch ~epoch with
+    | Some root -> R.Root root | None -> R.Missing) in
+  with_store (fun store ->
+    let ledger = Octra_core.Ledger.create store in
+    let profile = match V.view_profile rules ~epoch:plan.activation_epoch with
+      | Ok profile -> profile | Error fault -> fail (R.fault_message fault) in
+    let ctx = V.make_view_ctx ~trusted:[] ~profile ~store ~ledger ~get_fhe_pubkey:(fun _ -> None) () in
+    if not (ctx.point_ops && ctx.object_cost && ctx.math) then fail "active view modes absent";
+    if ctx.int_work <> Octra_vm.Int_work.Active then fail "view integer mode differs";
+    if ctx.current_epoch <> plan.activation_epoch then fail "view epoch differs";
+    let missing = R.create ~chain_id ~root_at:(fun _ -> R.Missing) in
+    if Result.is_ok (V.view_profile missing ~epoch:plan.activation_epoch) then
+      fail "view profile ignored anchor")
+
+let test_view_release_keys () =
+  let module V = Octra_vm in
+  let private_key = String.make 32 '\042' in
+  let key = match Mirage_crypto_ec.Ed25519.priv_of_octets private_key with
+    | Ok key -> key | Error _ -> fail "signing key refused" in
+  let public_key = Mirage_crypto_ec.Ed25519.(pub_to_octets (pub_of_priv key)) in
+  let trusted = [V.Program_attestation.{id = "read-key"; public_key}] in
+  let compiled = V.Oct_compile.compile_program
+    "program Signed { public view fn echo(): int { return 7 } public view fn identity(): bytes { return pedersen_identity() } }"
+    |> V.Oct_compile.attest_program ~key_id:"read-key" ~private_key in
+  let raw = match compiled.program_envelope with
+    | Some raw when compiled.error = None -> raw | _ -> fail "signed compile failed" in
+  with_store (fun store ->
+    let address = token_address '3' in
+    Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
+      ~code_hash:Digestif.SHA256.(digest_string raw |> to_hex)
+      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~admission:"binary"
+      ~bytecode_b64:(Base64.encode_exn raw));
+    let ledger = Octra_core.Ledger.create store in
+    let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = true;
+      object_cost = false; int_work = V.Int_work.Active} in
+    let read trusted =
+      V.Contract_rpc.call_params ~trusted ~profile ~store ~ledger
+        ~get_fhe_pubkey:(fun _ -> None) ~storage_json:(fun _ -> `Assoc [])
+        (`List [`String address; `String "echo"; `List []]) |> Lwt_main.run in
+    let nested trusted =
+      let ctx = V.Contract_rpc.make_view_ctx ~trusted ~profile ~store ~ledger
+        ~get_fhe_pubkey:(fun _ -> None) () in
+      Lwt_main.run (Lwt_preemptive.detach
+        (fun () -> ctx.call_contract address address "echo" [] 0) ()) in
+    with_chaindata (fun chaindata ->
+      let abi ?(point_ops = true) trusted = Lwt_main.run
+        (V.Contract_rpc.abi_params ~trusted ~point_ops ~store ~chaindata
+          (`List [`String address])) in
+      begin match abi ~point_ops:false trusted with
+      | Error error when error.Octra_core.Rpc.code = 112 -> ()
+      | _ -> fail "signed ABI ignored opcode profile"
+      end;
+      let wrong = [V.Program_attestation.{id = "read-key";
+        public_key = String.make 32 'x'}] in
+      List.iter (fun keys ->
+        match abi keys with
+        | Error error when error.Octra_core.Rpc.code = 112 -> ()
+        | _ -> fail "signed ABI accepted wrong trust") [[]; wrong];
+      match abi trusted with
+      | Ok (`Assoc fields) when
+          List.assoc_opt "methods" fields =
+            Some (`List [`Assoc ["name", `String "echo"; "view", `Bool true];
+              `Assoc ["name", `String "identity"; "view", `Bool true]]) -> ()
+      | Error error -> fail ("signed ABI refused: " ^ error.Octra_core.Rpc.message)
+      | Ok _ -> fail "signed ABI methods differ");
+    if Result.is_ok (read []) || Result.is_ok (nested []) then
+      fail "unsigned trust admitted signed program";
+    begin match read trusted with
+    | Ok (`Assoc fields) when List.assoc_opt "result" fields = Some (`String "7") -> ()
+    | Error error -> fail ("signed read refused: " ^ error.Octra_core.Rpc.message)
+    | Ok _ -> fail "signed read result differs"
+    end;
+    match nested trusted with
+    | Ok value when value.V.Contract_vm.return_value = V.Contract_vm.VInt (Z.of_int 7) -> ()
+    | Error reason -> fail ("signed nested read refused: " ^ reason)
+    | Ok _ -> fail "signed nested result differs")
+
 let () =
+  test_view_release_keys ();
+  test_view_profile ();
   test_view_effort_limit ();
   test_compile_limit ();
   test_storage_dump_disabled ();

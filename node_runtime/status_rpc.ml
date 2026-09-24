@@ -44,9 +44,11 @@ let enrollment_epoch = function
   | None -> `Null
   | Some epoch -> `String (Int64.to_string epoch)
 
-let validator_enrollment ~head_epoch ~address ~pubkey
+let validator_enrollment ~chain_id ~head_epoch ~address ~pubkey
     (candidate : Octra_core.Validator_admission.candidate option) =
-  match candidate with
+  if head_epoch < 0 then
+    Error (Rpc.err (-32000) "invalid committed validator head" None)
+  else match candidate with
   | None ->
     Ok
       (`Assoc [
@@ -59,6 +61,8 @@ let validator_enrollment ~head_epoch ~address ~pubkey
         "bonded_epoch", `Null;
         "ready_epoch", `Null;
         "exit_epoch", `Null;
+        "withdraw_epoch", `Null;
+        "withdraw_remaining_epochs", `Null;
       ])
   | Some candidate ->
     let candidate_pubkey = Base64.encode_exn candidate.pubkey in
@@ -73,8 +77,16 @@ let validator_enrollment ~head_epoch ~address ~pubkey
         | None, Some _ -> "ready"
         | None, None -> "bonded"
       in
-      Ok
-        (`Assoc [
+      let withdrawal =
+        match candidate.exit_epoch with
+        | None -> Ok None
+        | Some _ ->
+          Octra_core.Validator_policy.withdraw_epoch ~chain_id ~epoch:head_epoch candidate
+          |> Result.map Option.some
+          |> Result.map_error (fun reason -> Rpc.err (-32000) reason None)
+      in
+      Result.map (fun withdraw_epoch ->
+        `Assoc [
           "head_epoch", `Int head_epoch;
           "address", `String address;
           "consensus_pubkey", `String pubkey;
@@ -84,7 +96,11 @@ let validator_enrollment ~head_epoch ~address ~pubkey
           "bonded_epoch", `String (Int64.to_string candidate.bonded_epoch);
           "ready_epoch", enrollment_epoch candidate.ready_epoch;
           "exit_epoch", enrollment_epoch candidate.exit_epoch;
-        ])
+          "withdraw_epoch", enrollment_epoch withdraw_epoch;
+          "withdraw_remaining_epochs", enrollment_epoch
+            (Option.map (fun epoch -> Int64.max 0L
+              (Int64.sub epoch (Int64.of_int head_epoch))) withdraw_epoch);
+        ]) withdrawal
 
 let consensus_peer_states
     ~now ~diag ~peer_records ~voting ~voting_reason ~round_state ~round_peers

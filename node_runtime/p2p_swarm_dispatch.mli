@@ -24,6 +24,8 @@ type deps = {
 }
 
 val handle_frame :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   deps ->
   Octra_net.P2p_frame.frame ->
   unit

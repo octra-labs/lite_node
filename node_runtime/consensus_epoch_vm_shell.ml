@@ -250,6 +250,8 @@ type live_vm_tx_args = {
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
+  program_mode : Octra_core.Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   epoch : int;
   now : unit -> float;
@@ -311,6 +313,8 @@ type live_sender_vm_tx_args = {
   tx : Transaction.t;
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
+  program_mode : Octra_core.Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   current_epoch : unit -> int;
   epoch_time_ms : int64;
@@ -551,8 +555,10 @@ let run_direct_exec spec ~fee ~target ~apply_value_effect ~log_failed
       log_failed meta target call.method_name error;
       reject_after_fee fee meta.failure_type error);
     reject;
-    crash = (fun meta err ->
-      reject_after_fee fee meta.exception_type err);
+    crash = (fun meta error ->
+      match error with
+      | Octra_circle_runtime.Circle_exec.Execution_unavailable _ -> Lwt.fail error
+      | _ -> reject_after_fee fee meta.exception_type (Printexc.to_string error));
   }
 
 let run_direct_call (deps : 'result direct_call_deps) ~domain ~reject_domain
@@ -796,13 +802,19 @@ let run_program_deploy_tx (deps : vm_tx_deps) tx =
             runtime.log_constructor_failed result.contract_addr reason;
             runtime.reject_after_fee tx.ou "constructor_failed" reason)
 
-let prepare_program_package ~point_ops (tx : Transaction.t) =
+let prepare_program_package ~overlap ~program_mode ~point_ops (tx : Transaction.t) =
   match tx.encrypted_data with
   | None -> Lwt.return_error "Program package missing"
   | Some encoded ->
+    let compiler = Program_package.compiler_mode program_mode in
+    let admit =
+      if overlap && compiler = Program_package.Source then
+        Program_package.admit_transition ~point_ops
+      else Program_package.admit_base64 ~compiler ~point_ops
+    in
     Lwt_preemptive.detach
       (fun () ->
-        match Program_package.admit_base64 ~point_ops encoded with
+        match admit encoded with
         | Ok package -> Ok package
         | Error error -> Error (Program_package.error_message error))
       ()
@@ -860,7 +872,8 @@ let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
             deps.log_failed err;
             deps.reject_after_fee fee "multi_exec_failed" err
         with
-        | Tx_effects.Commit_failed _ as error -> raise error
+        | (Tx_effects.Commit_failed _ | Stack_overflow | Out_of_memory) as error ->
+          raise error
         | error ->
           deps.reject_after_fee fee "multi_exec_exception"
             (Printexc.to_string error))
@@ -1004,6 +1017,8 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       { contract_addr; receipt });
     program_prepare = prepare_program_package
+      ~overlap:args.program_overlap
+      ~program_mode:args.program_mode
       ~point_ops:
         (match args.proof_mode with
          | Octra_core.Rule_graph.Prior -> false
@@ -1165,6 +1180,8 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
       args.reject "malformed_transaction" reason);
     max_multi_exec_calls = max_multi_exec_calls ~env:Sys.getenv_opt;
     proof_mode = args.proof_mode;
+    program_mode = args.program_mode;
+    program_overlap = args.program_overlap;
     math = args.math;
     epoch = args.current_epoch ();
     now = Unix.gettimeofday;

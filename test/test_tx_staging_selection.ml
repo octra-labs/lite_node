@@ -352,7 +352,8 @@ let check_ready_gap () =
     else Some (if addr = sender 3 then 1 else 0)
   in
   let read capacity =
-    Tx_staging.ready_epoch_txs ~capacity ~confirmed_nonce |> List.map identity
+    Tx_staging.ready_epoch_txs ~accept:(fun _ -> true) ~capacity ~confirmed_nonce
+    |> List.map identity
   in
   let capacity = Tx_staging.max_ou_per_epoch in
   let before = Tx_staging.staging_size () in
@@ -376,7 +377,7 @@ let check_ready_gap () =
   in
   let contents = snapshot () in
   let moved =
-    Tx_staging.ready_epoch_txs ~capacity
+    Tx_staging.ready_epoch_txs ~accept:(fun _ -> true) ~capacity
       ~confirmed_nonce:(fun addr ->
         if addr = sender 1 then Some 1 else confirmed_nonce addr)
     |> List.map identity
@@ -389,7 +390,8 @@ let check_ready_gap () =
   List.iter add [first; next; used; unknown; later; other; third; second];
   check "ready order ignores insertion" (read capacity = filled);
   check "nonce limit has no successor"
-    (Tx_staging.ready_epoch_txs ~capacity ~confirmed_nonce:(fun _ -> Some max_int) = [])
+    (Tx_staging.ready_epoch_txs ~accept:(fun _ -> true) ~capacity
+       ~confirmed_nonce:(fun _ -> Some max_int) = [])
 
 let check_ready_cost () =
   Tx_staging.clear ();
@@ -401,7 +403,8 @@ let check_ready_cost () =
   let capacity = Z.add (Transaction.ou_cost first) (Transaction.ou_cost other) in
   check "middle cost exceeds budget" (Z.gt (Transaction.ou_cost second) capacity);
   let selected =
-    Tx_staging.ready_epoch_txs ~capacity ~confirmed_nonce:(fun _ -> Some 0)
+    Tx_staging.ready_epoch_txs ~accept:(fun _ -> true) ~capacity
+      ~confirmed_nonce:(fun _ -> Some 0)
     |> List.map identity
   in
   check "over budget suffix omitted" (selected = List.map identity [first; other])

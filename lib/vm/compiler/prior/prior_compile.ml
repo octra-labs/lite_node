@@ -256,7 +256,9 @@ let program_certificate raw effects facts =
         :: ("facts", facts_json facts)
         :: fields)))
     | _ -> Error "program certificate must be an object"
-  with _ -> Error "invalid program certificate"
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> Error "invalid program certificate"
 
 let certificate_json ~declaration ~source_mode ~source_material ~bytecode ~verification_json =
   let verification_hash = sha256_hex verification_json in
@@ -452,8 +454,7 @@ let merge_interfaces ast interfaces =
 
 let compile_exception = function
   | Compile_limit message -> error_result message
-  | Stack_overflow -> error_result "Program compiler complexity limit exceeded"
-  | Out_of_memory -> raise Out_of_memory
+  | (Stack_overflow | Out_of_memory) as error -> raise error
   | error ->
     error_result (Printf.sprintf "compile error: %s" (Printexc.to_string error))
 

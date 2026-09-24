@@ -353,9 +353,8 @@ and flow program trail cache env owner =
   in
   walk cache env owner.fn_body
 
-and expr program trail cache env value =
+and expr_op cache value =
   let unary make expected result input =
-    let* input, cache = expr program trail cache env input in
     let* () = same expected input.typ result in
     let* value =
       node (make input.term) expected (input.nodes + 1) input.depth input.calls
@@ -363,8 +362,6 @@ and expr program trail cache env value =
     Ok (value, cache)
   in
   let binary make expected result left right =
-    let* left, cache = expr program trail cache env left in
-    let* right, cache = expr program trail cache env right in
     let* () = same expected left.typ result in
     let* () = same expected right.typ result in
     let* value =
@@ -375,8 +372,6 @@ and expr program trail cache env value =
     Ok (value, cache)
   in
   let compare rel left right =
-    let* left, cache = expr program trail cache env left in
-    let* right, cache = expr program trail cache env right in
     let reason = "direct form comparison requires int" in
     let* () = same C_syn.TInt left.typ reason in
     let* () = same C_syn.TInt right.typ reason in
@@ -384,6 +379,101 @@ and expr program trail cache env value =
       node (C_syn.Cmp (rel, left.term, right.term)) C_syn.TBool
         (left.nodes + right.nodes + 1) (Int.max left.depth right.depth)
         (Int.max left.calls right.calls)
+    in
+    Ok (value, cache)
+  in
+  match value with
+  | `Binary (Add, left, right) ->
+    binary (fun left right -> C_syn.Add (left, right)) C_syn.TInt
+      "direct form addition requires int" left right
+  | `Binary (Sub, left, right) ->
+    binary (fun left right -> C_syn.Sub (left, right)) C_syn.TInt
+      "direct form subtraction requires int" left right
+  | `Binary (Mul, left, right) ->
+    binary (fun left right -> C_syn.Mul (left, right)) C_syn.TInt
+      "direct form multiplication requires int" left right
+  | `Binary (Div, left, right) ->
+    binary (fun left right -> C_syn.Div (left, right)) C_syn.TInt
+      "direct form division requires int" left right
+  | `Binary (Mod, left, right) ->
+    binary (fun left right -> C_syn.Mod (left, right)) C_syn.TInt
+      "direct form remainder requires int" left right
+  | `Binary (Lt, left, right) -> compare C_syn.Lt left right
+  | `Binary (Le, left, right) -> compare C_syn.Le left right
+  | `Binary (Gt, left, right) -> compare C_syn.Gt left right
+  | `Binary (Ge, left, right) -> compare C_syn.Ge left right
+  | `Binary ((Eq | Neq as op), left, right) ->
+    let* () = same left.typ right.typ "direct form equality type differs" in
+    let equal = C_syn.Eq (left.typ, left.term, right.term) in
+    let term =
+      if op = Eq then equal
+      else C_syn.Eq (C_syn.TBool, equal, C_syn.KBool false)
+    in
+    let extra = if op = Eq then 1 else 3 in
+    let* value =
+      node term C_syn.TBool (left.nodes + right.nodes + extra)
+        (Int.max left.depth right.depth)
+        (Int.max left.calls right.calls)
+    in
+    Ok (value, cache)
+  | `Binary (And, left, right) ->
+    let reason = "direct form conjunction requires bool" in
+    let* () = same C_syn.TBool left.typ reason in
+    let* () = same C_syn.TBool right.typ reason in
+    let term = C_syn.If (left.term, right.term, C_syn.KBool false) in
+    let* value =
+      node term C_syn.TBool (left.nodes + right.nodes + 2)
+        (Int.max left.depth right.depth)
+        (Int.max left.calls right.calls)
+    in
+    Ok (value, cache)
+  | `Binary (Or, left, right) ->
+    let reason = "direct form disjunction requires bool" in
+    let* () = same C_syn.TBool left.typ reason in
+    let* () = same C_syn.TBool right.typ reason in
+    let term = C_syn.If (left.term, C_syn.KBool true, right.term) in
+    let* value =
+      node term C_syn.TBool (left.nodes + right.nodes + 2)
+        (Int.max left.depth right.depth)
+        (Int.max left.calls right.calls)
+    in
+    Ok (value, cache)
+  | `Unary (Neg, input) ->
+    unary (fun value -> C_syn.Neg value) C_syn.TInt
+      "direct form negation requires int" input
+  | `Unary (Not, input) ->
+    unary
+      (fun value -> C_syn.Eq (C_syn.TBool, value, C_syn.KBool false))
+      C_syn.TBool "direct form negation requires bool" input
+
+and expr program trail cache env value =
+  let rec descend cache frames = function
+    | EBinop (op, left, right) ->
+      descend cache (`Right (op, right) :: frames) left
+    | EUnop (op, value) -> descend cache (`Unary op :: frames) value
+    | value ->
+      let* value, cache = expr_atom program trail cache env value in
+      finish cache frames value
+  and finish cache frames value =
+    match frames with
+    | [] -> Ok (value, cache)
+    | `Right (op, right) :: rest ->
+      descend cache (`Left (op, value) :: rest) right
+    | `Left (op, left) :: rest ->
+      let* value, cache = expr_op cache (`Binary (op, left, value)) in
+      finish cache rest value
+    | `Unary op :: rest ->
+      let* value, cache = expr_op cache (`Unary (op, value)) in
+      finish cache rest value
+  in
+  descend cache [] value
+
+and expr_atom program trail cache env value =
+  let unary make expected result input =
+    let* input, cache = expr program trail cache env input in
+    let* () = same expected input.typ result in
+    let* value =
+      node (make input.term) expected (input.nodes + 1) input.depth input.calls
     in
     Ok (value, cache)
   in
@@ -519,74 +609,7 @@ and expr program trail cache env value =
           nodes = 1; depth = 0; calls = 0 }, cache)
       | None -> Error ("direct form variable is absent = " ^ value)
     end
-  | EBinop (Add, left, right) ->
-    binary (fun left right -> C_syn.Add (left, right)) C_syn.TInt
-      "direct form addition requires int" left right
-  | EBinop (Sub, left, right) ->
-    binary (fun left right -> C_syn.Sub (left, right)) C_syn.TInt
-      "direct form subtraction requires int" left right
-  | EBinop (Mul, left, right) ->
-    binary (fun left right -> C_syn.Mul (left, right)) C_syn.TInt
-      "direct form multiplication requires int" left right
-  | EBinop (Div, left, right) ->
-    binary (fun left right -> C_syn.Div (left, right)) C_syn.TInt
-      "direct form division requires int" left right
-  | EBinop (Mod, left, right) ->
-    binary (fun left right -> C_syn.Mod (left, right)) C_syn.TInt
-      "direct form remainder requires int" left right
-  | EBinop (Lt, left, right) -> compare C_syn.Lt left right
-  | EBinop (Le, left, right) -> compare C_syn.Le left right
-  | EBinop (Gt, left, right) -> compare C_syn.Gt left right
-  | EBinop (Ge, left, right) -> compare C_syn.Ge left right
-  | EBinop ((Eq | Neq as op), left, right) ->
-    let* left, cache = expr program trail cache env left in
-    let* right, cache = expr program trail cache env right in
-    let* () = same left.typ right.typ "direct form equality type differs" in
-    let equal = C_syn.Eq (left.typ, left.term, right.term) in
-    let term =
-      if op = Eq then equal
-      else C_syn.Eq (C_syn.TBool, equal, C_syn.KBool false)
-    in
-    let extra = if op = Eq then 1 else 3 in
-    let* value =
-      node term C_syn.TBool (left.nodes + right.nodes + extra)
-        (Int.max left.depth right.depth)
-        (Int.max left.calls right.calls)
-    in
-    Ok (value, cache)
-  | EBinop (And, left, right) ->
-    let* left, cache = expr program trail cache env left in
-    let* right, cache = expr program trail cache env right in
-    let reason = "direct form conjunction requires bool" in
-    let* () = same C_syn.TBool left.typ reason in
-    let* () = same C_syn.TBool right.typ reason in
-    let term = C_syn.If (left.term, right.term, C_syn.KBool false) in
-    let* value =
-      node term C_syn.TBool (left.nodes + right.nodes + 2)
-        (Int.max left.depth right.depth)
-        (Int.max left.calls right.calls)
-    in
-    Ok (value, cache)
-  | EBinop (Or, left, right) ->
-    let* left, cache = expr program trail cache env left in
-    let* right, cache = expr program trail cache env right in
-    let reason = "direct form disjunction requires bool" in
-    let* () = same C_syn.TBool left.typ reason in
-    let* () = same C_syn.TBool right.typ reason in
-    let term = C_syn.If (left.term, C_syn.KBool true, right.term) in
-    let* value =
-      node term C_syn.TBool (left.nodes + right.nodes + 2)
-        (Int.max left.depth right.depth)
-        (Int.max left.calls right.calls)
-    in
-    Ok (value, cache)
-  | EUnop (Neg, input) ->
-    unary (fun value -> C_syn.Neg value) C_syn.TInt
-      "direct form negation requires int" input
-  | EUnop (Not, input) ->
-    unary
-      (fun value -> C_syn.Eq (C_syn.TBool, value, C_syn.KBool false))
-      C_syn.TBool "direct form negation requires bool" input
+  | EBinop _ | EUnop _ -> expr program trail cache env value
   | ETernary (guard, yes, no) ->
     let* guard, cache = expr program trail cache env guard in
     let* yes, cache = expr program trail cache env yes in
@@ -786,25 +809,30 @@ let rec host_infer program values = function
       | Some _ | None -> None
     end
   | EBinop ((Eq | Neq | Lt | Gt | Le | Ge | And | Or), _, _) -> Some TBool
-  | EBinop (Add, left, right) ->
-    begin
-      match host_infer program values left, host_infer program values right with
-      | Some left, Some right when Oct_types.text left || Oct_types.text right ->
-        Some TString
-      | Some left, Some right
-          when Oct_types.numeric left && Oct_types.numeric right ->
-        Some (Oct_types.numeric_result left right)
-      | Some _, Some _ | Some _, None | None, Some _ | None, None -> None
-    end
-  | EBinop ((Sub | Mul | Div | Mod), left, right) ->
-    begin
-      match host_infer program values left, host_infer program values right with
-      | Some left, Some right
-          when Oct_types.numeric left && Oct_types.numeric right ->
-        Some (Oct_types.numeric_result left right)
-      | Some _, Some _ | Some _, None | None, Some _ | None, None -> None
-    end
-  | EUnop (_, value) -> host_infer program values value
+  | (EBinop ((Add | Sub | Mul | Div | Mod), _, _) | EUnop _) as value ->
+    let rec descend frames = function
+      | EBinop ((Add | Sub | Mul | Div | Mod as op), left, right) ->
+        descend (`Left (op, left) :: frames) right
+      | EUnop (_, value) -> descend frames value
+      | value -> finish frames (host_infer program values value)
+    and finish frames value =
+      match frames with
+      | [] -> value
+      | `Left (op, left) :: rest -> descend (`Right (op, value) :: rest) left
+      | `Right (op, right) :: rest ->
+        let value =
+          match value, right with
+          | Some left, Some right
+              when op = Add && (Oct_types.text left || Oct_types.text right) ->
+            Some TString
+          | Some left, Some right
+              when Oct_types.numeric left && Oct_types.numeric right ->
+            Some (Oct_types.numeric_result left right)
+          | Some _, Some _ | Some _, None | None, Some _ | None, None -> None
+        in
+        finish rest value
+    in
+    descend [] value
   | ECall (name, _) ->
     begin
       match List.find_opt (fun value -> String.equal value.fn_name name) program.funcs with
@@ -898,8 +926,7 @@ let rec check_expr program line column values = function
   | EArray keys
   | ETuple keys -> check_exprs program line column values keys
   | EBinop (_, left, right) ->
-    let* () = check_expr program line column values left in
-    check_expr program line column values right
+    check_exprs program line column values [left; right]
   | EUnop (_, value)
   | EBalance value -> check_expr program line column values value
   | EStoragePath (_, keys, _)
@@ -927,6 +954,10 @@ let rec check_expr program line column values = function
 
 and check_exprs program line column values = function
   | [] -> Ok ()
+  | EBinop (_, left, right) :: rest ->
+    check_exprs program line column values (left :: right :: rest)
+  | (EUnop (_, value) | EBalance value) :: rest ->
+    check_exprs program line column values (value :: rest)
   | value :: rest ->
     let* () = check_expr program line column values value in
     check_exprs program line column values rest
@@ -1121,7 +1152,7 @@ let rec refs_expr program (forms, calls) = function
   | EIndexField (_, values, _) -> refs_exprs program (forms, calls) values
   | EEqual (_, left, right)
   | EBinop (_, left, right) ->
-    refs_expr program (refs_expr program (forms, calls) left) right
+    refs_exprs program (forms, calls) [left; right]
   | ETernary (guard, yes, no) ->
     let found = refs_expr program (forms, calls) guard in
     let found = refs_expr program found yes in
@@ -1156,6 +1187,10 @@ let rec refs_expr program (forms, calls) = function
 
 and refs_exprs program found = function
   | [] -> found
+  | (EEqual (_, left, right) | EBinop (_, left, right)) :: rest ->
+    refs_exprs program found (left :: right :: rest)
+  | (EAction (_, value) | EUnop (_, value) | EBalance value) :: rest ->
+    refs_exprs program found (value :: rest)
   | value :: rest ->
     refs_exprs program (refs_expr program found value) rest
 

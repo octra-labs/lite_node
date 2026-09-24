@@ -182,7 +182,6 @@ type verified_proposal_route =
     }
 
 type proposal_wait = {
-  gen : int;
   pid : string;
   proposal : C_types.propose;
   route : verified_proposal_route;
@@ -255,7 +254,6 @@ type t = {
   catchup_responses : (string, catchup_range_response_record list) Hashtbl.t;
   peer_states : (string, peer_state_record) Hashtbl.t;
   round_peers : (string, round_peer_record) Hashtbl.t;
-  resource_attestations : (string, Resource_attestations.attestation) Hashtbl.t;
   resource_admission : Resource_attestation_admission.pool;
   vote_evidence : (string, C_evidence.vote_conflict) Hashtbl.t;
   activated_validator_set_fingerprints : (string, bool) Hashtbl.t;
@@ -295,6 +293,7 @@ type t = {
   mutable round_spread_warned_at : float;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable proposal_slot : (proposal_job, proposal_reply) C_work_slot.t;
+  proposal_relay : (string option * Frame.frame) C_relay.t;
   mutable on_validator_set_activated :
     C_types.validator_set -> string -> unit Lwt.t;
   mutable on_validator_set_relief :
@@ -465,7 +464,6 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
     catchup_responses = Hashtbl.create 8;
     peer_states = Hashtbl.create 16;
     round_peers = Hashtbl.create 32;
-    resource_attestations = Hashtbl.create 256;
     resource_admission = Resource_attestation_admission.create_pool ();
     vote_evidence = Hashtbl.create 16;
     activated_validator_set_fingerprints = Hashtbl.create 8;
@@ -504,6 +502,15 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
     round_spread_warned_at = 0.0;
     proposal_work_gate = C_proposal_work_gate.create ();
     proposal_slot = C_work_slot.empty;
+    proposal_relay = C_relay.create
+      ~now:(fun () -> Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1e9)
+      ~wait:Lwt_unix.sleep
+      ~warn:(fun reason ->
+        log_node config.my_addr "event = proposal_relay reason = %s" reason)
+      ~send:(fun (except, frame) ->
+        match except with
+        | None -> Octra_net.P2p_swarm.broadcast swarm frame
+        | Some except -> Octra_net.P2p_swarm.broadcast_except swarm ~except frame);
     on_validator_set_activated =
       (fun _ _ -> Lwt.return_unit);
     on_validator_set_relief =
@@ -1967,10 +1974,17 @@ let defer_verified_proposal t (p : C_types.propose) =
 
 let defer_pending_proposal t (p : C_types.propose) =
   let height = t.engine.state.height in
-  if height = Int64.max_int
-     || p.epoch_id <> Int64.succ height
-     || p.round < 0
-     || p.round > C_engine.max_round_ahead
+  let current = p.epoch_id = height && proposal_verify_current t p
+                && p.round > t.engine.state.round in
+  let next = height <> Int64.max_int && p.epoch_id = Int64.succ height
+             && p.round >= 0 && p.round <= C_engine.max_round_ahead in
+  Hashtbl.filter_map_inplace
+    (fun _ (entry : C_types.propose) ->
+      if entry.epoch_id < height
+         || (entry.epoch_id = height && entry.round < t.engine.state.round)
+      then None else Some entry)
+    t.pending_proposals;
+  if not (current || next)
   then
     false
   else
@@ -1981,6 +1995,17 @@ let defer_pending_proposal t (p : C_types.propose) =
       Hashtbl.add t.pending_proposals key p;
       true
     end
+
+let queue_verified_proposal t route (p : C_types.propose) =
+  let except, payload =
+    match route with
+    | Publish_verified_proposal -> None, C_codec.encode_propose p
+    | Relay_verified_proposal { source_peer; payload } -> Some source_peer, payload
+  in
+  C_relay.offer t.proposal_relay
+    ~generation:t.engine.generation
+    ~key:(Printf.sprintf "%Ld:%d:%s" p.epoch_id p.round (C_hash.proposal_id p.header))
+    (except, { Frame.msg_type = Frame.msg_cons_propose; payload })
 
 let replay_deferred_proposal t =
   let height = t.engine.state.height in
@@ -1998,7 +2023,11 @@ let replay_deferred_proposal t =
       p
       ~verify_fn:(verify_engine_signature t)
       ~execute_fn:(fun _ -> true)
-      ~sign_fn:t.config.sign_fn
+      ~sign_fn:t.config.sign_fn;
+    (match t.engine.current_proposal with
+     | Some accepted when accepted = p ->
+       queue_verified_proposal t Publish_verified_proposal p
+     | Some _ | None -> ())
 
 let clear_pace t =
   let prior = t.pace in
@@ -2023,6 +2052,12 @@ let clear_round_sync_jump t ~height ~round =
                     && wait.proposal.round >= round -> ()
    | Some _
    | None -> t.proposal_wait <- None);
+  Hashtbl.filter_map_inplace
+    (fun _ (proposal : C_types.propose) ->
+      if proposal.epoch_id > height
+         || (proposal.epoch_id = height && proposal.round >= round)
+      then Some proposal else None)
+    t.pending_proposals;
   Hashtbl.filter_map_inplace
     (fun _ (proposal : C_types.propose) ->
       if proposal.epoch_id = height && proposal.round >= round then
@@ -2115,7 +2150,19 @@ let historical_replay_needed t msg_type payload =
     false
 
 let resource_attestation_pool t =
-  Hashtbl.fold (fun _ attestation acc -> attestation :: acc) t.resource_attestations []
+  match t.config.resource_committee_config with
+  | None -> []
+  | Some cfg ->
+    let window = Resource_attestation_admission.{
+      current_epoch = t.config.local_head_epoch ();
+      fraud_window = cfg.fraud_window;
+      future_window = cfg.future_window;
+    } in
+    if not (Resource_attestation_admission.valid_window window) then []
+    else begin
+      Resource_attestation_admission.prune t.resource_admission window;
+      Resource_attestation_admission.accepted t.resource_admission
+    end
 
 let vote_evidence_window = 128L
 let max_vote_evidence = 4_096
@@ -2596,8 +2643,8 @@ let maybe_activate_resource_committee t ~target_epoch =
                 when not (Resource_attestation_flow.ready_for_voting
                   ~minimum_weight:cfg.minimum_weight snapshot) ->
                   log_node t.config.my_addr
-                    "event = resource_committee_pending target_epoch = %Ld source_epoch = %Ld weight = %Ld minimum = %Ld"
-                    target_epoch snapshot.source_epoch snapshot.total_weight cfg.minimum_weight;
+                    "event = resource_committee_pending target_epoch = %Ld source_epoch = %Ld weight = %s minimum = %Ld"
+                    target_epoch snapshot.source_epoch (Z.to_string snapshot.total_weight) cfg.minimum_weight;
                   Lwt.return_unit
               | Some snapshot ->
                   match Resource_attestation_flow.validator_set_of_committee
@@ -2614,9 +2661,9 @@ let maybe_activate_resource_committee t ~target_epoch =
                       t.n_validators <- validator_set.C_types.n;
                       let root_hex = raw_to_hex snapshot.committee_root in
                       log_node t.config.my_addr
-                        "event = resource_committee_activated target_epoch = %Ld source_epoch = %Ld n = %d quorum = %d weight = %Ld root = %s"
+                        "event = resource_committee_activated target_epoch = %Ld source_epoch = %Ld n = %d quorum = %d weight = %s root = %s"
                         target_epoch snapshot.source_epoch
-                        validator_set.n validator_set.quorum snapshot.total_weight
+                        validator_set.n validator_set.quorum (Z.to_string snapshot.total_weight)
                         (String.sub root_hex 0 (min 16 (String.length root_hex)));
                       cfg.on_committee_selected snapshot
 
@@ -2703,25 +2750,10 @@ let admit_resource_attestation t attestation =
             t.resource_admission
             attestation
 
-let send_verified_proposal t route (p : C_types.propose) =
-  match route with
-  | Publish_verified_proposal ->
-    Octra_net.P2p_swarm.broadcast
-      t.swarm
-      {
-        msg_type = Frame.msg_cons_propose;
-        payload = C_codec.encode_propose p;
-      }
-  | Relay_verified_proposal { source_peer; payload } ->
-    Octra_net.P2p_swarm.broadcast_except
-      t.swarm
-      ~except:source_peer
-      { msg_type = Frame.msg_cons_propose; payload }
-
 let proposal_wait_delay attempt =
   let ms =
     match attempt with
-    | 1 -> 0
+    | 0 | 1 -> 0
     | 2 -> 500
     | 3 -> 1_000
     | 4 -> 2_000
@@ -2735,28 +2767,36 @@ let proposal_wait_id (p : C_types.propose) =
 let clear_proposal_wait t (p : C_types.propose) =
   let pid = proposal_wait_id p in
   match t.proposal_wait with
-  | Some wait when wait.pid = pid -> t.proposal_wait <- None
+  | Some wait when wait.pid = pid && wait.proposal.round = p.round ->
+    t.proposal_wait <- None
   | Some _
   | None -> ()
 
-let retain_proposal_wait t ~route (p : C_types.propose) =
-  let gen = t.engine.generation in
+let retain_proposal_wait ?(initial = false) t ~route (p : C_types.propose) =
   let pid = proposal_wait_id p in
   let prior = t.proposal_wait in
   let keep_prior =
     match prior with
-    | Some wait when wait.gen = gen
-                     && wait.proposal.epoch_id = p.epoch_id
-                     && wait.pid <> pid ->
-      wait.proposal.round <= p.round
+    | Some wait when proposal_verify_current t wait.proposal ->
+      wait.proposal.round < p.round
+      || (wait.proposal.round = p.round && (wait.pid <> pid || initial))
     | Some _
     | None -> false
   in
-  if keep_prior then ()
-  else
+  if keep_prior then
+    (match prior with
+     | Some wait when wait.proposal.round < p.round ->
+       ignore (defer_pending_proposal t p)
+     | Some _ | None -> ())
+  else begin
+    Option.iter (fun wait ->
+      if wait.pid <> pid || wait.proposal.round <> p.round then
+        ignore (defer_pending_proposal t wait.proposal)) prior;
     let attempt =
-      match prior with
-      | Some wait when wait.gen = gen && wait.pid = pid ->
+      if initial then 0
+      else match prior with
+      | Some wait when wait.pid = pid
+                       && wait.proposal.round = p.round ->
         min 16 (wait.attempt + 1)
       | Some _
       | None -> 1
@@ -2767,18 +2807,18 @@ let retain_proposal_wait t ~route (p : C_types.propose) =
         (proposal_wait_delay attempt)
     in
     t.proposal_wait <- Some {
-      gen;
       pid;
       proposal = p;
       route;
       attempt;
       retry_at;
     };
-    log_node t.config.my_addr
+    if not initial then log_node t.config.my_addr
       "event = proposal_wait epoch = %Ld round = %d attempt = %d"
       p.epoch_id
       p.round
       attempt
+  end
 
 let check_proposal_frame t (p : C_types.propose) =
   let signature_valid =
@@ -2816,47 +2856,8 @@ let finish_check t ~route (p : C_types.propose) preview =
     ignore (C_engine.on_propose t.engine p
       ~verify_fn:(verify_engine_signature t)
       ~execute_fn:(fun _ -> accepted) ~sign_fn:t.config.sign_fn);
-    if accepted then send_verified_proposal t route p
-    else Lwt.return_unit
-
-let admit_current_proposal t ~route (p : C_types.propose) =
-  let open Lwt.Syntax in
-  if not (check_proposal_frame t p)
-  then
-    begin
-      clear_proposal_wait t p;
-      Lwt.return_unit
-    end
-  else
-    let* preview =
-      C_proposal_work_gate.run
-        t.proposal_work_gate
-        ~relevant:(fun () -> proposal_verify_current t p)
-        (fun () ->
-          let gen = t.engine.generation in
-          let height = t.engine.state.height in
-          let round = t.engine.state.round in
-          let step = t.engine.state.step in
-          mark_proposal_verify t ~gen ~height ~round ~step;
-          let* verdict =
-            Lwt.finalize
-              (fun () ->
-                Lwt.catch
-                  (fun () -> t.config.verify_proposal p)
-                  (fun exn ->
-                    warn_node t.config.my_addr
-                      "event = proposal_verify_wait epoch = %Ld round = %d reason = %s"
-                      p.epoch_id
-                      p.round
-                      (Printexc.to_string exn);
-                    Lwt.return Proposal_wait))
-              (fun () ->
-                clear_proposal_verify t ~gen ~height ~round ~step;
-                Lwt.return_unit)
-          in
-          Lwt.return_some verdict)
-    in
-    finish_check t ~route p preview
+    if accepted then queue_verified_proposal t route p;
+    Lwt.return_unit
 
 let check_work t proposal route =
   let work = {
@@ -2873,10 +2874,14 @@ let waiting_work t =
   | Some wait when not (proposal_verify_current t wait.proposal) ->
     t.proposal_wait <- None;
     None
+  | Some wait when wait.proposal.round > t.engine.state.round
+                   && Hashtbl.mem t.pending_proposals
+                        (proposal_round_key t.engine.state.height t.engine.state.round) ->
+    None
   | Some wait when Int64.compare
                      (Mtime_clock.elapsed_ns ())
                      wait.retry_at >= 0 ->
-    log_node t.config.my_addr
+    if wait.attempt > 0 then log_node t.config.my_addr
       "event = proposal_retry epoch = %Ld round = %d attempt = %d"
       wait.proposal.epoch_id
       wait.proposal.round
@@ -2890,7 +2895,8 @@ let pending_work t =
   let round = t.engine.state.round in
   Hashtbl.filter_map_inplace
     (fun _ (p : C_types.propose) ->
-      if p.epoch_id < height then None else Some p)
+      if p.epoch_id < height || (p.epoch_id = height && p.round < round)
+      then None else Some p)
     t.pending_proposals;
   let key = proposal_round_key height round in
   match Hashtbl.find_opt t.pending_proposals key with
@@ -3061,6 +3067,7 @@ let notify_fold t ~next_epoch event =
 
 let rec process_outputs_once t =
   let open Lwt.Syntax in
+  C_relay.progress t.proposal_relay ~generation:t.engine.generation;
   let* () = maybe_activate_relief t in
   let* () = Lwt_list.iter_s
     (function
@@ -3766,7 +3773,8 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                  payload = frame.payload;
                }
              in
-             let* () = admit_current_proposal t ~route p in
+             if check_proposal_frame t p then
+               retain_proposal_wait ~initial:true t ~route p;
              process_outputs t)
         )
       (fun exn ->
@@ -4516,10 +4524,6 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               (min 14 (String.length gossip.attestation.Resource_attestations.node_id)));
           match decision with
           | Resource_attestation_admission.Accept ->
-              Hashtbl.replace
-                t.resource_attestations
-                (Resource_attestations.attestation_id gossip.attestation)
-                gossip.attestation;
               t.config.on_resource_attestation gossip
           | Resource_attestation_admission.Reject _ ->
               Octra_net.P2p_swarm.report_bad_peer t.swarm _conn
@@ -4547,10 +4551,6 @@ let broadcast_resource_attestation t attestation =
   } in
   match admit_resource_attestation t attestation with
   | Resource_attestation_admission.Accept ->
-      Hashtbl.replace
-        t.resource_attestations
-        (Resource_attestations.attestation_id attestation)
-        attestation;
       let payload = Resource_attestation_flow.encode_gossip gossip in
       Octra_net.P2p_swarm.broadcast t.swarm { msg_type = Frame.msg_resource_attestation; payload }
   | Resource_attestation_admission.Reject _
@@ -5351,6 +5351,7 @@ let realign_progress t ~height ~round =
     wake_ready t
 
 let start t =
+  C_relay.open_ t.proposal_relay ~generation:t.engine.generation;
   ignore (move_proposal_slot t C_work_slot.Open);
   C_engine.set_round_skip_ready
     t.engine
@@ -5413,6 +5414,7 @@ let start t =
 
 let stop t =
   t.running <- false;
+  C_relay.close t.proposal_relay;
   ignore (move_proposal_slot t C_work_slot.Close);
   t.proposal_build <- None;
   t.proposal_verify <- None;

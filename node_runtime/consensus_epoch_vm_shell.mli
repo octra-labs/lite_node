@@ -230,6 +230,8 @@ type vm_tx_deps = {
 }
 
 val prepare_program_package :
+  overlap:bool ->
+  program_mode:Octra_core.Rule_graph.mode ->
   point_ops:bool ->
   Transaction.t ->
   (Octra_vm.Program_package.admitted, string) result Lwt.t
@@ -247,6 +249,8 @@ type live_vm_tx_args = {
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
+  program_mode : Octra_core.Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   epoch : int;
   now : unit -> float;
@@ -308,6 +312,8 @@ type live_sender_vm_tx_args = {
   tx : Transaction.t;
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
+  program_mode : Octra_core.Rule_graph.mode;
+  program_overlap : bool;
   math : bool;
   current_epoch : unit -> int;
   epoch_time_ms : int64;

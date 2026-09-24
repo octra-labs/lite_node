@@ -3,6 +3,8 @@
 
 module Replay = Pvac_legacy_public_replay
 
+type classifier = Prior_v1 | Capped_v1
+
 type entry = {
   address : string;
   source_cipher_hash : string;
@@ -11,6 +13,7 @@ type entry = {
 }
 
 type enabled = {
+  classifier : classifier option;
   chain_id : string;
   snapshot_epoch : int;
   state_root : string;
@@ -23,7 +26,14 @@ type t =
   | Disabled of string
   | Enabled of enabled
 
-let schema = "octra_pvac_migration_entitlements_v2"
+let schema = function
+  | None -> "octra_pvac_migration_entitlements_v2"
+  | Some _ -> "octra_pvac_migration_entitlements_v3"
+
+let classifier_name = function
+  | Prior_v1 -> "prior_v1"
+  | Capped_v1 -> "capped_v1"
+
 let max_artifact_bytes = 64 * 1024 * 1024
 let max_entries = 1_000_000
 let state_name = "migration_state.json"
@@ -94,9 +104,10 @@ let encode_entry buf entry =
   List.iter (put_string buf) decision.blockers;
   put_string buf decision.reason
 
-let encoded_payload ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
+let encoded_payload ~classifier ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   let buf = Buffer.create 4096 in
-  put_string buf schema;
+  put_string buf (schema classifier);
+  Option.iter (fun value -> put_string buf (classifier_name value)) classifier;
   put_string buf chain_id;
   put_int buf snapshot_epoch;
   put_string buf state_root;
@@ -105,8 +116,9 @@ let encoded_payload ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entr
   List.iter (encode_entry buf) entries;
   Buffer.contents buf
 
-let root_of ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
+let root_of ~classifier ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   encoded_payload
+    ~classifier
     ~chain_id
     ~snapshot_epoch
     ~state_root
@@ -174,7 +186,7 @@ let rec validate_entries seen = function
         Hashtbl.add seen entry.address ();
         validate_entries seen rest
 
-let create ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
+let create ?classifier ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   if chain_id = "" then
     Error "migration chain_id is empty"
   else if snapshot_epoch < 0 then
@@ -198,12 +210,14 @@ let create ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
       List.iter (fun entry -> Hashtbl.add table entry.address entry) entries;
       Ok
         (Enabled {
+          classifier;
           chain_id;
           snapshot_epoch;
           state_root;
           activation_epoch;
           root =
             root_of
+              ~classifier
               ~chain_id
               ~snapshot_epoch
               ~state_root
@@ -390,52 +404,48 @@ let parse_entries = function
 
 let load_json ~chain_id ~expected_root = function
   | `Assoc fields ->
-    bind
-      (exact_fields
-         "artifact"
-         [
-           "schema";
-           "chain_id";
-           "snapshot_epoch";
-           "state_root";
-           "activation_epoch";
-           "root";
-           "entries";
-         ]
-         fields)
-      (fun () ->
-    bind (string_field fields "schema") (fun artifact_schema ->
-    if artifact_schema <> schema then
-      Error ("unsupported migration schema = " ^ artifact_schema)
-    else
-      bind (string_field fields "chain_id") (fun artifact_chain_id ->
-      if artifact_chain_id <> chain_id then
-        Error "migration chain_id mismatch"
-      else
-        bind (int_field fields "snapshot_epoch") (fun snapshot_epoch ->
-        bind (string_field fields "state_root") (fun state_root ->
-        bind (int_field fields "activation_epoch") (fun activation_epoch ->
-        bind (string_field fields "root") (fun artifact_root ->
-        if artifact_root <> expected_root then
-          Error "migration artifact root does not match configured root"
-        else
-        bind
-          (match List.assoc_opt "entries" fields with
-           | Some values -> parse_entries values
-           | None -> Error "migration entries missing")
-          (fun entries ->
-          bind
-            (create
-               ~chain_id
-               ~snapshot_epoch
-               ~state_root
-               ~activation_epoch
-               entries)
-            (fun value ->
-          match root value with
-          | Some actual when String.equal actual expected_root -> Ok value
-          | Some _ -> Error "migration admission root mismatch"
-          | None -> Error "migration admission artifact disabled")))))))))
+    let ( let* ) = bind in
+    let* artifact_schema = string_field fields "schema" in
+    let* classifier =
+      if artifact_schema = schema None then Ok None
+      else if artifact_schema = schema (Some Capped_v1) then
+        let* name = string_field fields "classifier" in
+        begin match name with
+        | "prior_v1" -> Ok (Some Prior_v1)
+        | "capped_v1" -> Ok (Some Capped_v1)
+        | _ -> Error ("unsupported migration classifier = " ^ name)
+        end
+      else Error ("unsupported migration schema = " ^ artifact_schema)
+    in
+    let expected = [
+      "schema"; "chain_id"; "snapshot_epoch"; "state_root";
+      "activation_epoch"; "root"; "entries";
+    ] in
+    let expected = match classifier with
+      | None -> expected
+      | Some _ -> "classifier" :: expected in
+    let* () = exact_fields "artifact" expected fields in
+    let* artifact_chain_id = string_field fields "chain_id" in
+    let* () =
+      if artifact_chain_id = chain_id then Ok ()
+      else Error "migration chain_id mismatch" in
+    let* snapshot_epoch = int_field fields "snapshot_epoch" in
+    let* state_root = string_field fields "state_root" in
+    let* activation_epoch = int_field fields "activation_epoch" in
+    let* artifact_root = string_field fields "root" in
+    let* () =
+      if artifact_root = expected_root then Ok ()
+      else Error "migration artifact root does not match configured root" in
+    let* entries = match List.assoc_opt "entries" fields with
+      | Some values -> parse_entries values
+      | None -> Error "migration entries missing" in
+    let* value = create ?classifier ~chain_id ~snapshot_epoch ~state_root
+      ~activation_epoch entries in
+    begin match root value with
+    | Some actual when String.equal actual expected_root -> Ok value
+    | Some _ -> Error "migration admission root mismatch"
+    | None -> Error "migration admission artifact disabled"
+    end
   | _ -> Error "migration admission artifact must be an object"
 
 let configured getenv name =
@@ -528,12 +538,14 @@ let to_yojson = function
       |> List.sort (fun left right -> String.compare left.address right.address)
     in
     Ok
-      (`Assoc [
-        "schema", `String schema;
+      (`Assoc ([
+        "schema", `String (schema value.classifier);
         "chain_id", `String value.chain_id;
         "snapshot_epoch", `Int value.snapshot_epoch;
         "state_root", `String value.state_root;
         "activation_epoch", `Int value.activation_epoch;
         "root", `String value.root;
         "entries", `List (List.map entry_json entries);
-      ])
+      ] @ match value.classifier with
+      | None -> []
+      | Some classifier -> ["classifier", `String (classifier_name classifier)]))

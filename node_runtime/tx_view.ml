@@ -396,10 +396,13 @@ let submit_rpc_error etype reason =
   | "invalid_nonce" -> Rpc.invalid_nonce
   | "nonce_too_far" -> Rpc.nonce_too_far
   | "insufficient_balance" -> Rpc.insufficient_balance
-  | "duplicate_transaction" -> Rpc.duplicate_tx
+  | "duplicate_transaction" ->
+    { Rpc.duplicate_tx with data = Some (`String reason) }
   | "self_transfer" -> Rpc.self_transfer
   | "invalid_address" -> Rpc.invalid_address reason
   | "staging_full" -> Rpc.staging_full
+  | "pre_verify_busy" | "pre_verify_unavailable" ->
+    Rpc.err 110 "service unavailable" (Some (`String reason))
   | "fee_too_low" -> Rpc.fee_too_low reason
   | "tx_too_large" -> Rpc.tx_too_large reason
   | "self_only_operation" -> Rpc.self_only_op reason
@@ -510,6 +513,23 @@ let staging_submit_admission ~min_ou ~min_relay_fee tx =
       if Z.lt tx.Transaction.ou required then
         Error (Printf.sprintf "fee too low (min: %s)" (Z.to_string required))
       else Ok ()
+
+let duty_nonce_admission ~head ~confirmed_nonce tx =
+  match head, tx.Transaction.op_type with
+  | Some head, Transaction.ValidatorReady ->
+    begin
+      match Octra_core.Validator_registry.ready_payload_of_message tx.message with
+      | Ok ready when Int64.compare ready.head_epoch head > 0 ->
+        let distance = Z.sub (Z.of_int64 ready.head_epoch) (Z.of_int64 head) in
+        if Z.leq distance (Z.of_int Octra_consensus.C_catchup.range_epochs) then
+          Ok ()
+        else Error "validator ready head exceeds relay window"
+      | _ when Int64.compare (Int64.of_int tx.nonce)
+                 (Int64.succ (Int64.of_int confirmed_nonce)) > 0 ->
+        Error "validator ready requires next confirmed nonce"
+      | _ -> Ok ()
+    end
+  | _ -> Ok ()
 
 type staging_submit_effects = {
   total_txs : int;
@@ -695,12 +715,17 @@ let encrypted_balance_auth params ~addr =
 
 let staging_error msg =
   let m = String.lowercase_ascii msg in
-  if m = "duplicate transaction" || String.length m > 14 && String.sub m 0 14 = "duplicate nonce" then
+  if m = "duplicate transaction" then
     "duplicate_transaction", "tx already in staging"
+  else if String.starts_with ~prefix:"duplicate nonce" m then
+    "duplicate_transaction", msg
   else if m = "nonce too low (already used)" then
     "invalid_nonce", "nonce already used"
   else if m = "nonce too far ahead" then
     "nonce_too_far", "nonce too far ahead"
+  else if m = "validator ready requires next confirmed nonce"
+          || m = "validator ready head exceeds relay window" then
+    "nonce_too_far", msg
   else if String.length m > 20 && String.sub m 0 21 = "insufficient balance " then
     "insufficient_balance", msg
   else if String.length m > 20 && String.sub m 0 20 = "amount must be posit" then
@@ -743,7 +768,7 @@ let has_html value =
 
 let call_params_message_ok msg =
   try
-    let json = Yojson.Safe.from_string msg in
+    let json = Octra_core.Json_tree.read msg in
     let value_ok = function
       | `String value -> not (has_html value)
       | _ -> true
@@ -1094,14 +1119,29 @@ let bft_op_admission ~bft_mode tx =
   else
     Ok ()
 
+let duty_retry ~now ~duty ~bft_mode tx =
+  match duty with
+    | Some (head, Octra_core.Rule_graph.Active)
+      when bft_mode && Float.is_finite now
+           && Float.is_finite tx.Transaction.timestamp && tx.timestamp <= now
+           && tx.op_type = Transaction.ValidatorReady ->
+      not (Octra_core.Tx_staging.duty_expired
+        ~mode:Octra_core.Rule_graph.Active ~head:(Some head) tx)
+      && (match Octra_core.Validator_registry.ready_payload_of_message tx.message with
+        | Ok ready -> ready.head_epoch <= head
+        | Error _ -> false)
+    | _ -> false
+
 let pre_route_admission
+    ?(duty = None)
     ~now
     ~max_timestamp_drift
     ~observer_rpc_mode
     ~bft_mode
     tx =
   let timestamp_drift = Float.abs (tx.Transaction.timestamp -. now) in
-  if timestamp_drift > max_timestamp_drift then
+  if not (Float.is_finite tx.timestamp && Float.is_finite now)
+     || timestamp_drift > max_timestamp_drift && not (duty_retry ~now ~duty ~bft_mode tx) then
     Error ("malformed_transaction",
       Printf.sprintf "timestamp drift %.0fs exceeds %ds limit"
         timestamp_drift (int_of_float max_timestamp_drift))
@@ -1133,6 +1173,7 @@ let sender_admission ~sender_exists tx =
   else Ok ()
 
 let submit_pre_signature_admission
+    ?(duty = None)
     ~now
     ~max_timestamp_drift
     ~observer_rpc_mode
@@ -1141,6 +1182,7 @@ let submit_pre_signature_admission
     ~sender_exists
     tx =
   match pre_route_admission
+          ~duty
           ~now
           ~max_timestamp_drift
           ~observer_rpc_mode

@@ -446,7 +446,7 @@ let note_final ?(cap_mode=Reject) cfg ~at ~active ~final ~signers state =
   | Final_applied state -> Ok state
   | Final_held (_, error) -> Error error
 
-let advance_pulse cfg epoch = function
+let advance_pulse cfg epoch credit = function
   | None -> Ok { first = epoch; last = epoch; count = 1 }
   | Some pulse when Int64.compare epoch pulse.last < 0 ->
     Error "validator duty pulse epoch moved backward"
@@ -454,16 +454,20 @@ let advance_pulse cfg epoch = function
   | Some pulse ->
     let gap = Int64.sub epoch pulse.last in
     if Int64.compare gap cfg.pulse_gap <= 0 then
-      Ok { pulse with last = epoch; count = pulse.count + 1 }
+      if credit <= pulse.last then Ok pulse
+      else Ok { pulse with last = credit; count = pulse.count + 1 }
     else
       Ok { first = epoch; last = epoch; count = 1 }
 
-let note_pulse ?(cap_mode=Reject) cfg ~epoch ~active ~address state =
+let note_pulse ?(cap_mode = Reject) ?credit cfg ~epoch ~active ~address state =
+  let credit = Option.value ~default:epoch credit in
   match validate_cfg cfg with
   | Error _ as error -> error
   | Ok () when address = "" -> Error "validator duty pulse address is empty"
   | Ok () when Int64.compare epoch 0L < 0 ->
     Error "validator duty pulse epoch is negative"
+  | Ok () when credit < 0L || credit > epoch ->
+    Error "validator duty pulse credit is outside execution epoch"
   | Ok () when active -> Ok state
   | Ok () ->
     let table = table_of_members state.members in
@@ -478,7 +482,7 @@ let note_pulse ?(cap_mode=Reject) cfg ~epoch ~active ~address state =
       | Shadow pulse -> pulse
     in
     begin
-      match advance_pulse cfg epoch prior with
+      match advance_pulse cfg epoch credit prior with
       | Error _ as error -> error
       | Ok pulse ->
         let member = {

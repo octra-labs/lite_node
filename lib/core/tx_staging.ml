@@ -207,13 +207,26 @@ let duty_nonce sender confirmed =
     then None
     else Some nonce
 
-let duty_expired ~head (tx : Transaction.t) =
+let duty_expired ?(mode = Rule_graph.Prior) ~head (tx : Transaction.t) =
   match head, tx.op_type with
   | Some head, ValidatorReady ->
     begin
       match Validator_registry.ready_payload_of_message tx.message with
-      | Ok ready -> Int64.compare ready.head_epoch head < 0
-      | Error _ -> false
+      | Ok ready ->
+        begin match mode with
+        | Rule_graph.Prior -> Int64.compare ready.head_epoch head < 0
+        | Rule_graph.Active ->
+          ready.head_proposal_id = None
+          || Validator_ready_policy.expired ~head ~reference:ready.head_epoch
+          || (match Set_fold.proof_of_message tx.message with
+            | Error _ -> true
+            | Ok None -> false
+            | Ok (Some proof) ->
+              let epoch = proof.vote.epoch_id in
+              epoch < 0L || epoch <= head
+                && Int64.sub head epoch >= Set_fold.participating.challenge)
+        end
+      | Error _ -> mode = Rule_graph.Active
     end
   | _ -> false
 
@@ -491,13 +504,15 @@ let ready_queue ~confirmed queue =
   if confirmed < 0 || confirmed = max_int then []
   else take (confirmed + 1) [] queue
 
-let ready_epoch_txs ~capacity ~confirmed_nonce =
+let ready_epoch_txs ~accept ~capacity ~confirmed_nonce =
   let queues =
     sender_queues ()
     |> Sender_queue.mapi (fun sender queue ->
       match confirmed_nonce sender with
       | None -> []
-      | Some confirmed -> ready_queue ~confirmed queue)
+      | Some confirmed ->
+        List.filter (fun entry -> accept entry.tx) queue
+        |> ready_queue ~confirmed)
   in
   select_epoch_txs
     capacity
@@ -529,7 +544,7 @@ let remove_processed hashes =
   ) hashes;
   clear_virtual_state touched
 
-let expire_duty ?sender ~head () =
+let expire_duty ?sender ?(mode = Rule_graph.Prior) ~head () =
   match head with
   | None -> []
   | Some _ ->
@@ -539,7 +554,7 @@ let expire_duty ?sender ~head () =
       | None -> Index.bindings !view_index |> List.map snd
     in
     let expired =
-      List.filter (fun entry -> duty_expired ~head entry.tx) entries
+      List.filter (fun entry -> duty_expired ~mode ~head entry.tx) entries
     in
     let records =
       List.map (fun entry ->

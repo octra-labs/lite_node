@@ -14,7 +14,7 @@ let compile_program_base source =
   Octra_vm.Oct_compile.compile_program source
 
 let compile_linked name source =
-  match Octra_vm.Aml_source.compile source with
+  match Octra_vm.Aml_source.compile ~syntax:Octra_vm.Oct_gen.Source source with
   | Ok value -> value
   | Error error -> failwith (name ^ ": " ^ error)
 
@@ -378,7 +378,8 @@ let run_bytecode ?(args = []) ?(value = Z.zero) name method_name bytecode =
 
 let rpc_compile name source program =
   let params = `List [`String source; `Bool program] in
-  match Lwt.state (Octra_vm.Contract_rpc.compile_aml_params params) with
+  match Lwt.state (Octra_vm.Contract_rpc.compile_aml_params
+      ~compiler:Octra_vm.Program_package.Source params) with
   | Lwt.Return (Ok (`Assoc fields)) -> fields
   | Lwt.Return (Ok _) -> failwith (name ^ ": response is invalid")
   | Lwt.Return (Error error) -> failwith (name ^ ": " ^ error.Octra_core.Rpc.message)
@@ -391,7 +392,8 @@ let rpc_field name fields field =
   | _ -> failwith (name ^ ": field is absent name = " ^ field)
 
 let rpc_bytecode name source =
-  match Lwt.state (Octra_vm.Contract_rpc.compile_aml ~source) with
+  match Lwt.state (Octra_vm.Contract_rpc.compile_aml_with
+      ~compiler:Octra_vm.Program_package.Source ~point_ops:true ~program:false ~source) with
   | Lwt.Return (Ok (`Assoc fields)) ->
     begin
       match List.assoc_opt "bytecode" fields with
@@ -504,9 +506,11 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let ledger = Octra_core.Ledger.create store in
       let view_ctx =
         Octra_vm.Contract_rpc.make_view_ctx
+          ~trusted:[]
+          ~profile:{epoch = 0; math = false; point_ops = false;
+                    object_cost = false; int_work = Octra_vm.Int_work.Active}
           ~store
           ~ledger
-          ~current_epoch:0
           ~get_fhe_pubkey:(fun _ -> None)
           ()
       in
@@ -623,9 +627,11 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let call params =
         Lwt_main.run
           (Octra_vm.Contract_rpc.call_params
+             ~trusted:[]
+             ~profile:{epoch = 0; math = false; point_ops = false;
+                       object_cost = false; int_work = Octra_vm.Int_work.Active}
              ~store
              ~ledger
-             ~current_epoch:0
              ~get_fhe_pubkey:(fun _ -> None)
              ~storage_json
              params)
@@ -877,6 +883,8 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         match
           Lwt_main.run
             (Octra_vm.Contract_rpc.abi
+               ~trusted:[]
+               ~point_ops:true
                ~store
                ~chaindata:reopened
                ~addr:address)
@@ -906,7 +914,8 @@ let rpc_multi_bytecode name =
         ];
       ])
   in
-  match Lwt.state (Octra_vm.Contract_rpc.compile_aml_multi ~json) with
+  match Lwt.state (Octra_vm.Contract_rpc.compile_aml_multi_with
+      ~compiler:Octra_vm.Program_package.Source ~point_ops:true ~json) with
   | Lwt.Return (Ok (`Assoc fields)) ->
     begin
       match List.assoc_opt "bytecode" fields with
@@ -1073,7 +1082,7 @@ let () =
     | _ -> None
   in
   let linked_multi =
-    match Octra_vm.Aml_source.compile_multi multi_resolver "main.aml" with
+    match Octra_vm.Aml_source.compile_multi ~syntax:Octra_vm.Oct_gen.Source multi_resolver "main.aml" with
     | Ok value -> value
     | Error error -> failwith ("linked multi: " ^ error)
   in

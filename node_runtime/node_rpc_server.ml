@@ -54,6 +54,7 @@ type config = {
 }
 
 type ctx = {
+  data_dir : string;
   ledger : Ledger.t;
   store : Store_irmin.t;
   chaindata : Store_chaindata.t;
@@ -115,6 +116,7 @@ let status_read_ctx (ctx : ctx) =
            Sys.getenv_opt)
   in
   Status_read_rpc.{
+    data_dir = ctx.data_dir;
     ledger = ctx.ledger;
     store = ctx.store;
     chaindata = ctx.chaindata;
@@ -302,20 +304,20 @@ let fhe_pubkey_loader store addr =
     | Ok pk -> Some pk
     | Error _ -> None
 
-let math_mode ctx =
-  match Octra_core.Rule_graph.math ctx.rules ~epoch:!(ctx.current_epoch) with
-  | Ok mode -> mode = Octra_core.Rule_graph.Active
+let view_profile ctx =
+  match Octra_vm.Contract_rpc.view_profile ctx.rules ~epoch:!(ctx.current_epoch) with
+  | Ok profile -> profile
   | Error fault -> failwith (Octra_core.Rule_graph.fault_message fault)
 
-let make_view_ctx ~math store ledger current_epoch_ref =
+let make_view_ctx ~trusted ~profile store ledger =
   let running, stop = Octra_vm.Contract_rpc.view_clock () in
   let ctx =
     Octra_vm.Contract_rpc.make_view_ctx
-      ~math
+      ~trusted
+      ~profile
       ~running
       ~store
       ~ledger
-      ~current_epoch:!current_epoch_ref
       ~get_fhe_pubkey:(fhe_pubkey_loader store)
       ()
   in
@@ -323,17 +325,18 @@ let make_view_ctx ~math store ledger current_epoch_ref =
 
 let contract_call params ctx =
   Octra_vm.Contract_rpc.call_params
-    ~math:(math_mode ctx)
+    ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
+    ~profile:(view_profile ctx)
     ~store:ctx.store
     ~ledger:ctx.ledger
-    ~current_epoch:!(ctx.current_epoch)
     ~get_fhe_pubkey:(fhe_pubkey_loader ctx.store)
     ~storage_json:(Rpc_view.storage_assoc ~limit:4096)
     params
 
 let circle_view params ctx =
   let view_ctx, running, stop =
-    make_view_ctx ~math:(math_mode ctx) ctx.store ctx.ledger ctx.current_epoch in
+    make_view_ctx ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
+      ~profile:(view_profile ctx) ctx.store ctx.ledger in
   Circle_read_rpc.view_call_public_params
     ~running ~stop
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
@@ -341,7 +344,8 @@ let circle_view params ctx =
 
 let circle_view_auth params ctx =
   let view_ctx, running, stop =
-    make_view_ctx ~math:(math_mode ctx) ctx.store ctx.ledger ctx.current_epoch in
+    make_view_ctx ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
+      ~profile:(view_profile ctx) ctx.store ctx.ledger in
   Circle_read_rpc.view_call_auth
     ~running ~stop
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
@@ -449,13 +453,16 @@ let program_dispatch =
     no_ctx;
     json0_read;
     compile_read = (fun handler params ctx ->
-      let point_ops =
-        Octra_core.Rule_graph.standard_at ~chain_id:ctx.chain_id
-          ~epoch:!(ctx.current_epoch) = Octra_core.Rule_graph.Active
-      in
-      handler ~point_ops params);
+      Program_read_rpc.compile_at ~chain_id:ctx.chain_id
+        ~epoch:!(ctx.current_epoch) handler params);
     program_info = program_info_read;
     program_call = contract_call;
+    program_abi = (fun params ctx ->
+      store_chaindata_read
+        (Octra_vm.Contract_rpc.abi_params
+          ~point_ops:(view_profile ctx).point_ops
+          ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust))
+        params ctx);
     program_list = program_list_read;
     program_save_abi = contract_save_abi;
     program_tokens_by_address;
@@ -559,6 +566,7 @@ let start (cfg : config) =
     }
   in
   let rpc_ctx = {
+    data_dir = cfg.data_dir;
     ledger = cfg.ledger;
     store = cfg.store;
     chaindata = cfg.chaindata;

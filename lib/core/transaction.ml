@@ -407,7 +407,7 @@ let ou_cost tx = match tx.op_type with
       match tx.message with
       | Some msg ->
         (try
-           match Yojson.Safe.from_string msg with
+           match Json_tree.read msg with
            | `List calls -> List.length calls
            | `Assoc fields ->
              (match List.assoc_opt "calls" fields with

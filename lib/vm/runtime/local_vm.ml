@@ -195,11 +195,11 @@ let make_state config storage =
     config.args;
   state
 
-let outcome state stop steps frames storage =
-  let closes =
+let outcome state stop steps frames initial storage =
+  let storage, closes =
     match stop with
-    | Returned -> List.rev state.Contract_vm.closes
-    | Reverted | Step_cap | Host_operation _ -> []
+    | Returned -> storage_rows storage, List.rev state.Contract_vm.closes
+    | Reverted | Step_cap | Host_operation _ -> List.sort compare initial, []
   in
   {
     stop;
@@ -207,7 +207,7 @@ let outcome state stop steps frames storage =
     regs = Array.copy state.Contract_vm.regs;
     effort = state.effort_used;
     steps;
-    storage = storage_rows storage;
+    storage;
     events = List.rev !(state.logs);
     closes;
     frames = List.rev frames;
@@ -240,7 +240,7 @@ let execute ~trace config code entry =
           state.Contract_vm.pc <- entry;
           let rec run index frames =
             if index >= config.step_cap then
-              Ok (outcome state Step_cap index frames storage)
+              Ok (outcome state Step_cap index frames config.storage storage)
             else
               let pc = state.pc in
               if pc < 0 || pc >= Array.length code then
@@ -250,7 +250,7 @@ let execute ~trace config code entry =
                 let op = code.(pc) in
                 match host_operation op with
                 | Some name ->
-                  Ok (outcome state (Host_operation (pc, name)) index frames storage)
+                  Ok (outcome state (Host_operation (pc, name)) index frames config.storage storage)
                 | None ->
                   let progress = Contract_vm.step state code in
                   let frame = {
@@ -267,9 +267,9 @@ let execute ~trace config code entry =
                   match progress with
                   | Contract_vm.Running -> run (index + 1) frames
                   | Contract_vm.Finished ->
-                    Ok (outcome state Returned (index + 1) frames storage)
+                    Ok (outcome state Returned (index + 1) frames config.storage storage)
                   | Contract_vm.Refused ->
-                    Ok (outcome state Reverted (index + 1) frames storage)
+                    Ok (outcome state Reverted (index + 1) frames config.storage storage)
           in
           run 0 []
       end

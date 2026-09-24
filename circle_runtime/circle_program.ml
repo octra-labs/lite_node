@@ -82,8 +82,9 @@ let decode_bytecode ?(trusted = []) ?(point_ops = false) code_b64 =
         profile = Octra_vm.Admission.profile admitted;
       }
     | Error e -> Error (Octra_vm.Admission.error_message e)
-  with e ->
-    Error (Printexc.to_string e)
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | e -> Error (Printexc.to_string e)
 
 let decode_descriptor_bytecode code_b64 =
   try
@@ -98,8 +99,9 @@ let decode_descriptor_bytecode code_b64 =
       | Error e -> Error (Octra_vm.Admission.error_message e)
     else
       decode_bytecode ~point_ops:true code_b64
-  with e ->
-    Error (Printexc.to_string e)
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | e -> Error (Printexc.to_string e)
 
 let methods_of_bytecode bytecode =
   Octra_vm.Contract.extract_methods bytecode
@@ -295,7 +297,9 @@ let describe
                         })
                     end
                 end
-          with e ->
+          with
+          | (Stack_overflow | Out_of_memory) as error -> raise error
+          | e ->
             Lwt.return (Error ("invalid circle code: " ^ Printexc.to_string e))
         end
     end
@@ -408,7 +412,9 @@ let load
                         end
                     end
                 end
-          with e ->
+          with
+          | (Stack_overflow | Out_of_memory) as error -> raise error
+          | e ->
             Lwt.return
               (Error
                  (Octra_core.Circle_wasm_host.Rejected

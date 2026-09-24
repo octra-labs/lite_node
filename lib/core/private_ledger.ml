@@ -475,7 +475,7 @@ let json_payload op raw =
   match raw with
   | None -> error "malformed_transaction" (op ^ ": missing encrypted_data") ~user_reason:(op ^ ": malformed encrypted_data")
   | Some s ->
-    try Ok (Yojson.Safe.from_string s)
+    try Ok (Json_tree.read s)
     with _ ->
       error "malformed_transaction"
         (op ^ ": malformed encrypted_data")
@@ -485,7 +485,7 @@ let safe_json raw =
   match raw with
   | None -> Error "missing"
   | Some s ->
-    try Ok (Yojson.Safe.from_string s)
+    try Ok (Json_tree.read s)
     with _ -> Error "parse"
 
 let parse_encrypt field_policy raw =

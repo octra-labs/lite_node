@@ -70,12 +70,14 @@ val note_final :
   (t, string) result
 val note_pulse :
   ?cap_mode:cap_mode ->
+  ?credit:int64 ->
   cfg ->
   epoch:int64 ->
   active:bool ->
   address:string ->
   t ->
   (t, string) result
+val find_final : int64 -> t -> final option
 val apply_proof :
   ?cap_mode:cap_mode ->
   cfg ->

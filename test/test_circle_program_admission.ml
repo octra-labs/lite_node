@@ -57,7 +57,7 @@ let key private_key =
 let compile_signed () =
   let result =
     Vm.Oct_compile.compile_program
-      "program CircleTyped { fn echo(x: int): int { return x } }" in
+      "program CircleTyped { fn echo(x: int): int { return x } view fn complete_preview(prompt: string, count: int): string { return \"2\" } }" in
   let private_key = String.make 32 '\042' in
   let trusted_key = key private_key in
   let certificate =
@@ -171,6 +171,45 @@ let test_view_stop () =
     let stopped = execute (fun () -> incr steps; !steps <= 1) in
     require (not stopped.success && !steps = 2) "view stop not propagated")
 
+let test_preview_trust () =
+  with_store (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111111" in
+    let circle_id = "octPREVIEW_TRUST" in
+    let envelope, trusted_key = compile_signed () in
+    save_circle store circle_id owner (Base64.encode_exn envelope);
+    let read trusted prompt = Lwt_main.run
+      (Circle_exec.execute_view_call ~trusted store circle_id
+        "complete_preview" [`String prompt; `Int 1] owner) in
+    let trusted = [trusted_key] in
+    let direct = Lwt_main.run (Circle_exec.execute_view_call_direct ~trusted
+      store circle_id "complete_preview" [`String "1"; `Int 1] owner) in
+    require direct.success "direct signed preview failed";
+    let first = read trusted "1" in
+    require (first.success && first.return_value = direct.return_value)
+      "signed preview failed";
+    let cached = read trusted "1" in
+    require (cached.success && cached.return_value = direct.return_value)
+      "cached signed preview failed";
+    let refused = read [] "1" in
+    require (not refused.success) "preview cache accepted removed trust";
+    let other = key (String.make 32 '\043') in
+    let refused = read [other] "1" in
+    require (not refused.success) "preview cache accepted a different key";
+    let key = Circle_exec.preview_cache_key ~trusted ~math:false circle_id owner "1,2" in
+    let rec drain () =
+      if Hashtbl.mem Circle_exec.preview_session_inflight key then
+        Lwt.bind (Lwt_unix.sleep 0.001) drain
+      else Lwt.return_unit in
+    Lwt_main.run (Lwt.pick [drain ();
+      Lwt.bind (Lwt_unix.sleep 10.) (fun () -> Lwt.fail_with "preview prefetch timed out")]);
+    require (Circle_exec.preview_cache_lookup key 1 = Some "2")
+      "signed preview prefetch did not populate cache";
+    let next = Lwt_main.run (Circle_exec.execute_view_call
+      ~running:(fun () -> true) ~trusted store circle_id
+      "complete_preview" [`String "1,2"; `Int 1] owner) in
+    require (next.success && next.effort_used = 0 && next.return_value = direct.return_value)
+      "signed preview continuation failed")
+
 let method_info name view execution =
   `Assoc [
     "name", `String name;
@@ -249,6 +288,7 @@ let test_cache_program_identity () =
 let () =
   test_admission_and_inputs ();
   test_view_stop ();
+  test_preview_trust ();
   test_compute_manifest ();
   test_cache_program_identity ();
   Printf.printf "circle_program_admission = 1\nstrict_circle_inputs = 1\nPASS\n%!"

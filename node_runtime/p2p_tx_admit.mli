@@ -15,6 +15,8 @@ val addr_valid : Octra_core.Transaction.t -> bool
 val sig_valid : Octra_core.Transaction.t -> string option -> bool
 
 val admit :
+  ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
+  ?bft_mode:bool ->
   now:float ->
   max_drift:float ->
   sender_pk:string option ->

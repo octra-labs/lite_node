@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type classifier = Prior_v1 | Capped_v1
+
 type entry = {
   address : string;
   source_cipher_hash : string;
@@ -19,6 +21,7 @@ val disabled :
   t
 
 val create :
+  ?classifier:classifier ->
   chain_id:string ->
   snapshot_epoch:int ->
   state_root:string ->

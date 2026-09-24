@@ -12,14 +12,17 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
 type enrollment_snapshot = {
   head_epoch : int;
+  head_proposal_id : string option;
   state_root : string;
   chain_id : string;
   config_hash : string;
   candidate : Octra_core.Validator_admission.candidate option;
   duty : Octra_core.Set_fold.receipt option;
+  sets : string option * string option;
 }
 
 type read_ctx = {
+  data_dir : string;
   ledger : Ledger.t;
   store : Store_irmin.t;
   chaindata : Store_chaindata.t;
@@ -140,6 +143,42 @@ let validator_set_proof ~chain_id ~program_trust_hash
        ?scheduled
        validator_set)
 
+let head_proposal_id ~source ~chain_id ~(head : Octra_core.Head_manifest.t) =
+  if head.epoch_id < 0 || head.epoch_id = max_int then
+    Error "committed head epoch is invalid"
+  else
+    Result.bind source (fun source ->
+      Result.bind
+        (Consensus_parent_commit.load source ~epoch_id:(Int64.succ (Int64.of_int head.epoch_id)))
+        (function
+        | None -> Error "committed head certificate is unavailable"
+        | Some parent ->
+          let certificate = parent.Octra_consensus.C_types.certificate in
+          if certificate.epoch_id <> Int64.of_int head.epoch_id
+             || certificate.chain_id <> chain_id
+             || not (Text.is_hex_len 64 head.state_root || Text.is_hex_len 128 head.state_root)
+             || Consensus_epoch_apply_guard.raw32_of_pre_root head.state_root
+                <> certificate.header.proposed_state_root
+             || String.length certificate.proposal_id <> 32 then
+            Error "committed head certificate does not match head"
+          else Ok (Text.raw_to_hex certificate.proposal_id)))
+
+let duty_state ~store ~(head : Octra_core.Head_manifest.t) =
+  let open Lwt.Syntax in
+  match head.ledger_state_root with
+  | None -> Lwt.return_error "committed ledger root unavailable"
+  | Some state_root ->
+    let* snapshot = Store_irmin.capture_read_snapshot_at store
+      ~epoch_id:(Int64.of_int head.epoch_id) ~state_root in
+    match snapshot with
+    | Error error -> Lwt.return_error ("committed duty snapshot unavailable: " ^ error)
+    | Ok snapshot ->
+      let* raw = Store_irmin.read_snapshot snapshot ["meta"; Octra_core.Set_fold.meta_key] in
+      Lwt.return (match raw with
+        | None -> Ok Octra_core.Set_fold.empty
+        | Some raw -> Octra_core.Set_fold.of_string raw
+          |> Result.map_error (fun error -> "committed duty state invalid: " ^ error))
+
 let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_hash ~automatic =
   let open Lwt.Syntax in
   match head with
@@ -190,8 +229,13 @@ let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_
                         (Octra_core.Set_fold.receipt ~address:validator_address state))
                       |> Lwt.return
                 in
+                let* active = Store_irmin.read_snapshot snapshot
+                  ["meta"; Octra_core.Validator_set_update.active_meta_key] in
+                let* pending = Store_irmin.read_snapshot snapshot
+                  ["meta"; Octra_core.Validator_set_update.pending_meta_key] in
                 Lwt.return (Result.map (fun duty -> {
                   head_epoch = head.epoch_id;
+                  head_proposal_id = None;
                   state_root = head.state_root;
                   chain_id;
                   config_hash;
@@ -200,10 +244,23 @@ let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_
                       validator_address
                       registry;
                   duty;
+                  sets = active, pending;
                 }) duty)
             end
         end
     end
+
+let enrollment_membership = function
+  | None -> `Null
+  | Some (member : Enroll_members.t) ->
+    `Assoc [
+      "epoch", `String (Int64.to_string member.epoch);
+      "active", `Bool member.active;
+      "scheduled", `Bool member.scheduled;
+      "activate_epoch", Status_rpc.enrollment_epoch member.activate_epoch;
+      "next_set_epoch", Status_rpc.enrollment_epoch member.next_set_epoch;
+      "validator_set_hash", `String (Text.raw_to_hex member.set_hash);
+    ]
 
 let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
   match snapshot with
@@ -229,22 +286,42 @@ let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
           "max_gap", `String (Int64.to_string cfg.pulse_gap);
         ]
     in
-    let ready = `Assoc [
+    let proposal = match snapshot.head_proposal_id with
+      | Some proposal -> ["head_proposal_id", `String proposal]
+      | None when snapshot.head_epoch < max_int
+                  && Octra_core.Rule_graph.ready_exec_at
+                    ~chain_id:snapshot.chain_id ~epoch:(snapshot.head_epoch + 1)
+                    = Octra_core.Rule_graph.Active ->
+        ["head_proposal_id", `Null]
+      | None -> []
+    in
+    let ready = `Assoc ([
       "consensus_pubkey", `String validator_pubkey;
       "head_epoch", `String (string_of_int snapshot.head_epoch);
       "state_root", `String snapshot.state_root;
       "chain_id", `String snapshot.chain_id;
       "config_hash", `String snapshot.config_hash;
       "catchup_head_epoch", `String (string_of_int snapshot.head_epoch);
-    ] in
+    ] @ proposal) in
     Lwt.return
       (Result.bind (Status_rpc.validator_enrollment
+         ~chain_id:snapshot.chain_id
          ~head_epoch:snapshot.head_epoch
          ~address:validator_address
          ~pubkey:validator_pubkey
          snapshot.candidate)
          (function
-           | `Assoc fields -> Ok (`Assoc (fields @ ["ready", ready; "duty", duty]))
+           | `Assoc fields ->
+             Enroll_members.of_values ~head_epoch:(Int64.of_int snapshot.head_epoch)
+               ~address:validator_address ~pubkey:validator_pubkey snapshot.sets
+             |> Result.map_error (fun reason -> Octra_core.Rpc.err (-32000) reason None)
+             |> Result.map (fun membership -> `Assoc (fields @ [
+               "state_root", `String snapshot.state_root;
+               "chain_id", `String snapshot.chain_id;
+               "membership", enrollment_membership membership;
+               "ready", ready;
+               "duty", duty;
+             ]))
            | _ -> Error (Octra_core.Rpc.err (-32000) "invalid enrollment result" None)))
 
 let runtime_version ~chain_id ~epoch ~validator_address ~program_trust_hash
@@ -426,11 +503,43 @@ let validator_set_proof_params _params ctx =
     ~validator_set_ref:ctx.validator_set_ref
     ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
 
+let local_control ~data_dir ~(snapshot : enrollment_snapshot) ~address ~pubkey =
+  let state = match snapshot.candidate with
+    | None -> Ok None
+    | Some candidate ->
+      Octra_core.Validator_control.status
+        (Octra_core.Validator_control.create ~data_dir)
+        Octra_core.Validator_intent.{
+          chain_id = snapshot.chain_id;
+          address;
+          pubkey;
+          bonded_epoch = candidate.bonded_epoch;
+        }
+  in
+  match state with
+  | Ok id -> `Assoc [
+      "exit_intent", `Bool true;
+      "exit_requested", `Bool (Option.is_some id);
+      "intent_id", (match id with None -> `Null | Some id -> `String id);
+    ]
+  | Error reason -> `Assoc [
+      "exit_intent", `Bool true;
+      "error", `String reason;
+    ]
+
 let validator_enrollment_params _params ctx =
-  validator_enrollment
-    ~snapshot:(ctx.validator_enrollment ())
+  let open Lwt.Syntax in
+  let snapshot = ctx.validator_enrollment () in
+  let* response = validator_enrollment
+    ~snapshot
     ~validator_address:ctx.validator_address
-    ~validator_pubkey:ctx.validator_pubkey
+    ~validator_pubkey:ctx.validator_pubkey in
+  match response, snapshot with
+  | Ok (`Assoc fields), Ok snapshot ->
+    let control = local_control ~data_dir:ctx.data_dir ~snapshot
+      ~address:ctx.validator_address ~pubkey:ctx.validator_pubkey in
+    ok (`Assoc (fields @ ["local_control", control]))
+  | _ -> Lwt.return response
 
 let epoch_proof_params params ctx =
   Light_rpc.epoch_proof_params ~chain_id:ctx.chain_id ctx.chaindata params

@@ -31,20 +31,20 @@ let int_value = function
   | None -> None
 
 let json_string_list values =
-  Yojson.Safe.to_string (`List (List.map (fun value -> `String value) values))
+  Json_tree.write (`List (List.rev (List.rev_map (fun value -> `String value) values)))
 
 let json_int_list values =
-  Yojson.Safe.to_string (`List (List.map (fun value -> `Int value) values))
+  Json_tree.write (`List (List.rev (List.rev_map (fun value -> `Int value) values)))
 
 let json_string_int_assoc values =
-  Yojson.Safe.to_string (`Assoc (List.map (fun (key, value) -> key, `Int value) values))
+  Json_tree.write (`Assoc (List.rev (List.rev_map (fun (key, value) -> key, `Int value) values)))
 
 let string_list_value = function
   | None -> []
   | Some value ->
     begin
       try
-        match Yojson.Safe.from_string value with
+        match Json_tree.read value with
         | `List items ->
           List.filter_map (function `String item -> Some item | _ -> None) items
         | _ -> []
@@ -57,7 +57,7 @@ let int_list_value = function
   | Some value ->
     begin
       try
-        match Yojson.Safe.from_string value with
+        match Json_tree.read value with
         | `List items ->
           let values =
             List.filter_map
@@ -86,7 +86,7 @@ let string_int_assoc_value = function
   | Some value ->
     begin
       try
-        match Yojson.Safe.from_string value with
+        match Json_tree.read value with
         | `Assoc items ->
           List.filter_map
             (fun (key, value) ->

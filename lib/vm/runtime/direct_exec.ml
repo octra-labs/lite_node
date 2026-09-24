@@ -21,7 +21,7 @@ type 'a io = {
   ok : Receipt_view.direct_call_meta -> Call_plan.direct_exec -> 'a -> unit Lwt.t;
   fail : Receipt_view.direct_call_meta -> Call_plan.direct_exec -> string -> unit Lwt.t;
   reject : Call_plan.direct_exec_reject -> unit Lwt.t;
-  crash : Receipt_view.direct_call_meta -> string -> unit Lwt.t;
+  crash : Receipt_view.direct_call_meta -> exn -> unit Lwt.t;
 }
 
 let plan spec =
@@ -56,8 +56,10 @@ let run spec io =
         io.reject (Call_plan.direct_exec_reject spec.reject_domain rejected))
     (fun exn ->
       match exn with
-      | Tx_effects.Commit_failed _ -> Lwt.fail exn
+      | Tx_effects.Commit_failed _
+      | Stack_overflow
+      | Out_of_memory -> Lwt.fail exn
       | _ ->
         io.crash
           (Receipt_view.direct_call_meta spec.domain)
-          (Printexc.to_string exn))
+          exn)

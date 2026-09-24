@@ -86,3 +86,7 @@
 (executable
  (name vote_floor)
  (libraries octra_node_runtime))
+
+(executable
+ (name fhe_audit)
+ (libraries octra_core lwt.unix unix digestif irmin-pack.unix))

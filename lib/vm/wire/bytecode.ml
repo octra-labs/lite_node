@@ -1003,6 +1003,7 @@ let decode_image ?(active = true) raw =
         failwith "OCTB trailing bytes";
     Ok { consts = const_cells; cells; text_at; state; proof; emission; veil; code }
   with Failure msg -> Error (trim_error msg)
+    | (Stack_overflow | Out_of_memory) as error -> raise error
     | exn -> Error (trim_error (Printexc.to_string exn))
 
 let decode ?(active = true) raw =

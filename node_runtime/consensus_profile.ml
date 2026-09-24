@@ -293,10 +293,27 @@ let standard_hash ~chain_id ~epoch getenv =
       | Octra_core.Rule_graph.Active ->
         put_standard_component buf "set_plan" "retain_until_activation"
     end;
-    match Octra_core.Rule_graph.math_at ~chain_id ~epoch with
+    begin match Octra_core.Rule_graph.math_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
-      put_standard_component buf "math" "scalar65_field_signed_cipher_zero_q16")
+      put_standard_component buf "math" "scalar65_field_signed_cipher_zero_q16"
+    end;
+    begin match Octra_core.Rule_graph.exit_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "validator_exit" Octra_core.Validator_policy.exit_id
+    end;
+    begin match Octra_core.Rule_graph.ready_exec_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "ready_reference"
+        Octra_core.Validator_ready_policy.window_id
+    end;
+    match Octra_core.Rule_graph.program_source_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "program_source"
+        Octra_vm.Program_package.source_id)
 
 let hash ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with

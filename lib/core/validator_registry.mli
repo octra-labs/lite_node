@@ -20,6 +20,7 @@ type ready_payload = {
   consensus_pubkey_b64 : string;
   head_epoch : int64;
   state_root : string;
+  head_proposal_id : string option;
   chain_id : string option;
   binary_hash : string option;
   config_hash : string option;

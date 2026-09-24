@@ -22,5 +22,7 @@ type deps = {
 }
 
 val run :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   deps ->
   unit

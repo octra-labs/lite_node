@@ -172,6 +172,33 @@ let member_count state =
     end
   | _ -> failwith "set_fold: state encoding invalid"
 
+let reload state =
+  let encoded = Fold.to_string state in
+  let restored = Fold.of_string encoded |> Result.get_ok in
+  expect "serialized fold bytes survive restoration"
+    (Fold.to_string restored = encoded);
+  restored
+
+let pulse_fields address state =
+  let open Yojson.Safe.Util in
+  let pulse =
+    Fold.to_yojson state
+    |> member "members"
+    |> to_list
+    |> List.find (fun item -> member "address" item = `String address)
+    |> member "phase"
+    |> member "pulse"
+  in
+  (member "first" pulse |> to_string |> Int64.of_string),
+  (member "last" pulse |> to_string |> Int64.of_string),
+  (member "count" pulse |> to_int)
+
+let credit_pulse epoch credit state =
+  Fold.note_pulse ~credit Fold.participating ~epoch ~active:false
+    ~address:"octA" state
+  |> Result.get_ok
+  |> reload
+
 let note_parent at parent state =
   let final, signers, _ = Fold.read_parent ~chain_id:"fold-test" parent |> Result.get_ok in
   Fold.note_final
@@ -424,11 +451,342 @@ let check_compaction () =
   let state = Fold.note_set cfg ~epoch:80L ~active:second state |> Result.get_ok in
   expect "pulse retained at gap boundary" (member_count state = 5);
   let state = Fold.note_set cfg ~epoch:81L ~active:second state |> Result.get_ok in
-  expect "stale pulse compacted" (member_count state = 4);
+  expect "expired pulse compacted" (member_count state = 4);
   let state = Fold.note_set cfg ~epoch:82L ~active:first state |> Result.get_ok in
   expect "compacted member reenters as live" (member_count state = 4);
   expect "compacted member remains eligible after reentry"
     (Fold.allows cfg ~start:0L ~source:82L ~address:"octA" state)
+
+let pulse_load count =
+  let cfg = Fold.participating in
+  let senders = List.init count (fun index ->
+    index mod 4, Printf.sprintf "octQueue%04d" index) in
+  let initial =
+    Fold.note_set cfg ~epoch:0L ~active:addresses Fold.empty
+    |> Result.get_ok
+  in
+  let state =
+    List.init 100 (fun step -> step + 100)
+    |> List.fold_left (fun state height ->
+      let epoch = Int64.of_int height in
+      senders
+      |> List.filter (fun (slot, _) -> slot = height mod 4)
+      |> List.fold_left (fun state (_, address) ->
+        Fold.note_pulse ~cap_mode:Fold.Prune cfg ~epoch ~active:false
+          ~address state
+        |> Result.get_ok) state
+      |> Fold.to_string
+      |> Fold.of_string
+      |> Result.get_ok) initial
+  in
+  let eligible =
+    List.filter
+      (fun (_, address) -> Fold.allows cfg ~start:0L ~source:199L ~address state)
+      senders
+    |> List.length
+  in
+  let records = member_count state in
+  expect "pulse load preserves the configured record limit"
+    (records <= cfg.max_members * 4);
+  let members =
+    Fold.to_yojson state
+    |> Yojson.Safe.Util.member "members"
+    |> Yojson.Safe.Util.to_list
+  in
+  expect "pulse load preserves live members"
+    (List.for_all (fun address ->
+      List.exists (fun member ->
+        Yojson.Safe.Util.member "address" member = `String address
+        && (member
+            |> Yojson.Safe.Util.member "phase"
+            |> Yojson.Safe.Util.member "kind") = `String "live") members)
+      addresses);
+  Printf.printf
+    "event = duty_load participants = %d eligible = %d records = %d epochs = 100\n%!"
+    count eligible records;
+  eligible
+
+let check_pulse_load () =
+  expect "confirmed pulses retain progress below capacity" (pulse_load 32 = 32);
+  expect "current overflow policy resets every returning series"
+    (pulse_load 1_000 = 0)
+
+let check_credit_first () =
+  let cfg = Fold.participating in
+  let live = Fold.note_set cfg ~epoch:200L ~active:addresses Fold.empty
+    |> Result.get_ok in
+  let shadow = note_parent_cfg cfg 200L (parent 199L addresses) live
+    |> Fold.note_set cfg ~epoch:200L ~active:["octB"; "octC"; "octD"]
+    |> Result.get_ok |> reload in
+  List.iter (fun initial ->
+    let state = credit_pulse 201L 199L initial in
+    expect "delayed first credit starts at execution"
+      (pulse_fields "octA" state = (201L, 201L, 1));
+    let state = credit_pulse 201L 200L state |> credit_pulse 201L 201L in
+    expect "first epoch replay cannot add progress"
+      (pulse_fields "octA" state = (201L, 201L, 1));
+    let state = List.init 15 (fun index -> Int64.of_int (205 + index * 4))
+      |> List.fold_left (fun state epoch -> credit_pulse epoch epoch state) state in
+    expect "delayed first cannot finish before sixty four epochs"
+      (not (Fold.allows cfg ~start:0L ~source:264L ~address:"octA" state));
+    let state = credit_pulse 265L 265L state in
+    expect "full execution span permits rejoin"
+      (Fold.allows cfg ~start:0L ~source:265L ~address:"octA" state);
+    expect "full span counts only new credit"
+      (pulse_fields "octA" state = (201L, 265L, 17)))
+    [Fold.empty; live; shadow]
+
+let check_credit_duplicates () =
+  let state = credit_pulse 100L 100L Fold.empty |> credit_pulse 104L 103L in
+  expect "continuation uses credit rather than execution"
+    (pulse_fields "octA" state = (100L, 103L, 2));
+  List.iter (fun credit ->
+    let next = credit_pulse 104L credit state in
+    expect "duplicate and older credit preserve bytes"
+      (Fold.to_string next = Fold.to_string state);
+    expect "duplicate and older credit preserve count"
+      (pulse_fields "octA" next = (100L, 103L, 2))) [103L; 102L];
+  let later = credit_pulse 105L 103L state in
+  expect "later duplicate does not extend the series"
+    (pulse_fields "octA" later = (100L, 103L, 2));
+  let reset = credit_pulse 112L 103L later in
+  expect "old credit after a gap starts at execution"
+    (pulse_fields "octA" reset = (112L, 112L, 1));
+  List.iter (fun initial ->
+    List.iter (fun active ->
+      List.iter (fun credit ->
+        expect "credit outside execution is rejected"
+          (Result.is_error (Fold.note_pulse ~credit Fold.participating
+            ~epoch:105L ~active ~address:"octA" initial)))
+        [Int64.min_int; -1L; 106L; Int64.max_int]) [false; true])
+    [Fold.empty; state];
+  expect "execution cannot precede confirmed credit"
+    (Result.is_error (Fold.note_pulse ~credit:102L Fold.participating
+      ~epoch:102L ~active:false ~address:"octA" state))
+
+let check_credit_gap () =
+  let cfg = Fold.participating in
+  expect "credit policy keeps gap eight and span sixty four"
+    (cfg.pulse_gap = 8L && cfg.rejoin_span = 64L);
+  let state = List.init 17 (fun index -> Int64.of_int (100 + index * 4))
+    |> List.fold_left (fun state epoch -> credit_pulse epoch epoch state) Fold.empty in
+  let delayed = credit_pulse 170L 168L state in
+  expect "two epoch delivery without loss preserves credit"
+    (pulse_fields "octA" delayed = (100L, 168L, 18));
+  let loss_one = credit_pulse 172L 171L state in
+  expect "one loss and one delay continues at gap eight"
+    (pulse_fields "octA" loss_one = (100L, 171L, 18));
+  expect "gap eight retains earned rejoin"
+    (Fold.allows cfg ~start:0L ~source:172L ~address:"octA" loss_one);
+  let loss_two = credit_pulse 173L 171L state in
+  expect "one loss and two delay resets at gap nine"
+    (pulse_fields "octA" loss_two = (173L, 173L, 1));
+  expect "gap nine loses rejoin progress"
+    (not (Fold.allows cfg ~start:0L ~source:173L ~address:"octA" loss_two))
+
+let check_credit_timely () =
+  let epochs =
+    List.init 17 (fun index -> Int64.of_int (100 + index * 4))
+    @ [164L; 172L; 181L; 181L; 185L]
+  in
+  ignore (List.fold_left (fun (prior, credited) epoch ->
+    let prior = Fold.note_pulse Fold.participating ~epoch ~active:false
+      ~address:"octA" prior |> Result.get_ok |> reload in
+    let credited = credit_pulse epoch epoch credited in
+    expect "explicit timely credit preserves default state bytes"
+      (Fold.to_string credited = Fold.to_string prior);
+    expect "explicit timely credit preserves eligibility"
+      (Fold.allows Fold.participating ~start:0L ~source:epoch ~address:"octA" prior
+       = Fold.allows Fold.participating ~start:0L ~source:epoch ~address:"octA" credited);
+    prior, credited) (Fold.empty, Fold.empty) epochs)
+
+let check_credit_capacity () =
+  let cfg = Fold.participating in
+  let live = List.init 36 (fun index -> Printf.sprintf "octLive%03d" index) in
+  let shadow = List.init 764 (fun index -> Printf.sprintf "octShadow%04d" index) in
+  let initial = Fold.note_set cfg ~epoch:100L ~active:live Fold.empty
+    |> Result.get_ok in
+  let state = List.fold_left (fun state address ->
+    Fold.note_pulse ~credit:98L cfg ~epoch:100L ~active:false ~address state
+    |> Result.get_ok) initial shadow |> reload in
+  expect "capacity is eight hundred total records" (member_count state = 800);
+  let shape state =
+    let open Yojson.Safe.Util in
+    let members = Fold.to_yojson state |> member "members" |> to_list in
+    let active = List.filter (fun item ->
+      (item |> member "phase" |> member "kind") = `String "live") members in
+    expect "all thirty six live records survive capacity handling"
+      (List.length active = 36 && List.for_all (fun address ->
+        List.exists (fun item -> member "address" item = `String address) active) live);
+    expect "capacity retains seven hundred sixty four shadow records"
+      (List.length members - List.length active = 764)
+  in
+  shape state;
+  let update cap_mode = List.fold_left (fun state address ->
+    Fold.note_pulse ~cap_mode ~credit:102L cfg ~epoch:104L ~active:false
+      ~address state |> Result.get_ok) state shadow |> reload in
+  let reject = update Fold.Reject in
+  let prune = update Fold.Prune in
+  expect "full capacity modes agree without overflow"
+    (Fold.to_string reject = Fold.to_string prune);
+  List.iter (fun address ->
+    expect "every shadow keeps delayed credit after restoration"
+      (pulse_fields address prune = (100L, 102L, 2))) shadow;
+  shape prune;
+  let encoded = Fold.to_string reject in
+  expect "record eight hundred one is rejected without pruning"
+    (Result.is_error (Fold.note_pulse ~credit:102L cfg ~epoch:104L ~active:false
+      ~address:"octNew" reject));
+  expect "capacity rejection does not mutate original state"
+    (Fold.to_string reject = encoded);
+  let pruned = Fold.note_pulse ~cap_mode:Fold.Prune ~credit:102L cfg
+    ~epoch:104L ~active:false ~address:"octNew" prune
+    |> Result.get_ok |> reload in
+  expect "overflow pruning keeps eight hundred total records"
+    (member_count pruned = 800);
+  shape pruned;
+  expect "new shadow at capacity begins at execution"
+    (pulse_fields "octNew" pruned = (104L, 104L, 1))
+
+let check_delivery_pool () =
+  let module Ready = Octra_core.Validator_ready_policy in
+  List.iter (fun (epoch, head, accepted) ->
+    expect "delivery admits only parent lag zero through two"
+      (Ready.delivery ~epoch ~head = accepted))
+    [0L, 0L, false; 1L, 0L, true; 1L, -1L, false;
+     10L, 9L, true; 10L, 8L, true; 10L, 7L, true;
+     10L, 6L, false; 10L, 10L, false; 10L, 11L, false;
+     Int64.max_int, Int64.pred Int64.max_int, true];
+  List.iter (fun reference ->
+    expect "pool expiry matches next execution for nonfuture references"
+      (Ready.expired ~head:9L ~reference = not (Ready.delivery ~epoch:10L ~head:reference)))
+    [-1L; 0L; 6L; 7L; 8L; 9L];
+  expect "future relay is held without becoming executable"
+    (not (Ready.expired ~head:9L ~reference:10L)
+     && not (Ready.delivery ~epoch:10L ~head:10L));
+  expect "negative pool head is rejected" (Ready.expired ~head:(-1L) ~reference:0L)
+
+let check_appeal_quorum () =
+  let cfg = Fold.participating in
+  let start = 100L in
+  let keys = List.init 36 (fun index -> key (Printf.sprintf "octDuty%02d" index)) in
+  let active = List.map (fun (item, _) -> item.C_types.address) keys in
+  let signers = List.filteri (fun index _ -> index < 25) active in
+  let missing = List.filteri (fun index _ -> index >= 25) active in
+  let validator_set = C_types.make_weighted_validator_set
+    (List.map (fun (item, _) -> item, Z.one) keys) |> Result.get_ok in
+  let vote epoch proposal_id address =
+    let _, private_key = List.find (fun (item, _) ->
+      item.C_types.address = address) keys in
+    let vote = C_types.{
+      chain_id = "fold-test";
+      epoch_id = epoch;
+      round = 2;
+      vote_type = Precommit;
+      proposal_id;
+      validator = address;
+      signature = String.make 64 '\x00';
+    } in
+    { vote with signature = Mirage_crypto_ec.Ed25519.sign ~key:private_key
+      (C_hash.vote_sign_bytes vote) }
+  in
+  let commit epoch =
+    let header = { (header epoch) with creator_addr = List.hd signers } in
+    let proposal_id = C_hash.proposal_id header in
+    C_types.{ validator_set; certificate = {
+      chain_id = "fold-test";
+      epoch_id = epoch;
+      commit_round = 2;
+      header;
+      proposal_id;
+      precommits = List.map (vote epoch proposal_id) signers;
+    } }
+  in
+  let advance epoch parent state =
+    let state, reason, changed = Fold.advance cfg ~chain_id:"fold-test"
+      ~start ~at:epoch ~parent:(Some parent) state |> Result.get_ok in
+    expect "contiguous quorum advancement has no grace extension"
+      (reason = None && changed);
+    reload state
+  in
+  let warm = Int64.add start (Int64.add cfg.window cfg.challenge) in
+  let measured = Int64.add warm cfg.delay in
+  let total = Int64.to_int (Int64.sub measured start) + 160 in
+  let _, _, _, checked = List.init total (fun index -> Int64.add start (Int64.of_int index))
+    |> List.fold_left (fun (state, control, commits, checked) epoch ->
+      let parent = commit (Int64.pred epoch) in
+      expect "certificate contains exactly twenty five votes"
+        (List.length parent.C_types.certificate.precommits = 25);
+      if epoch = start then begin
+        let short = { parent with C_types.certificate = {
+          parent.certificate with precommits = List.tl parent.certificate.precommits
+        } } in
+        expect "twenty four of thirty six cannot certify a parent"
+          (Result.is_error (Fold.read_parent ~chain_id:"fold-test" short))
+      end;
+      let control = advance epoch parent control in
+      let commits = (Int64.pred epoch, parent) :: commits in
+      let target = Int64.sub epoch 16L in
+      let state = match List.assoc_opt target commits with
+        | None -> state
+        | Some proof_commit ->
+          let head = Int64.sub epoch 3L in
+          let reference = List.assoc head commits in
+          let raw = reference.C_types.certificate.proposal_id in
+          let proposal = String.concat "" (List.init (String.length raw)
+            (fun index -> Printf.sprintf "%02x" (Char.code raw.[index]))) in
+          expect "appeal delivery is exactly two epochs behind parent"
+            (Int64.sub (Int64.pred epoch) head = 2L);
+          expect "delayed proposal identity matches restored fold history"
+            (Octra_core.Validator_ready_policy.reference ~epoch ~head
+              ~proposal:(Some proposal) ~parent:(Some parent) ~state = Ok ());
+          List.fold_left (fun state address ->
+            let vote = vote target proof_commit.C_types.certificate.proposal_id address in
+            let proof = Fold.{ vote; commit = proof_commit } in
+            expect "appeal arrives at proof age sixteen"
+              (Int64.sub epoch vote.C_types.epoch_id = cfg.challenge);
+            expect "age seventeen is rejected independently of delivery"
+              (Result.is_error (Fold.apply_proof cfg ~chain_id:"fold-test"
+                ~epoch:(Int64.succ epoch) ~active:true ~address proof state));
+            if epoch = Int64.add start 15L then begin
+              let invalid = Fold.{ proof with vote = {
+                vote with signature = String.make 64 '\x00'
+              } } in
+              expect "appeal requires the omitted signer signature"
+                (Result.is_error (Fold.apply_proof cfg ~chain_id:"fold-test"
+                  ~epoch ~active:true ~address invalid state))
+            end;
+            let state = Fold.apply_proof cfg ~chain_id:"fold-test" ~epoch
+              ~active:true ~address proof state |> Result.get_ok in
+            expect "authenticated appeal records the missing vote"
+              (List.mem target (Fold.receipt ~address state).marked);
+            state) state missing
+      in
+      let state = advance epoch parent state in
+      let checked = if epoch < measured then checked else begin
+        let safe_after = Fold.to_yojson state
+          |> Yojson.Safe.Util.member "safe_after"
+          |> Yojson.Safe.Util.to_string |> Int64.of_string in
+        expect "eligibility is checked after warmup and delay"
+          (epoch >= warm && Int64.sub epoch warm >= cfg.delay);
+        expect "eligibility is not supplied by safety grace"
+          (safe_after = 0L && epoch >= safe_after);
+        expect "all thirty six remain eligible after authenticated appeals"
+          (List.for_all (fun address -> Fold.allows cfg ~start ~source:epoch
+            ~address state) active);
+        expect "without appeals all eleven missing signers are excluded"
+          (List.for_all (fun address -> not (Fold.allows cfg ~start ~source:epoch
+            ~address control)) missing);
+        expect "certificate signers remain eligible in the control"
+          (List.for_all (fun address -> Fold.allows cfg ~start ~source:epoch
+            ~address control) signers);
+        expect "appeals do not create extra members" (member_count state = 36);
+        checked + 1
+      end in
+      let commits = List.filter (fun (at, _) -> at >= target) commits in
+      state, control, commits, checked) (Fold.empty, Fold.empty, [], 0)
+  in
+  expect "one hundred sixty post grace epochs have no exclusion" (checked = 160)
 
 let participation_state signed =
   let cfg = Fold.participating in
@@ -747,6 +1105,14 @@ let () =
   check_rejoin_and_delay ();
   check_scale ();
   check_compaction ();
+  check_pulse_load ();
+  check_credit_first ();
+  check_credit_duplicates ();
+  check_credit_gap ();
+  check_credit_timely ();
+  check_credit_capacity ();
+  check_delivery_pool ();
+  check_appeal_quorum ();
   check_participation_profile ();
   check_slow_signer_cutoff ();
   check_removal_no_ratchet ();

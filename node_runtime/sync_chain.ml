@@ -296,7 +296,7 @@ let prior_update deps update =
 
 let walk deps ~head_epoch ~base ~stop raw =
   let rec loop depth seen before_epoch raw =
-    if depth >= 1_024 then
+    if depth >= Anchor.max_steps then
       Lwt.return_error "state sync validator transition chain is too long"
     else
       let digest = Digestif.SHA256.(digest_string raw |> to_hex) in
@@ -425,6 +425,8 @@ let build deps ~head_epoch trusted active =
             let run stop =
               walk deps ~head_epoch ~base ~stop raw >>= function
               | Error _ as error -> Lwt.return error
+              | Ok chain when List.length chain.rev_steps > Anchor.max_steps ->
+                  Lwt.return_error "state sync validator transition chain is too long"
               | Ok chain when same_set chain.validator_set active ->
                   Lwt.return_ok (List.rev chain.rev_steps)
               | Ok _ ->

@@ -148,8 +148,9 @@ let observer_loop () =
 let idle ~observer ~follow =
   observer && not follow
 
-let node_launch_tasks (deps : node_launch_deps) =
-  let swarm_task = node_swarm_task ~swarm:deps.swarm ~deps:deps.swarm_deps in
+let node_launch_tasks ?duty_head ?bft_mode (deps : node_launch_deps) =
+  let swarm_task = P2p_swarm_lifecycle.node_task
+    ?duty_head ?bft_mode ~swarm:deps.swarm deps.swarm_deps in
   task_plan
     ~base_tasks:
       (transport_tasks ~p2p:deps.p2p ~rpc:deps.rpc ~swarm:swarm_task
@@ -189,16 +190,18 @@ let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~close_chaindata
     ~close_chaindata
     ~exit_fatal
 
-let run_node_launch_tasks (deps : node_launch_deps) ~close_chaindata
+let run_node_launch_tasks ?duty_head ?bft_mode (deps : node_launch_deps) ~close_chaindata
     ~exit_fatal =
   run_join
     ~log:default_join_log
-    ~tasks:(node_launch_tasks deps)
+    ~tasks:(node_launch_tasks ?duty_head ?bft_mode deps)
     ~close_chaindata
     ~exit_fatal
 
-let run_node_runtime (runtime : node_launch_runtime) =
+let run_node_runtime ?duty_head ?bft_mode (runtime : node_launch_runtime) =
   run_node_launch_tasks
+    ?duty_head
+    ?bft_mode
     (make_node_launch_deps_with_swarm
        ~p2p:runtime.p2p
        ~rpc:runtime.rpc

@@ -18,7 +18,7 @@ let finish octb =
 
 let compile source =
   if Aml_source.owns source then
-    match Aml_source.compile source with
+    match Aml_source.compile ~syntax:Oct_gen.Source source with
     | Ok value -> finish value.octb
     | Error reason -> Error reason
   else

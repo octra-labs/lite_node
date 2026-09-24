@@ -144,10 +144,12 @@ let value_effect ~from_addr ~target ~amount ~balance =
 
 let effort_limit ou =
   max 1_000_000
-    (try Z.to_int ou with _ -> 1_000_000)
+    (try Z.to_int ou with
+     | (Stack_overflow | Out_of_memory) as error -> raise error
+     | _ -> 1_000_000)
 
 let parse_params_json params_json =
-  match Yojson.Safe.from_string params_json with
+  match Octra_core.Json_tree.read params_json with
   | `List values -> values
   | _ -> []
 
@@ -223,7 +225,9 @@ let parse_deploy_params = function
   | Some params_json ->
     begin
       try parse_params_json params_json
-      with _ -> []
+      with
+      | (Stack_overflow | Out_of_memory) as error -> raise error
+      | _ -> []
     end
   | None -> []
 
@@ -333,8 +337,9 @@ let plan_deploy_input_with_keys ~trusted ~point_ops ~bytecode_b64_opt ~deployer
         }
       | (Deploy_invalid_bytecode _ | Deploy_address_mismatch) as rejected ->
         Deploy_input_rejected (deploy_payload_reject rejected)
-    with _ ->
-      Deploy_input_exception "Program deploy input failed"
+    with
+    | (Stack_overflow | Out_of_memory) as error -> raise error
+    | _ -> Deploy_input_exception "Program deploy input failed"
 
 let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
   plan_deploy_input_with_keys
@@ -378,7 +383,7 @@ let parse_call index = function
 
 let parse_multi_exec_calls ~max_calls message =
   try
-    let json = Yojson.Safe.from_string message in
+    let json = Octra_core.Json_tree.read message in
     let call_items =
       match json with
       | `List calls -> Ok calls
@@ -402,4 +407,6 @@ let parse_multi_exec_calls ~max_calls message =
           | Ok call -> loop (index + 1) (call :: acc) tail
       in
       loop 0 [] call_items
-  with _ -> Error "multi_exec payload is invalid"
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> Error "multi_exec payload is invalid"

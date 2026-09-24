@@ -94,6 +94,25 @@ let evidence ~window reason (attestation : Resource_attestations.attestation) =
     observed_epoch = window.current_epoch;
   }
 
+let valid_window window =
+  window.current_epoch >= 0L && window.fraud_window >= 0L
+  && window.future_window >= 0L
+
+let expired window epoch =
+  epoch < window.current_epoch
+  && Int64.sub window.current_epoch epoch > window.fraud_window
+
+let prune pool window =
+  Hashtbl.filter_map_inplace (fun _ (att : Resource_attestations.attestation) ->
+    if expired window att.epoch_id then None else Some att) pool.accepted;
+  Hashtbl.filter_map_inplace (fun _ id ->
+    if Hashtbl.mem pool.accepted id then Some id else None) pool.identity_index;
+  let retain _ entry =
+    if expired window entry.observed_epoch then None else Some entry
+  in
+  Hashtbl.filter_map_inplace retain pool.rejected;
+  Hashtbl.filter_map_inplace retain pool.quarantined
+
 let classify
     ~chain_id
     ~challenge
@@ -101,13 +120,14 @@ let classify
     ~pubkey_of_node
     pool
     (attestation : Resource_attestations.attestation) =
-  let attestation_id = Resource_attestations.attestation_id attestation in
-  if Hashtbl.mem pool.accepted attestation_id then Accept
-  else if Hashtbl.length pool.accepted >= max_accepted then Reject Capacity
+  if not (valid_window window) || String.length challenge <> 32
+      || attestation.epoch_id < 0L
+      || not (Resource_attestations.is_well_formed attestation) then Reject Malformed
   else if attestation.chain_id <> chain_id then Reject ChainMismatch
-  else if attestation.epoch_id < Int64.sub window.current_epoch window.fraud_window then Reject EpochTooOld
-  else if attestation.epoch_id > Int64.add window.current_epoch window.future_window then Reject EpochTooNew
-  else if not (Resource_attestations.is_well_formed attestation) then Reject Malformed
+  else if expired window attestation.epoch_id then Reject EpochTooOld
+  else if attestation.epoch_id > window.current_epoch
+      && Int64.sub attestation.epoch_id window.current_epoch > window.future_window then
+    Reject EpochTooNew
   else if attestation.score <> Resource_attestations.attestation_score ~challenge attestation then Reject BadScore
   else
     match pubkey_of_node attestation.node_id with
@@ -116,8 +136,11 @@ let classify
       when not (Resource_attestations.verify_attestation_signature ~pubkey_raw:pubkey attestation) ->
         Reject BadSignature
     | Some _ ->
+        let attestation_id = Resource_attestations.attestation_id attestation in
         match Hashtbl.find_opt pool.identity_index (identity_key attestation) with
         | Some existing_id when existing_id <> attestation_id -> Quarantine ConflictingIdentity
+        | _ when not (Hashtbl.mem pool.accepted attestation_id)
+            && Hashtbl.length pool.accepted >= max_accepted -> Reject Capacity
         | _ -> Accept
 
 let remember pool ~window decision attestation =
@@ -136,8 +159,9 @@ let remember pool ~window decision attestation =
         Hashtbl.replace pool.quarantined (evidence_id record) record
 
 let ingest ~chain_id ~challenge ~window ~pubkey_of_node pool attestation =
+  if valid_window window then prune pool window;
   let decision = classify ~chain_id ~challenge ~window ~pubkey_of_node pool attestation in
-  remember pool ~window decision attestation;
+  if decision <> Reject Malformed then remember pool ~window decision attestation;
   decision
 
 let accepted pool =

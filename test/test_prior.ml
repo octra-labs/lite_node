@@ -27,12 +27,12 @@ let digest value = Digestif.SHA256.(digest_string value |> to_hex)
 
 let compiler_files () =
   let files = [
-    "prior_compile.ml", "0ba26f637c3f7e330ce5b7ed3c549308a3207fac3dfcb256d6e53780aa940992";
-    "prior_gen.ml", "435873f8717318c64b91199ee85bce60fe2ba01e525f0d9a49061a2075afa329";
+    "prior_compile.ml", "a087065e9c7adbd47578d4005a442fcbf9866d4774f14e7030591505a086213e";
+    "prior_gen.ml", "b0c5d166fb4b0a7615d28c6e65d01aae6fb89d4897f8079673c002da3cdbe631";
     "prior_lang.ml", "8b57b70ca6ef70f759545aa6b9b874afa26992ea70ee9e6e09adc07f1a2635fb";
     "prior_lex.ml", "ccd669e0f5b5ad3b853b5552c2f5db6ca06c63707078319cb31d6a02b64488fc";
-    "prior_parse.ml", "c65248f3c3f87caeb70d6f6bdd5f1ca56eb711f66839e83f582877ef0dd10b4c";
-    "prior_verify.ml", "77b2ec0c8817b74b0a825af7e33ba8197f86aacc4040552b6fca200ae9eb667b";
+    "prior_parse.ml", "8a3f43a05e9df9defa4b42cf92268a7adbab6a97101ec1ae9e5c6eabe5cafc88";
+    "prior_verify.ml", "1517d5e46f6850413fe8d730e8a2812fccd9c724daaa30b229df19258c14a18e";
   ] in
   let root = if Sys.file_exists "lib/vm/compiler/prior" then "." else ".." in
   List.iter (fun (name, expected) ->

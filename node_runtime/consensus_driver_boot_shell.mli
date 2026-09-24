@@ -54,6 +54,7 @@ type deps = {
   read_pending_validator_meta : unit -> string option;
   read_head_hash : unit -> string option;
   get_meta : string -> string option;
+  duty_state : Octra_core.Head_manifest.t -> (Octra_core.Set_fold.t, string) result;
   read_persistent_pending : unit -> string option Lwt.t;
   root_of_head_hash : string -> string;
   root_to_raw32 : string -> string;

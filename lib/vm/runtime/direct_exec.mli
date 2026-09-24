@@ -21,7 +21,7 @@ type 'a io = {
   ok : Receipt_view.direct_call_meta -> Call_plan.direct_exec -> 'a -> unit Lwt.t;
   fail : Receipt_view.direct_call_meta -> Call_plan.direct_exec -> string -> unit Lwt.t;
   reject : Call_plan.direct_exec_reject -> unit Lwt.t;
-  crash : Receipt_view.direct_call_meta -> string -> unit Lwt.t;
+  crash : Receipt_view.direct_call_meta -> exn -> unit Lwt.t;
 }
 
 val plan :

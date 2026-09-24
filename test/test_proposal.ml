@@ -1967,6 +1967,8 @@ let test_verify_staging_lookup () =
       proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
       catchup_active = ref false;
       staging_epoch_capacity = Z.of_int 10_000;
+      chain_id = "proposal-test";
+      duty_state = (fun _ -> Ok Octra_core.Set_fold.empty);
       write_pending = (fun _ -> ());
       validator_pubkeys_for_epoch = (fun ~wallet_addr:_ ~wallet_pub:_ ~epoch:_ -> []);
     } in
@@ -2239,6 +2241,29 @@ let test_future_reproposal_active () =
              ~chain_id:"octra-devnet-9871-cluster"
              proposal)));
   expect "future activated reproposal previewed" (!previews = [])
+
+let test_time_recovery () =
+  let item = tx 1 in
+  let source = proposal_for_txs [item] in
+  let parent = 1_700_086_400.0 in
+  List.iter (fun valid_round ->
+    let proposal = {
+      source with
+      round = 1;
+      valid_round;
+      header = { source.header with ts = parent +. 10.0 };
+    } in
+    List.iter (fun (now, accepted) ->
+      let deps, _, _, _, _, _, _, previews = verify_proposal_deps
+        ~now ~previous_epoch_ts:(Some parent) ~staging:[item] () in
+      let verdict = Lwt_main.run
+        (C.verify_proposal deps ~chain_id:proposal.chain_id proposal) in
+      expect "temporal recovery admission differs"
+        (if accepted then verdict_accepts verdict else verdict_rejects verdict);
+      expect "rejected time entered execution"
+        (List.length !previews = if accepted then 1 else 0))
+      [parent -. 86_400.0, false; parent +. 4.0, false;
+       parent +. 5.0, true; parent +. 10.0, true]) [None; Some 0]
 
 let test_verify_invalid_valid_round () =
   let item = tx 1 in
@@ -2901,6 +2926,7 @@ let () =
   test_verify_old_valid_round ();
   test_future_reproposal_prior ();
   test_future_reproposal_active ();
+  test_time_recovery ();
   test_verify_invalid_valid_round ();
   test_tx_hash_admission_match ();
   test_tx_hash_admission_mismatch ();

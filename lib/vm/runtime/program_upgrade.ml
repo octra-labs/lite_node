@@ -24,7 +24,7 @@ let one name fields =
 
 let parse_message raw =
   try
-    match Yojson.Safe.from_string raw with
+    match Octra_core.Json_tree.read raw with
     | `Assoc fields when List.length fields = 2 ->
       begin
         match one "schema" fields, one "expected_code_hash" fields with

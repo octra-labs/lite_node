@@ -20,8 +20,8 @@ type committee_snapshot = {
   challenge : string;
   committee : Resource_attestations.attestation list;
   committee_root : string;
-  total_weight : int64;
-  quorum_weight : int64;
+  total_weight : Z.t;
+  quorum_weight : Z.t;
 }
 
 let max_chain_id_bytes = 128
@@ -84,7 +84,7 @@ let select_snapshot ~activation_delay ~committee_size ~target_epoch ~source_seed
       in
       let total_weight = Resource_attestations.sum_weight committee in
       let quorum_weight =
-        if total_weight <= 0L then 0L
+        if Z.sign total_weight <= 0 then Z.zero
         else Resource_attestations.quorum_weight total_weight
       in
       Some {
@@ -110,7 +110,7 @@ let validator_set_of_committee ~pubkey_of_node (committee : Resource_attestation
   loop [] committee
 
 let ready_for_voting ~minimum_weight snapshot =
-  snapshot.total_weight >= minimum_weight && snapshot.committee <> []
+  Z.geq snapshot.total_weight (Z.of_int64 minimum_weight) && snapshot.committee <> []
 
 let rewards_for_snapshot ~budget snapshot =
   Resource_attestations.distribute_resource_rewards ~budget snapshot.committee

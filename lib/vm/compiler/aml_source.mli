@@ -9,7 +9,7 @@ type t = private {
   octb : string;
 }
 
-val compile_ast : Oct_lang.contract -> (t, string) result
-val compile : string -> (t, string) result
-val compile_multi : (string -> string option) -> string -> (t, string) result
+val compile_ast : syntax:Oct_gen.syntax -> Oct_lang.contract -> (t, string) result
+val compile : syntax:Oct_gen.syntax -> string -> (t, string) result
+val compile_multi : syntax:Oct_gen.syntax -> (string -> string option) -> string -> (t, string) result
 val owns : string -> bool

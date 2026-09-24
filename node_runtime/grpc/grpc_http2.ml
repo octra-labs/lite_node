@@ -315,11 +315,24 @@ let connection config call submit lock address socket =
         (Grpc_status.make Grpc_status.Resource_exhausted "connection request limit"))
     end else begin
       let ended, finish = Lwt.task () in
+      let ready, start = Lwt.task () in
+      let checked invoke meta request =
+        if not (Lwt.is_sleeping ended) then Lwt.fail Lwt.Canceled
+        else
+          let work = invoke meta request in
+          if Lwt.is_sleeping ended then work
+          else begin
+            Lwt.cancel work;
+            Lwt.fail Lwt.Canceled
+          end
+      in
       let job = Lwt.catch
         (fun () ->
           let open Lwt.Syntax in
+          let* () = ready in
           let run =
-            let* () = handle config call submit lock address reqd in
+            let* () = handle config (checked call) (Option.map checked submit)
+              lock address reqd in
             let timeout =
               let* () = Lwt_unix.sleep config.max_deadline_s in
               Reqd.report_exn reqd (Failure "response delivery timeout");
@@ -335,6 +348,7 @@ let connection config call submit lock address socket =
       jobs := { reqd; ended; finish; job } :: !jobs;
       let remove _ = jobs := List.filter (fun current -> current.job != job) !jobs in
       Lwt.on_any job remove remove;
+      Lwt.wakeup start ();
       advance ();
       Lwt.async (fun () -> job)
     end
@@ -357,10 +371,13 @@ let connection config call submit lock address socket =
   Lwt.finalize
     (fun () -> Grpc_io.serve ~config:h2_config ~request_handler ~error_handler ~advance socket)
     (fun () ->
+      let open Lwt.Syntax in
+      let* () = Lwt.pause () in
       let pending = !jobs in
       jobs := [];
-      List.iter (fun pending -> Lwt.cancel pending.job) pending;
-      Lwt.return_unit)
+      List.iter (fun pending ->
+        if Lwt.is_sleeping pending.ended then Lwt.wakeup pending.finish ()) pending;
+      Lwt.join (List.map (fun pending -> pending.job) pending))
 
 let pipe_signal = lazy (Sys.set_signal Sys.sigpipe Sys.Signal_ignore)
 
@@ -435,6 +452,7 @@ let start ?submit ?socket config ~call =
           let job = Lwt.catch
             (fun () -> Lwt.finalize
               (fun () ->
+                let* () = Lwt.pause () in
                 Lwt_unix.set_close_on_exec client;
                 handle address client)
               (fun () -> close client))

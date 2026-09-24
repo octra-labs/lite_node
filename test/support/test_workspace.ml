@@ -52,6 +52,18 @@ let rec unique_dir prefix =
   with
   | Unix.Unix_error (Unix.EEXIST, _, _) -> unique_dir prefix
 
+let rec remove path =
+  match Unix.lstat path with
+  | { Unix.st_kind = Unix.S_DIR; _ } ->
+    Sys.readdir path |> Array.iter (fun name -> remove (Filename.concat path name));
+    Unix.rmdir path
+  | _ -> Unix.unlink path
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+
+let with_dir prefix action =
+  let directory = unique_dir prefix in
+  Fun.protect ~finally:(fun () -> remove directory) (fun () -> action directory)
+
 let unique_file prefix suffix =
   ensure_root ();
   Filename.temp_file ~temp_dir:root prefix suffix

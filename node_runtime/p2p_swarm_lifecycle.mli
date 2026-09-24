@@ -46,6 +46,8 @@ val node_lifecycle_deps :
   deps
 
 val handle_frame_with_transport :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   observer:bool ->
   peer_id:string ->
   tx:tx_callbacks ->
@@ -56,11 +58,15 @@ val handle_frame_with_transport :
   unit
 
 val start :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   deps ->
   Octra_net.P2p_swarm.t ->
   unit Lwt.t
 
 val node_task :
+  ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
+  ?bft_mode:bool ->
   swarm:Octra_net.P2p_swarm.t option ->
   node_deps ->
   unit Lwt.t option

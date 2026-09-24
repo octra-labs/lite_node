@@ -29,6 +29,7 @@ let run_json_classified input =
       | 1, message -> Error (Rejected message)
       | _, message -> Error (Unavailable message)
     with
+    | (Stack_overflow | Out_of_memory) as error -> raise error
     | exn -> Error (Unavailable (Printexc.to_string exn))
 
 let run_json input =

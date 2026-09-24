@@ -23,16 +23,26 @@ type 'handler dispatch_adapters = {
     (json:Yojson.Safe.t option -> rpc_result) ->
     'handler;
   compile_read :
-    (point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
+    (compiler:Octra_vm.Program_package.compiler ->
+     point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
     'handler;
   program_info : 'handler;
   program_list : 'handler;
   program_call : 'handler;
+  program_abi : 'handler;
   program_save_abi : 'handler;
   program_tokens_by_address : 'handler;
 }
 
 let compile_active = ref false
+
+let compile_at ~chain_id ~epoch handler params =
+  let point_ops =
+    Octra_core.Rule_graph.standard_at ~chain_id ~epoch = Octra_core.Rule_graph.Active
+  in
+  let compiler = Octra_core.Rule_graph.program_source_at ~chain_id ~epoch
+    |> Octra_vm.Program_package.compiler_mode in
+  handler ~compiler ~point_ops params
 
 let immediate task =
   match Lwt.state task with
@@ -87,8 +97,7 @@ let dispatch adapters =
       store_label_read Octra_vm.Contract_rpc.contract_storage_params;
     program_storage_dump =
       store_label_read Octra_vm.Contract_rpc.contract_storage_dump_params;
-    program_abi =
-      store_chaindata_read Octra_vm.Contract_rpc.abi_params;
+    program_abi = adapters.program_abi;
     program_verify =
       store_chaindata_read Octra_vm.Contract_rpc.verify_params;
     program_save_abi = adapters.program_save_abi;
@@ -99,13 +108,14 @@ let dispatch adapters =
     program_compile_assembly =
       no_ctx (compile_rpc Octra_vm.Contract_rpc.compile_assembly_params);
     program_compile_aml =
-      adapters.compile_read (fun ~point_ops params ->
-        compile_rpc (Octra_vm.Contract_rpc.compile_aml_params ~point_ops) params);
-    program_compile_aml_multi =
-      adapters.compile_read (fun ~point_ops params ->
+      adapters.compile_read (fun ~compiler ~point_ops params ->
         compile_rpc
-          (fun value -> Octra_vm.Contract_rpc.compile_aml_multi_for
-            ~point_ops ~json:(Octra_core.Rpc.param_json value 0))
+          (Octra_vm.Contract_rpc.compile_aml_params ~compiler ~point_ops) params);
+    program_compile_aml_multi =
+      adapters.compile_read (fun ~compiler ~point_ops params ->
+        compile_rpc
+          (fun value -> Octra_vm.Contract_rpc.compile_aml_multi_with
+            ~compiler ~point_ops ~json:(Octra_core.Rpc.param_json value 0))
           params);
     program_tokens_by_address = adapters.program_tokens_by_address;
   }

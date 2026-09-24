@@ -184,6 +184,24 @@ let signed_vote chain_id ~epoch_id ~round ~vote_type ~proposal_id validator =
 let settle () =
   Lwt_main.run (Lwt_list.iter_s (fun () -> Lwt.pause ()) (List.init 8 (fun _ -> ())))
 
+let receive_proposal driver value =
+  let local, peer = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = Octra_net.P2p_conn.create
+    ~peer_class:Octra_net.P2p_frame_budget.Validator local
+    ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v1"))
+    ~addr:"proposal-test" ~direction:Octra_net.P2p_conn.Inbound
+  in
+  Lwt_main.run (Lwt.finalize
+    (fun () -> C_driver.on_p2p_message driver conn Octra_net.P2p_frame.{
+      msg_type = msg_cons_propose;
+      payload = C_codec.encode_propose value;
+    })
+    (fun () ->
+      let open Lwt.Syntax in
+      let* () = Octra_net.P2p_conn.close conn in
+      Lwt_unix.close peer));
+  settle ()
+
 let certificate (value : C_types.propose) =
   let proposal_id = C_hash.proposal_id value.header in
   C_types.{
@@ -240,6 +258,193 @@ let test_work_slot () =
   assert (effects = [Run (id + 1, "next")]);
   let ignored, effects = step next (Finish (id, 8)) in
   assert (ignored = next && effects = [])
+
+let test_frame_finality () =
+  let chain_id = "octra-test-frame-finality" in
+  let result, finish = Lwt.wait () in
+  let calls = ref 0 in
+  let driver = driver
+    ~verify_proposal:(fun _ -> incr calls; Lwt.protected result) chain_id
+  in
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let local, peer = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = Octra_net.P2p_conn.create
+    ~peer_class:Octra_net.P2p_frame_budget.Validator local
+    ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v1"))
+    ~addr:"frame-finality" ~direction:Octra_net.P2p_conn.Inbound
+  in
+  let delivery =
+    let open Lwt.Syntax in
+    let* () = C_driver.on_p2p_message driver conn Octra_net.P2p_frame.{
+      msg_type = msg_cons_propose;
+      payload = C_codec.encode_propose value;
+    } in
+    C_driver.on_p2p_message driver conn Octra_net.P2p_frame.{
+      msg_type = msg_cons_finalize;
+      payload = C_codec.encode_finalize (certificate value);
+    }
+  in
+  settle ();
+  let progressed = driver.engine.state.height = 2L && not (Lwt.is_sleeping delivery) in
+  let pending = !calls = 1 && Lwt.is_sleeping result in
+  Lwt.wakeup_later finish C_driver.Proposal_accept;
+  settle ();
+  Lwt_main.run delivery;
+  let voted = C_vote_log.find_statement driver.vote_log ~chain_id ~validator:"v0"
+    ~epoch_id:1L ~round:0 ~vote_type:C_types.Prevote
+    ~proposal_id:(C_hash.proposal_id value.header)
+    |> Result.get_ok |> Option.is_some
+  in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close peer);
+  if not progressed || not pending then
+    failwith "first proposal check held following finality frame";
+  if voted then failwith "late frame check emitted a vote after finality"
+
+let test_frame_round () =
+  let chain_id = "octra-test-frame-round" in
+  let first, finish = Lwt.wait () in
+  let calls = ref [] in
+  let driver = driver ~verify_proposal:(fun value ->
+    calls := value.C_types.round :: !calls;
+    if List.length !calls = 1 then Lwt.protected first
+    else Lwt.return C_driver.Proposal_accept) chain_id
+  in
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let round = List.init C_engine.max_round_ahead (fun index -> index + 1)
+    |> List.find (fun round ->
+      (C_engine.leader_of validator_set ~epoch_id:1L ~round).address = value.proposer)
+  in
+  let next = { value with round; valid_round = Some 0 } in
+  let next = { next with signature = sign next.proposer (C_hash.propose_sign_bytes next) } in
+  let local, peer = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = Octra_net.P2p_conn.create
+    ~peer_class:Octra_net.P2p_frame_budget.Validator local
+    ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey (public_key "v1"))
+    ~addr:"frame-round" ~direction:Octra_net.P2p_conn.Inbound
+  in
+  let send value = C_driver.on_p2p_message driver conn Octra_net.P2p_frame.{
+    msg_type = msg_cons_propose;
+    payload = C_codec.encode_propose value;
+  } in
+  Lwt_main.run (send value);
+  Lwt_main.run (send value);
+  let single = !calls = [0] && Lwt.is_sleeping first in
+  let generation = driver.engine.generation in
+  C_engine.realign_round driver.engine round;
+  C_driver.clear_round_sync_jump driver ~height:1L ~round;
+  if driver.engine.generation = generation then failwith "generation did not advance";
+  Lwt_main.run (send next);
+  let queued = match driver.proposal_wait with
+    | Some wait -> wait.proposal.round = round
+    | None -> false
+  in
+  Lwt.wakeup_later finish C_driver.Proposal_accept;
+  settle ();
+  let completed = !calls = [round; 0] && driver.proposal_wait = None in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close peer);
+  if not single then failwith "duplicate frame launched another check";
+  if not queued || not completed then failwith "old reply removed next round check"
+
+let test_wait_order () =
+  let chain_id = "octra-test-wait-order" in
+  let driver = driver chain_id in
+  let route = C_driver.Publish_verified_proposal in
+  let first = proposal chain_id ~epoch_id:1L ~round:0 in
+  let next = proposal chain_id ~epoch_id:1L ~round:1 in
+  C_driver.retain_proposal_wait driver ~route first;
+  C_driver.retain_proposal_wait driver ~route first;
+  let waiting = driver.proposal_wait in
+  C_driver.retain_proposal_wait ~initial:true driver ~route first;
+  if driver.proposal_wait <> waiting then
+    failwith "duplicate frame reset check retry";
+  C_driver.retain_proposal_wait ~initial:true driver ~route next;
+  if driver.proposal_wait <> waiting then
+    failwith "future round displaced current check";
+  if Hashtbl.find_opt driver.pending_proposals
+       (C_driver.proposal_round_key 1L 1) <> Some next then
+    failwith "future round proposal lost";
+  C_engine.start_round driver.engine 1;
+  C_driver.retain_proposal_wait ~initial:true driver ~route next;
+  (match driver.proposal_wait with
+   | Some wait when wait.proposal = next && wait.attempt = 0 -> ()
+   | _ -> failwith "old round blocked new proposal");
+  C_driver.clear_proposal_wait driver first;
+  if driver.proposal_wait = None then
+    failwith "old completion erased next proposal";
+  Lwt_main.run (C_driver.stop driver)
+
+let test_wait_jump () =
+  let chain_id = "octra-test-wait-jump" in
+  let driver = driver chain_id in
+  let route = C_driver.Publish_verified_proposal in
+  let value = proposal chain_id ~epoch_id:1L ~round:1 in
+  C_driver.retain_proposal_wait driver ~route value;
+  C_driver.retain_proposal_wait driver ~route value;
+  C_driver.retain_proposal_wait ~initial:true driver ~route value;
+  if Hashtbl.length driver.pending_proposals <> 0 then
+    failwith "waiting duplicate occupied another slot";
+  let waiting = driver.proposal_wait in
+  let generation = driver.engine.generation in
+  C_engine.realign_round driver.engine 1;
+  if driver.engine.generation = generation then failwith "wait generation did not advance";
+  C_driver.clear_round_sync_jump driver ~height:1L ~round:1;
+  let other = { value with header = { value.header with ts = 2.0 } } in
+  C_driver.retain_proposal_wait ~initial:true driver ~route other;
+  if driver.proposal_wait <> waiting then
+    failwith "round jump displaced retained check";
+  C_driver.retain_proposal_wait ~initial:true driver ~route value;
+  if driver.proposal_wait <> waiting then
+    failwith "round jump reset retained retry";
+  Lwt_main.run (C_driver.stop driver)
+
+let test_future_wait () =
+  List.iter (fun future_first ->
+    let chain_id = "octra-test-future-wait" in
+    let calls = ref [] in
+    let driver = driver ~verify_proposal:(fun value ->
+      calls := value.C_types.round :: !calls;
+      Lwt.return C_driver.Proposal_wait) chain_id in
+    let current = proposal chain_id ~epoch_id:1L ~round:0 in
+    let future = proposal chain_id ~epoch_id:1L ~round:1 in
+    if future_first then receive_proposal driver future;
+    receive_proposal driver current;
+    receive_proposal driver future;
+    let kept = Hashtbl.find_opt driver.pending_proposals
+      (C_driver.proposal_round_key 1L 1) = Some future in
+    C_engine.start_round driver.engine 1;
+    C_driver.clear_round_sync_jump driver ~height:1L ~round:1;
+    calls := [];
+    Lwt_main.run (C_driver.process_outputs driver);
+    settle ();
+    let replayed = List.mem 1 !calls in
+    Lwt_main.run (C_driver.stop driver);
+    if not kept || not replayed then
+      failwith "future proposal required a second frame") [false; true]
+
+let test_wait_capacity () =
+  let chain_id = "octra-test-wait-capacity" in
+  let result, finish = Lwt.wait () in
+  let driver = driver ~verify_proposal:(fun _ -> Lwt.protected result) chain_id in
+  receive_proposal driver (proposal chain_id ~epoch_id:1L ~round:0);
+  List.iter (fun round ->
+    let value = proposal chain_id ~epoch_id:1L ~round in
+    receive_proposal driver value;
+    receive_proposal driver value)
+    (List.init (C_engine.max_round_ahead + 4) (fun index -> index + 1));
+  let limited = Hashtbl.length driver.pending_proposals = C_engine.max_round_ahead in
+  C_engine.start_round driver.engine C_engine.max_round_ahead;
+  C_driver.clear_round_sync_jump driver ~height:1L ~round:C_engine.max_round_ahead;
+  receive_proposal driver
+    (proposal chain_id ~epoch_id:1L ~round:(C_engine.max_round_ahead + 1));
+  let pruned = Hashtbl.length driver.pending_proposals <= 2 in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt.wakeup_later finish C_driver.Proposal_wait;
+  settle ();
+  if not limited || not pruned then failwith "round queue exceeded retention window"
 
 let test_check_flow () =
   List.iter (fun mode ->
@@ -346,12 +551,9 @@ let test_check_handoff () =
   in
   let driver = driver ~verify_proposal chain_id in
   let value = proposal chain_id ~epoch_id:1L ~round:0 in
-  let direct = C_driver.admit_current_proposal driver
-    ~route:C_driver.Publish_verified_proposal value
-  in
+  receive_proposal driver value;
   assert (!calls = 1);
-  Hashtbl.replace driver.pending_proposals (C_driver.proposal_round_key 1L 0) value;
-  Lwt_main.run (C_driver.process_outputs driver);
+  receive_proposal driver value;
   assert (!calls = 1 && driver.proposal_verify <> None);
   Lwt.wakeup_later finish_first C_driver.Proposal_wait;
   settle ();
@@ -359,7 +561,6 @@ let test_check_handoff () =
   Lwt_main.run (C_driver.stop driver);
   Lwt.wakeup_later finish_second C_driver.Proposal_wait;
   settle ();
-  Lwt_main.run direct;
   if not held then failwith "prior check cleared running work"
 
 let test_check_invalid () =
@@ -382,18 +583,15 @@ let test_reply_grace () =
   let driver = driver ~verify_proposal:(fun _ -> Lwt.protected result) chain_id in
   let value = proposal chain_id ~epoch_id:1L ~round:0 in
   let job = C_driver.check_work driver value C_driver.Publish_verified_proposal in
-  let direct = C_driver.admit_current_proposal driver
-    ~route:C_driver.Publish_verified_proposal value
-  in
+  receive_proposal driver value;
   let mark = driver.proposal_verify in
-  assert (mark <> None && Lwt.is_sleeping direct);
+  assert (mark <> None && Lwt.is_sleeping result);
   Lwt_main.run (C_driver.finish_proposal_work driver job
     (C_driver.Checked_proposal None));
   let kept = driver.proposal_verify = mark in
   Lwt_main.run (C_driver.stop driver);
   Lwt.wakeup_later finish C_driver.Proposal_wait;
   settle ();
-  Lwt_main.run direct;
   if not kept then failwith "delivered reply cleared another check"
 
 let test_work_timer () =
@@ -480,8 +678,7 @@ let test_pace_votes () =
   let pending = C_driver.process_outputs driver in
   let next = proposal chain_id ~epoch_id:2L ~round:0 in
   let pid = C_hash.proposal_id next.header in
-  Lwt_main.run (C_driver.admit_current_proposal driver
-    ~route:C_driver.Publish_verified_proposal next);
+  receive_proposal driver next;
   Lwt_main.run (C_driver.process_outputs driver);
   Lwt_main.run (Lwt_list.iter_s (fun _ -> Lwt.pause ()) (List.init 4 Fun.id));
   let saved vote_type =
@@ -516,8 +713,7 @@ let test_qc_vote () =
       Int64.sub (Mtime_clock.elapsed_ns ()) 60_000_000_000L;
     let value = proposal chain_id ~epoch_id:1L ~round:0 in
     let pid = C_hash.proposal_id value.header in
-    Lwt_main.run (C_driver.admit_current_proposal driver
-      ~route:C_driver.Publish_verified_proposal value);
+    receive_proposal driver value;
     let vote vote_type address = signed_vote chain_id ~epoch_id:1L ~round:0
       ~vote_type ~proposal_id:pid address
     in
@@ -978,7 +1174,69 @@ let test_proposal_verify_error_waits_without_penalty () =
   Lwt_main.run (Octra_net.P2p_conn.close conn);
   Lwt_main.run (Lwt_unix.close remote_fd)
 
+let test_relay_backpressure () =
+  let chain_id = "octra-test-relay-pressure" in
+  let driver = driver chain_id in
+  driver.running <- true;
+  let local_fd, remote_fd = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = Octra_net.P2p_conn.create
+    ~peer_class:Octra_net.P2p_frame_budget.Observer local_fd
+    ~peer_id:"blocked-peer" ~addr:"198.51.100.29:19000"
+    ~direction:Octra_net.P2p_conn.Inbound in
+  Hashtbl.add driver.swarm.peers conn.peer_id conn;
+  Lwt_main.run (Lwt_mvar.put conn.write_queue
+    Octra_net.P2p_frame.{ msg_type = msg_cons_propose; payload = "occupied" });
+  let value = proposal chain_id ~epoch_id:1L ~round:0 in
+  let delivery = C_driver.finish_check driver
+    ~route:C_driver.Publish_verified_proposal value (Some C_driver.Proposal_accept) in
+  let immediate = not (Lwt.is_sleeping delivery) in
+  Lwt_main.run (C_driver.stop driver);
+  Lwt.cancel delivery;
+  Lwt_main.run (Octra_net.P2p_conn.close conn);
+  Lwt_main.run (Lwt_unix.close remote_fd);
+  if not immediate then failwith "verified proposal waited for blocked peer"
+
+let test_future_relay () =
+  List.iter (fun valid ->
+    let chain_id = "octra-test-future-relay" in
+    let sent = ref [] in
+    let relay = C_relay.create ~now:(fun () -> 0.)
+      ~send:(fun (_, frame) ->
+        sent := frame :: !sent;
+        fst (Lwt.task ()))
+      ~wait:(fun _ -> fst (Lwt.task ())) ~warn:ignore
+    in
+    let driver = { (driver chain_id) with C_driver.proposal_relay = relay } in
+    let value = proposal chain_id ~epoch_id:1L ~round:1 in
+    Lwt_main.run (C_driver.finish_check driver
+      ~route:C_driver.Publish_verified_proposal value (Some C_driver.Proposal_accept));
+    settle ();
+    let first = List.length !sent in
+    if not valid then
+      Hashtbl.replace driver.deferred_proposals (C_driver.proposal_round_key 1L 1)
+        { value with signature = String.make 64 '\x00' };
+    C_engine.realign_round driver.engine 1;
+    C_relay.progress relay ~generation:driver.engine.generation;
+    C_driver.replay_deferred_proposal driver;
+    settle ();
+    let expected = if valid then 2 else 1 in
+    let repeated = List.length !sent in
+    C_driver.replay_deferred_proposal driver;
+    settle ();
+    let once = List.length !sent = repeated in
+    Lwt_main.run (C_driver.stop driver);
+    if first <> 1 || repeated <> expected || not once then
+      failwith "future proposal relay did not follow accepted round replay") [true; false]
+
 let () =
+  test_future_relay ();
+  test_relay_backpressure ();
+  test_wait_order ();
+  test_wait_jump ();
+  test_future_wait ();
+  test_wait_capacity ();
+  test_frame_finality ();
+  test_frame_round ();
   test_work_slot ();
   test_check_handoff ();
   test_reply_grace ();

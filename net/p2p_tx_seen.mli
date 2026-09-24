@@ -7,4 +7,5 @@ val empty : t
 val capacity : int
 val lifetime : float
 val size : t -> int
+val recent : t -> now:float -> string -> bool
 val step : t -> now:float -> string -> t * bool

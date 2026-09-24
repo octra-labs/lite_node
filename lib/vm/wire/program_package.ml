@@ -17,6 +17,14 @@ type admitted = {
   program : Admission.t;
 }
 
+type compiler = Protocol | Source
+
+let compiler_mode = function
+  | Octra_core.Rule_graph.Prior -> Protocol
+  | Octra_core.Rule_graph.Active -> Source
+
+let source_id = "aml_source:oct_gen_count:source_abi:checked_address:option_values:scalar_equality:shape_limits:overlap_64"
+
 type package = {
   compiler_profile : int;
   main : string;
@@ -259,15 +267,17 @@ let compile_sources_with compile package =
   in
   result, used
 
-let compile_sources ~point_ops package =
+let compile_sources ~compiler ~point_ops package =
   let compile =
-    if point_ops then Oct_compile.compile_program_multi_first
-    else Prior_compile.compile_program_multi_first
+    match compiler with
+    | Source -> Oct_compile.compile_program_source
+    | Protocol when point_ops -> Oct_compile.compile_program_multi_first
+    | Protocol -> Prior_compile.compile_program_multi_first
   in
   compile_sources_with compile package
 
 let compile_sources_checked package =
-  compile_sources_with Oct_compile.compile_program_multi package
+  compile_sources_with Oct_compile.compile_program_described package
 
 let build_with ~point_ops compile package =
   let result, used = compile package in
@@ -291,14 +301,18 @@ let build_with ~point_ops compile package =
           bind (encode { package with envelope }) (fun encoded ->
             Ok { package = encoded; envelope; result }))
 
-let build ~point_ops package =
-  build_with ~point_ops (compile_sources ~point_ops) package
+let build ~compiler ~point_ops package =
+  build_with ~point_ops (compile_sources ~compiler ~point_ops) package
 
-let compile_for ~point_ops ~main ~sources =
+let compile_with ~compiler ~point_ops ~main ~sources =
+  if compiler = Source && not point_ops then Error Bad_compiler_profile
+  else
   bind (normalize ~main sources) (fun sources ->
     let compile =
-      if point_ops then compile_sources_checked
-      else compile_sources_with Prior_compile.compile_program_multi
+      match compiler with
+      | Source -> compile_sources_with Oct_compile.compile_program_source
+      | Protocol when point_ops -> compile_sources_checked
+      | Protocol -> compile_sources_with Prior_compile.compile_program_multi
     in
     build_with ~point_ops compile {
       compiler_profile;
@@ -307,15 +321,19 @@ let compile_for ~point_ops ~main ~sources =
       envelope = "";
     })
 
+let compile_for = compile_with ~compiler:Protocol
+
 let compile ~main ~sources =
   compile_for ~point_ops:true ~main ~sources
 
 let validate_base64 encoded =
   bind (decode_base64 encoded) (fun _ -> Ok ())
 
-let admit_base64 ?(point_ops = false) encoded =
+let admit_base64 ?(compiler = Protocol) ?(point_ops = false) encoded =
+  if compiler = Source && not point_ops then Error Bad_compiler_profile
+  else
   bind (decode_base64 encoded) (fun package ->
-    bind (build ~point_ops { package with envelope = "" }) (fun compiled ->
+    bind (build ~compiler ~point_ops { package with envelope = "" }) (fun compiled ->
       if not (String.equal compiled.envelope package.envelope) then
         Error Envelope_mismatch
       else
@@ -327,3 +345,12 @@ let admit_base64 ?(point_ops = false) encoded =
             envelope = package.envelope;
             program = admitted;
           }))
+
+let admit_transition ~point_ops encoded =
+  if not point_ops then Error Bad_compiler_profile else
+  match admit_base64 ~compiler:Source ~point_ops encoded with
+  | Ok admitted -> Ok admitted
+  | Error source_error ->
+    match admit_base64 ~compiler:Protocol ~point_ops encoded with
+    | Ok admitted -> Ok admitted
+    | Error _ -> Error source_error

@@ -77,7 +77,7 @@ let yojson_param = function
 
 let encode_request ~method_name params =
   let normalized_params =
-    List.map yojson_param params in
+    List.rev (List.rev_map yojson_param params) in
   match List.find_opt (function Error _ -> true | Ok _ -> false) normalized_params with
   | Some (Error e) -> Error e
   | _ ->

@@ -13,7 +13,7 @@ module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
-  duty_head : unit -> int64 option;
+  duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;
@@ -67,7 +67,10 @@ let sweep_low_fee_stealth () =
   n
 
 let expire_duty ?sender runtime () =
-  let drops = Staging.expire_duty ?sender ~head:(runtime.duty_head ()) () in
+  let point = runtime.duty_head () in
+  let head = Option.map fst point in
+  let mode = Option.fold ~none:Octra_core.Rule_graph.Prior ~some:snd point in
+  let drops = Staging.expire_duty ?sender ~mode ~head () in
   if drops <> [] then begin
     runtime.save_drops drops;
     List.iter (fun drop -> Preverify_cache.remove drop.Staging.d_hash) drops;
@@ -76,7 +79,10 @@ let expire_duty ?sender runtime () =
   end
 
 let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
-  if Staging.duty_expired ~head:(runtime.duty_head ()) tx then
+  let point = runtime.duty_head () in
+  let head = Option.map fst point in
+  let mode = Option.fold ~none:Octra_core.Rule_graph.Prior ~some:snd point in
+  if Staging.duty_expired ~mode ~head tx then
     Error "validator ready head has expired"
   else
   match Tx_view.bft_op_admission ~bft_mode tx with
@@ -89,8 +95,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
     | Error e -> Error e
     | Ok _ ->
       let tx_hash = Transaction.hash tx in
-      if tx.Transaction.op_type = Transaction.ValidatorReady then
-        expire_duty ~sender:tx.from runtime ();
+      expire_duty ~sender:tx.from runtime ();
       if tx.Transaction.op_type = Transaction.ValidatorReady
          && Option.is_some (Staging.find_by_hash tx_hash) then Ok tx_hash
       else
@@ -98,6 +103,11 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
         Ledger.find_opt ledger addr
         |> Option.map (fun a -> (a.Ledger.balance, a.Ledger.nonce))
       in
+      let confirmed_nonce = Option.fold ~none:0 ~some:snd (lookup tx.from) in
+      match Tx_view.duty_nonce_admission
+        ~head ~confirmed_nonce tx with
+      | Error _ as error -> error
+      | Ok () ->
       match Staging.add_smart ~lookup tx with
       | Error e -> Error e
       | Ok drops ->
@@ -193,6 +203,7 @@ let bft_pending_nonce_window () =
 let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
   let now = Unix.gettimeofday () in
   match Tx_view.submit_pre_signature_admission
+          ~duty:(runtime.duty_head ())
           ~now
           ~max_timestamp_drift
           ~observer_rpc_mode:(observer_rejects_submissions ())
