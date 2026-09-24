@@ -103,17 +103,17 @@ def node_status(url):
         raise ValidatorError("local node has no committed head")
     return head_epoch, state_root
 
-def require_admission_active(values):
+def require_join(values):
     try:
         activation_epoch = int(values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"])
     except (KeyError, TypeError, ValueError) as error:
-        raise ValidatorError("invalid validator admission activation epoch") from error
+        raise ValidatorError("invalid validator join activation epoch") from error
     if activation_epoch < 0:
-        raise ValidatorError("validator admission is inactive")
+        raise ValidatorError("validator join is inactive")
     head_epoch, _ = node_status(local_rpc(values))
     if head_epoch < activation_epoch:
         raise ValidatorError(
-            f"validator admission activates at epoch {activation_epoch}, current head is {head_epoch}"
+            f"validator join activates at epoch {activation_epoch}, current head is {head_epoch}"
         )
 
 def next_nonce(values, wallet):
@@ -821,7 +821,7 @@ def run_command(args, values, wallet, wallet_path):
         tx_hash = validator_exit.repair_pointer(values, wallet, args.pointer)
         emit(event = "validator_pointer", status = "ready", tx = tx_hash, action = "nothing_submitted")
         return False
-    require_admission_active(values)
+    require_join(values)
     if args.command == "bond":
         submit_bond(
             args.config,

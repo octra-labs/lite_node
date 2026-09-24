@@ -27,6 +27,12 @@ let rec ordered = function
   | json -> json
 
 let check_grammar () =
+  List.iter (fun raw ->
+    require (try ignore (Yojson.Safe.from_string raw); false
+      with Yojson.Json_error _ -> true) "JSON dependency grammar differs from lock";
+    require (try ignore (Json_tree.read raw); false
+      with Yojson.Json_error _ -> true) "JSON extension accepted")
+    ["(0)"; "<None>"; "<Some:0>"];
   List.iter check [
     ""; " \n/* a */ "; "null"; "true"; "false"; "NaN"; "Infinity"; "-Infinity";
     "0"; "-0"; "1.5"; "-1e-3"; "999999999999999999999999"; "[1,2]";
@@ -46,16 +52,13 @@ let check_grammar () =
   enumerate 4 "";
   let rng = Random.State.make [|53; 127|] in
   let atoms = [|`Null; `Bool true; `Int (-13); `Float 0.125;
-    `Float nan; `Intlit "123456789123456789123456789"; `String "\000\\\"\n"|] in
+    `Intlit "123456789123456789123456789"; `String "\000\\\"\n"|] in
   let rec tree depth =
     if depth = 0 then atoms.(Random.State.int rng (Array.length atoms))
-    else match Random.State.int rng 6 with
+    else match Random.State.int rng 3 with
     | 0 -> `Assoc (List.init (Random.State.int rng 5)
         (fun _ -> string_of_int (Random.State.int rng 3), tree (depth - 1)))
     | 1 -> `List (List.init (Random.State.int rng 5) (fun _ -> tree (depth - 1)))
-    | 2 -> `Tuple (List.init (Random.State.int rng 5) (fun _ -> tree (depth - 1)))
-    | 3 -> `Variant ("tag", Some (tree (depth - 1)))
-    | 4 -> `Variant ("empty", None)
     | _ -> tree 0
   in
   for _ = 1 to 5_000 do
@@ -80,8 +83,7 @@ let check_depth prior =
     let json = read raw in
     require (Json_tree.write json = raw) "deep JSON changed";
     require (Json_tree.write ~sort:true json = raw) "deep sorted JSON changed")
-    ["[", "]", 250_000; "{\"a\":", "}", 80_000;
-     "(", ")", 250_000; "<\"a\":", ">", 80_000];
+    ["[", "]", 250_000; "{\"a\":", "}", 80_000];
   let raw = "[" ^ String.concat "," (List.init 100_000 string_of_int) ^ "]" in
   require (Json_tree.write (read raw) = raw) "wide JSON changed";
   let raw = "{" ^ String.concat "," (List.init 100_000 (fun _ -> "\"x\":0")) ^ "}" in

@@ -483,7 +483,7 @@ class ValidatorExitTest(unittest.TestCase):
         ), mock.patch.object(enroll, "parse_env", return_value = self.values), mock.patch.object(
             enroll, "load_wallet", return_value = self.wallet,
         ), mock.patch.object(exit_control, "repair_pointer", side_effect = locked), mock.patch.object(
-            enroll, "require_admission_active",
+            enroll, "require_join",
         ) as rpc, mock.patch.object(enroll, "emit"), mock.patch.object(enroll.subprocess, "run") as run:
             parser.return_value.parse_args.return_value = args
             enroll.main()

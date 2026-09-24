@@ -3,6 +3,15 @@
 
 set -eu
 
+if [ "$#" -eq 0 ]; then
+  TESTS=0
+elif [ "$#" -eq 1 ] && [ "$1" = --tests ]; then
+  TESTS=1
+else
+  printf 'status = refused reason = arguments usage = check.sh_[--tests]\n' >&2
+  exit 2
+fi
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 cd "$ROOT"
@@ -57,7 +66,9 @@ fi
 
 PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/surface.py "$ROOT"
 PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import sync_need, upgrade, validator_bundle, validator_config, validator_enroll, validator_guard, validator_process, validator_recover, validator_rejoin, validator_rpc, validator_status, validator_store'
-PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest controls/lib/test_validator_tools.py
+if [ "$TESTS" -eq 1 ]; then
+  PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest controls/lib/test_validator_tools.py
+fi
 if [ -f config/network.env ]; then
   PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/validator_bundle.py \
     --network config/network.env

@@ -366,7 +366,7 @@ def validate_network(values, _bundle_dir):
     if protocol_activation < activation:
         raise ValidatorError("proposal protocol activation cannot precede emission")
     if validator_activation < activation:
-        raise ValidatorError("validator admission cannot precede emission")
+        raise ValidatorError("validator join cannot precede emission")
     if not HEX64.fullmatch(values["OCTRA_CONSENSUS_CONFIG_HASH"]):
         raise ValidatorError("invalid consensus config hash")
     if not HEX64.fullmatch(values["OCTRA_CHECKPOINT_STATE_ROOT"]):

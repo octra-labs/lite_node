@@ -7,6 +7,8 @@ authors: "Octra Labs"
 homepage: "https://octra.org"
 bug-reports: "https://gitlab.octra.org.uk/octra/libv_litecore/issues"
 depends: [
+  "alcotest" {= "1.9.1" & with-test}
+  "alcotest-lwt" {= "1.9.1" & with-test}
   "angstrom" {= "0.16.1"}
   "asn1-combinators" {= "0.3.2"}
   "astring" {= "0.8.5"}
@@ -33,6 +35,10 @@ depends: [
   "conf-libev" {= "4-13"}
   "conf-pkg-config" {= "4"}
   "conf-sqlite3" {= "1"}
+  "coq" {= "9.0.0" & with-test}
+  "coq-core" {= "9.0.0" & with-test}
+  "coq-stdlib" {= "9.0.0" & with-test}
+  "coqide-server" {= "9.0.0" & with-test}
   "cppo" {= "1.8.0"}
   "csexp" {= "1.5.2"}
   "cstruct" {= "6.2.0"}
@@ -105,6 +111,9 @@ depends: [
   "ptime" {= "1.2.0"}
   "re" {= "1.14.0"}
   "repr" {= "0.7.0"}
+  "rocq-core" {= "9.0.0" & with-test}
+  "rocq-runtime" {= "9.0.0" & with-test}
+  "rocq-stdlib" {= "9.0.0" & with-test}
   "rresult" {= "0.7.0"}
   "rusage" {= "1.0.0"}
   "semaphore-compat" {= "1.0.2"}

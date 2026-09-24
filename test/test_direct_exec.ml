@@ -6,6 +6,8 @@ module C = Octra_vm.Call_plan
 module R = Octra_vm.Receipt_view
 module VM = Octra_vm.Contract_vm
 module Contract = Octra_vm.Contract
+module A = Octra_node_runtime.Epoch_atomic
+module S = Octra_node_runtime.Startup_process_shell
 
 let fail msg =
   failwith ("test_direct_exec: " ^ msg)
@@ -175,8 +177,62 @@ let test_resource_failures () =
       ok "resource exception has no charge" (not !charged))
       [false; true]) [Stack_overflow; Out_of_memory]
 
+let test_resource_abort () =
+  List.iter (fun error ->
+    List.iter (fun exec ->
+      List.iter (fun delayed ->
+        let changed = ref false in
+        let events = ref [] in
+        let push item = events := item :: !events in
+        let effects = A.{
+          abort_ledger = (fun () -> changed := false; push "ledger");
+          abort_store = (fun () -> push "store");
+          abort_history = (fun () -> push "history");
+          fatal = (fun text -> push text);
+          exit = (fun () -> push "exit");
+        } in
+        let apply () = D.run (spec ()) {
+          apply = (fun _ -> changed := true);
+          exec = (fun _ -> exec error);
+          receipt = (fun r -> r);
+          save = (fun _ _ -> fail "resource receipt saved");
+          ok = (fun _ _ _ -> fail "resource call accepted");
+          fail = (fun _ _ _ -> fail "resource call charged");
+          reject = (fun _ -> fail "resource call rejected");
+          crash = (fun _ _ -> fail "resource call charged as crash");
+        } in
+        let raised = try
+          Lwt_main.run (A.run effects (fun () ->
+            if delayed then Lwt.bind (Lwt.pause ()) apply else apply ()));
+          false
+        with actual when actual = error -> true in
+        ok "atomic resource error preserved" raised;
+        ok "atomic value restored" (not !changed);
+        ok "atomic abort and exit order"
+          (List.rev !events = ["ledger"; "store"; "history";
+            "event = epoch_apply_failed reason = " ^ Printexc.to_string error;
+            "exit"]);
+        ok "event loop released" (Lwt_main.run (Lwt.return 7) = 7)
+      ) [false; true]
+    ) [(fun error -> raise error); Lwt.fail;
+       (fun error -> Lwt_preemptive.detach (fun () -> raise error) ())]
+  ) [Stack_overflow; Out_of_memory]
+
+let test_async_exit exits =
+  let before = !exits in
+  List.iter (fun error -> Lwt.async (fun () -> raise error))
+    [Stack_overflow; Out_of_memory];
+  ok "async resource failure exits" (!exits = before + 2);
+  Lwt.async (fun () -> Lwt.fail_with "ordinary failure");
+  ok "ordinary async failure contained" (!exits = before + 2)
+
 let () =
+  let exits = ref 0 in
+  S.configure_lwt ~exit_fatal:(fun () -> incr exits);
   test_resource_failures ();
+  test_resource_abort ();
+  ok "handled resource failure avoids async exit" (!exits = 0);
+  test_async_exit exits;
   test_success ();
   test_failed_receipt ();
   test_reject ();

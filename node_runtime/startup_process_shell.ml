@@ -218,12 +218,23 @@ let initialize_crypto exit_fatal =
 let set_async_exception_hook report =
   Lwt.async_exception_hook := report
 
-let configure_process ~exit_fatal =
-  Octra_log.init_from_env ();
+let configure_lwt ~exit_fatal =
+  Lwt.Exception_filter.set Lwt.Exception_filter.handle_all;
   set_async_exception_hook (fun error ->
-    Octra_log.error "runtime"
-      "event = async_exception status = contained error = %s"
-      (Printexc.to_string error));
+    match error with
+    | Stack_overflow | Out_of_memory ->
+        Fun.protect ~finally:exit_fatal (fun () ->
+          Octra_log.fatal "runtime"
+            "event = async_exception status = fatal error = %s"
+            (Printexc.to_string error))
+    | _ ->
+        Octra_log.error "runtime"
+          "event = async_exception status = contained error = %s"
+          (Printexc.to_string error))
+
+let configure_process ~exit_fatal =
+  configure_lwt ~exit_fatal;
+  Octra_log.init_from_env ();
   Octra_log.info "init" "starting_node backend = irmin-pack";
   configure_lwt_engine ();
   initialize_crypto exit_fatal;

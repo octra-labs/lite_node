@@ -393,7 +393,7 @@
 (test
  (name test_direct_exec)
  (modules test_direct_exec)
- (libraries octra_vm yojson zarith lwt lwt.unix))
+ (libraries octra_node_runtime octra_vm yojson zarith lwt lwt.unix))
 
 (test
  (name test_set_actor)

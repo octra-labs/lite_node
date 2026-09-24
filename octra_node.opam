@@ -24,7 +24,7 @@ depends: [
   "h2-lwt-unix"
   "irmin-pack"
   "lmdb"
-  "lwt"
+  "lwt" {= "6.1.2"}
   "mirage-crypto"
   "mirage-crypto-ec"
   "mirage-crypto-rng"
@@ -33,7 +33,7 @@ depends: [
   "sqlite3"
   "tls-lwt"
   "uri"
-  "yojson"
+  "yojson" {= "3.0.0"}
   "zarith"
   "alcotest" {with-test}
   "alcotest-lwt" {with-test}

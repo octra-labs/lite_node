@@ -67,3 +67,7 @@ let with_dir prefix action =
 let unique_file prefix suffix =
   ensure_root ();
   Filename.temp_file ~temp_dir:root prefix suffix
+
+let rec wait pid =
+  try snd (Unix.waitpid [] pid) with
+  | Unix.Unix_error (Unix.EINTR, _, _) -> wait pid

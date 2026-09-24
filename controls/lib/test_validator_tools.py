@@ -76,7 +76,7 @@ from validator_enroll import JoinStep
 from validator_enroll import membership
 from validator_enroll import next_nonce
 from validator_enroll import ready_message
-from validator_enroll import require_admission_active
+from validator_enroll import require_join
 from validator_enroll import resume_join_transaction
 from validator_enroll import set_validator_mode
 from validator_enroll import submit_bond
@@ -1106,14 +1106,14 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertFalse(ready("validator", observer))
         self.assertFalse(ready("observer", {**observer, "binary_match": False}))
 
-    def test_upgrade_admission(self):
+    def test_upgrade_join(self):
         state = {
             "process": "online", "rpc": "ready", "binary_match": True,
             "source_match": True, "runtime_match": True, "head_epoch": 41,
             "peer_epoch": 41, "lag": 0, "validator_member": False,
             "voting": True, "voting_reason": None,
         }
-        self.assertTrue(upgrade_tool.admission_pending("validator", state))
+        self.assertTrue(upgrade_tool.join_pending("validator", state))
         self.assertFalse(ready("validator", state))
         for field, value in (
             ("process", "offline"), ("rpc", "unavailable"),
@@ -1121,13 +1121,13 @@ class ValidatorToolsTest(unittest.TestCase):
             ("runtime_match", False), ("lag", 2), ("lag", None),
             ("validator_member", True), ("validator_member", None),
         ):
-            self.assertFalse(upgrade_tool.admission_pending("validator", {**state, field: value}))
-        self.assertFalse(upgrade_tool.admission_pending("observer", state))
+            self.assertFalse(upgrade_tool.join_pending("validator", {**state, field: value}))
+        self.assertFalse(upgrade_tool.join_pending("observer", state))
         for reason in ("role", "vote_log_bootstrap", "vote_log_corrupt", None):
-            self.assertFalse(upgrade_tool.admission_pending("validator", {
+            self.assertFalse(upgrade_tool.join_pending("validator", {
                 **state, "voting": False, "voting_reason": reason,
             }))
-        self.assertTrue(upgrade_tool.admission_pending("validator", {
+        self.assertTrue(upgrade_tool.join_pending("validator", {
             **state, "voting": False, "voting_reason": "not_ready",
         }))
 
@@ -3881,7 +3881,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 control_result(values, {}, WORK / "wallet.json", "validator_ready")
         run.assert_called_once()
 
-    def test_admission_epoch(self):
+    def test_join_epoch(self):
         values = {
             "OCTRA_API_PORT": "8080",
             "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH": "100",
@@ -3891,12 +3891,12 @@ class ValidatorToolsTest(unittest.TestCase):
             return_value={"head_epoch": 99, "state_root": "a" * 64},
         ):
             with self.assertRaises(ValidatorError):
-                require_admission_active(values)
+                require_join(values)
         with mock.patch(
             "validator_enroll.call",
             return_value={"head_epoch": 100, "state_root": "a" * 64},
         ):
-            require_admission_active(values)
+            require_join(values)
 
     def test_validator_control(self):
         config = WORK / "node.env"
@@ -3973,7 +3973,7 @@ class ValidatorToolsTest(unittest.TestCase):
         def apply_bond(*_):
             current[0] = bonded
 
-        with mock.patch("validator_enroll.require_admission_active"), mock.patch(
+        with mock.patch("validator_enroll.require_join"), mock.patch(
             "validator_enroll.membership", return_value = {"active": False, "scheduled": False},
         ), mock.patch(
             "validator_enroll.committed_enrollment", side_effect = lambda *_: current[0],
@@ -4492,6 +4492,46 @@ class ValidatorToolsTest(unittest.TestCase):
         script = script_path.read_text(encoding="utf-8")
         self.assertIn("source_commit_missing", script)
         self.assertIn("source_commit_invalid", script)
+
+    def test_gate_modes(self):
+        source = Path(__file__).resolve().parent
+        gate = source / "validator_tools_gate.sh"
+        gate = gate if gate.is_file() else source.parent / "check.sh"
+        controls = WORK / "controls"
+        modules = controls / "lib"
+        modules.mkdir(parents=True)
+        scripts = re.findall(r"sh -n controls/([a-z_]+\.sh)", gate.read_text())
+        for name in scripts:
+            (controls / name).write_text("")
+        shutil.copyfile(gate, controls / "check.sh")
+        for path in source.glob("*.py"):
+            (modules / path.name).write_text("")
+        (modules / "test_validator_tools.py").write_text(
+            'raise RuntimeError("test suite invoked")\n'
+        )
+        (WORK / "test").mkdir()
+        (WORK / "test/python_check.py").write_text("")
+        (WORK / "nodes.config").write_text("")
+        (WORK / "octra_node.opam.locked").write_text("")
+        (WORK / "SOURCE_COMMIT").write_text(hashlib.sha1(b"gate").hexdigest())
+        paths = sorted(path for path in WORK.rglob("*") if path.is_file())
+        (WORK / "MANIFEST.sha256").write_text("".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(WORK)}\n"
+            for path in paths
+        ))
+        command = ["sh", str(controls / "check.sh")]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run(command + ["--tests"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test suite invoked", result.stderr)
+        for args in (["--other"], ["--tests", "--tests"]):
+            result = subprocess.run(command + args, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+        (WORK / "nodes.config").write_text("changed")
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("test suite invoked", result.stderr)
 
     def test_sync_budget(self):
         args = parser().parse_args([])
@@ -5347,6 +5387,15 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_build_metadata(self):
         self.assertTrue((CONFIG_ROOT / "octra_node.opam.locked").is_file())
+        lock = (CONFIG_ROOT / "octra_node.opam.locked").read_text(encoding="utf-8")
+        for name, version in [
+            ("alcotest", "1.9.1"), ("alcotest-lwt", "1.9.1"),
+            ("coq", "9.0.0"), ("coq-core", "9.0.0"),
+            ("coq-stdlib", "9.0.0"), ("coqide-server", "9.0.0"),
+            ("rocq-core", "9.0.0"), ("rocq-runtime", "9.0.0"),
+            ("rocq-stdlib", "9.0.0"),
+        ]:
+            self.assertIn(f'"{name}" {{= "{version}" & with-test}}', lock)
         install_path = Path(__file__).resolve().parent / "install.sh"
         exported_install = Path(__file__).resolve().parent.parent / "install.sh"
         installer = install_path if install_path.is_file() else exported_install
@@ -5430,6 +5479,14 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertLess(command_values.index(refresh), command_values.index(install))
         self.assertIn("--locked", install)
         self.assertIn("--require-checksums", install)
+        self.assertNotIn("--with-test", install)
+        self.assertNotIn("@all", build)
+        self.assertNotIn("runtest", build)
+        self.assertNotIn("@runtest", build)
+        self.assertEqual(
+            [arg for arg in build if arg.endswith(".exe")],
+            [f"bin/{name}" for name in names],
+        )
         self.assertEqual(build_env["OCTRA_SRC_ROOT"], str(WORK))
         self.assertTrue((WORK / "mcl/obj").is_dir())
         self.assertTrue((WORK / "mcl/lib").is_dir())

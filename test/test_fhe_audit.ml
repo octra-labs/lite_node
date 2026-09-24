@@ -34,7 +34,7 @@ let invoke binary root =
   let fd = Unix.openfile path [Unix.O_CREAT; Unix.O_TRUNC; Unix.O_WRONLY] 0o600 in
   let pid = Fun.protect ~finally:(fun () -> Unix.close fd)
     (fun () -> Unix.create_process binary [|binary; root|] Unix.stdin fd fd) in
-  let _, status = Unix.waitpid [] pid in
+  let status = W.wait pid in
   status, read path
 
 let account cipher = T.{
@@ -157,7 +157,24 @@ let test_root binary =
     expect "bad account root has no completion" (not (contains text "status = complete"));
     expect "bad account root is unchanged" (files path = before))
 
+let test_wait () =
+  match Unix.fork () with
+  | 0 -> Unix.sleepf 0.15; Unix._exit 23
+  | pid ->
+      let signals = ref 0 in
+      let handler = Sys.signal Sys.sigalrm (Sys.Signal_handle (fun _ -> incr signals)) in
+      let timer = Unix.setitimer Unix.ITIMER_REAL
+        {Unix.it_interval = 0.005; it_value = 0.005} in
+      let status = Fun.protect
+        ~finally:(fun () ->
+          ignore (Unix.setitimer Unix.ITIMER_REAL timer);
+          Sys.set_signal Sys.sigalrm handler)
+        (fun () -> W.wait pid) in
+      expect "wait received signal" (!signals > 0);
+      expect "wait preserves child status" (status = Unix.WEXITED 23)
+
 let () =
+  test_wait ();
   let binary = W.absolute Sys.argv.(1) in
   test_scan binary false;
   test_scan binary true;

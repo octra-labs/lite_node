@@ -3,9 +3,7 @@
 
 type frame =
   | Array of Yojson.Safe.t list
-  | Tuple of Yojson.Safe.t list
   | Object of string * (string * Yojson.Safe.t) list
-  | Variant of string
 
 let read raw =
   let lex = Lexing.from_string raw in
@@ -31,12 +29,6 @@ let read raw =
       let empty = try Yojson.Safe.read_array_end lex; false
         with Yojson.End_of_array -> true in
       if empty then finish frames (`List []) else value (Array [] :: frames)
-    | Some '(' ->
-      Yojson.Safe.read_lpar state lex;
-      space ();
-      let empty = try Yojson.Safe.read_tuple_end lex; false
-        with Yojson.End_of_tuple -> true in
-      if empty then finish frames (`Tuple []) else value (Tuple [] :: frames)
     | Some '{' ->
       Yojson.Safe.read_lcurl state lex;
       space ();
@@ -44,16 +36,6 @@ let read raw =
         with Yojson.End_of_object -> true in
       if empty then finish frames (`Assoc [])
       else let name = key () in value (Object (name, []) :: frames)
-    | Some '<' ->
-      Yojson.Safe.read_lt state lex;
-      space ();
-      let name = Yojson.Safe.read_ident state lex in
-      space ();
-      if peek () = Some ':' then begin
-        Yojson.Safe.read_colon state lex;
-        value (Variant name :: frames)
-      end
-      else finish frames (`Variant (name, Yojson.Safe.finish_variant state lex))
     | _ ->
       let json = Yojson.Safe.read_json state lex in
       finish frames json
@@ -67,12 +49,6 @@ let read raw =
       let values = json :: values in
       if closed then finish rest (`List (List.rev values))
       else value (Array values :: rest)
-    | Tuple values :: rest ->
-      let closed = try Yojson.Safe.read_tuple_sep state lex; false
-        with Yojson.End_of_tuple -> true in
-      let values = json :: values in
-      if closed then finish rest (`Tuple (List.rev values))
-      else value (Tuple values :: rest)
     | Object (name, fields) :: rest ->
       let closed = try Yojson.Safe.read_object_sep state lex; false
         with Yojson.End_of_object -> true in
@@ -83,9 +59,6 @@ let read raw =
         let name = key () in
         value (Object (name, fields) :: rest)
       end
-    | Variant name :: rest ->
-      Yojson.Safe.read_gt state lex;
-      finish rest (`Variant (name, Some json))
   in
   space ();
   if Yojson.Safe.read_eof lex then Yojson.json_error "Blank input data";
@@ -107,7 +80,6 @@ type output =
   | Value of bool * Yojson.Safe.t
   | Values of bool * char * Yojson.Safe.t list
   | Fields of bool * (string * Yojson.Safe.t) list
-  | Close of char
 
 let write ?(sort = false) json =
   let buf = Buffer.create 256 in
@@ -124,14 +96,6 @@ let write ?(sort = false) json =
     | Value (sort, `List values) :: rest ->
       emit '[';
       values_next sort ']' values rest
-    | Value (_, `Tuple values) :: rest ->
-      emit '(';
-      values_next false ')' values rest
-    | Value (_, `Variant (name, Some json)) :: rest ->
-      emit '<';
-      scalar (`String name);
-      emit ':';
-      loop (Value (false, json) :: Close '>' :: rest)
     | Value (_, json) :: rest ->
       scalar json;
       loop rest
@@ -141,9 +105,6 @@ let write ?(sort = false) json =
     | Fields (sort, fields) :: rest ->
       if fields <> [] then emit ',';
       fields_next sort fields rest
-    | Close ch :: rest ->
-      emit ch;
-      loop rest
   and values_next sort close values rest =
     match values with
     | [] -> emit close; loop rest

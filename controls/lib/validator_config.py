@@ -447,7 +447,6 @@ def build_node():
         switch,
         ".",
         "--deps-only",
-        "--with-test",
         "--locked",
         "--require-checksums",
         "-y",

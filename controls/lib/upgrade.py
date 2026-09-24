@@ -650,7 +650,7 @@ def installed(role, state):
 def ready(role, state):
     return installed(role, state) and state.get("lag") == 0
 
-def admission_pending(role, state):
+def join_pending(role, state):
     return (
         role == "validator"
         and matches(state)
@@ -1002,7 +1002,7 @@ def diagnose(root, sup, values, release):
     if faults:
         emit(status="hold", reason="durable_record_requires_review", action="do_not_delete")
         return 2
-    if admission_pending(values["OCTRA_OPERATOR_ROLE"], state):
+    if join_pending(values["OCTRA_OPERATOR_ROLE"], state):
         emit(event="validator_admission", status="pending", action="leave_running")
     emit(status="pass", gate="upgrade_diagnostic")
     return 0
@@ -1146,7 +1146,7 @@ def wait_node(root, sup, values, args, release, prior_binary):
             result = "validator_active" if values["OCTRA_OPERATOR_ROLE"] == "validator" else "observer_synced"
             emit(status=result, **state)
             return 0
-        if admission_pending(values["OCTRA_OPERATOR_ROLE"], state):
+        if join_pending(values["OCTRA_OPERATOR_ROLE"], state):
             emit(
                 status="installed",
                 reason="validator_admission_pending",
