@@ -717,7 +717,17 @@ let verify_roots certificate data_dir =
             end
       end
 
-let run_sync ?(verify_state = Verify.verify) certificate sources root =
+let run_sync ?stage ?(verify_state = Verify.verify) certificate sources root =
+  let donor = match stage with
+    | None -> None
+    | Some stage ->
+        let expected = Filename.concat (Filename.concat stage "snapshots")
+          certificate.Manifest.manifest_hash in
+        if root <> expected then fail "state sync stage path differs";
+        match Journal.select_donor ~stage ~current:root with
+        | Ok donor -> donor
+        | Error reason -> fail reason
+  in
   let body = certificate.Manifest.manifest in
   let checkpoint = certificate.checkpoint in
   let data_dir = Filename.concat root "data" in
@@ -773,6 +783,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
   let journal_lock = Lwt_mutex.create () in
   let progress_lock = Lwt_mutex.create () in
   let downloaded = ref !completed_bytes in
+  let reused = ref 0L in
   let last_log = ref 0.0 in
   let salt = random_salt (Filename.concat root "source_salt.json") in
   let expired_sources = Hashtbl.create (List.length sources) in
@@ -803,7 +814,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
           !downloaded
           body.total_size
           percent
-          source.Source.url
+          source
           task.file.path
           task.chunk.index
       end;
@@ -856,7 +867,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
                 Journal.record_completed journal task.file.path task.chunk;
                 Lwt.return_unit) >>= fun () ->
               Source.record_success source ((Unix.gettimeofday () -. started) *. 1000.0);
-              report_progress task source)
+              report_progress task source.Source.url)
         (function
           | Lwt.Canceled as exn -> Lwt.fail exn
           | Source_busy wait_seconds ->
@@ -913,11 +924,23 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
     if Queue.is_empty pending then Lwt.return_unit
     else
       let task = Queue.take pending in
-      download_task
-        task
-        0
-        []
-        (Unix.gettimeofday () +. busy_budget ()) >>= worker
+      begin match donor with
+      | None -> Lwt.return_false
+      | Some donor ->
+          Lwt_preemptive.detach
+            (fun () -> Journal.reuse_chunk ~donor ~path:task.file.path
+              ~partial:task.partial task.chunk) () >>= function
+          | Error reason -> Lwt.fail_with reason
+          | Ok value -> Lwt.return value
+      end >>= fun local ->
+      (if local then
+         Lwt_mutex.with_lock journal_lock (fun () ->
+           Journal.record_completed journal task.file.path task.chunk;
+           reused := Int64.add !reused (Int64.of_int task.chunk.size);
+           Lwt.return_unit) >>= fun () ->
+         report_progress task "local"
+       else download_task task 0 [] (Unix.gettimeofday () +. busy_budget ()))
+      >>= worker
   in
   Printf.printf
     "event = sync_start hash = %s epoch = %Ld files = %d chunks = %d sources = %d pending = %d bytes = %Ld resumed = %Ld\n%!"
@@ -931,9 +954,10 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
     !completed_bytes;
   Lwt.join (List.init !concurrency (fun _ -> worker ())) >>= fun () ->
   Printf.printf
-    "event = sync_download_complete hash = %s bytes = %Ld\n%!"
+    "event = sync_download_complete hash = %s bytes = %Ld reused = %Ld\n%!"
     certificate.manifest_hash
-    body.total_size;
+    body.total_size
+    !reused;
   Printf.printf
     "event = sync_finalize_start hash = %s files = %d\n%!"
     certificate.manifest_hash
@@ -1012,7 +1036,7 @@ let run_sync ?(verify_state = Verify.verify) certificate sources root =
             Lwt.return_unit
       end
 
-let sync_manifests ~max_bytes ~stage ~check ~sync candidates =
+let sync_manifests ~max_bytes ~stage ~check ~sync manifests =
   let rec loop = function
     | [] -> Lwt.fail (Sync_error "all state sync byte manifests failed")
     | (certificate, matching_sources) :: rest ->
@@ -1041,7 +1065,7 @@ let sync_manifests ~max_bytes ~stage ~check ~sync candidates =
                 | [] -> Lwt.fail exn
                 | _ -> loop rest)
   in
-  loop candidates
+  loop manifests
 
 let run () =
   Arg.parse options (fun value -> fail ("unexpected argument: " ^ value)) usage;
@@ -1076,29 +1100,35 @@ let run () =
     | Error reason -> fail reason
   in
   mkdir_p stage;
-  Lwt_list.map_p
-    (fun source ->
-      Lwt.catch
-        (fun () ->
-          fetch_manifest validator_set exporter_set source >|= fun result -> Some result)
-        (function
-          | Lwt.Canceled as exn -> Lwt.fail exn
-          | exn ->
-              Printf.eprintf
-                "event = manifest_source_rejected source = %s error = %s\n%!"
-                source.Source.url
-                (Printexc.to_string exn);
-              Lwt.return_none))
-    sources >>= fun results ->
-  let candidates =
-    results |> List.filter_map Fun.id |> select_manifests
+  let lock = match Journal.stage_lock stage with
+    | Ok lock -> lock
+    | Error reason -> fail ("state sync stage is busy or inaccessible: " ^ reason)
   in
-  sync_manifests
-    ~max_bytes:!max_bytes
-    ~stage
-    ~check:check_manifest_chunk
-    ~sync:run_sync
-    candidates
+  Lwt.finalize (fun () ->
+    Lwt_list.map_p
+      (fun source ->
+        Lwt.catch
+          (fun () ->
+            fetch_manifest validator_set exporter_set source >|= fun result -> Some result)
+          (function
+            | Lwt.Canceled as exn -> Lwt.fail exn
+            | exn ->
+                Printf.eprintf
+                  "event = manifest_source_rejected source = %s error = %s\n%!"
+                  source.Source.url
+                  (Printexc.to_string exn);
+                Lwt.return_none))
+      sources >>= fun results ->
+    let manifests =
+      results |> List.filter_map Fun.id |> select_manifests
+    in
+    sync_manifests
+      ~max_bytes:!max_bytes
+      ~stage
+      ~check:check_manifest_chunk
+      ~sync:(run_sync ~stage)
+      manifests)
+    (fun () -> Unix.close lock; Lwt.return_unit)
 
 let main () =
   try Lwt_main.run (run ()) with

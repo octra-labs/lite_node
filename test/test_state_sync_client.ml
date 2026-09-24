@@ -37,15 +37,15 @@ let mkdir_p path =
   loop path
 
 let rec remove_tree path =
-  if Sys.file_exists path then
-    match (Unix.lstat path).Unix.st_kind with
-    | Unix.S_DIR ->
-        Sys.readdir path
-        |> Array.iter (fun name ->
-          if name <> "." && name <> ".." then
-            remove_tree (Filename.concat path name));
-        Unix.rmdir path
-    | _ -> Unix.unlink path
+  match (Unix.lstat path).Unix.st_kind with
+  | Unix.S_DIR ->
+      Sys.readdir path
+      |> Array.iter (fun name ->
+        if name <> "." && name <> ".." then
+          remove_tree (Filename.concat path name));
+      Unix.rmdir path
+  | _ -> Unix.unlink path
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
 
 let write_file path value =
   mkdir_p (Filename.dirname path);
@@ -367,6 +367,116 @@ let test_chunk_resume root certificate data_dir validators ~delay =
       if not (List.for_all (Journal.is_completed journal file.path) file.chunks) then
         fail "resumed journal is incomplete";
       Lwt.return_unit)
+    (fun () -> Lwt.cancel service; remove_tree root; Lwt.return_unit)
+
+let test_rotation root wallets payload certificate data_dir validators =
+  let lock = expect_ok (Journal.stage_lock root) in
+  let test_lock blocked =
+    match Unix.fork () with
+    | 0 ->
+        let acquired = match Journal.stage_lock root with
+          | Ok fd -> Unix.close fd; true
+          | Error _ -> false in
+        Unix._exit (if acquired = not blocked then 0 else 1)
+    | pid ->
+        let rec wait () =
+          try snd (Unix.waitpid [] pid) with
+          | Unix.Unix_error (Unix.EINTR, _, _) -> wait () in
+        if wait () <> Unix.WEXITED 0 then fail "stage lock did not isolate processes"
+  in
+  test_lock true;
+  Unix.close lock;
+  test_lock false;
+  let changed = Bytes.of_string payload in
+  Bytes.set changed Manifest.chunk_size_min '\255';
+  let _, _, _, _, prior = sample wallets (Bytes.to_string changed) "previous" in
+  let snapshots = Filename.concat root "snapshots" in
+  let old = Filename.concat snapshots prior.Manifest.manifest_hash in
+  let current = Filename.concat snapshots certificate.Manifest.manifest_hash in
+  let file = List.find (fun file -> file.Manifest.path = "chaindata/blob")
+    prior.manifest.files in
+  let _, partial, _ = expect_ok (Journal.prepare_file ~stage:(Filename.concat old "data") file) in
+  let journal = expect_ok (Journal.open_journal ~path:(Filename.concat old "journal.jsonl")
+    ~manifest_hash:prior.manifest_hash) in
+  List.iter (fun chunk ->
+    if chunk.Manifest.index < 2 then begin
+      let body = Bytes.sub_string changed (Int64.to_int chunk.offset) chunk.size in
+      ignore (expect_ok (Journal.write_chunk ~partial chunk body));
+      Journal.record_completed journal file.path chunk
+    end) file.chunks;
+  Unix.LargeFile.truncate partial (Int64.of_int (2 * Manifest.chunk_size_min));
+  let discarded = Filename.concat snapshots (sha "discarded") in
+  write_file (Filename.concat discarded "data/unused") "unused";
+  let outside = Filename.concat root "outside" in
+  write_file (Filename.concat outside "keep") "preserve";
+  Unix.symlink (Unix.realpath outside) (Filename.concat discarded "link");
+  let unknown = Filename.concat snapshots "notes" in
+  write_file (Filename.concat unknown "keep") "preserve";
+  let donor = expect_ok (Journal.select_donor ~stage:root ~current) in
+  if donor <> Some (Filename.concat old "data") then fail "download donor selection differs";
+  if Sys.file_exists discarded || not (Sys.file_exists (Filename.concat outside "keep"))
+     || not (Sys.file_exists unknown) then fail "stage cleanup selected unrelated data";
+  listen () >>= fun (socket, port) ->
+  let requests = ref [] in
+  let unavailable = ref true in
+  let reply uri =
+    if !unavailable && Uri.get_query_param uri "path" = Some file.path
+       && Uri.get_query_param uri "index" = Some "2" then
+      Cohttp_lwt_unix.Server.respond_string ~status:`Service_unavailable ~body:"wait" ()
+      >|= Option.some
+    else Lwt.return_none
+  in
+  let service = server ~reply ~socket ~data_dir
+    ~chain_id:certificate.checkpoint.chain_id ~config_hash:certificate.checkpoint.config_hash
+    ~validator_set:validators ~requests () in
+  let verified = ref 0 in
+  let sync () =
+    let source = expect_ok (Source.create ~allow_private_http:false (source_url port)) in
+    Client.run_sync ~stage:root certificate [source] current
+      ~verify_state:(fun checkpoint data_dir ->
+        incr verified;
+        match Head.load_result data_dir with
+        | Head.Present head when Checkpoint.matches_head checkpoint head -> Lwt.return_ok ()
+        | _ -> Lwt.return_error "restored head differs")
+  in
+  let count index = List.length (List.filter (fun uri ->
+    Uri.get_query_param uri "path" = Some file.path
+    && Uri.get_query_param uri "index" = Some (string_of_int index)) !requests) in
+  Lwt.finalize (fun () ->
+    Client.retries := 1;
+    Lwt.try_bind sync (fun () -> fail "missing tail was accepted")
+      (function
+        | Failure reason when reason =
+            "chunk retry budget exhausted path = chaindata/blob index = 2" -> Lwt.return_unit
+        | exn -> Lwt.fail exn) >>= fun () ->
+    if count 0 <> 0 || count 1 <> 1 || count 2 <> 1 || !verified <> 0 then
+      fail "rotated download did not reuse only matching chunks";
+    let journal = expect_ok (Journal.open_journal
+      ~path:(Filename.concat current "journal.jsonl") ~manifest_hash:certificate.manifest_hash) in
+    let first = List.hd file.chunks in
+    if not (Journal.is_completed journal file.path first) then fail "local chunk was not journaled";
+    requests := [];
+    unavailable := false;
+    sync () >>= fun () ->
+    if count 0 <> 0 || count 1 <> 0 || count 2 <> 1 || !verified <> 1 then
+      fail "restart lost rotated download progress";
+    let target = Filename.concat current "data/chaindata/blob" in
+    if expect_ok (Journal.hash_file target) <> sha payload then fail "rotated payload differs";
+    let donor = Filename.concat old "data" in
+    let output = Filename.concat current "probe" in
+    write_file output (String.make first.size '\000');
+    let reuse path = expect_ok (Journal.reuse_chunk ~donor ~path ~partial:output first) in
+    write_file (Filename.concat donor "final") (String.sub payload 0 first.size);
+    if not (reuse "final") then fail "completed donor file was not reused";
+    write_file (Filename.concat donor "final") "short";
+    if reuse "final" then fail "short donor chunk was accepted";
+    write_file (Filename.concat donor "final") (String.make first.size '\255');
+    if reuse "final" then fail "damaged donor chunk was accepted";
+    Unix.symlink (Unix.realpath target) (Filename.concat donor "file-link");
+    Unix.symlink (Unix.realpath (Filename.dirname target)) (Filename.concat donor "dir-link");
+    if reuse "file-link" || reuse "dir-link/blob" || reuse "../probe" then
+      fail "local chunk read followed an indirect path";
+    Lwt.return_unit)
     (fun () -> Lwt.cancel service; remove_tree root; Lwt.return_unit)
 
 let test_conflicting_quorum () =
@@ -788,6 +898,8 @@ let run () =
   test_chunk_resume (Filename.concat root "chunk-timeout") certificate good_data
     runtime_validators ~delay:1.5 >>= fun () ->
   Client.timeout_seconds := 5.0;
+  test_rotation (Filename.concat root "rotation") wallets payload certificate good_data
+    runtime_validators >>= fun () ->
   Client.retries := 6;
   Client.concurrency := 3;
   Client.source_concurrency := 2;

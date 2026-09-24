@@ -27,7 +27,7 @@ from validator_process import pm2_entries
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
 
-def tree_bytes(path, device=None, live=False):
+def tree_bytes(path, device=None, live=False, allocated=False):
     try:
         meta = path.lstat()
     except FileNotFoundError:
@@ -46,8 +46,8 @@ def tree_bytes(path, device=None, live=False):
             if live:
                 return 0
             raise
-        return sum(tree_bytes(child, device, live) for child in children)
-    return meta.st_size
+        return sum(tree_bytes(child, device, live, allocated) for child in children)
+    return meta.st_blocks * 512 if allocated else meta.st_size
 
 def state_scan(data_path, kind):
     if kind not in {"prior", "rejected"}:
@@ -188,6 +188,13 @@ def report(values):
     suffix = suffix_bytes(data_path)
     pack = pack_bytes(data_path)
     snapshots = snapshot_stats(values, data_path)
+    stage = validator_config.resolve_sync_stage(None, data_path)
+    try:
+        stage_bytes = tree_bytes(stage, live=True)
+        stage_allocated = tree_bytes(stage, live=True, allocated=True)
+    except (OSError, ValidatorError):
+        stage_bytes = "unknown"
+        stage_allocated = "unknown"
     gc = rpc_method(values["OCTRA_API_PORT"], "octra_epochTags")
     raw_need = gc.get("pack_gc_need_bytes") if isinstance(gc, dict) else None
     try:
@@ -215,6 +222,9 @@ def report(values):
         snapshot_payload_bytes=snapshots["payload"],
         lease_files=snapshots["leased"],
         snapshot_skipped=snapshots["skipped"],
+        stage_path=stage,
+        stage_bytes=stage_bytes,
+        stage_allocated_bytes=stage_allocated,
     )
     for kind in saved:
         for path, size in saved[kind]:

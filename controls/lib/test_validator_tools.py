@@ -62,6 +62,9 @@ from validator_config import rebind_runtime
 from validator_config import source_commit
 from validator_config import main as configure
 from validator_config import sync_client_command
+from validator_config import sync_lock
+from validator_config import sync_snapshot
+from validator_config import prune_sync
 from validator_config import validate_advertise
 from validator_config import validate_sync_layout
 from validator_bundle import validate_bundle
@@ -455,6 +458,25 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(storage["prior_bytes"], 5)
         self.assertEqual(storage["rejected_bytes"], 8)
         self.assertEqual(storage["data_bytes"], 0)
+
+    def test_store_sync_stage(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        stage = WORK / "devnet.state_sync"
+        stage.mkdir()
+        part = stage / "partial"
+        with part.open("wb") as output:
+            output.write(b"local")
+            output.truncate(1024 * 1024)
+        values = {"OCTRA_DATA_DIR": str(data), "OCTRA_API_PORT": "18080"}
+        with mock.patch("validator_store.rpc_method", return_value=None), mock.patch(
+            "validator_store.emit"
+        ) as output:
+            report(values)
+        sync = next(call.kwargs for call in output.call_args_list if call.kwargs["event"] == "sync_store")
+        self.assertEqual(sync["stage_path"], stage.resolve())
+        self.assertEqual(sync["stage_bytes"], 1024 * 1024)
+        self.assertEqual(sync["stage_allocated_bytes"], part.stat().st_blocks * 512)
 
     def test_store_data_link(self):
         target = WORK / "volume/devnet"
@@ -4145,6 +4167,79 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue((target / "HEAD.json").is_file())
         self.assertTrue((target / ".state_sync/snapshot_verified.json").is_file())
         self.assertFalse(data.exists())
+
+    def test_sync_cleanup(self):
+        stage = WORK / "stage"
+        root = stage / "snapshots"
+        old = root / ("a" * 64)
+        old.mkdir(parents=True)
+        (old / "partial").write_bytes(b"download")
+        outside = WORK / "outside"
+        outside.mkdir()
+        (outside / "keep").write_bytes(b"preserve")
+        (old / "link").symlink_to(outside.resolve(), target_is_directory=True)
+        (root / ("b" * 64)).symlink_to(outside.resolve(), target_is_directory=True)
+        (root / "notes").mkdir()
+        with sync_lock(stage):
+            prune_sync(stage)
+        self.assertFalse(old.exists())
+        self.assertEqual((outside / "keep").read_bytes(), b"preserve")
+        self.assertTrue((root / ("b" * 64)).is_symlink())
+        self.assertTrue((root / "notes").is_dir())
+
+    def test_sync_cleanup_retry(self):
+        stage = WORK / "stage"
+        old = stage / "snapshots" / ("a" * 64)
+        old.mkdir(parents=True)
+        (old / "certificate.json").write_text("{}", encoding="utf-8")
+        (old / "partial").write_bytes(b"download")
+        def interrupt(path):
+            (path / "certificate.json").unlink()
+            raise OSError("interrupted")
+        with mock.patch("validator_config.shutil.rmtree", side_effect=interrupt):
+            prune_sync(stage)
+        self.assertTrue(old.exists())
+        prune_sync(stage)
+        self.assertFalse(old.exists())
+
+    def test_sync_install_order(self):
+        stage = WORK / "stage"
+        target = WORK / "data"
+        selected = stage / "snapshots" / ("a" * 64)
+        selected.mkdir(parents=True)
+        for valid in (False, True):
+            with mock.patch("validator_config.run"), mock.patch(
+                "validator_config.load_verified_snapshot", return_value=selected
+            ), mock.patch("validator_config.validate_checkpoint", return_value={"epoch": 101}), mock.patch(
+                "validator_config.install_verified_snapshot"
+            ) as install, mock.patch("validator_config.state_ready", return_value=valid), mock.patch(
+                "validator_config.prune_sync"
+            ) as prune:
+                if valid:
+                    sync_snapshot("sync", stage, target, network_values(), [], 2, 1)
+                    prune.assert_called_once_with(stage)
+                else:
+                    with self.assertRaisesRegex(ValidatorError, "without a valid checkpoint"):
+                        sync_snapshot("sync", stage, target, network_values(), [], 2, 1)
+                    prune.assert_not_called()
+                install.assert_called_once_with(selected, target)
+
+    def test_sync_stage_lock(self):
+        stage = WORK / "stage"
+        stage.mkdir()
+        program = (
+            "import fcntl,sys; "
+            "f=open(sys.argv[1], 'r+'); "
+            "fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+        )
+        with sync_lock(stage):
+            result = subprocess.run([sys.executable, "-c", program, str(stage / "sync.lock")],
+                capture_output=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"BlockingIOError", result.stderr)
+        result = subprocess.run([sys.executable, "-c", program, str(stage / "sync.lock")],
+            capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_checkpoint_root(self):
         data = WORK / "data"

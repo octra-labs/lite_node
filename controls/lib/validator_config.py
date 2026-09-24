@@ -2,14 +2,17 @@
 # Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 import argparse
+import fcntl
 import importlib.util
 import json
 import os
 import pwd
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from validator_common import ENDPOINT
@@ -633,6 +636,43 @@ def install_verified_snapshot(snapshot, data_dir):
     finally:
         os.close(descriptor)
 
+@contextmanager
+def sync_lock(stage):
+    fd = os.open(stage / "sync.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        meta = os.fstat(fd)
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+            raise ValidatorError("state sync lock is not private")
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValidatorError("another state sync command is running") from error
+        yield
+    finally:
+        os.close(fd)
+
+def prune_sync(stage):
+    root = stage / "snapshots"
+    meta = root.lstat()
+    if not stat.S_ISDIR(meta.st_mode):
+        raise ValidatorError("state sync snapshots path is not a directory")
+    for path in sorted(root.iterdir()):
+        if len(path.name) != 64 or any(char not in "0123456789abcdef" for char in path.name):
+            continue
+        try:
+            child = path.lstat()
+            if not stat.S_ISDIR(child.st_mode) or child.st_uid != os.getuid() or child.st_mode & 0o022:
+                continue
+            for parent, dirs, _ in os.walk(path, followlinks=False):
+                for entry in [Path(parent), *(Path(parent) / name for name in dirs)]:
+                    info = entry.lstat()
+                    if info.st_dev != meta.st_dev or os.path.ismount(entry):
+                        raise ValidatorError("state sync stage device differs")
+            shutil.rmtree(path)
+            emit(event="sync_stage_removed", path=path)
+        except (OSError, ValidatorError) as error:
+            emit(event="sync_stage_retained", path=path, reason=str(error))
+
 def sync_snapshot(
     sync_binary,
     stage,
@@ -657,14 +697,16 @@ def sync_snapshot(
         min_epoch=floor,
     )
     run(command)
-    snapshot = load_verified_snapshot(stage, values)
-    head = validate_checkpoint(snapshot / "data", values, allow_progress=True)
-    if head["epoch"] < floor:
-        raise ValidatorError("signed snapshot is below required epoch")
-    install_verified_snapshot(snapshot, data_path)
-    if not state_ready(data_path):
-        raise ValidatorError("state sync completed without a valid checkpoint")
-    validate_checkpoint(data_path, values, allow_progress=True)
+    with sync_lock(stage):
+        snapshot = load_verified_snapshot(stage, values)
+        head = validate_checkpoint(snapshot / "data", values, allow_progress=True)
+        if head["epoch"] < floor:
+            raise ValidatorError("signed snapshot is below required epoch")
+        install_verified_snapshot(snapshot, data_path)
+        if not state_ready(data_path):
+            raise ValidatorError("state sync completed without a valid checkpoint")
+        validate_checkpoint(data_path, values, allow_progress=True)
+        prune_sync(stage)
 
 def sync_client_command(
     sync_binary,

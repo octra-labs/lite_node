@@ -309,13 +309,124 @@ let verify_completed_chunk ~partial (chunk : Manifest.chunk) =
   | Error _ as error -> error
 
 let finalize_file ~destination ~partial (file : Manifest.file) =
-  let candidate =
+  let source =
     if Sys.file_exists destination then destination else partial in
-  let* hash = hash_file candidate in
+  let* hash = hash_file source in
   if hash <> file.Manifest.sha256 then Error "file hash mismatch"
-  else if candidate = destination then Ok ()
+  else if source = destination then Ok ()
   else
     protect (fun () ->
       Unix.rename partial destination;
       Unix.chmod destination 0o600;
       fsync_parent destination)
+
+let stage_lock stage =
+  protect (fun () ->
+    mkdir_p stage;
+    let path = Filename.concat stage "sync.lock" in
+    begin match Unix.lstat path with
+    | meta when meta.Unix.st_kind <> Unix.S_REG ->
+        failwith "state sync lock is not a regular file"
+    | _ -> ()
+    | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+    end;
+    let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT] 0o600 in
+    try
+      Unix.set_close_on_exec fd;
+      let meta = Unix.fstat fd in
+      let named = Unix.lstat path in
+      if meta.Unix.st_kind <> Unix.S_REG || named.st_kind <> Unix.S_REG
+         || meta.st_uid <> Unix.getuid () || meta.st_perm land 0o077 <> 0
+         || meta.st_dev <> named.st_dev || meta.st_ino <> named.st_ino then
+        failwith "state sync lock is not private";
+      Unix.lockf fd Unix.F_TLOCK 0;
+      fd
+    with exn -> Unix.close fd; raise exn)
+
+let stage_dirs stage =
+  let root = Filename.concat stage "snapshots" in
+  mkdir_p root;
+  let meta = Unix.lstat root in
+  if meta.Unix.st_kind <> Unix.S_DIR then
+    failwith "state sync snapshots path is not a directory";
+  Sys.readdir root |> Array.to_list |> List.filter_map (fun name ->
+    if not (State_sync_checkpoint.lower_hex 64 name) then None
+    else
+      let path = Filename.concat root name in
+      let child = Unix.lstat path in
+      if child.Unix.st_kind = Unix.S_DIR && child.st_dev = meta.st_dev
+         && child.st_uid = Unix.getuid () && child.st_perm land 0o022 = 0
+      then Some path else None)
+
+let rec remove_stage device path =
+  let meta = Unix.lstat path in
+  if meta.Unix.st_dev <> device then failwith "state sync stage device differs";
+  if meta.st_kind = Unix.S_DIR then begin
+    Sys.readdir path |> Array.iter (fun name ->
+      remove_stage device (Filename.concat path name));
+    Unix.rmdir path
+  end else Unix.unlink path
+
+let select_donor ~stage ~current =
+  protect (fun () ->
+    let score path =
+      try
+        let meta = Unix.lstat (Filename.concat path "journal.jsonl") in
+        if meta.Unix.st_kind = Unix.S_REG then meta.st_size, meta.st_mtime
+        else 0, 0.
+      with Unix.Unix_error (Unix.ENOENT, _, _) -> 0, 0.
+    in
+    let previous = stage_dirs stage |> List.filter (fun path -> path <> current)
+      |> List.map (fun path -> score path, path)
+      |> List.sort (fun left right -> compare right left) in
+    match previous with
+    | [] -> None
+    | (_, donor) :: rest ->
+        List.iter (fun (_, path) ->
+          remove_stage (Unix.lstat path).Unix.st_dev path) rest;
+        Some (Filename.concat donor "data"))
+
+let read_local root relative chunk =
+  protect (fun () ->
+    if (Unix.lstat root).Unix.st_kind <> Unix.S_DIR then
+      failwith "chunk source is not a directory";
+    let rec walk path = function
+      | [] -> failwith "chunk source path is empty"
+      | name :: rest ->
+          let path = Filename.concat path name in
+          let meta = Unix.lstat path in
+          if rest <> [] then begin
+            if meta.Unix.st_kind <> Unix.S_DIR then
+              failwith "chunk source parent is not a directory";
+            walk path rest
+          end else begin
+            if meta.Unix.st_kind <> Unix.S_REG then
+              failwith "chunk source is not a regular file";
+            path, meta
+          end
+    in
+    if Manifest.normalize_path relative <> Some relative then
+      failwith "invalid local chunk path";
+    let path, meta = walk root (String.split_on_char '/' relative) in
+    let input = open_in_bin path in
+    Fun.protect ~finally:(fun () -> close_in_noerr input) (fun () ->
+      let opened = Unix.fstat (Unix.descr_of_in_channel input) in
+      if opened.Unix.st_dev <> meta.st_dev || opened.st_ino <> meta.st_ino then
+        failwith "chunk source changed";
+      LargeFile.seek_in input chunk.Manifest.offset;
+      let body = really_input_string input chunk.size in
+      if Digestif.SHA256.(digest_string body |> to_hex) <> chunk.sha256 then
+        failwith "local chunk hash mismatch";
+      body))
+
+let reuse_chunk ~donor ~path ~partial chunk =
+  let rec read = function
+    | [] -> Ok false
+    | relative :: rest ->
+        match read_local donor relative chunk with
+        | Error _ -> read rest
+        | Ok body ->
+            let* () = write_chunk ~partial chunk body in
+            Ok true
+  in
+  read [path; part_path path]
