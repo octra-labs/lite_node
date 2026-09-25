@@ -110,9 +110,11 @@ let check_overload () =
   Lwt_main.run (Lwt_unix.sleep 0.01);
   for index = 1 to Actor.stream_capacity do
     expect "stream accepts finite capacity"
-      (Actor.notify actor ~epoch:(Int64.of_int (index + 1)) None
+      (Actor.notify actor ~epoch:(Int64.of_int (index + 1))
+         (Some (vote (Int64.of_int index), parent (Int64.of_int index)))
        = Actor.Accepted)
   done;
+  events := [];
   expect "stream reports overload"
     (Actor.notify actor ~epoch:99L (Some (vote 98L, parent 98L)) = Actor.Busy);
   expect "overload preserves available proof evidence"
@@ -120,6 +122,29 @@ let check_overload () =
      = [Actor.Overload; Actor.Available]);
   Lwt.wakeup_later wake (Ok ());
   Lwt_main.run (Lwt_unix.sleep 0.02);
+  Lwt_main.run (Actor.shutdown actor)
+
+let check_wake_merge () =
+  let hold, release = Lwt.wait () in
+  let reads = ref 0 in
+  let sends = ref 0 in
+  let actor = Actor.create Actor.{
+    sample = (fun () -> { epoch = 100L; active = false; bonded = Ok true });
+    read = (fun ~epoch:_ ->
+      incr reads;
+      if !reads = 1 then hold else unread ~epoch:100L);
+    peers = (fun () -> 1);
+    send = (fun ~epoch:_ _ -> incr sends; Lwt.return_ok ());
+    warn = (fun _ _ -> ());
+  } in
+  ignore (Actor.wake actor ~head:99);
+  Lwt_main.run (Lwt.pause ());
+  for head = 99 to 99 + Actor.stream_capacity - 1 do
+    expect "repeated wake accepted" (Actor.wake actor ~head = Actor.Accepted)
+  done;
+  Lwt.wakeup release (Error "head not committed");
+  Lwt_main.run (settle ());
+  expect "one queued retry after read refusal" (!reads = 2 && !sends = 1);
   Lwt_main.run (Actor.shutdown actor)
 
 let check_effect_failure () =
@@ -1127,4 +1152,5 @@ let () =
   check_flow ();
   check_effect_failure ();
   check_overload ();
+  check_wake_merge ();
   Printf.printf "status = pass test = set_actor\n%!"

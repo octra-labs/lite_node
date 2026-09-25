@@ -474,6 +474,10 @@ let query_chunk_deps ?(local_root = base_root) ?(answer = Some (chunk ()))
     events =
   S.{
     env_timeout = (fun () -> None);
+    verify_http = check_qcs
+      ~chain_id:"octra-test"
+      ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+      ~start_txid:4L;
     read_query_root = (fun () ->
       add events "query_root";
       Lwt.return local_root);
@@ -485,8 +489,8 @@ let query_chunk_deps ?(local_root = base_root) ?(answer = Some (chunk ()))
           ~validate ->
         add events "query_range";
         match answer with
-        | Some candidate when validate candidate ->
-          Lwt.return_some candidate
+        | Some response when validate response ->
+          Lwt.return_some response
         | _ ->
           Lwt.return_none);
       http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
@@ -530,6 +534,232 @@ let test_query_chunk_failure () =
   let events = snapshot events in
   assert_true "retried sleep twice"
     (List.length (List.filter (( = ) "query_sleep") events) = 2)
+
+let test_http_qc () =
+  let check = S.check_qcs
+    ~chain_id:"octra-test"
+    ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+    ~start_txid:4L in
+  let first = record () in
+  let second = record ~epoch:12L ~prev:next_root () in
+  let changed = record ~epoch:12L ~prev:next_root ~creator:"oct_other" () in
+  let wrong_chain = S.check_qcs
+    ~chain_id:"octra-other"
+    ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+    ~start_txid:4L in
+  let first_epoch = function
+    | Ok [record] -> record.Octra_consensus.C_codec.epoch_id = 11L
+    | _ -> false
+  in
+  assert_true "changed validator set keeps proved prefix"
+    (first_epoch (check [first; changed]));
+  assert_true "other chain rejected"
+    (Result.is_error (wrong_chain [first]));
+  assert_true "missing finality rejected"
+    (Result.is_error (check [{ first with finality = None }]));
+  assert_true "signed range accepted"
+    (match check [first; second] with Ok records -> List.length records = 2 | _ -> false);
+  let bad_vote =
+    match first.finality with
+    | None -> failwith "finality missing"
+    | Some proof ->
+      let finalize = proof.finalize in
+      let precommits =
+        List.map
+          (fun (vote : Octra_consensus.C_types.vote) ->
+            { vote with signature = String.make 64 '\000' })
+          finalize.precommits
+      in
+      { first with finality = Some { proof with
+        finalize = { finalize with precommits } } }
+  in
+  assert_true "unsigned first record rejected"
+    (Result.is_error (check [bad_vote]));
+  let failed_read = S.check_qcs
+    ~chain_id:"octra-test"
+    ~expected_validator_set_hash:(fun _ -> failwith "store read")
+    ~start_txid:4L in
+  assert_true "store read rejected"
+    (Result.is_error (failed_read [first]));
+  let failed_later = S.check_qcs
+    ~chain_id:"octra-test"
+    ~expected_validator_set_hash:(fun epoch ->
+      if epoch = 12L then failwith "store read"
+      else Ok trusted_validator_set_hash)
+    ~start_txid:4L in
+  assert_true "store read keeps proved prefix"
+    (first_epoch (failed_later [first; second]))
+
+let test_query_chunk_http_reject () =
+  let events = ref [] in
+  let calls = ref 0 in
+  let deps = query_chunk_deps events in
+  let range_query = S.{ deps.range_query with
+    query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
+        ~validate ->
+      incr calls;
+      add events "query_range";
+      let response = chunk () in
+      Lwt.return
+        (if !calls > 1 && validate response then Some response else None));
+    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ ->
+      add events "http";
+      Lwt.return_some (chunk ~records:[{ (record ()) with finality = None }] ()));
+  } in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query }
+         ~target_epoch:12L
+         ~from_epoch:11L
+         ~reason:"reject")
+  in
+  begin
+    match step with
+    | S.Query_chunk _ -> ()
+    | _ -> failwith "peer retry should succeed"
+  end;
+  assert_true "invalid http rejected" (!calls = 2);
+  assert_true "http precedes second peer"
+    (snapshot events =
+     ["query_root"; "query_range"; "http"; "query_sleep"; "query_range"])
+
+let test_query_chunk_http_first () =
+  let events = ref [] in
+  let deps = query_chunk_deps ~answer:None events in
+  let range_query = S.{ deps.range_query with
+    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+      add events "http";
+      let response = chunk () in
+      Lwt.return (if validate response then Some response else None));
+  } in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query }
+         ~target_epoch:12L
+         ~from_epoch:11L
+         ~reason:"http")
+  in
+  begin
+    match step with
+    | S.Query_chunk _ -> ()
+    | _ -> failwith "http chunk should be used"
+  end;
+  assert_true "http precedes peer retry"
+    (snapshot events = ["query_root"; "query_range"; "http"])
+
+let test_query_chunk_http_prefix () =
+  let events = ref [] in
+  let checks = ref 0 in
+  let first = record () in
+  let changed = record ~epoch:12L ~prev:next_root ~creator:"oct_other" () in
+  let deps = query_chunk_deps ~answer:None events in
+  let range_query = S.{ deps.range_query with
+    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+      let response = chunk ~records:[first; changed] () in
+      Lwt.return (if validate response then Some response else None));
+  } in
+  let verify_http records =
+    incr checks;
+    S.check_qcs
+      ~chain_id:"octra-test"
+      ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+      ~start_txid:4L records
+  in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query; verify_http }
+         ~target_epoch:12L
+         ~from_epoch:11L
+         ~reason:"prefix")
+  in
+  begin
+    match step with
+    | S.Query_chunk response ->
+      assert_true "only proved prefix accepted"
+        (List.map (fun record -> record.Octra_consensus.C_codec.epoch_id)
+           response.records = [11L]);
+      assert_true "prefix cursor" (response.next_epoch = Some 12L)
+    | _ -> failwith "proved prefix should be used"
+  end;
+  assert_true "proof checked once" (!checks = 1)
+
+let test_query_chunk_http_read () =
+  let events = ref [] in
+  let calls = ref 0 in
+  let deps = query_chunk_deps ~answer:None events in
+  let range_query = S.{ deps.range_query with
+    query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
+        ~validate ->
+      incr calls;
+      let response = chunk () in
+      Lwt.return
+        (if !calls > 1 && validate response then Some response else None));
+    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+      let response = chunk () in
+      Lwt.return (if validate response then Some response else None));
+  } in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query;
+           verify_http = (fun _ -> failwith "store read") }
+         ~target_epoch:11L
+         ~from_epoch:11L
+         ~reason:"read")
+  in
+  assert_true "read failure retries peer"
+    (match step with S.Query_chunk _ -> !calls = 2 | _ -> false)
+
+let test_query_chunk_http_last () =
+  let events = ref [] in
+  let calls = ref 0 in
+  let deps = query_chunk_deps ~answer:None events in
+  let range_query = S.{ deps.range_query with
+    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+      incr calls;
+      let response =
+        if !calls = 1 then
+          chunk ~records:[{ (record ()) with finality = None }] ()
+        else chunk ()
+      in
+      Lwt.return (if validate response then Some response else None));
+  } in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query }
+         ~target_epoch:11L
+         ~from_epoch:11L
+         ~reason:"last")
+  in
+  assert_true "last http response checked"
+    (match step with S.Query_chunk _ -> !calls = 2 | _ -> false)
+
+let test_query_chunk_http_bad_last () =
+  let events = ref [] in
+  let calls = ref 0 in
+  let deps = query_chunk_deps ~answer:None events in
+  let range_query = S.{ deps.range_query with
+    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+      incr calls;
+      let response =
+        chunk ~records:[{ (record ()) with finality = None }] ()
+      in
+      Lwt.return (if validate response then Some response else None));
+  } in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query }
+         ~target_epoch:11L
+         ~from_epoch:11L
+         ~reason:"bad_last")
+  in
+  assert_true "invalid final http rejected"
+    (match step with S.Query_failed _ -> !calls = 2 | _ -> false)
 
 let test_base_gate_decisions () =
   begin
@@ -1315,6 +1545,10 @@ let test_local_apply_cancels_query () =
   let waiting, _ = Lwt.task () in
   let query = S.{
     env_timeout = (fun () -> None);
+    verify_http = check_qcs
+      ~chain_id:"octra-test"
+      ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+      ~start_txid:4L;
     read_query_root = (fun () -> Lwt.return base_root);
     range_query = {
       sleep = (fun _ ->
@@ -1846,6 +2080,13 @@ let tests = [
   "range retry success", test_range_retry_success;
   "query chunk success", test_query_chunk_success;
   "query chunk failure", test_query_chunk_failure;
+  "http qc", test_http_qc;
+  "query chunk http reject", test_query_chunk_http_reject;
+  "query chunk http first", test_query_chunk_http_first;
+  "query chunk http prefix", test_query_chunk_http_prefix;
+  "query chunk http read", test_query_chunk_http_read;
+  "query chunk http last", test_query_chunk_http_last;
+  "query chunk http bad last", test_query_chunk_http_bad_last;
   "base gate decisions", test_base_gate_decisions;
   "continuity gate failure", test_continuity_gate_failure;
   "apply result gate decisions", test_apply_result_gate_decisions;

@@ -405,10 +405,19 @@ let notify t ~epoch event =
       event
   in
   Option.iter (observe t Available epoch) proof;
+  let queued =
+    Option.is_none proof
+    && Queue.fold (fun found command ->
+      found || match command.message with
+      | Notice { proof = None; _ } -> not (expired command)
+      | _ -> false) false t.stream
+  in
   if not t.open_ then begin
     Option.iter (observe t Closed epoch) proof;
     Stopped
-  end else if Queue.length t.stream >= stream_capacity then begin
+  end else if queued then
+    Accepted
+  else if Queue.length t.stream >= stream_capacity then begin
     Option.iter (observe t Overload epoch) proof;
     Busy
   end else begin

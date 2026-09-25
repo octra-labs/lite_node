@@ -81,6 +81,8 @@ type chunk_query_deps = {
   env_timeout : unit -> string option;
   read_query_root : unit -> string Lwt.t;
   range_query : query_deps;
+  verify_http : Octra_consensus.C_codec.catchup_epoch_record list ->
+    (Octra_consensus.C_codec.catchup_epoch_record list, string) result;
 }
 
 type gate_action =
@@ -331,6 +333,13 @@ val range_plan :
 val response_payload_valid :
   Octra_consensus.C_codec.catchup_epoch_record list ->
   bool
+
+val check_qcs :
+  chain_id:string ->
+  expected_validator_set_hash:(int64 -> (string, string) result) ->
+  start_txid:int64 ->
+  Octra_consensus.C_codec.catchup_epoch_record list ->
+  (Octra_consensus.C_codec.catchup_epoch_record list, string) result
 
 val query_range :
   query_deps ->

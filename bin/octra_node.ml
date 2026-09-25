@@ -1932,8 +1932,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             swarm_opt := Some swarm;
             swarm_ref := Some swarm;
             Octra_net.P2p_swarm.set_peer_hook swarm (fun _ ->
-              Set_post.tick fold_post;
-              (!fold_wake) ~head:(max 0 (!current_epoch - 1))));
+              if Octra_net.P2p_swarm.connected_count swarm = 1 then begin
+                match Octra_core.Head_manifest.get_cached () with
+                | Some head -> (!fold_wake) ~head:head.epoch_id
+                | None -> Set_post.tick fold_post
+              end));
         };
         current_epoch;
         consensus_finalized;

@@ -830,6 +830,10 @@ let test_http_range_sources () =
       in
       let deps = Shell.{
         env_timeout = (fun () -> Some "1");
+        verify_http = Shell.check_qcs
+          ~chain_id:"octra-test"
+          ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+          ~start_txid:7L;
         read_query_root = (fun () -> Lwt.return (raw 'p'));
         range_query = {
           sleep = (fun _ -> Lwt.return_unit);

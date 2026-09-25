@@ -89,6 +89,8 @@ type chunk_query_deps = {
   env_timeout : unit -> string option;
   read_query_root : unit -> string Lwt.t;
   range_query : query_deps;
+  verify_http : Octra_consensus.C_codec.catchup_epoch_record list ->
+    (Octra_consensus.C_codec.catchup_epoch_record list, string) result;
 }
 
 type gate_action =
@@ -396,6 +398,43 @@ let response_payload_error records =
 let response_payload_valid records =
   Option.is_none (response_payload_error records)
 
+let check_qcs ~chain_id ~expected_validator_set_hash ~start_txid records =
+  let stop checked error =
+    match checked with
+    | [] -> Error error
+    | _ -> Ok (List.rev checked)
+  in
+  let read_hash epoch =
+    try expected_validator_set_hash epoch with
+    | Out_of_memory | Stack_overflow | Sys.Break | Lwt.Canceled as exn ->
+      raise exn
+    | exn -> Error (Printexc.to_string exn)
+  in
+  let rec check txid checked = function
+    | [] -> Ok (List.rev checked)
+    | record :: rest ->
+      let next_txid =
+        Int64.add txid
+          (Int64.of_int (List.length record.Octra_consensus.C_codec.tx_hashes))
+      in
+      if Int64.compare next_txid txid < 0 then
+        stop checked "catchup transaction index overflow"
+      else
+        match read_hash record.epoch_id with
+        | Error error -> stop checked error
+        | Ok hash ->
+          match C_catchup.verify_record_finality
+                  ~chain_id
+                  ~expected_validator_set_hash:hash
+                  ~expected_txid:next_txid
+                  ~record with
+          | Error error -> stop checked error
+          | Ok _ -> check next_txid (record :: checked) rest
+  in
+  match records with
+  | [] -> Error "catchup range is empty"
+  | _ -> check start_txid [] records
+
 let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
   let open Lwt.Syntax in
   let range_plan =
@@ -410,11 +449,16 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       (Int64.to_int from_epoch) range_plan.remain target_epoch reason;
   let* local_root = deps.read_query_root () in
   let reject (r : C_driver.catchup_range_response_record) reason =
+    let first_epoch =
+      match r.C_driver.records with
+      | [] -> "none"
+      | first :: _ -> Int64.to_string first.epoch_id
+    in
     Log.info "catchup"
-      "event = range_validate_failed from = %Ld peer = %s reason = %s"
+      "event = range_validate_failed from = %Ld peer = %s reason = %s status_ok = %b first_epoch = %s"
       from_epoch
       (Text.addr_short r.C_driver.responder_addr)
-      reason;
+      reason (r.status = "ok") first_epoch;
     false
   in
   let validate r =
@@ -435,10 +479,10 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
         | Ok () -> true
         | Error error -> reject r ("continuity: " ^ error)
   in
-  let* result =
+  let peer attempts =
     query_range
       deps.range_query
-      ~attempts:3
+      ~attempts
       ~retry_delay:2.0
       ~from_epoch
       ~max_epochs:range_plan.max_epochs
@@ -446,34 +490,95 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       ~reason
       ~validate
   in
-  let* result =
-    match result with
-    | Some _ -> Lwt.return result
-    | None ->
-      let* response =
-        deps.range_query.http_range
-          ~from_epoch
-          ~max_epochs:range_cap
-          ~validate
+  let http () =
+    let checked = ref None in
+    let check response =
+      let verified =
+        if not (validate response) then None
+        else
+          let result =
+            try deps.verify_http response.C_driver.records with
+            | Out_of_memory | Stack_overflow | Sys.Break | Lwt.Canceled as exn ->
+              raise exn
+            | exn -> Error (Printexc.to_string exn)
+          in
+          match result with
+          | Error error ->
+            Log.info "catchup"
+              "event = range_finality_failed from = %Ld reason = %s"
+              from_epoch error;
+            None
+          | Ok records ->
+            let count = List.length records in
+            let total = List.length response.C_driver.records in
+            if count = 0 || count > total then None
+            else if count = total then Some response
+            else
+              match List.rev records with
+              | [] -> None
+              | last :: _ ->
+                Log.info "catchup"
+                  "event = range_prefix from = %Ld verified = %d received = %d"
+                  from_epoch count total;
+                Some { response with records;
+                  next_epoch = Some (Int64.succ last.epoch_id) }
       in
-      begin
-        match response with
-        | Some response when validate response ->
-          Log.warn "catchup"
-            "event = range_http_secondary from = %Ld records = %d reason = %s"
-            from_epoch
-            (List.length response.C_driver.records)
-            reason;
-          Lwt.return_some response
-        | Some response ->
-          Log.warn "catchup"
-            "event = range_http_rejected from = %Ld records = %d reason = %s"
-            from_epoch
-            (List.length response.C_driver.records)
-            reason;
-          Lwt.return_none
-        | None -> Lwt.return_none
-      end
+      checked := Option.map (fun prefix -> response, prefix) verified;
+      Option.is_some verified
+    in
+    let* response =
+      deps.range_query.http_range
+        ~from_epoch
+        ~max_epochs:range_cap
+        ~validate:check
+    in
+    let verified =
+      match response with
+      | None -> None
+      | Some received ->
+        match !checked with
+        | Some (seen, prefix) when received == seen -> Some prefix
+        | _ ->
+          if check received then Option.map snd !checked else None
+    in
+    match response, verified with
+    | _, Some response ->
+      Log.warn "catchup"
+        "event = range_http_secondary from = %Ld records = %d reason = %s"
+        from_epoch
+        (List.length response.C_driver.records)
+        reason;
+      Lwt.return_some response
+    | Some received, None ->
+      Log.warn "catchup"
+        "event = range_http_rejected from = %Ld records = %d reason = %s"
+        from_epoch
+        (List.length received.C_driver.records)
+        reason;
+      Lwt.return_none
+    | None, None -> Lwt.return_none
+  in
+  let* first = peer 1 in
+  let* result =
+    match first with
+    | Some _ -> Lwt.return first
+    | None ->
+      let* early =
+        Lwt.catch
+          (fun () ->
+            Lwt_unix.with_timeout range_plan.timeout_seconds http)
+          (function
+            | Lwt_unix.Timeout -> Lwt.return_none
+            | exn -> Lwt.fail exn)
+      in
+      match early with
+      | Some _ -> Lwt.return early
+      | None ->
+        let* () = deps.range_query.sleep 2.0 in
+        let* retried = peer 2 in
+        match retried with
+        | Some _ -> Lwt.return retried
+        | None -> http ()
   in
   match result with
   | Some chunk ->
@@ -1212,6 +1317,12 @@ let target_of_wiring (wiring : target_wiring) =
       env_timeout = wiring.env_timeout;
       read_query_root = wiring.read_query_root;
       range_query = wiring.range_query;
+      verify_http = (fun records ->
+        check_qcs
+          ~chain_id:wiring.chain_id
+          ~expected_validator_set_hash:wiring.expected_validator_set_hash
+          ~start_txid:(wiring.next_txid ())
+          records);
     };
     apply = {
       read_local_root = wiring.read_local_root;
