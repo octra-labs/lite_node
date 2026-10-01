@@ -26,6 +26,7 @@ type fatal =
   | Outcome_invalid of string
 
 type deps = {
+  rules : Octra_core.Rule_graph.t;
   check_override_receipts :
     epoch_id:int ->
     receipts:string list ->
@@ -39,6 +40,7 @@ type deps = {
 }
 
 type node_deps = {
+  rules : Octra_core.Rule_graph.t;
   check_override_receipts :
     epoch_id:int ->
     receipts:string list ->
@@ -105,7 +107,7 @@ let fatal_lines ~epoch_id = function
         error;
     ]
 
-let selected ?(effects = []) txs receipts_json =
+let selected rules ~epoch ?(effects = []) txs receipts_json =
   match Octra_core.Tx_outcome.split_admit receipts_json with
   | Error error -> Error (Outcome_invalid error)
   | Ok partition ->
@@ -115,7 +117,10 @@ let selected ?(effects = []) txs receipts_json =
         ~rejections:partition.rejections
     with
     | Error error -> Error (Outcome_invalid error)
-    | Ok _ ->
+    | Ok inputs ->
+      match Octra_core.Tx_envelope.check_rule rules ~epoch inputs with
+      | Error error -> Error (Outcome_invalid error)
+      | Ok () ->
       Ok {
         txs;
         receipts_json;
@@ -128,7 +133,7 @@ let choose_override (deps : deps) request txs =
   let receipts =
     Option.value request.override_receipts_json ~default:[]
   in
-  match selected txs receipts with
+  match selected deps.rules ~epoch:request.epoch_id txs receipts with
   | Error _ as error -> error
   | Ok selected ->
     match
@@ -149,12 +154,12 @@ let choose_consensus (deps : deps) request =
     match deps.cached_bundle proposal_id with
     | Some (_tx_hashes, txs, receipts_json) ->
       if deps.receipt_root_matches header receipts_json then
-        selected txs receipts_json
+        selected deps.rules ~epoch:request.epoch_id txs receipts_json
       else
         Error (Receipt_root_mismatch { proposal_id })
     | None ->
       if deps.header_has_empty_bundle header then
-        selected [] [] ~effects:[Store_empty_bundle header]
+        selected deps.rules ~epoch:request.epoch_id [] [] ~effects:[Store_empty_bundle header]
       else
         Error (Missing_canonical_bundle { proposal_id })
 
@@ -162,7 +167,7 @@ let choose (deps : deps) request =
   match request.override_ordered_txs with
   | Some txs -> choose_override deps request txs
   | None when request.consensus_mode -> choose_consensus deps request
-  | None -> selected (deps.staging_txs ()) []
+  | None -> selected deps.rules ~epoch:request.epoch_id (deps.staging_txs ()) []
 
 let run (deps : deps) request ~apply_effect ~fatal ~exit =
   match choose deps request with
@@ -183,6 +188,7 @@ let run (deps : deps) request ~apply_effect ~fatal ~exit =
 
 let deps_of_node (deps : node_deps) =
   {
+    rules = deps.rules;
     check_override_receipts = deps.check_override_receipts;
     find_finalized = deps.find_finalized;
     cached_bundle = deps.cached_bundle;

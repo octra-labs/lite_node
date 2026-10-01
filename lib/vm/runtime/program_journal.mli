@@ -8,6 +8,7 @@ type deploy = {
   owner : string;
   ctype : string;
   admission : string;
+  version : string;
   storage : (string, string) Hashtbl.t;
 }
 

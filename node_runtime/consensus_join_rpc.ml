@@ -687,6 +687,8 @@ let http_head ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
        None heads)
 
 let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
+  if record.epoch_id < 0L || record.epoch_id >= Int64.of_int max_int then
+    failwith "join epoch is out of range";
   if record.epoch_id <> cursor.epoch then
     failwith
       (Printf.sprintf
@@ -701,6 +703,11 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
          cursor.prev_root
          record.prev_state_root);
   let txs = List.map parse_tx record.txs_json in
+  begin match Octra_core.Tx_envelope.check_outcome ~chain_id
+                ~epoch:record.epoch_id ~receipts:record.receipts_json txs with
+  | Ok () -> ()
+  | Error error -> failwith ("join transaction envelope: " ^ error)
+  end;
   let parsed_hashes = List.map Transaction.hash txs in
   if parsed_hashes <> record.tx_hashes then
     failwith (Printf.sprintf "join tx hash mismatch epoch = %Ld" record.epoch_id);

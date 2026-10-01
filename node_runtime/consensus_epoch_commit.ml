@@ -102,12 +102,7 @@ type commit_boundary = {
   log : boundary_log option;
 }
 
-type rollback_offsets = {
-  head_epoch : int;
-  txlog_seg : int;
-  txlog_off : int;
-  epochlog_off : int;
-}
+type rollback_head = Head_manifest.t
 
 type rollback_refusal = {
   head_epoch : int;
@@ -122,7 +117,7 @@ type rollback_ok = {
 }
 
 type rollback_plan =
-  | Rollback_to_head of rollback_offsets
+  | Rollback_to_head of rollback_head
   | Rollback_missing_offsets
   | Rollback_refused of rollback_refusal
   | Rollback_missing_head
@@ -154,7 +149,7 @@ type prepared_commit = {
 }
 
 type rollback_effects = {
-  rollback_to_head : rollback_offsets -> int * int * int * int;
+  rollback_to_head : rollback_head -> int * int * int * int;
   delete_wal : unit -> unit;
   clear_marker : unit -> unit;
   log : string -> unit;
@@ -186,17 +181,19 @@ type commit_effects = {
   set_epoch_index_commitment :
     epoch_id:int -> epoch_hash:string -> root:string -> unit;
   fsync_chaindata : unit -> unit;
-  commit_chaindata_batch : unit -> unit;
+  commit_chaindata_batch : Octra_core.Aux_delta.anchor -> unit;
   verify_history :
     epoch_id:int -> start_txid:int64 -> tx_count:int ->
     Store_chaindata.epoch_index_status;
   commit_irmin_batch : string -> unit Lwt.t;
   tag_epoch : int -> unit Lwt.t;
+  sync_irmin : unit -> unit;
   irmin_commit_hash : unit -> string option Lwt.t;
   txlog_position : unit -> int * int;
   epochlog_offset : unit -> int;
   write_head : Head_manifest.t -> unit;
   cache_head : Head_manifest.t -> unit;
+  retire_auxiliary : Head_manifest.t -> unit;
   delete_wal : int -> unit;
   delete_pending_commits : int -> unit;
   clear_marker : unit -> unit;
@@ -323,13 +320,7 @@ let rollback_plan ~commit_epoch ~(boundary : Epoch_boundary.plan) = function
     (match h.Head_manifest.txlog_seg,
            h.Head_manifest.txlog_off,
            h.Head_manifest.epochlog_off with
-     | Some txlog_seg, Some txlog_off, Some epochlog_off ->
-       Rollback_to_head {
-         head_epoch = h.Head_manifest.epoch_id;
-         txlog_seg;
-         txlog_off;
-         epochlog_off;
-       }
+     | Some _, Some _, Some _ -> Rollback_to_head h
      | _ -> Rollback_missing_offsets)
   | Some h ->
     Rollback_refused {
@@ -372,13 +363,13 @@ let prepare_commit (effects : prepare_effects) (input : prepare_input) =
         head_before_commit;
   }
 
-let rollback_start_log (r : rollback_offsets) =
+let rollback_start_log (r : rollback_head) =
   Printf.sprintf
     "event = rollback action = start head_epoch = %d txlog_seg = %d txlog_off = %d epochlog_off = %d"
-    r.head_epoch
-    r.txlog_seg
-    r.txlog_off
-    r.epochlog_off
+    r.epoch_id
+    (Option.value ~default:(-1) r.txlog_seg)
+    (Option.value ~default:(-1) r.txlog_off)
+    (Option.value ~default:(-1) r.epochlog_off)
 
 let rollback_ok_log (r : rollback_ok) =
   Printf.sprintf
@@ -493,10 +484,7 @@ let live_rollback_effects deps ~commit_epoch ~start_txid ~tx_count =
   {
     rollback_to_head = (fun r ->
       Store_chaindata.rollback_to_head deps.chaindata
-        ~head_epoch:r.head_epoch
-        ~head_txlog_seg:r.txlog_seg
-        ~head_txlog_off:r.txlog_off
-        ~head_epochlog_off:r.epochlog_off
+        ~head:r
         ~inflight_start_txid:start_txid
         ~inflight_tx_count:tx_count);
     delete_wal = (fun () -> Wal.delete deps.data_dir commit_epoch);
@@ -516,8 +504,12 @@ let live_commit_effects deps =
     set_epoch_index_commitment =
       Store_chaindata.set_epoch_index_commitment deps.chaindata;
     fsync_chaindata = (fun () -> Store_chaindata.fsync deps.chaindata);
-    commit_chaindata_batch = (fun () ->
-      Store_chaindata.commit_batch deps.chaindata);
+    commit_chaindata_batch = (fun target ->
+      let previous = match Head_manifest.load_result deps.data_dir with
+        | Head_manifest.Present head -> Some (Store_chaindata.head_anchor head)
+        | Head_manifest.Missing -> None
+        | Head_manifest.Corrupt reason -> failwith ("invalid HEAD: " ^ reason) in
+      Store_chaindata.commit_batch ~anchor:(previous, target) deps.chaindata);
     verify_history = (fun ~epoch_id ~start_txid ~tx_count ->
       Store_chaindata.verify_epoch_index_complete_raw deps.chaindata
         ~epoch_id
@@ -533,11 +525,15 @@ let live_commit_effects deps =
         | Ok () -> Lwt.return_unit
         | Error error -> Lwt.fail_with error);
     tag_epoch = Store_irmin.tag_epoch deps.store;
+    sync_irmin = (fun () ->
+      Store_irmin.Store.flush deps.store.repo;
+      Store_irmin.sync_branches deps.store.store_path);
     irmin_commit_hash = (fun () -> Store_irmin.get_commit_hash deps.store);
     txlog_position = (fun () -> Store_chaindata.txlog_position deps.chaindata);
     epochlog_offset = (fun () -> Store_chaindata.epochlog_offset deps.chaindata);
     write_head = Head_manifest.atomic_write deps.data_dir;
     cache_head = Head_manifest.set_cached;
+    retire_auxiliary = (fun head -> Store_chaindata.retire_auxiliary deps.chaindata (Some head));
     delete_wal = Wal.delete deps.data_dir;
     delete_pending_commits = Wal.delete_pending_commits_for_epoch deps.data_dir;
     clear_marker = (fun () ->
@@ -663,7 +659,8 @@ let run_commit_effects (effects : commit_effects) (request : commit_request) =
   effects.trace "event = commit_batch";
   effects.write_marker request.epoch_id "chaindata_begin";
   effects.chaos "after_chaindata_begin";
-  effects.commit_chaindata_batch ();
+  effects.commit_chaindata_batch Octra_core.Aux_delta.{
+    epoch = request.epoch_id; root = request.post_consensus_root; commit_id = request.commit_id};
   mark_chaindata_committed request.progress;
   effects.write_marker request.epoch_id "chaindata_committed";
   let history_status =
@@ -693,6 +690,7 @@ let run_commit_effects (effects : commit_effects) (request : commit_request) =
   effects.chaos "after_irmin_committed";
   effects.trace "event = tag_epoch";
   let* () = effects.tag_epoch request.epoch_id in
+  effects.sync_irmin ();
   let* irmin_commit_hash = effects.irmin_commit_hash () in
   let txlog_seg, txlog_off = effects.txlog_position () in
   let epochlog_off_now = effects.epochlog_offset () in
@@ -721,6 +719,7 @@ let run_commit_effects (effects : commit_effects) (request : commit_request) =
        ~commit_id:request.commit_id
        ~generation:request.epoch_id
        ~ts:(effects.now ()));
+  effects.retire_auxiliary new_head;
   effects.delete_wal request.epoch_id;
   effects.delete_pending_commits request.epoch_id;
   effects.clear_marker ();

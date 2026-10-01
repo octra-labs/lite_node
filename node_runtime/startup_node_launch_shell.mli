@@ -17,12 +17,12 @@ type deps = {
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
-  close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
 
 val run :
   ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
   ?bft_mode:bool ->
+  ?shutdown:(unit -> unit Lwt.t) ->
   deps ->
   unit

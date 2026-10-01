@@ -21,19 +21,23 @@ let ledger () =
   Ledger.create store
 
 let standard_tx () =
-  Transaction.{
-    from = "oct7xCozDD9JEsbeVpo5C7HXp2BJbKqfmNUHmDDCCTtWcGb";
+  let secret = Base64.encode_exn (String.make 32 '\001') in
+  let key = Mirage_crypto_ec.Ed25519.priv_of_octets (Base64.decode_exn secret) |> Result.get_ok in
+  let public = Mirage_crypto_ec.Ed25519.pub_of_priv key
+    |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn in
+  Transaction.sign_with_privkey Transaction.{
+    from = Octra_core.Crypto.Address.address_from_pubkey public;
     to_ = "oct5TWVJk7LZmzEeU73KAwd8HRuQjt2sdBiagm3rxcWDzYH";
     amount = Z.of_int 1;
     nonce = 1;
     ou = Z.of_int 1;
     timestamp = Unix.gettimeofday ();
     signature = "sig";
-    public_key = None;
+    public_key = Some public;
     message = None;
     op_type = Standard;
     encrypted_data = None;
-  }
+  } secret
 
 let runtime () =
   R.{
@@ -437,12 +441,12 @@ let test_delivery_retry () =
     let ordinary = {item with op_type = Standard; amount = Z.one} in
     head := 105L;
     expect "current duty keeps replacement fee rule" (Result.is_error (submit ordinary));
-    let tail = {ordinary with nonce = 2} in
-    expect "ordinary successor may wait" (Result.is_ok (submit tail));
+    let suffix = {ordinary with nonce = 2} in
+    expect "ordinary successor may wait" (Result.is_ok (submit suffix));
     head := 106L;
     expect "ordinary replaces expired duty at equal fee" (Result.is_ok (submit ordinary));
     expect "successor preserved after expiry"
-      (Staging.find_by_hash (Transaction.hash tail) = Some tail);
+      (Staging.find_by_hash (Transaction.hash suffix) = Some suffix);
     let selected = Staging.ready_epoch_txs ~accept:(fun _ -> true)
       ~capacity:(Z.of_int 1_000_000) ~confirmed_nonce:(fun _ -> Some 0) in
     expect "replacement restores contiguous prefix"
@@ -465,4 +469,4 @@ let () =
   test_duty_window ();
   test_duty_flood ();
   test_duty_peer_head ();
-  print_endline "node runtime rest facade tests passed"
+  print_endline "status = pass test = rest_accept"

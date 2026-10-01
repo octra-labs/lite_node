@@ -240,7 +240,8 @@ lib/core/set_fold.ml
 lib/core/set_fold.mli
 lib/core/startup_recovery.ml
 lib/core/state_preview.ml
-lib/core/storage.ml
+lib/core/drop_record.ml
+lib/core/drop_record.mli
 lib/core/store_chaindata.ml
 lib/core/store_irmin.ml
 lib/core/transaction.ml

@@ -686,7 +686,8 @@ let collect_ops () =
           expect (Lwt.state collected = Lwt.Return []) "unused collection is immediate";
         ignore (Lwt_main.run (Pool.await pool transaction));
         expect (Lwt_main.run collected = []) "invalid input has no artifact")
-        [T.StealthOp, false; T.ClaimOp, false; T.EncryptOp, true; T.DecryptOp, true])
+        [T.StealthOp, true; T.ClaimOp, true; T.EncryptOp, true; T.DecryptOp, true;
+         T.KeySwitch, false])
 
 let cache_key_mode_case () =
   let path, store, ledger, _, _ = setup "cache_key_mode" in
@@ -1021,8 +1022,8 @@ let switch_reuse () =
       expect (Lwt_main.run (L.hash ledger) = root) "switch preview changed base";
       expect (Lwt_main.run (L.get_pvac_pubkey ledger addr) = old_key) "switch preview changed key")
 
-let reuse_case decrypt =
-  let name = if decrypt then "decrypt_reuse" else "encrypt_reuse" in
+let reuse_case op =
+  let name = T.op_type_to_string op ^ "_reuse" in
   let path, store, ledger, pk, sk = setup name in
   Fun.protect
     ~finally:(fun () ->
@@ -1039,7 +1040,45 @@ let reuse_case decrypt =
       set_cipher source;
       let transaction = tx (payload pk sk true) in
       let transaction =
-        if not decrypt then transaction
+        if op = T.StealthOp || op = T.ClaimOp then
+          let delta = P.enc_value_seeded pk sk 10L (bytes '\002') in
+          let cipher = FB.encode_cipher delta in
+          let commitment = P.commit_ct pk delta |> Bytes.to_string |> Base64.encode_exn in
+          let fields = transaction.T.encrypted_data |> Option.get
+            |> Yojson.Safe.from_string |> Yojson.Safe.Util.to_assoc in
+          let amount_commitment = List.assoc "amount_commitment" fields in
+          let proof = List.assoc "zero_proof" fields in
+          let secret = String.make 32 '\011' in
+          let hex value = String.to_seq value |> Seq.map (fun c -> Printf.sprintf "%02x" (Char.code c))
+            |> List.of_seq |> String.concat "" in
+          let claim_pub = Octra_core.Crypto.StealthAddress.compute_claim_pub secret addr |> hex in
+          let fields = if op = T.StealthOp then
+            let current = P.enc_value_seeded pk sk 20L (bytes '\004') in
+            let remaining = P.ct_sub pk current delta in
+            let range ct blind = P.make_zero_proof_bound_range pk sk ct 10L blind
+              |> FB.encode_bound_range_proof in
+            ["delta_cipher", `String cipher; "commitment", `String commitment;
+             "range_proof_delta", `String (range delta (bytes '\007'));
+             "range_proof_balance", `String (range remaining (bytes '\010'));
+             "eph_pub", `String "eph"; "stealth_tag", `String (String.make 32 'a');
+             "enc_amount", `String "enc"; "claim_pub", `String claim_pub;
+             "amount_commitment", amount_commitment; "send_zero_proof", proof]
+          else
+            let output = Lwt_main.run (Octra_core.Ledger.create_stealth_output ledger
+              ~stealth_tag:(String.make 32 'a') ~eph_pub:"eph" ~enc_amount:"enc"
+              ~amount:Z.zero ~epoch_id:0 ~tx_hash:"proof-reuse-output"
+              ~sender_addr:addr ~claim_pub ~delta_cipher_stored:cipher
+              ~amount_hash:PL.key_bound_stealth_output_marker
+              ~amount_commitment:(Yojson.Safe.Util.to_string amount_commitment) ()) in
+            let id = match output with Ok id -> Int64.to_int id | Error e -> fail e in
+            ["output_id", `Int id; "claim_cipher", `String cipher;
+             "commitment", `String commitment; "claim_secret", `String (hex secret);
+             "zero_proof", proof]
+          in
+          { transaction with T.op_type = op; amount = Z.zero;
+            to_ = (if op = T.StealthOp then "stealth" else addr);
+            encrypted_data = Some (Yojson.Safe.to_string (`Assoc (("version", `Int 5) :: fields))) }
+        else if op = T.EncryptOp then transaction
         else
           let delta = P.enc_value_seeded pk sk 10L (bytes '\002') in
           let current = P.enc_value_seeded pk sk 20L (bytes '\004') in
@@ -1096,15 +1135,20 @@ let reuse_case decrypt =
       let prior = make_artifact false in
       let plan_hash = PL.hash_prepared prepared in
       let run ?math ?field_policy ?result_policy artifacts tx hash =
-        let receipt = receipt ledger tx hash in
-        expect (Octra_core.Ledger.begin_journal ledger = Ok ()) "journal start";
-        Fun.protect
-          ~finally:(fun () ->
-            expect (Octra_core.Ledger.abort_journal ledger = Ok ()) "journal end")
-          (fun () ->
-            let result = process ?math ~artifacts ?field_policy ?result_policy
+        let open Lwt.Syntax in
+        Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+        match Lwt_main.run (Octra_core.State_preview.with_state
+          ~base_store:store ~base_ledger:ledger ~epoch_id:1 ~proposal_id:name
+          (fun store ledger ->
+            let* receipt = receipt_lwt ledger tx hash in
+            let* result = process_lwt ?math ~artifacts ?field_policy ?result_policy
               Octra_core.Rule_graph.Active store ledger tx receipt in
-            result, Octra_core.Ledger.find_opt ledger addr)
+            let account = Octra_core.Ledger.find_opt ledger addr in
+            let* () = Octra_core.Ledger.flush_dirty_lwt ledger in
+            let* root = Octra_core.Ledger.hash ledger in
+            Lwt.return_ok (result, (account, root)))) with
+        | Ok result -> result
+        | Error reason -> fail reason
       in
       let timed f =
         let start = Mtime_clock.elapsed_ns () in
@@ -1134,25 +1178,29 @@ let reuse_case decrypt =
             (fst mismatch = Error ("preverify_transition_mismatch",
               "private transition does not match the certified receipt"))
             "reused plan receipt mismatch";
-          let needs_worker ?math ?field_policy ?result_policy entries tx =
-            let retried =
-              try ignore (run ?math ?field_policy ?result_policy entries tx plan_hash); false
-              with PL.Worker_retry _ -> true
+          let refuses_cache label ?math ?field_policy ?result_policy entries tx =
+            let check entries =
+              try
+                match run ?math ?field_policy ?result_policy entries tx plan_hash with
+                | Ok _, _ -> fail (label ^ " accepted without verification")
+                | Error error, account -> `Rejected (error, account)
+              with PL.Worker_retry _ -> `Retry
             in
-            expect retried "changed inputs require verification"
+            let expected = check [] in
+            expect (check entries = expected) (label ^ " differs from uncached check")
           in
-          needs_worker [] transaction;
-          needs_worker (entries transaction prior) transaction;
-          needs_worker ~math:true (entries transaction artifact) transaction;
-          needs_worker ~field_policy:PL.First_field
+          refuses_cache "missing" [] transaction;
+          refuses_cache "proof mode" (entries transaction prior) transaction;
+          refuses_cache "math" ~math:true (entries transaction artifact) transaction;
+          refuses_cache "fields" ~field_policy:PL.First_field
             (entries transaction artifact) transaction;
-          needs_worker ~result_policy:Octra_core.Private_result_policy.Legacy
+          refuses_cache "result policy" ~result_policy:Octra_core.Private_result_policy.Legacy
             (entries transaction artifact) transaction;
           let changed = { transaction with T.nonce = 2 } in
-          needs_worker (entries changed artifact) changed;
+          refuses_cache "transaction" (entries changed artifact) changed;
           set_cipher (FB.encode_cipher
             (P.enc_value_seeded pk sk 21L (bytes '\005')));
-          needs_worker (entries transaction artifact) transaction;
+          refuses_cache "cipher" (entries transaction artifact) transaction;
           set_cipher source;
           let other_pk, _ = P.keygen_from_seed (P.default_params ()) (bytes '\006') in
           let set_key key = Lwt_main.run
@@ -1162,7 +1210,7 @@ let reuse_case decrypt =
             ~finally:(fun () -> set_key pk)
             (fun () ->
               set_key other_pk;
-              needs_worker (entries transaction artifact) transaction)))
+              refuses_cache "key" (entries transaction artifact) transaction)))
 
 let valid_case () =
   let path, store, ledger, pk, sk = setup "valid" in
@@ -1640,9 +1688,15 @@ let () =
     valid_case ();
     print_endline "status = pass test = private_transition_receipt case = valid"
   | [_; "reuse"] ->
-    reuse_case false;
-    reuse_case true;
+    reuse_case T.EncryptOp;
+    reuse_case T.DecryptOp;
     print_endline "status = pass test = private_transition_receipt case = reuse"
+  | [_; "stealth_reuse"] ->
+    reuse_case T.StealthOp;
+    print_endline "status = pass test = private_transition_receipt case = stealth_reuse"
+  | [_; "claim_reuse"] ->
+    reuse_case T.ClaimOp;
+    print_endline "status = pass test = private_transition_receipt case = claim_reuse"
   | [_; "switch_reuse"] ->
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt case = switch_reuse"
@@ -1666,8 +1720,10 @@ let () =
     worker_retry_case ();
     circle_reject_case ();
     recovery_case ();
-    reuse_case false;
-    reuse_case true;
+    reuse_case T.EncryptOp;
+    reuse_case T.DecryptOp;
+    reuse_case T.StealthOp;
+    reuse_case T.ClaimOp;
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt"
-  | _ -> fail "expected collect, cache_key, migration, math, circle_policy, valid, reuse or switch_reuse"
+  | _ -> fail "expected collect, cache_key, migration, math, circle_policy, valid, reuse, stealth_reuse, claim_reuse or switch_reuse"

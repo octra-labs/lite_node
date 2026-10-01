@@ -394,7 +394,8 @@ let public_reads_hash snapshots =
   |> List.map Octra_core.Circle_wasm_public_read.yojson_of_snapshot
   |> fun values -> hash_json "octra:circle_public_reads:v1" (`List values)
 
-let hfhe_context_hash ~math ~strict caps pubkeys active_key =
+let hfhe_context_hash ?(float_mode=Octra_core.Rule_graph.Prior)
+    ~math ~strict caps pubkeys active_key =
   let caps =
     caps
     |> List.sort_uniq String.compare
@@ -427,7 +428,10 @@ let hfhe_context_hash ~math ~strict caps pubkeys active_key =
       "caps", `List caps;
       "pubkeys", `List pubkeys;
       "active_key", active_key;
-    ] @ if math then ["math", `Bool true] else []))
+    ] @ (if math then ["math", `Bool true] else [])
+      @ (if Octra_core.Circle_wasm_host.float_enabled float_mode
+         then ["wasm_float", `String Octra_core.Circle_wasm_host.float_id]
+         else [])))
 
 let hfhe_binding loaded circle_id public_reads_hash context_hash transcript = {
   circle_id;
@@ -932,7 +936,8 @@ let wasm_hfhe_pubkeys_of_runtime_ctx
             ~requested_addr
             ~active_relay
         then
-          match ctx.get_fhe_pubkey requested_addr with
+          match Option.bind (ctx.get_fhe_pubkey requested_addr)
+            (ContractVM.load_fhe_key ?memory:ctx.fhe_memory) with
           | Some pk ->
             let pubkey_b64 =
               Base64.encode_exn
@@ -1002,6 +1007,7 @@ let execute_wasm_view
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1022,6 +1028,7 @@ let execute_wasm_view
       ~hfhe_active_key
       ~hfhe_strict
       ~math
+      ~float_mode
       ~hfhe_mode
       ~public_reads
       ~fuel_limit:(wasm_fuel_limit fuel_limit)
@@ -1030,6 +1037,7 @@ let execute_wasm_view
   | Circle_program.Compute ->
     Octra_core.Circle_wasm_host.execute_compute
       ~math
+      ~float_mode
       ~code_b64
       ~export_name
       ~request_bytes
@@ -1100,7 +1108,8 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
     end;
     Lwt.return receipt in
   let* loaded_result =
-    Circle_program.load ~trusted ~point_ops:ctx.point_ops store circle_id in
+    Circle_program.load ~trusted ~point_ops:ctx.point_ops
+      ~float_mode:ctx.wasm_float store circle_id in
   timing_mark "load_program";
   match loaded_result with
   | Error e ->
@@ -1154,7 +1163,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                   | Ok (fixed, state) ->
                     state.ContractVM.is_view <- true;
                     let* receipt =
-                      Lwt_preemptive.detach
+                      Octra_core.Exec_resource.detach
                         (fun () ->
                           Contract.run_fixed_from_dispatcher ?running state fixed)
                         ()
@@ -1236,6 +1245,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                             ~hfhe_pubkeys
                             ~hfhe_active_key
                             ~math:runtime_hfhe.exec_ctx.math
+                            ~float_mode:runtime_hfhe.exec_ctx.wasm_float
                             ~hfhe_strict:true
                             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
                             ~public_reads:public_reads.snapshots
@@ -1433,7 +1443,8 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
     store circle_id method_name params caller value =
   let* loaded_result =
     Circle_program.load
-      ~trusted ~point_ops:ctx.point_ops ~manifest_profile store circle_id in
+      ~trusted ~point_ops:ctx.point_ops ~manifest_profile
+      ~float_mode:ctx.wasm_float store circle_id in
   match loaded_result with
   | Error (Octra_core.Circle_wasm_host.Rejected e) ->
     Lwt.return (failed_call_result e)
@@ -1494,7 +1505,7 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                   | Error error -> Lwt.return (failed_call_result error)
                   | Ok (fixed, state) ->
                     let* receipt =
-                      Lwt_preemptive.detach
+                      Octra_core.Exec_resource.detach
                         (fun () ->
                           Contract.run_fixed_from_dispatcher state fixed)
                         ()
@@ -1513,7 +1524,8 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                           loaded
                           circle_id
                           (public_reads_hash [])
-                          (hfhe_context_hash ~math:ctx.math ~strict:hfhe_strict [] [] None)
+                          (hfhe_context_hash ~float_mode:ctx.wasm_float
+                             ~math:ctx.math ~strict:hfhe_strict [] [] None)
                           [];
                     }
                 end
@@ -1575,6 +1587,7 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                           let* wasm_result =
                             Octra_core.Circle_wasm_host.execute
                               ~math:runtime_hfhe.exec_ctx.math
+                              ~float_mode:runtime_hfhe.exec_ctx.wasm_float
                               ~code_b64:wasm.code_b64
                               ~export_name:"octra_update"
                               ~request_bytes
@@ -1639,6 +1652,7 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                                       circle_id
                                       (public_reads_hash public_reads.snapshots)
                                       (hfhe_context_hash ~math:ctx.math
+                                         ~float_mode:ctx.wasm_float
                                          ~strict:hfhe_strict
                                          hfhe_caps
                                          hfhe_pubkeys
@@ -1695,6 +1709,7 @@ let list_storage_page store circle_id ~limit =
 
 let commit_call_result
     ?(deployment_profile = Octra_core.Circle_wasm_host.Standard)
+    ?(float_mode = Octra_core.Rule_graph.Prior)
     ~proof_mode
     store
     circle_id
@@ -1753,6 +1768,7 @@ let commit_call_result
                 let* checked =
                   Octra_core.Circle_deploy.check_available
                     ~execution_profile:deployment_profile
+                    ~float_mode
                     store
                     src
                     payload in

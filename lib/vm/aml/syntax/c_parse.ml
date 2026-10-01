@@ -171,39 +171,39 @@ let top_mark state =
   | value :: _ -> value
   | [] -> None
 
-let rec mark_term at term tail =
+let rec mark_term at term remainder =
   match term with
   | C_syn.KUnit | C_syn.KBool _ | C_syn.KInt _ | C_syn.KBytes _
-  | C_syn.Var _ -> at :: tail
+  | C_syn.Var _ -> at :: remainder
   | C_syn.KVec (_, values) | C_syn.KSeq (_, _, values) ->
-      mark_terms at values (at :: tail)
+      mark_terms at values (at :: remainder)
   | C_syn.Let (_, value, body) | C_syn.Unpair (value, _, _, body) ->
-      mark_term at value (mark_term at body (at :: tail))
+      mark_term at value (mark_term at body (at :: remainder))
   | C_syn.If (guard, yes, no) ->
       mark_term at guard
-        (mark_term at yes (mark_term at no (at :: tail)))
+        (mark_term at yes (mark_term at no (at :: remainder)))
   | C_syn.Pair (left, right) | C_syn.Add (left, right)
   | C_syn.Sub (left, right) | C_syn.Mul (left, right)
   | C_syn.Div (left, right) | C_syn.Mod (left, right)
   | C_syn.Eq (_, left, right) | C_syn.Cmp (_, left, right)
   | C_syn.Cat (left, right)
   | C_syn.Vcat (left, right) | C_syn.Step (left, right) ->
-      mark_term at left (mark_term at right (at :: tail))
+      mark_term at left (mark_term at right (at :: remainder))
   | C_syn.Fst value | C_syn.Snd value | C_syn.Inl (value, _)
   | C_syn.Inr (_, value) | C_syn.Act (_, value) | C_syn.Neg value
   | C_syn.Abs value | C_syn.Fit (_, value) | C_syn.Wide value
   | C_syn.Length value | C_syn.Take (_, value)
   | C_syn.Drop (_, value) | C_syn.At (_, value) | C_syn.Uncons value
-  | C_syn.Close value -> mark_term at value (at :: tail)
+  | C_syn.Close value -> mark_term at value (at :: remainder)
   | C_syn.Case (value, _, yes, _, no) ->
       mark_term at value
-        (mark_term at yes (mark_term at no (at :: tail)))
+        (mark_term at yes (mark_term at no (at :: remainder)))
   | C_syn.Vfold (vector, seed, fold) ->
       mark_term at vector
-        (mark_term at seed (mark_term at fold.C_syn.body (at :: tail)))
+        (mark_term at seed (mark_term at fold.C_syn.body (at :: remainder)))
 
-and mark_terms at terms tail =
-  List.fold_left (fun out term -> mark_term at term out) tail (List.rev terms)
+and mark_terms at terms remainder =
+  List.fold_left (fun out term -> mark_term at term out) remainder (List.rev terms)
 
 type origin = {
   term : C_syn.t;
@@ -240,8 +240,8 @@ let take_origin term parent origins =
           match item.spans with
           | [] -> parent, List.rev_append out (item :: rest)
           | [at] -> at, List.rev_append out (item :: rest)
-          | at :: tail ->
-              let next = { item with spans = tail @ [at] } in
+          | at :: remainder ->
+              let next = { item with spans = remainder @ [at] } in
               at, List.rev_append out (next :: rest)
         end
     | item :: rest -> walk (item :: out) rest
@@ -2287,15 +2287,15 @@ let lower_base (program : t) =
         | Error error -> Error { cause = Fun error; span = program.body_span }
       end
 
-let rec term_order term tail =
+let rec term_order term remainder =
   match term with
   | C_term.Unit | C_term.Bool _ | C_term.Int _ | C_term.Narrow _
   | C_term.Bytes _
-  | C_term.Var _ -> term :: tail
+  | C_term.Var _ -> term :: remainder
   | C_term.Vec (_, values) | C_term.Seq (_, _, values) ->
     List.fold_left
       (fun out value -> term_order value out)
-      (term :: tail) (List.rev values)
+      (term :: remainder) (List.rev values)
   | C_term.Let (_, value, body)
   | C_term.Unpair (value, _, _, body)
   | C_term.Pair (value, body)
@@ -2309,22 +2309,22 @@ let rec term_order term tail =
   | C_term.Cat (value, body)
   | C_term.Vcat (value, body)
   | C_term.Step (value, body) ->
-    term_order value (term_order body (term :: tail))
+    term_order value (term_order body (term :: remainder))
   | C_term.If (guard, yes, no) ->
     term_order guard
-      (term_order yes (term_order no (term :: tail)))
+      (term_order yes (term_order no (term :: remainder)))
   | C_term.Fst value | C_term.Snd value | C_term.Inl (value, _)
   | C_term.Inr (_, value) | C_term.Act (_, value) | C_term.Neg value
   | C_term.Abs value | C_term.Fit (_, value) | C_term.Wide value
   | C_term.Length value | C_term.Take (_, value) | C_term.Drop (_, value)
   | C_term.At (_, value) | C_term.Uncons value | C_term.Close value ->
-    term_order value (term :: tail)
+    term_order value (term :: remainder)
   | C_term.Case (value, _, yes, _, no) ->
     term_order value
-      (term_order yes (term_order no (term :: tail)))
+      (term_order yes (term_order no (term :: remainder)))
   | C_term.Vfold (vector, seed, fold) ->
     term_order vector
-      (term_order seed (term_order fold.body (term :: tail)))
+      (term_order seed (term_order fold.body (term :: remainder)))
 
 let marked_failure_span default marks term failure =
   match failure.C_check.term with

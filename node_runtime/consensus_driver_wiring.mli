@@ -357,10 +357,12 @@ val node_proposal_preview :
   (Octra_core.Epoch_exec.exec_result, string) result Lwt.t
 
 val config :
+  ?private_slots:Octra_core.Private_slots.limits ->
   deps ->
   Octra_consensus.C_driver.config
 
 val config_with_standard :
+  ?private_slots:Octra_core.Private_slots.limits ->
   config_with_standard_input ->
   Octra_consensus.C_driver.config
 

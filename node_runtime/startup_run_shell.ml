@@ -65,7 +65,6 @@ type node_launch_runtime = {
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
-  close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
 
@@ -166,36 +165,47 @@ let default_join_log =
     warn = Octra_log.warn "init" "%s";
   }
 
-let run_join ~log ~tasks ~close_chaindata ~exit_fatal =
+let exit_fatal () = Unix._exit 1
+
+let exit_store store () =
+  match Octra_core.Store_irmin.Store.Gc.cancel store.Octra_core.Store_irmin.repo with
+  | _ -> exit_fatal ()
+  | exception _ -> exit_fatal ()
+
+let require_sync ~data_dir ~chain ~store need =
+  let status, stored = match Sync_mark.write ~data_dir ~chain need with
+    | Ok Sync_mark.Stored -> "stored", need
+    | Ok (Sync_mark.Present prior) -> "present", prior
+    | Error reason ->
+      Log.fatal "consensus" "event = sync_recovery status = rejected reason = %s" reason;
+      exit_store store () in
+  Log.fatal "consensus"
+    "event = sync_recovery status = %s cause = %s epoch = %d head = %d action = exit"
+    status (Sync_need.label stored.Sync_need.cause) stored.epoch stored.head;
+  exit_store store ()
+
+let run_join ~log ~tasks ~exit_fatal =
   Lwt.catch
     (fun () -> Lwt.pick tasks)
     (fun e ->
       log.fatal
         (Printf.sprintf "event = lwt_main_failed reason = %s"
            (Printexc.to_string e));
-      (try close_chaindata ()
-       with close_error ->
-         log.warn
-           (Printf.sprintf "event = chaindata_close_failed reason = %s"
-              (Printexc.to_string close_error)));
-      log.warn "event = irmin_close_skipped reason = lwt_main_unwinding";
+      log.warn "event = store_ownership_retained reason = fatal_exit";
       exit_fatal ();
       Lwt.return_unit)
 
-let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~close_chaindata
-    ~exit_fatal =
+let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~exit_fatal =
   run_join
     ~log:default_join_log
     ~tasks:(launch_tasks deps)
-    ~close_chaindata
     ~exit_fatal
 
-let run_node_launch_tasks ?duty_head ?bft_mode (deps : node_launch_deps) ~close_chaindata
+let run_node_launch_tasks ?duty_head ?bft_mode (deps : node_launch_deps)
     ~exit_fatal =
   run_join
     ~log:default_join_log
     ~tasks:(node_launch_tasks ?duty_head ?bft_mode deps)
-    ~close_chaindata
     ~exit_fatal
 
 let run_node_runtime ?duty_head ?bft_mode (runtime : node_launch_runtime) =
@@ -218,5 +228,4 @@ let run_node_runtime ?duty_head ?bft_mode (runtime : node_launch_runtime) =
        ~max_drift:runtime.max_drift
        ~driver_ref:runtime.driver_ref
        ~resource_compute:runtime.resource_compute)
-    ~close_chaindata:runtime.close_chaindata
     ~exit_fatal:runtime.exit_fatal

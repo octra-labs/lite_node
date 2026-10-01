@@ -159,6 +159,16 @@ let persist_available_bundle (deps : deps) finalize proposal_id =
   | None ->
     false
 
+let check_cached_bundle (deps : deps) finalize =
+  let proposal_id = C_hash.proposal_id finalize.C_types.header in
+  match deps.cached_bundle_data ~proposal_id with
+  | None -> ()
+  | Some (hashes, txs, receipts) ->
+    match Consensus_finality_journal.validate_bundle finalize
+            (journal_bundle hashes txs receipts) with
+    | Ok () -> ()
+    | Error reason -> failwith reason
+
 let rec await_bundle (deps : deps) header proposal_id delay remaining quarantined =
   let open Lwt.Syntax in
   let* state =
@@ -195,6 +205,7 @@ let rec await_bundle (deps : deps) header proposal_id delay remaining quarantine
 
 let run (deps : deps) ~validator_set finalize =
   let open Lwt.Syntax in
+  check_cached_bundle deps finalize;
   deps.check_finality finalize;
   let finalize = deps.persist_finality_certificate ~validator_set finalize in
   deps.store_proposer finalize;
@@ -220,6 +231,7 @@ let run (deps : deps) ~validator_set finalize =
       (max 0.001 deps.bundle_wait_timeout_seconds)
       false
   in
+  check_cached_bundle deps finalize;
   if
     not bundle_persisted
     && not (persist_available_bundle deps finalize proposal_id)

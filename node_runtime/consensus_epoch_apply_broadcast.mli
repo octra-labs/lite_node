@@ -12,7 +12,7 @@ type message = {
 type log_view = {
   epoch_id : int;
   root_head : string;
-  root_tail : string;
+  root_suffix : string;
 }
 
 val frame_type : int
@@ -24,7 +24,7 @@ val message :
   txs_serialized:string list ->
   message
 val root_head : string -> string
-val root_tail : string -> string
+val root_suffix : string -> string
 val payload : message -> string
 val frame : message -> Octra_net.P2p_frame.frame
 val log_view : message -> log_view

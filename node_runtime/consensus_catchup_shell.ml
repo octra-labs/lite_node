@@ -695,6 +695,10 @@ let cached_apply_point (source : apply_point_source) =
 
 let validate_record ~chain_id ~expected_validator_set_hash ~prev_eic
     ~start_txid ~head_before_record record =
+  if record.Octra_consensus.C_codec.epoch_id < 0L
+     || record.epoch_id >= Int64.of_int max_int then
+    Error "catchup epoch is out of range"
+  else
   match parse_record_txs record with
   | Error e -> Error e
   | Ok parsed_txs ->
@@ -718,6 +722,10 @@ let validate_record ~chain_id ~expected_validator_set_hash ~prev_eic
               e
           )
         | Ok partition ->
+        match Octra_core.Tx_envelope.check_outcome ~chain_id
+                ~epoch:record.epoch_id ~receipts:record.receipts_json parsed_txs with
+        | Error error -> Error ("catchup transaction envelope: " ^ error)
+        | Ok () ->
         match Octra_core.Preverify_receipt_policy.check
                 ~epoch_id:(Int64.to_int record.epoch_id)
                 ~receipts:partition.preverify

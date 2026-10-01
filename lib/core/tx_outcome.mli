@@ -22,7 +22,7 @@ val parse : string -> (item, string) result
 val split : string list -> (partition, string) result
 val split_admit : string list -> (partition, string) result
 val build :
-  candidates:Transaction.t list ->
+  inputs:Transaction.t list ->
   (Transaction.t * string * string) list ->
   (rejection list, string) result
 val merge :

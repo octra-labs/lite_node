@@ -20,22 +20,27 @@ inline std::vector<int> prg_choose_k(
     int k,
     int N,
     const char * label,
-    const std::vector<uint64_t> & words
+    const std::vector<uint64_t> & words,
+    size_t draw_factor = 0
 ) {
     if (k < 0 || N < 0)
         throw std::runtime_error("pvac: unique sample negative domain rejected");
     if (k > N)
         throw std::runtime_error("pvac: unique sample exceeds domain");
+    if (draw_factor && static_cast<size_t>(k) > SIZE_MAX / draw_factor)
+        throw std::runtime_error("pvac: sampling effort overflow");
 
     struct Ctr {
         const char * L;
-        std::vector<uint64_t>   w;
+        std::vector<uint64_t> w;
         uint64_t ctr;
         uint8_t buf[32];
         int idx;
+        bool capped;
+        size_t remaining;
 
-        Ctr(const char * lab, const std::vector<uint64_t> & ww)
-            : L(lab), w(ww), ctr(0), idx(32) {}
+        Ctr(const char * lab, const std::vector<uint64_t> & ww, size_t factor, size_t count)
+            : L(lab), w(ww), ctr(0), idx(32), capped(factor != 0), remaining(factor * count) {}
 
         void refill() {
             uint8_t out[32];
@@ -60,6 +65,11 @@ inline std::vector<int> prg_choose_k(
         }
 
         uint64_t rnd() {
+            if (capped) {
+                if (remaining == 0)
+                    throw std::runtime_error("pvac: sampling effort exhausted");
+                --remaining;
+            }
             if (idx >= 32) {
                 refill();
             }
@@ -82,7 +92,7 @@ inline std::vector<int> prg_choose_k(
                 }
             }
         }
-    } rng(label, words);
+    } rng(label, words, draw_factor, static_cast<size_t>(k));
 
     std::unordered_set<int> used;
     used.reserve((size_t)k * 2 + 1);
@@ -303,7 +313,8 @@ inline BitVec sigma_from_H(
     Nonce128 nonce,
     uint16_t idx,
     uint8_t ch,
-    uint64_t salt
+    uint64_t salt,
+    size_t draw_factor = 0
 ) {
     int m = pk.prm.m_bits;
     int n = pk.prm.n_bits;
@@ -320,14 +331,14 @@ inline BitVec sigma_from_H(
         salt
     };
 
-    auto cols = prg_choose_k(pk.prm.x_col_wt, n, Dom::X_SEED, words);
+    auto cols = prg_choose_k(pk.prm.x_col_wt, n, Dom::X_SEED, words, draw_factor);
 
     for (int c : cols) {
         s.xor_with(pk.H[c]);
     }
 
     int noise_wt = mixed_weight(pk.prm.err_wt, m, "pvac.noise.weight", words);
-    auto noise = prg_choose_k(noise_wt, m, Dom::NOISE, words);
+    auto noise = prg_choose_k(noise_wt, m, Dom::NOISE, words, draw_factor);
 
     for (int r : noise) {
         s.w[(size_t)r >> 6] ^= (1ull << (r & 63));

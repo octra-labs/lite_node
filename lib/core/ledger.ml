@@ -332,7 +332,7 @@ let update_enc_balance l addr cipher =
   Ok ()
 
 let create_private_transfer _l ~from_addr:_ ~to_addr:_ ~amount:_ ~from_priv:_ =
-  Error "PrivateOp V1 is disabled — use StealthOp V5"
+  Error "PrivateOp V1 is disabled; use StealthOp V5"
 
 let collect_rows _st _ncols = []
 

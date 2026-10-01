@@ -731,7 +731,7 @@ let run_slashing store =
     |> Registry.of_string
     |> expect_ok "slashed registry"
   in
-  expect "slashed candidate removed"
+  expect "slashed validator removed"
     (Registry.find offender.address registry = None);
   expect "slash evidence persisted"
     (List.length (Registry.slashes registry) = 1);
@@ -1239,4 +1239,4 @@ let () =
        ~epoch_id:65);
   with_store run_slashing;
   with_store run_slash_rollback;
-  print_endline "validator lifecycle tests passed"
+  print_endline "status = pass test = validator_lifecycle"

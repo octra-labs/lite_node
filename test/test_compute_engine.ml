@@ -6,7 +6,7 @@ module Engine = Octra_node_runtime.Resource_compute_provider_engine
 module Rpc = Octra_node_runtime.Resource_compute_provider_rpc
 
 let fail message =
-  failwith ("test_resource_compute_provider_engine: " ^ message)
+  failwith ("test_compute_engine: " ^ message)
 
 let hash char =
   String.make 64 char
@@ -195,4 +195,4 @@ let () =
   test_unprepared ();
   test_wrong_executor ();
   test_snapshot_alias ();
-  print_endline "test_resource_compute_provider_engine: ok"
+  print_endline "status = pass test = resource_provider"

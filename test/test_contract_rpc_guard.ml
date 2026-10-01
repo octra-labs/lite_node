@@ -195,6 +195,129 @@ let test_view_steps () =
   if result.success || not state.reverted || !count <> 9 then
     fail "view step stop missing"
 
+let test_source_paths () =
+  let main = "My-Program.aml" in
+  let interface_path = "interfaces/Chosen-Reader.aml" in
+  let source =
+    "import Reader from \"interfaces/Chosen-Reader.aml\"\n"
+    ^ "program Verify implements Reader { view fn value(): int { return 7 } }"
+  in
+  let interface = "interface Reader { fn value(): int }" in
+  let sources = Octra_vm.Program_package.[
+    {path = main; body = source};
+    {path = interface_path; body = interface};
+  ] in
+  let files = List.map (fun (file : Octra_vm.Program_package.source) ->
+    `Assoc ["path", `String file.path; "source", `String file.body]) sources in
+  let owner = "oct" ^ String.make 44 '1' in
+  let check compiler version =
+  let compiled =
+    match Octra_vm.Program_package.compile_with ~compiler ~point_ops:true ~main ~sources with
+    | Ok value -> value
+    | Error error -> fail (Octra_vm.Program_package.error_message error)
+  in
+  if not (String.equal compiled.result.version version) then
+    fail "Program compiler version differs";
+  let certificate = Yojson.Safe.from_string compiled.result.certificate_json in
+  if Yojson.Safe.Util.member "compiler_version" certificate <> `String version then
+    fail "Program certificate compiler version differs";
+  let code_hash = Digestif.SHA256.(digest_string compiled.envelope |> to_hex) in
+  with_store (fun store ->
+    let package =
+      match Octra_vm.Program_package.admit_base64 ~compiler ~point_ops:true
+        (Base64.encode_exn compiled.package) with
+      | Ok value -> value
+      | Error error -> fail (Octra_vm.Program_package.error_message error)
+    in
+    let journal = Octra_vm.Program_journal.create () in
+    let ctx = Octra_vm.Contract_vm.{default_ctx with point_ops = true} in
+    let address, result = Octra_vm.Contract.deploy ~journal ~admitted:package.program
+      ~ctx store owner "CUSTOM" [||] compiled.envelope 0 in
+    if not result.success then fail "Program constructor failed";
+    if Lwt_main.run (Octra_core.Store_irmin.contract_exists store address) then
+      fail "Program persisted before staging";
+    Octra_vm.Program_store.stage store journal;
+    begin match Lwt_main.run (Octra_core.Store_irmin.get_contract_info store address) with
+    | Some (_, _, stored_version, _) when String.equal stored_version version -> ()
+    | _ -> fail "Program persisted compiler version differs"
+    end;
+    begin match Lwt_main.run (Octra_core.Store_irmin.get_contract_abi store address) with
+    | Some abi when Yojson.Safe.Util.member "version" (Yojson.Safe.from_string abi)
+        = `String version -> ()
+    | _ -> fail "Program ABI compiler version differs"
+    end;
+    let ledger = Octra_core.Ledger.create store in
+    begin match Lwt_main.run (Octra_vm.Contract_rpc.program_info ~store ~ledger ~addr:address) with
+    | Ok json when Yojson.Safe.Util.member "version" json = `String version -> ()
+    | _ -> fail "Program RPC compiler version differs"
+    end;
+    let call = Octra_vm.Contract.execute_call ~journal ~ctx store address "value" [] owner Z.zero in
+    if not call.success || call.return_value <> Some (Octra_vm.Contract_vm.VInt (Z.of_int 7)) then
+      fail "Multi-file Program execution differs";
+    with_chaindata (fun chaindata ->
+      let verify main files =
+        Lwt_main.run (Octra_vm.Contract_rpc.verify_params ~store ~chaindata
+          (`List [`String address; `Assoc ["main", main; "files", `List files]]))
+      in
+      let read () = Lwt_main.run (Octra_vm.Contract_rpc.source
+        ~store ~chaindata ~addr:address) in
+      let expect_error result =
+        match result with
+        | Error _ -> ()
+        | Ok _ -> fail "different source package was accepted"
+      in
+      expect_error (Lwt_main.run (Octra_vm.Contract_rpc.verify ~store ~chaindata
+        ~addr:address ~source ~files_json:(Some [List.nth files 1])));
+      begin
+        match verify (`String main) files with
+        | Ok (`Assoc fields)
+          when List.assoc_opt "verified" fields = Some (`Bool true)
+            && List.assoc_opt "published" fields = Some (`Bool true)
+            && List.assoc_opt "code_hash" fields = Some (`String code_hash)
+            && List.mem_assoc "verification" fields
+            && List.mem_assoc "certificate" fields -> ()
+        | Ok _ -> fail "named source verification was not published"
+        | Error error -> fail ("named source verification: " ^ error.Octra_core.Rpc.message)
+      end;
+      let published = read () in
+      begin
+        match published with
+        | Ok (`Assoc fields)
+          when List.assoc_opt "source" fields = Some (`String source)
+            && List.assoc_opt "main" fields = Some (`String main) ->
+          begin
+            match List.assoc_opt "files" fields with
+            | Some (`Assoc published_files)
+              when List.sort compare published_files = List.sort compare
+                [main, `String source; interface_path, `String interface] -> ()
+            | _ -> fail "published source file names differ"
+          end
+        | _ -> fail "named source read differs"
+      end;
+      begin
+        match verify (`String main) (List.rev files) with
+        | Ok _ when read () = published -> ()
+        | Ok _ -> fail "source order changed published record"
+        | Error error -> fail error.Octra_core.Rpc.message
+      end;
+      List.iter (fun path ->
+        expect_error (verify (`String path) files))
+        [""; "missing.aml"; "/My-Program.aml"; "../My-Program.aml"];
+      expect_error (verify (`Int 7) files);
+      expect_error (verify (`String main) (files @ [List.hd files]));
+      expect_error (verify (`String main)
+        [`Assoc ["path", `String main; "source", `Int 7]; List.nth files 1]);
+      expect_error (verify (`String main)
+        (`Assoc ["path", `String main; "source", `String (source ^ "\n")]
+          :: List.tl files));
+      expect_error (verify (`String main)
+        (files @ [`Assoc ["path", `String "unused.aml"; "source", `String ""]]));
+      if read () <> published then fail "refused source changed published record"))
+  in
+  check Octra_vm.Program_package.Protocol "1.0 Rehovot";
+  check Octra_vm.Program_package.Source "1.0 Rehovot";
+  check Octra_vm.Program_package.Preview "2.0 AML-preview"
+
 let test_source_program_verify () =
   with_store (fun store ->
     let source =
@@ -282,7 +405,9 @@ let test_source_program_verify () =
         (Octra_vm.Contract_rpc.call
            ~trusted:[]
            ~profile:{epoch = 0; math = false; point_ops = false;
-                     object_cost = false; int_work = Octra_vm.Int_work.Active}
+                     object_cost = false; int_work = Octra_vm.Int_work.Active;
+                     fhe_work = Octra_core.Rule_graph.Prior;
+                     wasm_float = Octra_core.Rule_graph.Prior}
            ~store
            ~ledger
            ~get_fhe_pubkey:(fun _ -> None)
@@ -295,6 +420,57 @@ let test_source_program_verify () =
     with
     | Ok _ -> ()
     | Error error -> fail error.Octra_core.Rpc.message)
+
+let test_balance_dispatch () =
+  with_store (fun store ->
+    let module V = Octra_vm in
+    let address = "oct" ^ String.make 44 '2' in
+    let holder = "oct" ^ String.make 44 '1' in
+    let ledger = Octra_core.Ledger.create store in
+    let read method_name params =
+      Lwt_main.run (V.Contract_rpc.call ~trusted:[]
+        ~profile:{epoch = 0; math = false; point_ops = true;
+          object_cost = false; int_work = V.Int_work.Active;
+          fhe_work = Octra_core.Rule_graph.Prior;
+          wasm_float = Octra_core.Rule_graph.Prior}
+        ~store ~ledger ~get_fhe_pubkey:(fun _ -> None)
+        ~storage_json:(fun pairs -> `Assoc (List.map (fun (k, v) -> k, `String v) pairs))
+        ~addr:address ~method_name ~call_params:params ~caller_addr:holder
+        ~include_storage:false) in
+    if Result.is_ok (read "balance_of" [`String holder]) then
+      fail "balance_of fabricated a missing Program";
+    let source = {|
+program Balance {
+  state { balances: map[address]int }
+  fn balance_of(holder: address): int { return self.balances[holder] + 7 }
+  fn read(holder: address): int { return self.balances[holder] + 7 }
+}
+|} in
+    let compiled = match V.Program_package.compile_with
+        ~compiler:V.Program_package.Source ~point_ops:true ~main:"main.aml"
+        ~sources:[V.Program_package.{path = "main.aml"; body = source}] with
+      | Ok value -> value
+      | Error error -> fail (V.Program_package.error_message error) in
+    let hash = Digestif.SHA256.(digest_string compiled.envelope |> to_hex) in
+    ignore (Lwt_main.run (Octra_core.Store_irmin.deploy_contract store
+      ~address ~code_hash:hash ~version:"1" ~owner:holder ~ctype:"CUSTOM"
+      ~admission:"source" ~bytecode_b64:(Base64.encode_exn compiled.envelope)));
+    let storage = Hashtbl.create 2 in
+    Hashtbl.replace storage ("@aml/map/balances/47#" ^ holder) "41";
+    Hashtbl.replace storage ("balances:" ^ holder) "999";
+    Lwt_main.run (Octra_core.Store_irmin.save_contract_storage store address storage);
+    let expected = read "read" [`String holder] in
+    begin match expected with
+    | Ok (`Assoc fields) when List.assoc_opt "result" fields = Some (`String "48") -> ()
+    | Error error -> fail error.Octra_core.Rpc.message
+    | Ok json -> fail ("AML map control differs: " ^ Yojson.Safe.to_string json)
+    end;
+    if read "balance_of" [`String holder] <> expected then
+      fail "balance_of skipped Program execution";
+    if Result.is_ok (read "balance_of" []) then
+      fail "balance_of ignored arity";
+    if Result.is_ok (read "missing" [`String holder]) then
+      fail "missing method accepted")
 
 let token_address digit =
   "oct" ^ String.make 44 digit
@@ -493,10 +669,12 @@ let test_nested_view_stop () =
     let run running =
       let ctx = Octra_vm.Contract_rpc.make_view_ctx ~trusted:[] ~running ~store ~ledger
         ~profile:{epoch = 0; math = false; point_ops = false;
-                  object_cost = false; int_work = Octra_vm.Int_work.Active}
+                  object_cost = false; int_work = Octra_vm.Int_work.Active;
+                  fhe_work = Octra_core.Rule_graph.Prior;
+                  wasm_float = Octra_core.Rule_graph.Prior}
         ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
-        (fun () -> ctx.call_contract address address "echo" [] 0) ())
+        (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory}) ())
     in
     begin match run (fun () -> true) with
     | Ok value when value.Octra_vm.Contract_vm.return_value = Octra_vm.Contract_vm.VInt (Z.of_int 7) -> ()
@@ -558,7 +736,9 @@ let test_view_release_keys () =
       ~bytecode_b64:(Base64.encode_exn raw));
     let ledger = Octra_core.Ledger.create store in
     let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = true;
-      object_cost = false; int_work = V.Int_work.Active} in
+      object_cost = false; int_work = V.Int_work.Active;
+      fhe_work = Octra_core.Rule_graph.Prior;
+      wasm_float = Octra_core.Rule_graph.Prior} in
     let read trusted =
       V.Contract_rpc.call_params ~trusted ~profile ~store ~ledger
         ~get_fhe_pubkey:(fun _ -> None) ~storage_json:(fun _ -> `Assoc [])
@@ -567,7 +747,7 @@ let test_view_release_keys () =
       let ctx = V.Contract_rpc.make_view_ctx ~trusted ~profile ~store ~ledger
         ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
-        (fun () -> ctx.call_contract address address "echo" [] 0) ()) in
+        (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory}) ()) in
     with_chaindata (fun chaindata ->
       let abi ?(point_ops = true) trusted = Lwt_main.run
         (V.Contract_rpc.abi_params ~trusted ~point_ops ~store ~chaindata
@@ -614,8 +794,10 @@ let () =
   test_view_steps ();
   test_nested_view_stop ();
   test_source_program_verify ();
+  test_source_paths ();
+  test_balance_dispatch ();
   test_token_value_policy ();
   test_token_page_policy ();
   test_token_actor_limits ();
   test_token_actor_overload ();
-  print_endline "test_contract_rpc_guard: ok"
+  print_endline "status = pass test = program_rpc"

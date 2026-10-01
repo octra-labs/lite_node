@@ -245,6 +245,7 @@ let native_execute ~model ~program ~storage (request : Provider_rpc.execute) =
       | Ok request_bytes ->
         let* result =
           Octra_core.Circle_wasm_host.execute_compute_isolated_with_storage
+            ~float_mode:Octra_core.Rule_graph.Prior
             ~math:false
             ~compute_session_scope:(session_scope request)
             ~compute_storage_cache_key:(Some model.cache_key)

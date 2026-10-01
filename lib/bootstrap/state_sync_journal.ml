@@ -129,7 +129,7 @@ let parse_line line =
         Error "invalid journal entry kind"
     | _ -> Error "journal entry must be an object"
 
-let repair_tail path meta cut =
+let repair_suffix path meta cut =
   protect (fun () ->
     let same found =
       found.Unix.st_kind = Unix.S_REG
@@ -138,13 +138,13 @@ let repair_tail path meta cut =
       && found.st_ctime = meta.st_ctime
     in
     if cut < 0 || cut > meta.Unix.st_size || not (same (Unix.lstat path)) then
-      invalid_arg "journal changed before tail repair";
+      invalid_arg "journal changed before suffix repair";
     let descriptor = Unix.openfile path [Unix.O_WRONLY] 0 in
     Fun.protect
       ~finally:(fun () -> Unix.close descriptor)
       (fun () ->
         if not (same (Unix.fstat descriptor)) then
-          invalid_arg "journal changed during tail repair";
+          invalid_arg "journal changed during suffix repair";
         if cut < meta.st_size then Unix.ftruncate descriptor cut
         else begin
           ignore (Unix.lseek descriptor 0 Unix.SEEK_END);
@@ -211,7 +211,7 @@ let open_journal ~path ~manifest_hash =
               let* () =
                 match repair with
                 | None -> Ok ()
-                | Some cut -> repair_tail path meta cut
+                | Some cut -> repair_suffix path meta cut
               in
               Ok { path; manifest_hash; completed }
           | `Header _ -> Error "journal manifest mismatch"

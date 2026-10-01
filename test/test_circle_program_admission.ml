@@ -291,4 +291,4 @@ let () =
   test_preview_trust ();
   test_compute_manifest ();
   test_cache_program_identity ();
-  Printf.printf "circle_program_admission = 1\nstrict_circle_inputs = 1\nPASS\n%!"
+  Printf.printf "status = pass test = circle_program strict_inputs = true\n%!"

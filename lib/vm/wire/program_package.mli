@@ -19,10 +19,11 @@ type admitted = {
 
 type error
 
-type compiler = Protocol | Source
+type compiler = Protocol | Source | Preview
 
-val compiler_mode : Octra_core.Rule_graph.mode -> compiler
+val compiler_mode : ?preview:Octra_core.Rule_graph.mode -> Octra_core.Rule_graph.mode -> compiler
 val source_id : string
+val preview_id : string
 val admit_transition : point_ops:bool -> string -> (admitted, error) result
 
 val error_message : error -> string

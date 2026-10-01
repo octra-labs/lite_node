@@ -2,7 +2,7 @@ _build/
 _opam
 _cargo_target/
 target/
-data/
+/data/
 runtime_data/
 .keys/
 *.a

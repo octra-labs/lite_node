@@ -1,5 +1,6 @@
 (executable
  (name octra_node)
+ (modules octra_node)
  (public_name octra_node)
  (libraries
   octra_core
@@ -46,6 +47,7 @@
 
 (executable
  (name octra_pvac_worker)
+ (modules octra_pvac_worker)
  (public_name octra_pvac_worker)
  (libraries octra_core pvac_ffi lwt.unix yojson zarith digestif digestif.c)
  (flags
@@ -58,6 +60,7 @@
 
 (executable
  (name octra_state_sync_client)
+ (modules octra_state_sync_client)
  (libraries octra_core octra_bootstrap octra_net lwt.unix cohttp-lwt-unix tls-lwt yojson uri digestif digestif.c)
  (flags
   (:standard
@@ -67,6 +70,7 @@
 
 (executable
  (name octra_state_sync_manifest)
+ (modules octra_state_sync_manifest)
  (libraries octra_core octra_bootstrap octra_consensus unix yojson)
  (flags
   (:standard
@@ -76,6 +80,7 @@
 
 (executable
  (name bft_control_tx)
+ (modules bft_control_tx)
  (libraries octra_core lwt.unix cohttp-lwt-unix base64 yojson zarith uri mirage-crypto-ec mirage-crypto-rng.unix)
  (flags
   (:standard
@@ -85,8 +90,20 @@
 
 (executable
  (name vote_floor)
+ (modules vote_floor)
  (libraries octra_node_runtime))
 
 (executable
  (name fhe_audit)
+ (modules fhe_audit)
  (libraries octra_core lwt.unix unix digestif irmin-pack.unix))
+
+(executable
+ (name check_store)
+ (modules check_store)
+ (libraries octra_core lwt.unix unix))
+
+(executable
+ (name repair_chaindata_to_head)
+ (modules repair_chaindata_to_head)
+ (libraries octra_core lwt.unix unix))

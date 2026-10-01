@@ -112,4 +112,4 @@ let () =
   test_insufficient_value ();
   test_failed_receipt ();
   test_cost ();
-  print_endline "test_multi_exec: ok"
+  print_endline "status = pass test = multi_exec"

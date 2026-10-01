@@ -60,7 +60,7 @@ let expect_unmanaged name = function
   | Availability.Ready _ -> fail (name ^ " ready")
   | Availability.Invalid reason -> fail (name ^ " invalid " ^ reason)
 
-let test_duplicate_job_and_ready_binding () =
+let test_duplicate_ready_job () =
   let item = tx 1 in
   let calls = ref 0 in
   let pending, resolve = Lwt.wait () in
@@ -68,7 +68,7 @@ let test_duplicate_job_and_ready_binding () =
     Pool.create {
       eligible = (fun _ -> true);
       verify = (fun _priority _ -> incr calls; pending);
-      bind = (fun _ artifact -> Lwt.return (Pool.Bound (artifact ^ ":bound")));
+      bind = (fun _ artifact -> Lwt.return (Pool.Bound (artifact ^ ":prepared")));
     }
   in
   Pool.admit pool item |> expect_pending "first admission";
@@ -80,7 +80,7 @@ let test_duplicate_job_and_ready_binding () =
   Lwt.wakeup resolve (Ok (Pool.Verification_ready "artifact"));
   advance ();
   Lwt_main.run (Pool.observe pool item)
-  |> expect_ready "ready binding" "artifact:bound";
+  |> expect_ready "ready binding" "artifact:prepared";
   let stats = Pool.stats pool in
   expect "ready stats" (stats.ready = 1 && stats.pending = 0 && stats.invalid = 0)
 
@@ -123,7 +123,7 @@ let test_private_operation_coverage () =
        (Private_pool.eligible
           (with_op Transaction.Standard item)))
 
-let test_builder_defers_slow_private_job () =
+let test_builder_slow_job () =
   let item = with_op Transaction.EncryptOp (tx 11) in
   let job, resolve = Lwt.wait () in
   let calls = ref 0 in
@@ -146,7 +146,7 @@ let test_builder_defers_slow_private_job () =
   |> expect_ready "validator receives private result" "prepared";
   expect "private verification remains unique" (!calls = 1)
 
-let test_cancelled_validator_keeps_shared_job () =
+let test_cancel_shared_job () =
   let item = tx 8 in
   let pending, resolve = Lwt.wait () in
   let calls = ref 0 in
@@ -170,7 +170,7 @@ let test_cancelled_validator_keeps_shared_job () =
   |> expect_ready "shared job completed after cancellation" "prepared";
   expect "cancel did not restart job" (!calls = 1)
 
-let test_validator_restarts_stale_artifact () =
+let test_validator_artifact_retry () =
   let item = tx 6 in
   let source = ref 1 in
   let calls = ref 0 in
@@ -185,14 +185,14 @@ let test_validator_restarts_stale_artifact () =
         else Lwt.return Pool.Source_changed);
     }
   in
-  Pool.admit pool item |> expect_pending "stale validator admission";
+  Pool.admit pool item |> expect_pending "superseded validator admission";
   advance ();
   source := 2;
   Lwt_main.run (Pool.await pool item)
-  |> expect_ready "validator renewed stale artifact" 2;
+  |> expect_ready "validator renewed superseded artifact" 2;
   expect "validator verified each source once" (!calls = 2)
 
-let test_validator_uses_local_check_after_worker_error () =
+let test_validator_worker_error () =
   let item = tx 7 in
   let pool =
     Pool.create {
@@ -205,7 +205,7 @@ let test_validator_uses_local_check_after_worker_error () =
   Lwt_main.run (Pool.await pool item)
   |> expect_unmanaged "validator synchronous retry"
 
-let test_required_job_precedes_speculative_queue () =
+let test_required_job_priority () =
   let first = tx ~from:"octSlotFirst" 1 in
   let second = tx ~from:"octSlotSecond" 1 in
   let required = tx ~from:"octSlotRequired" 1 in
@@ -236,7 +236,7 @@ let test_required_job_precedes_speculative_queue () =
   let waiting = Pool.await pool required in
   expect "required job waits in local queue" (Lwt.is_sleeping waiting);
   let queued = Pool.stats pool in
-  expect "bounded queue reports active and waiting work"
+  expect "capped queue reports active and waiting work"
     (queued.running = 1 && queued.queued = 2 && queued.pending = 3);
   Lwt.wakeup resolve_first (Ok (Pool.Verification_ready "first"));
   advance ();
@@ -258,7 +258,7 @@ let test_required_job_precedes_speculative_queue () =
   Lwt_main.run (Pool.observe pool second)
   |> expect_ready "second job completed" "second"
 
-let test_required_job_displaces_full_speculative_queue () =
+let test_required_job_capacity () =
   let active = tx ~from:"octQueueActive" 1 in
   let old = tx ~from:"octQueueOld" 1 in
   let recent = tx ~from:"octQueueRecent" 1 in
@@ -290,7 +290,7 @@ let test_required_job_displaces_full_speculative_queue () =
   let waiting = Pool.await pool required in
   expect "required job waits after displacement" (Lwt.is_sleeping waiting);
   let queued = Pool.stats pool in
-  expect "queue remains bounded after displacement"
+  expect "queue remains capped after displacement"
     (queued.running = 1 && queued.queued = 2);
   Lwt.wakeup resolve_active (Ok (Pool.Verification_ready "active"));
   advance ();
@@ -300,7 +300,7 @@ let test_required_job_displaces_full_speculative_queue () =
   Lwt_main.run waiting
   |> expect_ready "displaced queue required result" "required"
 
-let test_source_change_restarts_verification () =
+let test_source_change_retry () =
   let item = tx 2 in
   let source = ref 1 in
   let calls = ref 0 in
@@ -324,7 +324,7 @@ let test_source_change_restarts_verification () =
   Lwt_main.run (Pool.observe pool item) |> expect_ready "renewed source" 2;
   expect "source change verified twice" (!calls = 2)
 
-let test_distinct_wallet_jobs_run_together () =
+let test_wallet_parallel_jobs () =
   let first = tx ~from:"octFirst" 1 in
   let second = tx ~from:"octSecond" 1 in
   let first_job, resolve_first = Lwt.wait () in
@@ -352,7 +352,7 @@ let test_distinct_wallet_jobs_run_together () =
   Lwt_main.run (Pool.observe pool second)
   |> expect_ready "second wallet ready" "second"
 
-let test_retain_keeps_running_validator_job () =
+let test_retain_running_job () =
   let item = tx 3 in
   let job, resolve = Lwt.wait () in
   let calls = ref 0 in
@@ -376,7 +376,7 @@ let test_retain_keeps_running_validator_job () =
   |> expect_ready "retained validator receives result" "prepared";
   expect "retained job ran once" (!calls = 1)
 
-let test_validator_bounds_source_restarts () =
+let test_source_restart_limit () =
   let item = tx 9 in
   let calls = ref 0 in
   let pool =
@@ -388,9 +388,9 @@ let test_validator_bounds_source_restarts () =
       bind = (fun _ _ -> Lwt.return Pool.Source_changed);
     }
   in
-  Pool.admit pool item |> expect_pending "bounded source admission";
+  Pool.admit pool item |> expect_pending "capped source admission";
   Lwt_main.run (Pool.await pool item)
-  |> expect_unmanaged "bounded source local check";
+  |> expect_unmanaged "capped source local check";
   expect "source retries are finite" (!calls = 2)
 
 let test_invalid_result_is_stable () =
@@ -545,7 +545,7 @@ let test_collect_batch () =
   let first_job, first_done = Lwt.wait () in
   let second_job, second_done = Lwt.wait () in
   let calls = ref [] in
-  let pool = Pool.create ~max_running:1 ~max_queued:3 {
+  let pool = Pool.create ~max_running:1 ~max_queued:3 ~max_complete:1 {
     eligible = (fun _ -> true);
     verify = (fun priority item ->
       calls := !calls @ [priority, item.Transaction.nonce];
@@ -579,6 +579,28 @@ let test_collect_batch () =
   Lwt.wakeup older_done (Ok (Pool.Verification_ready "older"));
   advance ()
 
+let test_collect_reverse () =
+  let first = tx 31 and second = tx 32 in
+  let first_job, first_done = Lwt.wait () in
+  let second_job, second_done = Lwt.wait () in
+  let calls = ref 0 in
+  let pool = Pool.create ~max_running:2 ~max_complete:1 {
+    eligible = (fun _ -> true);
+    verify = (fun _ item -> incr calls;
+      if item.Transaction.nonce = first.nonce then first_job else second_job);
+    bind = (fun _ artifact -> Lwt.return (Pool.Bound artifact));
+  } in
+  List.iter (fun item -> ignore (Pool.admit pool item)) [first; second];
+  advance ();
+  let applied = Pool.collect pool [first; second] in
+  Lwt.wakeup second_done (Ok (Pool.Verification_ready "second"));
+  advance ();
+  expect "collection finished before all jobs" (Lwt.is_sleeping applied);
+  Lwt.wakeup first_done (Ok (Pool.Verification_ready "first"));
+  expect "out of order result was evicted"
+    (Lwt_main.run applied = [Transaction.hash first, "first"; Transaction.hash second, "second"]);
+  expect "collection repeated verification" (!calls = 2)
+
 let test_collect_exception () =
   let item = tx 24 in
   let pending, resolve = Lwt.wait () in
@@ -595,24 +617,25 @@ let test_collect_exception () =
   expect "worker exit releases running entry" ((Pool.stats pool).running = 0)
 
 let () =
+  test_collect_reverse ();
   test_collect_batch ();
   test_collect ();
   test_collect_queue ();
   test_collect_errors ();
   test_collect_exception ();
   test_artifact_lookup ();
-  test_duplicate_job_and_ready_binding ();
+  test_duplicate_ready_job ();
   test_validator_joins_running_job ();
   test_private_operation_coverage ();
-  test_builder_defers_slow_private_job ();
-  test_cancelled_validator_keeps_shared_job ();
-  test_validator_restarts_stale_artifact ();
-  test_validator_uses_local_check_after_worker_error ();
-  test_required_job_precedes_speculative_queue ();
-  test_required_job_displaces_full_speculative_queue ();
-  test_source_change_restarts_verification ();
-  test_distinct_wallet_jobs_run_together ();
-  test_retain_keeps_running_validator_job ();
-  test_validator_bounds_source_restarts ();
+  test_builder_slow_job ();
+  test_cancel_shared_job ();
+  test_validator_artifact_retry ();
+  test_validator_worker_error ();
+  test_required_job_priority ();
+  test_required_job_capacity ();
+  test_source_change_retry ();
+  test_wallet_parallel_jobs ();
+  test_retain_running_job ();
+  test_source_restart_limit ();
   test_invalid_result_is_stable ();
   print_endline "status = pass test = preverify_pool"

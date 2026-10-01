@@ -43,8 +43,7 @@
 (test
  (name test_rule_graph)
  (modules test_rule_graph)
- (libraries octra_core)
- (action (run %{test} %{dep:../README.md})))
+ (libraries octra_core))
 
 (test
  (name test_ready_ref)
@@ -235,6 +234,297 @@
  (libraries octra_core unix))
 
 (test
+ (name test_recovery_guard)
+ (modules test_recovery_guard)
+ (libraries octra_core octra_node_runtime lwt.unix unix octra_test_workspace))
+
+(test
+ (name test_wal_io)
+ (modules test_wal_io)
+ (libraries octra_core unix octra_test_workspace))
+
+(test
+ (name test_disk_sync)
+ (modules test_disk_sync)
+ (libraries octra_core unix octra_test_workspace))
+
+(test
+ (name test_journal_io)
+ (modules test_journal_io)
+ (libraries octra_core unix octra_test_workspace))
+
+(test
+ (name test_head_cut)
+ (modules test_head_cut)
+ (libraries octra_core lwt.unix unix octra_test_workspace))
+
+(test
+ (name test_wal_phase)
+ (modules test_wal_phase)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix lmdb))
+
+(test
+ (name test_store_check)
+ (modules test_store_check)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix)
+ (deps ../bin/check_store.exe)
+ (action (run %{test} %{dep:../bin/check_store.exe})))
+
+(test
+ (name test_forward_phase)
+ (modules test_forward_phase)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix lmdb))
+
+(test
+ (name test_cut_retry)
+ (modules test_cut_retry)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_commit_attempt)
+ (modules test_commit_attempt)
+ (libraries octra_core))
+
+(test
+ (name test_first_attempt)
+ (modules test_first_attempt)
+ (libraries octra_core))
+
+(test
+ (name test_commit_read)
+ (modules test_commit_read)
+ (libraries octra_core octra_test_workspace unix yojson))
+
+(test
+ (name test_head_file)
+ (modules test_head_file)
+ (libraries octra_core octra_test_workspace unix yojson))
+
+(test
+ (name test_head_decode)
+ (modules test_head_decode)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix yojson))
+
+(test
+ (name test_commit_record)
+ (modules test_commit_record)
+ (libraries octra_core yojson))
+
+(test
+ (name test_head_record)
+ (modules test_head_record)
+ (libraries octra_core yojson str))
+
+(test
+ (name test_commit_write)
+ (modules test_commit_write)
+ (libraries octra_core octra_test_workspace unix yojson))
+
+(test
+ (name test_commit_frames)
+ (modules test_commit_frames)
+ (libraries octra_core octra_test_workspace unix yojson))
+
+(test
+ (name test_commit_cut)
+ (modules test_commit_cut)
+ (libraries octra_core octra_test_workspace unix yojson))
+
+(test
+ (name test_read_error)
+ (modules test_read_error)
+ (libraries octra_core octra_test_workspace unix))
+
+(test
+ (name test_commit_kill)
+ (modules test_commit_kill)
+ (libraries octra_core octra_recovery_case octra_test_workspace unix yojson))
+
+(test
+ (name test_attempt_sync)
+ (modules test_attempt_sync)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_empty_phase)
+ (modules test_empty_phase)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_empty_sync)
+ (modules test_empty_sync)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_root_write)
+ (modules test_root_write)
+ (foreign_stubs
+  (language c)
+  (names root_probe)
+  (flags (:standard -std=c11 -Werror=implicit-function-declaration)))
+ (link_flags (:standard -cclib -ldl))
+ (libraries octra_core octra_node_runtime octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_root_query)
+ (modules test_root_query)
+ (libraries octra_net octra_consensus lwt.unix))
+
+(test
+ (name test_aux_delta)
+ (modules test_aux_delta)
+ (libraries octra_core yojson digestif.c))
+
+(test
+ (name test_aux_frame)
+ (modules test_aux_frame)
+ (libraries octra_core yojson digestif.c))
+
+(test
+ (name test_aux_index)
+ (modules test_aux_index)
+ (libraries octra_core octra_recovery_case octra_test_workspace lmdb lwt.unix unix))
+
+(test
+ (name test_aux_commit)
+ (modules test_aux_commit)
+ (libraries octra_core octra_vm octra_node_runtime octra_recovery_case octra_test_workspace lmdb lwt.unix unix))
+
+(test
+ (name test_root_readers)
+ (modules test_root_readers)
+ (libraries octra_consensus))
+
+(test
+ (name test_branch_sync)
+ (modules test_branch_sync)
+ (foreign_stubs
+  (language c)
+  (names branch_probe)
+  (flags (:standard -std=c11 -Werror=implicit-function-declaration)))
+ (link_flags (:standard -cclib -ldl))
+ (libraries octra_core octra_node_runtime octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_recovery_phase)
+ (modules test_recovery_phase)
+ (libraries octra_core))
+
+(test
+ (name test_phase_sync)
+ (modules test_phase_sync)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_node_phase)
+ (modules test_node_phase)
+ (libraries octra_core octra_node_runtime octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_apply_fork)
+ (modules test_apply_fork)
+ (libraries octra_core octra_node_runtime octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_boot_errors)
+ (modules test_boot_errors)
+ (libraries octra_core octra_node_runtime octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_store_owner)
+ (modules test_store_owner)
+ (deps ../bin/repair_chaindata_to_head.exe)
+ (action (run %{test} %{dep:../bin/repair_chaindata_to_head.exe}))
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_store_open)
+ (modules test_store_open)
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_store_exec)
+ (modules test_store_exec)
+ (foreign_stubs (language c) (names fd_probe))
+ (libraries octra_core octra_recovery_case octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_store_lock)
+ (modules test_store_lock)
+ (libraries octra_core octra_test_workspace unix))
+
+(test
+ (name test_store_scope)
+ (modules test_store_scope)
+ (libraries octra_core))
+
+(test
+ (name test_store_boot)
+ (modules test_store_boot)
+ (libraries octra_core octra_node_runtime octra_test_workspace lwt.unix unix))
+
+(test
+ (name test_crash_atomic_eic)
+ (modules test_crash_atomic_eic)
+ (libraries octra_core lwt.unix unix octra_test_workspace))
+
+(test
+ (name test_startup_eic)
+ (modules test_startup_eic)
+ (libraries octra_core lwt.unix unix octra_test_workspace))
+
+(test
+ (name test_log_cut)
+ (modules test_log_cut)
+ (libraries octra_core unix octra_test_workspace))
+
+(test
+ (name test_cut_sync)
+ (modules test_cut_sync)
+ (libraries octra_core unix octra_test_workspace))
+
+(test
+ (name test_index_cut)
+ (modules test_index_cut)
+ (libraries octra_core lmdb unix octra_test_workspace))
+
+(test
+ (name test_history_reads)
+ (modules test_history_reads)
+ (libraries octra_core octra_node_runtime lwt.unix unix lmdb digestif octra_test_workspace))
+
+(test
+ (name test_startup_history)
+ (modules test_startup_history)
+ (libraries octra_node_runtime octra_core))
+
+(test
+ (name test_snapshot_read)
+ (modules test_snapshot_read)
+ (libraries octra_core octra_node_runtime octra_consensus octra_net
+  mirage-crypto-ec mirage-crypto-rng.unix digestif octra_test_workspace))
+
+(test
+ (name test_cipher_views)
+ (modules test_cipher_views)
+ (libraries octra_core octra_node_runtime octra_test_workspace lwt.unix unix base64 zarith))
+
+(test
+ (name test_fhe_ops)
+ (modules test_fhe_ops)
+ (libraries pvac_ffi))
+
+(test
+ (name test_tx_loc_repair)
+ (modules test_tx_loc_repair)
+ (libraries octra_core unix lmdb octra_test_workspace))
+
+(test
+ (name test_committed_repair)
+ (modules test_committed_repair)
+ (libraries octra_core lwt.unix unix lmdb octra_test_workspace))
+
+(test
  (name test_state_sync_reliability)
  (modules test_state_sync_reliability)
  (libraries octra_bootstrap octra_node_runtime unix))
@@ -298,14 +588,19 @@
 
 (rule
  (target native_math.exe)
- (deps native_math.cpp ../pvac_ffi/pvac_serialize.hpp
+ (deps native_math.cpp ../pvac/pvac_c_api.cpp ../pvac/pvac_c_api.h ../pvac_ffi/pvac_serialize.hpp
   (source_tree ../pvac/include))
  (action
-  (bash "ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; c++ -std=c++17 -O2 -pthread $AES_FLAGS -I../pvac/include -I../pvac_ffi %{dep:native_math.cpp} -o %{target}")))
+  (bash "ARCH=$(uname -m); AES_FLAGS=''; if [ \"$ARCH\" = 'x86_64' ]; then AES_FLAGS='-maes -msse2'; elif [ \"$ARCH\" = 'aarch64' ] || [ \"$ARCH\" = 'arm64' ]; then AES_FLAGS='-march=armv8-a+crypto'; fi; c++ -std=c++17 -O2 -pthread $AES_FLAGS -DPVAC_C_API -I../pvac/include -I../pvac_ffi -I../pvac %{dep:native_math.cpp} %{dep:../pvac/pvac_c_api.cpp} -o %{target}")))
 
 (rule
  (alias runtest)
  (action (run ./native_math.exe)))
+
+(rule
+ (alias runtest)
+ (deps test_replay_diff.mjs replay_diff.mjs)
+ (action (run node %{dep:test_replay_diff.mjs})))
 
 (test
  (name test_pvac_verify_worker)
@@ -427,8 +722,8 @@
   lwt.unix unix base64 yojson zarith mirage-crypto-ec))
 
 (test
- (name test_resource_compute_provider_engine)
- (modules test_resource_compute_provider_engine)
+ (name test_compute_engine)
+ (modules test_compute_engine)
  (libraries octra_node_runtime base64 digestif digestif.c))
 
 (test
@@ -450,6 +745,42 @@
  (name test_rest_admit)
  (modules test_rest_admit)
  (libraries octra_node_runtime octra_core zarith lwt.unix octra_test_workspace))
+
+(test
+ (name test_tx_envelope)
+ (modules test_tx_envelope)
+ (libraries octra_node_runtime octra_core octra_net zarith lwt.unix octra_test_workspace mirage-crypto-rng.unix))
+
+(test
+ (name test_tx_rule)
+ (modules test_tx_rule)
+ (libraries octra_node_runtime octra_core octra_consensus octra_net zarith lwt.unix octra_test_workspace mirage-crypto-rng.unix))
+
+(test
+ (name test_tx_drop)
+ (modules test_tx_drop)
+ (libraries octra_core zarith digestif digestif.c lmdb unix octra_test_workspace))
+
+(test
+ (name test_drop_sink)
+ (modules test_drop_sink)
+ (libraries octra_core octra_node_runtime lwt.unix zarith))
+
+(test
+ (name test_node_runtime_history)
+ (modules test_node_runtime_history)
+ (libraries octra_node_runtime octra_test_workspace yojson))
+
+(test
+ (name test_run_exit)
+ (modules test_run_exit)
+ (foreign_stubs (language c) (names gc_fork))
+ (libraries octra_core octra_node_runtime lwt.unix octra_test_workspace))
+
+(test
+ (name test_tx_queue)
+ (modules test_tx_queue)
+ (libraries octra_node_runtime octra_core octra_net zarith lwt.unix octra_test_workspace mirage-crypto-rng.unix))
 
 (test
  (name test_journal_hash)
@@ -476,3 +807,93 @@
  (name test_preverify_pool)
  (modules test_preverify_pool)
  (libraries octra_node_runtime octra_core lwt.unix zarith))
+(test
+ (name test_set_report)
+ (modules test_set_report)
+ (libraries octra_core))
+(test
+ (name test_fhe_work)
+ (modules test_fhe_work)
+ (libraries octra_vm pvac_ffi zarith base64))
+
+(test
+ (name test_fhe_memory)
+ (modules test_fhe_memory)
+ (libraries octra_vm pvac_ffi zarith base64))
+
+(test
+ (name test_vm_effects)
+ (modules test_vm_effects)
+ (libraries octra_node_runtime octra_vm zarith))
+
+(test
+ (name test_fhe_state)
+ (modules test_fhe_state)
+ (libraries octra_vm octra_core pvac_ffi zarith))
+
+(test
+ (name test_fhe_budget)
+ (modules test_fhe_budget)
+ (libraries octra_vm octra_core pvac_ffi zarith))
+
+(test
+ (name test_native_alloc)
+ (modules test_native_alloc preview_alloc)
+ (foreign_stubs
+  (language cxx)
+  (names alloc_fault)
+  (flags (:include ../pvac_ffi/flags.sexp)))
+ (libraries octra_vm octra_node_runtime octra_test_workspace pvac_ffi zarith base64 lwt.unix unix))
+
+(test
+ (name test_zk_ffi)
+ (modules test_zk_ffi)
+ (libraries zk_ffi))
+
+(test
+ (name test_print_style)
+ (modules test_print_style)
+ (libraries compiler-libs.common)
+ (deps (glob_files *.ml) (glob_files support/*.ml) (glob_files recovery_case/*.ml))
+ (action (run %{test} %{deps})))
+
+(test
+ (name test_zk_start)
+ (modules test_zk_start)
+ (foreign_stubs
+  (language cxx)
+  (names zk_init_fault)
+  (flags (:include ../zk_ffi/flags.sexp))
+  (include_dirs ../zk_ffi))
+ (libraries zk_ffi))
+
+(test
+ (name test_zk_e2e)
+ (modules test_zk_e2e)
+ (deps zk_convert.py)
+ (action (run %{test} %{dep:zk_convert.py}))
+ (libraries zk_ffi unix octra_test_workspace))
+
+(test
+ (name test_zk_vm)
+ (modules test_zk_vm)
+ (link_flags (:include zk_vm_link.sexp))
+ (foreign_stubs
+  (language cxx)
+  (names zk_vm_fault)
+  (flags (:include ../zk_ffi/flags.sexp))
+  (include_dirs ../zk_ffi))
+ (libraries zk_ffi octra_vm base64 zarith))
+
+(rule
+ (targets zk_vm_link.sexp)
+ (action
+  (with-stdout-to zk_vm_link.sexp
+   (bash "if [ \"$(uname -s)\" = Linux ]; then printf '%s\\n' '(-cclib -Wl,--wrap=caml_zk_initialize -cclib -Wl,--wrap=caml_zk_groth16_verify_bn254)'; else printf '%s\\n' '()'; fi"))))
+
+(test
+ (name test_zk_golden)
+ (modules test_zk_golden)
+ (deps zk_convert.py (source_tree cases/zk/multiplier))
+ (action (run %{test} %{dep:zk_convert.py} cases/zk/multiplier))
+ (libraries zk_ffi unix octra_test_workspace))

@@ -508,7 +508,9 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         Octra_vm.Contract_rpc.make_view_ctx
           ~trusted:[]
           ~profile:{epoch = 0; math = false; point_ops = false;
-                    object_cost = false; int_work = Octra_vm.Int_work.Active}
+                    object_cost = false; int_work = Octra_vm.Int_work.Active;
+                    fhe_work = Octra_core.Rule_graph.Prior;
+                    wasm_float = Octra_core.Rule_graph.Prior}
           ~store
           ~ledger
           ~get_fhe_pubkey:(fun _ -> None)
@@ -629,7 +631,9 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
           (Octra_vm.Contract_rpc.call_params
              ~trusted:[]
              ~profile:{epoch = 0; math = false; point_ops = false;
-                       object_cost = false; int_work = Octra_vm.Int_work.Active}
+                       object_cost = false; int_work = Octra_vm.Int_work.Active;
+                       fhe_work = Octra_core.Rule_graph.Prior;
+                       wasm_float = Octra_core.Rule_graph.Prior}
              ~store
              ~ledger
              ~get_fhe_pubkey:(fun _ -> None)
@@ -637,16 +641,30 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
              params)
       in
       let holder = "oct" ^ String.make 44 '2' in
-      let default_view =
+      let missing_view =
         call (`List [
           `String address;
           `String "balance_of";
           `List [`String holder];
         ])
       in
+      begin match missing_view with
+      | Error error when error.Octra_core.Rpc.message = "method not found" -> ()
+      | _ -> failwith "program call fabricated a missing method"
+      end;
+      let default_view =
+        call (`List [
+          `String address;
+          `String "run";
+          `List [];
+        ])
+      in
       begin
         match default_view with
         | Ok (`Assoc fields) ->
+          require
+            (List.assoc_opt "result" fields = Some (`String "210"))
+            "program call result differs";
           require
             (List.assoc_opt "storage" fields = None)
             "program call returned storage by default"
@@ -656,8 +674,8 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let storage_view =
         call (`List [
           `String address;
-          `String "balance_of";
-          `List [`String holder];
+          `String "run";
+          `List [];
           `Null;
           `Bool true;
         ])

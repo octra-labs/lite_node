@@ -117,7 +117,7 @@ let node_deps refs =
       Log.info "consensus" "broadcast epoch = %d root = %s..%s peers = %d"
         view.Broadcast.epoch_id
         view.root_head
-        view.root_tail
+        view.root_suffix
         peers);
     set_last_epoch_time = (fun value -> refs.last_epoch_time := value);
     reset_tree = (fun ~epoch_id ~parent_commit ->

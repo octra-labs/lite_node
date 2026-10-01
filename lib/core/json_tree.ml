@@ -108,13 +108,13 @@ let write ?(sort = false) json =
   and values_next sort close values rest =
     match values with
     | [] -> emit close; loop rest
-    | json :: tail -> loop (Value (sort, json) :: Values (sort, close, tail) :: rest)
+    | json :: suffix -> loop (Value (sort, json) :: Values (sort, close, suffix) :: rest)
   and fields_next sort fields rest =
     match fields with
     | [] -> emit '}'; loop rest
-    | (name, json) :: tail ->
+    | (name, json) :: suffix ->
       scalar (`String name);
       emit ':';
-      loop (Value (sort, json) :: Fields (sort, tail) :: rest)
+      loop (Value (sort, json) :: Fields (sort, suffix) :: rest)
   in
   loop [Value (sort, json)]

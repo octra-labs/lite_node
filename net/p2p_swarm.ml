@@ -391,7 +391,9 @@ let send_with_timeout conn frame timeout_s =
          let* () = Lwt_unix.sleep timeout_s in
          Lwt.return_unit)
       ])
-    (fun _exn -> Lwt.return_unit)
+    (function
+      | Lwt.Canceled as error -> Lwt.fail error
+      | _ -> Lwt.return_unit)
 
 let connected_peers t =
   let conns = Hashtbl.fold (fun _ c acc -> c :: acc) t.peers [] in

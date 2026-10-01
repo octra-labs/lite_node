@@ -53,7 +53,7 @@ let sample_tx ?(amount = Z.of_int 1_000_000) ?(nonce = 7) ?(ou = Z.of_int 9) ?en
     op_type;
   }
 
-let signed_sample_tx () =
+let test_keys () =
   let priv =
     match Mirage_crypto_ec.Ed25519.priv_of_octets (String.make 32 '\042') with
     | Ok value -> value
@@ -63,6 +63,10 @@ let signed_sample_tx () =
   let priv_b64 = Base64.encode_exn (Mirage_crypto_ec.Ed25519.priv_to_octets priv) in
   let pub_b64 = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pub) in
   let addr = Octra_core.Crypto.Address.address_from_pubkey pub_b64 in
+  (addr, priv_b64, pub_b64)
+
+let signed_sample_tx () =
+  let addr, priv_b64, pub_b64 = test_keys () in
   let unsigned =
     { (sample_tx Transaction.Standard) with
       Transaction.from = addr;
@@ -390,13 +394,13 @@ let test_route_admission () =
   expect_payload_error "invalid route address"
     ("invalid_address", "malformed sender or recipient address")
     (Tx_view.address_route_admission (route_tx ~to_addr:"bad" Transaction.Standard));
-  expect_payload_error "short noncanonical route address"
+  expect_payload_error "truncated route address"
     ("invalid_address", "malformed sender or recipient address")
     (Tx_view.address_route_admission
        (route_tx
           ~to_addr:(String.sub route_to 0 (String.length route_to - 1))
           Transaction.Standard));
-  expect_payload_error "long noncanonical route address"
+  expect_payload_error "extended route address"
     ("invalid_address", "malformed sender or recipient address")
     (Tx_view.address_route_admission
        (route_tx ~to_addr:(route_to ^ "1") Transaction.Standard));
@@ -519,9 +523,7 @@ let test_admission_semantics () =
        (sample_tx ~amount:(Z.of_int (-1)) Transaction.ProgramExec))
 
 let test_staging_remove_auth () =
-  let sender = "octBnxVM2DQxLH93H3xBxAVRjHpyrTcM87FMnEFZ5t8RaXr" in
-  let priv_b64 = "plv3RpuPxlopIP2cAwF0PLPA29S2flKL8J9DX/x8/ls=" in
-  let pub_b64 = "GZqVq3wLRzWIshIoGhIKWLMe4RRowpD2u5eL93JJmuc=" in
+  let sender, priv_b64, pub_b64 = test_keys () in
   let tx_hash = "445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233" in
   let msg = Tx_view.staging_remove_message tx_hash in
   let signature_b64 = Peer_auth.sign msg priv_b64 in
@@ -581,9 +583,7 @@ let test_staging_remove_auth () =
   end
 
 let test_pubkey_registration_auth () =
-  let addr = "octBnxVM2DQxLH93H3xBxAVRjHpyrTcM87FMnEFZ5t8RaXr" in
-  let priv_b64 = "plv3RpuPxlopIP2cAwF0PLPA29S2flKL8J9DX/x8/ls=" in
-  let pub_b64 = "GZqVq3wLRzWIshIoGhIKWLMe4RRowpD2u5eL93JJmuc=" in
+  let addr, priv_b64, pub_b64 = test_keys () in
   let msg = Tx_view.public_key_registration_message addr in
   let signature_b64 = Peer_auth.sign msg priv_b64 in
   begin
@@ -623,9 +623,7 @@ let test_pubkey_registration_auth () =
   end
 
 let test_encrypted_balance_auth () =
-  let addr = "octBnxVM2DQxLH93H3xBxAVRjHpyrTcM87FMnEFZ5t8RaXr" in
-  let priv_b64 = "plv3RpuPxlopIP2cAwF0PLPA29S2flKL8J9DX/x8/ls=" in
-  let pub_b64 = "GZqVq3wLRzWIshIoGhIKWLMe4RRowpD2u5eL93JJmuc=" in
+  let addr, priv_b64, pub_b64 = test_keys () in
   let msg = Tx_view.encrypted_balance_message addr in
   let signature_b64 = Peer_auth.sign msg priv_b64 in
   let params = `List [`String addr; `String signature_b64; `String pub_b64] in
@@ -1233,7 +1231,7 @@ let test_preverify_cache_plans () =
       [
         entry "old" 80.0 false;
         entry "fresh" 95.0 false;
-        entry "stale-pending" 50.0 true;
+        entry "expired-pending" 50.0 true;
         entry "newest" 99.0 false;
       ]
   in
@@ -1371,4 +1369,4 @@ let () =
   test_preverify_cache_plans ();
   test_post_signature_admission ();
   test_submit_signature_admission ();
-  print_endline "node_runtime_tx_view tests passed"
+  print_endline "status = pass test = tx_view"

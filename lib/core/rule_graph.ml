@@ -119,6 +119,10 @@ let devnet_exit_activation = {
   devnet_set_plan_activation with activation_epoch = 1_572_000;
 }
 
+let devnet_tx_envelope_activation = {
+  devnet_set_plan_activation with activation_epoch = 1_611_500;
+}
+
 let devnet_set_open_activation = {
   anchor_epoch = 1_380_960;
   anchor_state_root =
@@ -235,13 +239,24 @@ let program_source_activation_for_chain chain_id =
     Some devnet_exit_activation
   else None
 
+let tx_envelope_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then Some devnet_tx_envelope_activation
+  else None
+
+let fhe_work_activation_for_chain = tx_envelope_activation_for_chain
+
+let wasm_float_activation_for_chain = tx_envelope_activation_for_chain
+
 let profile_epochs ~chain_id =
   [standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
    math_activation_for_chain chain_id;
    exit_activation_for_chain chain_id;
    ready_exec_activation_for_chain chain_id;
-   program_source_activation_for_chain chain_id]
+   program_source_activation_for_chain chain_id;
+   tx_envelope_activation_for_chain chain_id;
+   fhe_work_activation_for_chain chain_id;
+   wasm_float_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -300,6 +315,7 @@ let live_chain ~chain_id =
     exit_activation_for_chain chain_id;
     ready_exec_activation_for_chain chain_id;
     program_source_activation_for_chain chain_id;
+    tx_envelope_activation_for_chain chain_id;
   ] in
   List.for_all Option.is_some plans
 
@@ -326,6 +342,18 @@ let consensus_id ~chain_id ~epoch =
     | Some _ | None -> plans)
   |> (fun plans ->
     match program_source_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match tx_envelope_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match fhe_work_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match wasm_float_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
   |> List.map activation_id
@@ -411,6 +439,9 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       exit_activation_for_chain chain_id;
       ready_exec_activation_for_chain chain_id;
       program_source_activation_for_chain chain_id;
+      tx_envelope_activation_for_chain chain_id;
+      fhe_work_activation_for_chain chain_id;
+      wasm_float_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -422,8 +453,8 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
         | None -> None)
       activations
 
-let verify_anchor t activation =
-  match t.root_at activation.anchor_epoch with
+let verify_anchor root_at activation =
+  match root_at activation.anchor_epoch with
   | Missing ->
     Error (Anchor_missing activation.anchor_epoch)
   | Unreadable reason ->
@@ -442,12 +473,14 @@ let verify_anchor t activation =
          actual;
        })
 
-let mode t activation ~epoch =
+let activation_mode ~root_at activation ~epoch =
   match activation with
   | None -> Ok Prior
   | Some activation when epoch < activation.activation_epoch -> Ok Prior
   | Some activation ->
-    Result.map (fun () -> Active) (verify_anchor t activation)
+    Result.map (fun () -> Active) (verify_anchor root_at activation)
+
+let mode t activation ~epoch = activation_mode ~root_at:t.root_at activation ~epoch
 
 let circle t ~epoch = mode t t.circle_activation ~epoch
 
@@ -523,6 +556,28 @@ let exit t ~epoch = mode t t.exit_activation ~epoch
 let ready_exec t ~epoch = mode t t.ready_exec_activation ~epoch
 
 let program_source t ~epoch = mode t t.program_source_activation ~epoch
+
+let tx_envelope t ~epoch =
+  mode t (tx_envelope_activation_for_chain t.chain_id) ~epoch
+
+let fhe_work t ~epoch = mode t (fhe_work_activation_for_chain t.chain_id) ~epoch
+
+let wasm_float t ~epoch = mode t (wasm_float_activation_for_chain t.chain_id) ~epoch
+
+let wasm_float_at ~chain_id ~epoch =
+  match wasm_float_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let fhe_work_at ~chain_id ~epoch =
+  match fhe_work_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let tx_envelope_at ~chain_id ~epoch =
+  match tx_envelope_activation_for_chain chain_id with
+  | Some plan when Int64.compare epoch (Int64.of_int plan.activation_epoch) >= 0 -> Active
+  | Some _ | None -> Prior
 
 let program_overlap_epochs = 64
 

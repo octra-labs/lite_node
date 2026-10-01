@@ -203,8 +203,7 @@ let run_fork_store (deps : store_deps) =
     Octra_log.fatal "init"
       "event = fork_repair phase = store status = refused reason = %s"
       reason;
-    deps.exit_fatal ();
-    failwith "fork repair store resume failed"
+    raise (Octra_core.Startup_recovery.Refused ("fork repair store: " ^ reason))
 
 let run_recovery deps =
   Startup_recovery_shell.run_atomic_recovery {
@@ -234,8 +233,7 @@ let run_fork_chain deps =
     Octra_log.fatal "init"
       "event = fork_repair phase = chaindata status = refused reason = %s"
       reason;
-    deps.exit_fatal ();
-    failwith "fork repair chaindata resume failed"
+    raise (Octra_core.Startup_recovery.Refused ("fork repair chaindata: " ^ reason))
 
 let run_reconciliation deps =
   Startup_recovery_shell.run_reconciliation {
@@ -248,19 +246,13 @@ let run_reconciliation deps =
 let run_history deps =
   Startup_history_shell.run_startup_checks {
     int_value = deps.int_value;
+    first_epoch = (fun () ->
+      match Store_chaindata.first_history_epoch deps.chaindata with
+      | Error reason -> failwith reason
+      | Ok epoch -> epoch);
     last_epoch = chain_last_epoch deps;
-    repair_tx_loc = (fun ~from_epoch ~to_epoch ->
-      Store_chaindata.verify_and_repair_tx_loc_recent_epochs
-        deps.chaindata
-        ~from_epoch
-        ~to_epoch);
-    repair_txid_loc = (fun ~from_epoch ~to_epoch ->
-      Store_chaindata.verify_and_repair_txid_loc_recent_epochs
-        deps.chaindata
-        ~from_epoch
-        ~to_epoch);
     status_at = (fun epoch ->
-      Store_chaindata.get_visible_epoch_index_status deps.chaindata epoch);
+      Store_chaindata.get_epoch_index_status deps.chaindata epoch);
     marker_path = Filename.concat deps.data_dir "chaindata/.reindex_in_progress";
     marker_exists = Sys.file_exists;
     irmin_stealth_counter = irmin_stealth_counter deps;
@@ -292,9 +284,7 @@ let run_epoch deps =
   }
 
 let run_store deps =
-  run_fork_store deps;
-  run_store_integrity deps;
-  run_epoch_tags deps
+  run_fork_store deps
 
 let run_node deps =
   let skip_recovery = deps.env "OCTRA_SKIP_RECOVERY" = Some "1" in
@@ -310,9 +300,16 @@ let run_node deps =
   | None ->
     run_fork_chain deps;
     run_recovery deps;
+    let store_deps = {data_dir = deps.data_dir; store = deps.store;
+      exit_fatal = deps.exit_fatal} in
+    run_store_integrity store_deps;
+    run_epoch_tags store_deps;
     run_reconciliation deps;
     run_history deps;
     check_supply deps;
     check_emission deps;
     run_account deps;
-    run_epoch deps
+    let epoch = run_epoch deps in
+    if not skip_recovery then
+      Octra_core.Epoch_commit_marker.clear_recovery deps.data_dir;
+    epoch

@@ -24,9 +24,7 @@ let write_json path value =
     (fun () -> output_string output (Yojson.Safe.to_string value))
 
 let tools () =
-  let exported = Test_workspace.source "controls/lib" in
-  if Sys.file_exists (Filename.concat exported "validator_enroll.py") then exported
-  else Test_workspace.source "docs/release/validator_tools"
+  Test_workspace.source "controls/lib"
 
 let invoke ?(renew = false) ?pointer config operation expected =
   let open Lwt.Syntax in

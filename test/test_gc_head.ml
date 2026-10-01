@@ -247,8 +247,34 @@ let old_anchor path =
   ) (fun () -> S.close store) in
   let* store = S.open_store path in
   Lwt.finalize (fun () ->
-    let* () = no_split store in
-    value store "old-head"
+    let* branches = S.Store.Branch.list store.S.repo in
+    expect "opening the store removed the old split"
+      (List.mem "pack_split_2" branches);
+    expect "unverified split entered the GC plan" (store.S.split_epoch = None);
+    let* () = value store "old-head" in
+    let* restored = head store in
+    let* split = S.collect_pack_at store ~keep:1 1 in
+    (match split with
+    | S.Gc_error reason -> Printf.printf "event = empty_split status = refused reason = %S\n%!" reason
+    | _ -> failwith "empty repeated split was not refused");
+    let* current = head store in
+    let* unchanged = S.Store.Branch.list store.repo in
+    expect "refused collection changed HEAD"
+      (S.Store.Commit.hash current = S.Store.Commit.hash restored);
+    expect "refused collection changed saved branches"
+      (List.sort String.compare branches = List.sort String.compare unchanged);
+    let* () = epoch store 3 "resumed" in
+    let* resumed = head store in
+    let* split = S.collect_pack_at store ~keep:1 3 in
+    expect "explicit collection did not create a new split" (split = S.Gc_split 3);
+    let* selected = S.Store.Branch.find store.repo "pack_split_3" in
+    expect "new split does not name the resumed commit"
+      (Option.fold ~none:false ~some:(fun commit ->
+        S.Store.Commit.hash commit = S.Store.Commit.hash resumed) selected);
+    let* branches = S.Store.Branch.list store.repo in
+    expect "explicit collection retained the old split"
+      (not (List.mem "pack_split_2" branches));
+    value store "resumed"
   ) (fun () -> S.close store)
 
 let () =

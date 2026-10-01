@@ -15,17 +15,12 @@ type 'handler dispatch_adapters = {
   transactions_by_epoch : 'handler;
 }
 
-val bounded_heal_limit : int -> int
+val lookup_record_limit : int -> int
 
-val lookup_confirmed_tx_with_heal :
+val lookup_confirmed_tx :
   Octra_core.Store_chaindata.t ->
   string ->
   (int * string) option
-
-val confirmed_tx_epoch_with_heal :
-  Octra_core.Store_chaindata.t ->
-  string ->
-  int option
 
 val transaction :
   find_drop:(string -> Octra_core.Tx_drop.row option) ->

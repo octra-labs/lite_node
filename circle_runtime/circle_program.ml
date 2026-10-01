@@ -55,8 +55,14 @@ let loaded_cache : (string, loaded_cache_entry) Hashtbl.t =
 let loaded_cache_ttl_secs = 300.0
 let loaded_cache_limit = 64
 
-let loaded_cache_key circle_id (info : Octra_core.Circles.circle_info) =
-  circle_id ^ ":" ^ Int64.to_string info.version ^ ":" ^ info.code_hash
+let loaded_cache_key ?(float_mode=Octra_core.Rule_graph.Prior)
+    ?(manifest_profile=Octra_core.Circle_wasm_host.Manifest) circle_id
+    (info : Octra_core.Circles.circle_info) =
+  String.concat ":" [
+    circle_id; Int64.to_string info.version; info.code_hash;
+    Octra_core.Circle_wasm_host.profile_name manifest_profile;
+    string_of_bool (Octra_core.Circle_wasm_host.float_enabled float_mode);
+  ]
 
 let prune_loaded_cache () =
   let now = Unix.gettimeofday () in
@@ -224,6 +230,7 @@ let yojson_of_descriptor (t : descriptor) =
 
 let describe
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
+    ?(float_mode = Octra_core.Rule_graph.Prior)
     store
     circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
@@ -272,6 +279,7 @@ let describe
                 let* wasm_descriptor_result =
                   Octra_core.Circle_wasm_host.describe
                     ~execution_profile:manifest_profile
+                    ~float_mode
                     code_b64 in
                 begin
                   match wasm_descriptor_result with
@@ -308,6 +316,7 @@ let load
     ?(trusted = [])
     ?(point_ops = false)
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
+    ?(float_mode = Octra_core.Rule_graph.Prior)
     store
     circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
@@ -317,7 +326,7 @@ let load
       (Error (Octra_core.Circle_wasm_host.Rejected "circle not found"))
   | Some info ->
     prune_loaded_cache ();
-    let cache_key = loaded_cache_key circle_id info in
+    let cache_key = loaded_cache_key ~float_mode ~manifest_profile circle_id info in
     begin
       match Hashtbl.find_opt loaded_cache cache_key with
       | Some entry ->
@@ -367,6 +376,7 @@ let load
                 let* wasm_descriptor_result =
                   Octra_core.Circle_wasm_host.describe
                     ~execution_profile:manifest_profile
+                    ~float_mode
                     code_b64 in
                 begin
                   match wasm_descriptor_result with

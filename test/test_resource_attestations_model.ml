@@ -281,7 +281,7 @@ let check_storage_verifier () =
 
 let check_useful_work_verifier () =
   let challenge = hash '\041' in
-  let input = "bounded deterministic computation task" in
+  let input = "finite deterministic computation task" in
   let iterations = 64 in
   let result =
     match Resource_attestations.useful_hash_chain_result ~input ~iterations with
@@ -487,7 +487,7 @@ let check_circle_asset_plugin () =
   assert_true "circle asset accepts" (verify attestation evidence);
   assert_true "circle asset rejects root" (not (verify attestation bad_evidence))
 
-let check_snapshot_availability_plugin () =
+let check_snapshot_availability () =
   let challenge = hash '\081' in
   let left_chunk = "snapshot left range" in
   let right_chunk = "snapshot right range" in
@@ -590,14 +590,14 @@ let check_deterministic_trace_plugin () =
 
 let find_perturbed_matrix_nonce ~challenge ~difficulty_bits evidence =
   let rec loop attempt =
-    let candidate = Resource_attestations.{ evidence with opening_nonce = string_of_int attempt } in
-    if Resource_attestations.leading_zero_bits (Resource_attestations.perturbed_matrix_opening_hash ~challenge candidate) >= difficulty_bits
-    then candidate
+    let perturbed = Resource_attestations.{ evidence with opening_nonce = string_of_int attempt } in
+    if Resource_attestations.leading_zero_bits (Resource_attestations.perturbed_matrix_opening_hash ~challenge perturbed) >= difficulty_bits
+    then perturbed
     else loop (attempt + 1)
   in
   loop 0
 
-let check_perturbed_matrix_trace_plugin () =
+let check_matrix_trace () =
   let challenge = hash '\101' in
   let difficulty_bits = 8 in
   let evidence_without_trace =
@@ -746,13 +746,13 @@ let capture_probability trials alpha =
 let check_capture_probability () =
   let alpha_20_committee_256 = capture_probability 256 0.20 in
   let alpha_25_committee_512 = capture_probability 512 0.25 in
-  let bound_20_committee_256 =
+  let maximum_20_committee_256 =
     Resource_attestations.committee_capture_bound
       ~committee_size:256
       ~adversarial_fraction:0.20
       ~capture_fraction:(1.0 /. 3.0)
   in
-  let bound_25_committee_512 =
+  let maximum_25_committee_512 =
     Resource_attestations.committee_capture_bound
       ~committee_size:512
       ~adversarial_fraction:0.25
@@ -760,12 +760,12 @@ let check_capture_probability () =
   in
   Printf.printf "capture_probability_alpha_20_m_256 = %.12g\n" alpha_20_committee_256;
   Printf.printf "capture_probability_alpha_25_m_512 = %.12g\n" alpha_25_committee_512;
-  Printf.printf "capture_bound_alpha_20_m_256 = %.12g\n" bound_20_committee_256;
-  Printf.printf "capture_bound_alpha_25_m_512 = %.12g\n" bound_25_committee_512;
+  Printf.printf "capture_maximum_alpha_20_m_256 = %.12g\n" maximum_20_committee_256;
+  Printf.printf "capture_maximum_alpha_25_m_512 = %.12g\n" maximum_25_committee_512;
   assert_true "capture alpha 20" (alpha_20_committee_256 < 0.00001);
   assert_true "capture alpha 25" (alpha_25_committee_512 < 0.001);
-  assert_true "bound covers alpha 20" (bound_20_committee_256 >= alpha_20_committee_256);
-  assert_true "bound covers alpha 25" (bound_25_committee_512 >= alpha_25_committee_512)
+  assert_true "maximum covers alpha 20" (maximum_20_committee_256 >= alpha_20_committee_256);
+  assert_true "maximum covers alpha 25" (maximum_25_committee_512 >= alpha_25_committee_512)
 
 let () =
   check_qc_intersection ();
@@ -782,9 +782,9 @@ let () =
   check_pvac_kat_plugin ();
   check_fhe_receipt_plugin ();
   check_circle_asset_plugin ();
-  check_snapshot_availability_plugin ();
+  check_snapshot_availability ();
   check_deterministic_trace_plugin ();
-  check_perturbed_matrix_trace_plugin ();
+  check_matrix_trace ();
   check_decision_determinism ();
   check_capture_probability ();
   Printf.printf "resource_attestation_model = ok\n"

@@ -55,7 +55,7 @@ module Address = struct
         String.make (44 - String.length base58_hash) '1' ^ base58_hash
       else base58_hash in
       "oct" ^ padded
-    with _ -> ""
+    with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> ""
 
   let verify_address_pubkey addr pubkey =
     let expected = address_from_pubkey pubkey in
@@ -72,7 +72,7 @@ module WalletKey = struct
         let pk = Mirage_crypto_ec.Ed25519.pub_of_priv sk in
         let pub_b64 = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets pk) in
         Address.address_from_pubkey pub_b64 = addr
-    with _ -> false
+    with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> false
 end
 
 module FheBalance = struct
@@ -117,14 +117,16 @@ module FheBalance = struct
       let b64 = String.sub s prefix_len (String.length s - prefix_len) in
       let raw = Base64.decode_exn b64 in
       Ok (Pvac_ffi.deserialize_cipher ~strict ~cap (Bytes.of_string raw))
-    with e -> Error (Printexc.to_string e)
+    with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e)
 
   let public_cipher s =
-    if s = "0" || s = "" || not (is_fhe_cipher s) then s
+    if s = "0" || s = "" || not (String.starts_with ~prefix s) then Ok s
     else
       match decode_cipher s with
-      | Ok ct -> encode_cipher_public ct
-      | Error _ -> "0"
+      | Ok ct ->
+        (try Ok (encode_cipher_public ct)
+         with (Out_of_memory | Stack_overflow) as error -> raise error | exn -> Error (Printexc.to_string exn))
+      | Error _ as error -> error
 
   let cipher_has_key_bound_material ?(cap = true) s =
     match decode_cipher ~cap s with
@@ -159,7 +161,7 @@ module FheBalance = struct
     | None | Some "0" | Some "" ->
       Ok (encode_cipher delta)
     | Some s when not (is_fhe_cipher s) ->
-      Ok (encode_cipher delta)
+      Error "unsupported encrypted balance format"
     | Some s ->
       (match decode_cipher s with
        | Error e -> Error ("decode current: " ^ e)
@@ -186,12 +188,14 @@ module FheBalance = struct
 
   let load_pubkey blob =
     try Pvac_ffi.deserialize_pubkey (Bytes.of_string blob)
-    with e ->
+    with (Out_of_memory | Stack_overflow) as error -> raise error
+    | e ->
       failwith (Printf.sprintf "load_pubkey failed: %s" (Printexc.to_string e))
 
   let load_pubkey_result blob =
     try Ok (Pvac_ffi.deserialize_pubkey (Bytes.of_string blob))
-    with e -> Error (Printf.sprintf "load_pubkey failed: %s" (Printexc.to_string e))
+    with (Out_of_memory | Stack_overflow) as error -> raise error
+    | e -> Error (Printf.sprintf "load_pubkey failed: %s" (Printexc.to_string e))
 
   let pubkey_supports_alias_rejection pk =
     Pvac_ffi.pubkey_supports_alias_rejection pk
@@ -206,7 +210,7 @@ module FheBalance = struct
       | Error e -> Error e
       | Ok cipher ->
         (try Ok (Pvac_ffi.cipher_base_layers cipher)
-         with e -> Error (Printexc.to_string e))
+         with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e))
 
   let cipher_is_wrapped_scalar ?(strict = false) ?(cap = true) cipher_str =
     match decode_cipher ~strict ~cap cipher_str with
@@ -229,7 +233,7 @@ module FheBalance = struct
               layers)
         else
           Ok (encode_cipher cipher)
-      with e ->
+      with (Out_of_memory | Stack_overflow) as error -> raise error | e ->
         Error ("encrypted balance result shape failed: " ^ Printexc.to_string e)
 
   let check_private_input ?(cap = true) cipher_str =
@@ -348,7 +352,7 @@ module FheBalance = struct
       let b64 = String.sub s range_proof_prefix_len (String.length s - range_proof_prefix_len) in
       let raw = Base64.decode_exn b64 in
       Ok (Pvac_ffi.deserialize_range_proof (Bytes.of_string raw))
-    with e -> Error (Printexc.to_string e)
+    with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e)
 
   let zero_proof_prefix = "zkzp_v2|"
   let zero_proof_prefix_len = 8
@@ -366,7 +370,7 @@ module FheBalance = struct
       let raw = Base64.decode_exn b64 in
       if String.length raw < 50 then Error "zero proof too small to be valid"
       else Ok (Pvac_ffi.deserialize_zero_proof (Bytes.of_string raw))
-    with e -> Error (Printexc.to_string e)
+    with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e)
 
   let verify_zero ?(math = false) pk cipher_str zero_proof_str =
     match decode_cipher cipher_str, decode_zero_proof zero_proof_str with
@@ -392,7 +396,7 @@ module FheBalance = struct
       match decode_cipher ~strict ~cap:strict cipher_str with
       | Ok ct -> Pvac_ffi.verify_range_any ~math pk ct (Bytes.of_string raw) strict
       | Error _ -> false
-    with _ -> false
+    with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> false
 
   let verify_range ?(math = false) ~strict pk cipher_str range_proof_str =
     verify_range_any ~math ~strict pk cipher_str range_proof_str
@@ -418,7 +422,7 @@ module FheBalance = struct
            Error "amount_commitment must be 32 bytes"
          else if verifier pk ct zp commitment_bytes then Ok ()
          else Error "bound zero proof verification failed"
-       with e -> Error ("bad amount_commitment: " ^ Printexc.to_string e))
+       with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error ("bad amount_commitment: " ^ Printexc.to_string e))
     | Error e, _ -> Error ("bad claim cipher: " ^ e)
     | _, Error e -> Error ("bad zero proof: " ^ e)
 
@@ -474,7 +478,7 @@ module FheBalance = struct
             else Error "bound zero proof verification failed"
           | Error e, _ -> Error ("bad cipher: " ^ e)
           | _, Error e -> Error ("bad zero proof: " ^ e)
-    with e -> Error ("verify_encrypt_proof: " ^ Printexc.to_string e)
+    with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error ("verify_encrypt_proof: " ^ Printexc.to_string e)
 
   let compute_amount_commitment (amount : int64) (blinding : bytes) =
     Pvac_ffi.pedersen_commit_amount amount blinding
@@ -502,7 +506,7 @@ module PrivateTransferV2 = struct
       let int_k k = match get k with Some (`Int i) -> Ok i | _ -> Error ("missing " ^ k) in
       let str_k k = match get k with Some (`String s) -> Ok s | _ -> Error ("missing " ^ k) in
       let amount_of = function
-        | Some (`String s) -> (try Ok (Z.of_string s) with _ -> Error "invalid amount")
+        | Some (`String s) -> (try Ok (Z.of_string s) with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> Error "invalid amount")
         | Some (`Int n) -> Ok (Z.of_int n)
         | _ -> Error "missing amount"
       in
@@ -634,8 +638,8 @@ module StealthAddress = struct
         let key = Mirage_crypto.AES.GCM.of_secret (String.sub shared_secret 0 32) in
         match Mirage_crypto.AES.GCM.authenticate_decrypt ~key ~nonce ct_with_tag with
         | None -> Error "AES-GCM auth failed"
-        | Some plain -> (try Ok (Z.of_string plain) with _ -> Error "invalid amount string")
-    with e -> Error (Printexc.to_string e)
+        | Some plain -> (try Ok (Z.of_string plain) with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> Error "invalid amount string")
+    with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e)
 
   let validator_amount_domain = "OCTRA_VALIDATOR_AMOUNT_V1"
 
@@ -722,7 +726,7 @@ module PrivateTransferV3 = struct
       let str_k k = match get k with Some (`String s) -> Ok s | _ -> Error ("missing " ^ k) in
       let opt_str k = match get k with Some (`String s) -> s | _ -> "" in
       let opt_amount = function
-        | Some (`String s) -> (try Z.of_string s with _ -> Z.zero)
+        | Some (`String s) -> (try Z.of_string s with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> Z.zero)
         | Some (`Int n) -> Z.of_int n
         | _ -> Z.zero
       in
@@ -780,7 +784,7 @@ module StealthClaimData = struct
       let str_k k = match get k with Some (`String s) -> Ok s | _ -> Error ("missing " ^ k) in
       let opt_str k = match get k with Some (`String s) -> s | _ -> "" in
       let opt_amount = function
-        | Some (`String s) -> (try Z.of_string s with _ -> Z.zero)
+        | Some (`String s) -> (try Z.of_string s with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> Z.zero)
         | Some (`Int n) -> Z.of_int n
         | _ -> Z.zero
       in

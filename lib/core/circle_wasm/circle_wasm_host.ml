@@ -123,7 +123,7 @@ let read_process_json payload =
   Circle_wasm_hfhe_backend.ensure_registered ();
   let body = Yojson.Safe.to_string payload in
   let* native =
-    Lwt_preemptive.detach
+    Exec_resource.detach
       (fun () -> Circle_wasm_native.run_json_classified body)
       ()
   in
@@ -606,10 +606,15 @@ let profile_name = function
   | Manifest -> "manifest"
   | Compute -> "compute"
 
-let validate ?(execution_profile=Standard) code_b64 =
+let float_id = "wasm_float:arith_nan_7fc00000_7ff8000000000000:operand_calls:metered_helpers:v1"
+
+let float_enabled = function Rule_graph.Active -> true | Rule_graph.Prior -> false
+
+let validate ?(execution_profile=Standard) ?(float_mode=Rule_graph.Prior) code_b64 =
   let payload =
     `Assoc [
       "action", `String "validate";
+      "float_mode", `Bool (float_enabled float_mode);
       "code_b64", `String code_b64;
       "execution_profile", `String (profile_name execution_profile);
     ] in
@@ -620,10 +625,11 @@ let validate ?(execution_profile=Standard) code_b64 =
   | Ok json ->
     Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
-let describe ?(execution_profile=Standard) code_b64 =
+let describe ?(execution_profile=Standard) ?(float_mode=Rule_graph.Prior) code_b64 =
   let payload =
     `Assoc [
       "action", `String "describe";
+      "float_mode", `Bool (float_enabled float_mode);
       "code_b64", `String code_b64;
       "execution_profile", `String (profile_name execution_profile);
     ] in
@@ -651,6 +657,7 @@ let execute_with_profile
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -705,6 +712,7 @@ let execute_with_profile
     let payload =
       `Assoc [
         "action", `String "execute";
+        "float_mode", `Bool (float_enabled float_mode);
         "code_cache_key", `String code_key;
         "code_b64",
         begin
@@ -924,6 +932,7 @@ let execute
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -944,6 +953,7 @@ let execute
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -970,6 +980,7 @@ let execute_compute_with_storage_inner
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -988,6 +999,7 @@ let execute_compute_with_storage_inner
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -1013,6 +1025,7 @@ let execute_compute_with_storage
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1033,6 +1046,7 @@ let execute_compute_with_storage
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -1054,6 +1068,7 @@ let execute_compute_isolated_with_storage
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1074,6 +1089,7 @@ let execute_compute_isolated_with_storage
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit
@@ -1093,6 +1109,7 @@ let execute_compute
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
@@ -1112,6 +1129,7 @@ let execute_compute
     ~hfhe_active_key
     ~hfhe_strict
     ~math
+    ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit

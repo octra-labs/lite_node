@@ -238,4 +238,4 @@ let () =
   test_reject ();
   test_crash ();
   test_commit_failure_bubbles ();
-  print_endline "test_direct_exec: ok"
+  print_endline "status = pass test = direct_exec"

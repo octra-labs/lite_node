@@ -238,7 +238,7 @@ let rec event_type = function
   | [typ] -> core_type typ
   | typ :: rest ->
     Option.bind (core_type typ) (fun head ->
-      Option.map (fun tail -> C_type.Pair (head, tail)) (event_type rest))
+      Option.map (fun remainder -> C_type.Pair (head, remainder)) (event_type rest))
 
 let rec fault_type = function
   | C_type.Unit | C_type.Bool | C_type.Int | C_type.Num _ | C_type.Bytes _ -> true
@@ -339,8 +339,8 @@ let event_values types payload =
     | [], C_eval.Unit -> Some (List.rev out)
     | [typ], value ->
       Option.map (fun item -> List.rev (item :: out)) (scalar typ value)
-    | typ :: rest, C_eval.Pair (head, tail) ->
-      Option.bind (scalar typ head) (fun item -> walk (item :: out) rest tail)
+    | typ :: rest, C_eval.Pair (head, remainder) ->
+      Option.bind (scalar typ head) (fun item -> walk (item :: out) rest remainder)
     | [], _ | _ :: _, _ -> None
   in
   walk [] types payload

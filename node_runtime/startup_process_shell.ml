@@ -210,6 +210,7 @@ let configure_lwt_engine () =
 let initialize_crypto exit_fatal =
   try
     Mirage_crypto_rng_unix.use_default ();
+    Zk_ffi.initialize ();
     Octra_log.info "init" "crypto = initialized"
   with e ->
     Octra_log.fatal "init" "crypto = failed error = %s" (Printexc.to_string e);

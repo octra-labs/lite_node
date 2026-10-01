@@ -11,7 +11,7 @@ type error =
   | Label_space of int
   | Input of C_type.t
   | Output of C_type.t
-  | Tail
+  | Missing_stop
   | Verify
   | Bits
   | Count of int

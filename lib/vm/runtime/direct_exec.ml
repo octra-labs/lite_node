@@ -58,6 +58,7 @@ let run spec io =
       match exn with
       | Tx_effects.Commit_failed _
       | Stack_overflow
+      | Octra_core.Exec_resource.Unavailable _
       | Out_of_memory -> Lwt.fail exn
       | _ ->
         io.crash

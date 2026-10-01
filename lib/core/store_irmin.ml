@@ -203,13 +203,12 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     path
   in
   let* repo = Store.Repo.v config in
+  Lwt.catch (fun () ->
   let* store = Store.main repo in
   let* tags, split_epoch = load_tags repo in
   let* checked_split = check_split repo store split_epoch in
-  let* () =
-    if not readonly && checked_split <> split_epoch then clear_splits repo path
-    else Lwt.return_unit
-  in
+  if checked_split <> split_epoch then
+    Octra_log.warn "gc" "event = split_unverified action = retained";
   let counter = ref 0L in
   let* v = Store.find store ["index"; "stealth_counter"] in
   (match v with
@@ -217,7 +216,7 @@ let open_store ?(fresh=false) ?(readonly=false) path =
      (try counter := Int64.of_string s
       with e ->
 
-        let msg = Printf.sprintf "FATAL: stealth_counter corrupt value=%S: %s"
+        let msg = Printf.sprintf "stealth_counter corrupt value = %S: %s"
           s (Printexc.to_string e) in
         Octra_log.fatal "irmin"
           "event = stealth_counter_corrupt value = %S error = %s"
@@ -238,7 +237,9 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     store_path = path;
     pvac_dir = pvac_dir_of_store_path path;
     state_root_file = state_root_file_of_store_path path;
-  }
+  }) (fun error ->
+    let* () = Store.Repo.close repo in
+    Lwt.fail error)
 
 let close t =
   Store.Repo.close t.repo
@@ -257,7 +258,7 @@ let write t path value =
     (match result with
      | Ok () -> Lwt.return_unit
      | Error e ->
-       let msg = Printf.sprintf "Irmin write failed path=%s: %s"
+       let msg = Printf.sprintf "Irmin write failed path = %s: %s"
          (String.concat "/" path)
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
        Octra_log.fatal "irmin" "event = write_failed path = %s error = %s"
@@ -303,7 +304,7 @@ let remove_path t path =
     (match result with
      | Ok () -> Lwt.return_unit
      | Error e ->
-       let errmsg = Printf.sprintf "Irmin remove failed path=%s: %s"
+       let errmsg = Printf.sprintf "Irmin remove failed path = %s: %s"
          (String.concat "/" path)
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
        Octra_log.fatal "irmin" "event = remove_failed path = %s error = %s"
@@ -332,7 +333,7 @@ let commit_epoch_batch t msg =
        t.account_mode <- Rule_graph.Prior;
        Lwt.return_unit
      | Error e ->
-       let errmsg = Printf.sprintf "Irmin commit_epoch_batch failed msg=%s: %s" msg
+       let errmsg = Printf.sprintf "Irmin commit_epoch_batch failed msg = %s: %s" msg
          (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
        Octra_log.fatal "irmin"
          "event = epoch_commit_failed message = %s error = %s"
@@ -2118,6 +2119,8 @@ type integrity_result = {
   errors : string list;
 }
 
+let root_fault_prefix = "event = saved_root_mismatch "
+
 let verify_integrity t =
   let errors = ref [] in
   let err msg = errors := msg :: !errors in
@@ -2125,7 +2128,7 @@ let verify_integrity t =
   match head_opt with
   | None ->
     Lwt.return { ok = false; head_hash = ""; accounts_sampled = 0;
-                 accounts_ok = 0; errors = ["no head commit — store empty or corrupted"] }
+                 accounts_ok = 0; errors = ["event = store_integrity reason = head_missing"] }
   | Some commit ->
     let head_tree = Store.Commit.tree commit in
     let head_hash =
@@ -2196,7 +2199,7 @@ let verify_integrity t =
     in
     (match saved_root with
      | Some expected when expected <> head_hash ->
-       err (Printf.sprintf "STATE ROOT MISMATCH: saved=%s actual=%s — possible data corruption!" expected head_hash)
+       err (Printf.sprintf "%ssaved = %s actual = %s" root_fault_prefix expected head_hash)
      | _ -> ());
     let final_errors = List.rev !errors in
     Lwt.return { ok = (final_errors = []); head_hash;
@@ -2206,9 +2209,17 @@ let verify_integrity t =
 let save_state_root t =
   let* h = state_hash t in
   if h <> "empty" then begin
-    let oc = open_out_bin t.state_root_file in
-    output_string oc h;
-    close_out oc;
+    let staged = t.state_root_file ^ ".staged" in
+    let channel = open_out_bin staged in
+    Fun.protect ~finally:(fun () -> close_out_noerr channel) (fun () ->
+      output_string channel h;
+      flush channel;
+      Unix.fsync (Unix.descr_of_out_channel channel);
+      close_out channel);
+    Unix.rename staged t.state_root_file;
+    let fd = Unix.openfile (Filename.dirname t.state_root_file)
+      [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd);
     Lwt.return_unit
   end else Lwt.return_unit
 
@@ -2312,7 +2323,7 @@ let commit_bulk t tree msg =
   (match result with
    | Ok () -> Lwt.return_unit
    | Error e ->
-     let errmsg = Printf.sprintf "Irmin commit_bulk failed msg=%s: %s" msg
+     let errmsg = Printf.sprintf "Irmin commit_bulk failed msg = %s: %s" msg
        (Fmt.to_to_string (Irmin.Type.pp_json Store.write_error_t) e) in
      Octra_log.fatal "irmin"
        "event = bulk_commit_failed message = %s error = %s"

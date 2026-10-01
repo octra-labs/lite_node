@@ -7,6 +7,9 @@ type bundle = {
   receipts_json : string list;
 }
 
+val validate_bundle :
+  Octra_consensus.C_types.finalize -> bundle -> (unit, string) result
+
 type record = {
   finalize : Octra_consensus.C_types.finalize;
   validator_set : Octra_consensus.C_types.validator_set;

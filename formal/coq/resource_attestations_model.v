@@ -148,7 +148,7 @@ Qed.
 
 Fixpoint dust count values :=
   match count, values with
-  | S rest, value :: tail => value + 1 :: dust rest tail
+  | S rest, value :: suffix => value + 1 :: dust rest suffix
   | _, _ => values
   end.
 
@@ -250,7 +250,7 @@ Definition attestation_influence value :=
 Fixpoint influence values :=
   match values with
   | nil => 0
-  | cons head tail => attestation_influence head + influence tail
+  | cons head suffix => attestation_influence head + influence suffix
   end.
 
 Theorem attestation_sybil_invariance :
@@ -287,12 +287,12 @@ Definition weighted_binomial_term total selected adversarial honest :=
   * pow_nat adversarial selected
   * pow_nat honest (total - selected).
 
-Fixpoint weighted_tail_count total selected count adversarial honest :=
+Fixpoint weighted_threshold_count total selected count adversarial honest :=
   match count with
   | 0 => 0
   | S rest =>
       weighted_binomial_term total selected adversarial honest
-      + weighted_tail_count total (S selected) rest adversarial honest
+      + weighted_threshold_count total (S selected) rest adversarial honest
   end.
 
 Definition capture_threshold committee_size :=
@@ -300,7 +300,7 @@ Definition capture_threshold committee_size :=
 
 Definition weighted_capture_numerator committee_size threshold adversarial honest :=
   if threshold <=? committee_size then
-    weighted_tail_count
+    weighted_threshold_count
       committee_size
       threshold
       (S (committee_size - threshold))
@@ -318,7 +318,7 @@ Definition rational_limit_holds committee_size threshold adversarial honest limi
 Definition committee_captured committee_size adversarial_selected :=
   3 * adversarial_selected > committee_size.
 
-Theorem capture_tail_zero_above_size :
+Theorem capture_zero_above_size :
   forall committee_size threshold adversarial honest,
     threshold > committee_size ->
     weighted_capture_numerator committee_size threshold adversarial honest = 0.
@@ -346,7 +346,7 @@ Proof.
   reflexivity.
 Qed.
 
-Example capture_tail_half_5_threshold_2 :
+Example capture_half_5_threshold_2 :
   weighted_capture_numerator 5 2 1 1 = 26.
 Proof.
   reflexivity.

@@ -97,9 +97,9 @@ let order (names : field list) values get =
     let rec walk (names : field list) values =
       match names, values with
       | [], [] -> Ok ()
-      | field :: rest, value :: tail ->
+      | field :: rest, value :: remainder ->
           let got = get value in
-          if C_syn.name_equal field.name got then walk rest tail
+          if C_syn.name_equal field.name got then walk rest remainder
           else Error (Order (C_syn.name_text field.name, C_syn.name_text got))
       | _ -> Error (Items (expected, actual))
     in
@@ -138,7 +138,7 @@ let picks (fields : field list) (values : pick list) =
   let rec walk fields values =
     match fields, values with
     | [], [] -> Ok ()
-    | field :: rest, item :: tail ->
+    | field :: rest, item :: remainder ->
         let* expected = Result.map_error (fun error -> Low error)
           (C_low.typ field.typ) in
         let* actual = Result.map_error (fun error -> Low error)
@@ -149,7 +149,7 @@ let picks (fields : field list) (values : pick list) =
           let mode = needed expected in
           if item.bind.mul <> mode then
             Error (Mode (C_syn.name_text field.name, mode, item.bind.mul))
-          else walk rest tail
+          else walk rest remainder
     | _ -> Error (Items (List.length fields, List.length values))
   in
   walk fields values
@@ -162,7 +162,7 @@ let next seed =
 let rec open_fields seed (fields : field list) (picks : pick list) value body =
   match fields, picks with
   | [_], [item] -> Ok (C_syn.Let (item.bind, value, body))
-  | _ :: rest, item :: tail ->
+  | _ :: rest, item :: remainder ->
       begin
         match prod rest with
         | None -> Error Empty
@@ -172,7 +172,7 @@ let rec open_fields seed (fields : field list) (picks : pick list) value body =
               (C_low.typ right) in
             let bind = C_syn.bind name (needed right_core) right in
             let* seed = next seed in
-            let* body = open_fields seed rest tail (C_syn.Var name) body in
+            let* body = open_fields seed rest remainder (C_syn.Var name) body in
             Ok (C_syn.Unpair (value, item.bind, bind, body))
       end
   | _ -> Error Empty

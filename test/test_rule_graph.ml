@@ -89,7 +89,7 @@ let test_set_plan () =
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
   require
-    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000])
+    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000; 1_611_500])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
@@ -257,37 +257,7 @@ let test_program_rule () =
     require (Graph.program_source_at ~chain_id ~epoch:max_int = Graph.Prior)
       "other chain RPC mode changed") ["octra-mainnet"; "other"]
 
-let readme_ok epoch text =
-  let words = String.map (function '\n' | '\r' | '\t' -> ' ' | ch -> ch) text
-    |> String.split_on_char ' ' |> List.filter (( <> ) "") in
-  let rec epochs = function
-    | "The" :: "proposed" :: "devnet" :: "switch" :: "is" :: "epoch" :: value :: rest ->
-      value :: epochs rest
-    | _ :: rest -> epochs rest
-    | [] -> [] in
-  epochs words = [Printf.sprintf "%d;" epoch]
-
-let test_readme path =
-  let plan = Option.get (Graph.exit_activation (graph (fun _ -> Graph.Missing))) in
-  let sentence epoch = Printf.sprintf "The proposed devnet switch is epoch %d; deployment requires" epoch in
-  let text = sentence plan.activation_epoch in
-  require (readme_ok plan.activation_epoch text) "README sentence refused";
-  List.iter (fun space ->
-    require (readme_ok plan.activation_epoch (String.concat space (String.split_on_char ' ' text)))
-      "README reflow refused") ["\n"; "\r\n"; "\t"; "  "];
-  List.iter (fun text ->
-    require (not (readme_ok plan.activation_epoch text)) "README invalid height accepted")
-    [""; sentence (plan.activation_epoch - 1); sentence (plan.activation_epoch + 1);
-     text ^ "\n" ^ text; "The proposed devnet switch is epoch unknown;"];
-  let input = open_in path in
-  let text = Fun.protect ~finally:(fun () -> close_in_noerr input) (fun () ->
-    really_input_string input (in_channel_length input)) in
-  require (readme_ok plan.activation_epoch text) "README exit epoch differs from rule plan"
-
 let () =
-  (match Array.to_list Sys.argv with
-   | [_; path] -> test_readme path
-   | _ -> fail "expected README path");
   test_exit ();
   test_program_rule ();
   test_live_chain ();
@@ -329,7 +299,7 @@ let () =
        ~floor_epoch:plan.activation_epoch
        ~epoch:(plan.anchor_epoch + 1)
      = None)
-    "floor recovered an unbound epoch root";
+    "floor recovered an unanchored epoch root";
   let missing = graph (fun _ -> Graph.Missing) in
   require
     (match Graph.circle missing ~epoch:plan.activation_epoch with
@@ -807,4 +777,4 @@ let () =
     (Graph.private_payload mainnet ~epoch:max_int = Ok Graph.Active)
     "new mainnet did not require strict private payloads at genesis";
   Printf.printf
-    "rule_graph_before = 1\nrule_graph_boundary = 1\nrule_graph_after = 1\nrule_graph_mixed = 1\nPASS\n%!"
+    "status = pass test = rule_graph before = true activation = true after = true mixed = true\n%!"

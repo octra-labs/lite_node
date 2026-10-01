@@ -416,7 +416,8 @@ let node_standard_adapters
     read_prev_ledger_root = runtime.read_prev_ledger_root;
     staging_txs = Staging.all;
     staging_epoch_txs = (fun () ->
-      let accept = match runtime.cached_head () with
+      let head = runtime.cached_head () in
+      let accept = match head with
         | Some head when head.epoch_id < max_int
           && Octra_core.Rule_graph.ready_exec_at ~chain_id:runtime.chain_id
                ~epoch:(head.epoch_id + 1) = Octra_core.Rule_graph.Active ->
@@ -443,6 +444,12 @@ let node_standard_adapters
                    | Error _ -> false))
         | _ -> (fun _ -> true)
       in
+      let accept tx = accept tx && match head with
+        | Some head when head.epoch_id < max_int ->
+          Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id:runtime.chain_id
+            ~epoch:(Int64.of_int (head.epoch_id + 1)) [tx])
+        | Some _ -> false
+        | None -> true in
       Staging.ready_epoch_txs
         ~accept
         ~capacity:runtime.staging_epoch_capacity
@@ -470,7 +477,9 @@ let preview_with_optional_catch ~catch_exn ~warn run =
   if catch_exn then
     Lwt.catch
       run
-      (fun exn ->
+      (function
+      | Octra_core.Exec_resource.Exhausted _ as exn -> Lwt.fail exn
+      | exn ->
         let reason = Printexc.to_string exn in
         warn reason;
         Lwt.return (Stdlib.Error reason))
@@ -766,7 +775,7 @@ let before_precommit (deps : deps) ~epoch_id ~round ~proposal_id ~proposed_state
       ~proposal_wire
       ~vote_wire)
 
-let config (deps : deps) =
+let config ?private_slots (deps : deps) =
   Octra_consensus.C_driver.{
     chain_id = deps.chain_id;
     my_addr = deps.my_addr;
@@ -800,6 +809,7 @@ let config (deps : deps) =
         finalize);
     make_proposal = (fun epoch_id ->
       Consensus_proposal.make_proposal
+        ?private_slots
         (make_proposal_deps deps)
         ~chain_id:deps.chain_id
         ~root_to_raw32:deps.root_to_raw32
@@ -819,9 +829,9 @@ let config (deps : deps) =
     resource_committee_config = None;
   }
 
-let config_with_standard (input : config_with_standard_input) =
+let config_with_standard ?private_slots (input : config_with_standard_input) =
   let standard = input.standard in
-  config
+  config ?private_slots
     {
       chain_id = input.chain_id;
       my_addr = input.my_addr;
@@ -881,7 +891,17 @@ let config_with_standard (input : config_with_standard_input) =
     }
 
 let node_driver_config (runtime : node_driver_config_runtime) =
+  let getenv = runtime.standard.getenv in
+  let private_limits = Startup_runtime_limits.private_limits {
+    opt = getenv;
+    int_value = (fun name default ->
+      Option.value ~default (Option.bind (getenv name) int_of_string_opt));
+  } in
   config_with_standard
+    ~private_slots:Octra_core.Private_slots.{
+      fhe = private_limits.max_fhe_per_epoch;
+      stealth = private_limits.max_stealth_per_epoch;
+    }
     {
       standard = node_standard_adapters ~parent:(fun ~epoch_id ->
         Result.bind (runtime.load_parent_commit ~epoch_id) (fun parent ->

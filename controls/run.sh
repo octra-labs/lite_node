@@ -49,6 +49,7 @@ pm2 start "$OCTRA_OPERATOR_BINARY" \
   --name "$OCTRA_OPERATOR_PM2_NAME" \
   --cwd "$ROOT" \
   --interpreter none \
+  --stop-exit-codes 78 \
   --merge-logs \
   --output "$OCTRA_OPERATOR_LOG_DIR/node.log" \
   --error "$OCTRA_OPERATOR_LOG_DIR/node.log"

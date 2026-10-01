@@ -172,7 +172,7 @@ let test_partition () =
       tx_count = 0;
     } in
     let result = P.verify_preview_partition
-      ~candidates:[tx] ~confirmed:[] ~rejections
+      ~inputs:[tx] ~confirmed:[] ~rejections
       (Ok X.{post_state_root = root; artifacts}) in
     match mode with
     | R.Prior -> expect "reproduction missing" (result = Error "preview_rejection_mismatch")

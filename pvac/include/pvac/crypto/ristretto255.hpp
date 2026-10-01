@@ -19,7 +19,7 @@ struct Fe25519 {
 static constexpr uint64_t FE_MASK51 = (1ULL << 51) - 1;
 
 inline Fe25519 fe_zero() { return {{0,0,0,0,0}}; }
-inline Fe25519 fe_one()  { return {{1,0,0,0,0}}; }
+inline Fe25519 fe_one() { return {{1,0,0,0,0}}; }
 
 inline Fe25519 fe_reduce(Fe25519 h) {
     uint64_t c;
@@ -43,10 +43,10 @@ inline Fe25519 fe_sub(const Fe25519& f, const Fe25519& g) {
 
     Fe25519 h;
     h.v[0] = (f.v[0] + ((1ULL << 52) - 38)) - g.v[0];
-    h.v[1] = (f.v[1] + ((1ULL << 52) - 2))  - g.v[1];
-    h.v[2] = (f.v[2] + ((1ULL << 52) - 2))  - g.v[2];
-    h.v[3] = (f.v[3] + ((1ULL << 52) - 2))  - g.v[3];
-    h.v[4] = (f.v[4] + ((1ULL << 52) - 2))  - g.v[4];
+    h.v[1] = (f.v[1] + ((1ULL << 52) - 2)) - g.v[1];
+    h.v[2] = (f.v[2] + ((1ULL << 52) - 2)) - g.v[2];
+    h.v[3] = (f.v[3] + ((1ULL << 52) - 2)) - g.v[3];
+    h.v[4] = (f.v[4] + ((1ULL << 52) - 2)) - g.v[4];
     return fe_reduce(h);
 }
 

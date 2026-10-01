@@ -47,7 +47,7 @@ let test_published_epoch () =
   in
   expect_effects [Cycle.Capture 140L] effects
 
-let test_epoch_regression () =
+let test_published_before_capture () =
   let policy = expect_ok (Cycle.policy ~interval:10L ~retain:2) in
   let state, _ =
     Cycle.init ~published:None
@@ -63,8 +63,8 @@ let test_epoch_regression () =
        })
   with
   | Error "sync published epoch precedes capture target" -> ()
-  | Error reason -> fail ("publication regression reason differs: " ^ reason)
-  | Ok _ -> fail "publication regression was accepted"
+  | Error reason -> fail ("publication before capture reason differs: " ^ reason)
+  | Ok _ -> fail "publication before capture was accepted"
 
 let mkdir path mode =
   if not (Sys.file_exists path) then Unix.mkdir path mode
@@ -156,11 +156,11 @@ let test_bridge_epoch_limit () =
 
 let () =
   test_published_epoch ();
-  test_epoch_regression ();
+  test_published_before_capture ();
   test_read_only_retention ();
   test_manifest_epoch_limit ();
   test_committed_epoch ();
   test_busy_delay ();
   test_publisher_mode ();
   test_bridge_epoch_limit ();
-  print_endline "test_state_sync_reliability: ok"
+  print_endline "status = pass test = state_sync_reliability"

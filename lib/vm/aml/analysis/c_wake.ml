@@ -57,8 +57,8 @@ let rec chain left keep typ seed item body =
     let bind = C_syn.bind keep C_type.Many typ in
     let next = C_syn.Let (item, seed, body) in
     let head = C_syn.KVec (typ, [C_syn.Var keep]) in
-    let tail = chain (left - 1) keep typ (C_syn.Var keep) item body in
-    C_syn.Let (bind, next, C_syn.Vcat (head, tail))
+    let remainder = chain (left - 1) keep typ (C_syn.Var keep) item body in
+    C_syn.Let (bind, next, C_syn.Vcat (head, remainder))
 
 let term keep count seed item body =
   if C_nat.equal count C_nat.zero then

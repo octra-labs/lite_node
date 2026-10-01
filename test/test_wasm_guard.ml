@@ -126,11 +126,49 @@ let commit_guard balance before_tbl changed_tbl =
           "circle commit guard changed storage")
 
 let () =
+  let module R = Octra_core.Rule_graph in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (R.wasm_float_activation_for_chain chain_id) in
+  need (plan.activation_epoch = 1_611_500) "WASM float activation changed";
+  need (R.fhe_work_activation_for_chain chain_id = Some plan)
+    "WASM float and FHE activations differ";
+  List.iter (fun epoch ->
+    let expected = if epoch < plan.activation_epoch then R.Prior else R.Active in
+    let graph = R.create ~chain_id ~root_at:(fun at ->
+      need (at = plan.anchor_epoch) "WASM float anchor epoch differs";
+      R.Root plan.anchor_state_root) in
+    need (R.wasm_float graph ~epoch = Ok expected) "WASM float mode differs";
+    need (R.wasm_float_at ~chain_id ~epoch = expected) "WASM profile mode differs";
+    let view_graph = R.create ~chain_id ~root_at:(fun at ->
+      let plans = List.filter_map Fun.id [
+        R.standard_activation graph; R.math_activation graph;
+        R.object_cost_activation graph; Some plan] in
+      match List.find_opt (fun (p : R.activation) -> p.anchor_epoch = at) plans with
+      | Some p -> R.Root p.anchor_state_root
+      | None -> R.Missing) in
+    let view = Result.get_ok (Octra_vm.Contract_rpc.view_profile view_graph ~epoch) in
+    need (view.wasm_float = expected) "WASM view mode differs";
+    List.iter (fun root ->
+      let graph = R.create ~chain_id ~root_at:(fun _ -> root) in
+      need
+        (if expected = R.Prior then R.wasm_float graph ~epoch = Ok R.Prior
+         else Result.is_error (R.wasm_float graph ~epoch))
+        "WASM float accepted unverified anchor")
+      [R.Missing; R.Unreadable "read failed"; R.Root "wrong"])
+    [1_601_500; plan.activation_epoch - 1; plan.activation_epoch;
+     plan.activation_epoch + 1];
+  List.iter (fun chain_id ->
+    let graph = R.create ~chain_id ~root_at:(fun _ -> R.Missing) in
+    need (R.wasm_float graph ~epoch:max_int = Ok R.Prior)
+      "WASM float activated on unapproved chain") ["octra-mainnet"; "local"];
   need
     (String.equal Transcript.consensus_id "receipt_mode:amount_link_v1")
     "circle hfhe consensus id changed";
   let prior_context = Exec.hfhe_context_hash ~math:false ~strict:false [] [] None in
   let active_context = Exec.hfhe_context_hash ~math:false ~strict:true [] [] None in
+  let float_context = Exec.hfhe_context_hash
+    ~float_mode:R.Active ~math:false ~strict:true [] [] None in
+  need (float_context <> active_context) "WASM float modes share receipt context";
   need
     (String.equal
        prior_context

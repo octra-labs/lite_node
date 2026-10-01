@@ -136,7 +136,7 @@ let validate getenv =
               | _ ->
                 if value = "devnet_private_v1" then
                   if getenv "OCTRA_EMISSION_GUARD" <> Some "1" then
-                    Error (value ^ " requires OCTRA_EMISSION_GUARD = 1")
+                    Error (value ^ " env = OCTRA_EMISSION_GUARD required_value = 1")
                   else
                     begin
                       match schedule with
@@ -145,7 +145,7 @@ let validate getenv =
                         Error (value ^ " rejects active emission")
                     end
                 else if getenv "OCTRA_EMISSION_GUARD" = Some "1" then
-                  Error (value ^ " rejects OCTRA_EMISSION_GUARD = 1")
+                  Error (value ^ " env = OCTRA_EMISSION_GUARD rejected_value = 1")
                 else
                   begin
                     match schedule with
@@ -309,11 +309,39 @@ let standard_hash ~chain_id ~epoch getenv =
       put_standard_component buf "ready_reference"
         Octra_core.Validator_ready_policy.window_id
     end;
-    match Octra_core.Rule_graph.program_source_at ~chain_id ~epoch with
+    begin match Octra_core.Rule_graph.program_source_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "program_source"
-        Octra_vm.Program_package.source_id)
+        Octra_vm.Program_package.source_id
+    end;
+    begin match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      let module VM = Octra_vm.Contract_vm in
+      let bases = List.map VM.effort_cost [
+        VM.FHE_ADD (0, 0, 0, 0); VM.FHE_SUB (0, 0, 0, 0);
+        VM.FHE_MUL (0, 0, 0, 0); VM.FHE_SCALE (0, 0, 0, 0);
+        VM.FHE_DIV_CONST (0, 0, 0, 0); VM.FHE_ADD_CONST (0, 0, 0, 0);
+        VM.FHE_SUB_CONST (0, 0, 0, 0); VM.FHE_SER (0, 0); VM.FHE_COMMIT (0, 0, 0)
+      ] in
+      put_standard_component buf "fhe_work"
+        (String.concat ":" (Octra_vm.Fhe_view_policy.consensus_id :: List.map string_of_int bases))
+    end;
+    begin match Octra_core.Rule_graph.wasm_float_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "wasm_float" Octra_core.Circle_wasm_host.float_id
+    end;
+    begin match Octra_core.Rule_graph.tx_envelope_at ~chain_id ~epoch:(Int64.of_int epoch) with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "transaction_envelope" Octra_core.Tx_envelope.consensus_id
+    end;
+    match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "program_preview" Octra_vm.Program_package.preview_id)
 
 let hash ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with

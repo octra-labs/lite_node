@@ -17,7 +17,6 @@ type deps = {
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
-  close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
 
@@ -30,9 +29,9 @@ let log_observer_mode observer =
   if observer then
     Log.info "init" "event = observer_mode epoch_production = false p2p_shadow = true"
 
-let run ?duty_head ?bft_mode deps =
+let run ?duty_head ?bft_mode ?(shutdown = fun () -> Lwt.return_unit) deps =
   log_observer_mode deps.observer;
-  Lwt_main.run (
+  Lwt_main.run (Lwt.finalize (fun () ->
     Startup_run_shell.run_node_runtime
       ?duty_head
       ?bft_mode
@@ -52,6 +51,5 @@ let run ?duty_head ?bft_mode deps =
         max_drift = deps.max_drift;
         driver_ref = deps.driver_ref;
         resource_compute = deps.resource_compute;
-        close_chaindata = deps.close_chaindata;
         exit_fatal = deps.exit_fatal;
-      })
+      }) shutdown)

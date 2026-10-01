@@ -28,17 +28,54 @@ if ! printf '%s\n' "$SOURCE_COMMIT" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; then
   exit 1
 fi
 
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum -c MANIFEST.sha256 >/dev/null
-elif command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 -c MANIFEST.sha256 >/dev/null
-else
-  printf 'status = refused reason = sha256_tool_missing\n' >&2
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'status = refused reason = python3_missing\n' >&2
   exit 1
 fi
 
-test -f nodes.config
-test -f octra_node.opam.locked
+PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+def refuse(reason, path):
+    print(f"status = refused reason = {reason} path = {path}", file = sys.stderr)
+    raise SystemExit(1)
+
+manifest = Path("MANIFEST.sha256")
+try:
+    lines = manifest.read_text(encoding = "utf-8").splitlines()
+except FileNotFoundError:
+    refuse("manifest_missing", manifest)
+except (OSError, UnicodeError):
+    refuse("manifest_unreadable", manifest)
+if not lines:
+    refuse("manifest_invalid", manifest)
+for line in lines:
+    entry = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+    if entry is None:
+        refuse("manifest_invalid", manifest)
+    expected, name = entry.groups()
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts:
+        refuse("manifest_invalid", manifest)
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        refuse("manifest_missing", path)
+    except OSError:
+        refuse("manifest_unreadable", path)
+    if digest.hexdigest() != expected:
+        refuse("manifest_mismatch", path)
+for name in ("nodes.config", "octra_node.opam.locked"):
+    if not Path(name).is_file():
+        refuse("file_missing", name)
+PY
+
 sh -n controls/check.sh
 sh -n controls/config_val.sh
 sh -n controls/enroll.sh
@@ -51,11 +88,7 @@ sh -n controls/build.sh
 sh -n controls/stat.sh
 sh -n controls/storage.sh
 sh -n controls/stop.sh
-
-if ! command -v python3 >/dev/null 2>&1; then
-  printf 'status = refused reason = python3_missing\n' >&2
-  exit 1
-fi
+sh -n controls/proof_gate.sh
 
 PYTHONDONTWRITEBYTECODE=1 python3 test/python_check.py
 
@@ -68,6 +101,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/surface.py "$ROOT"
 PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import sync_need, upgrade, validator_bundle, validator_config, validator_enroll, validator_guard, validator_process, validator_recover, validator_rejoin, validator_rpc, validator_status, validator_store'
 if [ "$TESTS" -eq 1 ]; then
   PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest controls/lib/test_validator_tools.py
+  sh controls/print_style_gate.sh
+  sh controls/proof_gate.sh
 fi
 if [ -f config/network.env ]; then
   PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/validator_bundle.py \

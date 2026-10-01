@@ -435,4 +435,4 @@ let () =
   test_read_only ();
   test_health ();
   test_error_map ();
-  print_endline "test_grpc: ok"
+  print_endline "status = pass test = grpc"

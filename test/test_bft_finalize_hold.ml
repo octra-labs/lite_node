@@ -136,7 +136,7 @@ let test_finalize_holds_height () =
   expect "height did not advance after callback"
     (Int64.equal driver.engine.state.height 2L)
 
-let test_finalize_keeps_catchup_height () =
+let test_finalize_catchup_height () =
   let driver =
     driver
       ~start_height:5L
@@ -187,7 +187,7 @@ let test_finalize_keeps_catchup_height () =
   C_engine.realign_round driver.engine 3;
   let generation = driver.engine.generation in
   Lwt_main.run (C_driver.process_outputs driver);
-  expect "catchup height regressed"
+  expect "catchup height decreased"
     (Int64.equal driver.engine.state.height 5L);
   expect "catchup round restarted" (driver.engine.state.round = 3);
   expect "catchup generation changed" (driver.engine.generation = generation);
@@ -385,7 +385,7 @@ let () =
   test_pace_plan ();
   test_vote_match ();
   test_finalize_holds_height ();
-  test_finalize_keeps_catchup_height ();
+  test_finalize_catchup_height ();
   test_fold_retention ();
   test_pacer_drain ();
   test_pace_proposal ();

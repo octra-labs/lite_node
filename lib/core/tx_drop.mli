@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type row = {
+type row = Drop_record.t = {
   hash : string;
   from_addr : string;
   to_addr : string;

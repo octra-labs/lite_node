@@ -85,8 +85,8 @@ let get_z = function
   | false :: false :: rest -> Some (Z.zero, rest)
   | false :: true :: rest -> get_pos rest
   | true :: false :: rest ->
-    let* value, tail = get_pos rest in
-    Some (Z.neg value, tail)
+    let* value, remainder = get_pos rest in
+    Some (Z.neg value, remainder)
   | _ -> None
 
 let put_code root =
@@ -114,16 +114,16 @@ let rec parse fuel input frames =
     let fuel = fuel - 1 in
     match input with
     | false :: false :: rest ->
-      let* value, tail = get_nat rest in
-      reduce fuel tail frames (Num value)
+      let* value, remainder = get_nat rest in
+      reduce fuel remainder frames (Num value)
     | false :: true :: rest ->
-      let* value, tail = get_z rest in
-      reduce fuel tail frames (Int value)
+      let* value, remainder = get_z rest in
+      reduce fuel remainder frames (Int value)
     | true :: false :: rest -> reduce fuel rest frames Nil
     | true :: true :: false :: rest -> parse fuel rest (First :: frames)
     | true :: true :: true :: rest ->
-      let* tag, tail = get_nat rest in
-      parse fuel tail (Mark tag :: frames)
+      let* tag, remainder = get_nat rest in
+      parse fuel remainder (Mark tag :: frames)
     | _ -> None
 
 and reduce fuel input frames value =

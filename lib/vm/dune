@@ -10,7 +10,6 @@
   zarith
   threads
   lwt
-  sqlite3
   base64
   mirage-crypto-ec
   yojson

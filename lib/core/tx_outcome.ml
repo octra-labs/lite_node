@@ -186,12 +186,12 @@ let find_position hash txs =
   in
   loop 0 txs
 
-let build ~candidates rejected =
-  let candidates = Transaction.consensus_order candidates in
-  let candidate_hashes = List.map Transaction.hash candidates in
+let build ~inputs rejected =
+  let inputs = Transaction.consensus_order inputs in
+  let hashes = List.map Transaction.hash inputs in
   if
-    List.length candidate_hashes
-    <> List.length (List.sort_uniq String.compare candidate_hashes)
+    List.length hashes
+    <> List.length (List.sort_uniq String.compare hashes)
   then
     Error "candidate_hash_duplicate"
   else
@@ -207,7 +207,7 @@ let build ~candidates rejected =
       | (tx, error_type, reason) :: rest ->
         let hash = Transaction.hash tx in
         begin
-          match find_position hash candidates with
+          match find_position hash inputs with
           | None -> Error "rejection_not_in_candidates"
           | Some position ->
             let reason = normalize_reason ~error_type reason in
@@ -227,15 +227,15 @@ let merge ~confirmed ~rejections =
       if position = total then
         match confirmed, rejections with
         | [], [] ->
-          let candidates = List.rev acc in
-          if Transaction.consensus_order candidates <> candidates then
+          let inputs = List.rev acc in
+          if Transaction.consensus_order inputs <> inputs then
             Error "outcome_order_invalid"
           else
-            let hashes = List.map Transaction.hash candidates in
+            let hashes = List.map Transaction.hash inputs in
             if List.length hashes <> List.length (List.sort_uniq String.compare hashes) then
               Error "outcome_hash_duplicate"
             else
-              Ok candidates
+              Ok inputs
         | _ -> Error "outcome_partition_incomplete"
       else
         match rejections with

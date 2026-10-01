@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type row = {
+type row = Drop_record.t = {
   hash : string;
   from_addr : string;
   to_addr : string;
@@ -14,222 +14,125 @@ type row = {
 }
 
 type t = {
-  db : Sqlite3.db;
-  put : Sqlite3.stmt;
-  get : Sqlite3.stmt;
-  by_addr : Sqlite3.stmt;
-  trim : Sqlite3.stmt;
+  env : Lmdb.Env.t;
+  resources : Store_scope.t;
+  rows : (string, string, [ `Uni ]) Lmdb.Map.t;
+  times : (string, string, [ `Uni ]) Lmdb.Map.t;
+  addresses : (string, string, [ `Dup | `Uni ]) Lmdb.Map.t;
   max_rows : int;
+  mutable closed : bool;
 }
-
-let exec db sql =
-  match Sqlite3.exec db sql with
-  | Sqlite3.Rc.OK -> ()
-  | code ->
-    failwith
-      (Printf.sprintf
-         "tx_drop sql failed code = %s reason = %s"
-         (Sqlite3.Rc.to_string code)
-         (Sqlite3.errmsg db))
-
-let ensure_dir path =
-  if Sys.file_exists path then begin
-    if (Unix.stat path).Unix.st_kind <> Unix.S_DIR then
-      invalid_arg "tx_drop path is not a directory"
-  end else
-    Unix.mkdir path 0o700
 
 let open_db ?(max_rows = 10_000) data_dir =
   if max_rows < 1 then invalid_arg "tx_drop max_rows must be positive";
-  let dir = Filename.concat data_dir "drop_db" in
-  ensure_dir dir;
-  let db = Sqlite3.db_open (Filename.concat dir "events.sqlite") in
-  exec db "PRAGMA journal_mode=WAL";
-  exec db "PRAGMA synchronous=NORMAL";
-  exec db "PRAGMA busy_timeout=5000";
-  exec db
-    "CREATE TABLE IF NOT EXISTS dropped(\
-     hash TEXT PRIMARY KEY,\
-     from_addr TEXT NOT NULL,\
-     to_addr TEXT NOT NULL,\
-     nonce INTEGER NOT NULL,\
-     ou TEXT NOT NULL,\
-     op_type TEXT NOT NULL,\
-     reason TEXT NOT NULL,\
-     detail TEXT NOT NULL,\
-     dropped_at REAL NOT NULL)";
-  exec db
-    "CREATE INDEX IF NOT EXISTS dropped_time ON dropped(dropped_at,hash)";
-  exec db
-    "CREATE INDEX IF NOT EXISTS dropped_from ON dropped(from_addr,dropped_at,hash)";
-  exec db
-    "CREATE INDEX IF NOT EXISTS dropped_to ON dropped(to_addr,dropped_at,hash)";
-  {
-    db;
-    put = Sqlite3.prepare db
-      "INSERT OR REPLACE INTO dropped(\
-       hash,from_addr,to_addr,nonce,ou,op_type,reason,detail,dropped_at)\
-       VALUES(?,?,?,?,?,?,?,?,?)";
-    get = Sqlite3.prepare db
-      "SELECT from_addr,to_addr,nonce,ou,op_type,reason,detail,dropped_at \
-       FROM dropped WHERE hash=?";
-    by_addr = Sqlite3.prepare db
-      "SELECT hash,from_addr,to_addr,nonce,ou,op_type,reason,detail,dropped_at \
-       FROM dropped WHERE from_addr=? OR to_addr=? \
-       ORDER BY dropped_at DESC,hash DESC LIMIT ? OFFSET ?";
-    trim = Sqlite3.prepare db
-      "DELETE FROM dropped WHERE hash IN (\
-       SELECT hash FROM dropped ORDER BY dropped_at DESC,hash DESC \
-       LIMIT -1 OFFSET ?)";
-    max_rows;
-  }
+  let dir = Filename.concat data_dir "local_drops" in
+  if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
+  let owner = Store_lock.acquire dir in
+  let resources = Store_scope.create ~release:(fun () -> Store_lock.release owner) in
+  Store_scope.guard resources (fun () ->
+    let env = Store_scope.acquire resources
+      (fun () -> Lmdb.Env.create Lmdb.Rw ~max_maps:3
+        ~map_size:(64 * 1024 * 1024) ~flags:Lmdb.Env.Flags.no_tls dir)
+      Lmdb.Env.close in
+    let rows = Store_scope.acquire resources
+      (fun () -> Lmdb.Map.create Lmdb.Map.Nodup ~key:Lmdb.Conv.string
+        ~value:Lmdb.Conv.string ~name:"rows" env) Lmdb_handle.close in
+    let times = Store_scope.acquire resources
+      (fun () -> Lmdb.Map.create Lmdb.Map.Nodup ~key:Lmdb.Conv.string
+        ~value:Lmdb.Conv.string ~name:"times" env) Lmdb_handle.close in
+    let addresses = Store_scope.acquire resources
+      (fun () -> Lmdb.Map.create Lmdb.Map.Dup ~key:Lmdb.Conv.string
+        ~value:Lmdb.Conv.string ~name:"addresses" env) Lmdb_handle.close in
+    List.iter (fun path ->
+      let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+      Fun.protect ~finally:(fun () -> Unix.close fd)
+        (fun () -> Unix.fsync fd)) [dir; data_dir];
+    {env; resources; rows; times; addresses; max_rows; closed = false})
 
-let bind_row statement row =
-  ignore (Sqlite3.reset statement);
-  ignore (Sqlite3.clear_bindings statement);
-  ignore (Sqlite3.bind_text statement 1 row.hash);
-  ignore (Sqlite3.bind_text statement 2 row.from_addr);
-  ignore (Sqlite3.bind_text statement 3 row.to_addr);
-  ignore (Sqlite3.bind_int statement 4 row.nonce);
-  ignore (Sqlite3.bind_text statement 5 (Z.to_string row.ou));
-  ignore
-    (Sqlite3.bind_text
-       statement
-       6
-       (Transaction.op_type_to_string row.op_type));
-  ignore (Sqlite3.bind_text statement 7 row.reason);
-  ignore (Sqlite3.bind_text statement 8 row.detail);
-  ignore (Sqlite3.bind_double statement 9 row.dropped_at)
+let require_open t =
+  if t.closed then invalid_arg "local drop store is closed"
 
-let rec skip count rows =
-  if count <= 0 then rows
-  else
-    match rows with
-    | [] -> []
-    | _ :: rest -> skip (count - 1) rest
+let copy bytes = Bytes.to_string (Bytes.of_string bytes)
 
-let bounded_rows max_rows rows =
-  let ordered =
-    List.sort
-      (fun left right ->
-         let time_order = compare left.dropped_at right.dropped_at in
-         if time_order <> 0 then time_order
-         else String.compare left.hash right.hash)
-      rows
-  in
-  skip (max 0 (List.length ordered - max_rows)) ordered
+let read_row t txn hash =
+  let row = Lmdb.Map.get t.rows ~txn hash |> copy |> Drop_record.decode in
+  if row.hash <> hash then invalid_arg "local drop hash mismatch";
+  row
+
+let remove t txn row =
+  let key = Drop_record.order_key row in
+  Lmdb.Map.remove t.rows ~txn row.hash;
+  Lmdb.Map.remove t.times ~txn key;
+  List.iter (fun addr -> Lmdb.Map.remove t.addresses ~txn ~value:key addr)
+    (Drop_record.addresses row)
+
+let trim t txn =
+  let rec loop count =
+    if count > t.max_rows then begin
+      let hash = Lmdb.Cursor.go Lmdb.Rw ~txn t.times
+        (fun cursor -> snd (Lmdb.Cursor.first cursor) |> copy) in
+      remove t txn (read_row t txn hash);
+      loop (count - 1)
+    end in
+  loop (Lmdb.Map.stat t.rows ~txn).entries
 
 let save_many t rows =
-  let rows = bounded_rows t.max_rows rows in
-  if rows = [] then Ok ()
-  else
-    try
-      exec t.db "BEGIN IMMEDIATE TRANSACTION";
-      List.iter
-        (fun row ->
-           bind_row t.put row;
-           match Sqlite3.step t.put with
-           | Sqlite3.Rc.DONE -> ()
-           | code ->
-             failwith
-               (Printf.sprintf
-                  "tx_drop insert failed code = %s"
-                  (Sqlite3.Rc.to_string code)))
-        rows;
-      ignore (Sqlite3.reset t.trim);
-      ignore (Sqlite3.clear_bindings t.trim);
-      ignore (Sqlite3.bind_int t.trim 1 t.max_rows);
-      begin
-        match Sqlite3.step t.trim with
-        | Sqlite3.Rc.DONE -> ()
-        | code ->
-          failwith
-            (Printf.sprintf
-               "tx_drop trim failed code = %s"
-               (Sqlite3.Rc.to_string code))
-      end;
-      exec t.db "COMMIT";
-      Ok ()
-    with exn ->
-      ignore (Sqlite3.exec t.db "ROLLBACK");
-      Error (Printexc.to_string exn)
-
-let row_at statement ~hash ~offset =
-  let text index =
-    Sqlite3.column statement (offset + index)
-    |> Sqlite3.Data.to_string_exn
-  in
-  match Transaction.op_type_of_string (text 4) with
-  | Error _ -> None
-  | Ok op_type ->
-    Some {
-      hash;
-      from_addr = text 0;
-      to_addr = text 1;
-      nonce =
-        Sqlite3.column statement (offset + 2)
-        |> Sqlite3.Data.to_int_exn;
-      ou = Z.of_string (text 3);
-      op_type;
-      reason = text 5;
-      detail = text 6;
-      dropped_at =
-        Sqlite3.column statement (offset + 7)
-        |> Sqlite3.Data.to_float_exn;
-    }
+  try
+    require_open t;
+    let selected = Drop_record.newest ~limit:t.max_rows rows in
+    let encoded = List.map (fun row -> row, Drop_record.encode row) selected in
+    if encoded = [] then Ok ()
+    else match Lmdb.Txn.go Lmdb.Rw t.env (fun txn ->
+      List.iter (fun (row, bytes) ->
+        let old = try Some (read_row t txn row.hash) with Not_found -> None in
+        Option.iter (remove t txn) old;
+        let key = Drop_record.order_key row in
+        Lmdb.Map.set t.rows ~txn row.hash bytes;
+        Lmdb.Map.set t.times ~txn key row.hash;
+        List.iter (fun addr -> Lmdb.Map.add t.addresses ~txn addr key)
+          (Drop_record.addresses row)) encoded;
+      trim t txn) with
+    | Some () -> Ok ()
+    | None -> Error "local drop write aborted"
+  with exn -> Error (Printexc.to_string exn)
 
 let find t hash =
-  try
-    ignore (Sqlite3.reset t.get);
-    ignore (Sqlite3.clear_bindings t.get);
-    ignore (Sqlite3.bind_text t.get 1 hash);
-    Fun.protect
-      ~finally:(fun () ->
-        ignore (Sqlite3.reset t.get);
-        ignore (Sqlite3.clear_bindings t.get))
-      (fun () ->
-         match Sqlite3.step t.get with
-         | Sqlite3.Rc.ROW ->
-           row_at t.get ~hash ~offset:0
-         | Sqlite3.Rc.DONE -> None
-         | _ -> None)
-  with _ -> None
+  require_open t;
+  match Lmdb.Txn.go Lmdb.Ro t.env (fun txn ->
+    try Some (read_row t txn hash) with Not_found -> None) with
+  | Some row -> row
+  | None -> failwith "local drop read aborted"
 
 let by_addr t addr ~limit ~offset =
-  if limit <= 0 then []
-  else
-    try
-      ignore (Sqlite3.reset t.by_addr);
-      ignore (Sqlite3.clear_bindings t.by_addr);
-      ignore (Sqlite3.bind_text t.by_addr 1 addr);
-      ignore (Sqlite3.bind_text t.by_addr 2 addr);
-      ignore (Sqlite3.bind_int t.by_addr 3 limit);
-      ignore (Sqlite3.bind_int t.by_addr 4 (max 0 offset));
-      Fun.protect
-        ~finally:(fun () ->
-          ignore (Sqlite3.reset t.by_addr);
-          ignore (Sqlite3.clear_bindings t.by_addr))
-        (fun () ->
-          let rec read rows =
-            match Sqlite3.step t.by_addr with
-            | Sqlite3.Rc.ROW ->
-              let hash =
-                Sqlite3.column t.by_addr 0
-                |> Sqlite3.Data.to_string_exn
-              in
-              begin
-                match row_at t.by_addr ~hash ~offset:1 with
-                | Some row -> read (row :: rows)
-                | None -> read rows
-              end
-            | Sqlite3.Rc.DONE -> List.rev rows
-            | _ -> []
-          in
-          read [])
-    with _ -> []
+  require_open t;
+  if limit <= 0 || addr = "" then []
+  else match Lmdb.Txn.go Lmdb.Ro t.env (fun txn ->
+    Lmdb.Cursor.go Lmdb.Ro ~txn t.addresses (fun cursor ->
+      let start = try
+        ignore (Lmdb.Cursor.seek cursor addr);
+        Some (Lmdb.Cursor.last_dup cursor |> copy)
+      with Not_found -> None in
+      let rec collect key skip left rows =
+        match key with
+        | None -> List.rev rows
+        | Some _ when left = 0 -> List.rev rows
+        | Some key ->
+          let next () = try Some (Lmdb.Cursor.prev_dup cursor |> copy)
+            with Not_found -> None in
+          if skip > 0 then collect (next ()) (skip - 1) left rows
+          else begin
+            let hash = try Lmdb.Map.get t.times ~txn key |> copy
+              with Not_found -> failwith "local drop time index is incomplete" in
+            let row = try read_row t txn hash
+              with Not_found -> failwith "local drop address index is incomplete" in
+            collect (next ()) 0 (left - 1) (row :: rows)
+          end in
+      collect start (max 0 offset) (min limit t.max_rows) [])) with
+  | Some rows -> rows
+  | None -> failwith "local drop address read aborted"
 
 let close t =
-  List.iter
-    (fun statement -> ignore (Sqlite3.finalize statement))
-    [t.put; t.get; t.by_addr; t.trim];
-  ignore (Sqlite3.db_close t.db)
+  if not t.closed then begin
+    t.closed <- true;
+    Store_scope.close t.resources
+  end

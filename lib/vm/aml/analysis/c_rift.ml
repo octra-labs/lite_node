@@ -3,7 +3,7 @@
 
 type step = {
   head : C_syn.name;
-  tail : C_syn.name;
+  remainder : C_syn.name;
 }
 
 type path = {
@@ -25,7 +25,7 @@ type spec = {
   total : C_nat.t;
 }
 
-let step head tail = { head; tail }
+let step head remainder = { head; remainder }
 let path source steps = { source; steps }
 
 let ( let* ) value next =
@@ -63,7 +63,7 @@ let prep cut rest elem source =
   Ok { elem; total }
 
 let names path =
-  let add out step = step.tail :: step.head :: out in
+  let add out step = step.remainder :: step.head :: out in
   path.source :: List.rev (List.fold_left add [] path.steps)
 
 let vec elem held =
@@ -73,17 +73,17 @@ let rec body steps left elem elem_core held source =
   match steps with
   | [] -> Ok (C_syn.Pair (vec elem held, C_syn.Var source))
   | item :: more ->
-    let* tail =
+    let* remainder =
       match C_nat.sub left C_nat.one with
-      | Some tail -> Ok tail
+      | Some remainder -> Ok remainder
       | None -> Error (Low (C_low.Nat (C_nat.to_z left)))
     in
-    let tail_core = C_type.Vec (tail, elem_core) in
+    let remainder_core = C_type.Vec (remainder, elem_core) in
     let head_bind = C_syn.bind item.head (mul elem_core) elem in
-    let tail_bind = C_syn.bind item.tail (mul tail_core)
-      (C_syn.TVec (C_nat.to_z tail, elem)) in
-    let* next = body more tail elem elem_core (item.head :: held) item.tail in
-    Ok (C_syn.Unpair (C_syn.Uncons (C_syn.Var source), head_bind, tail_bind,
+    let remainder_bind = C_syn.bind item.remainder (mul remainder_core)
+      (C_syn.TVec (C_nat.to_z remainder, elem)) in
+    let* next = body more remainder elem elem_core (item.head :: held) item.remainder in
+    Ok (C_syn.Unpair (C_syn.Uncons (C_syn.Var source), head_bind, remainder_bind,
       next))
 
 let term path spec elem source =
@@ -103,7 +103,7 @@ let build path cut rest elem source =
   else Error Fresh
 
 let rec steps out = function
-  | head :: tail :: rest -> steps ({ head; tail } :: out) rest
+  | head :: remainder :: rest -> steps ({ head; remainder } :: out) rest
   | [] -> Some (List.rev out)
   | _ -> None
 

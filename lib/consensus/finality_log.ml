@@ -118,8 +118,8 @@ let last_entry_fast base =
           let window = min length 16384 in
           let offset = length - window in
           seek_in ic offset;
-          let tail = really_input_string ic window in
-          let lines = String.split_on_char '\n' tail in
+          let suffix = really_input_string ic window in
+          let lines = String.split_on_char '\n' suffix in
           let complete =
             if offset = 0 then lines
             else
@@ -135,7 +135,7 @@ let last_entry_fast base =
           | value :: _ ->
             Some (entry_of_json (Yojson.Safe.from_string value))
           | [] ->
-            failwith "finality log tail exceeds read window")
+            failwith "finality log suffix exceeds read window")
 
 let same_commitment a b =
   a.height = b.height
@@ -290,8 +290,8 @@ let drop_after base head =
 
 let drop_uncommitted_after base head =
   let entries = read base in
-  let tail = List.filter (fun e -> e.height > head) entries in
-  match List.find_opt (fun e -> Option.is_some e.qc_hash) tail with
+  let suffix = List.filter (fun e -> e.height > head) entries in
+  match List.find_opt (fun e -> Option.is_some e.qc_hash) suffix with
   | Some entry ->
     Error
       (Printf.sprintf
@@ -311,8 +311,8 @@ let drop_matching_uncommitted base ~head expected =
     Error "unapplied finality height is not next"
   else
     let entries = read base in
-    let tail = List.filter (fun entry -> entry.height > head) entries in
-    match tail with
+    let suffix = List.filter (fun entry -> entry.height > head) entries in
+    match suffix with
     | [] -> Ok 0
     | [entry]
       when entry.height = expected.height

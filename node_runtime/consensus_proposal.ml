@@ -24,7 +24,7 @@ type capped = {
 
 type verified_bundle = {
   txs : Transaction.t list;
-  candidates : Transaction.t list;
+  inputs : Transaction.t list;
   receipts_json : string list;
   rejections : Octra_core.Tx_outcome.rejection list;
   preverify : Octra_core.Preverify_commit.t;
@@ -319,6 +319,7 @@ type reject_reason =
   | Receipt_root_mismatch
   | Receipt_decode_failed of string
   | Preverify_gate_failed of string
+  | Invalid_tx_envelope of string
   | Bundle_limit of {
       totals : totals;
       limits : limits;
@@ -487,7 +488,7 @@ let check_local_bundle ~expected_hashes
       else
         Ok received
 
-let build_preverify ~run_many ~limits txs =
+let build_preverify ?private_slots ~run_many ~limits txs =
   let open Lwt.Syntax in
   let heavy_count =
     List.fold_left
@@ -498,6 +499,9 @@ let build_preverify ~run_many ~limits txs =
   in
   let* batch = run_many txs in
   let ready_txs = Octra_core.Preverify_worker.txs batch in
+  let ready_txs = match private_slots with
+    | None -> ready_txs
+    | Some limits -> Octra_core.Private_slots.select ~limits ~inputs:txs ~ready:ready_txs in
   let capped = cap ~limits ready_txs in
   let txs = capped.txs in
   let tx_hashes = List.map Transaction.hash txs in
@@ -566,8 +570,12 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
           ~rejections:artifacts.rejections
       with
       | Error error -> Error (Receipt_decode_failed error)
-      | Ok candidates ->
-    match first_disabled_bft_tx candidates with
+      | Ok inputs ->
+    let ( let* ) = Result.bind in
+    let* () = Octra_core.Tx_envelope.check_epoch
+      ~chain_id:header.Octra_consensus.C_types.chain_id ~epoch:header.epoch_id inputs
+      |> Result.map_error (fun error -> Invalid_tx_envelope error) in
+    match first_disabled_bft_tx inputs with
     | Some tx ->
       Error
         (Disabled_operation {
@@ -575,7 +583,7 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
            op_type = Transaction.op_type_to_string tx.Transaction.op_type;
          })
     | None ->
-      match first_underpriced_tx candidates with
+      match first_underpriced_tx inputs with
       | Some tx ->
         Error
           (Underpriced_transaction {
@@ -595,15 +603,15 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
           match Octra_core.Preverify_commit.check preverify txs with
           | Error e -> Error (Preverify_gate_failed e)
           | Ok () ->
-            if not (within_limits ~limits candidates) then
-              Error (Bundle_limit { totals = totals candidates; limits })
+            if not (within_limits ~limits inputs) then
+              Error (Bundle_limit { totals = totals inputs; limits })
             else
-              match verify_signatures deps candidates with
+              match verify_signatures deps inputs with
               | Some bad -> Error bad
               | None ->
                 Ok {
                   txs;
-                  candidates;
+                  inputs;
                   receipts_json;
                   rejections = artifacts.rejections;
                   preverify;
@@ -681,6 +689,9 @@ let log_reject ~epoch_id = function
     Octra_log.warn "consensus"
       "reject proposal reason = preverify_gate_failed error = %s"
       e
+  | Invalid_tx_envelope error ->
+    Octra_log.warn "consensus"
+      "event = proposal_refused reason = transaction_envelope error = %s" error
   | Bundle_limit { totals; limits } ->
     Octra_log.warn "consensus"
       "reject proposal reason = bundle_limit epoch = %Ld txs = %d/%d bytes = %d/%d ou = %s/%s"
@@ -948,7 +959,7 @@ let rejection_tuples rejections =
        item.tx, item.error_type, item.reason)
     rejections
 
-let verify_preview_partition ~candidates ~confirmed ~rejections = function
+let verify_preview_partition ~inputs ~confirmed ~rejections = function
   | Stdlib.Error error -> Error ("preview_failed:" ^ error)
   | Stdlib.Ok result ->
     let artifacts = result.Octra_core.Epoch_exec.artifacts in
@@ -961,7 +972,7 @@ let verify_preview_partition ~candidates ~confirmed ~rejections = function
     else
       match
         Octra_core.Tx_outcome.build
-          ~candidates
+          ~inputs
           (rejection_tuples artifacts.rejected)
       with
       | Error error -> Error ("preview_outcome_invalid:" ^ error)
@@ -1737,40 +1748,40 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
           log_reject ~epoch_id:propose.epoch_id reason;
           Lwt.return reject
         | Ok verified ->
-          let candidate_hashes = List.map Transaction.hash verified.candidates in
-          let* local_candidates =
+          let input_hashes = List.map Transaction.hash verified.inputs in
+          let* prepared =
             time_verify propose pid Checks (fun () -> local_preverify_bundle
               ~run_many:(fun txs ->
                 deps.validate_preverify_once
                   ~state_root:local_ledger_root_for_preview
-                  ~tx_hashes:candidate_hashes
+                  ~tx_hashes:input_hashes
                   txs)
-              ~tx_hashes:candidate_hashes
-              verified.candidates)
+              ~tx_hashes:input_hashes
+              verified.inputs)
           in
           if not (deps.current ()) then Lwt.return wait else
           let () =
-            if local_candidates.skipped_count > 0 then
+            if prepared.skipped_count > 0 then
               Octra_log.warn "consensus"
                 "verify_proposal candidate_preverify_skipped = %d sample = %s"
-                local_candidates.skipped_count
-                local_candidates.skipped_sample
+                prepared.skipped_count
+                prepared.skipped_sample
           in
-          let local_candidate_hashes =
-            List.map Transaction.hash local_candidates.ready_txs
+          let prepared_hashes =
+            List.map Transaction.hash prepared.ready_txs
           in
-          if local_candidate_hashes <> candidate_hashes then begin
+          if prepared_hashes <> input_hashes then begin
             Octra_log.warn "consensus"
               "reject proposal reason = candidate_preverify_mismatch epoch = %Ld"
               propose.epoch_id;
             Lwt.return reject
           end else
             let local = {
-              local_candidates with
+              prepared with
               ready_txs = verified.txs;
               receipts_json =
                 Octra_core.Preverify_worker.receipt_json_for_hashes
-                  local_candidates.batch.ready
+                  prepared.batch.ready
                   tx_hashes_hex;
             } in
             match
@@ -1797,11 +1808,11 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
             let proposer = propose.header.creator_addr in
             let validator_pubkeys = deps.validator_pubkeys propose.epoch_id in
             let validator_addrs = List.map fst validator_pubkeys in
-            let candidate_preverify =
+            let input_preverify =
               Octra_core.Preverify_commit.create
                 (Octra_core.Preverify_worker.receipts_for_hashes
-                   local_candidates.batch.ready
-                   candidate_hashes)
+                   prepared.batch.ready
+                   input_hashes)
             in
             let* rejection_partition =
               match verified.rejections with
@@ -1818,13 +1829,13 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
                     parent_commit = propose.parent_commit;
                     proposer;
                     validator_pubkeys;
-                    preverify = candidate_preverify;
-                    txs = verified.candidates;
+                    preverify = input_preverify;
+                    txs = verified.inputs;
                   })
                 in
                 Lwt.return
                   (verify_preview_partition
-                     ~candidates:verified.candidates
+                     ~inputs:verified.inputs
                      ~confirmed:tx_list
                      ~rejections
                      result)
@@ -1855,7 +1866,7 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
             if not (deps.current ()) then Lwt.return wait else
             match
               verify_preview_partition
-                ~candidates:tx_list
+                ~inputs:tx_list
                 ~confirmed:tx_list
                 ~rejections:[]
                 preview_result
@@ -1939,7 +1950,11 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
               Lwt.return reject
             end
 
-let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~epoch_id =
+let make_proposal ?private_slots (deps : make_proposal_deps)
+    ~chain_id ~root_to_raw32 ~limits ~epoch_id =
+  let private_slots =
+    if Octra_core.Rule_graph.tx_envelope_at ~chain_id ~epoch:epoch_id
+       = Octra_core.Rule_graph.Active then private_slots else None in
   let open Lwt.Syntax in
   if not (deps.current ()) then Lwt.return_none else
   let* proposal_admission =
@@ -2021,36 +2036,46 @@ let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~
       end
     | None ->
       let tx_list_raw = deps.staging_txs () in
-      let tx_list_admitted = List.filter deps.admits_tx tx_list_raw in
-      let admitted_hashes = List.map Transaction.hash tx_list_admitted in
+      let tx_list_selected = List.filter (fun tx -> deps.admits_tx tx
+        && Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id ~epoch:epoch_id [tx])) tx_list_raw in
+      let selected_hashes = List.map Transaction.hash tx_list_selected in
       let* pre_shape =
         build_preverify
+          ?private_slots
           ~run_many:(fun txs ->
             deps.build_preverify_once
               ~state_root:prev_ledger_root
-              ~tx_hashes:admitted_hashes
+              ~tx_hashes:selected_hashes
               txs)
           ~limits
-          tx_list_admitted
+          tx_list_selected
       in
       if not (deps.current ()) then Lwt.return_none else
       let () = log_build_skipped ~epoch_id pre_shape in
       let tx_list = pre_shape.txs in
+      let pool = match private_slots with
+        | None -> tx_list
+        | Some _ ->
+          Octra_core.Private_slots.select
+            ~limits:{fhe = max_int; stealth = max_int}
+            ~inputs:tx_list_selected ~ready:(Octra_core.Preverify_worker.txs pre_shape.batch) in
       log_build_preverify
         ~epoch_id
         ~round:proposal_round
         ~limits
         ~staging_total:(deps.staging_total ())
         ~raw_count:(List.length tx_list_raw)
-        ~admitted_count:(List.length tx_list_admitted)
+        ~admitted_count:(List.length tx_list_selected)
         ~prev_root
         pre_shape;
       let proposer = deps.proposer () in
       let validator_pubkeys = deps.validator_pubkeys epoch_id in
       let epoch_ts = deps.now () in
-      let rec preview_until_stable attempt candidates remaining accumulated =
+      let rec preview_until_stable attempt ceiling pool inputs remaining accumulated =
+        let measure = (2 * ((2 * List.length pool) - List.length inputs))
+          + (if accumulated = [] then 1 else 0) in
         if not (deps.current ()) then Lwt.return_error "proposal context changed"
-        else if attempt > (2 * List.length tx_list) + 1 then
+        else if measure < 0 || measure >= ceiling then
           Lwt.return_error "preview_retry_limit"
         else
           let remaining_hashes = List.map Transaction.hash remaining in
@@ -2061,7 +2086,8 @@ let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~
           in
           let preverify = Octra_core.Preverify_commit.create receipts in
           let* preview_result =
-            deps.preview {
+            Lwt.catch
+              (fun () -> Lwt.map (fun value -> `Result value) (deps.preview {
               epoch_id;
               epoch_ts;
               proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
@@ -2072,13 +2098,27 @@ let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~
               validator_pubkeys;
               preverify;
               txs = remaining;
-            }
+            }))
+              (function
+                | Octra_core.Exec_resource.Exhausted (hash, resource) ->
+                  Lwt.return (`Exhausted (hash, resource))
+                | error -> Lwt.fail error)
           in
           if not (deps.current ()) then Lwt.return_error "proposal context changed" else
           match preview_result with
-          | Stdlib.Error error ->
+          | `Exhausted (hash, resource) ->
+            if not (List.exists (fun tx -> Transaction.hash tx = hash) remaining) then
+              Lwt.return_error "preview_resource_identity"
+            else
+              let retained = List.filter (fun tx -> Transaction.hash tx <> hash) inputs in
+              Octra_log.warn "consensus"
+                "event = proposal_resource_deferred epoch = %Ld hash = %s resource = %s remaining = %d"
+                epoch_id hash (Octra_core.Exec_resource.name resource) (List.length retained);
+              let pool = List.filter (fun tx -> Transaction.hash tx <> hash) pool in
+              preview_until_stable (attempt + 1) measure pool retained retained []
+          | `Result (Stdlib.Error error) ->
             Lwt.return_error error
-          | Stdlib.Ok result ->
+          | `Result (Stdlib.Ok result) ->
             let artifacts = result.Octra_core.Epoch_exec.artifacts in
             let confirmed = List.map fst artifacts.confirmed in
             let current_rejections = artifacts.rejected in
@@ -2095,7 +2135,7 @@ let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~
                 begin
                   match
                     Octra_core.Tx_outcome.build
-                      ~candidates
+                      ~inputs
                       (rejection_tuples accumulated)
                   with
                   | Error error ->
@@ -2121,13 +2161,30 @@ let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~
                   attempt
                   (List.length current)
                   (List.length confirmed);
-                if accumulated = [] then
+                let refill = match private_slots with
+                    | None -> None
+                    | Some slots ->
+                      let module Hashes = Set.Make (String) in
+                      let included = List.map Transaction.hash inputs |> Hashes.of_list in
+                      let fresh tx = not (Hashes.mem (Transaction.hash tx) included) in
+                      let eligible = confirmed @ List.filter fresh pool in
+                      let selected = Octra_core.Private_slots.select
+                        ~limits:slots ~inputs:eligible ~ready:eligible in
+                      let extended = (cap ~limits (inputs @ List.filter fresh selected)).txs in
+                      if List.length extended > List.length inputs then Some extended else None in
+                match refill with
+                | Some extended ->
+                  preview_until_stable (attempt + 1) measure pool extended extended []
+                | None ->
+                if accumulated = [] then begin
                   preview_until_stable
                     (attempt + 1)
-                    candidates
+                    measure
+                    pool
+                    inputs
                     confirmed
                     current
-                else
+                end else
                   let module Hashes = Set.Make (String) in
                   let deferred =
                     List.map
@@ -2136,20 +2193,23 @@ let make_proposal (deps : make_proposal_deps) ~chain_id ~root_to_raw32 ~limits ~
                       current
                     |> Hashes.of_list
                   in
-                  let candidates =
+                  let retained =
                     List.filter
                       (fun tx -> not (Hashes.mem (Transaction.hash tx) deferred))
-                      candidates
+                      inputs
                   in
                   Octra_log.info "consensus"
                     "event = proposal_dependency_deferred epoch = %Ld count = %d candidates = %d"
                     epoch_id
                     (Hashes.cardinal deferred)
-                    (List.length candidates);
-                  preview_until_stable (attempt + 1) candidates candidates []
+                    (List.length retained);
+                  let pool = List.filter (fun tx ->
+                    not (Hashes.mem (Transaction.hash tx) deferred)) pool in
+                  preview_until_stable (attempt + 1) measure pool retained retained []
             end
       in
-      let* stable_preview = preview_until_stable 1 tx_list tx_list [] in
+      let* stable_preview = preview_until_stable 1 ((4 * List.length pool) + 2)
+        pool tx_list tx_list [] in
       if not (deps.current ()) then Lwt.return_none else
       match stable_preview with
       | Stdlib.Error error ->

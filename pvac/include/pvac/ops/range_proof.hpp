@@ -302,7 +302,7 @@ inline Cipher compute_lc_diff(
     for (size_t i = 1; i < RANGE_BITS; ++i) {
         Fp power_of_two;
         if (i < 64) power_of_two = fp_from_u64(1ULL << i);
-        else        power_of_two = fp_from_words(0, 1ULL << (i - 64));
+        else power_of_two = fp_from_words(0, 1ULL << (i - 64));
         ct_sum = ct_add(pk, ct_sum, ct_scale(pk, ct_bit[i], power_of_two));
     }
     return ct_sub(pk, ct_sum, ct_value);

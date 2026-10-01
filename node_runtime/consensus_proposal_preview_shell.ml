@@ -118,6 +118,7 @@ let node_backend
                 in
                 let process_tx ~backend ~env
                     (tx : Octra_core.Transaction.t) =
+                  Octra_core.Exec_resource.run ~hash:(Octra_core.Transaction.hash tx) (fun () ->
                   if Octra_core.Transaction.bft_crypto_active ()
                     && Octra_core.Transaction.bft_crypto_op tx.op_type
                   then
@@ -141,7 +142,7 @@ let node_backend
                       ~object_cost
                       ~backend
                       ~env
-                      tx
+                      tx)
                 in
                 Octra_core.Epoch_exec.run_transition_rewarded
                   ~reward

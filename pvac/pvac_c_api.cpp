@@ -5,7 +5,7 @@
 
 #include "include/pvac/pvac.hpp"
 #include "include/pvac/crypto/legacy_profile.hpp"
-#include "../lib/pvac_ffi/pvac_serialize.hpp"
+#include "../pvac_ffi/pvac_serialize.hpp"
 
 #include <cstring>
 #include <cstdlib>

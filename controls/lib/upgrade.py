@@ -40,10 +40,10 @@ from sync_need import Need
 from sync_need import choose as choose_need
 from sync_need import make
 from validator_config import operator_wallet
+from wal_check import inspect as inspect_wal
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 ACTIVE = frozenset({"launching", "online", "stopping"})
-PENDING = re.compile(r"^[0-9]{10}_[0-9]{4}\.pending$")
 VOTE = re.compile(r"^[0-9]{20}_[0-9]{8}_[0-9a-f]{64}\.vote$")
 SYNC_LIMIT = 65_536
 CERT_LIMIT = 33_554_432
@@ -389,35 +389,27 @@ def restart_notice(sup):
         action="none" if ready else "review_unit_restart_policy",
     )
 
+def storage_stop_ready(policy):
+    codes = {"78", "CONFIG", "EX_CONFIG"}
+    has = lambda key: bool(codes.intersection(policy.get(key, "").split()))
+    if has("RestartForceExitStatus"):
+        return False
+    if has("RestartPreventExitStatus"):
+        return True
+    mode = policy.get("Restart", "")
+    if mode not in {"no", "always", "on-success", "on-failure", "on-abnormal", "on-abort", "on-watchdog"}:
+        return False
+    if has("SuccessExitStatus"):
+        return mode not in {"always", "on-success"}
+    return mode not in {"always", "on-failure"}
+
 def supervisor(config, values, rows, entries, unit=None):
     supervisors = pm2_sup(config, values, entries)
     supervisors.extend(unit_sup(config, values, rows, explicit = unit))
     return choose("node supervisor", supervisors)
 
 def inspect_pending(data_dir):
-    wal = Path(data_dir) / "wal"
-    if not wal.is_dir():
-        return []
-    faults = []
-    for path in sorted(wal.glob("*.pending")):
-        if not PENDING.fullmatch(path.name):
-            faults.append(("pending_name_invalid", path))
-            continue
-        try:
-            meta = path.lstat()
-            if not stat.S_ISREG(meta.st_mode) or meta.st_size <= 0:
-                raise ValueError("pending record size is invalid")
-            if meta.st_size > 128 * 1024 * 1024:
-                raise ValueError("pending record exceeds size limit")
-            value = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(value, dict):
-                raise ValueError("pending record is not an object")
-            for key in ("epoch_id", "round", "proposal_id", "validator_addr"):
-                if key not in value:
-                    raise ValueError(f"pending field is missing: {key}")
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-            faults.append(("pending_store_unreadable", path, str(error)))
-    return faults
+    return inspect_wal(data_dir)
 
 def inspect_votes(data_dir):
     vote_log = Path(data_dir) / "vote_log"
@@ -620,6 +612,12 @@ def view(values, pid, release):
         if isinstance(version, dict) else "unknown",
         "source_match": source_match,
         "runtime_match": runtime_match,
+        "live_profile": version.get("runtime_profile_hash")
+        if isinstance(version, dict) else None,
+        "live_consensus_profile": version.get("consensus_profile")
+        if isinstance(version, dict) else None,
+        "live_rules_id": version.get("consensus_rules_id")
+        if isinstance(version, dict) else None,
         "rpc": "ready" if isinstance(status, dict) else "unavailable",
         "head_epoch": local,
         "peer_epoch": remote,
@@ -632,6 +630,29 @@ def view(values, pid, release):
         "validator_scheduled": member["scheduled"],
         "activation_epoch": member["activate_epoch"],
     }
+
+def require_profile(state, release, *, allow_missing = False):
+    missing = state.get("live_profile") is None and all(
+        state.get(key) in (None, release[field]) for key, field in (
+            ("live_consensus_profile", "consensus_profile"),
+            ("live_rules_id", "consensus_rules_id"),
+        )
+    )
+    if allow_missing and missing:
+        return
+    if state.get("source_match") is True and state.get("runtime_match") is not True:
+        raise ValidatorError(
+            "release runtime mismatch"
+            f"; source = {release['source_commit']}"
+            f"; head = {state.get('head_epoch')}"
+            f"; marker_profile = {release['runtime_profile_hash']}"
+            f"; live_profile = {state.get('live_profile')}"
+            f"; marker_consensus_profile = {release['consensus_profile']}"
+            f"; live_consensus_profile = {state.get('live_consensus_profile')}"
+            f"; marker_rules = {release['consensus_rules_id']}"
+            f"; live_rules = {state.get('live_rules_id')}"
+            "; action = review_signed_release"
+        )
 
 def matches(state):
     return (
@@ -840,6 +861,16 @@ def preflight(root, sup, values, use_sudo):
             "data directory is used by unexpected processes: "
             + ",".join(map(str, owners))
         )
+    faults = inspect_pending(values["OCTRA_DATA_DIR"])
+    if faults:
+        for fault in faults:
+            emit(fault = fault[0], path = fault[1], detail = fault[2], action = "do_not_delete")
+        raise ValidatorError("WAL requires review; no build, stop or data changes performed")
+    if sup["kind"] == "systemd" and not storage_stop_ready(sup.get("restart", {})):
+        raise ValidatorError(
+            "storage restart policy does not stop on exit 78; review RestartPreventExitStatus "
+            "and RestartForceExitStatus before upgrading; no unit changes performed"
+        )
     if sup["kind"] == "systemd" and use_sudo:
         call(["sudo", "-n", "true"], quiet=True)
     free = shutil.disk_usage(root).free
@@ -954,10 +985,15 @@ def diagnose(root, sup, values, release):
         emit(**state)
     else:
         state = {"process": "offline", "source_match": False, "binary_match": False}
+    marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+    profile_error = None
+    try:
+        require_profile(state, release, allow_missing = marked is not None)
+    except ValidatorError as error:
+        profile_error = str(error)
     git = git_release(root)
     remote_known = git["upstream_head"] != "unknown"
     published = remote_known and git["upstream_head"] == release["public_commit"]
-    marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
     tip = sync_head(values)
     planned = sync_plan(values, state, sync_target(state, tip))
     need = choose_need(marked, planned, values["OCTRA_CHAIN_ID"])
@@ -969,6 +1005,8 @@ def diagnose(root, sup, values, release):
         or need is not None
     )
     action = "recover" if need is not None else ("upgrade" if upgrade else "none")
+    if profile_error is not None:
+        action = "review_signed_release"
     emit(
         event="upgrade_check",
         **git,
@@ -983,6 +1021,10 @@ def diagnose(root, sup, values, release):
     faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
     for fault in faults:
         emit(fault=fault[0], path=fault[1], detail=fault[2] if len(fault) > 2 else "invalid")
+    if profile_error is not None:
+        emit(status = "hold", reason = "release_runtime_mismatch",
+            detail = profile_error, action = "do_not_apply")
+        return 2
     if release["action"] == "hold":
         emit(status="hold", reason="release_channel_hold", action="do_not_apply")
         return 2
@@ -1026,6 +1068,8 @@ def apply(root, sup, values, args, release):
     public, source = release_target(release, args, values)
     preflight(root, sup, values, args.sudo)
     state = view(values, sup["pid"], release) if sup["pid"] else {}
+    marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+    require_profile(state, release, allow_missing = marked is not None)
     prior_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
     unit_binary = verify_unit(sup, values)
     _, _, changed = git_update(root, public, source)
@@ -1052,6 +1096,10 @@ def apply(root, sup, values, args, release):
     )
     call(["sh", str(root / "controls/check.sh")], cwd=root)
     call(["sh", str(root / "controls/build.sh")], cwd=root)
+    if sup["pid"]:
+        marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+        require_profile(view(values, sup["pid"], release), release,
+            allow_missing = marked is not None)
     call([
         "python3",
         str(root / "controls/lib/validator_config.py"),
@@ -1083,11 +1131,15 @@ def apply(root, sup, values, args, release):
     if sup["kind"] == "pm2" and prior_binary.parent != next_binary.parent:
         emit(event = "runtime_path", prior = prior_binary, current = next_binary)
     faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
-    unsafe = [fault for fault in faults if fault[0].startswith("pending_")]
+    unsafe = [fault for fault in faults if fault[0].startswith(("pending_", "wal_"))]
     if unsafe:
         for fault in unsafe:
             emit(fault=fault[0], path=fault[1], action="do_not_delete")
-        raise ValidatorError("pending WAL is unreadable; node was not stopped")
+        raise ValidatorError("WAL is unreadable; node was not stopped")
+    if sup["pid"]:
+        marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+        require_profile(view(values, sup["pid"], release), release,
+            allow_missing = marked is not None)
     stop(sup, args.sudo)
     owners = data_pids(values["OCTRA_DATA_DIR"])
     if owners:
@@ -1131,9 +1183,18 @@ def wait_node(root, sup, values, args, release, prior_binary):
         if now != marker:
             emit(event="upgrade_wait", **state)
             marker = now
+        if state.get("lag") == 0:
+            try:
+                require_profile(state, release, allow_missing = True)
+            except ValidatorError as error:
+                emit(status = "hold", reason = "release_runtime_mismatch",
+                    detail = str(error), action = "do_not_restart",
+                    prior_binary = prior_binary, config = sup["config"], **state)
+                return 2
         target = (
             floor_target(state)
             if values["OCTRA_OPERATOR_ROLE"] == "validator" and not floor_restored
+            and state.get("runtime_match") is True
             else None
         )
         if target is not None:

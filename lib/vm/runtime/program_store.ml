@@ -35,7 +35,7 @@ let stage_deploy store (deploy : Program_journal.deploy) =
     (Octra_core.Store_irmin.deploy_contract store
        ~address:deploy.Program_journal.address
        ~code_hash:deploy.code_hash
-       ~version:Oct_compile.lang_version
+       ~version:deploy.version
        ~owner:deploy.owner
        ~ctype:deploy.ctype
        ~admission:deploy.admission
@@ -48,7 +48,7 @@ let stage_deploy store (deploy : Program_journal.deploy) =
           ~ctype:deploy.ctype
           ~address:deploy.address
           ~owner:deploy.owner
-          ~version:Oct_compile.lang_version))
+          ~version:deploy.version))
 
 let stage_upgrade store (upgrade : Program_journal.upgrade) =
   match

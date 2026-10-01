@@ -204,12 +204,16 @@ type fhe_capability =
   | Fhe_cipher_serde_cap
   | Fhe_pubkey_serde_cap
 
+type fhe_key = Key_bytes of string | Key_value of Pvac_ffi.pubkey
+
+type call_scope = {depth : int; limit : int option; memory : Fhe_memory.t option}
+
 type exec_ctx = {
   get_balance : string -> Z.t;
   do_transfer : string -> string -> Z.t -> bool;
-  call_contract : string -> string -> string -> v list -> int -> (subcall_result, string) result;
-  deploy_contract : string -> string -> int -> int -> v list -> (spawn_result, string) result;
-  get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  call_contract : string -> string -> string -> v list -> call_scope -> (subcall_result, string) result;
+  deploy_contract : string -> string -> int -> call_scope -> v list -> (spawn_result, string) result;
+  get_fhe_pubkey : string -> fhe_key option;
   get_fhe_keypair : string -> (Pvac_ffi.pubkey * Pvac_ffi.seckey) option;
   allow_fhe_capability : fhe_capability -> bool;
   cap_live : cap -> bool;
@@ -220,6 +224,9 @@ type exec_ctx = {
   math : bool;
   object_cost : bool;
   int_work : Int_work.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
+  fhe_memory : Fhe_memory.t option;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -244,6 +251,9 @@ let default_ctx = {
   math = false;
   object_cost = false;
   int_work = Int_work.Prior;
+  fhe_work = Octra_core.Rule_graph.Prior;
+  wasm_float = Octra_core.Rule_graph.Prior;
+  fhe_memory = None;
   current_epoch = 0;
   epoch_time_ms = 0L;
   tree_hash = String.make 64 '0';
@@ -409,6 +419,10 @@ let create_state ?(limit = 1_000_000) ?(ctx = default_ctx) ?(depth = 0) ?(is_vie
     ?(strict_values = false) ?(storage_kinds = [])
     ?(byte_result = String_bytes)
     ~caller ~origin ~address ~value ~storage () =
+  let ctx =
+    if is_view || ctx.fhe_work = Octra_core.Rule_graph.Active then
+      {ctx with fhe_memory = Some (Option.value ctx.fhe_memory ~default:(Fhe_memory.create ()))}
+    else ctx in
   {
     regs = Array.make register_count (VInt Z.zero);
     memory = { data = Hashtbl.create 1024; size = 0 };
@@ -441,7 +455,7 @@ let to_z = function
   | VU128 z -> z
   | VU256 z -> z
   | VBool b -> if b then Z.one else Z.zero
-  | VString s -> (try Z.of_string s with _ -> Z.zero)
+  | VString s -> (try Z.of_string s with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> Z.zero)
   | _ -> Z.zero
 
 let to_bool = function
@@ -535,7 +549,7 @@ let storage_decode kind raw =
       if validate_u256 value then Some (VU256 value) else None
     | StorageAddr ->
       if is_valid_addr raw then Some (VAddr raw) else None
-  with _ ->
+  with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
     None
 
 let load_storage_value st key =
@@ -645,7 +659,7 @@ let fhe_verifier_cipher_allowed cipher =
   try
     Octra_core.Pvac_verify_policy.shape_allowed
       (Pvac_ffi.cipher_shape cipher)
-  with _ ->
+  with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
     false
 
 let proof_raw prefix prefix_len value =
@@ -721,9 +735,9 @@ let fhe_pubkey_output_cost raw =
 
 let deser_bytes f s =
   match Base64.decode s with
-  | Ok raw -> (try Some (f (Bytes.of_string raw)) with _ ->
-    (try Some (f (Bytes.of_string s)) with _ -> None))
-  | Error _ -> (try Some (f (Bytes.of_string s)) with _ -> None)
+  | Ok raw -> (try Some (f (Bytes.of_string raw)) with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
+    (try Some (f (Bytes.of_string s)) with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> None))
+  | Error _ -> (try Some (f (Bytes.of_string s)) with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> None)
 
 let decode_raw_or_b64_len expected s =
   if String.length s = expected then Some s
@@ -808,7 +822,7 @@ let is_decimal = function
     (try
        ignore (Z.of_string value);
        true
-     with _ ->
+     with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
        false)
   | _ -> false
 
@@ -1155,20 +1169,92 @@ let fhe_view_shape cipher =
     edges = shape.edges;
   }
 
-let admit_fhe_mul st left right =
+let fhe_slots_match left right =
   try
     let left_shape = fhe_view_shape left in
     let right_shape = fhe_view_shape right in
-    if left_shape.slots <> right_shape.slots then
-      false
-    else if not st.is_view then
-      true
-    else
-      match Fhe_view_policy.additional_effort ~left:left_shape ~right:right_shape with
-      | Some effort -> add_dyn_effort st effort
-      | None -> false
-  with _ ->
+    left_shape.slots = right_shape.slots
+  with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
     false
+
+let reserve_fhe ctx amount =
+  match ctx.fhe_memory with
+  | None -> true
+  | Some memory -> Fhe_memory.reserve memory amount
+
+let load_fhe_key ?memory source =
+  let permit amount = match memory with
+    | None -> true
+    | Some budget -> Fhe_memory.reserve budget amount in
+  match source with
+  | Key_value key ->
+    if permit (Fhe_memory.key_value key) then Some key else None
+  | Key_bytes raw ->
+    let allowed = match memory with
+      | None -> true
+      | Some _ -> Option.fold ~none:false ~some:permit (Fhe_memory.key_decode raw) in
+    if not allowed then None
+    else Result.to_option (Octra_core.Pvac_registry.load_pubkey raw)
+
+let charge_fhe_key st source =
+  if not st.is_view && st.ctx.fhe_work = Octra_core.Rule_graph.Prior then true
+  else
+    let cost = match source with
+      | Key_value key -> Fhe_memory.key_write_effort key
+      | Key_bytes raw -> Fhe_memory.key_read_effort raw in
+    Option.fold ~none:false ~some:(add_dyn_effort st) cost
+
+let prepare_fhe_work st op =
+  if not st.is_view && st.ctx.fhe_work = Octra_core.Rule_graph.Prior then true
+  else
+    let operands = match op with
+      | FHE_ADD (_, _, left, right) | FHE_SUB (_, _, left, right) ->
+        Some (Fhe_view_policy.Join, left, right, None)
+      | FHE_MUL (_, pk, left, right) -> Some (Fhe_view_policy.Product, left, right, Some pk)
+      | FHE_SCALE (_, _, source, _) | FHE_DIV_CONST (_, _, source, _)
+      | FHE_ADD_CONST (_, _, source, _) | FHE_SUB_CONST (_, _, source, _)
+      | FHE_SER (_, source) | FHE_COMMIT (_, _, source) ->
+        Some (Fhe_view_policy.Copy, source, source, None)
+      | FHE_VERIFY_ZERO (_, pk, source, _) | FHE_VERIFY_RANGE (_, pk, source, _)
+      | FHE_VERIFY_BOUND (_, pk, source, _, _) ->
+        Some (Fhe_view_policy.Copy, source, source, Some pk)
+      | _ -> None
+    in
+    match operands with
+    | None -> true
+    | Some (kind, left, right, pk) ->
+      try
+        let product_words, sample_work = match pk with
+          | None -> 0, 0
+          | Some register ->
+            match to_pubkey (getr st register) with
+            | Some pk ->
+              let shape = Pvac_ffi.pubkey_sampling pk in
+              let samples = Fhe_view_policy.sampling ~rows:shape.rows ~columns:shape.columns
+                ~weight:shape.weight ~noise:shape.noise ~branches:shape.branches in
+              if not (reserve_fhe st.ctx (Fhe_memory.key_value pk)) then -1, -1
+              else Pvac_ffi.pubkey_bit_words pk, Option.value samples ~default:(-1)
+            | None -> -1, -1 in
+        match to_cipher (getr st left), to_cipher (getr st right) with
+        | Some left, Some right ->
+          begin match Fhe_view_policy.plan kind ~base:(effort_cost op)
+            ~left_words:(Pvac_ffi.cipher_bit_words left)
+            ~right_words:(Pvac_ffi.cipher_bit_words right)
+            ~product_words ~sample_work
+            ~left:(fhe_view_shape left) ~right:(fhe_view_shape right) with
+          | Some (effort, memory) ->
+            add_dyn_effort st effort && reserve_fhe st.ctx memory
+          | None -> false
+          end
+        | _ -> false
+      with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> false
+
+let child_scope st = {
+  depth = st.call_depth + 1;
+  limit = if st.is_view || st.ctx.fhe_work = Octra_core.Rule_graph.Active
+    then Some (max 0 (st.effort_limit - st.effort_used)) else None;
+  memory = st.ctx.fhe_memory;
+}
 
 let object_apply_dyn_cost writes =
   List.fold_left
@@ -1209,6 +1295,7 @@ let exec_one st op =
   let work = if strict then op_effort st op else Z.of_int (effort_cost op) in
   if not (add_z_effort st work) then revert st
   else if not strict then revert st
+  else if not (prepare_fhe_work st op) then revert st
   else match op with
   | ADD (rd, rs1, rs2) ->
     setr st rd (VInt (Z.add (to_z (getr st rs1)) (to_z (getr st rs2)))); true
@@ -1400,7 +1487,7 @@ let exec_one st op =
             else begin
               (try
                 Hashtbl.replace st.memory.data idx (VInt (Z.of_string trimmed))
-              with _ ->
+              with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
                 if st.strict_values then ok := false
                 else Hashtbl.replace st.memory.data idx (VInt Z.zero));
               if idx >= st.memory.size then st.memory.size <- idx + 1;
@@ -2745,7 +2832,7 @@ let exec_one st op =
       let target = to_string (getr st rt) in
       let method_name = to_string (getr st rm) in
       let args = List.init nargs (fun i -> getr st (ra + i)) in
-      (match st.ctx.call_contract st.address target method_name args (st.call_depth + 1) with
+      (match st.ctx.call_contract st.address target method_name args (child_scope st) with
        | Ok sub ->
          if not (add_dyn_effort st sub.effort_used) then revert st
          else begin
@@ -2762,18 +2849,18 @@ let exec_one st op =
 
       let bytecode_raw =
         if String.length input >= 4 && String.sub input 0 4 = "OCTB" then input
-        else (try Base64.decode_exn input with _ -> input) in
+        else (try Base64.decode_exn input with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> input) in
       if String.length bytecode_raw < 12 then revert st
       else
         let nonce_key = "\x00spawn_nonce" in
         let nonce = match Hashtbl.find_opt st.storage nonce_key with
-          | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
+          | Some s -> (try int_of_string s with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> 0) | None -> 0 in
         storage_replace st nonce_key (string_of_int (nonce + 1));
 
         let spawn_effort = 5000 + (String.length bytecode_raw / 100) in
         if not (add_dyn_effort st spawn_effort) then revert st
         else
-        (match st.ctx.deploy_contract st.address bytecode_raw nonce (st.call_depth + 1) [] with
+        (match st.ctx.deploy_contract st.address bytecode_raw nonce (child_scope st) [] with
          | Ok sp ->
            if not (add_dyn_effort st sp.effort_used) then revert st
            else begin
@@ -2794,18 +2881,18 @@ let exec_one st op =
       let input = to_string (getr st rs) in
       let bytecode_raw =
         if String.length input >= 4 && String.sub input 0 4 = "OCTB" then input
-        else (try Base64.decode_exn input with _ -> input) in
+        else (try Base64.decode_exn input with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> input) in
       if String.length bytecode_raw < 12 then revert st
       else
         let params = List.init nargs (fun i -> getr st (base + i)) in
         let nonce_key = "\x00spawn_nonce" in
         let nonce = match Hashtbl.find_opt st.storage nonce_key with
-          | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
+          | Some s -> (try int_of_string s with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> 0) | None -> 0 in
         storage_replace st nonce_key (string_of_int (nonce + 1));
         let spawn_effort = 5000 + (String.length bytecode_raw / 100) in
         if not (add_dyn_effort st spawn_effort) then revert st
         else
-        (match st.ctx.deploy_contract st.address bytecode_raw nonce (st.call_depth + 1) params with
+        (match st.ctx.deploy_contract st.address bytecode_raw nonce (child_scope st) params with
          | Ok sp ->
            if not (add_dyn_effort st sp.effort_used) then revert st
            else begin
@@ -2901,8 +2988,11 @@ let exec_one st op =
     else
       let addr = to_string (getr st rs) in
       (match st.ctx.get_fhe_pubkey addr with
-       | Some pk -> setr st rd (VPubKey pk); true
-       | None -> revert_with_reason st ("fhe pubkey not available: " ^ addr))
+       | Some source when not (charge_fhe_key st source) -> revert st
+       | source ->
+         (match Option.bind source (load_fhe_key ?memory:st.ctx.fhe_memory) with
+          | Some pk -> setr st rd (VPubKey pk); true
+          | None -> revert_with_reason st ("fhe pubkey not available: " ^ addr)))
   | FHE_ADD (rd, rpk, ra, rb) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
       revert st
@@ -2910,7 +3000,7 @@ let exec_one st op =
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
          (try setr st rd (VCipher (Pvac_ffi.ct_add pk a b)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_SUB (rd, rpk, ra, rb) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2919,7 +3009,7 @@ let exec_one st op =
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
          (try setr st rd (VCipher (Pvac_ffi.ct_sub pk a b)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_MUL (rd, rpk, ra, rb) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2927,7 +3017,7 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
-         if not (admit_fhe_mul st a b) then
+         if not (fhe_slots_match a b) then
            revert st
          else
            (try
@@ -2938,8 +3028,12 @@ let exec_one st op =
                 string_of_int st.pc;
                 string_of_int rd;
               ] in
-              setr st rd (VCipher (Pvac_ffi.ct_mul_seeded ~math:st.ctx.math pk a b seed)); true
-            with _ -> revert st)
+              let result =
+                if st.is_view || st.ctx.fhe_work = Octra_core.Rule_graph.Active then
+                  Pvac_ffi.ct_mul_work (st.ctx.math, Fhe_view_policy.sample_factor) pk a b seed
+                else Pvac_ffi.ct_mul_seeded ~math:st.ctx.math pk a b seed in
+              setr st rd (VCipher result); true
+            with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_SCALE (rd, rpk, rct, rscalar) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2950,7 +3044,7 @@ let exec_one st op =
          (try
             let s = Z.to_int64 (to_z (getr st rscalar)) in
             setr st rd (VCipher (Pvac_ffi.ct_scale ~math:st.ctx.math pk ct s)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_DIV_CONST (rd, rpk, rct, rdivisor) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2965,7 +3059,7 @@ let exec_one st op =
            (try
               let lo = Z.to_int64 divisor in
               setr st rd (VCipher (Pvac_ffi.ct_div_const pk ct lo 0L)); true
-            with _ -> revert st)
+            with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_ADD_CONST (rd, rpk, rct, rconst) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2981,7 +3075,7 @@ let exec_one st op =
               else c, 0L
             in
             setr st rd (VCipher (Pvac_ffi.ct_add_const ~math:st.ctx.math pk ct lo hi)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_SUB_CONST (rd, rpk, rct, rconst) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -2997,7 +3091,7 @@ let exec_one st op =
               else Pvac_ffi.ct_sub_const ~math:st.ctx.math pk ct c
             in
             setr st rd (VCipher result); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_VERIFY_ZERO (rd, rpk, rct, rproof) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_zero_cap) then
@@ -3086,13 +3180,14 @@ let exec_one st op =
             setr st rd (VBool false);
             true
           | Some _ ->
+            Zk_ffi.initialize ();
             (try
                let ok = Zk_ffi.groth16_verify_bn254
                  (Bytes.of_string vk_raw)
                  (Bytes.of_string proof_raw)
                  (Bytes.of_string inputs_raw) in
                setr st rd (VBool ok); true
-             with _ -> setr st rd (VBool false); true))
+             with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> setr st rd (VBool false); true))
      | _ -> revert st)
   | FHE_VERIFY_BOUND (rd, rpk, rct, rproof, rcommit) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_bound_cap) then
@@ -3137,7 +3232,7 @@ let exec_one st op =
          (try
             let raw = Bytes.to_string (Pvac_ffi.commit_ct pk ct) in
             setr st rd (VString (Base64.encode_exn raw)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | FHE_PEDERSEN (rd, ramount, rblinding) ->
     if not (st.ctx.allow_fhe_capability Fhe_pedersen_cap) then
@@ -3149,7 +3244,7 @@ let exec_one st op =
             let amount = Z.to_int64 (to_z (getr st ramount)) in
             let result = Pvac_ffi.pedersen_commit_amount amount (Bytes.of_string blinding) in
             setr st rd (VString (Base64.encode_exn (Bytes.to_string result))); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | _ -> revert st)
   | (FHE_PEDERSEN_ADD (rd, rleft, rright)
     | FHE_PEDERSEN_SUB (rd, rleft, rright)) as point_op ->
@@ -3173,7 +3268,7 @@ let exec_one st op =
                in
                setr st rd (VString (Base64.encode_exn (Bytes.to_string result)));
                true
-             with _ -> revert st)
+             with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
           | _ -> revert st)
        | _ -> revert st)
   | FHE_PEDERSEN_IDENTITY rd ->
@@ -3185,7 +3280,7 @@ let exec_one st op =
          let result = Pvac_ffi.pedersen_identity () in
          setr st rd (VString (Base64.encode_exn (Bytes.to_string result)));
          true
-       with _ -> revert st)
+       with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
   | FHE_SER (rd, rct) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_serde_cap) then
       revert st
@@ -3195,7 +3290,7 @@ let exec_one st op =
          (try
             let raw = Bytes.to_string (Pvac_ffi.serialize_cipher ct) in
             setr st rd (VString (Base64.encode_exn raw)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | None -> revert st)
   | FHE_DESER (rd, rbytes) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_serde_cap) then
@@ -3205,19 +3300,20 @@ let exec_one st op =
        | Some encoded
          when add_dyn_effort st (fhe_decode_input_cost encoded) ->
          let raw = decode_serialized_text encoded in
-         if String.length raw > max_fhe_cipher_bytes then
+         if String.length raw > max_fhe_cipher_bytes
+            || not (reserve_fhe st.ctx (Fhe_memory.cipher_decode raw)) then
            revert st
          else
            (try
               let ct =
                 Pvac_ffi.deserialize_cipher
                   ~strict:st.ctx.point_ops
-                  ~cap:(st.is_view || st.ctx.point_ops)
+                  ~cap:(st.is_view || st.ctx.point_ops || st.ctx.fhe_work = Octra_core.Rule_graph.Active)
                   (Bytes.of_string raw)
               in
               setr st rd (VCipher ct);
               true
-            with _ ->
+            with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
               revert st)
        | Some _ -> revert st
        | None -> revert st)
@@ -3228,9 +3324,12 @@ let exec_one st op =
       (match to_pubkey (getr st rpk) with
        | Some pk ->
          (try
+            if not (charge_fhe_key st (Key_value pk))
+              || not (reserve_fhe st.ctx (Fhe_memory.key_value pk)) then revert st
+            else
             let raw = Bytes.to_string (Pvac_ffi.serialize_pubkey pk) in
             setr st rd (VString (Base64.encode_exn raw)); true
-          with _ -> revert st)
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
        | None -> revert st)
   | FHE_DESER_PK (rd, rbytes) ->
     if not (st.ctx.allow_fhe_capability Fhe_pubkey_serde_cap) then
@@ -3244,12 +3343,15 @@ let exec_one st op =
            revert st
          else
            (match fhe_pubkey_output_cost raw with
-            | Some cost when add_dyn_effort st cost ->
+            | Some cost when add_dyn_effort st cost
+                && (st.ctx.fhe_memory = None
+                  || Option.fold ~none:false ~some:(reserve_fhe st.ctx)
+                    (Fhe_memory.key_decode raw)) ->
               (try
                  let pk = Pvac_ffi.deserialize_pubkey (Bytes.of_string raw) in
                  setr st rd (VPubKey pk);
                  true
-               with _ ->
+               with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
                  revert st)
             | Some _ | None ->
               revert st)

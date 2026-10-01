@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let lang_version = "1.0 Rehovot"
+let source_version = "2.0 AML-preview"
 
 module String_set = Set.Make (String)
 
@@ -264,12 +265,12 @@ let program_certificate raw effects facts =
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | _ -> Error "invalid program certificate"
 
-let certificate_json ~declaration ~source_mode ~source_material ~bytecode ~verification_json =
+let certificate_json ~version ~declaration ~source_mode ~source_material ~bytecode ~verification_json =
   let verification_hash = sha256_hex verification_json in
   `Assoc [
     "schema", `String "aml_bytecode_certificate_v1";
     "compiler", `String "octra_aml";
-    "compiler_version", `String lang_version;
+    "compiler_version", `String version;
     "declaration", `String declaration;
     "verification_schema", `String Aml_verify.schema;
     "source_mode", `String source_mode;
@@ -336,7 +337,7 @@ let abi_json declaration abi =
 
 type abi_mode = Existing_abi | Source_abi
 
-let source_result ?(abi = Existing_abi) ?(syntax = Oct_gen.Forms)
+let source_result ?(version = lang_version) ?(abi = Existing_abi) ?(syntax = Oct_gen.Forms)
     ~source_mode ~source_material compiled =
   let declaration =
     Oct_lang.declaration_to_string compiled.Aml_source.declaration
@@ -344,7 +345,7 @@ let source_result ?(abi = Existing_abi) ?(syntax = Oct_gen.Forms)
   let bytecode = compiled.octb in
   let verification_json = verification_json compiled.ast in
   let certificate_json =
-    certificate_json ~declaration ~source_mode ~source_material ~bytecode
+    certificate_json ~version ~declaration ~source_mode ~source_material ~bytecode
       ~verification_json
   in
   let program_facts = facts_of_ast ~syntax compiled.ast compiled.code in
@@ -356,7 +357,7 @@ let source_result ?(abi = Existing_abi) ?(syntax = Oct_gen.Forms)
        | Source_abi -> Source_abi.encode compiled.ast);
     instructions = Array.length compiled.code;
     error = None;
-    version = lang_version;
+    version;
     verification_json;
     certificate_json;
     program_envelope = None;
@@ -388,6 +389,7 @@ let compile_ast_ready ?(abi = Existing_abi) ~checked ~source_mode ~source_materi
         let verification_json = verification_json ast in
         let certificate_json =
           certificate_json
+            ~version:lang_version
             ~declaration
             ~source_mode
             ~source_material
@@ -761,7 +763,7 @@ let compile_program_multi_first_checked resolver main_path =
   emit_program
     (compile_multi_first_mode ~checked:true ~program_only:true resolver main_path)
 
-let compile_program_source resolver main_path =
+let compile_source_version ~version resolver main_path =
   let sources = ref [] in
   let load path =
     match resolver path with
@@ -776,7 +778,13 @@ let compile_program_source resolver main_path =
     | Ok compiled when compiled.declaration <> Oct_lang.ProgramDecl ->
       error_result "Program declaration required"
     | Ok compiled ->
-      source_result ~abi:Source_abi ~syntax:Oct_gen.Source ~source_mode:"multi"
+      source_result ~version ~abi:Source_abi ~syntax:Oct_gen.Source ~source_mode:"multi"
         ~source_material:(ordered_sources !sources) compiled
       |> emit_program
   with error -> compile_exception error
+
+let compile_program_source resolver main_path =
+  compile_source_version ~version:lang_version resolver main_path
+
+let compile_program_preview resolver main_path =
+  compile_source_version ~version:source_version resolver main_path

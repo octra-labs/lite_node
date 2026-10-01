@@ -106,4 +106,4 @@ let () =
   test_guard_budget ();
   test_guard_prune ();
   test_guard_plans ();
-  print_endline "p2p_tx_gossip tests passed"
+  print_endline "status = pass test = p2p_tx_gossip"

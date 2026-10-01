@@ -164,7 +164,7 @@ let resolve_plan t check ~verify ~prepare ~pack =
     | Error e -> Lwt.return_error e
     | Ok () -> Lwt.return_ok plan
 
-let verify_balance t tx verify =
+let verify_private t tx project verify =
   let open Lwt.Syntax in
   let artifact =
     match t.proof_mode, t.preverify with
@@ -185,9 +185,8 @@ let verify_balance t tx verify =
           artifact
       in
       Lwt.return
-        (match tx.T.op_type, binding with
-         | T.EncryptOp, P.Private_bound (P.Prepared_encrypt plan)
-         | T.DecryptOp, P.Private_bound (P.Prepared_decrypt plan) -> Some plan
+        (match binding with
+         | P.Private_bound prepared -> project prepared
          | _ -> None)
   in
   match plan with
@@ -198,6 +197,22 @@ let verify_balance t tx verify =
       (String.sub (T.hash tx) 0 12)
       (T.op_type_to_string tx.T.op_type);
     Lwt.return_ok plan
+
+let verify_balance t tx verify =
+  verify_private t tx (function
+    | P.Prepared_encrypt plan when tx.T.op_type = T.EncryptOp -> Some plan
+    | P.Prepared_decrypt plan when tx.T.op_type = T.DecryptOp -> Some plan
+    | _ -> None) verify
+
+let verified_private t tx ~project ~pack verify =
+  let open Lwt.Syntax in
+  match verification t tx with
+  | Error e -> Lwt.return_error e
+  | Ok (Apply_receipt _) -> verify ()
+  | Ok (Verify_proof expected) ->
+    let* result = verify_private t tx project verify in
+    Lwt.return (Result.bind result (fun plan ->
+      Result.map (fun () -> plan) (receipt_matches expected (pack plan))))
 
 let encrypt t tx =
   let open Lwt.Syntax in
@@ -413,7 +428,7 @@ let key_switch t tx =
         Lwt.return_ok tx.T.ou
     end
 
-let verified_stealth_plan t tx =
+let compute_stealth_plan t tx =
   let open Lwt.Syntax in
   match verification t tx with
   | Error e -> Lwt.return_error e
@@ -484,6 +499,12 @@ let verified_stealth_plan t tx =
         end
     end
 
+let verified_stealth_plan t tx =
+  verified_private t tx
+    ~project:(function P.Prepared_stealth plan -> Some plan | _ -> None)
+    ~pack:(fun plan -> P.Prepared_stealth plan)
+    (fun () -> compute_stealth_plan t tx)
+
 let stealth t tx =
   let open Lwt.Syntax in
   match cap "fhe_epoch_cap" t.fhe t.limits.max_fhe,
@@ -553,7 +574,7 @@ let stealth t tx =
         end
     end
 
-let verified_claim_plan t tx =
+let compute_claim_plan t tx =
   let open Lwt.Syntax in
   match verification t tx with
   | Error e -> Lwt.return_error e
@@ -608,6 +629,12 @@ let verified_claim_plan t tx =
             | Ok () -> Lwt.return_ok (claim, balance)
         end
     end
+
+let verified_claim_plan t tx =
+  verified_private t tx
+    ~project:(function P.Prepared_claim (claim, balance) -> Some (claim, balance) | _ -> None)
+    ~pack:(fun (claim, balance) -> P.Prepared_claim (claim, balance))
+    (fun () -> compute_claim_plan t tx)
 
 let claim t tx =
   let open Lwt.Syntax in

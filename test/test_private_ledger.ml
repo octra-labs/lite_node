@@ -181,7 +181,7 @@ let test_private_version_wrong_type () =
            "only version 5 (private) claim operations are accepted")
     [P.First_field; P.Unique_fields]
 
-let test_balance_payload_field_policy () =
+let test_balance_fields () =
   let payload =
     Yojson.Safe.to_string
       (`Assoc [
@@ -289,7 +289,7 @@ let test_key_switch_field_policy () =
     | _ -> fail "duplicate key switch policy did not reject deterministically"
   end
 
-let test_key_switch_wrong_types_are_values () =
+let test_key_switch_types () =
   let store = ledger "key_switch_wrong_types" in
   let base = [
     "new_pubkey", `String "key";
@@ -355,7 +355,7 @@ let test_key_switch_wrong_types_are_values () =
            "encrypted_data must be JSON with new_pubkey and aes_kat")
     [P.First_field; P.Unique_fields]
 
-let test_key_switch_artifact_binds_field_policy () =
+let test_key_switch_fields () =
   let store = ledger "key_switch_artifact_policy" in
   let _, _ = pvac store (Z.of_int 100) in
   let params = Pvac_ffi.default_params () in
@@ -626,7 +626,7 @@ let test_private_ops_require_refresh () =
   expect_preverify T.EncryptOp;
   expect_preverify T.DecryptOp
 
-let test_claim_rejects_unmarked_output () =
+let test_claim_marked_output () =
   let ledger = ledger "claim_unmarked" in
   let _, _ = pvac ledger (Z.of_int 1000) in
   let amount_commitment = Base64.encode_exn (String.make 32 '\001') in
@@ -648,7 +648,7 @@ let test_claim_rejects_unmarked_output () =
   | W.Defer reason -> fail ("preverify deferred legacy output " ^ reason)
   | W.Ready _ -> fail "preverify accepted legacy output"
 
-let test_apply_key_switch_debit_failure () =
+let test_key_switch_debit () =
   let ledger = ledger "key_switch_debit_failure" in
   match
     Lwt_main.run
@@ -662,7 +662,7 @@ let test_apply_key_switch_debit_failure () =
     ok "key switch debit tag" (r.failure.P.tag = "key_switch_rejected")
   | P.Key_switch_applied _ -> fail "key switch debit failure accepted"
 
-let test_apply_key_switch_bad_payload_preserves () =
+let test_key_switch_payload () =
   let ledger = ledger "key_switch_bad_payload_apply" in
   (match Octra_core.Ledger.add_account ledger "octFrom" (Z.of_int 100) with
   | Ok () -> ()
@@ -681,7 +681,7 @@ let test_apply_key_switch_bad_payload_preserves () =
     ok "key switch bad nonce" (acc.nonce = 0)
   | P.Key_switch_applied _ -> fail "key switch bad payload accepted"
 
-let test_apply_key_switch_locked_balance () =
+let test_key_switch_locked () =
   let ledger = ledger "key_switch_locked_balance" in
   let pk, _ = pvac ledger (Z.of_int 100) in
   ignore (Octra_core.Ledger.update_enc_balance ledger "octFrom" "hfhe_v1|old");
@@ -735,8 +735,8 @@ let test_apply_key_switch_success () =
     | Some stored ->
       match Octra_core.Pvac_registry.canonicalize_blob new_blob with
       | Error e -> fail e
-      | Ok canonical ->
-        ok "key switch stored new key" (String.equal stored canonical);
+      | Ok reserialized ->
+        ok "key switch stored new key" (String.equal stored reserialized);
         ignore pk
 
 let test_json_tree () =
@@ -770,10 +770,10 @@ let () =
   test_decrypt_invalid_amount ();
   test_key_switch_bad_json ();
   test_private_version_wrong_type ();
-  test_balance_payload_field_policy ();
+  test_balance_fields ();
   test_key_switch_field_policy ();
-  test_key_switch_wrong_types_are_values ();
-  test_key_switch_artifact_binds_field_policy ();
+  test_key_switch_types ();
+  test_key_switch_fields ();
   test_key_cache ();
   test_stealth_missing ();
   test_claim_not_self ();
@@ -781,10 +781,10 @@ let () =
   test_apply_encrypt ();
   test_apply_decrypt ();
   test_private_ops_require_refresh ();
-  test_claim_rejects_unmarked_output ();
-  test_apply_key_switch_debit_failure ();
-  test_apply_key_switch_bad_payload_preserves ();
-  test_apply_key_switch_locked_balance ();
+  test_claim_marked_output ();
+  test_key_switch_debit ();
+  test_key_switch_payload ();
+  test_key_switch_locked ();
   test_apply_key_switch_success ();
-  print_endline "test_private_ledger: ok"
+  print_endline "status = pass test = private_ledger"
   end

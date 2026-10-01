@@ -100,6 +100,64 @@ let test_open () =
         (offset = T.header_size && (Unix.fstat fd).Unix.st_kind = Unix.S_REG));
     ignore (T.append log ~epoch_id:1 ~payload:"current"))
 
+let test_create () =
+  with_log "create" (fun dir _ ->
+    let original = Digest.file (T.seg_path dir 0) in
+    let interrupted = ref false in
+    let write fd bytes offset count =
+      if not !interrupted then begin
+        interrupted := true;
+        raise (Unix.Unix_error (Unix.EINTR, "write", ""))
+      end;
+      Unix.write fd bytes offset (min count 3)
+    in
+    let fd, offset = T.create_segment ~write dir 1 in
+    expect "short writes completed" (offset = T.header_size && T.validate_header fd = 1);
+    Unix.close fd;
+    released "header zero write" (Some (`Failure "txlog: header write made no progress"))
+      (fun () -> T.create_segment ~write:(fun _ _ _ _ -> 0) dir 2);
+    expect "zero write not published" (not (Sys.file_exists (T.seg_path dir 2)));
+    let write fd bytes offset count =
+      if offset > 0 then raise (Unix.Unix_error (Unix.EIO, "write", ""));
+      Unix.write fd bytes offset (min count 5)
+    in
+    released "header write failure" (Some (`Unix Unix.EIO))
+      (fun () -> T.create_segment ~write dir 2);
+    expect "partial header not published" (not (Sys.file_exists (T.seg_path dir 2)));
+    released "header sync failure" (Some (`Unix Unix.EIO))
+      (fun () -> T.create_segment ~sync:(fun _ -> raise (Unix.Unix_error (Unix.EIO, "fsync", ""))) dir 2);
+    expect "unsynced header not published" (not (Sys.file_exists (T.seg_path dir 2)));
+    let sync fd =
+      if (Unix.fstat fd).Unix.st_kind = Unix.S_DIR then
+        raise (Unix.Unix_error (Unix.EIO, "fsync", ""));
+      Unix.fsync fd
+    in
+    expect "directory sync failed" (failure (fun () -> T.create_segment ~sync dir 2) = Some (`Unix Unix.EIO));
+    let fd, offset = T.open_segment ~readonly:true dir 2 in
+    expect "published header complete" (offset = T.header_size && T.validate_header fd = 2);
+    Unix.close fd;
+    let retained = Digest.file (T.seg_path dir 2) in
+    expect "existing segment not replaced"
+      (failure (fun () -> T.create_segment dir 2) = Some (`Unix Unix.EEXIST));
+    expect "existing bytes preserved" (Digest.file (T.seg_path dir 2) = retained);
+    let child = Unix.fork () in
+    if child = 0 then begin
+      ignore (T.create_segment ~write:(fun fd bytes offset _ ->
+        ignore (Unix.write fd bytes offset 5);
+        Unix.kill (Unix.getpid ()) Sys.sigkill;
+        0) dir 3);
+      exit 2
+    end;
+    expect "header crash injected" (snd (Unix.waitpid [] child) = Unix.WSIGNALED Sys.sigkill);
+    expect "crashed header not published" (not (Sys.file_exists (T.seg_path dir 3)));
+    let reopened = T.open_log dir in
+    expect "old log opens after header crash" (reopened.current_seg = 2);
+    T.close reopened;
+    let fd, _ = T.create_segment dir 3 in
+    expect "retry after header crash" (T.validate_header fd = 3);
+    Unix.close fd;
+    expect "committed segment preserved" (Digest.file (T.seg_path dir 0) = original))
+
 let test_scan () =
   with_log "scan" (fun dir log ->
     ignore (T.append log ~epoch_id:1 ~payload:"one");
@@ -174,8 +232,8 @@ let test_lengths () =
         T.write_u32_le prefix 0 declared;
         ignore (Unix.lseek fd offset Unix.SEEK_SET);
         expect "write incomplete length" (Unix.write fd prefix 0 4 = 4);
-        expect "scan skips incomplete tail" (scan () = [first; last]);
-        expect "strict rejects incomplete tail"
+        expect "scan skips incomplete suffix" (scan () = [first; last]);
+        expect "strict rejects incomplete suffix"
           (strict () = Error (T.Length_invalid (segment, offset, declared))))
         [length + 1; T.max_record_len];
       T.write_u32_le prefix 0 length;
@@ -198,11 +256,11 @@ let test_lengths () =
 
 let () =
   let tests = ["reads", test_reads; "open", test_open; "scan", test_scan;
-    "lengths", test_lengths] in
+    "lengths", test_lengths; "create", test_create] in
   let selected = match Array.to_list Sys.argv with
     | [_] -> tests
     | [_; name] -> [name, List.assoc name tests]
-    | _ -> failwith "usage: test_txlog [reads|open|scan|lengths]"
+    | _ -> failwith "usage: test_txlog [reads|open|scan|lengths|create]"
   in
   List.iter (fun (_, test) -> test ()) selected;
   Printf.printf "event = txlog status = pass\n%!"

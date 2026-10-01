@@ -281,12 +281,12 @@ and parse_prefix ts depth =
     | TkMinus -> eat ts; collect (depth + 1) (Neg :: ops)
     | TkBang -> eat ts; collect (depth + 1) (Not :: ops)
     | _ ->
-      let value = parse_prefix_tail ts depth in
+      let value = parse_prefix_remainder ts depth in
       List.fold_left (fun value op -> EUnop (op, value)) value ops
   in
   collect depth []
 
-and parse_prefix_tail ts depth =
+and parse_prefix_remainder ts depth =
   match peek_token ts with
   | TkLet -> parse_term_let ts depth
   | TkIf -> parse_term_if ts depth
@@ -296,14 +296,14 @@ and parse_prefix_tail ts depth =
     begin
       match peek_token ts with
       | TkLBrack -> parse_term_orbit ts depth
-      | _ -> parse_named_tail ts "orbit"
+      | _ -> parse_named_remainder ts "orbit"
     end
   | TkIdent "equal" ->
     eat ts;
     begin
       match peek_token ts with
       | TkLBrack -> parse_equal ts depth
-      | _ -> parse_named_tail ts "equal"
+      | _ -> parse_named_remainder ts "equal"
     end
   | _ -> parse_primary ts
 
@@ -354,15 +354,15 @@ and parse_term_split ts depth =
           | ECall (_, values) -> ETuple values
           | _ -> perr ts "split call invariant differs"
         in
-        parse_term_split_tail ts depth value
+        parse_term_split_remainder ts depth value
       | _ -> call
     end
   | token when expr_start token ->
     let value = parse_expr_bp ts (depth + 1) 1 in
-    parse_term_split_tail ts depth value
-  | _ -> parse_named_tail ts "split"
+    parse_term_split_remainder ts depth value
+  | _ -> parse_named_remainder ts "split"
 
-and parse_term_split_tail ts depth value =
+and parse_term_split_remainder ts depth value =
   parse_term_word ts "as";
   let left = parse_term_bind ts in
   expect ts TkComma;
@@ -472,27 +472,27 @@ and parse_primary ts =
     end
   | TkIdent "use" ->
     eat ts;
-    if ident (peek_token ts) then parse_use ts else parse_named_tail ts "use"
+    if ident (peek_token ts) then parse_use ts else parse_named_remainder ts "use"
   | TkIdent "write" ->
     eat ts;
     begin
       match peek_token ts with
-      | TkLBrack -> parse_action_tail ts (fun kind -> C_eff.Write kind)
-      | _ -> parse_named_tail ts "write"
+      | TkLBrack -> parse_action_remainder ts (fun kind -> C_eff.Write kind)
+      | _ -> parse_named_remainder ts "write"
     end
   | TkIdent "read" ->
     eat ts;
     begin
       match peek_token ts with
-      | TkLBrack -> parse_action_tail ts (fun kind -> C_eff.Read kind)
-      | _ -> parse_named_tail ts "read"
+      | TkLBrack -> parse_action_remainder ts (fun kind -> C_eff.Read kind)
+      | _ -> parse_named_remainder ts "read"
     end
   | TkIdent "fail" ->
     eat ts;
     begin
       match peek_token ts with
-      | TkLBrack -> parse_action_tail ts (fun kind -> C_eff.Fail kind)
-      | _ -> parse_named_tail ts "fail"
+      | TkLBrack -> parse_action_remainder ts (fun kind -> C_eff.Fail kind)
+      | _ -> parse_named_remainder ts "fail"
     end
   | TkEmit -> parse_action ts
   | TkIdent name -> parse_named ts name
@@ -500,9 +500,9 @@ and parse_primary ts =
 
 and parse_action ts =
   eat ts;
-  parse_action_tail ts (fun kind -> C_eff.Emit kind)
+  parse_action_remainder ts (fun kind -> C_eff.Emit kind)
 
-and parse_action_tail ts make =
+and parse_action_remainder ts make =
   expect ts TkLBrack;
   let kind = parse_nat ts "expected effect atom" in
   expect ts TkRBrack;
@@ -513,9 +513,9 @@ and parse_action_tail ts make =
 
 and parse_named ts name =
   eat ts;
-  parse_named_tail ts name
+  parse_named_remainder ts name
 
-and parse_named_tail ts name =
+and parse_named_remainder ts name =
   match peek_token ts with
   | TkLParen -> parse_call_expr ts name
   | TkDot ->
@@ -573,7 +573,7 @@ and parse_self_access ts field =
   | TkDot ->
     eat ts;
     let first = expect_ident ts in
-    EStoragePath (field, keys, parse_storage_path_tail ts first)
+    EStoragePath (field, keys, parse_storage_path_remainder ts first)
   | _ ->
     if keys = [] then EField field else EIndex (field, keys)
 
@@ -588,7 +588,7 @@ and parse_index_chain ts =
     | _ -> List.rev acc
   in go []
 
-and parse_storage_path_tail ts first =
+and parse_storage_path_remainder ts first =
   let rec go acc =
     match peek_token ts with
     | TkDot ->
@@ -822,7 +822,7 @@ and parse_self_stmt ts =
   | Some keys, TkDot ->
     eat ts;
     let first = expect_ident ts in
-    let path = parse_storage_path_tail ts first in
+    let path = parse_storage_path_remainder ts first in
     (match peek_token ts with
      | TkPlusEq | TkMinusEq | TkStarEq | TkSlashEq ->
        let op = match compound_op ts with Some o -> o | None -> assert false in
@@ -858,7 +858,7 @@ and parse_self_stmt ts =
        in
        SFieldCall (field, first, go [])
      | _ ->
-       let path = parse_storage_path_tail ts first in
+       let path = parse_storage_path_remainder ts first in
        (match peek_token ts with
         | TkPlusEq | TkMinusEq | TkStarEq | TkSlashEq ->
           let op = match compound_op ts with Some o -> o | None -> assert false in
@@ -1034,7 +1034,7 @@ let parse_form_marks ts =
   in
   walk []
 
-let parse_form_tail ts line column name params public =
+let parse_form_remainder ts line column name params public =
   expect ts TkMinus;
   expect ts TkGt;
   expect ts TkLBrack;
@@ -1079,7 +1079,7 @@ let parse_form ts =
   expect ts TkLParen;
   let arg = parse_form_param ts in
   expect ts TkRParen;
-  parse_form_tail ts line column name (caps @ [arg]) false
+  parse_form_remainder ts line column name (caps @ [arg]) false
 
 let parse_main ts =
   let line = current_line ts in
@@ -1093,7 +1093,7 @@ let parse_main ts =
       if out <> [] then expect ts TkComma;
       params (parse_form_param ts :: out)
   in
-  parse_form_tail ts line column "main" (params []) true
+  parse_form_remainder ts line column "main" (params []) true
 
 let parse_constructor ts =
   let params = parse_params ts in

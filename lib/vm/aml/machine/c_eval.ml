@@ -740,9 +740,9 @@ let rec eval env term =
       | Vec values when Array.length values > 0 ->
         let rest = Array.length values - 1 in
         let* len = host_len rest in
-        let tail = Array.sub values 1 rest in
+        let remainder = Array.sub values 1 rest in
         Ok {
-          value = Pair (values.(0), Vec tail);
+          value = Pair (values.(0), Vec remainder);
           trace = value.trace;
           steps = Z.add (C_nat.to_z len) (Z.succ value.steps);
           work = Z.add (C_nat.to_z len) (Z.succ value.work);

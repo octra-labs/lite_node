@@ -558,7 +558,7 @@ let collect t txs =
     | Some (Queued queued) -> ignore (promote_required t queued)
     | Some (Running _ | Complete _) | None -> ()) txs;
   schedule t;
-  Lwt_list.filter_map_s (fun tx ->
+  Lwt_list.filter_map_p (fun tx ->
     let open Lwt.Syntax in
     let* result = join t tx in
     Lwt.return (Option.map (fun artifact -> Transaction.hash tx, artifact) result)) txs

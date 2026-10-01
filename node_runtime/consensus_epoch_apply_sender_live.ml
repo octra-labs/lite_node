@@ -116,11 +116,11 @@ let run deps sender_txs =
         tag
         reason
     in
-    let proof_mode, program_mode, program_overlap, math =
+    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float =
       match deps.fold (deps.current_epoch ()) with
       | Ok fold ->
         fold.Octra_core.Epoch_exec.standard_mode, fold.program_mode,
-        fold.program_overlap, fold.math
+        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float
       | Error reason -> failwith reason
     in
     let vm_tx_deps =
@@ -137,6 +137,8 @@ let run deps sender_txs =
           proof_mode;
           program_mode;
           program_overlap;
+          fhe_work;
+          wasm_float;
           math;
           current_epoch = deps.current_epoch;
           epoch_time_ms =

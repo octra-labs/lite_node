@@ -32,6 +32,7 @@ val dec_values : pubkey -> seckey -> cipher -> int64 array
 val ct_add : pubkey -> cipher -> cipher -> cipher
 val ct_sub : pubkey -> cipher -> cipher -> cipher
 val ct_mul_seeded : ?math:bool -> pubkey -> cipher -> cipher -> bytes -> cipher
+val ct_mul_work : bool * int -> pubkey -> cipher -> cipher -> bytes -> cipher
 val ct_scale : ?math:bool -> pubkey -> cipher -> int64 -> cipher
 val ct_add_const : ?math:bool -> pubkey -> cipher -> int64 -> int64 -> cipher
 val ct_sub_const : ?math:bool -> pubkey -> cipher -> int64 -> cipher
@@ -43,6 +44,17 @@ val commit_ct : pubkey -> cipher -> bytes
 val cipher_has_key_bound_material : cipher -> bool
 val cipher_base_layers : cipher -> int
 val cipher_shape : cipher -> cipher_shape
+val cipher_bit_words : cipher -> int
+val pubkey_bit_words : pubkey -> int
+type sampling = {
+  rows : int;
+  columns : int;
+  weight : int;
+  noise : int;
+  branches : int;
+}
+val pubkey_sampling : pubkey -> sampling
+val pubkey_image_size : pubkey -> int
 val cipher_mul_depth : cipher -> int
 val cipher_is_wrapped_scalar : cipher -> bool
 val pubkey_is_key_bound_extension : pubkey -> pubkey -> bool

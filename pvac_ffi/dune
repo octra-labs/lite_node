@@ -4,7 +4,7 @@
   (language cxx)
   (names pvac_stubs)
   (include_dirs %{project_root}/pvac/include)
-  (extra_deps pvac_serialize.hpp)
+  (extra_deps pvac_serialize.hpp native_call.hpp)
   (flags (:include flags.sexp)))
  (c_library_flags (:include clib_flags.sexp))
  (libraries bytes threads.posix))

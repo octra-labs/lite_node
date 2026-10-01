@@ -63,6 +63,7 @@ module Status_read_rpc = Octra_node_runtime.Status_read_rpc
 module Sync_publish = Octra_node_runtime.Sync_publish
 module Sync_mark = Octra_node_runtime.Sync_mark
 module Sync_need = Octra_node_runtime.Sync_need
+module Wal_start = Octra_node_runtime.Wal_start
 module Root_win = Octra_bootstrap.Root_win
 module Sync_anchor = Octra_bootstrap.Sync_anchor
 module Sync_manifest = Octra_bootstrap.State_sync_manifest
@@ -76,7 +77,7 @@ let hex_to_raw32_lossy = Octra_node_runtime.Text.hex_to_raw32_lossy
 let env_int = Octra_node_runtime.Env.int_value
 let env_opt = Sys.getenv_opt
 
-let exit_error () = exit 1
+let exit_error = Octra_node_runtime.Startup_run_shell.exit_fatal
 let exit_success () = exit 0
 
 let cli_has_flag name =
@@ -138,6 +139,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~init_mode
       ~data_dir
       ~exit_fatal:exit_error;
+    let require_wal = function
+      | Ok value -> value
+      | Error (error : Wal_start.error) ->
+        Log.fatal "init"
+          "event = wal_start status = refused path = %S reason = %S action = preserve"
+          error.path error.reason;
+        exit Wal_start.exit_code
+    in
+    require_wal (Wal_start.check data_dir);
     let recovery_need =
       match
         Sync_mark.read
@@ -173,30 +183,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
            | Some target -> Int64.to_string target
            | None -> "-"))
       recovery_need;
-    let require_sync need =
-      let status, stored =
-        match
-          Sync_mark.write
-            ~data_dir
-            ~chain:startup_network.chain_id
-            need
-        with
-        | Ok Sync_mark.Stored -> "stored", need
-        | Ok (Sync_mark.Present prior) -> "present", prior
-        | Error reason ->
-            Log.fatal "consensus"
-              "event = sync_recovery status = rejected reason = %s"
-              reason;
-            exit_error ()
-      in
-      Log.fatal "consensus"
-        "event = sync_recovery status = %s cause = %s epoch = %d head = %d action = exit"
-        status
-        (Sync_need.label stored.Sync_need.cause)
-        stored.epoch
-        stored.head;
-      exit_error ()
-    in
     let consensus_role = role.role in
     let consensus_mode = role.consensus_enabled in
     let voting_consensus_mode = role.voting_enabled in
@@ -210,15 +196,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           "event = validator_policy status = rejected reason = %s"
           error;
         exit_error ()
-    in
-    let drop_db = Tx_drop.open_db data_dir in
-    let save_drops drops =
-      match Tx_drop.save_many drop_db (List.map Staging.drop_row drops) with
-      | Ok () -> ()
-      | Error reason ->
-        Log.warn "staging"
-          "event = drop_persist_failed reason = %s"
-          reason
     in
     let private_result_activation_epoch =
       match Octra_core.Private_result_policy.activation_epoch_of env_opt with
@@ -309,15 +286,23 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     Startup_process_shell.start_gc_reporter ~prune:Preverify_cache.prune;
 
     let store_path = Startup_store_shell.irmin_path data_dir in
-    let store = Lwt_main.run (Store_irmin.open_store store_path) in
+    let lock_wait = env_int "OCTRA_STORE_WAIT_SECONDS" 300 in
+    if lock_wait < 0 || lock_wait > 300 then
+      invalid_arg "store ownership wait must be between zero and 300 seconds";
+    let chaindata, store = require_wal (Wal_start.recover ~data_dir
+      (fun () -> Startup_store_shell.open_stores ~lock_wait:(float_of_int lock_wait) data_dir)) in
+    let exit_error = Octra_node_runtime.Startup_run_shell.exit_store store in
+    let require_sync = Octra_node_runtime.Startup_run_shell.require_sync
+      ~data_dir ~chain:startup_network.chain_id ~store in
+    Startup_process_shell.configure_lwt ~exit_fatal:exit_error;
     Log.info "init" "event = storage_ready path = %s cwd = %s"
       store_path (Sys.getcwd ());
-    Startup_node_boot_shell.run_store
+    require_wal (Wal_start.recover ~data_dir (fun () -> Startup_node_boot_shell.run_store
       Startup_node_boot_shell.{
         data_dir;
         store;
         exit_fatal = exit_error;
-      };
+      }));
     let ledger = Ledger.create store in
     Log.info "init" "event = ledger_loaded accounts = %d" (Ledger.length ledger);
     Startup_private_profile.run
@@ -325,7 +310,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ~store
       ~exit_fatal:exit_error;
 
-    let chaindata = Store_chaindata.open_chaindata (data_dir ^ "/chaindata") in
     let history_floor =
       match Store_chaindata.history_floor chaindata with
       | Ok value -> value
@@ -504,7 +488,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     end;
 
     let current_epoch =
-      ref (Startup_node_boot_shell.run_node
+      ref (require_wal (Wal_start.recover ~data_dir (fun () -> Startup_node_boot_shell.run_node
         Startup_node_boot_shell.{
           data_dir;
           store;
@@ -524,7 +508,20 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           int_value = env_int;
           env = env_opt;
           exit_fatal = exit_error;
-        })
+        })))
+    in
+    let drop_db = Tx_drop.open_db data_dir in
+    let drop_clock = Mtime_clock.counter () in
+    let drop_sink = Octra_node_runtime.Drop_sink.create
+      ~now:(fun () -> Mtime.Span.to_float_ns (Mtime_clock.count drop_clock) /. 1e9)
+      ~write:(fun rows -> Lwt_preemptive.detach (Tx_drop.save_many drop_db) rows) in
+    let save_drops drops =
+      match Octra_node_runtime.Drop_sink.submit drop_sink (List.map Staging.drop_row drops) with
+      | Ok () -> ()
+      | Error reason ->
+        Log.warn "staging"
+          "event = drop_persist_failed reason = %s"
+          reason
     in
     let private_field_policy epoch =
       match Rule_graph.private_payload rules ~epoch with
@@ -807,6 +804,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Consensus_epoch_apply_start_shell.run
         Consensus_epoch_apply_start_shell.{
           source = Consensus_epoch_apply_source.{
+            rules;
             check_override_receipts = (fun ~epoch_id ~receipts txs ->
               Octra_core.Preverify_receipt_policy.check ~epoch_id ~receipts txs);
             find_finalized = (fun epoch ->
@@ -1580,6 +1578,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             Octra_node_runtime.Set_control.eligible ~mode ~head:(Int64.of_int head.epoch_id)
               ~bonded_epoch ~snapshot:!enrollment_ref tx
     in
+    let fold_delivery = Octra_node_runtime.Set_delivery.{
+      post = post_fold;
+      broadcast = (fun frame ->
+        match !swarm_ref with
+        | None -> ()
+        | Some swarm ->
+          Lwt.async (fun () ->
+            Lwt.catch (fun () -> Octra_net.P2p_swarm.broadcast swarm frame)
+              (fun exn ->
+                Log.warn "validator" "event = set_post_failed reason = %s"
+                  (Printexc.to_string exn);
+                Lwt.return_unit)));
+    } in
     let retry_fold ~bonded_epoch ~current tx =
       let wait reason = Lwt.return_error (Set_post.Wait reason) in
       match refresh_enrollment () with
@@ -1593,31 +1604,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               | Some head, Some account when current () && head.epoch_id = head_epoch
                   && account.Ledger.nonce < tx.nonce
                   && fold_eligibility ~bonded_epoch tx = Set_post.Eligible ->
-                begin
-                  match Rest.add_tx_to_staging ~relay:false ~bft_mode:consensus_mode
-                    rest_runtime ledger tx with
-                  | Error reason -> Ok (wait reason)
-                  | Ok hash when hash <> Transaction.hash tx ->
-                    Ok (Lwt.return_error (Set_post.Refused "validator duty staging hash mismatch"))
-                  | Ok hash ->
-                    begin match !swarm_ref with
-                    | None -> ()
-                    | Some swarm ->
-                      let payload = Octra_net.P2p_tx_gossip.encode
-                        (Octra_net.P2p_tx_gossip.Tx {
-                          hash;
-                          tx_json = Yojson.Safe.to_string (Transaction.to_yojson tx);
-                        }) in
-                      Lwt.async (fun () ->
-                        Lwt.catch (fun () -> Octra_net.P2p_swarm.broadcast swarm
-                          Octra_net.P2p_frame.{ msg_type = msg_tx_gossip; payload })
-                          (fun exn ->
-                            Log.warn "validator" "event = set_post_failed reason = %s"
-                              (Printexc.to_string exn);
-                            Lwt.return_unit))
-                    end;
-                    Ok (post_fold tx)
-                end
+                Ok (Octra_node_runtime.Set_delivery.retry ~bft_mode:consensus_mode
+                  rest_runtime ledger fold_delivery tx)
               | _ -> Ok (wait "validator duty head changed")) with
           | Ok result -> result
           | Error reason ->
@@ -1683,10 +1671,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               } in
               let tx = { draft with ou = Transaction.ou_cost draft } in
               let tx = Transaction.sign_with_privkey tx wallet.priv in
-              match Rest.add_tx_to_staging ~relay:false ~bft_mode:consensus_mode
-                      rest_runtime ledger tx with
-              | Ok hash -> Ok (hash, tx)
-              | Error error -> Error error
+              Octra_node_runtime.Set_delivery.stage ~bft_mode:consensus_mode
+                rest_runtime ledger tx
         in
         if Set_post.pending fold_post then Lwt.return_ok ()
         else match !enrollment_ref with
@@ -1697,13 +1683,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           |> (function
             | Error error -> Error (Set_actor.Control, error)
             | Ok result -> Result.map_error (fun error -> Set_actor.Send, error) result)
-          |> Result.map (fun (hash, tx) ->
+          |> Result.map (fun staged ->
             let retry = Set_post.{
               eligible = fold_eligibility ~bonded_epoch:candidate.bonded_epoch;
               post = retry_fold ~bonded_epoch:candidate.bonded_epoch;
               retain = Option.is_some head_proposal_id;
             } in
-            Set_post.put ~retry fold_post ~hash tx)
+            Octra_node_runtime.Set_delivery.put ~retry fold_post staged)
           |> Lwt.return
         | _ -> Lwt.return_error (Set_actor.Receipt, "validator duty enrollment changed")
       in
@@ -2138,6 +2124,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~validator_enrollment:(fun () -> !enrollment_ref)
     in
     Startup_node_launch_shell.run
+      ~shutdown:(fun () -> Octra_node_runtime.Drop_sink.finish
+        ~close:(fun () -> Tx_drop.close drop_db) drop_sink)
       ~duty_head:rest_runtime.duty_head
       ~bft_mode:consensus_mode
       Startup_node_launch_shell.{
@@ -2165,6 +2153,5 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         max_drift = Rest.max_timestamp_drift;
         driver_ref;
         resource_compute = Some resource_compute;
-        close_chaindata = (fun () -> Store_chaindata.close chaindata);
         exit_fatal = exit_error;
       }

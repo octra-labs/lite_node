@@ -3,7 +3,9 @@ synopsis: "Octra lite node pre-release"
 maintainer: "Octra Labs"
 authors: ["Octra Labs"]
 homepage: "https://octra.org"
-bug-reports: "https://gitlab.octra.org.uk/octra/libv_litecore/issues"
+bug-reports: "https://github.com/octra-labs/lite_node/issues"
+license: "BSD-3-Clause"
+dev-repo: "git+https://github.com/octra-labs/lite_node.git"
 depends: [
   "ocaml" {>= "4.14.2" & < "5.0"}
   "dune" {>= "3.0"}
@@ -13,7 +15,6 @@ depends: [
   "conf-gmp"
   "conf-libev"
   "conf-pkg-config"
-  "conf-sqlite3"
   "cstruct"
   "digestif"
   "eqaf"
@@ -30,7 +31,6 @@ depends: [
   "mirage-crypto-rng"
   "mtime"
   "pbrt"
-  "sqlite3"
   "tls-lwt"
   "uri"
   "yojson" {= "3.0.0"}
@@ -38,8 +38,10 @@ depends: [
   "alcotest" {with-test}
   "alcotest-lwt" {with-test}
   "coq" {with-test}
+  "conf-npm" {with-test}
 ]
 build: [
+  ["mkdir" "-p" "mcl/obj" "mcl/lib"]
   [
     make
     "-C"

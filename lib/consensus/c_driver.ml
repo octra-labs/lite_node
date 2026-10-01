@@ -249,7 +249,7 @@ type t = {
   mutable running : bool;
   mutable epoch_start_mono : int64;
   mutable pace : pace_wait option;
-  epoch_root_responses : (int64, epoch_root_response_record list) Hashtbl.t;
+  mutable epoch_root_queries : epoch_root_response_record C_root_query.t;
   bundle_responses : (string, bundle_response_record list) Hashtbl.t;
   catchup_responses : (string, catchup_range_response_record list) Hashtbl.t;
   peer_states : (string, peer_state_record) Hashtbl.t;
@@ -459,7 +459,7 @@ let create ~config ~validator_set ~swarm ~start_height ~sync_log ~relief_log
     historical_replays = C_seen.create ~capacity:4_096;
     epoch_start_mono = Mtime_clock.elapsed_ns ();
     pace = None;
-    epoch_root_responses = Hashtbl.create 16;
+    epoch_root_queries = C_root_query.empty;
     bundle_responses = Hashtbl.create 16;
     catchup_responses = Hashtbl.create 8;
     peer_states = Hashtbl.create 16;
@@ -1192,14 +1192,14 @@ let tx_hash_batches hashes =
     else
       match rest with
       | [] -> List.rev acc, []
-      | hash :: tail -> take (count - 1) (hash :: acc) tail
+      | hash :: suffix -> take (count - 1) (hash :: acc) suffix
   in
   let rec loop acc rest =
     match rest with
     | [] -> List.rev acc
     | _ ->
-      let batch, tail = take Octra_net.P2p_tx_gossip.max_hashes [] rest in
-      loop (batch :: acc) tail
+      let batch, suffix = take Octra_net.P2p_tx_gossip.max_hashes [] rest in
+      loop (batch :: acc) suffix
   in
   loop [] hashes
 
@@ -4030,7 +4030,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch (fun () ->
         let r = C_codec.decode_epoch_root_response frame.payload in
         if r.chain_id <> t.config.chain_id then Lwt.return_unit
-        else if not (Hashtbl.mem t.epoch_root_responses r.epoch_id) then
+        else if not (C_root_query.listening ~epoch:r.epoch_id t.epoch_root_queries) then
           Lwt.return_unit
         else if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
           log_node t.config.my_addr
@@ -4060,11 +4060,11 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               responder_head_epoch = r.responder_head_epoch;
               state_root = r.state_root;
             } in
-            let prior = try Hashtbl.find t.epoch_root_responses r.epoch_id with Not_found -> [] in
-            let already_seen = List.exists (fun (rec_ : epoch_root_response_record) ->
-              rec_.responder_addr = r.responder_addr) prior in
-            if not already_seen then
-              Hashtbl.replace t.epoch_root_responses r.epoch_id (record :: prior);
+            t.epoch_root_queries <- C_root_query.add
+              ~epoch:r.epoch_id
+              ~same:(fun (a : epoch_root_response_record) b ->
+                String.equal a.responder_addr b.responder_addr)
+              record t.epoch_root_queries;
             Lwt.return_unit
           end
         end)
@@ -5156,44 +5156,40 @@ let query_epoch_root
     ~epoch_id
     ~timeout_seconds =
   let open Lwt.Syntax in
-  Hashtbl.replace t.epoch_root_responses epoch_id [];
-  let has_root_quorum records =
-    epoch_root_wait_reached t ~epoch_id ~wait_for records
-  in
-  let q = C_codec.{
-    chain_id = t.config.chain_id;
-    epoch_id;
-  } in
-  let payload = C_codec.encode_epoch_root_query q in
-  let* () = Octra_net.P2p_swarm.broadcast t.swarm
-    { msg_type = Frame.msg_query_epoch_root; payload } in
-  let deadline = deadline_after timeout_seconds in
-  let rec wait () =
-    let collected = match Hashtbl.find_opt t.epoch_root_responses epoch_id with
-      | Some records -> records
-      | None -> []
-    in
-    if deadline_reached deadline || has_root_quorum collected then
-      Lwt.return collected
-    else
-      let* () = Lwt_unix.sleep 0.1 in
-      wait ()
-  in
-  let* collected = wait () in
-  let local_head = t.config.local_head_epoch () in
-  let* () =
-    if request_next
-       && epoch_id = local_head
-       && Int64.sub t.engine.state.height local_head = 1L then
-      request_missing_finalize
-        t
-        ~epoch_id:t.engine.state.height
-        collected
-    else
-      Lwt.return_unit
-  in
-  Hashtbl.remove t.epoch_root_responses epoch_id;
-  Lwt.return collected
+  match C_root_query.join ~epoch:epoch_id t.epoch_root_queries with
+  | Error reason -> Lwt.fail_with reason
+  | Ok (queries, lease) ->
+    t.epoch_root_queries <- queries;
+    Lwt.finalize
+      (fun () ->
+        let q = C_codec.{ chain_id = t.config.chain_id; epoch_id } in
+        let payload = C_codec.encode_epoch_root_query q in
+        let* () = Octra_net.P2p_swarm.broadcast t.swarm
+          { msg_type = Frame.msg_query_epoch_root; payload } in
+        let deadline = deadline_after timeout_seconds in
+        let rec wait () =
+          let collected = C_root_query.read lease t.epoch_root_queries in
+          if deadline_reached deadline
+             || epoch_root_wait_reached t ~epoch_id ~wait_for collected then
+            Lwt.return collected
+          else
+            let* () = Lwt_unix.sleep 0.1 in
+            wait ()
+        in
+        let* collected = wait () in
+        let local_head = t.config.local_head_epoch () in
+        let* () =
+          if request_next
+             && epoch_id = local_head
+             && Int64.sub t.engine.state.height local_head = 1L then
+            request_missing_finalize
+              t ~epoch_id:t.engine.state.height collected
+          else Lwt.return_unit
+        in
+        Lwt.return collected)
+      (fun () ->
+        t.epoch_root_queries <- C_root_query.leave lease t.epoch_root_queries;
+        Lwt.return_unit)
 
 let proof_wait tries =
   match tries with

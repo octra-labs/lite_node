@@ -21,5 +21,6 @@ val decode_program_source : ?point_ops:bool -> string -> (t, error) result
 val code : t -> Contract_vm.instr array
 val effects : t -> Program_effects.t
 val profile : t -> profile
+val compiler_version : t -> string option
 val check_standard : point_ops:bool -> t -> (unit, error) result
 val error_message : error -> string

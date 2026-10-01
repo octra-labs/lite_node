@@ -7,6 +7,7 @@ type plan = {
   finalize : Octra_consensus.C_types.finalize;
   txs : Octra_core.Transaction.t list;
   tx_hashes : string list;
+  receipts_json : string list;
   epoch : int;
   proposer_info : Octra_core.Epochlog.proposer_info option;
   expected_root : string option;
@@ -25,6 +26,7 @@ val build_plan :
   parent_commit:Octra_consensus.C_types.parent_commit option ->
   header:Octra_consensus.C_types.epoch_header ->
   commit_round:int ->
+  receipts_json:string list ->
   txs:Octra_core.Transaction.t list ->
   plan
 

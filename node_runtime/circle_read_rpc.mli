@@ -5,6 +5,9 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 
 type 'handler dispatch_adapters = {
   store_read : (Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
+  program_read :
+    (float_mode:Octra_core.Rule_graph.mode ->
+     Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
   epoch_read :
     (Octra_core.Store_irmin.t ->
      Yojson.Safe.t ->
@@ -34,11 +37,13 @@ val option_result :
   rpc_result
 
 val program_descriptor :
+  ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val program_descriptor_auth_params :
+  ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t
@@ -266,11 +271,13 @@ val with_object_member_auth :
   rpc_result Lwt.t
 
 val program_info_public :
+  ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val program_info_public_params :
+  ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t

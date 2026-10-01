@@ -16,6 +16,14 @@ type cipher_shape = {
   base_layers : int;
 }
 
+type sampling = {
+  rows : int;
+  columns : int;
+  weight : int;
+  noise : int;
+  branches : int;
+}
+
 external isolate_worker : unit -> unit = "caml_pvac_worker_isolate"
 external default_params : unit -> params = "caml_pvac_default_params"
 external keygen : params -> pubkey * seckey = "caml_pvac_keygen"
@@ -33,6 +41,9 @@ external ct_add : pubkey -> cipher -> cipher -> cipher = "caml_pvac_ct_add"
 external ct_sub : pubkey -> cipher -> cipher -> cipher = "caml_pvac_ct_sub"
 external ct_mul_seeded_raw : bool -> pubkey -> cipher -> cipher -> bytes -> cipher
   = "caml_pvac_ct_mul_seeded_math"
+
+external ct_mul_work : bool * int -> pubkey -> cipher -> cipher -> bytes -> cipher
+  = "caml_pvac_ct_mul_work"
 
 let ct_mul_seeded ?(math = false) key left right seed =
   ct_mul_seeded_raw math key left right seed
@@ -68,6 +79,10 @@ external commit_ct : pubkey -> cipher -> bytes = "caml_pvac_commit_ct"
 external cipher_has_key_bound_material : cipher -> bool = "caml_pvac_cipher_has_key_bound_material"
 external cipher_base_layers : cipher -> int = "caml_pvac_cipher_base_layers"
 external cipher_shape : cipher -> cipher_shape = "caml_pvac_cipher_shape"
+external cipher_bit_words : cipher -> int = "caml_pvac_cipher_bit_words"
+external pubkey_bit_words : pubkey -> int = "caml_pvac_pubkey_bit_words"
+external pubkey_sampling : pubkey -> sampling = "caml_pvac_pubkey_sampling"
+external pubkey_image_size : pubkey -> int = "caml_pvac_pubkey_image_size"
 external cipher_mul_depth : cipher -> int = "caml_pvac_cipher_mul_depth"
 external cipher_is_wrapped_scalar : cipher -> bool = "caml_pvac_cipher_is_wrapped_scalar"
 external pubkey_is_key_bound_extension : pubkey -> pubkey -> bool = "caml_pvac_pubkey_is_key_bound_extension"

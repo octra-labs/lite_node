@@ -750,7 +750,7 @@ let test_qc_vote () =
     | false, None -> ()
     | _ -> failwith "finalized vote appeal did not match durability") [true; false]
 
-let test_deferred_proposal_replays_after_round_skip () =
+let test_proposal_round_replay () =
   let chain_id = "octra-test-ready-replay" in
   let driver = driver chain_id in
   let proposal = proposal chain_id ~epoch_id:1L ~round:1 in
@@ -780,7 +780,7 @@ let test_deferred_proposal_replays_after_round_skip () =
   if Hashtbl.length driver.engine.prevotes.votes <> vote_count then
     failwith "deferred proposal replayed more than once"
 
-let test_pending_proposal_replays_after_height_advance () =
+let test_proposal_height_replay () =
   let chain_id = "octra-test-pending-proposal" in
   let driver = driver chain_id in
   let next_proposal = proposal chain_id ~epoch_id:2L ~round:0 in
@@ -804,7 +804,7 @@ let test_pending_proposal_replays_after_height_advance () =
   if Hashtbl.length driver.pending_proposals <> 0 then
     failwith "pending proposal was not consumed"
 
-let test_unretained_proposal_reenters_after_height_advance () =
+let test_unretained_replay () =
   let chain_id = "octra-test-proposal-reentry" in
   let driver = driver chain_id in
   driver.running <- true;
@@ -840,7 +840,7 @@ let test_unretained_proposal_reenters_after_height_advance () =
   Lwt_main.run (Octra_net.P2p_conn.close conn);
   Lwt_main.run (Lwt_unix.close remote_fd)
 
-let test_future_votes_replay_after_height_advance () =
+let test_future_vote_replay () =
   let chain_id = "octra-test-future-votes" in
   let driver = driver chain_id in
   let next_proposal = proposal chain_id ~epoch_id:2L ~round:0 in
@@ -889,7 +889,7 @@ let test_future_votes_replay_after_height_advance () =
   | Ok (Some vote) when C_hash.verify_vote ~pubkey_raw:(public_key "v0") vote -> ()
   | _ -> failwith "finalized output lost local appeal vote"
 
-let test_future_vote_conflict_is_retained () =
+let test_vote_conflict_retained () =
   let chain_id = "octra-test-future-vote-conflict" in
   let queued_driver = driver chain_id in
   let first =
@@ -939,7 +939,7 @@ let test_future_vote_conflict_is_retained () =
   if Hashtbl.length replay_driver.future_votes <> 0 then
     failwith "replayed conflict remained queued"
 
-let test_activation_vote_reenters_after_set_resolution () =
+let test_activation_vote_replay () =
   let chain_id = "octra-test-activation-vote-reentry" in
   let next_set =
     C_engine.make_validator_set
@@ -996,7 +996,7 @@ let test_activation_vote_reenters_after_set_resolution () =
   Lwt_main.run (Octra_net.P2p_conn.close conn);
   Lwt_main.run (Lwt_unix.close remote_fd)
 
-let test_activation_vote_evidence_targets_signer () =
+let test_activation_vote_signer () =
   let chain_id = "octra-test-activation-evidence" in
   let next_addresses = ["n0"; "n1"; "n2"; "n3"] in
   let next_set =
@@ -1082,7 +1082,7 @@ let test_activation_vote_evidence_targets_signer () =
   Lwt_main.run (Octra_net.P2p_conn.close conn);
   Lwt_main.run (Lwt_unix.close remote_fd)
 
-let test_waiting_proposal_retries_without_penalty () =
+let test_waiting_proposal_retry () =
   let chain_id = "octra-test-proposal-wait" in
   let ready = ref false in
   let calls = ref 0 in
@@ -1140,7 +1140,7 @@ let test_waiting_proposal_retries_without_penalty () =
   Lwt_main.run (Octra_net.P2p_conn.close conn);
   Lwt_main.run (Lwt_unix.close remote_fd)
 
-let test_proposal_verify_error_waits_without_penalty () =
+let test_verify_error_retry () =
   let chain_id = "octra-test-proposal-error" in
   let verify_proposal _ = Lwt.fail_with "local verify error" in
   let driver = driver ~verify_proposal chain_id in
@@ -1247,13 +1247,13 @@ let () =
   test_build_error ();
   test_pace_votes ();
   test_qc_vote ();
-  test_deferred_proposal_replays_after_round_skip ();
-  test_pending_proposal_replays_after_height_advance ();
-  test_unretained_proposal_reenters_after_height_advance ();
-  test_future_votes_replay_after_height_advance ();
-  test_future_vote_conflict_is_retained ();
-  test_activation_vote_reenters_after_set_resolution ();
-  test_activation_vote_evidence_targets_signer ();
-  test_waiting_proposal_retries_without_penalty ();
-  test_proposal_verify_error_waits_without_penalty ();
+  test_proposal_round_replay ();
+  test_proposal_height_replay ();
+  test_unretained_replay ();
+  test_future_vote_replay ();
+  test_vote_conflict_retained ();
+  test_activation_vote_replay ();
+  test_activation_vote_signer ();
+  test_waiting_proposal_retry ();
+  test_verify_error_retry ();
   Printf.printf "status = pass test = bft_ready_replay\n%!"

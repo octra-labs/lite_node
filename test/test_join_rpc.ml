@@ -8,7 +8,7 @@ let () =
   Mirage_crypto_rng_unix.use_default ()
 
 let fail msg =
-  failwith ("test_node_runtime_consensus_join_rpc: " ^ msg)
+  failwith ("test_join_rpc: " ^ msg)
 
 let expect label cond =
   if not cond then fail label
@@ -327,7 +327,7 @@ let test_head_roots () =
   expect "local root none" (Join.local_root_from_head None = "");
   expect "local root truncates"
     (Join.local_root_from_head
-       (Some (head ~state_root:(hex_of_raw (raw 's') ^ "tail") ())) =
+       (Some (head ~state_root:(hex_of_raw (raw 's') ^ "more") ())) =
      hex_of_raw (raw 's'));
   expect "base eic none" (Join.base_eic_root_from_head None = genesis);
   expect "base eic missing ledger"
@@ -1017,7 +1017,7 @@ let test_run_catchup_ready () =
   expect "ready start" (!starts = ["http://leader"]);
   expect "ready not written" (!writes = [])
 
-let test_run_catchup_stale_leader () =
+let test_catchup_old_epoch_leader () =
   let deps = Join.{
     fetch_head = (fun _ ->
       Lwt.return (head_json ~epoch:11L ~root:(hex_of_raw (raw 'r'))));
@@ -1288,7 +1288,7 @@ let test_node_deps_head_roots () =
       Some (head
         ~ledger_state_root:"ledger"
         ~epoch_index_root:"eic-root"
-        ~state_root:(hex_of_raw (raw 'r') ^ "tail")
+        ~state_root:(hex_of_raw (raw 'r') ^ "more")
         ()));
     next_txid = (fun () -> 99L);
     put_proposer = (fun epoch proposer ->
@@ -1701,7 +1701,7 @@ let () =
   test_apply_records_success ();
   test_apply_root_mismatch ();
   test_run_catchup_ready ();
-  test_run_catchup_stale_leader ();
+  test_catchup_old_epoch_leader ();
   test_catchup_retry_apply_ready ();
   test_run_catchup_transport_retry ();
   test_run_node_catchup_ready ();
@@ -1711,4 +1711,4 @@ let () =
   test_catchup_no_env ();
   test_wiring_no_env ();
   test_catchup_sources_exhausted ();
-  print_endline "status = pass test = node_runtime_consensus_join_rpc"
+  print_endline "status = pass test = join_rpc"

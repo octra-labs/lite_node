@@ -462,4 +462,4 @@ let run ?(inject_duplicate_offer = false) validator_count =
 let () =
   Lwt_main.run (run ~inject_duplicate_offer:true 5);
   Lwt_main.run (run 1);
-  print_endline "test_resource_compute_service: ok"
+  print_endline "status = pass test = resource_service"

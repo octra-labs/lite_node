@@ -57,7 +57,7 @@ let derived_abi ~trusted ~point_ops ~store ~addr =
       "instruction_count", `Int (Array.length bytecode);
     ])
 
-let source_admission = function
+let source_entry = function
   | Some meta -> String.equal meta.Store_irmin.admission "source"
   | None -> false
 
@@ -65,7 +65,7 @@ let current_program_record ~store ~chaindata ~addr =
   let open Lwt.Syntax in
   let* info = Store_irmin.get_contract_info store addr in
   let* meta = Store_irmin.get_contract_meta store addr in
-  match info, source_admission meta with
+  match info, source_entry meta with
   | None, _ -> Lwt.return_ok None
   | Some _, false -> Lwt.return_ok None
   | Some (_, code_hash, _, _), true ->
@@ -81,7 +81,7 @@ let current_program_record ~store ~chaindata ~addr =
         let* current = Store_irmin.get_contract_info store addr in
         let* current_meta = Store_irmin.get_contract_meta store addr in
         begin
-          match current, source_admission current_meta with
+          match current, source_entry current_meta with
           | Some (_, current_hash, _, _), true
             when String.equal code_hash current_hash ->
             Lwt.return_ok record
@@ -112,18 +112,13 @@ let abi_params ~trusted ~point_ops ~store ~chaindata params =
 
 let file_source item =
   match item with
-  | `Assoc fields ->
-    let path =
-      match List.assoc_opt "path" fields with
-      | Some (`String value) -> value
-      | _ -> ""
-    in
-    let source =
-      match List.assoc_opt "source" fields with
-      | Some (`String value) -> value
-      | _ -> ""
-    in
-    if String.equal path "" then None else Some (path, source)
+  | `Assoc fields when List.length fields = 2 ->
+    begin
+      match List.assoc_opt "path" fields, List.assoc_opt "source" fields with
+      | Some (`String path), Some (`String source)
+        when not (String.equal path "") -> Some (path, source)
+      | _ -> None
+    end
   | _ ->
     None
 
@@ -186,7 +181,7 @@ let validate_compile_input ?reserved_path source files =
       in
       check (String.length source) items
 
-let source_files source files_json =
+let source_files ?(main = "main.aml") source files_json =
   let files =
     List.filter_map
       (fun item ->
@@ -196,9 +191,9 @@ let source_files source files_json =
       files_json
     |> List.sort (fun (left, _) (right, _) -> String.compare left right)
   in
-  `Assoc (("main.aml", `String source) :: files)
+  `Assoc ((main, `String source) :: files)
 
-let compile_source source files_json =
+let compile_source ?(main = "main.aml") source files_json =
   match files_json with
   | Some files_json ->
     let file_map = Hashtbl.create 16 in
@@ -208,9 +203,9 @@ let compile_source source files_json =
         | Some (path, item_source) -> Hashtbl.replace file_map path item_source
         | None -> ())
       files_json;
-    Hashtbl.replace file_map "main.aml" source;
+    Hashtbl.replace file_map main source;
     let resolver path = Hashtbl.find_opt file_map path in
-    Oct_compile.compile_multi resolver "main.aml"
+    Oct_compile.compile_multi resolver main
   | None ->
     Oct_compile.compile source
 
@@ -266,7 +261,7 @@ let aml_multi_result ~syntax resolver main_path sources =
          ~source_material:(Oct_compile.ordered_sources sources)
          compiled)
 
-let aml_source_result ~syntax source files_json =
+let aml_source_result ?(main = "main.aml") ~syntax source files_json =
   match files_json with
   | None -> aml_result ~syntax source
   | Some files_json ->
@@ -277,12 +272,12 @@ let aml_source_result ~syntax source files_json =
         | Some (path, item_source) -> Hashtbl.replace file_map path item_source
         | None -> ())
       files_json;
-    Hashtbl.replace file_map "main.aml" source;
+    Hashtbl.replace file_map main source;
     let resolver path = Hashtbl.find_opt file_map path in
     let sources =
       Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
     in
-    aml_multi_result ~syntax resolver "main.aml" sources
+    aml_multi_result ~syntax resolver main sources
 
 let compile_assembly_response ~bytecode_b64 ~bytecode_size ~instructions =
   `Assoc [
@@ -375,7 +370,7 @@ let compile_program_source ?(compiler = Program_package.Protocol) ~point_ops sou
 
 let compiler_syntax = function
   | Program_package.Protocol -> Oct_gen.Forms
-  | Program_package.Source -> Oct_gen.Source
+  | Program_package.Source | Program_package.Preview -> Oct_gen.Source
 
 let compile_aml_with ~compiler ~point_ops ~program:_ ~source =
   match validate_compile_input source None with
@@ -757,11 +752,11 @@ let run_verify handler =
     |> Lwt.protected
   end
 
-let verify_compilation ~meta ~source ~files_json =
+let verify_compilation ~main ~meta ~source ~files_json =
   match meta with
   | Some meta when String.equal meta.Store_irmin.admission "source" ->
     let sources =
-      Program_package.{ path = "main.aml"; body = source }
+      Program_package.{ path = main; body = source }
       ::
       (Option.value files_json ~default:[]
        |> List.filter_map (fun item ->
@@ -770,16 +765,18 @@ let verify_compilation ~meta ~source ~files_json =
            Some Program_package.{ path; body }
          | None -> None))
     in
-    let current = Program_package.compile ~main:"main.aml" ~sources in
+    let current = Program_package.compile ~main ~sources in
     let source_result = Program_package.compile_with ~compiler:Program_package.Source
-      ~point_ops:true ~main:"main.aml" ~sources in
+      ~point_ops:true ~main ~sources in
+    let preview = Program_package.compile_with ~compiler:Program_package.Preview
+      ~point_ops:true ~main ~sources in
     let prior = Program_package.compile_for ~point_ops:false
-      ~main:"main.aml" ~sources in
+      ~main ~sources in
     let results = List.filter_map (function
       | Ok (compiled : Program_package.compiled) ->
         Some (compiled.envelope, compiled.result)
       | Error _ -> None
-    ) [current; prior; source_result] in
+    ) [current; prior; source_result; preview] in
     begin
       match results, current with
       | [], Error error -> Error (Program_package.error_message error)
@@ -787,9 +784,9 @@ let verify_compilation ~meta ~source ~files_json =
     end
   | Some _
   | None ->
-    let current = aml_source_result ~syntax:Oct_gen.Source source files_json in
-    let forms = aml_source_result ~syntax:Oct_gen.Forms source files_json in
-    let prior = compile_source source files_json in
+    let current = aml_source_result ~main ~syntax:Oct_gen.Source source files_json in
+    let forms = aml_source_result ~main ~syntax:Oct_gen.Forms source files_json in
+    let prior = compile_source ~main source files_json in
     let results =
       List.filter_map (function
         | Ok result -> Some (result.Oct_compile.bytecode, result)
@@ -815,17 +812,18 @@ let verify_compilation ~meta ~source ~files_json =
 
 let run_verify_worker handler =
   Lwt.catch
-    (fun () -> Lwt_preemptive.detach handler ())
+    (fun () -> Octra_core.Exec_resource.detach handler ())
     (function
-      | Out_of_memory as error -> Lwt.fail error
+      | Octra_core.Exec_resource.Unavailable Memory ->
+        Lwt.return_error "compiler resources unavailable"
       | Lwt.Canceled as error -> Lwt.fail error
-      | Stack_overflow ->
+      | Octra_core.Exec_resource.Unavailable Stack ->
         Lwt.return_error "compiler complexity limit exceeded"
       | _ -> Lwt.return_error "compiler failed")
 
-let verify_request ~store ~chaindata ~addr ~source ~files_json =
+let verify_request ~main ~store ~chaindata ~addr ~source ~files_json =
   let open Lwt.Syntax in
-  match validate_compile_input ~reserved_path:"main.aml" source files_json with
+  match validate_compile_input ~reserved_path:main source files_json with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
   | Ok () ->
     let* stored_b64 =
@@ -847,7 +845,7 @@ let verify_request ~store ~chaindata ~addr ~source ~files_json =
       | Ok stored ->
         let* compilation =
           run_verify_worker (fun () ->
-            verify_compilation ~meta ~source ~files_json)
+            verify_compilation ~main ~meta ~source ~files_json)
         in
         match compilation with
         | Error msg ->
@@ -888,7 +886,13 @@ let verify_request ~store ~chaindata ~addr ~source ~files_json =
             | Some (_, result) ->
               let source_json =
                 match files_json with
-                | Some files -> Yojson.Safe.to_string (source_files source files)
+                | Some files ->
+                  let files = source_files ~main source files in
+                  let stored =
+                    if String.equal main "main.aml" then files
+                    else `Assoc ["main", `String main; "files", files]
+                  in
+                  Yojson.Safe.to_string stored
                 | None -> source
               in
               let record = Store_chaindata.{
@@ -908,9 +912,9 @@ let verify_request ~store ~chaindata ~addr ~source ~files_json =
                 match current with
                 | Some (_, code_hash, _, _)
                   when String.equal code_hash stored_hash ->
-                  if not (source_admission meta) then
+                  if not (source_entry meta) then
                     ok_lwt (verified_record_response ~published:false record)
-                  else if not (source_admission current_meta) then
+                  else if not (source_entry current_meta) then
                     err_lwt
                       (Rpc.err
                          (-32000)
@@ -918,7 +922,7 @@ let verify_request ~store ~chaindata ~addr ~source ~files_json =
                          None)
                   else begin
                     let* saved =
-                      Lwt_preemptive.detach
+                      Octra_core.Exec_resource.detach
                         (fun () ->
                           Store_chaindata.save_program_record
                             chaindata
@@ -953,20 +957,50 @@ let verify_request ~store ~chaindata ~addr ~source ~files_json =
 
 let verify ~store ~chaindata ~addr ~source ~files_json =
   run_verify (fun () ->
-    verify_request ~store ~chaindata ~addr ~source ~files_json)
+    verify_request ~main:"main.aml" ~store ~chaindata ~addr ~source ~files_json)
+
+let verify_input params =
+  let invalid message = Error (Rpc.invalid_params message) in
+  match Rpc.param_json params 1 with
+  | Some (`String source) ->
+    begin
+      match Rpc.param_json params 2 with
+      | None -> Ok ("main.aml", source, None)
+      | Some (`List files) -> Ok ("main.aml", source, Some files)
+      | Some _ -> invalid "program files must be an array"
+    end
+  | Some (`Assoc fields) ->
+    begin
+      match List.assoc_opt "main" fields, List.assoc_opt "files" fields with
+      | Some (`String main), Some (`List files)
+        when List.length fields = 2 && valid_compile_path main ->
+        begin
+          match validate_compile_input "" (Some files) with
+          | Error message -> invalid message
+          | Ok () ->
+            let sources = List.filter_map file_source files in
+            begin
+              match List.assoc_opt main sources with
+              | None -> invalid "program main source is missing"
+              | Some source ->
+                let imports = List.filter (fun file ->
+                  match file_source file with
+                  | Some (path, _) -> not (String.equal path main)
+                  | None -> false) files in
+                Ok (main, source, Some imports)
+            end
+        end
+      | _ -> invalid "expected {main, files} with a valid program main path"
+    end
+  | _ -> invalid "expected source string or {main, files}"
 
 let verify_params ~store ~chaindata params =
-  match Rpc.require_address params 0 "address",
-        Rpc.require_string params 1 "source" with
+  match Rpc.require_address params 0 "address", verify_input params with
   | Error e, _ | _, Error e ->
     err_lwt e
-  | Ok addr, Ok source ->
-    let files_json =
-      match Rpc.param_json params 2 with
-      | Some (`List files) -> Some files
-      | _ -> None
-    in
-    verify ~store ~chaindata ~addr ~source ~files_json
+  | Ok addr, Ok (main, source, files_json) ->
+    run_verify (fun () ->
+      verify_request ~main ~store ~chaindata ~addr ~source ~files_json)
 
 let source_meta_fields ~verification ~certificate =
   let verification_fields =
@@ -998,6 +1032,22 @@ let source_response source meta_fields =
   | Some raw ->
     try
       match Yojson.Safe.from_string raw with
+      | `Assoc fields when
+          (match List.assoc_opt "files" fields with
+           | Some (`Assoc _) -> true
+           | _ -> false) ->
+        begin
+          match List.assoc_opt "main" fields, List.assoc_opt "files" fields with
+          | Some (`String main), Some (`Assoc files) ->
+            begin
+              match List.assoc_opt main files with
+              | Some (`String source) ->
+                `Assoc (["source", `String source; "main", `String main;
+                  "files", `Assoc files] @ meta_fields)
+              | _ -> `Assoc (["source", `Null] @ meta_fields)
+            end
+          | _ -> `Assoc (["source", `Null] @ meta_fields)
+        end
       | `Assoc files ->
         let main =
           match List.assoc_opt "main.aml" files with
@@ -1085,8 +1135,13 @@ let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
     view_active := true;
     let work = Lwt.finalize
       (fun () ->
-        Lwt_preemptive.detach handler ()
-        |> Lwt.map (fun value -> Ok value))
+        Lwt.catch
+          (fun () -> Octra_core.Exec_resource.detach handler ()
+            |> Lwt.map (fun value -> Ok value))
+          (function
+            | Octra_core.Exec_resource.Unavailable _ ->
+              Lwt.return_error (Rpc.err (-32005) "Program view resources unavailable" None)
+            | error -> Lwt.fail error))
       (fun () ->
         view_active := false;
         Lwt.return_unit)
@@ -1108,6 +1163,8 @@ type view_profile = {
   math : bool;
   object_cost : bool;
   int_work : Int_work.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
 }
 
 let view_profile rules ~epoch =
@@ -1116,12 +1173,16 @@ let view_profile rules ~epoch =
   let* standard = R.standard rules ~epoch in
   let* math = R.math rules ~epoch in
   let* object_cost = R.object_cost rules ~epoch in
+  let* fhe_work = R.fhe_work rules ~epoch in
+  let* wasm_float = R.wasm_float rules ~epoch in
   Ok {
     epoch;
     point_ops = standard = R.Active;
     math = math = R.Active;
     object_cost = object_cost = R.Active;
     int_work = if standard = R.Active then Int_work.Active else Int_work.Prior;
+    fhe_work;
+    wasm_float;
   }
 
 let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
@@ -1137,21 +1198,24 @@ let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
     get_fhe_pubkey;
     allow_fhe_capability;
     int_work = profile.int_work;
+    fhe_work = profile.fhe_work;
+    wasm_float = profile.wasm_float;
+    fhe_memory = Some (Fhe_memory.create ());
     point_ops = profile.point_ops;
     math = profile.math;
     object_cost = profile.object_cost;
     current_epoch = profile.epoch;
     do_transfer = (fun _ _ _ -> false);
     deploy_contract = (fun _ _ _ _ _ -> Error "deploy in view context");
-    call_contract = (fun caller target method_name args depth ->
+    call_contract = (fun caller target method_name args scope ->
       let params = List.map Receipt_view.call_arg_json args in
       let result =
         Contract.execute_view_call
           ?running
           ~trusted
-          ~ctx:view_ctx
-          ~depth
-          ~limit:view_effort_limit
+          ~ctx:{view_ctx with fhe_memory = scope.memory}
+          ~depth:scope.depth
+          ~limit:(Option.fold ~none:view_effort_limit ~some:(min view_effort_limit) scope.limit)
           store
           target
           method_name
@@ -1195,52 +1259,34 @@ let call_result ~store ~addr ~include_storage ~storage_json value =
 let call ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json
     ~addr ~method_name ~call_params ~caller_addr ~include_storage =
   let open Lwt.Syntax in
-  if String.equal method_name "balance_of" then
-    match call_params with
-    | [`String holder_addr] ->
-      let* balance =
-        Store_irmin.read_contract_storage_key
-          store
-          addr
-          ("balances:" ^ holder_addr)
-      in
+  let running, stop = view_clock () in
+  let view_ctx = make_view_ctx ~trusted ~profile ~running ~store ~ledger ~get_fhe_pubkey () in
+  let* executed =
+    run_view ~stop (fun () ->
+      Contract.execute_view_call
+        ~running
+        ~trusted
+        ~ctx:view_ctx
+        ~limit:view_effort_limit
+        store
+        addr
+        method_name
+        call_params
+        caller_addr)
+  in
+  match executed with
+  | Error error ->
+    Lwt.return_error error
+  | Ok result ->
+    if result.Contract.success then
       call_result
         ~store
         ~addr
         ~include_storage
         ~storage_json
-        (`String (Option.value ~default:"0" balance))
-    | _ ->
-      err_lwt (Rpc.invalid_params "balance_of expects exactly one address parameter")
-  else
-    let running, stop = view_clock () in
-    let view_ctx = make_view_ctx ~trusted ~profile ~running ~store ~ledger ~get_fhe_pubkey () in
-    let* executed =
-      run_view ~stop (fun () ->
-        Contract.execute_view_call
-          ~running
-          ~trusted
-          ~ctx:view_ctx
-          ~limit:view_effort_limit
-          store
-          addr
-          method_name
-          call_params
-          caller_addr)
-    in
-    match executed with
-    | Error error ->
-      Lwt.return_error error
-    | Ok result ->
-      if result.Contract.success then
-        call_result
-          ~store
-          ~addr
-          ~include_storage
-          ~storage_json
-          (Receipt_view.return_json result.return_value)
-      else
-        err_lwt (Rpc.err (-32000) (Receipt_view.view_error result.error) None)
+        (Receipt_view.return_json result.return_value)
+    else
+      err_lwt (Rpc.err (-32000) (Receipt_view.view_error result.error) None)
 
 let call_params ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json params =
   match Rpc.require_address params 0 "address",

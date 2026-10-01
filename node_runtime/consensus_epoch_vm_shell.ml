@@ -29,6 +29,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
   execute_call :
     ctx:ContractVM.exec_ctx ->
     depth:int ->
+    limit:int option ->
     target:string ->
     method_name:string ->
     params:Yojson.Safe.t list ->
@@ -38,16 +39,19 @@ type ('value_snapshot, 'program_snapshot) deps = {
   deploy_internal :
     ctx:ContractVM.exec_ctx ->
     depth:int ->
+    limit:int option ->
     params:ContractVM.v list ->
     deployer:string ->
     bytecode_raw:string ->
     nonce:int ->
     (ContractVM.spawn_result, string) result;
-  get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  get_fhe_pubkey : string -> ContractVM.fhe_key option;
   point_ops : bool;
   math : bool;
   object_cost : bool;
   int_work : Octra_vm.Int_work.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -251,6 +255,7 @@ type live_vm_tx_args = {
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
+  preview : Octra_core.Rule_graph.mode;
   program_overlap : bool;
   math : bool;
   epoch : int;
@@ -275,8 +280,10 @@ type live_contract_ctx_args = {
   program_journal : Program_journal.t;
   trusted_program_keys : Program_trust.t;
   store : Octra_core.Store_irmin.t;
-  get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  get_fhe_pubkey : string -> ContractVM.fhe_key option;
   proof_mode : Octra_core.Rule_graph.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   object_cost : bool;
   current_epoch : int;
@@ -313,6 +320,8 @@ type live_sender_vm_tx_args = {
   tx : Transaction.t;
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
   math : bool;
@@ -399,21 +408,25 @@ let subcall_result (r : Contract.exec_result) =
   | Error e ->
     Error e
 
-let make_contract_ctx deps =
+let make_contract_ctx (deps : (_, _) deps) =
+  let fhe_memory = match deps.fhe_work with
+    | Octra_core.Rule_graph.Prior -> None
+    | Octra_core.Rule_graph.Active -> Some (Octra_vm.Fhe_memory.create ()) in
   let rec ctx =
     {
       ContractVM.default_ctx with
       get_balance = deps.get_balance;
       do_transfer = (fun from_addr to_addr amount ->
         deps.transfer ~from_addr ~to_addr ~amount);
-      call_contract = (fun caller target method_name args depth ->
+      call_contract = (fun caller target method_name args scope ->
         let value = deps.snapshot_value () in
         let program = deps.snapshot_program () in
         let params = List.map Receipt_view.nested_call_arg_json args in
         let r =
           deps.execute_call
-            ~ctx
-            ~depth
+            ~ctx:{ctx with fhe_memory = scope.memory}
+            ~depth:scope.depth
+            ~limit:scope.limit
             ~target
             ~method_name
             ~params
@@ -423,13 +436,14 @@ let make_contract_ctx deps =
         if not r.success then
           restore deps value program;
         subcall_result r);
-      deploy_contract = (fun deployer bytecode_raw nonce depth params ->
+      deploy_contract = (fun deployer bytecode_raw nonce scope params ->
         let value = deps.snapshot_value () in
         let program = deps.snapshot_program () in
         match
           deps.deploy_internal
-            ~ctx
-            ~depth
+            ~ctx:{ctx with fhe_memory = scope.memory}
+            ~depth:scope.depth
+            ~limit:scope.limit
             ~params
             ~deployer
             ~bytecode_raw
@@ -447,6 +461,9 @@ let make_contract_ctx deps =
       math = deps.math;
       object_cost = deps.object_cost;
       int_work = deps.int_work;
+      fhe_work = deps.fhe_work;
+      wasm_float = deps.wasm_float;
+      fhe_memory;
       current_epoch = deps.current_epoch;
       epoch_time_ms = deps.epoch_time_ms;
       tree_hash = deps.tree_hash;
@@ -469,20 +486,22 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
         Program_journal.snapshot args.program_journal);
       restore_program = (fun snapshot ->
         Program_journal.restore args.program_journal snapshot);
-      execute_call = (fun ~ctx ~depth ~target ~method_name ~params ~caller
+      execute_call = (fun ~ctx ~depth ~limit ~target ~method_name ~params ~caller
           ~amount ->
         Contract.execute_call
           ~trusted:(Program_trust.keys args.trusted_program_keys)
-          ~journal:args.program_journal ~ctx ~depth
+          ~journal:args.program_journal ~ctx ~depth ?limit
           args.store target method_name params caller amount);
-      deploy_internal = (fun ~ctx ~depth ~params ~deployer ~bytecode_raw
+      deploy_internal = (fun ~ctx ~depth ~limit ~params ~deployer ~bytecode_raw
           ~nonce ->
         Contract.deploy_internal
           ~trusted:(Program_trust.keys args.trusted_program_keys)
-          ~journal:args.program_journal ~ctx ~depth
+          ~journal:args.program_journal ~ctx ~depth ?limit
           ~params args.store ~deployer ~bytecode_raw ~nonce);
       get_fhe_pubkey = args.get_fhe_pubkey;
       math = args.math;
+      fhe_work = args.fhe_work;
+      wasm_float = args.wasm_float;
       point_ops =
         (match args.proof_mode with
          | Octra_core.Rule_graph.Prior -> false
@@ -504,10 +523,7 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
 let live_fhe_pubkey store addr =
   match Node_rest_facade.run_s (Octra_core.Store_irmin.get_pvac_pubkey store addr) with
   | None -> None
-  | Some blob ->
-    match Octra_core.Pvac_registry.load_pubkey blob with
-    | Ok pk -> Some pk
-    | Error _ -> None
+  | Some blob -> Some (ContractVM.Key_bytes blob)
 
 let make_live_value_effects (args : live_value_effect_args) =
   let tx = Tx_effects.create ~ledger:args.ledger ~store:args.store in
@@ -557,6 +573,7 @@ let run_direct_exec spec ~fee ~target ~apply_value_effect ~log_failed
     reject;
     crash = (fun meta error ->
       match error with
+      | Octra_core.Exec_resource.Unavailable _ -> Lwt.fail error
       | Octra_circle_runtime.Circle_exec.Execution_unavailable _ -> Lwt.fail error
       | _ -> reject_after_fee fee meta.exception_type (Printexc.to_string error));
   }
@@ -579,7 +596,7 @@ let run_direct_call (deps : 'result direct_call_deps) ~domain ~reject_domain
       ~log_failed:deps.log_failed
       ~reject_after_fee:deps.reject_after_fee
       ~reject:deps.reject
-      ~exec:(deps.exec ~ctx)
+      ~exec:(Octra_core.Exec_resource.protect (deps.exec ~ctx))
       ~receipt:deps.receipt_of_result
       ~save:(fun call result -> deps.save ~tx_hash call result)
       ~ok:deps.ok)
@@ -779,12 +796,13 @@ let run_program_deploy_tx (deps : vm_tx_deps) tx =
         else
           let params = Call_plan.parse_deploy_params tx.message in
           let result =
-            deps.deploy_and_save
-              tx
-              ~admitted:(Some package.program)
-              ~params
-              ~bytecode:(Admission.code package.program)
-              ~bytecode_raw:package.envelope
+            Octra_core.Exec_resource.protect (fun () ->
+              deps.deploy_and_save
+                tx
+                ~admitted:(Some package.program)
+                ~params
+                ~bytecode:(Admission.code package.program)
+                ~bytecode_raw:package.envelope) ()
           in
           if result.receipt.success then begin
             deps.ensure_account result.contract_addr;
@@ -802,17 +820,18 @@ let run_program_deploy_tx (deps : vm_tx_deps) tx =
             runtime.log_constructor_failed result.contract_addr reason;
             runtime.reject_after_fee tx.ou "constructor_failed" reason)
 
-let prepare_program_package ~overlap ~program_mode ~point_ops (tx : Transaction.t) =
+let prepare_program_package ?(preview = Octra_core.Rule_graph.Prior)
+    ~overlap ~program_mode ~point_ops (tx : Transaction.t) =
   match tx.encrypted_data with
   | None -> Lwt.return_error "Program package missing"
   | Some encoded ->
-    let compiler = Program_package.compiler_mode program_mode in
+    let compiler = Program_package.compiler_mode ~preview program_mode in
     let admit =
       if overlap && compiler = Program_package.Source then
         Program_package.admit_transition ~point_ops
       else Program_package.admit_base64 ~compiler ~point_ops
     in
-    Lwt_preemptive.detach
+    Octra_core.Exec_resource.detach
       (fun () ->
         match admit encoded with
         | Ok package -> Ok package
@@ -830,8 +849,8 @@ let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
       deps.reject_malformed err
     | Ok calls ->
       deps.with_debited_fee fee (fun () ->
+        let ctx = deps.make_ctx tx_hash in
         try
-          let ctx = deps.make_ctx tx_hash in
           let result =
             Multi_exec.run
               ~from_addr
@@ -872,7 +891,8 @@ let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
             deps.log_failed err;
             deps.reject_after_fee fee "multi_exec_failed" err
         with
-        | (Tx_effects.Commit_failed _ | Stack_overflow | Out_of_memory) as error ->
+        | (Tx_effects.Commit_failed _ | Stack_overflow | Out_of_memory
+          | Octra_core.Exec_resource.Unavailable _) as error ->
           raise error
         | error ->
           deps.reject_after_fee fee "multi_exec_exception"
@@ -1017,6 +1037,7 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       { contract_addr; receipt });
     program_prepare = prepare_program_package
+      ~preview:args.preview
       ~overlap:args.program_overlap
       ~program_mode:args.program_mode
       ~point_ops:
@@ -1039,6 +1060,7 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
     circle_commit = (fun tx call_result ->
       Circle_exec.commit_call_result
         ~proof_mode:args.proof_mode
+        ~float_mode:(args.ctx_for_hash (Transaction.hash tx)).wasm_float
         args.store
         tx.to_
         call_result);
@@ -1143,6 +1165,8 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         store = args.store;
         get_fhe_pubkey = live_fhe_pubkey args.store;
         proof_mode = args.proof_mode;
+        fhe_work = args.fhe_work;
+        wasm_float = args.wasm_float;
         math = args.math;
         object_cost = args.object_cost;
         current_epoch = args.current_epoch ();
@@ -1181,6 +1205,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
     max_multi_exec_calls = max_multi_exec_calls ~env:Sys.getenv_opt;
     proof_mode = args.proof_mode;
     program_mode = args.program_mode;
+    preview = args.fhe_work;
     program_overlap = args.program_overlap;
     math = args.math;
     epoch = args.current_epoch ();

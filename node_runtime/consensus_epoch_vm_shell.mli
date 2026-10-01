@@ -21,6 +21,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
   execute_call :
     ctx:ContractVM.exec_ctx ->
     depth:int ->
+    limit:int option ->
     target:string ->
     method_name:string ->
     params:Yojson.Safe.t list ->
@@ -30,16 +31,19 @@ type ('value_snapshot, 'program_snapshot) deps = {
   deploy_internal :
     ctx:ContractVM.exec_ctx ->
     depth:int ->
+    limit:int option ->
     params:ContractVM.v list ->
     deployer:string ->
     bytecode_raw:string ->
     nonce:int ->
     (ContractVM.spawn_result, string) result;
-  get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  get_fhe_pubkey : string -> ContractVM.fhe_key option;
   point_ops : bool;
   math : bool;
   object_cost : bool;
   int_work : Octra_vm.Int_work.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
   current_epoch : int;
   epoch_time_ms : int64;
   tree_hash : string;
@@ -230,6 +234,7 @@ type vm_tx_deps = {
 }
 
 val prepare_program_package :
+  ?preview:Octra_core.Rule_graph.mode ->
   overlap:bool ->
   program_mode:Octra_core.Rule_graph.mode ->
   point_ops:bool ->
@@ -250,6 +255,7 @@ type live_vm_tx_args = {
   max_multi_exec_calls : int;
   proof_mode : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
+  preview : Octra_core.Rule_graph.mode;
   program_overlap : bool;
   math : bool;
   epoch : int;
@@ -274,8 +280,10 @@ type live_contract_ctx_args = {
   program_journal : Program_journal.t;
   trusted_program_keys : Octra_vm.Program_trust.t;
   store : Octra_core.Store_irmin.t;
-  get_fhe_pubkey : string -> Pvac_ffi.pubkey option;
+  get_fhe_pubkey : string -> ContractVM.fhe_key option;
   proof_mode : Octra_core.Rule_graph.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   object_cost : bool;
   current_epoch : int;
@@ -312,6 +320,8 @@ type live_sender_vm_tx_args = {
   tx : Transaction.t;
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
+  fhe_work : Octra_core.Rule_graph.mode;
+  wasm_float : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
   math : bool;
@@ -344,7 +354,7 @@ val make_live_contract_ctx :
 val live_fhe_pubkey :
   Octra_core.Store_irmin.t ->
   string ->
-  Pvac_ffi.pubkey option
+  ContractVM.fhe_key option
 
 val make_live_value_effects :
   live_value_effect_args ->

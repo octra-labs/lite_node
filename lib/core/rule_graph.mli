@@ -25,6 +25,17 @@ type activation = {
 
 type t
 
+val activation_mode : root_at:(int -> root_read) -> activation option ->
+  epoch:int -> (mode, fault) result
+
+val fhe_work_activation_for_chain : string -> activation option
+val fhe_work : t -> epoch:int -> (mode, fault) result
+val fhe_work_at : chain_id:string -> epoch:int -> mode
+
+val wasm_float_activation_for_chain : string -> activation option
+val wasm_float : t -> epoch:int -> (mode, fault) result
+val wasm_float_at : chain_id:string -> epoch:int -> mode
+
 val create :
   chain_id:string ->
   root_at:(int -> root_read) ->
@@ -59,6 +70,9 @@ val ready_exec_activation_for_chain : string -> activation option
 val ready_exec : t -> epoch:int -> (mode, fault) result
 val ready_exec_at : chain_id:string -> epoch:int -> mode
 val program_source_activation_for_chain : string -> activation option
+val tx_envelope_activation_for_chain : string -> activation option
+val tx_envelope : t -> epoch:int -> (mode, fault) result
+val tx_envelope_at : chain_id:string -> epoch:int64 -> mode
 val program_source : t -> epoch:int -> (mode, fault) result
 val program_overlap_epochs : int
 val program_overlap : t -> epoch:int -> (bool, fault) result

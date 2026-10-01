@@ -17,13 +17,16 @@ type admitted = {
   program : Admission.t;
 }
 
-type compiler = Protocol | Source
+type compiler = Protocol | Source | Preview
 
-let compiler_mode = function
+let compiler_mode ?(preview = Octra_core.Rule_graph.Prior) = function
   | Octra_core.Rule_graph.Prior -> Protocol
-  | Octra_core.Rule_graph.Active -> Source
+  | Octra_core.Rule_graph.Active ->
+    if preview = Octra_core.Rule_graph.Active then Preview else Source
 
 let source_id = "aml_source:oct_gen_count:source_abi:checked_address:option_values:scalar_equality:shape_limits:overlap_64"
+
+let preview_id = "aml_2_preview:certificate_version:stored_version:source_compat"
 
 type package = {
   compiler_profile : int;
@@ -271,6 +274,7 @@ let compile_sources ~compiler ~point_ops package =
   let compile =
     match compiler with
     | Source -> Oct_compile.compile_program_source
+    | Preview -> Oct_compile.compile_program_preview
     | Protocol when point_ops -> Oct_compile.compile_program_multi_first
     | Protocol -> Prior_compile.compile_program_multi_first
   in
@@ -305,12 +309,13 @@ let build ~compiler ~point_ops package =
   build_with ~point_ops (compile_sources ~compiler ~point_ops) package
 
 let compile_with ~compiler ~point_ops ~main ~sources =
-  if compiler = Source && not point_ops then Error Bad_compiler_profile
+  if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
   else
   bind (normalize ~main sources) (fun sources ->
     let compile =
       match compiler with
       | Source -> compile_sources_with Oct_compile.compile_program_source
+      | Preview -> compile_sources_with Oct_compile.compile_program_preview
       | Protocol when point_ops -> compile_sources_checked
       | Protocol -> compile_sources_with Prior_compile.compile_program_multi
     in
@@ -330,10 +335,16 @@ let validate_base64 encoded =
   bind (decode_base64 encoded) (fun _ -> Ok ())
 
 let admit_base64 ?(compiler = Protocol) ?(point_ops = false) encoded =
-  if compiler = Source && not point_ops then Error Bad_compiler_profile
+  if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
   else
   bind (decode_base64 encoded) (fun package ->
-    bind (build ~compiler ~point_ops { package with envelope = "" }) (fun compiled ->
+    let built = build ~compiler ~point_ops { package with envelope = "" } in
+    let built = match compiler, built with
+      | Preview, Ok compiled when String.equal compiled.envelope package.envelope -> built
+      | Preview, _ -> build ~compiler:Source ~point_ops { package with envelope = "" }
+      | Protocol, _ | Source, _ -> built
+    in
+    bind built (fun compiled ->
       if not (String.equal compiled.envelope package.envelope) then
         Error Envelope_mismatch
       else

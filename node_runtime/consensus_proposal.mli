@@ -23,7 +23,7 @@ type capped = {
 
 type verified_bundle = {
   txs : Transaction.t list;
-  candidates : Transaction.t list;
+  inputs : Transaction.t list;
   receipts_json : string list;
   rejections : Octra_core.Tx_outcome.rejection list;
   preverify : Octra_core.Preverify_commit.t;
@@ -320,6 +320,7 @@ type reject_reason =
   | Receipt_root_mismatch
   | Receipt_decode_failed of string
   | Preverify_gate_failed of string
+  | Invalid_tx_envelope of string
   | Bundle_limit of {
       totals : totals;
       limits : limits;
@@ -377,6 +378,7 @@ val check_local_bundle :
   (Consensus_bundle_fetch.proposal_bundle, string) result
 
 val build_preverify :
+  ?private_slots:Octra_core.Private_slots.limits ->
   run_many:(Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t) ->
   limits:limits ->
   Transaction.t list ->
@@ -497,7 +499,7 @@ val rejection_tuples :
   (Transaction.t * string * string) list
 
 val verify_preview_partition :
-  candidates:Transaction.t list ->
+  inputs:Transaction.t list ->
   confirmed:Transaction.t list ->
   rejections:Octra_core.Tx_outcome.rejection list ->
   (Octra_core.Epoch_exec.exec_result, string) result ->
@@ -620,6 +622,7 @@ val verify_proposal :
   Octra_consensus.C_driver.proposal_verdict Lwt.t
 
 val make_proposal :
+  ?private_slots:Octra_core.Private_slots.limits ->
   make_proposal_deps ->
   chain_id:string ->
   root_to_raw32:(string -> string) ->

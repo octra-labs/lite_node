@@ -392,12 +392,12 @@ let test_legacy_parent () =
        legacy_finalize
      = Octra_consensus.C_qc.Invalid "header_proto_version")
 
-let test_parent_tail () =
+let test_parent_suffix () =
   let module Log = Octra_consensus.Finality_log in
   let module Journal = Octra_node_runtime.Consensus_finality_journal in
   let module Source = Octra_node_runtime.Consensus_parent_commit in
   let module Store = Octra_core.Store_chaindata in
-  let base = Test_workspace.unique_dir "parent_tail" in
+  let base = Test_workspace.unique_dir "parent_suffix" in
   let chaindata = Store.open_chaindata (Filename.concat base "chaindata") in
   Fun.protect
     ~finally:(fun () -> Store.close chaindata)
@@ -423,7 +423,7 @@ let test_parent_tail () =
       let entry = Log.of_finalize finalize in
       Log.replace base
         (List.init 8192 (fun index -> { entry with height = index + 1 }));
-      expect "tail matches full read"
+      expect "suffix matches full read"
         (Log.last_entry_fast base = Log.last base);
       let source =
         Source.create ~chain_id:"parent-test" ~data_dir:base ~chaindata
@@ -435,7 +435,7 @@ let test_parent_tail () =
       in
       let before = Gc.allocated_bytes () in
       for _ = 1 to 8 do
-        expect "verified parent from tail"
+        expect "verified parent from suffix"
           (Source.verify source ~epoch_id:8193L (Some value) = Ok ())
       done;
       let allocated = Gc.allocated_bytes () -. before in
@@ -454,9 +454,9 @@ let test_parent_tail () =
       in
       Fun.protect ~finally:(fun () -> close_out output)
         (fun () -> output_string output "{\"height\":");
-      expect "incomplete tail refused"
+      expect "incomplete suffix refused"
         (try ignore (Source.load source ~epoch_id:8193L); false with _ -> true);
-      Printf.printf "event = parent_tail reads = 8 allocated_bytes = %.0f\n" allocated)
+      Printf.printf "event = parent_suffix reads = 8 allocated_bytes = %.0f\n" allocated)
 
 let () =
   test_roundtrip ();
@@ -466,5 +466,5 @@ let () =
   test_reward_cutover ();
   test_epoch_reward_source ();
   test_legacy_parent ();
-  test_parent_tail ();
+  test_parent_suffix ();
   print_endline "status = pass test = parent_commit"

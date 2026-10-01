@@ -240,7 +240,7 @@ let handle_request meta req ctx routes =
     if elapsed > slow_warn_s then
       Log.warn
         "rpc"
-        "SLOW method=%s took=%.2fs from=%s id=%s params=%s body_bytes=%d ua=%s"
+        "event = rpc_slow method = %s took = %.2fs from = %s id = %s params = %s body_bytes = %d ua = %s"
         req.method_
         elapsed
         meta.Rpc_http.rpc_peer
@@ -251,13 +251,13 @@ let handle_request meta req ctx routes =
     else if elapsed > info_s then
       Log.info
         "rpc"
-        "method=%s took=%.0fms from=%s params=%s"
+        "event = rpc_complete method = %s took = %.0fms from = %s params = %s"
         req.method_
         (elapsed *. 1000.0)
         meta.rpc_peer
         (Rpc_view.json_short 160 req.params)
     else
-      Log.trace "rpc" "%s %.0fms" req.method_ (elapsed *. 1000.0);
+      Log.trace "rpc" "event = rpc_complete method = %s took = %.0fms" req.method_ (elapsed *. 1000.0);
     Lwt.return
       (match result with
        | Ok v -> Rpc.Result (v, req.id)

@@ -74,18 +74,15 @@ let tx_epoch_cache_put key ~ttl value =
       tx_epoch_cache_v = value;
     }
 
-let tx_lookup_recent_heal_window () =
+let tx_lookup_recent_window () =
   Env.int_value "OCTRA_TX_HEAL_RECENT_EPOCHS" 256
 
-let bounded_heal_limit value =
+let lookup_record_limit value =
   min 4096 (max 0 value)
 
-let tx_lookup_recent_heal_limit () =
+let tx_lookup_record_limit () =
   Env.int_value "OCTRA_TX_HEAL_MAX_RECORDS" 256
-  |> bounded_heal_limit
-
-let txid_epoch_heal_recent_window () =
-  Env.int_value "OCTRA_TXID_HEAL_RECENT_EPOCHS" 256
+  |> lookup_record_limit
 
 let warn_epoch_profile profile =
   let warn_ms =
@@ -97,36 +94,17 @@ let warn_epoch_profile profile =
   | None ->
     ()
 
-let lookup_confirmed_tx_with_heal chaindata txh =
+let lookup_confirmed_tx chaindata txh =
   match Store_chaindata.get_tx_by_hash chaindata txh with
   | Some _ as hit ->
     hit
   | None ->
-    let recent_epochs = tx_lookup_recent_heal_window () in
-    let max_records = tx_lookup_recent_heal_limit () in
+    let recent_epochs = tx_lookup_recent_window () in
+    let max_records = tx_lookup_record_limit () in
     if recent_epochs <= 0 || max_records <= 0 then None
     else
-      match
-        Store_chaindata.heal_tx_by_hash_recent
-          chaindata
-          ~hash:txh
-          ~recent_epochs
-          ~max_records
-      with
-      | Some (epoch_id, tx_json) ->
-        Log.warn
-          "chaindata"
-          "auto-healed tx_loc hash = %s epoch = %d recent_epochs = %d max_records = %d"
-          (Text.addr_short txh)
-          epoch_id
-          recent_epochs
-          max_records;
-        Some (epoch_id, tx_json)
-      | None ->
-        None
-
-let confirmed_tx_epoch_with_heal chaindata hash =
-  Option.map fst (lookup_confirmed_tx_with_heal chaindata hash)
+      Store_chaindata.find_tx_by_hash_recent
+        chaindata ~hash:txh ~recent_epochs ~max_records
 
 let transaction ~find_drop ?(account_nonce = fun _ -> None) chaindata ~params =
   match Rpc.require_hash params 0 "hash" with
@@ -144,7 +122,7 @@ let transaction ~find_drop ?(account_nonce = fun _ -> None) chaindata ~params =
     in
     let confirmed =
       if Option.is_some pending then None
-      else lookup_confirmed_tx_with_heal chaindata txh
+      else lookup_confirmed_tx chaindata txh
     in
     let rejected =
       if Option.is_some pending || Option.is_some confirmed then None
@@ -153,12 +131,12 @@ let transaction ~find_drop ?(account_nonce = fun _ -> None) chaindata ~params =
     let dropped =
       if Option.is_some pending || Option.is_some confirmed ||
          Option.is_some rejected
-      then None
+      then Ok None
       else
         match Staging.lookup_dropped txh with
-        | Some _ as row -> row
+        | Some _ as row -> Ok row
         | None ->
-          Option.map
+          try Ok (Option.map
             (fun row ->
                (row.Octra_core.Tx_drop.reason,
                 row.detail,
@@ -168,9 +146,15 @@ let transaction ~find_drop ?(account_nonce = fun _ -> None) chaindata ~params =
                 row.nonce,
                 row.ou,
                 row.op_type))
-            (find_drop txh)
+            (find_drop txh))
+          with error -> Error error
     in
-    match
+    match dropped with
+    | Error error ->
+      Log.warn "rpc" "event = drop_read_failed reason = %s" (Printexc.to_string error);
+      err {Rpc.service_unavailable with data = Some (`Assoc [
+        "hash", `String txh; "dropped_status", `String "unavailable"])}
+    | Ok dropped -> match
       Tx_view.transaction_lookup_response
         ~decode_message:Text.decode_message_if_hex
         ~hash:txh
@@ -299,8 +283,15 @@ let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
       ~limit:page.limit
       ~offset:page.offset
   in
+  let drop_rows, drop_status =
+    match drops_by_addr addr ~limit:page.limit ~offset:page.offset with
+    | rows -> rows, "ready"
+    | exception error ->
+      Log.warn "rpc" "event = drop_read_failed reason = %s" (Printexc.to_string error);
+      [], "unavailable"
+  in
   let dropped =
-    drops_by_addr addr ~limit:page.limit ~offset:page.offset
+    drop_rows
     |> List.filter (fun row ->
       not (drop_is_private row || drop_is_superseded chaindata row))
     |> List.map drop_json
@@ -317,8 +308,9 @@ let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
       ~rejected
       ~dropped
   with
-  | Ok response ->
-    ok response
+  | Ok (`Assoc fields) ->
+    ok (`Assoc (("dropped_status", `String drop_status) :: fields))
+  | Ok response -> ok response
   | Error e ->
     err e
 
@@ -407,38 +399,8 @@ let transactions_by_epoch chaindata ~params ~current_epoch_id =
         Store_chaindata.txs_by_epoch_rows_status chaindata eid ~limit ~offset
       in
       let status0_ms = (Unix.gettimeofday () -. status0_start) *. 1000.0 in
-      let recent_epochs = txid_epoch_heal_recent_window () in
-      let page_status =
-        History.epoch_page_status_with_heal
-          ~is_incomplete:(fun (status : Store_chaindata.rows_status) ->
-            status.incomplete)
-          ~recent_epochs
-          ~now:Unix.gettimeofday
-          ~heal:(fun () ->
-            let stats =
-              Store_chaindata.heal_epoch_txids_recent
-                chaindata
-                ~epoch_id:eid
-                ~recent_epochs
-            in
-            stats.checked, stats.repaired, List.length stats.errors)
-          ~retry:(fun () ->
-            Store_chaindata.txs_by_epoch_rows_status
-              chaindata
-              eid
-              ~limit
-              ~offset)
-          status0
-      in
-      if History.epoch_page_heal_should_log page_status then
-        Log.warn
-          "chaindata"
-          "auto-healed txid_loc epoch = %d checked = %d repaired = %d errors = %d"
-          eid
-          page_status.History.epoch_page_heal_checked
-          page_status.History.epoch_page_heal_repaired
-          page_status.History.epoch_page_heal_errors;
-      let status = page_status.History.epoch_page_status in
+      let page_status = History.epoch_page_status_without_heal status0 in
+      let status = status0 in
       if status.incomplete then
         let total_ms = (Unix.gettimeofday () -. profile_start) *. 1000.0 in
         let profile =
@@ -459,7 +421,7 @@ let transactions_by_epoch chaindata ~params ~current_epoch_id =
           (History.epoch_incomplete_status_error
              ~epoch_id:eid
              ~missing:status.missing
-             (Store_chaindata.get_visible_epoch_index_status chaindata eid))
+             (Store_chaindata.get_epoch_index_status chaindata eid))
       else
         let rejected_start = Unix.gettimeofday () in
         let rejected_rows =

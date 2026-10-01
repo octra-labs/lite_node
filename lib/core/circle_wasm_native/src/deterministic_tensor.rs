@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_linear_and_top1_match_reference() {
+    fn parallel_linear_top1() {
         let input_len = 1024;
         let rows = 1024;
         let input = (0..input_len)
@@ -753,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn nonlinear_functions_preserve_symmetry() {
+    fn nonlinear_symmetry() {
         assert_eq!(sigmoid(0), Ok(HALF));
         let positive = sigmoid(ONE).unwrap();
         let negative = sigmoid(-ONE).unwrap();
@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn rope_and_attention_have_fixed_outputs() {
+    fn rope_attention_outputs() {
         assert_eq!(sin_cos(0), Ok((0, ONE)));
         let quarter = sin_cos(HALF_PI).unwrap();
         assert!((quarter.0 - ONE).abs() < 16);

@@ -25,6 +25,7 @@ type fatal =
   | Outcome_invalid of string
 
 type deps = {
+  rules : Octra_core.Rule_graph.t;
   check_override_receipts :
     epoch_id:int ->
     receipts:string list ->
@@ -38,6 +39,7 @@ type deps = {
 }
 
 type node_deps = {
+  rules : Octra_core.Rule_graph.t;
   check_override_receipts :
     epoch_id:int ->
     receipts:string list ->

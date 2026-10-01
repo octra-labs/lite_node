@@ -368,7 +368,7 @@ let test_catchup_activation_boundary () =
        ~signer_count:(List.length responders)
        ~signed_weight:effective_weight)
 
-let test_new_chain_quorum_from_genesis () =
+let test_genesis_quorum () =
   let chain_id = "new-private-network" in
   let epoch_id = 0L in
   expect "new chain has no historical quorum anchor"
@@ -580,10 +580,10 @@ let test_config_binding () =
   let unit_set =
     C_types.make_validator_set [alice; bob; carol; dave]
   in
-  expect "weighted hash canonical"
+  expect "weighted hash order independent"
     (C_config.validator_set_hash validator_set
      = C_config.validator_set_hash reordered);
-  expect "weight is config bound"
+  expect "weight changes config hash"
     (C_config.validator_set_hash validator_set
      <> C_config.validator_set_hash unit_set)
 
@@ -618,7 +618,7 @@ let () =
   test_threshold ();
   test_live_activation ();
   test_catchup_activation_boundary ();
-  test_new_chain_quorum_from_genesis ();
+  test_genesis_quorum ();
   test_small_distributions ();
   test_activation_rewind_boundary ();
   test_qc ();
@@ -627,4 +627,4 @@ let () =
   test_config_binding ();
   test_invalid_sets ();
   test_codec ();
-  Printf.printf "weighted bft tests passed\n"
+  Printf.printf "status = pass test = weighted_bft\n"

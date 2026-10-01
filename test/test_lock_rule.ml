@@ -128,7 +128,7 @@ let test_no_lock_accepts_anything () =
     assert (v.proposal_id = C_hash.proposal_id h)
   | None -> failwith "no prevote emitted"
 
-let test_lock_blocks_conflicting_proposal () =
+let test_lock_conflict () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let _pid_a = lock_on_round_0 t h_a in
@@ -143,7 +143,7 @@ let test_lock_blocks_conflicting_proposal () =
     assert (Octra_net.Hash_domain.is_nil v.proposal_id)
   | None -> failwith "no prevote emitted"
 
-let test_lock_accepts_same_locked_value () =
+let test_lock_same_value () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let pid_a = lock_on_round_0 t h_a in
@@ -159,7 +159,7 @@ let test_lock_accepts_same_locked_value () =
     assert (v.proposal_id = pid_a)
   | None -> failwith "no prevote emitted"
 
-let test_rejects_non_prior_valid_round () =
+let test_valid_round_prior () =
   let t = make_engine four_validators in
   advance_to_round t 1;
   let h_a = mk_header 0 in
@@ -196,7 +196,7 @@ let test_unlock_with_polc () =
     assert (v.proposal_id = pid_a)
   | None -> failwith "no prevote emitted"
 
-let test_no_unlock_when_polc_for_other_value () =
+let test_polc_other_value () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let pid_a = lock_on_round_0 t h_a in
@@ -214,7 +214,7 @@ let test_no_unlock_when_polc_for_other_value () =
     assert (Octra_net.Hash_domain.is_nil v.proposal_id)
   | None -> failwith "no prevote emitted"
 
-let test_no_unlock_without_valid_round () =
+let test_polc_missing_round () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let _ = lock_on_round_0 t h_a in
@@ -229,7 +229,7 @@ let test_no_unlock_without_valid_round () =
     assert (Octra_net.Hash_domain.is_nil v.proposal_id)
   | None -> failwith "no prevote emitted"
 
-let test_no_unlock_when_valid_round_le_locked () =
+let test_polc_locked_round () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let _ = lock_on_round_0 t h_a in
@@ -246,7 +246,7 @@ let test_no_unlock_when_valid_round_le_locked () =
     assert (Octra_net.Hash_domain.is_nil v.proposal_id)
   | None -> failwith "no prevote emitted"
 
-let test_round_timeout_preserves_lock () =
+let test_timeout_lock () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let _ = lock_on_round_0 t h_a in
@@ -303,7 +303,7 @@ let test_historical_polc_recovery () =
     assert (C_hash.proposal_id value = proposal_id)
   | None -> failwith "historical PoLC did not restore valid value"
 
-let test_historical_polc_request_retries () =
+let test_polc_request_retry () =
   let t = make_engine four_validators in
   drain_clear t;
   C_engine.start_round t 1;
@@ -321,7 +321,7 @@ let test_historical_polc_request_retries () =
   in
   assert (List.sort Int.compare second = [0; 1])
 
-let test_historical_polc_storage_is_bounded () =
+let test_polc_storage_limit () =
   let t = make_engine four_validators in
   drain_clear t;
   for round = 1 to 200 do
@@ -332,7 +332,7 @@ let test_historical_polc_storage_is_bounded () =
   assert
     (Hashtbl.length t.prevotes_by_round <= C_engine.round_history_limit + 1)
 
-let test_lock_conflict_caches_value_until_polc () =
+let test_lock_conflict_cache () =
   let t = make_engine four_validators in
   let header_a = mk_header ~creator:(leader_addr t 0) 3 in
   let _ = lock_on_round_0 t header_a in
@@ -373,7 +373,7 @@ let test_lock_conflict_caches_value_until_polc () =
     assert (C_hash.proposal_id value = proposal_id_b)
   | None -> failwith "cached value was not promoted by historical PoLC"
 
-let test_add_vote_reports_exact_quorum_pid () =
+let test_vote_quorum_pid () =
   let vs = C_engine.create_vote_set () in
   let pid_a = String.make 32 '\x11' in
   let pid_b = String.make 32 '\x22' in
@@ -397,7 +397,7 @@ let test_add_vote_reports_exact_quorum_pid () =
   assert (C_engine.count_for_pid vs pid_a = 5);
   assert (C_engine.count_for_pid vs pid_b = 2)
 
-let test_accept_finalize_batch_rejects_conflicting_lower_round_lock () =
+let test_finalize_lower_lock () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let _ = lock_on_round_0 t h_a in
@@ -407,7 +407,7 @@ let test_accept_finalize_batch_rejects_conflicting_lower_round_lock () =
   assert (not accepted);
   assert (drain t = [])
 
-let test_accept_finalize_batch_accepts_conflicting_higher_round_lock () =
+let test_finalize_higher_lock () =
   let t = make_engine four_validators in
   let h_a = mk_header 0 in
   let _ = lock_on_round_0 t h_a in
@@ -441,7 +441,7 @@ let test_polc_reset_on_height_change () =
   assert (t.state.valid_round = -1);
   assert (t.state.locked_value = None)
 
-let test_make_proposal_re_proposes_valid_value_single_validator () =
+let test_single_reproposal () =
   let t = make_engine one_validator ~my_addr:"v0" in
   let empty_tlh = Octra_net.Hash_domain.hash "octra:tx_list:v1" "" in
   let h_a = {
@@ -467,7 +467,7 @@ let test_make_proposal_re_proposes_valid_value_single_validator () =
     assert (p.tx_hashes = [])
   | None -> failwith "no SendPropose emitted"
 
-let test_multi_validator_re_proposes_valid_value () =
+let test_multi_reproposal () =
   let t = make_engine four_validators ~my_addr:(leader_addr (make_engine four_validators) 1) in
   let empty_tlh = Octra_net.Hash_domain.hash "octra:tx_list:v1" "" in
   let h_a = { (mk_header 0) with Octra_consensus.C_types.tx_list_hash = empty_tlh } in
@@ -490,24 +490,24 @@ let test_multi_validator_re_proposes_valid_value () =
     assert (p.tx_hashes = [])
   | None -> failwith "no SendPropose emitted"
 
-let test_re_propose_uses_cached_tx_hashes_single_validator () =
+let test_single_hash_cache () =
   let t = make_engine one_validator ~my_addr:"v0" in
   let tx1 = String.make 32 '\xa1' in
   let tx2 = String.make 32 '\xa2' in
-  let canonical_hashes = [tx1; tx2] in
+  let agreed_hashes = [tx1; tx2] in
   let raw_to_hex s =
     String.concat "" (List.init (String.length s) (fun i ->
       Printf.sprintf "%02x" (Char.code s.[i])))
   in
-  let canonical_tlh = Octra_net.Hash_domain.hash
+  let agreed_tlh = Octra_net.Hash_domain.hash
     "octra:tx_list:v1"
-    (String.concat "" (List.map raw_to_hex canonical_hashes)) in
+    (String.concat "" (List.map raw_to_hex agreed_hashes)) in
   let h_a = {
     (mk_header ~creator:"v0" 0) with
-    Octra_consensus.C_types.tx_list_hash = canonical_tlh;
+    Octra_consensus.C_types.tx_list_hash = agreed_tlh;
   } in
-  let p_a = mk_propose ~proposer:(leader_addr t 0) { h_a with tx_list_hash = canonical_tlh } in
-  let p_a = { p_a with tx_hashes = canonical_hashes } in
+  let p_a = mk_propose ~proposer:(leader_addr t 0) { h_a with tx_list_hash = agreed_tlh } in
+  let p_a = { p_a with tx_hashes = agreed_hashes } in
   C_engine.on_propose t p_a ~verify_fn:always_true ~execute_fn:always_exec ~sign_fn:dummy_sign;
   let pid = C_hash.proposal_id h_a in
   inject_prevote_quorum t 0 pid;
@@ -523,10 +523,10 @@ let test_re_propose_uses_cached_tx_hashes_single_validator () =
   match send_propose with
   | Some p ->
     assert (C_hash.proposal_id p.header = pid);
-    assert (p.tx_hashes = canonical_hashes)
+    assert (p.tx_hashes = agreed_hashes)
   | None -> failwith "no SendPropose emitted"
 
-let test_re_propose_refuses_when_cache_miss_single_validator () =
+let test_single_cache_miss () =
   let t = make_engine one_validator ~my_addr:"v0" in
   let h_a = mk_header 0 in
   let pid = C_hash.proposal_id h_a in
@@ -546,7 +546,7 @@ let test_re_propose_refuses_when_cache_miss_single_validator () =
   in
   assert (send_propose = None)
 
-let test_re_propose_refuses_when_cached_hashes_dont_match_tlh_single_validator () =
+let test_single_cache_hash () =
   let t = make_engine one_validator ~my_addr:"v0" in
   let h_a = mk_header 0 in
   let pid = C_hash.proposal_id h_a in
@@ -572,7 +572,7 @@ let test_re_propose_refuses_when_cached_hashes_dont_match_tlh_single_validator (
   in
   assert (send_propose = None)
 
-let test_precommit_quorum_without_header_waits_for_finalize_batch () =
+let test_precommit_header_wait () =
   let t = make_engine four_validators ~my_addr:"v0" in
   drain_clear t;
   let h = mk_header 8 in
@@ -598,7 +598,7 @@ let test_precommit_quorum_without_header_waits_for_finalize_batch () =
   in
   assert finalized
 
-let test_reproposal_finalize_keeps_parent_commit () =
+let test_reproposal_parent () =
   let t = make_engine four_validators ~my_addr:"v0" in
   drain_clear t;
   let parent_header = mk_header ~epoch_id:0L 2 in
@@ -641,7 +641,7 @@ let test_reproposal_finalize_keeps_parent_commit () =
        = header.parent_commit_hash)
   | None -> failwith "reproposal did not finalize"
 
-let test_parent_commit_required_before_local_finalize () =
+let test_local_parent_required () =
   let t = make_engine four_validators ~my_addr:"v0" in
   drain_clear t;
   let parent_header = mk_header ~epoch_id:0L 3 in
@@ -705,7 +705,7 @@ let test_parent_commit_required_before_local_finalize () =
        = header.parent_commit_hash)
   | None -> failwith "parent commit recovery did not finalize"
 
-let test_parent_commit_mismatch_blocks_local_finalize () =
+let test_local_parent_mismatch () =
   let t = make_engine four_validators ~my_addr:"v0" in
   drain_clear t;
   let expected_header = mk_header ~epoch_id:0L 4 in
@@ -1007,29 +1007,29 @@ let () =
   test_value_timeout ();
   test_split_timer ();
   test_no_lock_accepts_anything ();
-  test_lock_blocks_conflicting_proposal ();
-  test_lock_accepts_same_locked_value ();
-  test_rejects_non_prior_valid_round ();
+  test_lock_conflict ();
+  test_lock_same_value ();
+  test_valid_round_prior ();
   test_unlock_with_polc ();
-  test_no_unlock_when_polc_for_other_value ();
-  test_no_unlock_without_valid_round ();
-  test_no_unlock_when_valid_round_le_locked ();
-  test_round_timeout_preserves_lock ();
+  test_polc_other_value ();
+  test_polc_missing_round ();
+  test_polc_locked_round ();
+  test_timeout_lock ();
   test_historical_polc_recovery ();
-  test_historical_polc_request_retries ();
-  test_historical_polc_storage_is_bounded ();
-  test_lock_conflict_caches_value_until_polc ();
-  test_add_vote_reports_exact_quorum_pid ();
-  test_accept_finalize_batch_rejects_conflicting_lower_round_lock ();
-  test_accept_finalize_batch_accepts_conflicting_higher_round_lock ();
+  test_polc_request_retry ();
+  test_polc_storage_limit ();
+  test_lock_conflict_cache ();
+  test_vote_quorum_pid ();
+  test_finalize_lower_lock ();
+  test_finalize_higher_lock ();
   test_polc_reset_on_height_change ();
-  test_make_proposal_re_proposes_valid_value_single_validator ();
-  test_multi_validator_re_proposes_valid_value ();
-  test_re_propose_uses_cached_tx_hashes_single_validator ();
-  test_re_propose_refuses_when_cache_miss_single_validator ();
-  test_re_propose_refuses_when_cached_hashes_dont_match_tlh_single_validator ();
-  test_precommit_quorum_without_header_waits_for_finalize_batch ();
-  test_reproposal_finalize_keeps_parent_commit ();
-  test_parent_commit_required_before_local_finalize ();
-  test_parent_commit_mismatch_blocks_local_finalize ();
+  test_single_reproposal ();
+  test_multi_reproposal ();
+  test_single_hash_cache ();
+  test_single_cache_miss ();
+  test_single_cache_hash ();
+  test_precommit_header_wait ();
+  test_reproposal_parent ();
+  test_local_parent_required ();
+  test_local_parent_mismatch ();
   Printf.printf "status = pass test = lock_rule\n%!"

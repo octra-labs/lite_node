@@ -18,6 +18,7 @@ from multiprocessing import get_context
 from unittest import mock
 from test_validator_exit import ValidatorExitTest
 from test_exit_crash import ExitCrashTest
+from test_upgrade_profile import UpgradeProfileTest
 
 from nacl.signing import SigningKey
 
@@ -3258,7 +3259,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 self.assertIsNone(report_ready(values, wallet, snapshot))
         emit.assert_not_called()
 
-    def test_rejoin_wait_bounds(self):
+    def test_rejoin_wait_range(self):
         self.assertEqual(positive_seconds("30"), 30)
         with self.assertRaisesRegex(ValidatorError, "outside"):
             positive_seconds("29")
@@ -3781,10 +3782,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 )
 
     def test_ready_payload(self):
-        installed = Path(__file__).resolve().parents[1].name == "controls"
-        path = CONFIG_ROOT / (
-            "test/ready_payload.py" if installed else "scripts/bft_lab/validator_ready_payload.py"
-        )
+        path = CONFIG_ROOT / "test/ready_payload.py"
         self.assertTrue(path.is_file(), "readiness producer is missing from the source")
         main = runpy.run_path(str(path))["main"]
         ready = {
@@ -4595,9 +4593,7 @@ class ValidatorToolsTest(unittest.TestCase):
         install.assert_called_once_with()
 
     def test_gate_python(self):
-        source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
-        exported_path = Path(__file__).resolve().parent.parent / "check.sh"
-        script_path = source_path if source_path.is_file() else exported_path
+        script_path = Path(__file__).resolve().parent.parent / "check.sh"
         script = script_path.read_text(encoding="utf-8")
         self.assertIn("python3_missing", script)
         self.assertIn("python3_nacl_missing", script)
@@ -4608,17 +4604,14 @@ class ValidatorToolsTest(unittest.TestCase):
                         install.index("npm install -g pm2"))
 
     def test_gate_requires_source_commit(self):
-        source_path = Path(__file__).resolve().parent / "validator_tools_gate.sh"
-        exported_path = Path(__file__).resolve().parent.parent / "check.sh"
-        script_path = source_path if source_path.is_file() else exported_path
+        script_path = Path(__file__).resolve().parent.parent / "check.sh"
         script = script_path.read_text(encoding="utf-8")
         self.assertIn("source_commit_missing", script)
         self.assertIn("source_commit_invalid", script)
 
     def test_gate_modes(self):
         source = Path(__file__).resolve().parent
-        gate = source / "validator_tools_gate.sh"
-        gate = gate if gate.is_file() else source.parent / "check.sh"
+        gate = source.parent / "check.sh"
         controls = WORK / "controls"
         modules = controls / "lib"
         modules.mkdir(parents=True)
@@ -4653,7 +4646,64 @@ class ValidatorToolsTest(unittest.TestCase):
         (WORK / "nodes.config").write_text("changed")
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reason = manifest_mismatch", result.stderr)
+        self.assertIn("path = nodes.config", result.stderr)
         self.assertNotIn("test suite invoked", result.stderr)
+        (WORK / "nodes.config").unlink()
+        result = subprocess.run(command, capture_output = True, text = True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reason = manifest_missing path = nodes.config", result.stderr)
+        (WORK / "nodes.config").write_text("")
+        manifest = WORK / "MANIFEST.sha256"
+        content = manifest.read_text()
+        for value in ("", "invalid\n", content + "invalid\n"):
+            manifest.write_text(value)
+            result = subprocess.run(command, capture_output = True, text = True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("reason = manifest_invalid path = MANIFEST.sha256", result.stderr)
+        manifest.unlink()
+        result = subprocess.run(command, capture_output = True, text = True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reason = manifest_missing path = MANIFEST.sha256", result.stderr)
+
+    def test_proof_diagnostics(self):
+        source = Path(__file__).resolve().parent.parent / "proof_gate.sh"
+        controls = WORK / "controls"
+        controls.mkdir()
+        shutil.copyfile(source, controls / source.name)
+        proof = WORK / "sample.v"
+        proof.write_text("Goal True. Proof. exact I. Qed.\n")
+        opam = WORK / "opam"
+        opam.write_text(
+            '#!/bin/sh\n'
+            'if [ "$3" = "$PROOF_PHASE" ]; then\n'
+            '  printf "proof_tool_failed\\n" >&2\n'
+            '  exit 42\n'
+            'fi\n'
+            'if [ "$3" = coqchk ]; then\n'
+            '  printf "%s\\n" "* Axioms: <none>" '
+            '"* Constants/Inductives relying on type-in-type: <none>" '
+            '"* Constants/Inductives relying on unsafe (co)fixpoints: <none>" '
+            '"* Inductives whose positivity is assumed: <none>"\n'
+            'fi\n'
+        )
+        opam.chmod(0o700)
+        command = ["sh", str(controls / source.name), str(proof)]
+        for phase in ("coqc", "coqchk", "none"):
+            with self.subTest(phase = phase):
+                env = dict(
+                    os.environ,
+                    PATH = str(WORK) + os.pathsep + os.environ["PATH"],
+                    PROOF_PHASE = phase,
+                )
+                result = subprocess.run(command, env = env, capture_output = True, text = True)
+                if phase == "none":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("status = pass proof = sample axioms = none", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 42)
+                    self.assertIn(f"status = fail proof = sample reason = {phase} exit = 42", result.stderr)
+                    self.assertIn("proof_tool_failed", result.stderr)
 
     def test_sync_budget(self):
         args = parser().parse_args([])
@@ -5513,7 +5563,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 self.assertEqual(dict(os.environ), inherited)
             mkdir.assert_called_once_with(parents = True, exist_ok = True)
             self.assertEqual(TOOLCHAIN_ROOT, CONFIG_ROOT / "runtime_data/toolchains")
-            self.assertEqual(environment["T" + "MPDIR"], str(BUILD_WORK))
+            self.assertEqual(environment["TMPDIR"], str(BUILD_WORK))
             self.assertEqual(environment["CARGO_HOME"], str(CARGO_HOME))
             self.assertEqual(environment["RUSTUP_HOME"], str(RUSTUP_HOME))
             self.assertEqual(OPAM_SWITCH, TOOLCHAIN_ROOT / "ocaml")
@@ -5961,7 +6011,8 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool.shutil, "disk_usage", return_value=mock.Mock(free=8 * 1024 ** 3),
         ), mock.patch.object(upgrade_tool, "emit"):
             for kind in ("pm2", "systemd"):
-                supervisor = {"kind": kind, "pid": 17}
+                supervisor = {"kind": kind, "pid": 17,
+                              "restart": {"Restart": "on-failure", "RestartPreventExitStatus": "78"}}
                 upgrade_tool.preflight(WORK, supervisor, values, False)
                 owners.return_value = [17, 18, 19]
                 with self.assertRaisesRegex(ValidatorError, "unexpected processes: 17,18,19"):

@@ -444,7 +444,7 @@ let test_rotation root wallets payload certificate data_dir validators =
     && Uri.get_query_param uri "index" = Some (string_of_int index)) !requests) in
   Lwt.finalize (fun () ->
     Client.retries := 1;
-    Lwt.try_bind sync (fun () -> fail "missing tail was accepted")
+    Lwt.try_bind sync (fun () -> fail "missing suffix was accepted")
       (function
         | Failure reason when reason =
             "chunk retry budget exhausted path = chaindata/blob index = 2" -> Lwt.return_unit
@@ -954,4 +954,4 @@ let () =
   test_distinct_checkpoints ();
   test_transport_guard ();
   Lwt_main.run (run ());
-  print_endline "test_state_sync_client: ok"
+  print_endline "status = pass test = state_sync_client"

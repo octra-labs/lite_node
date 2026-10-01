@@ -5,6 +5,7 @@ type t = {
   admitted_code : Contract_vm.instr array;
   admitted_effects : Program_effects.t;
   profile : profile;
+  compiler_version : string option;
 }
 
 and profile =
@@ -65,6 +66,7 @@ let admit ~program ~point_ops code =
           admitted_code = Array.copy code;
           admitted_effects = Program_effects.scan code;
           profile = if program then Program Program_type_flow.empty_facts else Legacy;
+          compiler_version = None;
         }
 
 let of_code ?(point_ops = false) code = admit ~program:false ~point_ops code
@@ -330,8 +332,11 @@ let verify_program_cert ~attested ~trusted raw_code code raw =
                  (match Program_policy.verify code facts effects with
                   | Error error -> Error ("program effect policy: " ^ error)
                   | Ok () ->
-                    if facts_hash = Some (Program_type_flow.facts_hash facts) then Ok facts
-                    else Error "program certificate facts hash mismatch"))))
+                    if facts_hash <> Some (Program_type_flow.facts_hash facts) then
+                      Error "program certificate facts hash mismatch"
+                    else match cert_text "compiler_version" fields with
+                    | Some version -> Ok (facts, version)
+                    | None -> Error "program certificate provenance mismatch"))))
     | _ -> Error "program certificate must be an object"
   with
   | (Stack_overflow | Out_of_memory) as error -> raise error
@@ -353,7 +358,10 @@ let decode_program ?(trusted = []) ?(point_ops = false) raw =
           envelope.cert
       with
       | Error error -> Error (Verify_error error)
-      | Ok facts -> of_program ~point_ops ~facts image.code
+      | Ok (facts, version) ->
+        Result.map
+          (fun program -> { program with compiler_version = Some version })
+          (of_program ~point_ops ~facts image.code)
 
 let decode_deploy ?(trusted = []) ?(point_ops = false) raw =
   if Program_envelope.is_program raw then decode_program ~trusted ~point_ops raw
@@ -375,7 +383,12 @@ let decode_program_source ?(point_ops = false) raw =
           envelope.cert
       with
       | Error error -> Error (Verify_error error)
-      | Ok facts -> of_program ~point_ops ~facts image.code
+      | Ok (facts, version) ->
+        Result.map
+          (fun program -> { program with compiler_version = Some version })
+          (of_program ~point_ops ~facts image.code)
+
+let compiler_version program = program.compiler_version
 
 let code admitted =
   Array.copy admitted.admitted_code

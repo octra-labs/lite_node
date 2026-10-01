@@ -289,15 +289,15 @@ inline bool r1cs_verify(
             pt.push_back(proof.V[j]);
         }
 
-        sc.push_back(xc);        pt.push_back(proof.T_1);
+        sc.push_back(xc); pt.push_back(proof.T_1);
 
-        sc.push_back(x3);        pt.push_back(proof.T_3);
+        sc.push_back(x3); pt.push_back(proof.T_3);
 
-        sc.push_back(x4);        pt.push_back(proof.T_4);
+        sc.push_back(x4); pt.push_back(proof.T_4);
 
-        sc.push_back(x5);        pt.push_back(proof.T_5);
+        sc.push_back(x5); pt.push_back(proof.T_5);
 
-        sc.push_back(x6);        pt.push_back(proof.T_6);
+        sc.push_back(x6); pt.push_back(proof.T_6);
 
         RistrettoPoint T_rhs = multi_scalar_mul(sc, pt);
 

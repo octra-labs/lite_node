@@ -82,8 +82,9 @@ inline Edge make_repack_edge(const PubKey& pk, const Layer& L, uint32_t lid,
 }
 
 inline Edge make_repack_edge(const PubKey& pk, const Layer& L, uint32_t lid,
-                             uint16_t idx, uint8_t ch, std::vector<Fp> w, SeedableRng& rng) {
-    return {lid, idx, ch, std::move(w), sigma_from_H(pk, L.seed.ztag, L.seed.nonce, idx, ch, rng.u64())};
+                             uint16_t idx, uint8_t ch, std::vector<Fp> w, SeedableRng& rng,
+                             size_t draw_factor = 0) {
+    return {lid, idx, ch, std::move(w), sigma_from_H(pk, L.seed.ztag, L.seed.nonce, idx, ch, rng.u64(), draw_factor)};
 }
 
 inline auto emit_repack_edges(const PubKey& pk, uint32_t lid, const Layer& L,
@@ -122,7 +123,8 @@ inline auto emit_repack_edges(const PubKey& pk, uint32_t lid, const Layer& L,
 }
 
 inline auto emit_repack_edges(const PubKey& pk, uint32_t lid, const Layer& L,
-                              const std::vector<Fp>& target, size_t s, SeedableRng& rng) -> std::vector<Edge> {
+                              const std::vector<Fp>& target, size_t s, SeedableRng& rng,
+                              size_t draw_factor = 0) -> std::vector<Edge> {
     if (s == 0) return {};
     size_t S = target.size();
 
@@ -144,7 +146,7 @@ inline auto emit_repack_edges(const PubKey& pk, uint32_t lid, const Layer& L,
         for (auto& x : w) x = rng.fp_nonzero();
         auto t = field::Op::mul(w, pk.powg_B[idx]);
         sum = ch == SGN_P ? field::Op::add(sum, t) : field::Op::sub(sum, t);
-        edges.push_back(make_repack_edge(pk, L, lid, idx, ch, std::move(w), rng));
+        edges.push_back(make_repack_edge(pk, L, lid, idx, ch, std::move(w), rng, draw_factor));
     }
 
     auto [last_idx, last_ch] = specs.back();
@@ -152,7 +154,7 @@ inline auto emit_repack_edges(const PubKey& pk, uint32_t lid, const Layer& L,
     Fp ginv = pk.powg_B[(pk.prm.B - last_idx) % pk.prm.B];
     auto final_w = field::Op::mul(last_ch == SGN_M ? field::Op::neg(diff) : diff, ginv);
 
-    edges.push_back(make_repack_edge(pk, L, lid, last_idx, last_ch, std::move(final_w), rng));
+    edges.push_back(make_repack_edge(pk, L, lid, last_idx, last_ch, std::move(final_w), rng, draw_factor));
     return edges;
 }
 
@@ -202,7 +204,8 @@ inline void append_scaled_edges(std::vector<Edge>& dest, const std::vector<Edge>
 template<typename LayerGen, typename TargetGen>
 inline Cipher build_product_cipher_seeded(const PubKey& pk, const Cipher& A, const Cipher* B,
                                           LayerGen&& layer_gen, TargetGen&& target_gen,
-                                          size_t num_prods, size_t S, const char* tag, SeedableRng& rng) {
+                                          size_t num_prods, size_t S, const char* tag, SeedableRng& rng,
+                                          size_t draw_factor = 0) {
     Cipher C;
     C.slots = A.slots;
     C.c0 = field::Op::zeros(A.slots);
@@ -232,7 +235,7 @@ inline Cipher build_product_cipher_seeded(const PubKey& pk, const Cipher& A, con
         C.L.push_back(L);
 
         auto target = target_gen(gA, gB, la, lb_raw);
-        auto edges = emit_repack_edges(pk, lid, C.L[lid], target, S, rng);
+        auto edges = emit_repack_edges(pk, lid, C.L[lid], target, S, rng, draw_factor);
         std::move(edges.begin(), edges.end(), std::back_inserter(C.E));
     });
 
@@ -394,7 +397,7 @@ inline Cipher ct_square(const PubKey& pk, const Cipher& A, size_t S = 8, bool ma
     return C;
 }
 
-inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, const uint8_t seed[32], size_t S = 8, bool math = false) {
+inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, const uint8_t seed[32], size_t S = 8, bool math = false, size_t draw_factor = 0) {
     if (A.slots != B.slots)
         throw std::runtime_error("pvac: ct_mul: slot count mismatch between operands");
     SeedableRng rng = make_seeded_rng(seed);
@@ -419,7 +422,7 @@ inline Cipher ct_mul_seeded(const PubKey& pk, const Cipher& A, const Cipher& B, 
         [](const auto& gA, const auto& gB, uint32_t la, uint32_t lb) {
             return field::Op::mul(gA[la], gB[lb]);
         },
-        static_cast<size_t>(LA) * LB, S ? S : 1, "mul", rng);
+        static_cast<size_t>(LA) * LB, S ? S : 1, "mul", rng, draw_factor);
 
     detail::append_scaled_edges(C.E, B_g.E, a0, off);
     detail::append_scaled_edges(C.E, A_g.E, b0, 0);

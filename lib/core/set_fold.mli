@@ -36,6 +36,14 @@ type receipt = {
   pulse : int64 option;
 }
 
+type exclusion =
+  | Member_missing
+  | Pulse_missing
+  | Pulse_future of int64
+  | Pulse_old of int64
+  | Pulse_short of { first : int64; last : int64 }
+  | Marks_short of { low : int64; high : int64; signed : int; required : int }
+
 type cap_mode = Reject | Prune
 
 val meta_key : string
@@ -95,6 +103,13 @@ val allows :
   address:string ->
   t ->
   bool
+val exclusion :
+  cfg ->
+  start:int64 ->
+  source:int64 ->
+  address:string ->
+  t ->
+  exclusion option
 val filter :
   cfg ->
   start:int64 ->

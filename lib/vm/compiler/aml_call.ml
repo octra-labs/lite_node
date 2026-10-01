@@ -19,7 +19,7 @@ type error =
   | Label_space of int
   | Input of C_type.t
   | Output of C_type.t
-  | Tail
+  | Missing_stop
   | Verify
   | Bits
   | Count of int
@@ -111,7 +111,7 @@ let make ~entry ~first evidence =
       | Error error -> Error (Evidence error)
     in
     let count = Array.length runtime in
-    if count = 0 || runtime.(count - 1) <> Contract_vm.STOP then Error Tail
+    if count = 0 || runtime.(count - 1) <> Contract_vm.STOP then Error Missing_stop
     else
       let* runtime, next =
         match Vm_program.scope ~first runtime with
@@ -362,7 +362,7 @@ let text = function
     Printf.sprintf "call label space is exhausted value = %d" value
   | Input typ -> "call input type is unsupported type = " ^ C_type.text typ
   | Output typ -> "call output type is unsupported type = " ^ C_type.text typ
-  | Tail -> "call runtime tail is invalid"
+  | Missing_stop -> "call runtime terminator is invalid"
   | Verify -> "call runtime verification failed"
   | Bits -> "call evidence bits are invalid"
   | Count value -> Printf.sprintf "call evidence count is invalid value = %d" value

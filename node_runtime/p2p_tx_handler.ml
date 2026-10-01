@@ -24,14 +24,14 @@ let broadcast_inv io hash =
   io.broadcast_payload
     (Octra_net.P2p_tx_gossip.encode (Octra_net.P2p_tx_gossip.Inv [hash]))
 
-let handle_tx ?duty ?bft_mode io tx =
+let receive_tx ?duty ?bft_mode io tx =
   let tx_hash = Octra_core.Transaction.hash tx in
   if io.has_tx tx_hash then ()
   else
     let now = io.now () in
     if not (Octra_net.P2p_tx_gossip_guard.remember io.guard ~now tx_hash) then ()
     else
-    let sender_pk = io.sender_pk tx in
+    let sender_pk = tx.Octra_core.Transaction.public_key in
     let h12 = Text.hash_short tx_hash in
     match P2p_tx_admit.admit ?duty ?bft_mode ~now ~max_drift:io.max_drift ~sender_pk tx with
     | P2p_tx_admit.Invalid_address ->
@@ -48,7 +48,22 @@ let handle_tx ?duty ?bft_mode io tx =
       match io.add_tx tx with
       | Ok tx_hash -> broadcast_inv io tx_hash
       | Error e ->
-        Log.warn "p2p" "tx_gossip rejected: admission hash = %s reason = %s" h12 e
+        Log.warn "p2p" "event = tx_queue_refused hash = %s reason = %s" h12 e
+
+let handle_tx ?duty ?bft_mode io tx =
+  let received_hash = Octra_core.Transaction.hash tx in
+  let now = io.now () in
+  if io.has_tx received_hash
+     || Octra_net.P2p_tx_gossip_guard.recent io.guard ~now received_hash then ()
+  else
+    match Octra_core.Tx_envelope.normalize ~sender_pk:(io.sender_pk tx) tx with
+    | Error (code, reason) ->
+      ignore (Octra_net.P2p_tx_gossip_guard.remember io.guard ~now received_hash);
+      Log.warn "p2p" "event = tx_envelope_refused code = %s reason = %s" code reason
+    | Ok tx ->
+      if received_hash <> Octra_core.Transaction.hash tx then
+        ignore (Octra_net.P2p_tx_gossip_guard.remember io.guard ~now received_hash);
+      receive_tx ?duty ?bft_mode io tx
 
 let handle_legacy ?duty ?bft_mode io =
   let c = Octra_net.Oce1.make_cursor io.payload in

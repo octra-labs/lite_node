@@ -34,6 +34,7 @@ type t = {
   mutable current_seg : int;
   mutable current_fd : Unix.file_descr;
   mutable current_offset : int;
+  mutable cut : (int * int) option;
 }
 
 let seg_path dir seg_id =
@@ -135,14 +136,20 @@ let read_scan_record fd ~segment ~offset ~size ~check_checksum =
           else
             Ok { segment; offset; length; epoch; payload }
 
-let write_header fd seg_id =
+let write_header ?(write = Unix.write) fd seg_id =
   let buf = Bytes.make header_size '\000' in
   Bytes.blit_string magic 0 buf 0 4;
   Bytes.set_uint8 buf 4 (version land 0xFF);
   Bytes.set_uint8 buf 5 ((version lsr 8) land 0xFF);
   write_u32_le buf 6 seg_id;
-  let _ = Unix.write fd buf 0 header_size in
-  ()
+  let rec loop offset =
+    if offset < header_size then
+      match write fd buf offset (header_size - offset) with
+      | 0 -> failwith "txlog: header write made no progress"
+      | count -> loop (offset + count)
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop offset
+  in
+  loop 0
 
 let validate_header fd =
   let buf = Bytes.create header_size in
@@ -154,30 +161,37 @@ let validate_header fd =
   if v <> version then failwith (Printf.sprintf "txlog: version %d != %d" v version);
   read_u32_le buf 6
 
+let create_segment ?write ?(sync = Unix.fsync) dir seg_id =
+  let path = seg_path dir seg_id in
+  let rec reserve attempt =
+    let staged = Printf.sprintf "%s.staged.%d.%d" path (Unix.getpid ()) attempt in
+    match Unix.openfile staged [Unix.O_RDWR; Unix.O_CREAT; Unix.O_EXCL; Unix.O_CLOEXEC] 0o644 with
+    | fd -> staged, fd
+    | exception Unix.Unix_error (Unix.EEXIST, _, _) -> reserve (attempt + 1)
+  in
+  let staged, fd = reserve 0 in
+  Store_scope.protect ~close:(fun () -> Unix.close fd) (fun () ->
+    Fun.protect ~finally:(fun () ->
+      try Unix.unlink staged with Unix.Unix_error (Unix.ENOENT, _, _) -> ()) (fun () ->
+      write_header ?write fd seg_id;
+      sync fd;
+      Unix.link staged path;
+      Unix.unlink staged;
+      let parent = Unix.openfile dir [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
+      Fun.protect ~finally:(fun () -> Unix.close parent) (fun () -> sync parent);
+      fd, header_size))
+
 let open_segment ?(readonly = false) dir seg_id =
   let path = seg_path dir seg_id in
   let exists = Sys.file_exists path in
   if not exists && readonly then failwith "txlog: read-only segment is missing";
-  let flags =
-    if not exists then [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC]
-    else if readonly then [Unix.O_RDONLY]
-    else [Unix.O_RDWR]
-  in
-  let fd = Unix.openfile path flags 0o644 in
-  match
-    if exists then begin
-      ignore (validate_header fd);
-      Unix.lseek fd 0 Unix.SEEK_END
-    end else begin
-      write_header fd seg_id;
-      header_size
-    end
-  with
-  | offset -> fd, offset
-  | exception error ->
-    let trace = Printexc.get_raw_backtrace () in
-    Unix.close fd;
-    Printexc.raise_with_backtrace error trace
+  if not exists then create_segment dir seg_id
+  else
+    let flags = if readonly then [Unix.O_RDONLY] else [Unix.O_RDWR] in
+    let fd = Unix.openfile path (Unix.O_CLOEXEC :: flags) 0o644 in
+    Store_scope.protect ~close:(fun () -> Unix.close fd) (fun () ->
+      if validate_header fd <> seg_id then failwith "txlog: segment header identity differs";
+      fd, Unix.lseek fd 0 Unix.SEEK_END)
 
 let parse_segment_id filename =
   let len = String.length filename in
@@ -227,18 +241,40 @@ let find_latest_segment ?(readonly=false) dir =
            (String.concat ", " (List.rev !malformed)));
     if !max_seg < 0 then 0 else !max_seg
 
-let open_log ?(readonly=false) dir =
+let open_log ?retained ?(readonly=false) dir =
   let seg_id = find_latest_segment ~readonly dir in
-  let (fd, off) = open_segment ~readonly dir seg_id in
-  { dir; readonly; current_seg = seg_id; current_fd = fd; current_offset = off }
+  let cut = match retained with
+    | Some (segment, offset) when segment >= 0 && segment < seg_id && offset >= header_size ->
+      let stat = Unix.lstat (seg_path dir seg_id) in
+      if stat.Unix.st_kind = Unix.S_REG && stat.st_size < header_size then retained else None
+    | _ -> None in
+  let fd, off = match cut with
+    | None -> open_segment ~readonly dir seg_id
+    | Some _ ->
+      let flags = if readonly then [Unix.O_RDONLY; Unix.O_CLOEXEC] else [Unix.O_RDWR; Unix.O_CLOEXEC] in
+      let fd = Unix.openfile (seg_path dir seg_id) flags 0 in
+      Store_scope.protect ~close:(fun () -> Unix.close fd) (fun () ->
+        let stat = Unix.fstat fd in
+        if stat.Unix.st_kind <> Unix.S_REG || stat.st_size >= header_size then
+          failwith "txlog: incomplete segment changed during open";
+        fd, stat.st_size) in
+  { dir; readonly; current_seg = seg_id; current_fd = fd; current_offset = off; cut }
 
 let close t =
   Unix.close t.current_fd
 
-let rotate t =
-  Unix.close t.current_fd;
+let rotate ?(sync = Unix.fsync) t =
+  if t.readonly then failwith "txlog: rotate on read-only log";
+  if t.cut <> None then failwith "txlog: cut is incomplete";
+  sync t.current_fd;
   let new_seg = t.current_seg + 1 in
   let (fd, off) = open_segment t.dir new_seg in
+  (match Unix.close t.current_fd with
+   | () -> ()
+   | exception error ->
+     let trace = Printexc.get_raw_backtrace () in
+     Unix.close fd;
+     Printexc.raise_with_backtrace error trace);
   t.current_seg <- new_seg;
   t.current_fd <- fd;
   t.current_offset <- off
@@ -247,7 +283,7 @@ let ensure_physical_eof_matches t =
   let actual = Unix.lseek t.current_fd 0 Unix.SEEK_END in
   if actual <> t.current_offset then
     failwith (Printf.sprintf
-      "txlog: physical EOF drift seg=%d expected=%d actual=%d"
+      "txlog: physical EOF drift seg = %d expected = %d actual = %d"
       t.current_seg t.current_offset actual)
 
 let read_at t ~seg_id ~offset length =
@@ -259,11 +295,12 @@ let read_at t ~seg_id ~offset length =
   in
   if seg_id = t.current_seg then read t.current_fd
   else
-    let fd = Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDONLY] 0 in
+    let fd = Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
     Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> read fd)
 
 let rec append t ~epoch_id ~payload =
   if t.readonly then failwith "txlog: append on read-only log";
+  if t.cut <> None then failwith "txlog: cut is incomplete";
   ensure_physical_eof_matches t;
   if t.current_offset >= max_segment_size then rotate t;
   ensure_physical_eof_matches t;
@@ -284,7 +321,7 @@ let rec append t ~epoch_id ~payload =
   let actual = Unix.lseek t.current_fd 0 Unix.SEEK_END in
   if actual <> offset then
     failwith (Printf.sprintf
-      "txlog: append offset drift seg=%d expected=%d actual=%d"
+      "txlog: append offset drift seg = %d expected = %d actual = %d"
       seg_id offset actual);
   ignore (Unix.lseek t.current_fd offset Unix.SEEK_SET);
   let written = ref 0 in
@@ -297,13 +334,13 @@ let rec append t ~epoch_id ~payload =
   let actual_end = Unix.lseek t.current_fd 0 Unix.SEEK_END in
   if actual_end <> expected_end then
     failwith (Printf.sprintf
-      "txlog: append end drift seg=%d expected_end=%d actual_end=%d"
+      "txlog: append end drift seg = %d expected_end = %d actual_end = %d"
       seg_id expected_end actual_end);
   t.current_offset <- expected_end;
   let (stored_epoch, stored_payload) = read_record t ~seg_id ~offset ~len:record_len in
   if stored_epoch <> epoch_id || stored_payload <> payload then
     failwith (Printf.sprintf
-      "txlog: append readback mismatch seg=%d offset=%d epoch=%d stored_epoch=%d"
+      "txlog: append readback mismatch seg = %d offset = %d epoch = %d stored_epoch = %d"
       seg_id offset epoch_id stored_epoch);
   (seg_id, offset, record_len)
 
@@ -330,13 +367,19 @@ let read_record_prefix t ~seg_id ~offset ~len ~prefix_len =
   let payload_prefix = Bytes.sub_string buf 8 prefix_len in
   (epoch_id, payload_prefix)
 
-let fsync t =
-  if not t.readonly then Unix.fsync t.current_fd
+let fsync ?(sync = Unix.fsync) t =
+  if not t.readonly then begin
+    sync t.current_fd;
+    List.iter (fun path ->
+      let fd = Unix.openfile path [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
+      Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> sync fd))
+      [t.dir; Filename.dirname t.dir]
+  end
 
 let scan_all t f =
   let seg_id = ref 0 in
   while Sys.file_exists (seg_path t.dir !seg_id) do
-    let fd = Unix.openfile (seg_path t.dir !seg_id) [Unix.O_RDONLY] 0 in
+    let fd = Unix.openfile (seg_path t.dir !seg_id) [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
     Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
       let _seg = validate_header fd in
       let file_size = Unix.lseek fd 0 Unix.SEEK_END in
@@ -356,19 +399,24 @@ let scan_all t f =
     incr seg_id
   done
 
-let fold_strict t ~init ~f =
+let fold_strict ?end_at t ~init ~f =
+  let last = match end_at with None -> t.current_seg | Some (segment, _) -> segment in
   let inspect_segment state segment =
     let path = seg_path t.dir segment in
     if not (Sys.file_exists path) then Error (Segment_missing segment)
     else
-      let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+      let fd = Unix.openfile path [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
       Fun.protect
         ~finally:(fun () -> Unix.close fd)
         (fun () ->
-          let size = (Unix.fstat fd).Unix.st_size in
+          let physical = (Unix.fstat fd).Unix.st_size in
+          let size = match end_at with
+            | Some (last, offset) when segment = last -> offset
+            | _ -> physical in
           let header = Bytes.create header_size in
           ignore (Unix.lseek fd 0 Unix.SEEK_SET);
-          if size < header_size || not (read_exact fd header 0 header_size) then
+          if size > physical then Error (Scan_io "transaction cut exceeds file length")
+          else if size < header_size || not (read_exact fd header 0 header_size) then
             Error (Header_truncated segment)
           else if Bytes.sub_string header 0 4 <> magic then
             Error (Header_marker segment)
@@ -397,13 +445,16 @@ let fold_strict t ~init ~f =
                 records state header_size)
   in
   let rec segments state segment =
-    if segment > t.current_seg then Ok state
+    if segment > last then Ok state
     else
       match inspect_segment state segment with
       | Error _ as error -> error
       | Ok state -> segments state (segment + 1)
   in
-  try segments init 0 with
+  try
+    if last < 0 || last > t.current_seg then Error (Segment_missing last)
+    else segments init 0
+  with
   | Unix.Unix_error (error, call, path) ->
       Error (Scan_io (Printf.sprintf "%s: %s: %s" call path (Unix.error_message error)))
   | Sys_error reason -> Error (Scan_io reason)
@@ -411,18 +462,37 @@ let fold_strict t ~init ~f =
 let current_position t =
   (t.current_seg, t.current_offset)
 
-let truncate_to t ~seg_id ~offset =
+let truncate_to ?(sync = Unix.fsync) ?(remove = Unix.unlink) t ~seg_id ~offset =
   if t.readonly then failwith "txlog: truncate on read-only log";
-  Unix.close t.current_fd;
-  let later = ref (seg_id + 1) in
-  while Sys.file_exists (seg_path t.dir !later) do
-    Sys.remove (seg_path t.dir !later);
-    incr later
-  done;
-  let path = seg_path t.dir seg_id in
-  if Sys.file_exists path then
-    Unix.truncate path offset;
-  let (fd, off) = open_segment t.dir seg_id in
-  t.current_seg <- seg_id;
-  t.current_fd <- fd;
-  t.current_offset <- off
+  let target = seg_id, offset in
+  if Option.fold ~none:false ~some:((<>) target) t.cut then
+    failwith "txlog: a different cut is incomplete";
+  (match fold_strict ~end_at:target t ~init:() ~f:(fun () _ -> Ok ()) with
+   | Ok () -> ()
+   | Error reason -> failwith (scan_error_message reason));
+  let later = Sys.readdir t.dir |> Array.to_list |> List.filter_map (fun name ->
+    match parse_segment_id name with
+    | Some segment when segment > seg_id ->
+      let path = seg_path t.dir segment in
+      if Filename.basename path <> name || (Unix.lstat path).Unix.st_kind <> Unix.S_REG then
+        failwith "txlog: invalid segment path";
+      Some (segment, path)
+    | _ -> None) |> List.sort (fun (left, _) (right, _) -> compare right left) in
+  let fd = Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDWR; Unix.O_CLOEXEC] 0 in
+  let owned = ref false in
+  Fun.protect ~finally:(fun () -> if not !owned then Unix.close fd) (fun () ->
+    t.cut <- Some target;
+    Unix.ftruncate fd offset;
+    sync fd;
+    List.iter (fun (_, path) -> remove path) later;
+    List.iter (fun path ->
+      let dir = Unix.openfile path [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
+      Fun.protect ~finally:(fun () -> Unix.close dir) (fun () -> sync dir))
+      [t.dir; Filename.dirname t.dir];
+    let previous = t.current_fd in
+    t.current_fd <- fd;
+    t.current_seg <- seg_id;
+    t.current_offset <- offset;
+    owned := true;
+    Unix.close previous;
+    t.cut <- None)

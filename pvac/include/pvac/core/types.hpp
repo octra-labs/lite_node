@@ -135,7 +135,7 @@ struct Edge {
     uint16_t idx;
     uint8_t ch;
     std::vector<Fp> w;
-    BitVec  s;
+    BitVec s;
 };
 
 struct Cipher {

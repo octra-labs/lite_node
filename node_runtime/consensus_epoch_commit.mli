@@ -64,12 +64,7 @@ type commit_boundary = {
   log : boundary_log option;
 }
 
-type rollback_offsets = {
-  head_epoch : int;
-  txlog_seg : int;
-  txlog_off : int;
-  epochlog_off : int;
-}
+type rollback_head = Octra_core.Head_manifest.t
 
 type rollback_refusal = {
   head_epoch : int;
@@ -84,7 +79,7 @@ type rollback_ok = {
 }
 
 type rollback_plan =
-  | Rollback_to_head of rollback_offsets
+  | Rollback_to_head of rollback_head
   | Rollback_missing_offsets
   | Rollback_refused of rollback_refusal
   | Rollback_missing_head
@@ -116,7 +111,7 @@ type prepared_commit = {
 }
 
 type rollback_effects = {
-  rollback_to_head : rollback_offsets -> int * int * int * int;
+  rollback_to_head : rollback_head -> int * int * int * int;
   delete_wal : unit -> unit;
   clear_marker : unit -> unit;
   log : string -> unit;
@@ -142,17 +137,19 @@ type commit_effects = {
   set_epoch_index_commitment :
     epoch_id:int -> epoch_hash:string -> root:string -> unit;
   fsync_chaindata : unit -> unit;
-  commit_chaindata_batch : unit -> unit;
+  commit_chaindata_batch : Octra_core.Aux_delta.anchor -> unit;
   verify_history :
     epoch_id:int -> start_txid:int64 -> tx_count:int ->
     Octra_core.Store_chaindata.epoch_index_status;
   commit_irmin_batch : string -> unit Lwt.t;
   tag_epoch : int -> unit Lwt.t;
+  sync_irmin : unit -> unit;
   irmin_commit_hash : unit -> string option Lwt.t;
   txlog_position : unit -> int * int;
   epochlog_offset : unit -> int;
   write_head : Octra_core.Head_manifest.t -> unit;
   cache_head : Octra_core.Head_manifest.t -> unit;
+  retire_auxiliary : Octra_core.Head_manifest.t -> unit;
   delete_wal : int -> unit;
   delete_pending_commits : int -> unit;
   clear_marker : unit -> unit;
@@ -222,7 +219,7 @@ val prepare_commit :
   prepare_input ->
   prepared_commit
 
-val rollback_start_log : rollback_offsets -> string
+val rollback_start_log : rollback_head -> string
 
 val rollback_ok_log : rollback_ok -> string
 

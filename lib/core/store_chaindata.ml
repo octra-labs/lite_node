@@ -127,11 +127,25 @@ let emit_history_profile ~tag ~cache ~addr ~limit ~offset ~total ~missing profil
       profile.page_ms
       profile.total_ms
 
+type tx_write = {
+  hash : string;
+  epoch : int;
+  txid : int64;
+  payload : string;
+  sender : string;
+  recipient : string;
+  addrs : string list;
+}
+
+type tx_writes = Pending of tx_write list | Write_failed
+
 type t = {
+  resources : Store_scope.t;
   txlog : Txlog.t;
   epochlog : Epochlog.t;
   index : Chaindata_index.t;
   mutable next_txid : int64;
+  mutable tx_writes : tx_writes;
   epoch_status_cache : (int, epoch_index_status) Hashtbl.t;
   epoch_rows_page_cache : (string, rows_status) Hashtbl.t;
   addr_rows_page_cache : (string, rows_status) Hashtbl.t;
@@ -146,28 +160,37 @@ let rec mkdir_p path =
     (try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
   end
 
-let open_chaindata ?(readonly = false) base_dir =
+let open_chaindata ?(readonly = false) ?(lock_wait = 0.) base_dir =
   if not readonly then mkdir_p base_dir;
+  let owner = if readonly then None else Some (Store_lock.acquire ~wait_seconds:lock_wait base_dir) in
+  let resources = Store_scope.create ~release:(fun () -> Option.iter Store_lock.release owner) in
+  Store_scope.guard resources (fun () ->
   let txlog_dir = Filename.concat base_dir "txlog" in
   let epochlog_path = Filename.concat (Filename.concat base_dir "epochlog") "epochs.dat" in
   let index_dir = Filename.concat base_dir "index" in
-  let txlog = Txlog.open_log ~readonly txlog_dir in
-  let epochlog = Epochlog.open_log ~readonly epochlog_path in
-  let index = Chaindata_index.open_index ~readonly index_dir in
+  let retained = match Head_manifest.load_result (Filename.dirname base_dir) with
+    | Head_manifest.Present head ->
+      Option.bind head.txlog_seg (fun segment -> Option.map (fun offset -> segment, offset) head.txlog_off)
+    | Head_manifest.Missing | Head_manifest.Corrupt _ -> None in
+  let txlog = Store_scope.acquire resources (fun () -> Txlog.open_log ?retained ~readonly txlog_dir) Txlog.close in
+  let epochlog = Store_scope.acquire resources (fun () -> Epochlog.open_log ~readonly epochlog_path) Epochlog.close in
+  let index = Store_scope.acquire resources (fun () -> Chaindata_index.open_index ~readonly index_dir) Chaindata_index.close in
   let next_txid = match Chaindata_index.get_meta index "next_txid" with
     | Some s -> (try Int64.of_string s with _ -> 0L)
     | None -> 0L in
   {
+    resources;
     txlog;
     epochlog;
     index;
     next_txid;
+    tx_writes = Pending [];
     epoch_status_cache = Hashtbl.create 256;
     epoch_rows_page_cache = Hashtbl.create 256;
     addr_rows_page_cache = Hashtbl.create 256;
     rejected_rows_page_cache = Hashtbl.create 128;
     token_rows_page_cache = Hashtbl.create 128;
-  }
+  })
 
 let program_record_legacy_key address =
   "program_record:" ^ address
@@ -309,19 +332,49 @@ let save_program_record t address record =
            ("program record write failed reason = " ^ Printexc.to_string exn))
 
 let close t =
-  Txlog.close t.txlog;
-  Epochlog.close t.epochlog;
-  Chaindata_index.close t.index
+  Store_scope.close t.resources
 
 let begin_batch t =
+  if t.tx_writes <> Pending [] || t.index.Chaindata_index.batch <> None then
+    invalid_arg "chaindata batch is already active";
   Chaindata_index.begin_write t.index
 
-let commit_batch t =
+let flush_txs t =
+  match t.tx_writes with
+  | Write_failed -> failwith "chaindata transaction write requires recovery"
+  | Pending rows ->
+    t.tx_writes <- Write_failed;
+    List.rev rows |> List.iter (fun row ->
+      let seg_id, offset, len = Txlog.append t.txlog ~epoch_id:row.epoch ~payload:row.payload in
+      Chaindata_index.buffer_tx t.index ~hash:row.hash ~seg_id ~offset ~len
+        ~epoch_id:row.epoch ~txid:row.txid ~from_addr:row.sender
+        ~to_addr:row.recipient ~addrs:row.addrs);
+    t.tx_writes <- Pending []
+
+let commit_batch ?anchor t =
+  flush_txs t;
   Chaindata_index.buffer_meta t.index "next_txid" (Int64.to_string t.next_txid);
-  Chaindata_index.commit_write t.index
+  Chaindata_index.commit_write ?anchor t.index
+
+let head_anchor (head : Head_manifest.t) =
+  Aux_delta.{epoch = head.epoch_id; root = head.state_root; commit_id = head.commit_id}
+
+let verify_auxiliary t head =
+  Aux_index.inspect (Chaindata_index.auxiliary t.index) ~head:(Option.map head_anchor head)
+
+let retire_auxiliary t head =
+  (match Lmdb.Txn.go Lmdb.Rw t.index.env (fun txn ->
+    Aux_index.retire (Chaindata_index.auxiliary t.index) txn ~head:(Option.map head_anchor head)) with
+  | Some () -> ()
+  | None -> raise (Chaindata_index.Index_commit_failed "auxiliary journal retirement aborted"));
+  Chaindata_index.sync t.index
 
 let abort_batch t =
-  Chaindata_index.abort_write t.index
+  Chaindata_index.abort_write t.index;
+  (match t.tx_writes with Pending _ -> t.tx_writes <- Pending [] | Write_failed -> ());
+  t.next_txid <- (match Chaindata_index.get_meta t.index "next_txid" with
+    | Some value -> Int64.of_string value
+    | None -> 0L)
 
 let extract_call_recipient ~op_type ~encrypted_data ~message ~from_addr ~to_addr =
   if op_type = "call" && encrypted_data <> "" && message <> "" then
@@ -338,15 +391,18 @@ let extract_call_recipient ~op_type ~encrypted_data ~message ~from_addr ~to_addr
 
 let save_tx t ~hash ~epoch_id ~from_addr ~to_addr ~tx_json
     ~op_type ~encrypted_data ~message =
-  let payload = hash ^ tx_json in
-  let (seg_id, offset, len) =
-    Txlog.append t.txlog ~epoch_id ~payload in
-  let txid = t.next_txid in
-  t.next_txid <- Int64.add t.next_txid 1L;
-  let addrs = extract_call_recipient ~op_type ~encrypted_data
-    ~message ~from_addr ~to_addr in
-  Chaindata_index.buffer_tx t.index ~hash ~seg_id ~offset ~len
-    ~epoch_id ~txid ~from_addr ~to_addr ~addrs
+  if t.index.Chaindata_index.batch = None then
+    invalid_arg "chaindata transaction requires a batch";
+  if t.next_txid < 0L || t.next_txid = Int64.max_int then
+    invalid_arg "chaindata transaction identifier exceeds range";
+  match t.tx_writes with
+  | Write_failed -> failwith "chaindata transaction write requires recovery"
+  | Pending rows ->
+    let row = {hash; epoch = epoch_id; txid = t.next_txid; payload = hash ^ tx_json;
+      sender = from_addr; recipient = to_addr;
+      addrs = extract_call_recipient ~op_type ~encrypted_data ~message ~from_addr ~to_addr} in
+    t.tx_writes <- Pending (row :: rows);
+    t.next_txid <- Int64.succ t.next_txid
 
 let save_rejected t ~hash ~from_addr ~to_addr ~amount ~nonce
     ~error_type ~reason ~epoch_id ~ts =
@@ -383,6 +439,7 @@ let save_receipt_raw t ~tx_hash ~json =
   Chaindata_index.buffer_receipt t.index tx_hash json
 
 let set_epoch t (h : Epochlog.epoch_header) =
+  flush_txs t;
   Epochlog.append t.epochlog h;
   Chaindata_index.buffer_epoch t.index h.id (Epochlog.epoch_to_json h);
 
@@ -439,6 +496,17 @@ let history_floor t =
   match Chaindata_index.get_meta t.index history_floor_key with
   | None -> Ok None
   | Some encoded -> Result.map Option.some (History_floor.of_string encoded)
+
+let first_history_epoch t =
+  match history_floor t with
+  | Error reason -> Error reason
+  | Ok (Some floor) ->
+      let epoch = History_floor.epoch floor in
+      if epoch = max_int then Error "history floor epoch exceeds range"
+      else Ok (epoch + 1)
+  | Ok None ->
+      if Epochlog.get t.epochlog 0 = None && Epochlog.get t.epochlog 1 <> None
+      then Ok 1 else Ok 0
 
 let validate_history_floor t floor =
   let epoch = History_floor.epoch floor in
@@ -628,7 +696,7 @@ let compute_epoch_index_hash_raw t ~epoch_id ~start_txid ~tx_count =
     let txid = Int64.add start_txid (Int64.of_int i) in
     match Chaindata_index.get_txid_loc_raw t.index txid with
     | None ->
-        errors := Printf.sprintf "missing txid_loc txid=%Ld" txid :: !errors
+        errors := Printf.sprintf "missing txid_loc txid = %Ld" txid :: !errors
     | Some (seg_id, offset, len) ->
         try
           let record_epoch_id, payload =
@@ -636,15 +704,15 @@ let compute_epoch_index_hash_raw t ~epoch_id ~start_txid ~tx_count =
           in
           if record_epoch_id <> epoch_id then
             errors := Printf.sprintf
-              "txid=%Ld epoch mismatch expected=%d actual=%d"
+              "txid = %Ld epoch mismatch expected = %d actual = %d"
               txid epoch_id record_epoch_id :: !errors;
           let hash, _tx_json = split_payload payload in
           try
             items := Epoch_index_commitment.item ~txid ~hash :: !items
           with Invalid_argument msg ->
-            errors := Printf.sprintf "txid=%Ld %s" txid msg :: !errors
+            errors := Printf.sprintf "txid = %Ld %s" txid msg :: !errors
         with e ->
-          errors := Printf.sprintf "txid=%Ld %s" txid (Printexc.to_string e) :: !errors
+          errors := Printf.sprintf "txid = %Ld %s" txid (Printexc.to_string e) :: !errors
   done;
   match !errors with
   | [] ->
@@ -666,13 +734,13 @@ let verify_epoch_index_commitment_raw t ~epoch_id ~start_txid ~tx_count ~prev_ro
     @ (match stored_epoch_hash, actual_epoch_hash with
        | Some a, Some b when a = b -> []
        | Some a, Some b ->
-           [Printf.sprintf "epoch hash mismatch stored=%s actual=%s" a b]
+           [Printf.sprintf "epoch hash mismatch stored = %s actual = %s" a b]
        | None, _ -> ["stored epoch hash missing"]
        | _, None -> [])
     @ (match stored_root, actual_root with
        | Some a, Some b when a = b -> []
        | Some a, Some b ->
-           [Printf.sprintf "epoch root mismatch stored=%s actual=%s" a b]
+           [Printf.sprintf "epoch root mismatch stored = %s actual = %s" a b]
        | None, _ -> ["stored epoch root missing"]
        | _, None -> [])
   in
@@ -765,8 +833,6 @@ type repair_stats = {
   errors : string list;
 }
 
-let repair_stats_zero = { checked = 0; repaired = 0; errors = [] }
-
 let parse_tx_identity tx_json =
   let j = Yojson.Safe.from_string tx_json in
   let open Yojson.Safe.Util in
@@ -791,11 +857,6 @@ let dedupe_addrs addrs =
   ) addrs;
   List.rev !acc
 
-let buffer_repair_tx_full t ~hash ~seg_id ~offset ~len ~epoch_id ~txid ~tx_json =
-  let (from_addr, to_addr, addrs) = parse_tx_identity tx_json in
-  Chaindata_index.buffer_tx t.index ~hash ~seg_id ~offset ~len
-    ~epoch_id ~txid ~from_addr ~to_addr ~addrs
-
 let verify_epoch_index_complete_raw t ~epoch_id ~start_txid ~tx_count =
   match cached_epoch_status_ok t ~epoch_id ~start_txid ~tx_count with
   | Some status -> status
@@ -819,11 +880,11 @@ let verify_epoch_index_complete_raw t ~epoch_id ~start_txid ~tx_count =
              | Some h ->
                  if h.Epochlog.start_txid <> start_txid then
                    errors := (Printf.sprintf
-                     "epoch_meta start_txid mismatch expected=%Ld actual=%Ld"
+                     "epoch_meta start_txid mismatch expected = %Ld actual = %Ld"
                      start_txid h.Epochlog.start_txid) :: !errors;
                  if h.Epochlog.tx_count <> tx_count then
                    errors := (Printf.sprintf
-                     "epoch_meta tx_count mismatch expected=%d actual=%d"
+                     "epoch_meta tx_count mismatch expected = %d actual = %d"
                      tx_count h.Epochlog.tx_count) :: !errors)
       end;
       for i = 0 to tx_count - 1 do
@@ -838,12 +899,12 @@ let verify_epoch_index_complete_raw t ~epoch_id ~start_txid ~tx_count =
                in
                if stored_epoch_id <> epoch_id then
                  errors := (Printf.sprintf
-                   "txid_loc points to wrong epoch txid=%Ld expected=%d actual=%d"
+                   "txid_loc points to wrong epoch txid = %Ld expected = %d actual = %d"
                    txid epoch_id stored_epoch_id) :: !errors;
                let (hash, tx_json) = split_payload payload in
                if String.length hash <> 64 then begin
                  incr malformed_records;
-                 errors := (Printf.sprintf "payload hash malformed txid=%Ld" txid) :: !errors
+                 errors := (Printf.sprintf "payload hash malformed txid = %Ld" txid) :: !errors
                end else begin
                  (match Chaindata_index.get_tx_loc_raw t.index hash with
                   | Some (seg2, off2, len2, epoch2)
@@ -851,7 +912,7 @@ let verify_epoch_index_complete_raw t ~epoch_id ~start_txid ~tx_count =
                   | Some (seg2, off2, len2, epoch2) ->
                       incr missing_tx_loc;
                       errors := (Printf.sprintf
-                        "tx_loc mismatch hash=%s txid=%Ld expected=(%d,%d,%d,%d) actual=(%d,%d,%d,%d)"
+                        "tx_loc mismatch hash = %s txid = %Ld expected = (%d,%d,%d,%d) actual = (%d,%d,%d,%d)"
                         (String.sub hash 0 (min 16 (String.length hash)))
                         txid seg_id offset len epoch_id seg2 off2 len2 epoch2) :: !errors
                   | None ->
@@ -865,7 +926,7 @@ let verify_epoch_index_complete_raw t ~epoch_id ~start_txid ~tx_count =
                end
              with e ->
                incr malformed_records;
-               errors := (Printf.sprintf "txid=%Ld: %s" txid (Printexc.to_string e)) :: !errors)
+               errors := (Printf.sprintf "txid = %Ld: %s" txid (Printexc.to_string e)) :: !errors)
       done;
       let status = {
         epoch_id;
@@ -905,96 +966,31 @@ let get_visible_epoch_index_status t epoch_id =
              ~start_txid:h.Epochlog.start_txid
              ~tx_count:h.Epochlog.tx_count))
 
-let verify_and_repair_tx_loc_only t ~max_epoch =
-  let checked = ref 0 in
-  let repaired = ref 0 in
-  let errors = ref [] in
-  let progress = ref 0 in
-  let pending = ref 0 in
-  let batch_size = 50_000 in
-  Chaindata_index.begin_write t.index;
-  Txlog.scan_all t.txlog (fun seg_id pos record_len epoch_id payload ->
-    incr progress;
-    if !progress mod 1_000_000 = 0 then
-      Octra_log.info "chaindata"
-        "event = tx_location_repair scanned_million = %d repaired = %d"
-        (!progress / 1_000_000) !repaired;
-    if epoch_id > max_epoch then ()
-    else begin
-      let (hash, _tx_json) = split_payload payload in
-      if String.length hash = 64 then begin
-        match Chaindata_index.get_tx_loc t.index hash with
-        | Some _ -> ()
-        | None ->
-          incr checked;
-          (try
-            Chaindata_index.buffer_tx_loc_only t.index ~hash ~seg_id ~offset:pos
-              ~len:record_len ~epoch_id;
-            incr repaired;
-            incr pending;
-            if !pending >= batch_size then begin
-              Chaindata_index.commit_tx_loc_only t.index;
-              Chaindata_index.begin_write t.index;
-              pending := 0
-            end
-          with e ->
-            errors := (Printf.sprintf "hash=%s: %s"
-              (String.sub hash 0 (min 16 (String.length hash)))
-              (Printexc.to_string e)) :: !errors)
-      end
-    end
-  );
-  Chaindata_index.commit_tx_loc_only t.index;
-  { checked = !checked; repaired = !repaired; errors = List.rev !errors }
+let get_epoch_index_status t epoch_id =
+  match Epochlog.get t.epochlog epoch_id with
+  | None -> None
+  | Some header ->
+      Some (verify_epoch_index_complete_raw t ~epoch_id
+        ~start_txid:header.Epochlog.start_txid ~tx_count:header.Epochlog.tx_count)
 
-let verify_and_repair_tx_loc_recent_epochs t ~from_epoch ~to_epoch =
-  if to_epoch < from_epoch then
-    { checked = 0; repaired = 0; errors = [] }
-  else begin
-    let checked = ref 0 in
-    let repaired = ref 0 in
-    let errors = ref [] in
-    let pending = ref 0 in
-    let batch_size = 10_000 in
-    Chaindata_index.begin_write t.index;
-    (try
-       for epoch_id = from_epoch to to_epoch do
-         match Epochlog.get t.epochlog epoch_id with
-         | None -> ()
-         | Some h ->
-           for i = 0 to h.Epochlog.tx_count - 1 do
-             let txid = Int64.add h.Epochlog.start_txid (Int64.of_int i) in
-             match read_tx_record_at_txid t txid with
-             | Some (hash, record_epoch_id, _tx_json, seg_id, offset, len)
-               when String.length hash = 64 ->
-               incr checked;
-               (match Chaindata_index.get_tx_loc t.index hash with
-                | Some _ -> ()
-                | None ->
-                  (try
-                     Chaindata_index.buffer_tx_loc_only t.index ~hash ~seg_id ~offset
-                       ~len ~epoch_id:record_epoch_id;
-                     incr repaired;
-                     incr pending;
-                     if !pending >= batch_size then begin
-                       Chaindata_index.commit_tx_loc_only t.index;
-                       Chaindata_index.begin_write t.index;
-                       pending := 0
-                     end
-                   with e ->
-                     errors := (Printf.sprintf "epoch=%d txid=%Ld hash=%s: %s"
-                       epoch_id txid
-                       (String.sub hash 0 (min 16 (String.length hash)))
-                       (Printexc.to_string e)) :: !errors))
-             | _ -> ()
-           done
-       done;
-       Chaindata_index.commit_tx_loc_only t.index
-     with e ->
-       Chaindata_index.abort_write t.index;
-       raise e);
-    { checked = !checked; repaired = !repaired; errors = List.rev !errors }
-  end
+exception Tx_location_invalid of string
+
+let repair_committed_history t ~max_epoch =
+  try
+    let checked, repaired, epochs, legacy_epochs = Chaindata_index.with_tx_loc_write t.index (fun io ->
+      match Committed_history.verify io ~head:(Head_manifest.get_cached ()) ~max_epoch
+        ~txlog:t.txlog ~epochlog:t.epochlog with
+      | Ok result -> result
+      | Error reason -> raise (Tx_location_invalid reason)) in
+    if legacy_epochs > 0 then
+      Octra_log.warn "recovery" "event = unproven_legacy_prefix epochs = %d checks = ranges_locations_frames eic = unavailable"
+        legacy_epochs;
+    { checked; repaired; errors = [] }, epochs
+  with Tx_location_invalid reason ->
+    { checked = 0; repaired = 0; errors = [reason] }, []
+
+let verify_and_repair_tx_loc_only t ~max_epoch =
+  fst (repair_committed_history t ~max_epoch)
 
 let read_tx_hash_at_txid t txid =
   match Chaindata_index.get_txid_loc t.index txid with
@@ -1010,7 +1006,7 @@ let read_tx_hash_at_txid t txid =
         else Some (prefix, epoch_id)
       with _ -> None
 
-let heal_tx_by_hash_recent t ~hash ~recent_epochs ~max_records =
+let find_tx_by_hash_recent t ~hash ~recent_epochs ~max_records =
   match Epochlog.last t.epochlog with
   | None -> None
   | Some tip ->
@@ -1033,12 +1029,11 @@ let heal_tx_by_hash_recent t ~hash ~recent_epochs ~max_records =
             | Some (tx_hash, record_epoch_id) when tx_hash = hash ->
               begin
                 match read_tx_record_at_txid t txid with
-                | Some (_, _, tx_json, seg_id, offset, len) ->
-                  (try
-                     Chaindata_index.set_tx_loc_only t.index hash ~seg_id ~offset ~len
-                       ~epoch_id:record_epoch_id
-                   with _ -> ());
-                  found := Some (record_epoch_id, tx_json)
+                | Some (stored_hash, stored_epoch, tx_json, _, _, _)
+                  when stored_hash = hash && stored_epoch = h.Epochlog.id
+                    && record_epoch_id = stored_epoch ->
+                  found := Some (stored_epoch, visible_tx_json stored_hash tx_json)
+                | Some _ -> ()
                 | None -> ()
               end
             | _ -> ()
@@ -1048,128 +1043,6 @@ let heal_tx_by_hash_recent t ~hash ~recent_epochs ~max_records =
         decr epoch_id
     done;
     !found
-
-let verify_and_repair_txid_loc_recent_epochs t ~from_epoch ~to_epoch =
-  if to_epoch < from_epoch then
-    repair_stats_zero
-  else begin
-    let epoch_plan = Hashtbl.create 32 in
-    for epoch_id = from_epoch to to_epoch do
-      match Epochlog.get t.epochlog epoch_id with
-      | Some h when h.Epochlog.tx_count > 0 ->
-          Hashtbl.replace epoch_plan epoch_id
-            (h.Epochlog.start_txid, h.Epochlog.tx_count, ref 0)
-      | _ -> ()
-    done;
-    if Hashtbl.length epoch_plan = 0 then
-      repair_stats_zero
-    else begin
-      let checked = ref 0 in
-      let repaired = ref 0 in
-      let errors = ref [] in
-      let pending = ref 0 in
-      let batch_size = 10_000 in
-      Chaindata_index.begin_write t.index;
-      let flush_pending () =
-        if !pending > 0 then begin
-          Chaindata_index.commit_write t.index;
-          Chaindata_index.begin_write t.index;
-          pending := 0
-        end
-      in
-      (try
-         Txlog.scan_all t.txlog (fun seg_id offset len epoch_id payload ->
-           match Hashtbl.find_opt epoch_plan epoch_id with
-           | Some (start_txid, tx_count, seen_ref) when !seen_ref < tx_count ->
-               let slot = !seen_ref in
-               incr seen_ref;
-               let txid = Int64.add start_txid (Int64.of_int slot) in
-               incr checked;
-               if Int64.compare txid 0L > 0
-                  && not (Chaindata_index.txid_loc_present t.index txid) then begin
-                 let (hash, tx_json) = split_payload payload in
-                 if String.length hash = 64 then
-                   (try
-                      buffer_repair_tx_full t ~hash ~seg_id ~offset ~len
-                        ~epoch_id ~txid ~tx_json;
-                      incr repaired;
-                      incr pending;
-                      if !pending >= batch_size then flush_pending ()
-                    with e ->
-                      errors := (Printf.sprintf "epoch=%d txid=%Ld hash=%s: %s"
-                        epoch_id txid
-                        (String.sub hash 0 (min 16 (String.length hash)))
-                        (Printexc.to_string e)) :: !errors)
-               end
-           | _ -> ()
-         );
-         if !pending > 0 then Chaindata_index.commit_write t.index
-         else Chaindata_index.abort_write t.index
-       with e ->
-         Chaindata_index.abort_write t.index;
-         raise e);
-      { checked = !checked; repaired = !repaired; errors = List.rev !errors }
-    end
-  end
-
-let heal_epoch_txids_recent t ~epoch_id ~recent_epochs =
-  match Epochlog.last t.epochlog with
-  | None -> repair_stats_zero
-  | Some tip ->
-      let window = max 1 recent_epochs in
-      let from_epoch = max 0 (tip.Epochlog.id - window + 1) in
-      if epoch_id < from_epoch || epoch_id > tip.Epochlog.id then
-        repair_stats_zero
-      else
-        verify_and_repair_txid_loc_recent_epochs t ~from_epoch:epoch_id ~to_epoch:epoch_id
-
-let verify_and_repair t ~last_irmin_epoch =
-  let _ = last_irmin_epoch in
-  let checked = ref 0 in
-  let repaired = ref 0 in
-  let errors = ref [] in
-  let progress = ref 0 in
-  Txlog.scan_all t.txlog (fun seg_id pos record_len epoch_id payload ->
-    incr progress;
-    if !progress mod 1_000_000 = 0 then
-      Octra_log.info "chaindata"
-        "event = verify_progress scanned_million = %d repaired = %d"
-        (!progress / 1_000_000) !repaired;
-    let (hash, tx_json) = split_payload payload in
-    if String.length hash = 64 then begin
-      match Chaindata_index.get_tx_loc t.index hash with
-      | Some _ -> ()
-      | None ->
-        incr checked;
-        let txid = t.next_txid in
-        t.next_txid <- Int64.add t.next_txid 1L;
-        (try
-          let j = Yojson.Safe.from_string tx_json in
-          let open Yojson.Safe.Util in
-          let from_addr = j |> member "from" |> to_string in
-          let to_addr = j |> member "to_" |> to_string in
-          let op_type = try j |> member "op_type" |> to_string with _ -> "" in
-          let encrypted_data = try j |> member "encrypted_data" |> to_string with _ -> "" in
-          let message = try j |> member "message" |> to_string with _ -> "" in
-          let addrs = extract_call_recipient ~op_type ~encrypted_data
-            ~message ~from_addr ~to_addr in
-          Chaindata_index.begin_write t.index;
-          Chaindata_index.buffer_tx t.index ~hash ~seg_id ~offset:pos
-            ~len:record_len ~epoch_id ~txid ~from_addr ~to_addr ~addrs;
-          Chaindata_index.commit_write t.index;
-          incr repaired
-        with e ->
-          errors := (Printf.sprintf "hash=%s: %s"
-            (String.sub hash 0 (min 16 (String.length hash)))
-            (Printexc.to_string e)) :: !errors)
-    end
-  );
-  if !repaired > 0 then begin
-    Chaindata_index.begin_write t.index;
-    Chaindata_index.buffer_meta t.index "next_txid" (Int64.to_string t.next_txid);
-    Chaindata_index.commit_write t.index
-  end;
-  { checked = !checked; repaired = !repaired; errors = List.rev !errors }
 
 let tx_json_to_summary_row hash epoch_id tx_json =
   try
@@ -1682,11 +1555,21 @@ let token_txs_by_addr_page ?(profile_tag = "") t addr ~limit ~offset =
     page
 
 let txs_by_epoch_rows_status t epoch_id ~limit ~offset =
-  match Chaindata_index.get_epoch t.index epoch_id with
-  | None -> { total = 0; rows = []; missing = 0; incomplete = false }
-  | Some epoch_json ->
+  let empty = { total = 0; rows = []; missing = 0; incomplete = false } in
+  let absent total = { total; rows = []; missing = 1; incomplete = true } in
+  let head = Head_manifest.get_cached () in
+  if not (Head_manifest.is_epoch_visible head epoch_id) then empty
+  else match Chaindata_index.get_epoch_raw t.index epoch_id, Epochlog.get t.epochlog epoch_id with
+  | None, None ->
+      (match head with
+       | Some head when epoch_id >= 0 && epoch_id <= head.Head_manifest.epoch_id -> absent 0
+       | _ -> empty)
+  | None, Some durable -> absent durable.Epochlog.tx_count
+  | Some _, None -> absent 0
+  | Some epoch_json, Some durable ->
     (match Epochlog.epoch_of_json epoch_json with
-     | None -> { total = 0; rows = []; missing = 1; incomplete = true }
+     | None -> absent durable.Epochlog.tx_count
+     | Some h when h <> durable -> absent durable.Epochlog.tx_count
      | Some h ->
        let total = h.Epochlog.tx_count in
        let key =
@@ -2153,8 +2036,13 @@ let epochs_empty_after t ~from_epoch ~to_epoch =
   in
   loop (from_epoch + 1)
 
-let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
-                       ~head_epochlog_off ~inflight_start_txid ~inflight_tx_count =
+let rollback_to_head t ~(head : Head_manifest.t) ~inflight_start_txid ~inflight_tx_count =
+  let head_epoch = head.epoch_id in
+  if head.txid_hi < -1L || head.txid_hi = Int64.max_int
+     || inflight_start_txid <> Int64.succ head.txid_hi
+     || inflight_tx_count < 0
+     || Int64.of_int inflight_tx_count > Int64.sub Int64.max_int inflight_start_txid then
+    invalid_arg "rollback transaction range differs from HEAD";
   let floor =
     match history_floor t with
     | Ok value -> value
@@ -2166,26 +2054,40 @@ let rollback_to_head t ~head_epoch ~head_txlog_seg ~head_txlog_off
         invalid_arg "rollback target precedes history floor"
     | _ -> ()
   end;
+  (match Head_cut.verify ~head ~index:t.index ~txlog:t.txlog ~epochlog:t.epochlog with
+   | Ok () -> ()
+   | Error reason -> failwith reason);
+  verify_auxiliary t (Some head);
+  let head_txlog_seg, head_txlog_off, head_epochlog_off =
+    match head.txlog_seg, head.txlog_off, head.epochlog_off with
+    | Some segment, Some offset, Some epoch_offset -> segment, offset, epoch_offset
+    | _ -> invalid_arg "rollback requires journal offsets" in
   Txlog.truncate_to t.txlog ~seg_id:head_txlog_seg ~offset:head_txlog_off;
   Epochlog.truncate_to t.epochlog ~offset:head_epochlog_off;
+  let metadata = ["repaired_upto_epoch", string_of_int head_epoch;
+    "next_txid", Int64.to_string inflight_start_txid] @
+    (match floor with
+     | Some value when head_epoch = History_floor.epoch value ->
+       [Printf.sprintf "eic_epoch_hash:%d" head_epoch, History_floor.epoch_index_hash value;
+        Printf.sprintf "eic_epoch_root:%d" head_epoch, History_floor.epoch_index_root value;
+        "eic_latest_epoch", string_of_int head_epoch;
+        "eic_latest_root", History_floor.epoch_index_root value]
+     | _ -> []) in
   let (n_tx, n_ep, n_addr, n_txid) = Chaindata_index.cleanup_after_epoch t.index
+    ~metadata
+    ~head:(head_anchor head)
     ~max_epoch:head_epoch
     ~start_txid_inflight:inflight_start_txid
     ~tx_count_inflight:inflight_tx_count in
 
-  Chaindata_index.set_meta_direct t.index "repaired_upto_epoch"
-    (string_of_int head_epoch);
-  t.next_txid <- (
-    match floor with
-    | Some value when head_epoch = History_floor.epoch value ->
-        set_epoch_index_commitment_direct
-          t
-          ~epoch_id:head_epoch
-          ~epoch_hash:(History_floor.epoch_index_hash value)
-          ~root:(History_floor.epoch_index_root value);
-        History_floor.next_txid value
-    | _ -> Int64.add inflight_start_txid 0L);
-  Chaindata_index.set_meta_direct t.index "next_txid" (Int64.to_string t.next_txid);
+  Chaindata_index.sync t.index;
+  t.next_txid <- inflight_start_txid;
+  t.tx_writes <- Pending [];
+  Hashtbl.clear t.epoch_status_cache;
+  Hashtbl.clear t.epoch_rows_page_cache;
+  Hashtbl.clear t.addr_rows_page_cache;
+  Hashtbl.clear t.rejected_rows_page_cache;
+  Hashtbl.clear t.token_rows_page_cache;
   (n_tx, n_ep, n_addr, n_txid)
 
 let lower_hex_hash value =

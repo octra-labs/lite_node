@@ -1,2 +1,12 @@
 (dirs
- (:standard \ runtime_data archive libv_litecore))
+ (:standard \ runtime_data))
+
+(env
+ (_
+  (link_flags (:standard (:include native_link.sexp)))))
+
+(rule
+ (targets native_link.sexp)
+ (action
+  (with-stdout-to native_link.sexp
+   (bash "if [ '%{ocaml-config:system}' = 'macosx' ]; then printf '(-cc \"%s\")\\n' '%{ocaml-config:c_compiler}'; else printf '()\\n'; fi"))))

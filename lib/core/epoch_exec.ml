@@ -79,6 +79,8 @@ type fold_ctx = {
   ready_exec_mode : Rule_graph.mode;
   program_mode : Rule_graph.mode;
   program_overlap : bool;
+  fhe_work : Rule_graph.mode;
+  wasm_float : Rule_graph.mode;
   math : bool;
   cap_mode : Set_fold.cap_mode;
   ready_config_hash : string option;
@@ -158,6 +160,8 @@ let prior_fold _ =
     ready_exec_mode = Rule_graph.Prior;
     program_mode = Rule_graph.Prior;
     program_overlap = false;
+    fhe_work = Rule_graph.Prior;
+    wasm_float = Rule_graph.Prior;
     math = false;
     cap_mode = Set_fold.Reject;
     ready_config_hash = None;
@@ -225,7 +229,7 @@ let make_overlay_backend ?emission_policy ?emission_schedule
 }
 
 let emission_divisor = Reward_policy.emission_divisor
-let emission_tail = Reward_policy.emission_tail
+let emission_floor = Reward_policy.emission_floor
 
 let compute_base_reward ~emission_remaining =
   Reward_policy.compute_base ~emission_remaining
@@ -977,6 +981,7 @@ let debit_fee ~(backend : backend) (tx : Transaction.t) =
 
 let process_circle_deploy_tx
     ?(wasm_profile=Circle_wasm_host.Standard)
+    ?(float_mode=Rule_graph.Prior)
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -991,6 +996,7 @@ let process_circle_deploy_tx
       let* checked =
         Circle_deploy.check_available
           ~execution_profile:wasm_profile
+          ~float_mode
           backend.store
           src
           payload in
@@ -1009,6 +1015,7 @@ let process_circle_deploy_tx
 
 let process_circle_program_update_tx
     ?(wasm_profile=Circle_wasm_host.Standard)
+    ?(float_mode=Rule_graph.Prior)
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -1039,6 +1046,7 @@ let process_circle_program_update_tx
                     let* validate_result =
                       Circle_wasm_host.validate
                         ~execution_profile:wasm_profile
+                        ~float_mode
                         payload.code_b64 in
                     begin
                       match validate_result with
@@ -3156,9 +3164,11 @@ let process_circle_operation_tx
   let open Transaction in
   match tx.op_type with
   | CircleDeploy ->
-    process_circle_deploy_tx ~wasm_profile ~backend tx
+    process_circle_deploy_tx ~wasm_profile
+      ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleProgramUpdate ->
-    process_circle_program_update_tx ~wasm_profile ~backend tx
+    process_circle_program_update_tx ~wasm_profile
+      ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleAssetPut ->
     process_circle_asset_put_tx ~backend tx
   | CircleAssetPutEncrypted ->
@@ -3333,6 +3343,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
       counts.Set_fold.live
       counts.shadow
       counts.allowed;
+    Set_report.excluded cfg ~start:(set_fold_start ctx) ~source ~active state;
     let max_validators, incumbents =
       match ctx.seat_mode with
       | Rule_graph.Prior -> cfg.max_members, []
@@ -3515,6 +3526,10 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
     ~(process_tx : backend:backend -> env:env -> Transaction.t ->
         (tx_effect, string * string) Stdlib.result Lwt.t) =
   let open Lwt.Syntax in
+  match Tx_envelope.check_epoch ~chain_id:env.chain_id
+    ~epoch:(Int64.of_int env.epoch_id) txs with
+  | Error error -> Lwt.return (Error ("transaction envelope: " ^ error))
+  | Ok () ->
   Ledger.clear_spent_nonces backend.ledger;
   let* gate_ok =
     match preverify with
@@ -3704,7 +3719,9 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
         Ledger.clear_spent_nonces backend.ledger;
         Store_irmin.abort_epoch_batch backend.store;
         ignore (Ledger.abort_journal backend.ledger);
-        Lwt.return (Error (Printexc.to_string exn)))
+        match exn with
+        | Exec_resource.Exhausted _ -> Lwt.fail exn
+        | _ -> Lwt.return (Error (Printexc.to_string exn)))
 
 let confirmed_process process_tx ~backend ~env tx =
   let open Lwt.Syntax in

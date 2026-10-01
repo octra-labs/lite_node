@@ -23,6 +23,7 @@ type batch = {
 }
 
 type t = {
+  resources : Store_scope.t;
   env : Lmdb.Env.t;
   readonly : bool;
   tx_loc : (string, string, [ `Uni ]) Lmdb.Map.t;
@@ -36,12 +37,14 @@ type t = {
   receipts : (string, string, [ `Uni ]) Lmdb.Map.t;
   meta : (string, string, [ `Uni ]) Lmdb.Map.t;
   mutable batch : batch option;
-  mutable closed : bool;
 }
 
 let map_size_default = 64 * 1024 * 1024 * 1024
 let addr_recent_limit = 128
 let copy s = Bytes.unsafe_to_string (Bytes.of_string s)
+
+let auxiliary (t : t) = Aux_index.{env = t.env; meta = t.meta; receipts = t.receipts;
+  rejected = t.rejected; addresses = t.rej_addr; epochs = t.rej_epoch}
 
 let rejected_addr_ref ~epoch_id ~hash =
   Printf.sprintf "~%020d:%s" epoch_id hash
@@ -54,17 +57,18 @@ let rejected_hash_of_addr_ref value =
   else
     value
 
-let open_index_map readonly card ~key ~value ~name env =
+let open_index_map resources readonly card ~key ~value ~name env =
+  Store_scope.acquire resources (fun () ->
   if readonly then
     Lmdb.Map.open_existing card ~key ~value ~name env
   else
-    Lmdb.Map.create card ~key ~value ~name env
+    Lmdb.Map.create card ~key ~value ~name env) Lmdb_handle.close
 
 let open_index ?(readonly = false) path =
   if not (Sys.file_exists path) && readonly then
     failwith "chaindata index: read-only directory is missing"
   else if not (Sys.file_exists path) then begin
-    try Unix.mkdir path 0o755 with Unix.Unix_error _ -> ()
+    try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
   end;
   let flags =
     if readonly then
@@ -88,27 +92,31 @@ let open_index ?(readonly = false) path =
         ~flags
         path
   in
-  let tx_loc = open_index_map readonly Lmdb.Map.Nodup
+  let resources = Store_scope.create ~release:(fun () -> Lmdb.Env.close env) in
+  Store_scope.guard resources (fun () ->
+  let tx_loc = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"tx_loc" env in
-  let addr_tx = open_index_map readonly Lmdb.Map.Dup
+  let addr_tx = open_index_map resources readonly Lmdb.Map.Dup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.int64_be ~name:"addr_tx" env in
-  let addr_recent = open_index_map readonly Lmdb.Map.Nodup
+  let addr_recent = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"addr_recent" env in
-  let txid_loc = open_index_map readonly Lmdb.Map.Nodup
+  let txid_loc = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.int64_be ~value:Lmdb.Conv.string ~name:"txid_loc" env in
-  let epoch_meta = open_index_map readonly Lmdb.Map.Nodup
+  let epoch_meta = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.int32_be ~value:Lmdb.Conv.string ~name:"epoch_meta" env in
-  let rejected = open_index_map readonly Lmdb.Map.Nodup
+  let rejected = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"rejected" env in
-  let rej_addr = open_index_map readonly Lmdb.Map.Dup
+  let rej_addr = open_index_map resources readonly Lmdb.Map.Dup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"rej_addr" env in
-  let rej_epoch = open_index_map readonly Lmdb.Map.Dup
+  let rej_epoch = open_index_map resources readonly Lmdb.Map.Dup
     ~key:Lmdb.Conv.int32_be ~value:Lmdb.Conv.string ~name:"rej_epoch" env in
-  let receipts = open_index_map readonly Lmdb.Map.Nodup
+  let receipts = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"receipts" env in
-  let meta = open_index_map readonly Lmdb.Map.Nodup
+  let meta = open_index_map resources readonly Lmdb.Map.Nodup
     ~key:Lmdb.Conv.string ~value:Lmdb.Conv.string ~name:"meta" env in
+  Store_scope.acquire resources (fun () -> ()) (fun () -> if not readonly then Lmdb.Env.sync env);
   {
+    resources;
     env;
     readonly;
     tx_loc;
@@ -122,25 +130,10 @@ let open_index ?(readonly = false) path =
     receipts;
     meta;
     batch = None;
-    closed = false;
-  }
+  })
 
 let close t =
-  if not t.closed then begin
-    if not t.readonly then Lmdb.Env.sync t.env;
-    Lmdb_handle.close t.tx_loc;
-    Lmdb_handle.close t.addr_tx;
-    Lmdb_handle.close t.addr_recent;
-    Lmdb_handle.close t.txid_loc;
-    Lmdb_handle.close t.epoch_meta;
-    Lmdb_handle.close t.rejected;
-    Lmdb_handle.close t.rej_addr;
-    Lmdb_handle.close t.rej_epoch;
-    Lmdb_handle.close t.receipts;
-    Lmdb_handle.close t.meta;
-    Lmdb.Env.close t.env;
-    t.closed <- true
-  end
+  Store_scope.close t.resources
 
 let sync t =
   if t.readonly then invalid_arg "chaindata index is read-only"
@@ -277,6 +270,31 @@ let buffer_meta t key value =
 
 exception Index_commit_failed of string
 
+type tx_location_io = {
+  read_hash : string -> string option;
+  read_txid : int64 -> string option;
+  read_meta : string -> string option;
+  write_hash : string -> string -> unit;
+  hash_count : unit -> int;
+}
+
+let with_tx_loc_write t action =
+  if t.readonly then invalid_arg "chaindata index is read-only";
+  if t.batch <> None then invalid_arg "transaction location repair during active batch";
+  match Lmdb.Txn.go Lmdb.Rw t.env (fun txn ->
+    let read map key =
+      try Some (Lmdb.Map.get map ~txn key) with Not_found -> None
+    in
+    action {
+      read_hash = read t.tx_loc;
+      read_txid = read t.txid_loc;
+      read_meta = read t.meta;
+      write_hash = (fun hash location -> Lmdb.Map.set t.tx_loc ~txn hash location);
+      hash_count = (fun () -> (Lmdb.Map.stat t.tx_loc ~txn).entries);
+    }) with
+  | Some result -> result
+  | None -> raise (Index_commit_failed "transaction location repair aborted")
+
 let set_tx_loc_only t hash ~seg_id ~offset ~len ~epoch_id =
   let loc = encode_tx_loc ~seg_id ~offset ~len ~epoch_id in
   match
@@ -320,13 +338,51 @@ let commit_tx_loc_only t =
      | None -> raise (Index_commit_failed "commit_tx_loc_only: Txn.go returned None"));
     t.batch <- None
 
-let commit_write t =
+let auxiliary_writes (b : batch) =
+  List.concat_map (fun (hash, addr, json, epoch_id) -> Aux_delta.[
+    Rejected hash, Value (Some json);
+    Address (addr, hash), Member false;
+    Address (addr, rejected_addr_ref ~epoch_id ~hash), Member true;
+    Epoch (epoch_id, hash), Member true
+  ]) (List.rev b.rejected)
+  @ List.map (fun (hash, json) -> Aux_delta.Receipt hash, Aux_delta.Value (Some json)) b.receipts
+  @ List.map (fun (key, value) -> Aux_delta.Metadata key, Aux_delta.Value (Some value)) (List.rev b.meta_writes)
+
+let validate_epoch (target : Aux_delta.anchor) (b : batch) =
+  if b.clear_rebuild_tables then invalid_arg "epoch commit cannot rebuild index";
+  (match b.epochs with
+  | [epoch, json] when epoch = target.epoch ->
+    (match Epochlog.epoch_of_json json with
+    | Some header when header.id = target.epoch && header.state_root = target.root -> ()
+    | _ -> invalid_arg "epoch header differs from auxiliary target")
+  | _ -> invalid_arg "epoch index batch differs from auxiliary target");
+  if List.exists (fun (tx : tx_write) -> tx.epoch_id <> target.epoch) b.txs then
+    invalid_arg "transaction epoch differs from auxiliary target";
+  List.iter (fun (hash, _, json, epoch) ->
+    if epoch <> target.epoch || Aux_index.epoch_field "rejected" hash "epoch_id" json <> target.epoch then
+      invalid_arg "rejection epoch differs from auxiliary target") b.rejected;
+  List.iter (fun (hash, json) ->
+    if Aux_index.epoch_field "receipt" hash "epoch" json <> target.epoch then
+      invalid_arg "receipt epoch differs from auxiliary target") b.receipts
+
+let commit_write ?anchor t =
   match t.batch with
   | None -> failwith "history_index: no batch to commit"
   | Some b ->
     let result =
       try
-        Lmdb.Txn.go Lmdb.Rw t.env (fun txn ->
+        let aux = auxiliary t in
+        let writes = auxiliary_writes b in
+        let transaction action = match anchor with
+          | None -> Lmdb.Txn.go Lmdb.Rw t.env (fun txn ->
+            if (b.clear_rebuild_tables || writes <> []) && Aux_index.journal aux txn <> None then
+              failwith "unjournaled index write would change an epoch journal";
+            action txn;
+            List.iter (Aux_index.write aux txn) writes)
+          | Some (previous, target) ->
+            validate_epoch target b;
+            Some (Aux_index.with_write aux ~previous ~target ~writes action) in
+        transaction (fun txn ->
           if b.clear_rebuild_tables then begin
             Lmdb.Map.drop ~txn ~delete:false t.tx_loc;
             Lmdb.Map.drop ~txn ~delete:false t.txid_loc;
@@ -392,20 +448,7 @@ let commit_write t =
           ) recent_updates;
           List.iter (fun (eid, json) ->
             Lmdb.Map.set t.epoch_meta ~txn (Int32.of_int eid) json
-          ) b.epochs;
-          List.iter (fun (hash, addr, json, epoch_id) ->
-            Lmdb.Map.set t.rejected ~txn hash json;
-            (try Lmdb.Map.remove t.rej_addr ~txn ~value:hash addr with Not_found -> ());
-            let addr_ref = rejected_addr_ref ~epoch_id ~hash in
-            (try Lmdb.Map.add t.rej_addr ~txn addr addr_ref with Lmdb.Exists -> ());
-            (try Lmdb.Map.add t.rej_epoch ~txn (Int32.of_int epoch_id) hash with Lmdb.Exists -> ())
-          ) (List.rev b.rejected);
-          List.iter (fun (tx_hash, json) ->
-            Lmdb.Map.set t.receipts ~txn tx_hash json
-          ) b.receipts;
-          List.iter (fun (key, value) ->
-            Lmdb.Map.set t.meta ~txn key value
-          ) (List.rev b.meta_writes)
+          ) b.epochs
         )
       with e ->
         let msg = Printf.sprintf "LMDB commit failed: %s" (Printexc.to_string e) in
@@ -643,96 +686,46 @@ let get_meta_int64 t key =
   | None -> None
   | Some s -> (try Some (Int64.of_string s) with _ -> None)
 
-let cleanup_after_epoch t ~max_epoch ~start_txid_inflight ~tx_count_inflight:_ =
-  let to_del_hashes = ref [] in
-  let to_del_epochs_int32 = ref [] in
-  let to_del_addr_pairs = ref [] in
-  let to_del_txids = ref [] in
-
-  let walk_collect () =
-    ignore (Lmdb.Txn.go Lmdb.Ro t.env (fun txn ->
-      ignore (Lmdb.Cursor.go Lmdb.Ro t.tx_loc ~txn (fun cur ->
-        try
-          let rec loop (hash, loc_str) =
-            (try
-              let (_, _, _, eid) = decode_tx_loc loc_str in
-              if eid > max_epoch then to_del_hashes := hash :: !to_del_hashes
-            with _ -> ());
-            loop (Lmdb.Cursor.next cur)
-          in
-          loop (Lmdb.Cursor.first cur)
-        with Not_found -> ()));
-      ignore (Lmdb.Cursor.go Lmdb.Ro t.epoch_meta ~txn (fun cur ->
-        try
-          let rec loop (eid32, _) =
-            let eid = Int32.to_int eid32 in
-            if eid > max_epoch then
-              to_del_epochs_int32 := eid32 :: !to_del_epochs_int32;
-            loop (Lmdb.Cursor.next cur)
-          in
-          loop (Lmdb.Cursor.first cur)
-        with Not_found -> ()));
-      ignore (Lmdb.Cursor.go Lmdb.Ro t.txid_loc ~txn (fun cur ->
-        try
-          let rec seek_or_next first =
-            let (txid, _) =
-              if first then Lmdb.Cursor.seek_range cur start_txid_inflight
-              else Lmdb.Cursor.next cur
-            in
-            if Int64.compare txid start_txid_inflight >= 0 then begin
-              to_del_txids := txid :: !to_del_txids;
-              seek_or_next false
-            end
-          in
-          seek_or_next true
-        with Not_found -> ()));
-      ignore (Lmdb.Cursor.go Lmdb.Ro t.addr_tx ~txn (fun cur ->
-        try
-          let rec loop (addr, txid) =
-            if Int64.compare txid start_txid_inflight >= 0 then
-              to_del_addr_pairs := (addr, txid) :: !to_del_addr_pairs;
-            loop (Lmdb.Cursor.next cur)
-          in
-          loop (Lmdb.Cursor.first cur)
-        with Not_found -> ()))
-    ))
-  in
-  (try walk_collect () with _ -> ());
+let cleanup_after_epoch ?(metadata = []) ?head t ~max_epoch ~start_txid_inflight ~tx_count_inflight:_ =
+  if t.readonly then invalid_arg "chaindata index is read-only";
+  if Option.fold ~none:false ~some:(fun (value : Aux_delta.anchor) -> value.epoch <> max_epoch) head then
+    invalid_arg "auxiliary cut HEAD epoch differs";
   let result =
     try
       Lmdb.Txn.go Lmdb.Rw t.env (fun txn ->
-        List.iter (fun h ->
-          try Lmdb.Map.remove t.tx_loc ~txn h with _ -> ()
-        ) !to_del_hashes;
-        List.iter (fun eid32 ->
-          try Lmdb.Map.remove t.epoch_meta ~txn eid32 with _ -> ()
-        ) !to_del_epochs_int32;
-        List.iter (fun txid ->
-          try Lmdb.Map.remove t.txid_loc ~txn txid with _ -> ()
-        ) !to_del_txids;
-        List.iter (fun (addr, txid) ->
-          try Lmdb.Map.remove t.addr_tx ~txn ~value:txid addr with _ -> ()
-        ) !to_del_addr_pairs;
+        let aux = auxiliary t in
+        Aux_index.verify aux txn ~head;
+        let collect map select =
+          Lmdb.Cursor.go Lmdb.Rw map ~txn (fun cursor ->
+            let rec loop found pair = match pair with
+              | None -> List.rev found
+              | Some row ->
+                let found = if select row then row :: found else found in
+                loop found (try Some (Lmdb.Cursor.next cursor) with Not_found -> None) in
+            loop [] (try Some (Lmdb.Cursor.first cursor) with Not_found -> None)) in
+        let hashes = collect t.tx_loc (fun (_, bytes) ->
+          if String.length bytes <> 20 then failwith "transaction location length differs";
+          let _, _, _, epoch = decode_tx_loc bytes in
+          epoch > max_epoch) in
+        let epochs = collect t.epoch_meta (fun (epoch, _) -> Int32.to_int epoch > max_epoch) in
+        let txids = collect t.txid_loc (fun (txid, _) -> txid >= start_txid_inflight) in
+        let addresses = collect t.addr_tx (fun (_, txid) -> txid >= start_txid_inflight) in
+        List.iter (fun (hash, _) -> Lmdb.Map.remove t.tx_loc ~txn hash) hashes;
+        List.iter (fun (epoch, _) -> Lmdb.Map.remove t.epoch_meta ~txn epoch) epochs;
+        List.iter (fun (txid, _) -> Lmdb.Map.remove t.txid_loc ~txn txid) txids;
+        List.iter (fun (addr, txid) -> Lmdb.Map.remove t.addr_tx ~txn ~value:txid addr) addresses;
         drop_addr_recent_txn t txn;
-      )
-    with e ->
-      let msg = Printf.sprintf "cleanup_after_epoch txn failed: %s" (Printexc.to_string e) in
-      Octra_log.fatal "chaindata"
-        "event = cleanup_failed error = %s"
-        (Printexc.to_string e);
-      raise (Index_commit_failed msg)
+        Aux_index.apply_restore aux txn ~head;
+        List.iter (fun (key, value) -> Lmdb.Map.set t.meta ~txn key value) metadata;
+        List.length hashes, List.length epochs, List.length addresses, List.length txids)
+    with error ->
+      let reason = Printf.sprintf "index cut failed: %s" (Printexc.to_string error) in
+      Octra_log.fatal "chaindata" "event = cleanup_failed error = %s" reason;
+      raise (Index_commit_failed reason)
   in
-  (match result with
-   | Some () -> ()
-   | None ->
-     let msg = "cleanup_after_epoch: Txn.go returned None" in
-     Octra_log.fatal "chaindata"
-       "event = cleanup_failed reason = transaction_returned_none";
-     raise (Index_commit_failed msg));
-  (List.length !to_del_hashes,
-   List.length !to_del_epochs_int32,
-   List.length !to_del_addr_pairs,
-   List.length !to_del_txids)
+  match result with
+  | Some counts -> counts
+  | None -> raise (Index_commit_failed "index cut transaction returned no result")
 
 let set_meta_direct t key value =
   let result =
@@ -741,7 +734,7 @@ let set_meta_direct t key value =
         Lmdb.Map.set t.meta ~txn key value
       )
     with e ->
-      let msg = Printf.sprintf "LMDB set_meta_direct failed key=%S: %s" key (Printexc.to_string e) in
+      let msg = Printf.sprintf "LMDB set_meta_direct failed key = %S: %s" key (Printexc.to_string e) in
       Octra_log.fatal "chaindata"
         "event = metadata_write_failed key = %S error = %s"
         key (Printexc.to_string e);
@@ -750,7 +743,7 @@ let set_meta_direct t key value =
   match result with
   | Some () -> ()
   | None ->
-    let msg = Printf.sprintf "LMDB set_meta_direct Txn.go returned None key=%S" key in
+    let msg = Printf.sprintf "LMDB set_meta_direct Txn.go returned None key = %S" key in
     Octra_log.fatal "chaindata"
       "event = metadata_write_failed key = %S reason = transaction_returned_none"
       key;

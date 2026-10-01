@@ -4,7 +4,7 @@
 module S = Octra_node_runtime.Startup_network_boot_shell
 
 let fail msg =
-  failwith ("test_node_runtime_startup_network_boot_shell: " ^ msg)
+  failwith ("test_net_boot: " ^ msg)
 
 let expect label cond =
   if not cond then fail label
@@ -46,4 +46,4 @@ let test_profile_during_sync () =
 let () =
   test_create_refs ();
   test_profile_during_sync ();
-  print_endline "status = pass test = node_runtime_startup_network_boot_shell"
+  print_endline "status = pass test = net_boot"

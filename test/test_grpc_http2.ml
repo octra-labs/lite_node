@@ -973,4 +973,4 @@ let () =
     | _ -> Lwt.fail_with "test_grpc_http2: unknown case"
   in
   Lwt_main.run (Lwt.pick [run; limit]);
-  print_endline "test_grpc_http2: ok"
+  print_endline "status = pass test = grpc_http2"

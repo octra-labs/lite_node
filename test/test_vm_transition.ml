@@ -120,8 +120,10 @@ let program_trust =
   | Ok trust -> trust
   | Error error -> fail (Program_trust.error_message error)
 
-let compile source =
-  let compiled = Octra_vm.Oct_compile.compile_program source in
+let compile ?xcalls source =
+  let compiled = match xcalls with
+    | None -> Octra_vm.Oct_compile.compile_program source
+    | Some specs -> Octra_vm.Oct_compile.compile_program_with_xcalls source specs in
   let compiled =
     Octra_vm.Oct_compile.attest_program
       ~key_id:release_key.id
@@ -362,7 +364,7 @@ let run_sequence label =
     in
     expect "upgrade changes code hash"
       (not (String.equal old_code_hash upgraded_code_hash));
-    expect_rejected "stale program upgrade"
+    expect_rejected "hash_mismatch program upgrade"
       (apply
          (tx
             ~owner
@@ -524,7 +526,7 @@ let run_source_deploy ?submitted ?(refused = false) ?(epoch = 17) label =
       (Z.equal (view_int store target owner "count") Z.zero);
     let meta = Lwt_main.run (Store.get_contract_meta store target) in
     begin match Octra_vm.Contract_rpc.verify_compilation
-      ~meta ~source:source_v1 ~files_json:None with
+      ~main:"main.aml" ~meta ~source:source_v1 ~files_json:None with
     | Error reason -> fail ("source verification failed: " ^ reason)
     | Ok results ->
       expect "stored source has no matching compiler"
@@ -824,7 +826,282 @@ let test_circle_admission () =
              actual.circle_code_hash))
       validators
 
+type fhe_route = Direct | Nested | Batch
+
+let fhe_source =
+  let steps = List.init 10 (fun index ->
+    Printf.sprintf "let c%d = fhe_add(pk, c%d, c%d)" (index + 1) index index) in
+  {|
+Program FheJournal {
+  state { counter: int }
+  constructor() { self.counter = 0 }
+  fn inc(): int { self.counter = self.counter + 1 return self.counter }
+  view fn count(): int { return self.counter }
+  fn grow(key: address, data: bytes, destination: address): int {
+    self.counter = 7
+    require(transfer(destination, 1), "transfer refused")
+    let pk = fhe_load_pk(key)
+    let c0 = fhe_deser(data)
+|} ^ String.concat "\n" steps ^ {|
+    return 7
+  }
+  fn relay(child: address, key: address, data: bytes, destination: address): int {
+    self.counter = 9
+    require(transfer(destination, 1), "transfer refused")
+    return call(child, "grow", [key, data, destination])
+  }
+}
+|}
+
+let test_fhe_journal () =
+  let module L = Octra_core.Ledger in
+  let module R = Octra_core.Rule_graph in
+  let pk, sk = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\001') in
+  let cipher = Pvac_ffi.enc_value_seeded pk sk 1L (Bytes.make 32 '\002') in
+  let data = Pvac_ffi.serialize_cipher cipher |> Bytes.to_string |> Base64.encode_exn in
+  let raw, encoded = compile ~xcalls:[{
+    Octra_vm.Oct_compile.method_name = "grow";
+    inputs = [Octra_vm.Program_type_flow.Addr; Bytes; Addr];
+    output = Octra_vm.Program_type_flow.Int;
+    capabilities = [Octra_vm.Program_type_flow.Storage_write; Transfer; Fhe];
+  }] fhe_source in
+  let run label route epoch = with_store label (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111111" in
+    let destination = "oct7xCozDD9JEsbeVpo5C7HXp2BJbKqfmNUHmDDCCTtWcGb" in
+    let plan = R.{anchor_epoch = 10; anchor_state_root = "root"; activation_epoch = 20} in
+    let fhe_work = R.activation_mode ~root_at:(fun _ -> R.Root "root") (Some plan) ~epoch
+      |> Result.get_ok in
+    let fold epoch = Epoch_exec.prior_fold epoch
+      |> Result.map (fun ctx -> {ctx with Epoch_exec.fhe_work}) in
+    let ledger = L.create store in
+    List.iter (fun (address, balance) ->
+      match L.add_account ledger address (Z.of_int balance) with
+      | Ok () -> () | Error reason -> fail reason) [owner, 1000; destination, 100];
+    Lwt_main.run (L.set_pvac_pubkey ledger owner (Pvac_ffi.serialize_pubkey pk |> Bytes.to_string));
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let backend = Epoch_exec.make_live_backend ~fold store ledger in
+    Lwt_main.run (backend.begin_batch R.Prior);
+    let receipts = ref [] in
+    let apply = process ~env:{env with epoch_id = epoch}
+      ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts) backend in
+    let deploy nonce =
+      let address = Contract.addr_from_code raw owner nonce in
+      expect_confirmed "FHE program deployment"
+        (apply (tx ~owner ~target:address ~nonce ~op_type:Transaction.ContractDeploy
+          ~payload:(Some encoded) ~message:(Some "[]")));
+      begin match L.credit ledger address (Z.of_int 100) with
+      | Ok () -> () | Error reason -> fail reason end;
+      address in
+    let inner = deploy 1 in
+    let outer = deploy 2 in
+    let args = [`String owner; `String data; `String destination] in
+    let transaction = match route with
+      | Direct -> tx ~owner ~target:inner ~nonce:3 ~op_type:Transaction.ProgramExec
+          ~payload:(Some "grow") ~message:(Some (Yojson.Safe.to_string (`List args)))
+      | Nested -> tx ~owner ~target:outer ~nonce:3 ~op_type:Transaction.ProgramExec
+          ~payload:(Some "relay") ~message:(Some (Yojson.Safe.to_string (`List (`String inner :: args))))
+      | Batch ->
+        let call method_name params = `Assoc ["to", `String inner; "method", `String method_name;
+          "params", `List params; "amount", `String "0"] in
+        tx ~owner ~target:inner ~nonce:3 ~op_type:Transaction.MultiExec ~payload:None
+          ~message:(Some (Yojson.Safe.to_string (`List [call "inc" []; call "grow" args]))) in
+    begin match apply transaction with
+    | Ok (Epoch_exec.Rejected_after_fee rejected) when fhe_work = R.Active ->
+      expect "FHE refusal lost fee" (Z.equal rejected.fee (Z.of_int 10))
+    | Ok (Epoch_exec.Confirmed _) when fhe_work = R.Prior -> ()
+    | Error (_, reason) -> fail ("FHE transition error: " ^ reason)
+    | _ -> fail "FHE journal outcome differs from selected rule"
+    end;
+    let balance address = (Option.get (L.find_opt ledger address)).L.balance in
+    expect "FHE failure fee or nonce changed"
+      (Z.equal (balance owner) (Z.of_int 970) && (Option.get (L.find_opt ledger owner)).nonce = 3);
+    if fhe_work = R.Active then begin
+      expect "FHE failure kept transfer" (Z.equal (balance destination) (Z.of_int 100));
+      List.iter (fun address ->
+        expect "FHE failure kept program debit" (Z.equal (balance address) (Z.of_int 100));
+        expect "FHE failure kept storage write" (Z.equal (view_int store address owner "count") Z.zero))
+        [inner; outer]
+    end else
+      expect "historical FHE call did not write" (Z.equal (view_int store inner owner "count") (Z.of_int 7));
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let root = Lwt_main.run (Store.get_batch_tree_hash store) in
+    let result = root, List.rev !receipts in
+    Store.abort_epoch_batch store;
+    result) in
+  List.iteri (fun index route ->
+    ignore (run ("fhe_prior_" ^ string_of_int index) route 19);
+    let first = run ("fhe_active_a_" ^ string_of_int index) route 20 in
+    let second = run ("fhe_active_b_" ^ string_of_int index) route 20 in
+    expect "FHE failed replay root or receipt mismatch" (first = second)) [Direct; Nested; Batch]
+
+let test_circle_work () =
+  let module L = Octra_core.Ledger in
+  let module R = Octra_core.Rule_graph in
+  let module H = Octra_core.Circle_hfhe_policy in
+  let steps = List.init 10 (fun index ->
+    Printf.sprintf "let c%d = fhe_add(pk, c%d, c%d)" (index + 1) index index) in
+  let source = {|
+Program CircleWork {
+  state { counter: int }
+  fn grow(key: address, data: bytes): int {
+    self.counter = 7
+    let pk = fhe_load_pk(key)
+    let c0 = fhe_deser(data)
+|} ^ String.concat "\n" steps ^ {|
+    return 7
+  }
+}
+|} in
+  let _, encoded = compile source in
+  let pk, sk = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\003') in
+  let cipher = Pvac_ffi.enc_value_seeded pk sk 1L (Bytes.make 32 '\004') in
+  let data = Pvac_ffi.serialize_cipher cipher |> Bytes.to_string |> Base64.encode_exn in
+  let run label fhe_work = with_store label (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111111" in
+    let ledger = L.create store in
+    begin match L.add_account ledger owner (Z.of_int 1000) with
+    | Ok () -> () | Error error -> fail error end;
+    Lwt_main.run (L.set_pvac_pubkey ledger owner (Pvac_ffi.serialize_pubkey pk |> Bytes.to_string));
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let fold epoch = Epoch_exec.prior_fold epoch
+      |> Result.map (fun ctx -> {ctx with Epoch_exec.fhe_work}) in
+    let backend = Epoch_exec.make_live_backend ~fold store ledger in
+    Lwt_main.run (backend.begin_batch R.Prior);
+    let payload = Circles.{runtime = Octb; privacy_class = Public;
+      browser_mode = Native_sealed; resource_mode = Public_resources;
+      code_b64 = Some encoded; policy_hash = None; members_root = None;
+      export_policy = None; limits = default_limits} in
+    let target = Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 payload in
+    let receipts = ref [] in
+    let apply transaction = Lwt_main.run
+      (Transition.process_tx ~backend ~env ~circle_mode:R.Active
+        ~wasm_compute_mode:R.Active ~program_trust ~object_cost:false
+        ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts)
+        transaction) in
+    expect_confirmed "Circle work deploy"
+      (apply (tx ~owner ~target ~nonce:1 ~op_type:Transaction.CircleDeploy ~payload:None
+        ~message:(Some (Yojson.Safe.to_string (Circles.yojson_of_deploy_payload payload)))));
+    let storage = Lwt_main.run (Store.load_circle_stable_storage store target) |> Result.get_ok in
+    Hashtbl.replace storage H.require_live_key_policy_key "false";
+    ignore (Lwt_main.run (Store.save_circle_stable_storage store target storage));
+    let snapshot () = Lwt_main.run (Store.load_circle_stable_storage store target)
+      |> Result.get_ok |> Hashtbl.to_seq |> List.of_seq |> List.sort compare in
+    let before = snapshot () in
+    let transaction = tx ~owner ~target ~nonce:2 ~op_type:Transaction.CircleCall
+      ~payload:(Some "grow")
+      ~message:(Some (Yojson.Safe.to_string (`List [`String owner; `String data]))) in
+    begin match apply transaction, fhe_work with
+    | Ok (Epoch_exec.Confirmed _), R.Prior ->
+      expect "Circle prior call did not write" (before <> snapshot ())
+    | Ok (Epoch_exec.Rejected_after_fee rejected), R.Active ->
+      expect "Circle FHE refusal reason"
+        (rejected.reason = "execution reverted");
+      expect "Circle FHE failure kept storage" (before = snapshot ())
+    | Error (_, reason), _ -> fail ("Circle work transition: " ^ reason)
+    | _ -> fail "Circle work rule was not applied"
+    end;
+    let account = Option.get (L.find_opt ledger owner) in
+    expect "Circle work fee or nonce changed"
+      (Z.equal account.balance (Z.of_int 980) && account.nonce = 2);
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let result = Lwt_main.run (Store.get_batch_tree_hash store), List.rev !receipts in
+    Store.abort_epoch_batch store;
+    result) in
+  ignore (run "circle_work_prior" R.Prior);
+  let first = run "circle_work_active_a" R.Active in
+  let second = run "circle_work_active_b" R.Active in
+  expect "Circle work replay root or receipt changed" (first = second)
+
+let test_policy_abort () =
+  let raw, encoded = compile source_v1 in
+  let package = compile_package source_v1 in
+  List.iter (fun (label, op_type, raw, encoded) ->
+  with_store label (fun store ->
+    let module L = Octra_core.Ledger in
+    let owner = "oct11111111111111111111111111111111111111111111" in
+    let target = Contract.addr_from_code raw owner 1 in
+    let ledger = L.create store in
+    begin match L.add_account ledger owner (Z.of_int 1_000) with
+    | Ok () -> () | Error reason -> fail reason end;
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let backend = Epoch_exec.make_live_backend store ledger in
+    Lwt_main.run (backend.begin_batch Octra_core.Rule_graph.Prior);
+    let root = Lwt_main.run (Store.get_batch_tree_hash store) in
+    let backend = {backend with Epoch_exec.fold = (fun _ -> Error "anchor read failed")} in
+    let receipts = ref [] in
+    let message = if op_type = Transaction.MultiExec then
+      Yojson.Safe.to_string (`List [`Assoc ["to", `String target;
+        "method", `String "inc"; "params", `List []; "amount", `String "0"]])
+      else "[]" in
+    let transaction = tx ~owner ~target ~nonce:1 ~op_type
+      ~payload:(Some encoded) ~message:(Some message) in
+    let aborted = try
+      ignore (Lwt_main.run (Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+        Transition.process_tx ~backend ~env ~circle_mode:Octra_core.Rule_graph.Prior
+          ~wasm_compute_mode:Octra_core.Rule_graph.Active ~program_trust ~object_cost:false
+          ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts)
+          transaction)));
+      false
+      with Transition.Policy_unavailable reason -> reason = "anchor read failed" in
+    expect "policy read failure became transaction result" aborted;
+    let account = Option.get (L.find_opt ledger owner) in
+    expect "policy failure charged fee" (Z.equal account.balance (Z.of_int 1_000));
+    expect "policy failure consumed nonce" (account.nonce = 0);
+    expect "policy failure published receipt" (!receipts = []);
+    expect "policy failure changed root" (root = Lwt_main.run (Store.get_batch_tree_hash store));
+    expect "policy failure deployed program" (Lwt_main.run (Store.load_bytecode store target) = None);
+    Store.abort_epoch_batch store))
+    ["policy_legacy", Transaction.ContractDeploy, raw, encoded;
+     "policy_source", Transaction.ProgramDeploy, package.envelope, Base64.encode_exn package.package;
+     "policy_batch", Transaction.MultiExec, raw, encoded]
+
+let test_spawn_budget () =
+  let module VM = Octra_vm.Contract_vm in
+  let module R = Octra_core.Rule_graph in
+  let module Journal = Octra_vm.Program_journal in
+  let raw, _ = compile ~xcalls:[{
+    Octra_vm.Oct_compile.method_name = "value";
+    inputs = [];
+    output = Octra_vm.Program_type_flow.Int;
+    capabilities = [Octra_vm.Program_type_flow.View];
+  }] {|Program Budget {
+    constructor(target: address) { require(call(target, "value", []) == 1, "wrong value") }
+  }|} in
+  with_store "spawn_budget" (fun store ->
+    List.iter (fun (mode, depth, limit, success) ->
+      let observed = ref None in
+      let ctx = {VM.default_ctx with fhe_work = mode;
+        call_contract = (fun _ _ _ _ scope -> observed := Some scope;
+          Ok VM.{return_value = VInt Z.one; effort_used = 1; events = []})} in
+      let journal = Journal.create () in
+      let result = Contract.deploy_internal ~journal ~trusted:(Program_trust.keys program_trust)
+        ~ctx ~depth ~limit
+        ~params:[VM.VAddr "oct11111111111111111111111111111111111111111111"]
+        store ~deployer:"oct11111111111111111111111111111111111111111111"
+        ~bytecode_raw:raw ~nonce:1 in
+      expect "constructor budget or depth ignored" (Result.is_ok result = success);
+      if success then begin
+        let scope = Option.get !observed in
+        expect "constructor reset call depth"
+          (scope.depth = if mode = R.Prior then 1 else depth + 1);
+        expect "constructor reset child budget"
+          (match scope.limit with
+          | None -> mode = R.Prior
+          | Some value -> mode = R.Active && value >= 0 && value < limit)
+      end else begin
+        expect "failed constructor staged program"
+          (not (Journal.has_deploy journal (Contract.addr_from_code raw
+            "oct11111111111111111111111111111111111111111111" 1)));
+        expect "failed constructor called child" (!observed = None)
+      end)
+      [R.Prior, 8, 10_000, true; R.Active, 7, 10_000, true;
+       R.Active, 8, 10_000, false; R.Active, 0, 1, false])
+
 let () =
+  test_policy_abort ();
+  test_circle_work ();
+  test_spawn_budget ();
+  test_fhe_journal ();
   test_resource_abort ();
   test_deterministic_transition ();
   test_source_deploy_parity ();

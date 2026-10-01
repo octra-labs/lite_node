@@ -36,7 +36,7 @@ let full_key_hash blob =
 
 let decode_b64 s =
   try Ok (Base64.decode_exn s)
-  with e -> Error (Printexc.to_string e)
+  with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e)
 
 let validate_size raw =
   if String.length raw > max_pubkey_bytes then

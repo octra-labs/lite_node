@@ -613,7 +613,7 @@ let rec mkdir_p path =
     Unix.mkdir path 0o755
   end
 
-let test_journal_tail root manifest_hash (file : Manifest.file) chunk =
+let test_journal_suffix root manifest_hash (file : Manifest.file) chunk =
   let write path bytes =
     let output = open_out_bin path in
     Fun.protect ~finally:(fun () -> close_out_noerr output)
@@ -629,16 +629,16 @@ let test_journal_tail root manifest_hash (file : Manifest.file) chunk =
   let completed = Yojson.Safe.to_string (Journal.chunk_json key) in
   let dropped = Yojson.Safe.to_string (Journal.drop_json key) in
   List.iteri (fun index (bytes, present) ->
-    let path = Filename.concat root (Printf.sprintf "tail-%d.jsonl" index) in
+    let path = Filename.concat root (Printf.sprintf "suffix-%d.jsonl" index) in
     write path bytes;
     let journal = expect_ok (Journal.open_journal ~path ~manifest_hash) in
     if Journal.is_completed journal file.path chunk <> present then
-      fail "journal tail changed completed prefix";
+      fail "journal suffix changed completed prefix";
     if present then Journal.record_invalid journal file.path chunk
     else Journal.record_completed journal file.path chunk;
     let journal = expect_ok (Journal.open_journal ~path ~manifest_hash) in
     if Journal.is_completed journal file.path chunk = present then
-      fail "journal append after tail repair was lost"
+      fail "journal append after suffix repair was lost"
   ) [
     header, false;
     header ^ "\n" ^ completed, true;
@@ -675,7 +675,7 @@ let test_journal_tail root manifest_hash (file : Manifest.file) chunk =
   if read invalid <> bytes then fail "foreign manifest journal was modified";
   let meta = Unix.stat invalid in
   write invalid (bytes ^ "more");
-  expect_error (Journal.repair_tail invalid meta 0);
+  expect_error (Journal.repair_suffix invalid meta 0);
   if read invalid <> bytes ^ "more" then fail "changed journal was truncated";
   let alias = Filename.concat root "alias.jsonl" in
   Unix.symlink "invalid.jsonl" alias;
@@ -724,12 +724,12 @@ let test_journal () =
   Journal.record_invalid recovered file.path chunk;
   let continued = expect_ok (Journal.open_journal ~path:torn_path ~manifest_hash) in
   if Journal.is_completed continued file.path chunk then
-    fail "journal lost invalidation after tail repair";
+    fail "journal lost invalidation after suffix repair";
   Journal.record_completed continued file.path chunk;
   let resumed = expect_ok (Journal.open_journal ~path:torn_path ~manifest_hash) in
   if not (Journal.is_completed resumed file.path chunk) then
-    fail "journal lost completion after tail repair";
-  test_journal_tail root manifest_hash file chunk;
+    fail "journal lost completion after suffix repair";
+  test_journal_suffix root manifest_hash file chunk;
   remove_tree root
 
 let test_snapshot_roots () =
@@ -927,4 +927,4 @@ let () =
   test_chunks ();
   test_hash_slices ();
   test_large_manifest ();
-  print_endline "test_state_sync_manifest: ok"
+  print_endline "status = pass test = state_sync_manifest"

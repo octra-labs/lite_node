@@ -12,7 +12,7 @@ module F = Octra_node_runtime.Consensus_bundle_fetch
 module W = Octra_core.Preverify_worker
 
 let fail msg =
-  failwith ("test_node_runtime_consensus_proposal: " ^ msg)
+  failwith ("test_proposal: " ^ msg)
 
 let verdict_accepts = function
   | C_driver.Proposal_accept -> true
@@ -463,14 +463,33 @@ let test_preverify_cap_skip_sample () =
     (String.ends_with ~suffix:":heavy" shaped.skipped_sample)
 
 let test_layera_validator_addrs () =
-  expect "layera fallback"
-    (C.layera_validator_addrs ~env:None ~fallback:"oct_fallback" = ["oct_fallback"]);
+  expect "layera local address"
+    (C.layera_validator_addrs ~env:None ~fallback:"oct_local" = ["oct_local"]);
   expect "layera env parsed sorted"
     (C.layera_validator_addrs
        ~env:(Some "octB:1,bad,octA:2")
-       ~fallback:"oct_fallback" = ["octA"; "octB"]);
+       ~fallback:"oct_local" = ["octA"; "octB"]);
   expect "layera invalid env stays empty"
-    (C.layera_validator_addrs ~env:(Some "bad") ~fallback:"oct_fallback" = [])
+    (C.layera_validator_addrs ~env:(Some "bad") ~fallback:"oct_local" = [])
+
+let test_private_slot_preview () =
+  let high = {(tx ~ou:200_000 1) with Transaction.from = "octZ";
+    op_type = Transaction.EncryptOp} in
+  let low = {(tx ~ou:100_000 1) with Transaction.from = "octA";
+    op_type = Transaction.EncryptOp} in
+  let suffix = {(tx 2) with Transaction.from = "octA"} in
+  let public = {(tx 1) with Transaction.from = "octPublic"} in
+  let inputs = [high; low; suffix; public] in
+  let run ready =
+    Lwt_main.run (C.build_preverify ~private_slots:{fhe = 1; stealth = 1}
+      ~limits:(C.limits ~max_txs:10 ~max_bytes:1_000_000 ~max_ou:(Z.of_int 10_000_000))
+      ~run_many:(fun _ -> fake_batch ready) inputs) in
+  let selected = run inputs in
+  expect "preview receives price winner only" (selected.txs = [high; public]);
+  let selected = run [low; suffix; public] in
+  expect "failed proof releases proposal slot" (selected.txs = [low; suffix; public]);
+  expect "private selection hashes bind exact preview"
+    (selected.tx_hashes = List.map Transaction.hash selected.txs)
 
 let test_layera_diag_context () =
   let ctx =
@@ -490,14 +509,14 @@ let test_layera_env_diag_context () =
   let ctx =
     C.layera_env_diag_context
       ~env:(Some "octB:pub,octA:pub")
-      ~fallback:"octFallback"
+      ~fallback:"octLocal"
       ~hash_validators:(fun payload -> "hash:" ^ payload)
       ~meta:(fun key -> "meta:" ^ key)
   in
   expect "layera env addrs" (ctx.C.validator_addrs = ["octA"; "octB"]);
   expect "layera env sha" (ctx.validators_sha = "hash:octA,octB")
 
-let test_validator_pubkeys_fallback () =
+let test_validator_pubkeys_local () =
   let calls = ref 0 in
   let pubkeys =
     C.validator_pubkeys
@@ -506,8 +525,8 @@ let test_validator_pubkeys_fallback () =
         incr calls;
         ["octA", "pubA"; "octB", "pubB"])
   in
-  expect "validator fallback called" (!calls = 1);
-  expect "validator fallback pubkeys" (pubkeys = ["octA", "pubA"; "octB", "pubB"])
+  expect "validator local called" (!calls = 1);
+  expect "validator local pubkeys" (pubkeys = ["octA", "pubA"; "octB", "pubB"])
 
 let test_preview_exec_env () =
   let env =
@@ -561,7 +580,7 @@ let test_admission_plan () =
   (match plan ~epoch_id:9 ~current_epoch:10 () with
    | C.Realign_stale_height { target_epoch } ->
      expect "realign target" (target_epoch = 10L)
-   | _ -> fail "realign stale plan");
+   | _ -> fail "realign old epoch plan");
   (match plan ~epoch_id:11 ~current_epoch:10 () with
    | C.Defer_apply_gap -> ()
    | _ -> fail "apply gap plan");
@@ -922,6 +941,98 @@ let test_make_preview_rejections () =
      fail "make stored bundle");
   expect "make freeze" (List.length !(probe.frozen_writes) = 1)
 
+let test_private_apply_slot () =
+  let item key ou =
+    let public_key = Base64.encode_exn (String.make 32 key) in
+    {(tx ~ou 1) with Transaction.op_type = EncryptOp;
+      from = Octra_core.Crypto.Address.address_from_pubkey public_key;
+      signature = Base64.encode_exn (String.make 64 '\000');
+      public_key = Some public_key} in
+  let high = item 'a' 200_000 and low = item 'b' 100_000 in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch = (Option.get (Octra_core.Rule_graph.tx_envelope_activation_for_chain chain_id)).activation_epoch in
+  let deps, probe = make_proposal_deps ~current_epoch:epoch ~staging:[high; low]
+    ~preview_result:(fun request ->
+      let rejected, confirmed = List.partition (fun tx -> tx = high) request.C.txs in
+      let result = Result.get_ok (exec_result ~confirmed ~rejected ~post_state_root:(raw 'q')) in
+      let reason = if List.mem low request.C.txs then "fhe_epoch_cap" else "rejected" in
+      Ok {result with artifacts = {result.artifacts with rejected =
+        List.map (fun r -> {r with Octra_core.Epoch_exec.reason}) result.artifacts.rejected}}) () in
+  let plan = Lwt_main.run (C.make_proposal ~private_slots:{fhe = 1; stealth = 1}
+    deps ~chain_id ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:(Int64.of_int epoch)) in
+  expect "apply rejection consumed private slot"
+    (match plan with Some plan -> plan.tx_hashes = [Transaction.hash low] | None -> false);
+  match !(probe.stored_bundles) with
+  | [_, _, txs, receipts] ->
+    (match Octra_core.Tx_outcome.decode ~confirmed:txs receipts with
+    | Ok partition ->
+      expect "apply rejection evidence lost"
+        (List.map (fun r -> r.Octra_core.Tx_outcome.tx) partition.rejections = [high]);
+      expect "refill rejection differs from replay"
+        ((List.hd partition.rejections).reason = "fhe_epoch_cap")
+    | Error reason -> fail reason)
+  | _ -> fail "private proposal missing"
+
+let test_private_refill_cap () =
+  let item key ou op_type =
+    let public_key = Base64.encode_exn (String.make 32 key) in
+    {(tx ~ou 1) with Transaction.op_type;
+      from = Octra_core.Crypto.Address.address_from_pubkey public_key;
+      signature = Base64.encode_exn (String.make 64 '\000');
+      public_key = Some public_key} in
+  let first = item 'a' 300_000 EncryptOp in
+  let second = item 'b' 200_000 EncryptOp in
+  let public = item 'c' 100_000 Standard in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch = (Option.get (Octra_core.Rule_graph.tx_envelope_activation_for_chain chain_id)).activation_epoch in
+  let deps, probe = make_proposal_deps ~current_epoch:epoch ~staging:[first; second; public]
+    ~preview_result:(fun request ->
+      let rejected, confirmed = List.partition (fun tx -> tx = public) request.C.txs in
+      exec_result ~confirmed ~rejected ~post_state_root:(raw 'q')) () in
+  let limits = {generous_limits with C.max_txs = 2} in
+  let plan = Lwt_main.run (C.make_proposal ~private_slots:{fhe = 1; stealth = 1}
+    deps ~chain_id ~root_to_raw32:Fun.id ~limits ~epoch_id:(Int64.of_int epoch)) in
+  expect "refill cap lost original proposal" (Option.is_some plan);
+  match !(probe.stored_bundles) with
+  | [_, _, txs, receipts] ->
+    let partition = Result.get_ok (Octra_core.Tx_outcome.decode ~confirmed:txs receipts) in
+    expect "refill cap lost rejected input"
+      (List.map (fun r -> r.Octra_core.Tx_outcome.tx) partition.rejections = [public])
+  | _ -> fail "refill cap proposal missing"
+
+let test_private_refill_steps () =
+  let item key ou op_type =
+    let public_key = Base64.encode_exn (String.make 32 key) in
+    {(tx ~ou 1) with Transaction.op_type;
+      from = Octra_core.Crypto.Address.address_from_pubkey public_key;
+      signature = Base64.encode_exn (String.make 64 '\000');
+      public_key = Some public_key} in
+  let private_txs = List.init 4 (fun i ->
+    item (Char.chr (97 + i)) (500_000 - i * 100_000) EncryptOp) in
+  let public = item 'p' 100_000 Standard in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch = (Option.get (Octra_core.Rule_graph.tx_envelope_activation_for_chain chain_id)).activation_epoch in
+  let calls = ref 0 in
+  let deps, probe = make_proposal_deps ~current_epoch:epoch ~staging:(private_txs @ [public])
+    ~preview_result:(fun request ->
+      incr calls;
+      let private_txs = List.filter (fun item -> item <> public) request.C.txs in
+      let accepted = match private_txs with first :: _ :: _ -> Some first | _ -> None in
+      let confirmed, rejected = List.partition
+        (fun item -> item = public || Some item = accepted) request.C.txs in
+      exec_result ~confirmed ~rejected ~post_state_root:(raw 'q')) () in
+  let plan = Lwt_main.run (C.make_proposal ~private_slots:{fhe = 1; stealth = 1}
+    deps ~chain_id ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:(Int64.of_int epoch)) in
+  expect "refill exhausted preview budget"
+    (match plan with Some plan -> plan.tx_hashes = [Transaction.hash public] | None -> false);
+  expect "refill transition count differs" (!calls = 13);
+  match !(probe.stored_bundles) with
+  | [_, _, txs, receipts] ->
+    let partition = Result.get_ok (Octra_core.Tx_outcome.decode ~confirmed:txs receipts) in
+    expect "refill evidence differs"
+      (List.map (fun r -> r.Octra_core.Tx_outcome.tx) partition.rejections = [List.nth private_txs 3])
+  | _ -> fail "refill proposal missing"
+
 let test_make_rejection_only () =
   let rejected = tx 1 in
   let preview_count = ref 0 in
@@ -994,18 +1105,18 @@ let test_make_keep_partition () =
       | Ok value -> value
       | Error reason -> fail reason
     in
-    let candidates =
+    let inputs =
       match Octra_core.Tx_outcome.merge ~confirmed ~rejections:outcomes.rejections with
       | Ok value -> value
       | Error reason -> fail reason
     in
     begin
       match C.verify_preview_partition
-        ~candidates ~confirmed ~rejections:outcomes.rejections (preview candidates) with
+        ~inputs ~confirmed ~rejections:outcomes.rejections (preview inputs) with
       | Ok () -> ()
       | Error reason -> fail ("built partition rejected: " ^ reason)
     end;
-    expect "dependent transaction deferred" (not (List.mem dependent candidates));
+    expect "dependent transaction deferred" (not (List.mem dependent inputs));
     expect "independent transaction retained" (confirmed = [independent]);
     expect "original rejection retained"
       (List.map (fun (item : Octra_core.Tx_outcome.rejection) -> item.tx)
@@ -1043,12 +1154,12 @@ let test_make_dependency_chain () =
       | [_, _, confirmed, receipts] ->
         let get = function Ok value -> value | Error reason -> fail reason in
         let outcomes = get (Octra_core.Tx_outcome.decode ~confirmed receipts) in
-        let candidates =
+        let inputs =
           get (Octra_core.Tx_outcome.merge ~confirmed ~rejections:outcomes.rejections)
         in
-        get (C.verify_preview_partition ~candidates ~confirmed
-          ~rejections:outcomes.rejections (preview candidates));
-        get (C.verify_preview_partition ~candidates:confirmed ~confirmed
+        get (C.verify_preview_partition ~inputs ~confirmed
+          ~rejections:outcomes.rejections (preview inputs));
+        get (C.verify_preview_partition ~inputs:confirmed ~confirmed
           ~rejections:[] (preview confirmed));
         expect "chain independent retained" (confirmed = [independent]);
         expect "chain rejected positions"
@@ -1058,6 +1169,44 @@ let test_make_dependency_chain () =
         expect "chain staging unchanged" (deps.C.staging_txs () = staged)
       | _ -> fail "chain bundle missing")
     [1; 2; 3; 4; 8; 16]
+
+let test_preview_resources () =
+  let module Work = Octra_core.Exec_resource in
+  let module Wiring = Octra_node_runtime.Consensus_driver_wiring in
+  let first = tx 1 in
+  let second = { (tx 1) with Transaction.from = "oct_other" } in
+  List.iter (fun cause ->
+    List.iter (fun failed ->
+      let inputs = Transaction.consensus_order [first; second] in
+      let deps, probe = make_proposal_deps ~staging:inputs () in
+      let previews = ref 0 in
+      let deps = {deps with C.preview = (fun request ->
+        incr previews;
+        Wiring.preview_with_optional_catch ~catch_exn:true ~warn:ignore (fun () ->
+          match List.find_opt (fun tx -> List.mem tx failed) request.C.txs with
+          | Some tx -> Work.run ~hash:(Transaction.hash tx) (fun () -> Lwt.fail cause)
+          | None -> deps.preview request))} in
+      expect "resource failure stops proposal" (Option.is_some (run_make_proposal deps));
+      expect "resource retries differ" (!previews = List.length failed + 1);
+      expect "resource failure changes staging" (deps.staging_txs () = inputs);
+      match !(probe.stored_bundles) with
+      | [_, _, confirmed, receipts] ->
+        expect "resource failure changes retained input"
+          (confirmed = List.filter (fun tx -> not (List.mem tx failed)) inputs);
+        let outcome = Octra_core.Tx_outcome.decode ~confirmed receipts |> Result.get_ok in
+        expect "resource failure becomes consensus rejection" (outcome.rejections = []);
+        expect "resource failure publishes extra proposal"
+          (List.length !(probe.frozen_writes) = 1)
+      | _ -> fail "resource proposal missing")
+      [[first]; [second]; [first; second]]) [Out_of_memory; Stack_overflow];
+  let deps, probe = make_proposal_deps ~staging:[first] () in
+  let deps = {deps with C.preview = (fun _ -> Lwt.fail (Work.Exhausted ("unknown", Work.Memory)))} in
+  expect "unknown resource identity accepted" (run_make_proposal deps = None);
+  expect "unknown resource identity published" (!(probe.stored_bundles) = []);
+  let raised = try
+    ignore (Lwt_main.run (Work.run ~hash:"tx" (fun () -> Lwt.fail Exit))); false
+    with Exit -> true in
+  expect "unrelated failure reinterpreted" raised
 
 let test_make_preview_error_defer () =
   let deps, probe =
@@ -1631,7 +1780,7 @@ let test_preview_output_reject_retry () =
   let rejections =
     match
       Octra_core.Tx_outcome.build
-        ~candidates:[confirmed; rejected]
+        ~inputs:[confirmed; rejected]
         [rejected, "bad", "rejected"]
     with
     | Ok value -> value
@@ -2041,7 +2190,7 @@ let proposal_outcome ~accepted ~rejected ~reason =
   let rejections =
     match
       Octra_core.Tx_outcome.build
-        ~candidates:[accepted; rejected]
+        ~inputs:[accepted; rejected]
         [rejected, "program_exec_failed", reason]
     with
     | Ok value -> value
@@ -2357,7 +2506,7 @@ let test_empty_header_next_txid () =
       ~parent_commit_hash:Octra_net.Hash_domain.nil_hash
       ~ts:99.0
   in
-  expect "empty fallback txid hi" (h.C_types.txid_hi = 9L)
+  expect "empty default txid hi" (h.C_types.txid_hi = 9L)
 
 let test_build_proposal_envelope () =
   let final_txs = [tx 1; tx 2] in
@@ -2708,12 +2857,12 @@ let test_before_precommit_active_set () =
   let validator_set, proposal_id, proposal_wire, vote_wire =
     reproposal_precommit_wires ()
   in
-  let stale =
+  let superseded_set =
     C_types.make_validator_set [
       C_types.{ address = "oct_other"; pubkey = String.make 32 '\x03' };
     ]
   in
-  let active = ref stale in
+  let active = ref superseded_set in
   let deps, _, unsynced, pending =
     before_precommit_deps
       ~cached:([], [], [])
@@ -2737,7 +2886,7 @@ let test_before_precommit_active_set () =
       ~proposal_wire
       ~vote_wire
   in
-  expect "stale validator set refused" (not (run ()));
+  expect "superseded validator set refused" (not (run ()));
   active := validator_set;
   expect "active validator set accepted" (run ());
   expect "dynamic validator set unsynced once" (!unsynced = 1);
@@ -2865,10 +3014,11 @@ let () =
   test_cache_result_parity ();
   test_reject_forged_heavy_receipt ();
   test_preverify_cap_skip_sample ();
+  test_private_slot_preview ();
   test_layera_validator_addrs ();
   test_layera_diag_context ();
   test_layera_env_diag_context ();
-  test_validator_pubkeys_fallback ();
+  test_validator_pubkeys_local ();
   test_preview_exec_env ();
   test_admission_plan ();
   test_admission_proceed ();
@@ -2880,10 +3030,14 @@ let () =
   test_build_head_progress ();
   test_make_reuse_frozen_bundle ();
   test_make_preview_rejections ();
+  test_private_apply_slot ();
+  test_private_refill_cap ();
+  test_private_refill_steps ();
   test_make_rejection_only ();
   test_make_keep_partition ();
   test_make_dependency_chain ();
   test_make_preview_error_defer ();
+  test_preview_resources ();
   test_make_partition_error_defer ();
   test_verify_bundle_success ();
   test_verify_bundle_missing_txs ();
@@ -2948,4 +3102,4 @@ let () =
   test_before_precommit_missing ();
   test_precommit_wrong_validator ();
   test_precommit_write_failure ();
-  print_endline "status = pass test = node_runtime_consensus_proposal"
+  print_endline "status = pass test = proposal"

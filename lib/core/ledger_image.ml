@@ -396,7 +396,7 @@ let build ~free source stage expected_root =
   if Int64.compare available needed < 0 then
     Lwt.return_error
       (Printf.sprintf
-         "ledger restore space is insufficient: need=%Ld available=%Ld"
+         "ledger restore space is insufficient: need = %Ld available = %Ld"
          needed
          available)
   else

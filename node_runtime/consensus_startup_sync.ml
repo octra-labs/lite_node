@@ -80,6 +80,8 @@ let apply_callbacks ~now (apply : apply_finalized) =
     replay = (fun replay ->
       apply
         ~override_ordered_txs:replay.Consensus_replay.txs
+        ~override_receipts_json:replay.receipts_json
+        ~override_epoch_ts:replay.header.ts
         ?override_proposer_info:replay.proposer_info
         ?override_parent_commit:replay.finalize.parent_commit
         ~now:(now ())

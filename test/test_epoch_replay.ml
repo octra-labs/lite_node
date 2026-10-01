@@ -29,7 +29,7 @@ let tx nonce = T.{
 
 let first = String.make 128 'a'
 let next = String.make 128 'b'
-let candidate_root = String.make 128 'c'
+let input_root = String.make 128 'c'
 let confirmed = tx 1
 let rejected = tx 2
 let proof tx =
@@ -62,6 +62,7 @@ let prepare txs rejections =
     "prev_state_root", `String previous;
     "proposed_state_root", `String next_root;
   ]) in
+  let receipts_json = O.encode (W.json_of_receipts (List.map proof txs)) rejections in
   let record = J.{
     epoch_id = 1L;
     prev_state_root = previous;
@@ -69,7 +70,7 @@ let prepare txs rejections =
     tx_list_hash = "";
     tx_hashes = R.hashes txs;
     txs_json = List.map (fun tx -> Yojson.Safe.to_string (T.to_yojson tx)) txs;
-    receipts_json = O.encode (W.json_of_receipts (List.map proof txs)) rejections;
+    receipts_json;
     receipt_root = "";
     epoch_ts = 1.;
     creator_addr = "octProposer";
@@ -80,7 +81,7 @@ let prepare txs rejections =
       reward_members = [];
     };
     finality = Octra_consensus.C_codec.{
-      finalize = (H.build_plan ~parent_commit:None ~header ~commit_round:0
+      finalize = (H.build_plan ~parent_commit:None ~header ~commit_round:0 ~receipts_json
         ~txs).finalize;
       validator_set = C.make_validator_set [];
     };
@@ -109,14 +110,14 @@ let result ~txs ~root ~rejections ~fees = X.{
 
 let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
   let prepared = prepare txs rejections in
-  let candidates = R.get (O.merge ~confirmed:txs ~rejections) in
+  let inputs = R.get (O.merge ~confirmed:txs ~rejections) in
   let head = ref first in
   let previews = ref 0 in
   let writes = ref 0 in
   let deps = R.{
     head = (fun () -> Lwt.return !head);
     preverify = (fun txs ->
-      expect "preverify candidates" (R.hashes txs = R.hashes candidates);
+      expect "preverify inputs" (R.hashes txs = R.hashes inputs);
       if fault = "prewrite" then head := next;
       let ready = List.map (fun (tx : T.t) ->
         let item_receipt =
@@ -131,18 +132,18 @@ let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
       Lwt.return W.{ ready; skipped = [] });
     preview = (fun gate scope ->
       incr previews;
-      let candidate = !previews = 1 in
+      let input_scope = !previews = 1 in
       expect "preview transaction scope"
-        (R.hashes scope = R.hashes (if candidate then candidates else txs));
+        (R.hashes scope = R.hashes (if input_scope then inputs else txs));
       expect "preview receipt scope"
         (List.map (fun receipt -> receipt.Octra_core.Preverify_receipt.tx_hash)
           gate.R.G.receipts = R.hashes scope);
-      if (candidate && fault = "candidate_write") ||
-         (not candidate && fault = "confirmed_write") then head := next;
-      let root = if candidate then candidate_root else next in
-      let root = if not candidate && fault = "preview_root" then first else root in
+      if (input_scope && fault = "input_write") ||
+         (not input_scope && fault = "confirmed_write") then head := next;
+      let root = if input_scope then input_root else next in
+      let root = if not input_scope && fault = "preview_root" then first else root in
       let rejections =
-        if candidate then List.map (fun (item : O.rejection) -> X.{
+        if input_scope then List.map (fun (item : O.rejection) -> X.{
           tx = item.tx;
           error_type = item.error_type;
           reason = (if fault = "reason" then "different" else item.reason);
@@ -256,7 +257,7 @@ let () =
     | Ok trace, 1 -> trace
     | _ -> failwith "replay legitimate control failed"
   in
-  expect "confirmed root, not candidate root" (trace.R.ledger_root = next);
+  expect "confirmed root, not input root" (trace.R.ledger_root = next);
   expect "ordered rejection retained" (trace.rejections = [O.encode_rejection rejection]);
   let faults = [
     "next_cursor", "replay next cursor differs", 0;
@@ -264,9 +265,9 @@ let () =
     "txid", "replay finalized transaction cursor differs", 0;
     "receipt_missing", "missing_receipt:" ^ T.hash rejected, 0;
     "receipt_changed", "replay preverify receipts differ", 0;
-    "skip", "replay preverify omitted a candidate", 0;
+    "skip", "replay preverify omitted an input transaction", 0;
     "prewrite", "replay preview changed the starting state", 0;
-    "candidate_write", "replay preview changed the starting state", 0;
+    "input_write", "replay preview changed the starting state", 0;
     "reason", "preview_rejection_mismatch", 0;
     "position", "replay confirmed position differs", 0;
     "count", "replay execution count differs", 0;
@@ -288,9 +289,9 @@ let () =
   expect "different fees" (not (R.equal trace { trace with fees = Z.zero }));
   expect "different rejections" (not (R.equal trace { trace with rejections = [] }));
   expect "different roots" (not (R.equal trace { trace with ledger_root = first }));
-  expect "different candidate fees"
+  expect "different input fees"
     (not (R.equal trace { trace with candidate_fees = Z.zero }));
-  expect "different candidate roots"
+  expect "different input roots"
     (not (R.equal trace { trace with candidate_root = first }));
   begin match execute ~txs:[] ~rejections:[] "" with
   | Ok empty, 1 -> expect "empty epoch" (empty.confirmed = [] && empty.rejections = [])

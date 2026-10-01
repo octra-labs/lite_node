@@ -26,8 +26,18 @@ let finish outcome value =
   | Some _ ->
     Lwt.fail_with "vm transition completed more than once"
 
+exception Policy_unavailable of string
+
+let float_mode backend env =
+  match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
+  | Ok fold -> fold.wasm_float
+  | Error reason -> raise (Policy_unavailable reason)
+
 let context ~program_trust ~object_cost backend env
     (tx : Transaction.t) effects tx_hash =
+  let fhe_work, wasm_float = match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
+    | Ok fold -> fold.fhe_work, fold.wasm_float
+    | Error reason -> raise (Policy_unavailable reason) in
   Vm.make_live_contract_ctx
     {
       value_journal = Tx_effects.value effects;
@@ -36,6 +46,8 @@ let context ~program_trust ~object_cost backend env
       store = backend.Epoch_exec.store;
       get_fhe_pubkey = Vm.live_fhe_pubkey backend.store;
       proof_mode = backend.proof_mode;
+      fhe_work;
+      wasm_float;
       math = backend.math;
       object_cost;
       current_epoch = env.Epoch_exec.epoch_id;
@@ -192,9 +204,10 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         deploy_and_save ~admitted ~params ~bytecode ~bytecode_raw);
       program_prepare = (fun current ->
         match backend.fold env.Epoch_exec.epoch_id with
-        | Error reason -> Lwt.return_error reason
+        | Error reason -> Lwt.fail (Policy_unavailable reason)
         | Ok fold ->
           Vm.prepare_program_package
+            ~preview:fold.fhe_work
             ~overlap:fold.program_overlap
             ~program_mode:fold.program_mode
             ~point_ops:(backend.proof_mode = Rule_graph.Active)
@@ -258,6 +271,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
       circle_commit = (fun current result ->
         Circle_exec.commit_call_result
           ~deployment_profile:(wasm_admission_profile wasm_compute_mode)
+          ~float_mode:(float_mode backend env)
           ~proof_mode:backend.proof_mode
           backend.store
           current.to_
@@ -335,6 +349,8 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         match error with
         | Stack_overflow
         | Out_of_memory
+        | Octra_core.Exec_resource.Unavailable _
+        | Policy_unavailable _
         | Circle_receipt_mismatch _
         | Circle_exec.Execution_unavailable _ -> Lwt.fail error
         | _ when hfhe_mode = Transcript.Capture -> Lwt.fail error
@@ -502,6 +518,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
         let* result =
           Epoch_exec.process_circle_deploy_tx
             ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
+            ~float_mode:(float_mode backend env)
             ~backend
             tx in
         Lwt.return
@@ -523,6 +540,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
         let* result =
           Epoch_exec.process_circle_program_update_tx
             ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
+            ~float_mode:(float_mode backend env)
             ~backend
             tx in
         Lwt.return

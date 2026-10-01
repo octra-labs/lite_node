@@ -12,6 +12,7 @@ type plan = {
   finalize : C_types.finalize;
   txs : Transaction.t list;
   tx_hashes : string list;
+  receipts_json : string list;
   epoch : int;
   proposer_info : Octra_core.Epochlog.proposer_info option;
   expected_root : string option;
@@ -154,16 +155,31 @@ let finalize (header : C_types.epoch_header) commit_round parent_commit =
     parent_commit;
   }
 
-let build_plan ~parent_commit ~(header : C_types.epoch_header) ~commit_round ~txs =
+let build_plan ~parent_commit ~(header : C_types.epoch_header) ~commit_round ~receipts_json ~txs =
+  if header.epoch_id < 0L || header.epoch_id >= Int64.of_int max_int then
+    failwith "replay epoch is out of range";
   let expected_parent_hash = C_hash.parent_commit_hash_opt parent_commit in
   if header.parent_commit_hash <> expected_parent_hash then
     failwith "replay parent commit hash mismatch";
+  let tx_hashes = List.map Transaction.hash txs in
+  begin match Octra_core.Rule_graph.tx_envelope_at
+                ~chain_id:header.chain_id ~epoch:header.epoch_id with
+  | Octra_core.Rule_graph.Prior -> ()
+  | Octra_core.Rule_graph.Active ->
+    let response = Octra_consensus.C_driver.{responder_addr = "replay";
+      tx_hashes; txs_json = List.map (fun tx -> Transaction.to_yojson tx |> Yojson.Safe.to_string) txs;
+      receipts_json} in
+    match Consensus_bundle_validation.finalized ~header response with
+    | Ok _ -> ()
+    | Error reason -> failwith ("replay bundle: " ^ reason)
+  end;
   {
     header;
     commit_round;
     finalize = finalize header commit_round parent_commit;
     txs;
-    tx_hashes = List.map Transaction.hash txs;
+    tx_hashes;
+    receipts_json;
     epoch = Int64.to_int header.C_types.epoch_id;
     proposer_info = proposer_info header commit_round;
     expected_root = expected_root header;
@@ -177,12 +193,20 @@ let load_plan ~default_chain_id ~header_path ~bundle_path =
       header_json
   in
   let parent_commit = parse_parent_commit header_json in
+  if Octra_core.Rule_graph.tx_envelope_at ~chain_id:default_chain_id ~epoch:header.epoch_id
+     = Octra_core.Rule_graph.Active && header.chain_id <> default_chain_id then
+    failwith "replay chain mismatch";
+  let receipts_json =
+    match Yojson.Safe.Util.member "receipts_json" header_json with
+    | `Null -> []
+    | `List entries -> List.map Yojson.Safe.Util.to_string entries
+    | _ -> failwith "replay receipts must be a JSON string list" in
   let txs =
     match bundle_path with
     | None -> []
     | Some path -> parse_bundle (Yojson.Safe.from_file path)
   in
-  build_plan ~parent_commit ~header ~commit_round ~txs
+  build_plan ~parent_commit ~header ~commit_round ~receipts_json ~txs
 
 type one_shot_deps = {
   current_epoch : unit -> int;

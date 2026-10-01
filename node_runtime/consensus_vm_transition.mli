@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+exception Policy_unavailable of string
+
 val preverify_circle :
   circle_mode:Octra_core.Rule_graph.mode ->
   wasm_compute_mode:Octra_core.Rule_graph.mode ->

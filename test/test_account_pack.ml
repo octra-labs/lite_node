@@ -224,4 +224,4 @@ let () =
   test_text_account ();
   test_hfhe_account ();
   test_store_layout ();
-  Printf.printf "account_pack tests passed\n%!"
+  Printf.printf "status = pass test = account_pack\n%!"

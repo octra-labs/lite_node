@@ -78,7 +78,13 @@ let expire_duty ?sender runtime () =
     notify_staging_update ()
   end
 
+let prepare_tx ledger tx =
+  Octra_core.Tx_envelope.normalize
+    ~sender_pk:(Tx_sender_key.resolve ~find_account:(Ledger.find_opt ledger) tx) tx
+
 let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
+  let ( let* ) = Result.bind in
+  let* tx = prepare_tx ledger tx |> Result.map_error snd in
   let point = runtime.duty_head () in
   let head = Option.map fst point in
   let mode = Option.fold ~none:Octra_core.Rule_graph.Prior ~some:snd point in
@@ -214,6 +220,8 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
   | Error e -> Error e
   | Ok () ->
     let acc = Ledger.find ledger tx.from in
+    let ( let* ) = Result.bind in
+    let* tx = prepare_tx ledger tx in
     match Tx_view.submit_signature_admission
             ~account_public_key:acc.Ledger.public_key
             ~preverify_has_capacity:(Preverify_cache.has_capacity ())

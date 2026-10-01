@@ -44,7 +44,7 @@ type epoch_tag_deps = {
 }
 
 let state_root_mismatch_error error =
-  String.length error >= 16 && String.sub error 0 16 = "STATE ROOT MISMA"
+  String.starts_with ~prefix:Octra_core.Store_irmin.root_fault_prefix error
 
 let recoverable_state_root_mismatch r =
   List.for_all state_root_mismatch_error r.Octra_core.Store_irmin.errors
@@ -93,14 +93,14 @@ let log_integrity_ok r =
 
 let log_integrity_fatal r =
   Octra_log.fatal "init"
-    "INTEGRITY CHECK FAILED state_root = %s accounts = %d/%d"
+    "event = integrity_failed state_root = %s accounts = %d/%d"
     r.Octra_core.Store_irmin.head_hash
     r.accounts_ok
     r.accounts_sampled;
   List.iter
-    (fun e -> Octra_log.fatal "init" "  error: %s" e)
+    (fun e -> Octra_log.fatal "init" "event = integrity_error reason = %S" e)
     r.errors;
-  Octra_log.fatal "init" "REFUSING TO START - data store may be corrupted"
+  Octra_log.fatal "init" "event = startup_refused reason = store_integrity"
 
 let verify_store deps =
   let result = deps.verify_integrity () in
@@ -200,3 +200,15 @@ let run_epoch_tags deps =
 
 let irmin_path data_dir =
   data_dir ^ "/irmin_store"
+
+let open_stores ?(lock_wait = 0.) data_dir =
+  let chaindata = Octra_core.Store_chaindata.open_chaindata ~lock_wait
+    (Filename.concat data_dir "chaindata") in
+  match Lwt_main.run (Octra_core.Store_irmin.open_store (irmin_path data_dir)) with
+  | store -> chaindata, store
+  | exception error ->
+    let trace = Printexc.get_raw_backtrace () in
+    (try Octra_core.Store_chaindata.close chaindata with close_error ->
+      Octra_log.warn "init" "event = store_close error = %S"
+        (Printexc.to_string close_error));
+    Printexc.raise_with_backtrace error trace

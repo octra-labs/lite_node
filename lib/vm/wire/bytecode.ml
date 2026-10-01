@@ -156,7 +156,7 @@ let name_head = function
   | 'a' .. 'z' | 'A' .. 'Z' | '_' -> true
   | _ -> false
 
-let name_tail value =
+let name_remainder value =
   name_head value || (value >= '0' && value <= '9')
 
 let state_name name =
@@ -164,7 +164,7 @@ let state_name name =
   size > 0
   && size <= 65_535
   && name_head name.[0]
-  && String.for_all name_tail name
+  && String.for_all name_remainder name
 
 let state_rows rows =
   let rows = List.sort (fun (left, _) (right, _) -> String.compare left right) rows in

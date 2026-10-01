@@ -28,8 +28,8 @@ let slot id mul live = { id; mul; live }
 let rec same_bits left right =
   match left, right with
   | [], [] -> true
-  | lhead :: ltail, rhead :: rtail when Bool.equal lhead rhead ->
-    same_bits ltail rtail
+  | lhead :: lremainder, rhead :: rremainder when Bool.equal lhead rhead ->
+    same_bits lremainder rremainder
   | _ -> false
 
 let equal left right =

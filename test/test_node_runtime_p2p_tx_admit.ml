@@ -89,7 +89,7 @@ let test_rejects_invalid_address () =
     (String.equal
        padded
        "oct1zHDhuhZ9kBpPku5KstyRbZ7t54ZTk6xNz15dwQyHZAK");
-  assert_true "padded address has canonical width" (String.length padded = 47);
+  assert_true "padded address has fixed width" (String.length padded = 47);
   let malformed =
     tx ~from ~to_:"bad" ~timestamp:1000.0 ~op_type:Octra_core.Transaction.Standard
     |> signed ~priv
@@ -102,7 +102,7 @@ let test_rejects_invalid_address () =
        ~sender_pk:(Some pub)
        malformed);
   let recipient, _, _ = key () in
-  assert_true "derived address has canonical width" (String.length recipient = 47);
+  assert_true "derived address has fixed width" (String.length recipient = 47);
   let short = String.sub recipient 0 46 in
   let long = recipient ^ "1" in
   assert_true "short address rejected"
@@ -294,7 +294,7 @@ let test_program_package_shape () =
        ~sender_pk:(Some pub)
        (program "invalid"));
   assert_verdict
-    "canonical Program package accepted"
+    "compiled Program package accepted"
     Octra_node_runtime.P2p_tx_admit.Accept
     (Octra_node_runtime.P2p_tx_admit.admit
        ~now:1001.0
@@ -400,4 +400,4 @@ let () =
   test_signature_before_payload ();
   test_program_package_shape ();
   test_duty_retry ();
-  print_endline "node runtime p2p tx admit tests passed"
+  print_endline "status = pass test = p2p_tx_accept"

@@ -102,6 +102,8 @@ let run_stashed_plan deps validator_set finalize (header : C_types.epoch_header)
 
 let handle deps ~validator_set finalize =
   let header : C_types.epoch_header = finalize.C_types.header in
+  if header.epoch_id < 0L || header.epoch_id >= Int64.of_int max_int then
+    failwith "finalized epoch is out of range";
   let header_epoch = Int64.to_int header.C_types.epoch_id in
   record_finalized deps validator_set finalize header header_epoch;
   let head = deps.committed_head_epoch () in

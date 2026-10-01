@@ -10,6 +10,7 @@
 #include <vector>
 #include <array>
 #include <stdexcept>
+#include <new>
 
 namespace pvac {
 namespace compress {
@@ -31,7 +32,7 @@ struct AdaptiveState {
 
     AdaptiveState(int n = 256) : n_states(n), prev(0) {
         ctx = (uint32_t*)calloc(n_states, sizeof(uint32_t));
-        if (!ctx) throw std::runtime_error("pvac_compress: alloc failed");
+        if (!ctx) throw std::bad_alloc();
         for (int i = 0; i < n_states; ++i) {
             uint32_t w = (i & 1) * 2 + (i & 2) + (i >> 2 & 1) + (i >> 3 & 1)
                        + (i >> 4 & 1) + (i >> 5 & 1) + (i >> 6 & 1) + (i >> 7 & 1) + 3;

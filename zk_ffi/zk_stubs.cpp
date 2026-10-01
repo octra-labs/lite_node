@@ -23,13 +23,30 @@ constexpr size_t SCRATCH_SIZE = 128;
 
 constexpr int IO_BE = MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN;
 
+bool check_field() {
+    char order[128] = {0};
+    mclBn_getCurveOrder(order, sizeof(order));
+    if (strcmp(order, "21888242871839275222246405745257275088548364400416034343698204186575808495617") != 0)
+        return false;
+    memset(order, 0, sizeof(order));
+    mclBn_getFieldOrder(order, sizeof(order));
+    if (strcmp(order, "21888242871839275222246405745257275088696311157297823662689037894645226208583") != 0)
+        return false;
+    mclBnFp left, right, product, expected;
+    mclBnFp_setInt32(&left, 2);
+    mclBnFp_setInt32(&right, 3);
+    mclBnFp_setInt32(&expected, 6);
+    mclBnFp_mul(&product, &left, &right);
+    return mclBnFp_isEqual(&product, &expected) != 0;
+}
+
 bool ensure_init() {
     static const bool init_ok = [] {
         int ret = mclBn_init(MCL_BN_SNARK1, MCLBN_COMPILED_TIME_VAR);
         if (ret == 0) {
             mclBn_verifyOrderG1(1);
             mclBn_verifyOrderG2(1);
-            return true;
+            return check_field();
         }
         return false;
     }();
@@ -145,7 +162,6 @@ bool groth16_verify_bn254_impl(
     const uint8_t* vk_bytes, size_t vk_len,
     const uint8_t* proof_bytes, size_t proof_len,
     const uint8_t* inputs_bytes, size_t inputs_len) {
-    if (!ensure_init()) return false;
 
     ParsedVK vk;
     if (!parse_vk(vk_bytes, vk_len, vk)) return false;
@@ -203,8 +219,15 @@ bool groth16_verify_bn254_impl(
 
 extern "C" {
 
+CAMLprim value caml_zk_initialize(value unit) {
+    CAMLparam1(unit);
+    if (!ensure_init()) caml_failwith("mcl initialization failed");
+    CAMLreturn(Val_unit);
+}
+
 CAMLprim value caml_zk_groth16_verify_bn254(value vk_v, value proof_v, value inputs_v) {
     CAMLparam3(vk_v, proof_v, inputs_v);
+    if (!ensure_init()) caml_failwith("mcl initialization failed");
     const uint8_t* vk_p = (const uint8_t*)Bytes_val(vk_v);
     size_t vk_len = caml_string_length(vk_v);
     const uint8_t* pf_p = (const uint8_t*)Bytes_val(proof_v);

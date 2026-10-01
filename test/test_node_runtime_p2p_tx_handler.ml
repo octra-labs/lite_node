@@ -200,11 +200,11 @@ let test_signature_identity () =
   let next = { tx with public_key = Some pub } in
   assert_true "public key changes transaction hash" (Octra_core.Transaction.hash next <> hash);
   Octra_node_runtime.P2p_tx_handler.handle_tx io next;
-  assert_true "public key belongs to cache key" (!calls = 2);
+  assert_true "equivalent public key shares queue identity" (!calls = 1);
   let raised = { tx with ou = Z.mul tx.ou (Z.of_int 2) } |> signed ~priv in
   assert_true "fee changes transaction hash" (Octra_core.Transaction.hash raised <> hash);
   Octra_node_runtime.P2p_tx_handler.handle_tx io raised;
-  assert_true "fee belongs to cache key" (!calls = 3)
+  assert_true "signed fee change has another queue identity" (!calls = 2)
 
 let test_inv_repeat () =
   let module Gossip = Octra_net.P2p_tx_gossip in
@@ -307,4 +307,4 @@ let () =
   test_signature_identity ();
   test_inv_repeat ();
   test_duty_wire_retry ();
-  print_endline "node runtime p2p tx handler tests passed"
+  print_endline "status = pass test = p2p_tx_handler"

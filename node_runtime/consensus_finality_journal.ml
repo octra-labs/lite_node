@@ -411,7 +411,25 @@ let persist_certificate base ~validator_set finalize =
   | Some _ ->
     refuse base "conflicting finality journal certificate" finalize
 
+let validate_bundle finalize bundle =
+  let response : Octra_consensus.C_driver.bundle_response_record = {
+    responder_addr = "finality_journal";
+    tx_hashes = bundle.tx_hashes;
+    txs_json =
+      List.map
+        (fun tx -> Yojson.Safe.to_string (Transaction.to_yojson tx))
+        bundle.txs;
+    receipts_json = bundle.receipts_json;
+  } in
+  match Bundle_validation.finalized ~header:finalize.C_types.header response with
+  | Ok _ -> Ok ()
+  | Error reason -> Error reason
+
 let persist_bundle base finalize bundle =
+  begin match validate_bundle finalize bundle with
+  | Ok () -> ()
+  | Error reason -> failwith reason
+  end;
   match read_record (path base) with
   | None ->
     failwith "finality journal bundle requires certificate"
@@ -441,20 +459,6 @@ let validate_qc ~chain_id ~validator_set finalize =
   match verdict with
   | C_qc.Valid -> Ok ()
   | C_qc.Invalid reason -> Error ("finality qc " ^ reason)
-
-let validate_bundle finalize bundle =
-  let response : Octra_consensus.C_driver.bundle_response_record = {
-    responder_addr = "finality_journal";
-    tx_hashes = bundle.tx_hashes;
-    txs_json =
-      List.map
-        (fun tx -> Yojson.Safe.to_string (Transaction.to_yojson tx))
-        bundle.txs;
-    receipts_json = bundle.receipts_json;
-  } in
-  match Bundle_validation.finalized ~header:finalize.C_types.header response with
-  | Ok _ -> Ok ()
-  | Error reason -> Error reason
 
 let validate_record ~chain_id record =
   match validate_qc ~chain_id ~validator_set:record.validator_set record.finalize with
@@ -1204,11 +1208,11 @@ let prepare base ~chain_id ~validator_set finalize =
   selected.finalize
 
 let stage base ~chain_id ~validator_set ~bundle finalize =
-  let selected = prepare base ~chain_id ~validator_set finalize in
-  begin match validate_bundle selected bundle with
+  begin match validate_bundle finalize bundle with
   | Ok () -> ()
   | Error reason -> failwith reason
   end;
+  let selected = prepare base ~chain_id ~validator_set finalize in
   persist_bundle base selected bundle;
   selected
 

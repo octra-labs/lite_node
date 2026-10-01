@@ -15,6 +15,11 @@ use wasmi::{
 };
 
 mod deterministic_tensor;
+mod float_ops;
+#[cfg(test)]
+mod float_cases;
+mod native_bytes;
+use native_bytes::write_owned_bytes;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SPAWN_PAYLOAD_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -226,6 +231,7 @@ struct Payload {
     hfhe_active_key: Option<HfheActiveKey>,
     hfhe_strict: Option<bool>,
     math: Option<bool>,
+    float_mode: Option<bool>,
     hfhe_receipt_mode: Option<String>,
     hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
     public_reads: Option<Vec<PublicReadJson>>,
@@ -690,7 +696,7 @@ pub extern "C" fn octra_circle_wasm_host_free_bytes(ptr: *mut u8, len: usize) {
         return;
     }
     unsafe {
-        drop(Vec::from_raw_parts(ptr, len, len));
+        native_bytes::free_bytes(ptr, len);
     }
 }
 
@@ -698,7 +704,11 @@ fn run_json(input_ptr: *const u8, input_len: usize) -> Result<String, String> {
     if input_ptr.is_null() && input_len != 0 {
         return Err("octra_circle_wasm_host: null input".to_owned());
     }
-    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let input = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input_ptr, input_len) }
+    };
     let input_text = std::str::from_utf8(input)
         .map_err(|e| format!("octra_circle_wasm_host: invalid utf8 input: {e}"))?;
     let payload: Payload = serde_json::from_str(input_text)
@@ -1160,10 +1170,15 @@ impl Runtime {
                 format!("{:x}", hasher.finalize())
             }
         };
+        let cache_key = if payload.float_mode.unwrap_or(false) {
+            format!("float_bits:{module_key}")
+        } else {
+            format!("float_prior:{module_key}")
+        };
         let (module, exports, has_update_disabled_imports, has_compute_imports) = {
             let mut guard = cache_guard(module_cache());
             prune_module_cache_locked(&mut guard);
-            if let Some(entry) = guard.get_mut(&module_key) {
+            if let Some(entry) = guard.get_mut(&cache_key) {
                 entry.updated_at = now_secs();
                 (
                     entry.module.clone(),
@@ -1175,6 +1190,11 @@ impl Runtime {
                 let code_b64 = code_b64_opt
                     .ok_or_else(|| format!("missing wasm module cache: {module_key}"))?;
                 let wasm_bytes = decode_b64("code_b64", code_b64)?;
+                let wasm_bytes = if payload.float_mode.unwrap_or(false) {
+                    float_ops::prepare(shared_engine(), &wasm_bytes)?
+                } else {
+                    wasm_bytes
+                };
                 let module = Arc::new(
                     Module::new(shared_engine(), &mut &wasm_bytes[..])
                         .map_err(|e| format!("wasm compile failed: {e}"))?,
@@ -1189,7 +1209,7 @@ impl Runtime {
                     .imports()
                     .any(|entry| COMPUTE_IMPORTS.contains(&entry.name()));
                 guard.insert(
-                    module_key.clone(),
+                    cache_key,
                     ModuleCacheEntry {
                         module: module.clone(),
                         exports: exports.clone(),
@@ -6509,27 +6529,33 @@ fn read_utf8(raw: &[u8], offset: &mut usize, len: usize) -> Result<String, Strin
     String::from_utf8(bytes.to_vec()).map_err(|_| "invalid utf8".to_owned())
 }
 
-unsafe fn write_owned_bytes(bytes: Vec<u8>, ptr_out: *mut *mut u8, len_out: *mut usize) {
-    let mut bytes = bytes;
-    let len = bytes.len();
-    let ptr = if len == 0 {
-        std::ptr::null_mut()
-    } else {
-        let ptr = bytes.as_mut_ptr();
-        std::mem::forget(bytes);
-        ptr
-    };
-    if !ptr_out.is_null() {
-        *ptr_out = ptr;
-    }
-    if !len_out.is_null() {
-        *len_out = len;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_input() {
+        for (input, size) in [
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 1),
+            (b"".as_ptr(), 0),
+            (b"{}".as_ptr(), 2),
+        ] {
+            let mut output = std::ptr::null_mut();
+            let mut output_size = 0;
+            let mut error = std::ptr::null_mut();
+            let mut error_size = 0;
+            let status = octra_circle_wasm_host_run_json(
+                input, size, &mut output, &mut output_size, &mut error, &mut error_size,
+            );
+            assert_eq!(status, 1);
+            assert!(output.is_null());
+            assert_eq!(output_size, 0);
+            assert!(!error.is_null());
+            assert!(error_size > 0);
+            octra_circle_wasm_host_free_bytes(error, error_size);
+        }
+    }
 
     #[test]
     fn execution_mode_is_explicit() {
@@ -6619,7 +6645,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_profile_has_deterministic_standard_budget() {
+    fn manifest_budget() {
         assert_eq!(
             ExecutionProfile::Manifest.fuel(Some(COMPUTE_MAX_FUEL_LIMIT)),
             MAX_FUEL_LIMIT
@@ -6632,7 +6658,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_failure_modes_preserve_exports() {
+    fn manifest_export_failures() {
         let cases = [
             manifest_module(&[0x00, 0x00, 0x0b]),
             manifest_module(&[0x00, 0x41, 0x00, 0x0b]),
@@ -6648,7 +6674,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_input_rejects_invalid_shapes() {
+    fn receipt_input_shapes() {
         let valid = entry("fhe_verify_zero", 1, 2, Some(true));
         assert!(validate_hfhe_receipt_input("consume", &[valid.clone()]).is_ok());
         assert!(validate_hfhe_receipt_input("capture", &[valid.clone()]).is_err());
@@ -6663,7 +6689,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_request_binds_order_and_payload() {
+    fn receipt_request_identity() {
         let expected = entry("fhe_verify_zero", 1, 2, Some(true));
         assert!(
             match_hfhe_receipt_request(&expected, "fhe_verify_zero", &expected.request_hash)
@@ -6680,7 +6706,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_entry_binds_response_and_result() {
+    fn receipt_result_identity() {
         let expected = entry("fhe_verify_zero", 1, 2, Some(true));
         assert!(match_hfhe_receipt_entry(&expected, &expected).is_ok());
         assert!(
@@ -6694,7 +6720,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_domains_separate_strict_mode() {
+    fn receipt_mode_domains() {
         let prior = hfhe_receipt_entry(false, "fhe_verify_bound", &[1], &frame_bool(true))
             .expect("prior receipt failed");
         let active = hfhe_receipt_entry(true, "fhe_verify_bound", &[1], &frame_bool(true))
@@ -6711,7 +6737,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cache_replaces_roots_and_stays_bounded() {
+    fn storage_cache_root_limit() {
         let mut cache = HashMap::new();
         for index in 0..32 {
             let key = format!("oct{index:044}:root{index}");
@@ -6762,9 +6788,9 @@ mod tests {
     }
 
     #[test]
-    fn compute_invocation_preserves_live_sessions_and_prunes_expired_sessions() {
-        let live_key = "compute-session-regression-live".to_owned();
-        let expired_key = "compute-session-regression-expired".to_owned();
+    fn compute_session_expiry() {
+        let live_key = "compute-session-case-live".to_owned();
+        let expired_key = "compute-session-case-expired".to_owned();
         {
             let mut cache = cache_guard(session_cache());
             cache.insert(
@@ -6795,7 +6821,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_compute_cleanup_is_scoped_to_one_session() {
+    fn compute_session_cleanup() {
         let prefix = "circle|caller|session-a|";
         let scoped_key = format!("{prefix}meta");
         let other_key = "circle|caller|session-b|meta".to_owned();

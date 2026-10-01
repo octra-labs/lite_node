@@ -373,20 +373,25 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
   Octra_log.info "program" "event = deploy_start addr = %s deployer = %s size = %d hash = %s"
     addr (String.sub deployer 0 (min 12 (String.length deployer)))
     (String.length bytecode_raw) (String.sub hash 0 16);
-  let source_bound = Option.is_some admitted in
-  let admission_result =
+  let source_checked = Option.is_some admitted in
+  let checked =
     match admitted with
     | Some value ->
       Result.map (fun () -> value)
         (Admission.check_standard ~point_ops:ctx.point_ops value)
     | None -> Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw
   in
-  match admission_result with
+  match checked with
   | Error error ->
     (addr, { success = false; return_value = None; effort_used = 0;
              events = []; error = Some (Admission.error_message error); storage_writes = 0 })
 | Ok admitted ->
-  let admission = if source_bound then "source" else "binary" in
+  let admission = if source_checked then "source" else "binary" in
+  let version =
+    if source_checked then
+      Option.value (Admission.compiler_version admitted) ~default:Oct_compile.lang_version
+    else Oct_compile.lang_version
+  in
   let code = Admission.code admitted in
   let profile = Admission.profile admitted in
   let strict_values = strict_values profile in
@@ -432,6 +437,7 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
           owner = deployer;
           ctype;
           admission;
+          version;
           storage = storage_tbl;
         };
         Octra_log.info "program"
@@ -445,7 +451,7 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
         (addr, result)
       )
 
-let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(params = []) store ~deployer
+let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(limit = 1_000_000) ?(params = []) store ~deployer
     ~bytecode_raw ~nonce =
   match Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw with
   | Error (Admission.Decode_error error) -> Error (Printf.sprintf "bad bytecode: %s" error)
@@ -469,7 +475,8 @@ let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~dept
             "event = spawn_start addr = %s deployer = %s nonce = %d depth = %d"
             addr (String.sub deployer 0 (min 12 (String.length deployer))) nonce depth;
           let storage_tbl = Hashtbl.create 100 in
-          let state = Contract_vm.create_state ~ctx ~strict_values ~storage_kinds
+          let depth = if ctx.fhe_work = Octra_core.Rule_graph.Active then depth else 0 in
+          let state = Contract_vm.create_state ~ctx ~depth ~limit ~strict_values ~storage_kinds
             ~caller:deployer ~origin:deployer ~address:addr ~value:Z.zero
             ~storage:storage_tbl () in
           state.memory.data <- Hashtbl.create 1024;
@@ -486,6 +493,7 @@ let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~dept
               owner = deployer;
               ctype = "CUSTOM";
               admission = "binary";
+              version = Oct_compile.lang_version;
               storage = storage_tbl;
             };
             Octra_log.info "program"

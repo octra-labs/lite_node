@@ -69,7 +69,8 @@ let search ledger chaindata ~params =
       Rest_view.search_result_of_query
         ~pending_tx:(fun hash ->
           Option.map tx_display_fields (Staging.find_by_hash hash))
-        ~confirmed_tx:(History_read_rpc.confirmed_tx_epoch_with_heal chaindata)
+        ~confirmed_tx:(fun hash ->
+          Option.map fst (History_read_rpc.lookup_confirmed_tx chaindata hash))
         ~account:(fun addr ->
           Option.map
             (fun account -> account.Ledger.balance, account.Ledger.nonce)

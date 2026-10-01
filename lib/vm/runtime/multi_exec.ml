@@ -17,7 +17,7 @@ let run ~from_addr ~calls ~effort_limit ~balance ~exec =
   let rec go index trace = function
     | [] ->
       { trace; outcome = Ok () }
-    | call :: tail ->
+    | call :: remainder ->
       match Call_plan.plan_multi_exec_step
         ~from_addr
         ~call
@@ -55,7 +55,7 @@ let run ~from_addr ~calls ~effort_limit ~balance ~exec =
           ~events:receipt.Contract.events
           ~error:receipt.Contract.error
         with
-        | None -> go (index + 1) trace tail
+        | None -> go (index + 1) trace remainder
         | Some err -> { trace; outcome = Error err }
   in
   go 0 Receipt_view.empty_multi_exec_trace calls

@@ -2,7 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 let emission_divisor = Z.of_int 18_198_732
-let emission_tail = Z.of_int 10_000
+let emission_floor = Z.of_int 10_000
 let proposer_numerator = Z.of_int 7
 let proposer_denominator = Z.of_int 10
 
@@ -10,7 +10,7 @@ let compute_base ~emission_remaining =
   if Z.leq emission_remaining Z.zero then Z.zero
   else
     let raw = Z.div emission_remaining emission_divisor in
-    let reward = Z.max raw emission_tail in
+    let reward = Z.max raw emission_floor in
     Z.min reward emission_remaining
 
 let split total_reward =
@@ -27,7 +27,7 @@ let consensus_id =
   String.concat ":" [
     "reward";
     Z.to_string emission_divisor;
-    Z.to_string emission_tail;
+    Z.to_string emission_floor;
     Z.to_string proposer_numerator;
     Z.to_string proposer_denominator;
   ]

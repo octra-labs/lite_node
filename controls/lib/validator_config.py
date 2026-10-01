@@ -245,7 +245,6 @@ def install_runtime():
         "libev-dev",
         "libgmp-dev",
         "liblmdb-dev",
-        "libsqlite3-dev",
         "m4",
         "nodejs",
         "npm",
@@ -305,7 +304,7 @@ def rust_environment():
         "PATH": os.pathsep.join([cargo_bin, os.environ.get("PATH", "")]),
         "RUSTUP_HOME": str(RUSTUP_HOME),
     }
-    environment["T" + "MPDIR"] = str(BUILD_WORK)
+    environment["TMPDIR"] = str(BUILD_WORK)
     return environment
 
 def install_rust_toolchain():
@@ -1046,8 +1045,10 @@ def main():
     emit(event="validator_control", sha256=control_hash)
     emit(event="network", sha256=bundle_hash, chain=values["OCTRA_CHAIN_ID"])
     emit(
-        event="next",
-        command="./controls/run.sh" if state_ready(data_dir) else "restore_checkpoint",
+        event = "next",
+        script = str(ROOT / "controls" / ("run.sh" if state_ready(data_dir) else "recover.sh")),
+        config_env = "OCTRA_OPERATOR_CONFIG",
+        config = str(Path(args.config).resolve()),
     )
 
 if __name__ == "__main__":

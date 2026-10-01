@@ -23,7 +23,7 @@ let decode_commitment encoded =
     let value = Base64.decode_exn encoded |> Bytes.of_string in
     if Bytes.length value = 32 then Ok value
     else Error "commitment must be 32 bytes"
-  with _ ->
+  with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
     Error "invalid commitment"
 
 let decode_range_proof encoded =
@@ -41,7 +41,7 @@ let decode_range_proof encoded =
         |> Bytes.of_string
       in
       Ok raw
-    with _ ->
+    with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
       Error "invalid range proof"
 
 let verify_circle_proof
@@ -259,7 +259,7 @@ let rec execute ?(math = false) request =
                 Ok ()
               else
                 Error "bound range proof verification failed"
-          with _ ->
+          with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
             Error "invalid bound range proof"
         end
     end

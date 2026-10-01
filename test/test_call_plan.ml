@@ -464,4 +464,4 @@ let () =
   test_deploy_reject ();
   test_deploy_fee ();
   test_deploy_input ();
-  print_endline "test_call_plan: ok"
+  print_endline "status = pass test = call_plan"

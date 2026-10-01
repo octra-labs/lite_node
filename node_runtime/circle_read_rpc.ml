@@ -9,6 +9,9 @@ type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
 type 'handler dispatch_adapters = {
   store_read : (Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
+  program_read :
+    (float_mode:Octra_core.Rule_graph.mode ->
+     Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
   epoch_read :
     (Octra_core.Store_irmin.t ->
      Yojson.Safe.t ->
@@ -46,9 +49,10 @@ let option_result option ~not_found view =
   | None ->
     Error (Rpc.not_found not_found)
 
-let program_descriptor store ~circle_id =
+let program_descriptor ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
   let open Lwt.Syntax in
-  let* described = Octra_circle_runtime.Circle_program.describe store circle_id in
+  let* described =
+    Octra_circle_runtime.Circle_program.describe ~float_mode store circle_id in
   match described with
   | Ok descriptor ->
     ok (Octra_circle_runtime.Circle_program.yojson_of_descriptor descriptor)
@@ -206,14 +210,14 @@ let info_auth_params store params =
     (fun _circle_id info ->
       ok (Octra_core.Circles.yojson_of_circle_info info))
 
-let program_descriptor_auth_params store params =
+let program_descriptor_auth_params ?(float_mode=Octra_core.Rule_graph.Prior) store params =
   with_scope_auth
     store
     params
     ~gate:Circle_auth.Private_owner
     ~op:"octra_circle_program_info"
     (fun circle_id _info ->
-      program_descriptor store ~circle_id)
+      program_descriptor ~float_mode store ~circle_id)
 
 let with_owner_subject_auth store params ~field ~op f =
   match Rpc.require_string params 0 "circle_id", Rpc.require_string params 1 field with
@@ -334,7 +338,7 @@ let with_object_member_auth store params f =
         ~subject:(Circle_view.object_member_subject req)
         (fun _ -> f req.circle_id req.object_ref req.member_ref)
 
-let program_info_public store ~circle_id =
+let program_info_public ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
   let open Lwt.Syntax in
   let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
   match info_opt with
@@ -344,11 +348,11 @@ let program_info_public store ~circle_id =
     if Circle_auth.private_view_required info then
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle program info required" None))
     else
-      program_descriptor store ~circle_id
+      program_descriptor ~float_mode store ~circle_id
 
-let program_info_public_params store params =
+let program_info_public_params ?(float_mode=Octra_core.Rule_graph.Prior) store params =
   circle_id_param params (fun circle_id ->
-    program_info_public store ~circle_id)
+    program_info_public ~float_mode store ~circle_id)
 
 let program_value store (info : Octra_core.Circles.circle_info) =
   let open Lwt.Syntax in
@@ -1535,8 +1539,10 @@ let dispatch
   Rpc_dispatch.circle_routes Rpc_dispatch.{
     circle_info = adapters.store_read info_public_params;
     circle_info_auth = adapters.store_read info_auth_params;
-    circle_program_info = adapters.store_read program_info_public_params;
-    circle_program_info_auth = adapters.store_read program_descriptor_auth_params;
+    circle_program_info = adapters.program_read
+      (fun ~float_mode -> program_info_public_params ~float_mode);
+    circle_program_info_auth = adapters.program_read
+      (fun ~float_mode -> program_descriptor_auth_params ~float_mode);
     circle_asset = adapters.store_read asset_plaintext_params;
     circle_view = adapters.circle_view;
     circle_view_auth = adapters.circle_view_auth;

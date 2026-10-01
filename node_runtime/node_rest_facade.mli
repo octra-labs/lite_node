@@ -36,6 +36,8 @@ val sweep_low_fee_stealth :
   unit ->
   int
 
+val prepare_tx : Ledger.t -> Transaction.t -> (Transaction.t, string * string) result
+
 val add_tx_to_staging :
   ?relay:bool ->
   ?bft_mode:bool ->

@@ -22,7 +22,7 @@ let test_check_accepts () =
   | Ok value -> expect "accepted timestamp" (value = 1_700_000_001_000L)
   | Error _ -> failwith "accepted timestamp rejected"
 
-let test_check_accepts_protocol_interval () =
+let test_protocol_interval () =
   match
     T.check
       ~now:1_700_000_010.0
@@ -63,7 +63,7 @@ let test_check_rejects_drift () =
   expect_error "drift accepted"
     (T.check ~now:1_700_000_000.0 ~previous:None ~candidate:1_700_030_001.0)
 
-let test_check_rejects_short_interval () =
+let test_short_interval () =
   expect_error "short protocol interval accepted"
     (T.check
        ~now:1_700_000_009.0
@@ -94,7 +94,7 @@ let test_check_rejects_range () =
   expect_error "negative timestamp accepted"
     (T.check ~now:1.0 ~previous:None ~candidate:(-1.0))
 
-let test_reproposal_accepts_old_monotonic_time () =
+let test_reproposal_monotonic () =
   match
     T.check_reproposal
       ~previous:(Some 1_700_000_000_000L)
@@ -104,53 +104,53 @@ let test_reproposal_accepts_old_monotonic_time () =
     expect "reproposal timestamp" (value = 1_700_000_010_000L)
   | Error _ -> failwith "old reproposal timestamp rejected"
 
-let test_reproposal_rejects_short_interval () =
+let test_reproposal_short () =
   expect_error "short reproposal interval accepted"
     (T.check_reproposal
        ~previous:(Some 1_700_000_000_000L)
        ~candidate:1_700_000_009.999)
 
-let test_reproposal_rejects_backwards_time () =
+let test_reproposal_backwards () =
   expect_error "backwards reproposal timestamp accepted"
     (T.check_reproposal
        ~previous:(Some 1_700_000_001_000L)
        ~candidate:1_700_000_000.0)
 
-let future_candidate = 1_700_000_100.0
+let future_ts = 1_700_000_100.0
 
 let prior_time = Some 1_700_000_000_000L
 
-let test_historical_reproposal_preserves_prior_rule () =
+let test_historical_time_rule () =
   match
     T.check_proposal
       ~rule:T.Historical
       ~kind:T.Reproposal
       ~now:1_700_000_010.0
       ~previous:prior_time
-      ~candidate:future_candidate
+      ~candidate:future_ts
   with
   | Ok _ -> ()
   | Error _ -> failwith "historical reproposal rule changed"
 
-let test_historical_fresh_proposal_rejects_future_time () =
+let test_historical_future_time () =
   expect_error "historical fresh proposal accepted future time"
     (T.check_proposal
        ~rule:T.Historical
        ~kind:T.Fresh
        ~now:1_700_000_010.0
        ~previous:prior_time
-       ~candidate:future_candidate)
+       ~candidate:future_ts)
 
-let test_uniform_reproposal_rejects_future_time () =
+let test_uniform_future_time () =
   expect_error "uniform reproposal accepted future time"
     (T.check_proposal
        ~rule:T.Uniform
        ~kind:T.Reproposal
        ~now:1_700_000_010.0
        ~previous:prior_time
-       ~candidate:future_candidate)
+       ~candidate:future_ts)
 
-let test_uniform_reproposal_accepts_observed_time () =
+let test_uniform_observed_time () =
   match
     T.check_proposal
       ~rule:T.Uniform
@@ -162,7 +162,7 @@ let test_uniform_reproposal_accepts_observed_time () =
   | Ok _ -> ()
   | Error _ -> failwith "uniform reproposal rejected observed time"
 
-let test_uniform_early_reproposal_reduces_clock_drift () =
+let test_uniform_clock_drift () =
   match
     T.check_proposal
       ~rule:T.Uniform
@@ -244,23 +244,23 @@ let () =
   test_live_time_policy ();
   test_conversion ();
   test_check_accepts ();
-  test_check_accepts_protocol_interval ();
+  test_protocol_interval ();
   test_check_accepts_schedule_debt ();
   test_next_delay_before_boundary ();
   test_next_delay_at_boundary ();
   test_next_delay_after_boundary ();
   test_check_rejects_drift ();
-  test_check_rejects_short_interval ();
+  test_short_interval ();
   test_check_rejects_future_time ();
   test_check_rejects_backwards ();
   test_check_rejects_non_finite ();
   test_check_rejects_range ();
-  test_reproposal_accepts_old_monotonic_time ();
-  test_reproposal_rejects_short_interval ();
-  test_reproposal_rejects_backwards_time ();
-  test_historical_reproposal_preserves_prior_rule ();
-  test_historical_fresh_proposal_rejects_future_time ();
-  test_uniform_reproposal_rejects_future_time ();
-  test_uniform_reproposal_accepts_observed_time ();
-  test_uniform_early_reproposal_reduces_clock_drift ();
+  test_reproposal_monotonic ();
+  test_reproposal_short ();
+  test_reproposal_backwards ();
+  test_historical_time_rule ();
+  test_historical_future_time ();
+  test_uniform_future_time ();
+  test_uniform_observed_time ();
+  test_uniform_clock_drift ();
   test_policy_activation_boundary ()

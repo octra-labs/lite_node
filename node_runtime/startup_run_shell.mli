@@ -70,7 +70,6 @@ type node_launch_runtime = {
   max_drift : float;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
-  close_chaindata : unit -> unit;
   exit_fatal : unit -> unit;
 }
 
@@ -165,16 +164,19 @@ val idle :
 val default_join_log :
   join_log
 
+val exit_fatal : unit -> 'a
+val exit_store : Octra_core.Store_irmin.t -> unit -> 'a
+val require_sync : data_dir:string -> chain:string -> store:Octra_core.Store_irmin.t ->
+  Sync_need.t -> 'a
+
 val run_join :
   log:join_log ->
   tasks:unit Lwt.t list ->
-  close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t
 
 val run_launch_tasks :
   unit Lwt.t launch_tasks ->
-  close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t
 
@@ -182,7 +184,6 @@ val run_node_launch_tasks :
   ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
   ?bft_mode:bool ->
   node_launch_deps ->
-  close_chaindata:(unit -> unit) ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t
 

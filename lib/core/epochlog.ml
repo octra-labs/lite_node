@@ -61,9 +61,11 @@ let empty_epoch_header = {
 
 type t = {
   fd : Unix.file_descr;
+  dir : string;
   readonly : bool;
   mutable offsets : (int, int) Hashtbl.t;
   mutable tip : epoch_header option;
+  mutable cut : int option;
 }
 
 type read_error =
@@ -286,27 +288,29 @@ let open_log ?(readonly=false) path =
     failwith "epochlog: read-only directory is missing"
   else if not (Sys.file_exists dir) then
     Unix.mkdir dir 0o755;
-  if Sys.file_exists path then begin
-    let flags =
-      if readonly then [Unix.O_RDONLY] else [Unix.O_RDWR; Unix.O_APPEND]
-    in
-    let fd = Unix.openfile path flags 0o644 in
-    validate_file_header fd;
-    let (offsets, tip) = scan_records fd in
-    { fd; readonly; offsets; tip }
-  end else if readonly then begin
-    failwith "epochlog: read-only file is missing"
-  end else begin
-    let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
-    write_file_header fd;
-    { fd; readonly; offsets = Hashtbl.create 64; tip = None }
-  end
+  let exists = Sys.file_exists path in
+  if not exists && readonly then failwith "epochlog: read-only file is missing";
+  let flags =
+    if not exists then [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC]
+    else if readonly then [Unix.O_RDONLY]
+    else [Unix.O_RDWR; Unix.O_APPEND] in
+  let fd = Unix.openfile path (Unix.O_CLOEXEC :: flags) 0o644 in
+  Store_scope.protect ~close:(fun () -> Unix.close fd) (fun () ->
+    if exists then begin
+      validate_file_header fd;
+      let offsets, tip = scan_records fd in
+      { fd; dir; readonly; offsets; tip; cut = None }
+    end else begin
+      write_file_header fd;
+      { fd; dir; readonly; offsets = Hashtbl.create 64; tip = None; cut = None }
+    end)
 
 let close t =
   Unix.close t.fd
 
 let append t h =
   if t.readonly then failwith "epochlog: append on read-only log";
+  if t.cut <> None then failwith "epochlog: cut is incomplete";
   let payload = epoch_to_json h in
   let payload_len = String.length payload in
   let record_len = payload_len + 4 in
@@ -355,12 +359,14 @@ let read_all t =
   done with Exit -> ());
   List.rev !results
 
-let fold_strict t ~init ~f =
+let fold_strict ?end_at t ~init ~f =
   let inspect () =
-    let size = (Unix.fstat t.fd).Unix.st_size in
+    let physical = (Unix.fstat t.fd).Unix.st_size in
+    let size = Option.value ~default:physical end_at in
     let header = Bytes.create header_size in
     ignore (Unix.lseek t.fd 0 Unix.SEEK_SET);
-    if size < header_size || not (read_exact t.fd header 0 header_size) then
+    if size > physical then Error (Log_io "epoch cut exceeds file length")
+    else if size < header_size || not (read_exact t.fd header 0 header_size) then
       Error Log_header_truncated
     else if Bytes.sub_string header 0 4 <> magic then
       Error Log_header_marker
@@ -414,8 +420,8 @@ let fold_strict t ~init ~f =
       Error (Log_io (Printf.sprintf "%s: %s: %s" call path (Unix.error_message error)))
   | Sys_error reason -> Error (Log_io reason)
 
-let read_all_strict t =
-  match fold_strict t ~init:[] ~f:(fun items epoch -> Ok (epoch :: items)) with
+let read_all_strict ?end_at t =
+  match fold_strict ?end_at t ~init:[] ~f:(fun items epoch -> Ok (epoch :: items)) with
   | Error _ as error -> error
   | Ok items -> Ok (List.rev items)
 
@@ -444,16 +450,29 @@ let offset_after t epoch_id =
   end else
     None
 
-let fsync t =
-  if not t.readonly then Unix.fsync t.fd
+let fsync ?(sync = Unix.fsync) t =
+  if not t.readonly then begin
+    sync t.fd;
+    List.iter (fun path ->
+      let fd = Unix.openfile path [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
+      Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> sync fd))
+      [t.dir; Filename.dirname t.dir]
+  end
 
-let truncate_to t ~offset =
+let truncate_to ?(sync = Unix.fsync) t ~offset =
   if t.readonly then failwith "epochlog: truncate on read-only log";
+  if Option.fold ~none:false ~some:((<>) offset) t.cut then
+    failwith "epochlog: a different cut is incomplete";
+  (match fold_strict ~end_at:offset t ~init:() ~f:(fun () _ -> Ok ()) with
+   | Ok () -> ()
+   | Error reason -> failwith (read_error_message reason));
+  t.cut <- Some offset;
   Unix.ftruncate t.fd offset;
-  Unix.fsync t.fd;
+  fsync ~sync t;
   let (offsets, tip) = scan_records t.fd in
   t.offsets <- offsets;
-  t.tip <- tip
+  t.tip <- tip;
+  t.cut <- None
 
 let get t epoch_id =
   if Hashtbl.mem t.offsets epoch_id then begin

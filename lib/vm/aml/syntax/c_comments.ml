@@ -61,8 +61,8 @@ let erase src =
   let rec scan plain out state =
     match char state, char_at state 1 with
     | None, _ ->
-      let tail = String.sub src plain (state.len - plain) in
-      Ok (String.concat "" (List.rev (tail :: out)))
+      let remainder = String.sub src plain (state.len - plain) in
+      Ok (String.concat "" (List.rev (remainder :: out)))
     | Some '/', Some '/' ->
       let first = state.pos.off in
       let stop = line (twice state) in

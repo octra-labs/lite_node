@@ -119,6 +119,22 @@ let components ~epoch getenv =
   @ (match Octra_core.Rule_graph.program_source_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["program_source", "aml_source:oct_gen_count:source_abi:checked_address:option_values:scalar_equality:shape_limits:overlap_64"])
+  @ (match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["fhe_work",
+         String.concat ":" [Octra_vm.Fhe_view_policy.consensus_id;
+           "500"; "500"; "10000"; "1000"; "1000"; "500"; "500"; "100"; "200"]])
+  @ (match Octra_core.Rule_graph.wasm_float_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active ->
+       ["wasm_float", Octra_core.Circle_wasm_host.float_id])
+  @ (match Octra_core.Rule_graph.tx_envelope_at ~chain_id ~epoch:(Int64.of_int epoch) with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["transaction_envelope", "sender_key32_signature64_base64_scalar_unique_nonce"])
+  @ (match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> [
+         "program_preview", "aml_2_preview:certificate_version:stored_version:source_compat"])
 
 let derived ~epoch getenv =
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
@@ -202,7 +218,24 @@ let () =
   expect "exit profile golden" (raw_hex current = exit_golden);
   expect "exit profile commits parameters" (current = derived ~epoch devnet_env);
   expect "exit profile stable after activation"
-    (current = P.hash ~chain_id ~epoch:max_int devnet_env);
+    (current = P.hash ~chain_id ~epoch:1_611_499 devnet_env);
+  List.iter (fun epoch ->
+    expect "withdrawn activation keeps released profile"
+      (current = P.hash ~chain_id ~epoch devnet_env))
+    [1_582_999; 1_583_000; 1_583_001; 1_585_999; 1_586_000; 1_586_001;
+     1_588_999; 1_589_000; 1_589_001; 1_601_499; 1_601_500; 1_601_501;
+     1_605_499; 1_605_500; 1_605_501;
+     1_607_499; 1_607_500; 1_607_501; 1_609_499; 1_609_500; 1_609_501;
+     1_611_498; 1_611_499];
+  let envelope = P.hash ~chain_id ~epoch:1_611_500 devnet_env in
+  Printf.printf "event = tx_envelope_profile epoch = 1611500 hash = %s\n%!" (raw_hex envelope);
+  expect "envelope profile differs" (envelope <> current);
+  expect "envelope profile golden"
+    (raw_hex envelope = "0f403e211c7e1fdc29d15828c1c5edd04340090ca87dba02f9889e987583eee0");
+  expect "envelope binds components" (envelope = derived ~epoch:1_611_500 devnet_env);
+  expect "envelope profile stable after activation"
+    (envelope = P.hash ~chain_id ~epoch:1_611_501 devnet_env
+     && envelope = P.hash ~chain_id ~epoch:max_int devnet_env);
   Printf.printf "event = exit_profile epoch = %d hash = %s\n" epoch (raw_hex current);
   List.iter (fun (applied_epoch, expected) ->
     expect "profile switch epoch"
@@ -210,7 +243,15 @@ let () =
     [0, false; 1_499_998, false; 1_499_999, true;
      1_500_000, false; 1_500_001, false; 1_507_999, false;
      1_508_000, false; 1_508_001, false; 1_509_998, false;
-     1_509_999, true; 1_510_000, false; 1_510_001, false; max_int, false];
+     1_509_999, true; 1_510_000, false; 1_510_001, false;
+     1_582_999, false; 1_583_000, false; 1_583_001, false;
+     1_585_999, false; 1_586_000, false; 1_586_001, false;
+     1_588_998, false; 1_588_999, false; 1_589_000, false; 1_589_001, false;
+     1_601_499, false; 1_601_500, false; 1_601_501, false;
+     1_605_499, false; 1_605_500, false; 1_605_501, false;
+     1_607_499, false; 1_607_500, false; 1_607_501, false;
+     1_609_499, false; 1_609_500, false; 1_609_501, false;
+     1_611_498, false; 1_611_499, true; 1_611_500, false; 1_611_501, false; max_int, false];
   List.iter (fun epoch ->
     expect "other chain profile preserved"
       (P.hash ~chain_id:"octra-mainnet" ~epoch getenv = compat);
@@ -218,7 +259,11 @@ let () =
       (not (P.switch_after ~chain_id:"octra-mainnet" ~applied_epoch:epoch)))
     [0; 1_499_999; 1_500_000; 1_509_999; 1_510_000; 1_510_001;
      1_566_999; 1_567_000; 1_567_001; 1_571_999;
-     1_572_000; 1_572_001; max_int];
+     1_572_000; 1_572_001; 1_582_999; 1_583_000; 1_583_001;
+     1_585_999; 1_586_000; 1_586_001; 1_588_999; 1_589_000; 1_589_001;
+     1_601_499; 1_601_500; 1_601_501; 1_605_499; 1_605_500; 1_605_501;
+     1_607_499; 1_607_500; 1_607_501; 1_609_499; 1_609_500; 1_609_501;
+     1_611_499; 1_611_500; 1_611_501; max_int];
   expect "standard binds chain"
     (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" ~epoch:1_500_000 getenv)));
   print_endline "status = pass test = consensus_profile_golden"

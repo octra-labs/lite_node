@@ -65,3 +65,6 @@ val run_epoch_tags :
 val irmin_path :
   string ->
   string
+
+val open_stores :
+  ?lock_wait:float -> string -> Octra_core.Store_chaindata.t * Octra_core.Store_irmin.t

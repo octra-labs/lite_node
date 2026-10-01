@@ -67,6 +67,14 @@ type receipt = {
   pulse : int64 option;
 }
 
+type exclusion =
+  | Member_missing
+  | Pulse_missing
+  | Pulse_future of int64
+  | Pulse_old of int64
+  | Pulse_short of { first : int64; last : int64 }
+  | Marks_short of { low : int64; high : int64; signed : int; required : int }
+
 type cap_mode = Reject | Prune
 
 type final_step =
@@ -695,6 +703,25 @@ let allows cfg ~start ~source ~address state =
   | None -> false
   | Some member ->
     member_allows cfg ~start ~source ~safe_after:state.safe_after member
+
+let exclusion cfg ~start ~source ~address state =
+  match List.find_opt (fun member -> member.address = address) state.members with
+  | None -> Some Member_missing
+  | Some member when member_allows cfg ~start ~source ~safe_after:state.safe_after member -> None
+  | Some { phase = Live _; marks; _ } ->
+    let low, high = evidence_range cfg source in
+    let epochs = Int64.to_int (Int64.succ (Int64.sub high low)) in
+    Some (Marks_short {
+      low; high;
+      signed = mark_count ~low ~high marks;
+      required = Validator_participation.required cfg.minimum ~epochs;
+    })
+  | Some { phase = Shadow None; _ } -> Some Pulse_missing
+  | Some { phase = Shadow (Some pulse); _ } ->
+    if Int64.compare pulse.last source > 0 then Some (Pulse_future pulse.last)
+    else if Int64.compare (Int64.sub source pulse.last) cfg.pulse_gap > 0 then
+      Some (Pulse_old pulse.last)
+    else Some (Pulse_short { first = pulse.first; last = pulse.last })
 
 let filter cfg ~start ~source candidates state =
   let table = table_of_members state.members in

@@ -135,32 +135,32 @@ let run deps ~cursor ~(prepared : J.prepared) =
      prepared.next_cursor.txid = next_txid);
   require "replay prepared transactions differ" (hashes prepared.txs = record.tx_hashes);
   let outcomes = get (O.decode_final ~confirmed:prepared.txs record.receipts_json) in
-  let candidates = get (O.merge ~confirmed:prepared.txs ~rejections:outcomes.rejections) in
+  let inputs = get (O.merge ~confirmed:prepared.txs ~rejections:outcomes.rejections) in
   let* initial = deps.head () in
   require "replay starting root differs"
     (E.folded_state_root ~ledger_state_root:initial ~epoch_index_root:cursor.eic
       = cursor.prev_root);
-  let* batch = deps.preverify candidates in
-  require "replay preverify omitted a candidate"
-    (batch.W.skipped = [] && hashes (W.txs batch) = hashes candidates);
+  let* batch = deps.preverify inputs in
+  require "replay preverify omitted an input transaction"
+    (batch.W.skipped = [] && hashes (W.txs batch) = hashes inputs);
   let confirmed_hashes = hashes prepared.txs in
   let actual_receipts = W.receipt_json_for_hashes batch.ready confirmed_hashes in
   require "replay preverify receipts differ" (actual_receipts = outcomes.preverify);
-  let candidate_gate = G.create (W.receipts_for_hashes batch.ready (hashes candidates)) in
+  let input_gate = G.create (W.receipts_for_hashes batch.ready (hashes inputs)) in
   let confirmed_gate = G.create (W.receipts_for_hashes batch.ready confirmed_hashes) in
-  get (G.check candidate_gate candidates);
+  get (G.check input_gate inputs);
   get (G.check confirmed_gate prepared.txs);
   let* () = stable deps initial in
-  let* checked = deps.preview candidate_gate candidates in
-  get (P.verify_preview_partition ~candidates ~confirmed:prepared.txs
+  let* checked = deps.preview input_gate inputs in
+  get (P.verify_preview_partition ~inputs ~confirmed:prepared.txs
     ~rejections:outcomes.rejections checked);
   let checked = get checked in
-  positions candidates checked;
+  positions inputs checked;
   require "replay rejected order differs"
     (hashes (List.map (fun (item : X.tx_reject) -> item.tx) checked.artifacts.rejected)
       = hashes (List.map (fun (item : O.rejection) -> item.tx) outcomes.rejections));
   let rejections =
-    get (O.build ~candidates
+    get (O.build ~inputs
       (List.map (fun (item : X.tx_reject) -> item.tx, item.error_type, item.reason)
         checked.artifacts.rejected))
     |> List.map O.encode_rejection

@@ -299,10 +299,7 @@ let program_tokens_by_address params ctx =
 let fhe_pubkey_loader store addr =
   match run_s (Store_irmin.get_pvac_pubkey store addr) with
   | None -> None
-  | Some blob ->
-    match Octra_core.Pvac_registry.load_pubkey blob with
-    | Ok pk -> Some pk
-    | Error _ -> None
+  | Some blob -> Some (Octra_vm.Contract_vm.Key_bytes blob)
 
 let view_profile ctx =
   match Octra_vm.Contract_rpc.view_profile ctx.rules ~epoch:!(ctx.current_epoch) with
@@ -439,6 +436,8 @@ let rest_dispatch =
 let circle_dispatch =
   Circle_read_rpc.dispatch Circle_read_rpc.{
     store_read;
+    program_read = (fun f params ctx ->
+      f ~float_mode:(view_profile ctx).wasm_float ctx.store params);
     epoch_read;
     public_asset_read = circle_asset_public_read;
     circle_view;

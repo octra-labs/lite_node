@@ -138,6 +138,90 @@ void product_case(bool wire) {
     }
 }
 
+std::vector<uint8_t> edge_bytes(const std::vector<pvac::Edge>& edges) {
+    pvac_ser::Writer writer;
+    for (const auto& edge : edges) pvac_ser::write_edge(writer, edge);
+    return writer.buf;
+}
+
+std::vector<pvac::Edge> dense_merge(const std::vector<pvac::Edge>& edges, int basis, int layers) {
+    struct Slot { bool active = false; pvac::Edge edge; };
+    std::vector<Slot> plus(basis * layers), minus(basis * layers);
+    for (const auto& edge : edges) {
+        auto& slot = (edge.ch == pvac::SGN_P ? plus : minus)[edge.layer_id * basis + edge.idx];
+        if (!slot.active) {
+            slot.active = true;
+            slot.edge = edge;
+        } else {
+            for (size_t j = 0; j < edge.w.size(); ++j)
+                slot.edge.w[j] = pvac::fp_add(slot.edge.w[j], edge.w[j]);
+            slot.edge.s.xor_with(edge.s);
+        }
+    }
+    std::vector<pvac::Edge> output;
+    for (int layer = 0; layer < layers; ++layer) {
+        for (int index = 0; index < basis; ++index) {
+            for (auto* slots : {&plus, &minus}) {
+                auto& slot = (*slots)[layer * basis + index];
+                if (slot.active && (std::any_of(slot.edge.w.begin(), slot.edge.w.end(),
+                        [](const pvac::Fp& value) { return pvac::ct::fp_is_nonzero(value); })
+                        || std::any_of(slot.edge.s.w.begin(), slot.edge.s.w.end(),
+                            [](uint64_t value) { return value != 0; })))
+                    output.push_back(std::move(slot.edge));
+            }
+        }
+    }
+    return output;
+}
+
+void merge_cases() {
+    pvac::PubKey key{};
+    key.prm.m_bits = 65;
+    for (int basis : {1, 7, 337}) {
+        key.prm.B = basis;
+        for (int layers : {1, 3, 17}) {
+            for (int width : {1, 8}) {
+                std::vector<pvac::Edge> edges;
+                for (uint32_t n = 0; n < 300; ++n) {
+                    pvac::Edge edge{n % static_cast<uint32_t>(layers),
+                        static_cast<uint16_t>((n * 11) % basis),
+                        n % 2 ? pvac::SGN_P : pvac::SGN_M,
+                        std::vector<pvac::Fp>(width, pvac::fp_from_u64(n % 19)), pvac::BitVec::make(65)};
+                    edge.s.w[0] = n;
+                    edge.s.w[1] = n % 2;
+                    edges.push_back(edge);
+                    for (auto& value : edge.w) value = pvac::fp_neg(value);
+                    edges.push_back(edge);
+                    if (n % 3) edges.push_back(edge);
+                }
+                for (int order = 0; order < 3; ++order) {
+                    const auto expected = edge_bytes(dense_merge(edges, basis, layers));
+                    const auto result = pvac::reduction::merge(pvac::alg::Carrier<pvac::Edge>{edges}, key);
+                    check(edge_bytes(result.data) == expected, "merge prior bytes");
+                    std::rotate(edges.begin(), edges.begin() + edges.size() / 3, edges.end());
+                    std::reverse(edges.begin(), edges.end());
+                }
+            }
+        }
+    }
+    key.prm.B = std::numeric_limits<int>::max();
+    const pvac::Edge edge{0x7fffffff, 65535, pvac::SGN_M,
+        {pvac::fp_from_u64(9)}, pvac::BitVec::make(65)};
+    const auto result = pvac::reduction::merge(pvac::alg::Carrier<pvac::Edge>{{edge}}, key);
+    check(edge_bytes(result.data) == edge_bytes({edge}), "merge sparse domain");
+    for (int bad = 0; bad < 4; ++bad) {
+        auto altered = edge;
+        if (bad == 0) altered.ch = 9;
+        if (bad == 1) altered.w.clear();
+        if (bad == 2) altered.s = pvac::BitVec::make(64);
+        key.prm.B = bad == 3 ? 1 : std::numeric_limits<int>::max();
+        bool refused = false;
+        try { pvac::reduction::merge(pvac::alg::Carrier<pvac::Edge>{{altered}}, key); }
+        catch (const std::runtime_error&) { refused = true; }
+        check(refused, "merge malformed shape");
+    }
+}
+
 void table_cases() {
     std::atomic<unsigned> finished{0};
     bool refused = false;
@@ -380,6 +464,7 @@ int main(int argc, char** argv) {
         if (mode == "all" || mode == "shake") shake_cases();
         if (mode == "all" || mode == "sample") sample_cases();
         if (mode == "all" || mode == "reader") reader_cases();
+        if (mode == "all" || mode == "merge") merge_cases();
         if (mode == "all" || mode == "product") product_case(false);
         if (mode == "all" || mode == "table") table_cases();
         if (mode == "all" || mode == "scalar") scalar_cases();

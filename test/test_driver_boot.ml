@@ -5,7 +5,7 @@ module S = Octra_node_runtime.Consensus_driver_boot_shell
 module D = Octra_node_runtime.Consensus_driver_read
 
 let fail msg =
-  failwith ("test_node_runtime_consensus_driver_boot_shell: " ^ msg)
+  failwith ("test_driver_boot: " ^ msg)
 
 let expect label cond =
   if not cond then fail label
@@ -102,4 +102,4 @@ let () =
   test_committed_reads_closed ();
   test_sync_guard ();
   test_seed_fault ();
-  print_endline "status = pass test = node_runtime_consensus_driver_boot_shell"
+  print_endline "status = pass test = driver_boot"

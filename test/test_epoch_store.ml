@@ -42,7 +42,7 @@ let sample ~chain_id ~parent_commit (cursor : R.J.cursor) state_root =
       "ts", `Float epoch_ts;
     ]) in
   let plan = N.Consensus_replay.build_plan
-    ~parent_commit ~header ~commit_round:0 ~txs:[] in
+    ~parent_commit ~header ~commit_round:0 ~receipts_json:[] ~txs:[] in
   let validator_set = match parent_commit with
     | Some commit -> commit.C.validator_set
     | None -> C.make_validator_set []
@@ -219,7 +219,7 @@ let parent ~chain_id keys (cursor : R.J.cursor) =
       "proposed_state_root", `String cursor.prev_root;
     ]) in
   let plan = N.Consensus_replay.build_plan
-    ~parent_commit:None ~header ~commit_round:0 ~txs:[] in
+    ~parent_commit:None ~header ~commit_round:0 ~receipts_json:[] ~txs:[] in
   let header = plan.finalize.header in
   let proposal_id = H.proposal_id header in
   let precommits = List.map (fun (validator, key) ->

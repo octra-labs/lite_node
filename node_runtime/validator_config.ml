@@ -344,10 +344,10 @@ let self_membership ?(permissionless = false) ~address ~voting ~role_label cfg =
   | false, true, _ -> Self_scheduled
   | false, false, true when permissionless ->
     Self_observer
-      "validator candidate follows finality until selected by the bonded validator lifecycle"
+      "validator follows finality until selected by the bonded validator lifecycle"
   | false, false, true ->
     Self_refused
-      "REFUSING TO START: wallet is not in active or scheduled validator set"
+      "event = startup_refused reason = validator_membership_missing"
   | false, false, false ->
     Self_observer
       (Printf.sprintf
@@ -368,16 +368,16 @@ let quorum_admission ~allow_unsafe cfg =
   else if allow_unsafe then
     Quorum_unsafe_allowed
       (Printf.sprintf
-         "OCTRA_ALLOW_UNSAFE_QUORUM = 1 - running with n = %d (unsafe: not real BFT, do not use in production)"
+         "event = unsafe_quorum n = %d env = OCTRA_ALLOW_UNSAFE_QUORUM value = 1 production = false"
          vs.n)
   else
     Quorum_refused [
       Printf.sprintf
-        "REFUSING TO START: BFT consensus requires n >= 4 validators (current: n = %d, f = %d, quorum = %d)."
+        "event = startup_refused reason = validator_count n = %d f = %d quorum = %d minimum = 4"
         vs.n vs.f vs.quorum;
-      "With n < 4, BFT safety is broken (any single validator can finalize).";
-      "For local single-validator: unset OCTRA_CONSENSUS_MODE.";
-      "For testing/devnet only: set OCTRA_ALLOW_UNSAFE_QUORUM = 1 to bypass.";
+      "safety = false production = false";
+      "env = OCTRA_CONSENSUS_MODE local_action = unset";
+      "env = OCTRA_ALLOW_UNSAFE_QUORUM test_value = 1 production = false";
     ]
 
 let startup_admission ?(permissionless = false) ~address ~voting ~role_label
@@ -386,15 +386,15 @@ let startup_admission ?(permissionless = false) ~address ~voting ~role_label
     [Startup_refuse cfg.identity_errors]
   else if cfg.allowed_pubkeys = [] then
     [Startup_refuse [
-       "REFUSING TO START: consensus mode requires OCTRA_VALIDATORS with valid pubkeys. Set OCTRA_VALIDATORS=addr1:pub1,addr2:pub2,...";
+       "event = startup_refused reason = validator_pubkeys_missing env = OCTRA_VALIDATORS";
      ]]
   else if cfg.current_validator_list = [] then
     [Startup_refuse [
-       "REFUSING TO START: no valid peers parsed from OCTRA_VALIDATORS";
+       "event = startup_refused reason = validator_peers_missing env = OCTRA_VALIDATORS";
      ]]
   else if cfg.next_validator_list <> [] && next_activation_epoch = None then
     [Startup_refuse [
-       "REFUSING TO START: OCTRA_VALIDATORS_NEXT requires OCTRA_VALIDATORS_ACTIVATE_EPOCH";
+       "event = startup_refused reason = validator_activation_missing env = OCTRA_VALIDATORS_ACTIVATE_EPOCH";
      ]]
   else
     let self_events =

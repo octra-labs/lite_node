@@ -6,7 +6,7 @@ module Preverify_submit = Octra_node_runtime.Preverify_submit
 module Tx_view = Octra_node_runtime.Tx_view
 
 let fail msg =
-  failwith ("test_node_runtime_preverify_cache: " ^ msg)
+  failwith ("test_preverify_cache: " ^ msg)
 
 let result ?(math=false) strict sender_enc_snapshot =
   C.{
@@ -204,4 +204,4 @@ let () =
   test_start_task_capacity ();
   test_gate ();
   test_config_limits ();
-  print_endline "status = pass test = node_runtime_preverify_cache"
+  print_endline "status = pass test = preverify_cache"

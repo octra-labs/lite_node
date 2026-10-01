@@ -41,7 +41,8 @@ let compile_at ~chain_id ~epoch handler params =
     Octra_core.Rule_graph.standard_at ~chain_id ~epoch = Octra_core.Rule_graph.Active
   in
   let compiler = Octra_core.Rule_graph.program_source_at ~chain_id ~epoch
-    |> Octra_vm.Program_package.compiler_mode in
+    |> Octra_vm.Program_package.compiler_mode
+      ~preview:(Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch) in
   handler ~compiler ~point_ops params
 
 let immediate task =
@@ -60,16 +61,17 @@ let compile_rpc handler input =
       (fun () ->
         Lwt.finalize
           (fun () ->
-            Lwt_preemptive.detach
+            Octra_core.Exec_resource.detach
               (fun () -> immediate (handler input))
               ())
           (fun () ->
             compile_active := false;
             Lwt.return_unit))
       (function
-        | Out_of_memory as error -> Lwt.fail error
+        | Octra_core.Exec_resource.Unavailable Memory ->
+          Lwt.return_error (Octra_core.Rpc.err (-32005) "Program compiler resources unavailable" None)
         | Lwt.Canceled as error -> Lwt.fail error
-        | Stack_overflow ->
+        | Octra_core.Exec_resource.Unavailable Stack ->
           Lwt.return_error
             (Octra_core.Rpc.err
                (-32000)

@@ -401,10 +401,10 @@ let parse_multi_exec_calls ~max_calls message =
     | Ok call_items ->
       let rec loop index acc = function
         | [] -> Ok (List.rev acc)
-        | item :: tail ->
+        | item :: remainder ->
           match parse_call index item with
           | Error e -> Error e
-          | Ok call -> loop (index + 1) (call :: acc) tail
+          | Ok call -> loop (index + 1) (call :: acc) remainder
       in
       loop 0 [] call_items
   with

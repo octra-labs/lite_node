@@ -5,7 +5,9 @@ synopsis: "Octra lite node pre-release"
 maintainer: "Octra Labs"
 authors: "Octra Labs"
 homepage: "https://octra.org"
-bug-reports: "https://gitlab.octra.org.uk/octra/libv_litecore/issues"
+bug-reports: "https://github.com/octra-labs/lite_node/issues"
+license: "BSD-3-Clause"
+dev-repo: "git+https://github.com/octra-labs/lite_node.git"
 depends: [
   "alcotest" {= "1.9.1" & with-test}
   "alcotest-lwt" {= "1.9.1" & with-test}
@@ -33,8 +35,8 @@ depends: [
   "conf-gmp" {= "5"}
   "conf-gmp-powm-sec" {= "4"}
   "conf-libev" {= "4-13"}
+  "conf-npm" {= "1" & with-test}
   "conf-pkg-config" {= "4"}
-  "conf-sqlite3" {= "1"}
   "coq" {= "9.0.0" & with-test}
   "coq-core" {= "9.0.0" & with-test}
   "coq-stdlib" {= "9.0.0" & with-test}
@@ -120,7 +122,6 @@ depends: [
   "seq" {= "base"}
   "sexplib" {= "v0.16.0"}
   "sexplib0" {= "v0.16.0"}
-  "sqlite3" {= "5.4.1"}
   "stdlib-shims" {= "0.3.0"}
   "stringext" {= "1.6.0"}
   "terminal" {= "0.5.0"}
@@ -137,6 +138,7 @@ depends: [
   "zarith" {= "1.14"}
 ]
 build: [
+  ["mkdir" "-p" "mcl/obj" "mcl/lib"]
   [make "-C" "mcl" "MCL_FP_BIT=256" "MCL_FR_BIT=256" "lib/libmcl.a"]
   [
     "dune"

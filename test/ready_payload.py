@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
-#!/usr/bin/env python3
-
 import argparse
 import hashlib
 import json
 import time
 import urllib.request
 
-
 def fail(msg):
     raise SystemExit(msg)
-
 
 def sha256_file(path):
     h = hashlib.sha256()
@@ -20,7 +16,6 @@ def sha256_file(path):
         for block in iter(lambda: f.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
-
 
 def hex64(label, value, lengths = (64,)):
     if value is None:
@@ -31,14 +26,12 @@ def hex64(label, value, lengths = (64,)):
         fail(f"{label} must be {sizes} hex chars")
     return s
 
-
 def proposal_id(value):
     if not isinstance(value, str) or len(value) != 64 or any(
         char not in "0123456789abcdef" for char in value
     ):
         fail("head_proposal_id must be 64 lowercase hex chars")
     return value
-
 
 def rpc(url, method, params=None):
     body = json.dumps({
@@ -54,7 +47,6 @@ def rpc(url, method, params=None):
         fail(json.dumps(res["error"], separators=(",", ":")))
     return res["result"]
 
-
 def int_arg(label, value):
     try:
         n = int(value)
@@ -63,7 +55,6 @@ def int_arg(label, value):
     if n < 0:
         fail(f"{label} must be non-negative")
     return n
-
 
 def main():
     p = argparse.ArgumentParser()
@@ -127,7 +118,6 @@ def main():
     if args.shadow_epochs is not None:
         payload["shadow_epochs"] = str(int_arg("shadow_epochs", args.shadow_epochs))
     print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
-
 
 if __name__ == "__main__":
     main()

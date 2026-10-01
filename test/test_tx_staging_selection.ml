@@ -215,8 +215,8 @@ let check_duty_nonce () =
   Tx_staging.clear ();
   let from = sender 707 in
   let duty nonce = transaction ~op_type:Transaction.ValidatorReady from nonce in
-  let tail = List.init 5 (fun index -> duty (436 + index)) in
-  List.iter add tail;
+  let suffix = List.init 5 (fun index -> duty (436 + index)) in
+  List.iter add suffix;
   let nonce = Tx_staging.first_missing_nonce from 349 in
   check "duty fills confirmed gap" (nonce = 350);
   check "pending maximum is not next duty nonce"
@@ -226,7 +226,7 @@ let check_duty_nonce () =
     (Tx_staging.first_missing_nonce from 349 = 351);
   check "duty retains existing transactions"
     (List.for_all (fun tx ->
-      Tx_staging.find_by_hash (Transaction.hash tx) = Some tx) tail);
+      Tx_staging.find_by_hash (Transaction.hash tx) = Some tx) suffix);
   check "duty follows committed nonce"
     (Tx_staging.first_missing_nonce from 440 = 441);
   Tx_staging.clear ()
@@ -409,6 +409,44 @@ let check_ready_cost () =
   in
   check "over budget suffix omitted" (selected = List.map identity [first; other])
 
+let check_private_slots () =
+  let low = transaction ~fee:100_000 ~op_type:Transaction.EncryptOp (sender 1) 1 in
+  let high = transaction ~fee:200_000 ~op_type:Transaction.EncryptOp (sender 99) 1 in
+  let later = transaction ~fee:1_000_000 (sender 1) 2 in
+  let public = transaction (sender 50) 1 in
+  let inputs = select Tx_staging.max_ou_per_epoch [low; later; public; high] in
+  let choose limits ready = Private_slots.select ~limits ~inputs ~ready in
+  let one = Private_slots.{fhe = 1; stealth = 1} in
+  let picked = choose one inputs in
+  check "private price wins over sender address" (List.mem high picked && not (List.mem low picked));
+  check "private deferred nonce suffix remains queued" (not (List.mem later picked)
+    && Tx_staging.staging_size () = 4);
+  check "public transaction retains capacity" (List.mem public picked);
+  let failed = choose one (List.filter (fun item -> item <> high) inputs) in
+  check "invalid private proof cannot consume slot" (List.mem low failed && List.mem later failed);
+  check "zero private budget preserves public traffic"
+    (choose {one with fhe = 0} inputs = [public]);
+  check "independent senders use separate slots"
+    (List.length (choose {one with fhe = 2} inputs) = 4);
+  let decrypt = transaction ~op_type:Transaction.DecryptOp (sender 3) 1 in
+  let stealth = transaction ~op_type:Transaction.StealthOp (sender 3) 2 in
+  let suffix = transaction (sender 3) 3 in
+  let slots = Private_slots.create {fhe = 8; stealth = 4} in
+  let first = Option.get (Private_slots.reserve slots decrypt) in
+  check "same sender encrypted debit is not duplicated" (Private_slots.reserve first stealth = None);
+  check "independent budget has no side effects" (Option.is_some (Private_slots.reserve slots stealth));
+  check "blocked private debit cannot skip nonce"
+    (Private_slots.select ~limits:{fhe = 8; stealth = 4}
+      ~inputs:[decrypt; stealth; suffix] ~ready:[decrypt; stealth; suffix] = [decrypt]);
+  List.iter (fun max ->
+    for count = 0 to 12 do
+      let inputs = List.init count (fun i ->
+        transaction ~op_type:Transaction.StealthOp (sender (100 + i)) 1) in
+      let result = Private_slots.select ~limits:{fhe = 8; stealth = max} ~inputs ~ready:inputs in
+      check "private cap exceeded" (List.length result = min count (min 8 max))
+    done) [0; 1; 2; 4; 8];
+  Tx_staging.clear ()
+
 let () =
   check_fee_order ();
   check_cost_rate_order ();
@@ -422,5 +460,6 @@ let () =
   check_recent_order ();
   check_ready_gap ();
   check_ready_cost ();
+  check_private_slots ();
   check_selection_time ();
   check_payload_independence ()

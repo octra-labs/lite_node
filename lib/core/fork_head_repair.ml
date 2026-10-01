@@ -40,6 +40,16 @@ let head_at data_dir =
   | Head_manifest.Corrupt reason -> Error ("head:" ^ reason)
   | Head_manifest.Present head -> Ok head
 
+let journal_allows data_dir target =
+  let protected = Commit_journal.read_all data_dir |> List.find_map (function
+    | Commit_journal.Prepare entry when entry.epoch_id > target -> Some entry.epoch_id
+    | Commit_journal.Commit entry when entry.generation > target -> Some entry.generation
+    | _ -> None) in
+  match protected with
+  | None -> Ok ()
+  | Some epoch -> Error (Printf.sprintf
+      "fork repair crosses commit journal: target = %d epoch = %d; snapshot required" target epoch)
+
 let stable_plan_state data_dir chaindata old target next_txid =
   match head_at data_dir, Store_chaindata.last_epoch_id chaindata with
   | Ok current, Ok (Some chain_head) ->
@@ -51,9 +61,9 @@ let stable_plan_state data_dir chaindata old target next_txid =
 
 let plan ~data_dir ~store ~chaindata ~target ~root =
   let open Lwt.Syntax in
-  match head_at data_dir with
-  | Error reason -> Lwt.return_error reason
-  | Ok old ->
+  match head_at data_dir, journal_allows data_dir target with
+  | Error reason, _ | _, Error reason -> Lwt.return_error reason
+  | Ok old, Ok () ->
     let old_head = old.Head_manifest.epoch_id in
     if target < 0 then Lwt.return_error "negative_target"
     else if target >= old_head then Lwt.return_error "target_not_behind_head"
@@ -177,11 +187,11 @@ let same_source left right =
   && left.epoch_index_root = right.epoch_index_root
 
 let source_ready data_dir plan =
-  match head_at data_dir with
-  | Error reason -> Error reason
-  | Ok current when same_source current plan.Fork_repair_log.source -> Ok ()
-  | Ok current when current = plan.head -> Ok ()
-  | Ok _ -> Error "fork repair source HEAD changed"
+  match head_at data_dir, journal_allows data_dir plan.Fork_repair_log.head.epoch_id with
+  | Error reason, _ | _, Error reason -> Error reason
+  | Ok current, Ok () when same_source current plan.Fork_repair_log.source -> Ok ()
+  | Ok current, Ok () when current = plan.head -> Ok ()
+  | Ok _, Ok () -> Error "fork repair source HEAD changed"
 
 let resume_store ~data_dir ~store =
   let open Lwt.Syntax in
@@ -233,17 +243,17 @@ let resume_chain ~data_dir ~chaindata =
   | Ok (Some plan) ->
     let target = plan.head.Head_manifest.epoch_id in
     let target_head =
-      match head_at data_dir with
-      | Ok current when current = plan.head -> Ok ()
-      | Ok _ -> Error "fork repair target HEAD mismatch"
-      | Error reason -> Error reason
+      match head_at data_dir, journal_allows data_dir target with
+      | Error reason, _ | _, Error reason -> Error reason
+      | Ok current, Ok () when current = plan.head -> Ok ()
+      | Ok _, Ok () -> Error "fork repair target HEAD mismatch"
     in
     begin
       match target_head, Store_chaindata.last_epoch_id chaindata,
             plan.head.txlog_seg, plan.head.txlog_off,
             plan.head.epochlog_off, plan.head.epoch_index_hash,
             plan.head.epoch_index_root with
-      | Ok (), Ok (Some head), Some txlog_seg, Some txlog_off, Some epochlog_off,
+      | Ok (), Ok (Some head), Some _, Some _, Some epochlog_off,
         Some epoch_hash, Some epoch_root ->
         if head < target then Error "fork repair chaindata is behind target"
         else if not (empty_after chaindata ~target ~head) then
@@ -259,10 +269,7 @@ let resume_chain ~data_dir ~chaindata =
         else begin
           ignore
             (Store_chaindata.rollback_to_head chaindata
-               ~head_epoch:target
-               ~head_txlog_seg:txlog_seg
-               ~head_txlog_off:txlog_off
-               ~head_epochlog_off:epochlog_off
+               ~head:plan.head
                ~inflight_start_txid:plan.next_txid
                ~inflight_tx_count:0);
           Store_chaindata.fsync chaindata;

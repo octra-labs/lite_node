@@ -125,7 +125,7 @@ Proof.
   change (signed_parent current && linked current next &&
     (S (epoch next) =? epoch current) && (high next <=? high current) &&
     trace next rest = true) in accepted.
-  apply andb_true_iff in accepted as [checks tail].
+  apply andb_true_iff in accepted as [checks suffix].
   apply andb_true_iff in checks as [checks ordered].
   apply andb_true_iff in checks as [checks consecutive].
   apply andb_true_iff in checks as [signed link].

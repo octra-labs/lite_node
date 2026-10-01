@@ -107,6 +107,8 @@ let fold standard_mode =
     ready_exec_mode = Octra_core.Rule_graph.Prior;
     program_mode = Octra_core.Rule_graph.Prior;
     program_overlap = false;
+    fhe_work = Octra_core.Rule_graph.Prior;
+    wasm_float = Octra_core.Rule_graph.Prior;
     math = false;
     cap_mode = Octra_core.Set_fold.Prune;
     ready_config_hash = Some "ready";
@@ -167,7 +169,7 @@ let test_reward_plan () =
   expect "final mint exact" (Z.equal final.X.base_reward (Z.of_int 7));
   expect "final pool empty" (Z.equal final.new_emission_remaining Z.zero);
   expect "hard cap exact" (Z.equal final.new_total_supply max);
-  let tail =
+  let suffix =
     X.build_reward_plan
       ~fee_burn_active:false
       ~supply_retired:Z.zero
@@ -175,16 +177,16 @@ let test_reward_plan () =
       ~emission_remaining:Z.zero
       ~confirmed_fees:(Z.of_int 5)
       ~prev_supply:max
-    |> expect_ok "fee tail"
+    |> expect_ok "fee suffix"
   in
-  expect "fee tail has no mint" (Z.equal tail.base_reward Z.zero);
-  expect "fee tail preserves supply" (Z.equal tail.new_total_supply max);
-  expect "fee tail redistributes fees" (Z.equal tail.total_reward (Z.of_int 5));
+  expect "fee suffix has no mint" (Z.equal suffix.base_reward Z.zero);
+  expect "fee suffix preserves supply" (Z.equal suffix.new_total_supply max);
+  expect "fee suffix redistributes fees" (Z.equal suffix.total_reward (Z.of_int 5));
   expect "distribution exact"
     (Z.equal
-       (Z.add tail.proposer_total
-          (Z.mul tail.each_validator (Z.of_int 3)))
-       tail.total_reward);
+       (Z.add suffix.proposer_total
+          (Z.mul suffix.each_validator (Z.of_int 3)))
+       suffix.total_reward);
   expect "pool above headroom rejected"
     (match X.build_reward_plan
        ~fee_burn_active:false
@@ -493,6 +495,8 @@ let test_integer_work_gate () =
           store;
           get_fhe_pubkey = (fun _ -> None);
           proof_mode;
+          fhe_work = Octra_core.Rule_graph.Prior;
+          wasm_float = Octra_core.Rule_graph.Prior;
           math = false;
           object_cost = false;
           current_epoch = 0;
@@ -610,14 +614,14 @@ let test_upgrade_ready_refresh () =
 let test_reward_properties () =
   let max = Octra_core.Denomination.max_supply in
   let divisor = X.emission_divisor in
-  let tail = X.emission_tail in
-  let threshold = Z.mul divisor tail in
+  let suffix = X.emission_floor in
+  let threshold = Z.mul divisor suffix in
   let remaining_values = [
     Z.zero;
     Z.one;
-    Z.pred tail;
-    tail;
-    Z.succ tail;
+    Z.pred suffix;
+    suffix;
+    Z.succ suffix;
     Z.pred divisor;
     divisor;
     Z.succ divisor;

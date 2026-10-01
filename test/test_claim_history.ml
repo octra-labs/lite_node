@@ -667,9 +667,9 @@ let interval_case mode sender_key receiver_key transfer receipt deposit withdraw
         (result.sum.records = 4 && result.sum.changes = 2 && result.sum.received = 1);
       check "interval final cipher"
         (result.source_cipher_hash = Octra_core.Pvac_migration_admission.source_cipher_hash cipher);
-      let tail = total ~first_epoch:1 ~max_records:2 () |> unwrap in
+      let suffix = total ~first_epoch:1 ~max_records:2 () |> unwrap in
       check "source before empty starting state"
-        (tail.sum.commitment = result.sum.commitment && tail.sum.records = 2);
+        (suffix.sum.commitment = result.sum.commitment && suffix.sum.records = 2);
       let sender_total = total ~address:sender ~last_epoch:1 ~max_records:2 () |> unwrap in
       check "interval unclaimed sender debit" (sender_total.sum.commitment =
         b64 (P.pedersen_sub (P.pedersen_commit_amount 100L (bytes '\000'))

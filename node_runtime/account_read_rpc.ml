@@ -47,9 +47,11 @@ let account_cipher account =
 
 let public_cipher cipher =
   Octra_core.Crypto.FheBalance.public_cipher cipher
+  |> Result.map_error (fun _ ->
+    Rpc.err (-32005) "encrypted ciphertext unavailable" None)
 
 let public_stealth_record output =
-  `Assoc [
+  Result.map (fun cipher -> `Assoc [
     "id", `Int output.Octra_core.Ledger_types.id;
     "stealth_tag", `String output.stealth_tag;
     "eph_pub", `String output.eph_pub;
@@ -58,10 +60,28 @@ let public_stealth_record output =
     "tx_hash", `String output.tx_hash;
     "claimed", `Int output.claimed;
     "claim_pub", `String output.claim_pub;
-    "delta_cipher_stored", `String (public_cipher output.delta_cipher_stored);
+    "delta_cipher_stored", `String cipher;
     "amount_hash", `String output.amount_hash;
     "amount_commitment", `String output.amount_commitment;
-  ]
+  ]) (public_cipher output.Octra_core.Ledger_types.delta_cipher_stored)
+
+let public_outputs outputs =
+  List.map (fun output ->
+    match public_stealth_record output with
+    | Ok value -> value
+    | Error error ->
+      Octra_log.warn "rpc"
+        "event = stealth_cipher_unreadable id = %d epoch = %d"
+        output.Octra_core.Ledger_types.id output.epoch_id;
+      `Assoc [
+        "id", `Int output.id;
+        "epoch_id", `Int output.epoch_id;
+        "tx_hash", `String output.tx_hash;
+        "error", `Assoc [
+          "code", `Int error.Rpc.code;
+          "message", `String error.message;
+        ];
+      ]) outputs
 
 let balance ledger ~params =
   Lwt.return
@@ -170,7 +190,8 @@ let pvac_migration_status
          admissions)
 
 let encrypted_cipher ~addr ~account =
-  ok (Rpc_view.encrypted_cipher ~addr ~cipher:(public_cipher (account_cipher account)))
+  Lwt.return (Result.map (fun cipher -> Rpc_view.encrypted_cipher ~addr ~cipher)
+    (public_cipher (account_cipher account)))
 
 let encrypted_balance store ledger ~params ~addr =
   match Tx_view.encrypted_balance_auth params ~addr with
@@ -230,11 +251,12 @@ let stealth_outputs store ~params =
       ~before_id:None
       ~limit:256
   in
+  let outputs = public_outputs page.outputs in
   ok
     (Rpc_view.stealth_outputs_page
        ~from_epoch
        ~before_id:None
-       ~outputs:(List.map public_stealth_record page.outputs)
+       ~outputs
        ~next_before_id:page.next_before_id
        ~has_more:page.has_more
        ~scanned:page.scanned)
@@ -282,11 +304,12 @@ let stealth_outputs_page store ~params =
         ~before_id
         ~limit
     in
+    let outputs = public_outputs page.outputs in
     ok
       (Rpc_view.stealth_outputs_page
          ~from_epoch
          ~before_id
-         ~outputs:(List.map public_stealth_record page.outputs)
+         ~outputs
          ~next_before_id:page.next_before_id
          ~has_more:page.has_more
          ~scanned:page.scanned)
@@ -320,10 +343,11 @@ let stealth_outputs_by_id store ~params =
   | Ok ids ->
     let open Lwt.Syntax in
     let* outputs = Octra_core.Store_irmin.get_stealth_outputs_by_ids store ids in
+    let outputs = public_outputs outputs in
     ok
       (Rpc_view.stealth_outputs_by_id
          ~requested:(List.length ids)
-         ~outputs:(List.map public_stealth_record outputs))
+         ~outputs)
 
 let account chaindata ~params ~profile_enabled ~started_at ~addr ~account =
   let t0 = started_at in

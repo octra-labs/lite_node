@@ -250,7 +250,7 @@ and parse_self_access ts field =
   | TkDot ->
     eat ts;
     let first = expect_ident ts in
-    EStoragePath (field, keys, parse_storage_path_tail ts first)
+    EStoragePath (field, keys, parse_storage_path_remainder ts first)
   | _ ->
     if keys = [] then EField field else EIndex (field, keys)
 
@@ -265,7 +265,7 @@ and parse_index_chain ts =
     | _ -> List.rev acc
   in go []
 
-and parse_storage_path_tail ts first =
+and parse_storage_path_remainder ts first =
   let rec go acc =
     match peek_token ts with
     | TkDot ->
@@ -492,7 +492,7 @@ and parse_self_stmt ts =
   | Some keys, TkDot ->
     eat ts;
     let first = expect_ident ts in
-    let path = parse_storage_path_tail ts first in
+    let path = parse_storage_path_remainder ts first in
     (match peek_token ts with
      | TkPlusEq | TkMinusEq | TkStarEq | TkSlashEq ->
        let op = match compound_op ts with Some o -> o | None -> assert false in
@@ -528,7 +528,7 @@ and parse_self_stmt ts =
        in
        SFieldCall (field, first, go [])
      | _ ->
-       let path = parse_storage_path_tail ts first in
+       let path = parse_storage_path_remainder ts first in
        (match peek_token ts with
         | TkPlusEq | TkMinusEq | TkStarEq | TkSlashEq ->
           let op = match compound_op ts with Some o -> o | None -> assert false in

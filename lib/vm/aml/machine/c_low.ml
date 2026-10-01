@@ -352,16 +352,16 @@ let term term =
   let* term, _ = lower [] C_nat.zero term in
   Ok term
 
-let rec name_order term tail =
+let rec name_order term remainder =
   match term with
   | C_syn.KUnit | C_syn.KBool _ | C_syn.KInt _ | C_syn.KBytes _
-  | C_syn.Var _ -> tail
+  | C_syn.Var _ -> remainder
   | C_syn.KVec (_, values) | C_syn.KSeq (_, _, values) ->
-    List.fold_right name_order values tail
+    List.fold_right name_order values remainder
   | C_syn.Let (bind, value, body) ->
-    name_order value (bind.name :: name_order body tail)
+    name_order value (bind.name :: name_order body remainder)
   | C_syn.If (guard, yes, no) ->
-    name_order guard (name_order yes (name_order no tail))
+    name_order guard (name_order yes (name_order no remainder))
   | C_syn.Pair (left, right)
   | C_syn.Add (left, right)
   | C_syn.Sub (left, right)
@@ -373,27 +373,27 @@ let rec name_order term tail =
   | C_syn.Cat (left, right)
   | C_syn.Vcat (left, right)
   | C_syn.Step (left, right) ->
-    name_order left (name_order right tail)
+    name_order left (name_order right remainder)
   | C_syn.Unpair (pair, left, right, body) ->
-    name_order pair (left.name :: right.name :: name_order body tail)
+    name_order pair (left.name :: right.name :: name_order body remainder)
   | C_syn.Fst value | C_syn.Snd value | C_syn.Inl (value, _)
   | C_syn.Inr (_, value) | C_syn.Act (_, value) | C_syn.Neg value
   | C_syn.Abs value | C_syn.Fit (_, value) | C_syn.Wide value
   | C_syn.Length value | C_syn.Take (_, value) | C_syn.Drop (_, value)
   | C_syn.At (_, value) | C_syn.Uncons value | C_syn.Close value ->
-    name_order value tail
+    name_order value remainder
   | C_syn.Case (value, left, yes, right, no) ->
     name_order value
-      (left.name :: name_order yes (right.name :: name_order no tail))
+      (left.name :: name_order yes (right.name :: name_order no remainder))
   | C_syn.Vfold (vector, seed, fold) ->
     name_order vector
       (name_order seed
-        (fold.item.name :: fold.state.name :: name_order fold.body tail))
+        (fold.item.name :: fold.state.name :: name_order fold.body remainder))
 
 let names inputs term =
   let ordered =
     List.fold_right
-      (fun (bind : C_syn.bind) tail -> bind.name :: tail)
+      (fun (bind : C_syn.bind) remainder -> bind.name :: remainder)
       inputs
       (name_order term [])
   in

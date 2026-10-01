@@ -4,7 +4,7 @@
 module Capacity = Octra_node_runtime.Circle_view_capacity
 
 let fail message =
-  failwith ("test_node_runtime_circle_view_capacity: " ^ message)
+  failwith ("test_circle_view_cap: " ^ message)
 
 let test_busy_and_release () =
   let capacity = Capacity.create ~limit:1 in
@@ -60,4 +60,4 @@ let test_timeout_and_cancel () =
 let () =
   test_busy_and_release ();
   test_timeout_and_cancel ();
-  print_endline "test_node_runtime_circle_view_capacity: ok"
+  print_endline "status = pass test = circle_view_cap"

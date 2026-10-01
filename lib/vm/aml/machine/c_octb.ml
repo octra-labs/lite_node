@@ -292,14 +292,14 @@ let ( let* ) value next =
   | Ok value -> next value
   | Error error -> Error error
 
-let empty tail = tail
+let empty remainder = remainder
 let view env =
   List.map
     (fun item -> C_live.slot item.bind.C_term.id item.bind.mul item.live)
     env
 
-let one env at asm tail = { asm; at; live = view env } :: tail
-let cat left right tail = left (right tail)
+let one env at asm remainder = { asm; at; live = view env } :: remainder
+let cat left right remainder = left (right remainder)
 
 let order env at rel left right =
   let op value = one env at (Op value) in
@@ -485,8 +485,8 @@ and clone_vec env at values state =
   | [] -> Ok ([], state, empty)
   | first :: rest ->
     let* head, state, head_seq = clone env at first state in
-    let* tail, state, tail_seq = clone_vec env at rest state in
-    Ok (head :: tail, state, cat head_seq tail_seq)
+    let* remainder, state, remainder_seq = clone_vec env at rest state in
+    Ok (head :: remainder, state, cat head_seq remainder_seq)
 
 let rec copy env at src dst =
   match src, dst with
@@ -509,7 +509,7 @@ and copy_vec env at source target =
   | [], [] -> Some empty
   | src :: srest, dst :: drest ->
     Option.bind (copy env at src dst) (fun head ->
-      Option.map (fun tail -> cat head tail) (copy_vec env at srest drest))
+      Option.map (fun remainder -> cat head remainder) (copy_vec env at srest drest))
   | _ -> None
 
 let release_all values state =
@@ -596,8 +596,8 @@ let same_cell left right =
 let rec same_env left right =
   match left, right with
   | [], [] -> true
-  | lhead :: ltail, rhead :: rtail ->
-    same_cell lhead rhead && same_env ltail rtail
+  | lhead :: lremainder, rhead :: rremainder ->
+    same_cell lhead rhead && same_env lremainder rremainder
   | _ -> false
 
 let regs env =
@@ -609,8 +609,8 @@ let live_regs env =
       if item.live then layout_regs item.layout out else out)
     env []
 
-let exact tail = function
-  | value :: rest when rest = tail -> Some value
+let exact remainder = function
+  | value :: rest when rest = remainder -> Some value
   | _ -> None
 
 let num_range = function
@@ -662,9 +662,9 @@ let rec lower env state stack code loc =
   | C_mach.Plus rest, C_mach.LPlus (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Plus (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -672,9 +672,9 @@ let rec lower env state stack code loc =
   | C_mach.Minus rest, C_mach.LMinus (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Minus (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -682,9 +682,9 @@ let rec lower env state stack code loc =
   | C_mach.Times rest, C_mach.LTimes (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Times (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -692,9 +692,9 @@ let rec lower env state stack code loc =
   | C_mach.Quot rest, C_mach.LQuot (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Quotient (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -702,9 +702,9 @@ let rec lower env state stack code loc =
   | C_mach.Rem rest, C_mach.LRem (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Remainder (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -712,8 +712,8 @@ let rec lower env state stack code loc =
   | C_mach.Negate rest, C_mach.LNegate (at, lrest) ->
     begin
       match stack with
-      | Atom value :: tail ->
-        let* next = lower env state (Atom value :: tail) rest lrest in
+      | Atom value :: remainder ->
+        let* next = lower env state (Atom value :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Negate (value, value)))) next.seq }
       | _ -> Error Stack
@@ -721,8 +721,8 @@ let rec lower env state stack code loc =
   | C_mach.Absolute rest, C_mach.LAbsolute (at, lrest) ->
     begin
       match stack with
-      | Atom value :: tail ->
-        let* next = lower env state (Atom value :: tail) rest lrest in
+      | Atom value :: remainder ->
+        let* next = lower env state (Atom value :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Absolute (value, value)))) next.seq }
       | _ -> Error Stack
@@ -730,9 +730,9 @@ let rec lower env state stack code loc =
   | C_mach.Same rest, C_mach.LSame (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Same (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -740,9 +740,9 @@ let rec lower env state stack code loc =
   | C_mach.Different rest, C_mach.LDifferent (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Different (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -751,18 +751,18 @@ let rec lower env state stack code loc =
       when rel = found ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with seq = cat (order env at rel left right) next.seq }
       | _ -> Error Stack
     end
   | C_mach.Join rest, C_mach.LJoin (at, lrest) ->
     begin
       match stack with
-      | Atom right :: Atom left :: tail ->
+      | Atom right :: Atom left :: remainder ->
         let state = release right state in
-        let* next = lower env state (Atom left :: tail) rest lrest in
+        let* next = lower env state (Atom left :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Join (left, left, right)))) next.seq }
       | _ -> Error Stack
@@ -807,22 +807,22 @@ let rec lower env state stack code loc =
   | C_mach.Duo rest, C_mach.LDuo (_, lrest) ->
     begin
       match stack with
-      | right :: left :: tail ->
-        lower env state (Pair (left, right) :: tail) rest lrest
+      | right :: left :: remainder ->
+        lower env state (Pair (left, right) :: remainder) rest lrest
       | _ -> Error Stack
     end
   | C_mach.First rest, C_mach.LFirst (_, lrest) ->
     begin
       match stack with
-      | Pair (left, right) :: tail ->
-        lower env (release_layout right state) (left :: tail) rest lrest
+      | Pair (left, right) :: remainder ->
+        lower env (release_layout right state) (left :: remainder) rest lrest
       | _ -> Error Stack
     end
   | C_mach.Second rest, C_mach.LSecond (_, lrest) ->
     begin
       match stack with
-      | Pair (left, right) :: tail ->
-        lower env (release_layout left state) (right :: tail) rest lrest
+      | Pair (left, right) :: remainder ->
+        lower env (release_layout left state) (right :: remainder) rest lrest
       | _ -> Error Stack
     end
   | C_mach.Empty (elem, rest), C_mach.LEmpty (_, lrest) ->
@@ -830,26 +830,26 @@ let rec lower env state stack code loc =
   | C_mach.Cons rest, C_mach.LCons (_, lrest) ->
     begin
       match stack with
-      | Vec (elem, values) :: first :: tail when fits elem first ->
-        lower env state (Vec (elem, first :: values) :: tail) rest lrest
+      | Vec (elem, values) :: first :: remainder when fits elem first ->
+        lower env state (Vec (elem, first :: values) :: remainder) rest lrest
       | _ -> Error Stack
     end
   | C_mach.Append rest, C_mach.LAppend (_, lrest) ->
     begin
       match stack with
-      | Vec (right_elem, right) :: Vec (left_elem, left) :: tail
+      | Vec (right_elem, right) :: Vec (left_elem, left) :: remainder
           when C_mach.same_shape left_elem right_elem ->
-        lower env state (Vec (left_elem, left @ right) :: tail) rest lrest
+        lower env state (Vec (left_elem, left @ right) :: remainder) rest lrest
       | _ -> Error Stack
     end
   | C_mach.Pick (index, rest), C_mach.LPick (found, _, lrest)
       when C_nat.equal index found ->
     begin
       match stack with
-      | Vec (_, values) :: tail ->
+      | Vec (_, values) :: remainder ->
         begin
           match pick_layout (C_nat.to_int index) values state with
-          | Some (value, state) -> lower env state (value :: tail) rest lrest
+          | Some (value, state) -> lower env state (value :: remainder) rest lrest
           | None -> Error Stack
         end
       | _ -> Error Stack
@@ -857,17 +857,17 @@ let rec lower env state stack code loc =
   | C_mach.Unhead rest, C_mach.LUnhead (_, lrest) ->
     begin
       match stack with
-      | Vec (elem, first :: values) :: tail ->
+      | Vec (elem, first :: values) :: remainder ->
         lower env state
-          (Pair (first, Vec (elem, values)) :: tail) rest lrest
+          (Pair (first, Vec (elem, values)) :: remainder) rest lrest
       | _ -> Error Stack
     end
   | C_mach.Left rest, C_mach.LLeft (at, lrest) ->
     begin
       match stack with
-      | payload :: tail ->
+      | payload :: remainder ->
         let* tag, state = fresh_reg state in
-        let* next = lower env state (Sum (tag, payload) :: tail) rest lrest in
+        let* next = lower env state (Sum (tag, payload) :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Load (tag, C_emit.Bool true)))) next.seq }
       | [] -> Error Stack
@@ -875,9 +875,9 @@ let rec lower env state stack code loc =
   | C_mach.Right rest, C_mach.LRight (at, lrest) ->
     begin
       match stack with
-      | payload :: tail ->
+      | payload :: remainder ->
         let* tag, state = fresh_reg state in
-        let* next = lower env state (Sum (tag, payload) :: tail) rest lrest in
+        let* next = lower env state (Sum (tag, payload) :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Load (tag, C_emit.Bool false)))) next.seq }
       | [] -> Error Stack
@@ -885,7 +885,7 @@ let rec lower env state stack code loc =
   | C_mach.Pack (cap, typ, rest), C_mach.LPack (at, lrest) ->
     begin
       match stack, C_mach.shape_of typ with
-      | Vec (form, values) :: tail, Some expected
+      | Vec (form, values) :: remainder, Some expected
           when List.length values <= C_nat.to_int cap
             && C_mach.same_shape form expected ->
         let count = List.length values in
@@ -896,7 +896,7 @@ let rec lower env state stack code loc =
         let packed =
           Pair (Atom len_reg, Vec (form, values @ pad))
         in
-        let* next = lower env state (packed :: tail) rest lrest in
+        let* next = lower env state (packed :: remainder) rest lrest in
         let len = one env at (Op (Load (len_reg, C_emit.Int (Z.of_int count)))) in
         Ok { next with seq = cat len (cat loads next.seq) }
       | _ -> Error Stack
@@ -904,19 +904,19 @@ let rec lower env state stack code loc =
   | C_mach.Fit (typ, rest), C_mach.LFit (at, lrest) ->
     begin
       match stack, num_range typ with
-      | Atom value :: tail, Some (low, high) ->
+      | Atom value :: remainder, Some (low, high) ->
         let* tag, state = fresh_reg state in
         let* scratch, state = fresh_reg state in
         let low_at, state = fresh_label state in
         let bad_at, state = fresh_label state in
         let done_at, state = fresh_label state in
         let state = release scratch state in
-        let* next = lower env state (Sum (tag, Atom value) :: tail) rest lrest in
-        let rec noops count tail =
-          if count = 0 then tail
-          else one env at (Op Noop) (noops (count - 1) tail)
+        let* next = lower env state (Sum (tag, Atom value) :: remainder) rest lrest in
+        let rec noops count remainder =
+          if count = 0 then remainder
+          else one env at (Op Noop) (noops (count - 1) remainder)
         in
-        let code tail =
+        let code remainder =
           one env at (Op (Load (scratch, C_emit.Int low)))
             (one env at (Op (Less (tag, value, scratch)))
               (one env at (Branch (tag, low_at))
@@ -929,7 +929,7 @@ let rec lower env state stack code loc =
                             (noops 7
                               (one env at (Place bad_at)
                                 (one env at (Op (Load (tag, C_emit.Bool false)))
-                                  (one env at (Place done_at) tail))))))))))))
+                                  (one env at (Place done_at) remainder))))))))))))
         in
         Ok { next with seq = cat code next.seq }
       | _ -> Error Stack
@@ -945,9 +945,9 @@ let rec lower env state stack code loc =
   | C_mach.Close (kind, rest), C_mach.LClose (at, lrest) ->
     begin
       match stack with
-      | Atom reg :: tail ->
+      | Atom reg :: remainder ->
         let state = release reg state in
-        let* next = lower env state (Unit :: tail) rest lrest in
+        let* next = lower env state (Unit :: remainder) rest lrest in
         Ok { next with
           seq = cat (one env at (Op (Cap_close (kind, reg)))) next.seq }
       | _ -> Error Stack
@@ -955,15 +955,15 @@ let rec lower env state stack code loc =
   | C_mach.Scope (bind, body, rest), C_mach.LScope (_, lbody, lrest) ->
     begin
       match stack with
-      | value :: tail ->
+      | value :: remainder ->
         let* opened =
           match open_cell bind value env with
           | Some value -> Ok value
           | None -> Error Slot
         in
-        let* body_out = lower opened state tail body lbody in
+        let* body_out = lower opened state remainder body lbody in
         begin
-          match exact tail body_out.stack with
+          match exact remainder body_out.stack with
           | None -> Error Stack
           | Some _ ->
             let* closed =
@@ -981,7 +981,7 @@ let rec lower env state stack code loc =
       C_mach.LScope2 (_, lbody, lrest) ->
     begin
       match stack with
-      | Pair (left, right) :: tail ->
+      | Pair (left, right) :: remainder ->
         let* first =
           match open_cell left_bind left env with
           | Some value -> Ok value
@@ -992,9 +992,9 @@ let rec lower env state stack code loc =
           | Some value -> Ok value
           | None -> Error Slot
         in
-        let* body_out = lower opened state tail body lbody in
+        let* body_out = lower opened state remainder body lbody in
         begin
-          match exact tail body_out.stack with
+          match exact remainder body_out.stack with
           | None -> Error Stack
           | Some _ ->
             let* last =
@@ -1022,7 +1022,7 @@ let rec lower env state stack code loc =
           C_mach.shape_of item_bind.C_term.typ,
           C_mach.shape_of state_bind.C_term.typ with
       | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> Error Slot
-      | _, _, state_value :: Vec (elem, values) :: tail, Some item_shape,
+      | _, _, state_value :: Vec (elem, values) :: remainder, Some item_shape,
           Some state_shape
           when List.length values = C_nat.to_int len
             && C_mach.same_shape item_shape elem
@@ -1030,7 +1030,7 @@ let rec lower env state stack code loc =
             && List.for_all (fits elem) values ->
         let rec loop env state state_value seq = function
           | [] ->
-            let* next = lower env state (state_value :: tail) rest lrest in
+            let* next = lower env state (state_value :: remainder) rest lrest in
             Ok { next with seq = cat seq next.seq }
           | item_value :: values ->
             let* first =
@@ -1043,9 +1043,9 @@ let rec lower env state stack code loc =
               | Some value -> Ok value
               | None -> Error Slot
             in
-            let* body_out = lower opened state tail body lbody in
+            let* body_out = lower opened state remainder body lbody in
             begin
-              match exact tail body_out.stack with
+              match exact remainder body_out.stack with
               | None -> Error Stack
               | Some next_state ->
                 let* last =
@@ -1075,7 +1075,7 @@ let rec lower env state stack code loc =
           C_mach.shape_of item_bind.C_term.typ,
           C_mach.shape_of state_bind.C_term.typ with
       | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> Error Slot
-      | _, _, state_value :: Pair (Atom len_reg, Vec (elem, values)) :: tail,
+      | _, _, state_value :: Pair (Atom len_reg, Vec (elem, values)) :: remainder,
           Some item_shape, Some state_shape
           when List.length values = C_nat.to_int cap
             && C_mach.same_shape item_shape elem
@@ -1084,7 +1084,7 @@ let rec lower env state stack code loc =
         let rec loop index env state state_value seq = function
           | [] ->
             let state = release len_reg state in
-            let* next = lower env state (state_value :: tail) rest lrest in
+            let* next = lower env state (state_value :: remainder) rest lrest in
             Ok { next with seq = cat seq next.seq }
           | item_value :: values ->
             let* dst, state = alloc state_shape state in
@@ -1103,9 +1103,9 @@ let rec lower env state stack code loc =
               | Some value -> Ok value
               | None -> Error Slot
             in
-            let* body_out = lower opened body_state tail body lbody in
+            let* body_out = lower opened body_state remainder body lbody in
             let* next_state =
-              match exact tail body_out.stack with
+              match exact remainder body_out.stack with
               | Some value -> Ok value
               | None -> Error Stack
             in
@@ -1135,7 +1135,7 @@ let rec lower env state stack code loc =
               let live =
                 len_reg :: layout_regs dst
                   (List.fold_right layout_regs values
-                    (List.fold_right layout_regs tail (live_regs env)))
+                    (List.fold_right layout_regs remainder (live_regs env)))
               in
               let state = {
                 next = next_reg;
@@ -1163,7 +1163,7 @@ let rec lower env state stack code loc =
       C_mach.LChoice (at, yes_at, no_at, lyes, lno, lrest) ->
     begin
       match stack with
-      | Sum (guard, payload) :: tail ->
+      | Sum (guard, payload) :: remainder ->
         let state = release guard state in
         let* dst, state = alloc form state in
         let yes_label, state = fresh_label state in
@@ -1173,7 +1173,7 @@ let rec lower env state stack code loc =
           | Some value -> Ok value
           | None -> Error Slot
         in
-        let* no_out = lower no_env state tail no lno in
+        let* no_out = lower no_env state remainder no lno in
         let* no_closed =
           match close_cell right_bind no_out.env with
           | Some value -> Ok value
@@ -1185,14 +1185,14 @@ let rec lower env state stack code loc =
           | Some value -> Ok value
           | None -> Error Slot
         in
-        let* yes_out = lower yes_env yes_start tail yes lyes in
+        let* yes_out = lower yes_env yes_start remainder yes lyes in
         let* yes_closed =
           match close_cell left_bind yes_out.env with
           | Some value -> Ok value
           | None -> Error Slot
         in
         begin
-          match exact tail no_out.stack, exact tail yes_out.stack with
+          match exact remainder no_out.stack, exact remainder yes_out.stack with
           | Some no_value, Some yes_value
               when same_env no_closed yes_closed
                 && fits form no_value && fits form yes_value ->
@@ -1209,14 +1209,14 @@ let rec lower env state stack code loc =
             let next_reg = Int.max no_out.gen.next yes_out.gen.next in
             let live =
               layout_regs dst
-                (List.fold_right layout_regs tail (regs no_closed))
+                (List.fold_right layout_regs remainder (regs no_closed))
             in
             let state = {
               next = next_reg;
               free = avail next_reg live;
               label = yes_out.gen.label;
             } in
-            let* next = lower no_closed state (dst :: tail) rest lrest in
+            let* next = lower no_closed state (dst :: remainder) rest lrest in
             let branch =
               cat (one env at (Branch (guard, yes_label)))
                 (cat no_out.seq
@@ -1237,16 +1237,16 @@ let rec lower env state stack code loc =
       C_mach.LFork (at, yes_at, no_at, lyes, lno, lrest) ->
     begin
       match stack with
-      | Atom guard :: tail ->
+      | Atom guard :: remainder ->
         let state = release guard state in
         let* dst, state = alloc form state in
         let yes_label, state = fresh_label state in
         let end_label, state = fresh_label state in
-        let* no_out = lower env state tail no lno in
+        let* no_out = lower env state remainder no lno in
         let yes_start = { state with label = no_out.gen.label } in
-        let* yes_out = lower env yes_start tail yes lyes in
+        let* yes_out = lower env yes_start remainder yes lyes in
         begin
-          match exact tail no_out.stack, exact tail yes_out.stack with
+          match exact remainder no_out.stack, exact remainder yes_out.stack with
           | Some no_value, Some yes_value
               when same_env no_out.env yes_out.env
                 && fits form no_value && fits form yes_value ->
@@ -1263,7 +1263,7 @@ let rec lower env state stack code loc =
             let next_reg = Int.max no_out.gen.next yes_out.gen.next in
             let live =
               layout_regs dst
-                (List.fold_right layout_regs tail (regs no_out.env))
+                (List.fold_right layout_regs remainder (regs no_out.env))
             in
             let state = {
               next = next_reg;
@@ -1271,7 +1271,7 @@ let rec lower env state stack code loc =
               label = yes_out.gen.label;
             } in
             let* next =
-              lower no_out.env state (dst :: tail) rest lrest
+              lower no_out.env state (dst :: remainder) rest lrest
             in
             let branch =
               cat (one env at (Branch (guard, yes_label)))
@@ -1748,7 +1748,7 @@ let result_code typ code =
   else
     let body = Array.sub code 0 (count - 1) in
     let first = Array.length body in
-    let tail =
+    let remainder =
       match typ with
       | C_type.Int -> [|
           Load (61, C_emit.Int Z.zero);
@@ -1785,7 +1785,7 @@ let result_code typ code =
       | C_type.Unit | C_type.Num _ | C_type.Vec _ | C_type.Seq _
       | C_type.Cap _ | C_type.Enc _ | C_type.Pair _ | C_type.Sum _ -> [||]
     in
-    if Array.length tail = 0 then None else Some (Array.append body tail)
+    if Array.length remainder = 0 then None else Some (Array.append body remainder)
 
 let encode_scalar emission veil inputs regs typ code =
   let* code =
@@ -1825,7 +1825,7 @@ let scalar_type = function
 let range_code label_of reg low high label =
   let bad = label_of label in
   let done_at = label_of (label + 1) in
-  let code tail =
+  let code remainder =
     Contract_vm.LDI (61, Contract_vm.VInt low)
     :: Contract_vm.LT (63, reg, 61)
     :: Contract_vm.JIF (63, bad)
@@ -1836,31 +1836,31 @@ let range_code label_of reg low high label =
     :: Contract_vm.JDEST bad
     :: Contract_vm.REVERT
     :: Contract_vm.JDEST done_at
-    :: tail
+    :: remainder
   in
   code, label + 2
 
 let zero_lits typ =
   Option.bind (C_eval.zero typ) (C_mach.atoms typ)
 
-let rec vm_noops count tail =
-  if count = 0 then tail
-  else Contract_vm.NOP :: vm_noops (count - 1) tail
+let rec vm_noops count remainder =
+  if count = 0 then remainder
+  else Contract_vm.NOP :: vm_noops (count - 1) remainder
 
 let rec exact_code label_of regs lits label =
   match regs, lits with
-  | [], [] -> Some ((fun tail -> tail), label)
+  | [], [] -> Some ((fun remainder -> remainder), label)
   | reg :: reg_rest, lit :: lit_rest ->
     let yes = label_of label in
     Option.map
       (fun (rest, label) ->
-        ((fun tail ->
+        ((fun remainder ->
           Contract_vm.LDI (61, vm_lit lit)
           :: Contract_vm.EQ (63, reg, 61)
           :: Contract_vm.JIF (63, yes)
           :: Contract_vm.REVERT
           :: Contract_vm.JDEST yes
-          :: rest tail), label))
+          :: rest remainder), label))
       (exact_code label_of reg_rest lit_rest (label + 1))
   | _ -> None
 
@@ -1870,14 +1870,14 @@ let zero_code label_of len_reg index regs lits label =
   Option.map
     (fun (checks, label) ->
       let work = 9 * List.length lits in
-      let code tail =
+      let code remainder =
         Contract_vm.LDI (61, Contract_vm.VInt (Z.of_int index))
         :: Contract_vm.LT (63, 61, len_reg)
         :: Contract_vm.JIF (63, active)
         :: checks
           (Contract_vm.JMP done_at
           :: Contract_vm.JDEST active
-          :: vm_noops work (Contract_vm.JDEST done_at :: tail))
+          :: vm_noops work (Contract_vm.JDEST done_at :: remainder))
       in
       code, label)
     (exact_code label_of regs lits (label + 2))
@@ -1892,12 +1892,12 @@ let rec split_regs count out regs =
 let rec data_check typ at label =
   let reg = at + 1 in
   match typ with
-  | C_type.Unit -> Ok ((fun tail -> tail), at, label)
+  | C_type.Unit -> Ok ((fun remainder -> remainder), at, label)
   | C_type.Int ->
-    Ok ((fun tail ->
+    Ok ((fun remainder ->
       Contract_vm.LDI (61, Contract_vm.VInt Z.zero)
       :: Contract_vm.SUB (reg, reg, 61)
-      :: tail), at + 1, label)
+      :: remainder), at + 1, label)
   | C_type.Num _ ->
     begin
       match num_range typ with
@@ -1909,17 +1909,17 @@ let rec data_check typ at label =
   | C_type.Bool ->
     let yes = data_label label in
     let done_at = data_label (label + 1) in
-    Ok ((fun tail ->
+    Ok ((fun remainder ->
       Contract_vm.JIF (reg, yes)
       :: Contract_vm.NOP
       :: Contract_vm.JMP done_at
       :: Contract_vm.JDEST yes
       :: Contract_vm.JMP done_at
       :: Contract_vm.JDEST done_at
-      :: tail), at + 1, label + 2)
+      :: remainder), at + 1, label + 2)
   | C_type.Bytes len ->
     let next = data_label label in
-    Ok ((fun tail ->
+    Ok ((fun remainder ->
       Contract_vm.LDI (61, Contract_vm.VBytes "")
       :: Contract_vm.EQ (63, reg, 61)
       :: Contract_vm.STRLEN (61, reg)
@@ -1930,10 +1930,10 @@ let rec data_check typ at label =
       :: Contract_vm.JDEST next
       :: Contract_vm.LDI (61, Contract_vm.VInt Z.zero)
       :: Contract_vm.SUBSTR (reg, reg, 61, 62)
-      :: tail), at + 1, label + 1)
+      :: remainder), at + 1, label + 1)
   | C_type.Cap kind ->
-    Ok ((fun tail ->
-      Contract_vm.CAP_CHECK (C_nat.to_z kind, reg) :: tail), at + 1, label)
+    Ok ((fun remainder ->
+      Contract_vm.CAP_CHECK (C_nat.to_z kind, reg) :: remainder), at + 1, label)
   | C_type.Vec (len, elem) ->
     data_checks (C_nat.to_int len) elem at label
   | C_type.Seq (cap, elem) ->
@@ -1941,7 +1941,7 @@ let rec data_check typ at label =
   | C_type.Pair (lhs, rhs) ->
     let* first, at, label = data_check lhs at label in
     let* second, at, label = data_check rhs at label in
-    Ok ((fun tail -> first (second tail)), at, label)
+    Ok ((fun remainder -> first (second remainder)), at, label)
   | C_type.Sum (lhs, rhs) ->
     let yes = data_label label in
     let done_at = data_label (label + 1) in
@@ -1949,12 +1949,12 @@ let rec data_check typ at label =
     let* left, left_at, label = data_check lhs (at + 1) label in
     if left_at <> right_at then Error Output_code
     else
-      Ok ((fun tail ->
+      Ok ((fun remainder ->
         Contract_vm.JIF (reg, yes)
         :: right
           (Contract_vm.JMP done_at
           :: Contract_vm.JDEST yes
-          :: left (Contract_vm.JDEST done_at :: tail))), left_at, label)
+          :: left (Contract_vm.JDEST done_at :: remainder))), left_at, label)
   | C_type.Enc _ -> Error Output_code
 
 and data_seq count elem at label =
@@ -1963,7 +1963,7 @@ and data_seq count elem at label =
     range_code data_label len_reg Z.zero (Z.of_int count) label
   in
   let rec walk index at label =
-    if index = count then Ok ((fun tail -> tail), at, label)
+    if index = count then Ok ((fun remainder -> remainder), at, label)
     else
       let start = at in
       let* check, at, label = data_check elem at label in
@@ -1985,17 +1985,17 @@ and data_seq count elem at label =
         | None -> Error Output_code
       in
       let* rest, at, label = walk (index + 1) at label in
-      Ok ((fun tail -> check (zero (rest tail))), at, label)
+      Ok ((fun remainder -> check (zero (rest remainder))), at, label)
   in
   let* items, at, label = walk 0 (at + 1) label in
-  Ok ((fun tail -> range (items tail)), at, label)
+  Ok ((fun remainder -> range (items remainder)), at, label)
 
 and data_checks count typ at label =
-  if count = 0 then Ok ((fun tail -> tail), at, label)
+  if count = 0 then Ok ((fun remainder -> remainder), at, label)
   else
     let* first, at, label = data_check typ at label in
     let* rest, at, label = data_checks (count - 1) typ at label in
-    Ok ((fun tail -> first (rest tail)), at, label)
+    Ok ((fun remainder -> first (rest remainder)), at, label)
 
 let data_input_code inputs =
   let rec walk at label build = function
@@ -2003,18 +2003,18 @@ let data_input_code inputs =
       if label_count label then Ok (build [], at) else Error Output_code
     | typ :: rest ->
       let* code, at, label = data_check typ at label in
-      walk at label (fun tail -> build (code tail)) rest
+      walk at label (fun remainder -> build (code remainder)) rest
   in
-  walk 0 0 (fun tail -> tail) inputs
+  walk 0 0 (fun remainder -> remainder) inputs
 
 let rec data_guard typ regs label =
   match typ, regs with
-  | C_type.Unit, _ -> Ok ((fun tail -> tail), regs, label)
+  | C_type.Unit, _ -> Ok ((fun remainder -> remainder), regs, label)
   | C_type.Int, reg :: rest ->
-    Ok ((fun tail ->
+    Ok ((fun remainder ->
       Contract_vm.LDI (61, Contract_vm.VInt Z.zero)
       :: Contract_vm.SUB (reg, reg, 61)
-      :: tail), rest, label)
+      :: remainder), rest, label)
   | (C_type.Num _ as typ), reg :: rest ->
     begin
       match num_range typ with
@@ -2026,17 +2026,17 @@ let rec data_guard typ regs label =
   | C_type.Bool, reg :: rest ->
     let yes = guard_label label in
     let done_at = guard_label (label + 1) in
-    Ok ((fun tail ->
+    Ok ((fun remainder ->
       Contract_vm.JIF (reg, yes)
       :: Contract_vm.NOP
       :: Contract_vm.JMP done_at
       :: Contract_vm.JDEST yes
       :: Contract_vm.JMP done_at
       :: Contract_vm.JDEST done_at
-      :: tail), rest, label + 2)
+      :: remainder), rest, label + 2)
   | C_type.Bytes len, reg :: rest ->
     let next = guard_label label in
-    Ok ((fun tail ->
+    Ok ((fun remainder ->
       Contract_vm.LDI (61, Contract_vm.VBytes "")
       :: Contract_vm.EQ (63, reg, 61)
       :: Contract_vm.STRLEN (61, reg)
@@ -2047,7 +2047,7 @@ let rec data_guard typ regs label =
       :: Contract_vm.JDEST next
       :: Contract_vm.LDI (61, Contract_vm.VInt Z.zero)
       :: Contract_vm.SUBSTR (reg, reg, 61, 62)
-      :: tail), rest, label + 1)
+      :: remainder), rest, label + 1)
   | C_type.Vec (len, elem), _ ->
     data_guards (C_nat.to_int len) elem regs label
   | C_type.Seq (cap, elem), _ ->
@@ -2055,7 +2055,7 @@ let rec data_guard typ regs label =
   | C_type.Pair (lhs, rhs), _ ->
     let* first, regs, label = data_guard lhs regs label in
     let* second, regs, label = data_guard rhs regs label in
-    Ok ((fun tail -> first (second tail)), regs, label)
+    Ok ((fun remainder -> first (second remainder)), regs, label)
   | C_type.Sum (lhs, rhs), reg :: rest ->
     let yes = guard_label label in
     let done_at = guard_label (label + 1) in
@@ -2063,12 +2063,12 @@ let rec data_guard typ regs label =
     let* left, left_rest, label = data_guard lhs rest label in
     if left_rest <> right_rest then Error Output_code
     else
-      Ok ((fun tail ->
+      Ok ((fun remainder ->
         Contract_vm.JIF (reg, yes)
         :: right
           (Contract_vm.JMP done_at
           :: Contract_vm.JDEST yes
-          :: left (Contract_vm.JDEST done_at :: tail))), left_rest, label)
+          :: left (Contract_vm.JDEST done_at :: remainder))), left_rest, label)
   | (C_type.Int | C_type.Num _ | C_type.Bool | C_type.Bytes _
     | C_type.Sum _), []
   | (C_type.Cap _ | C_type.Enc _), _ -> Error Output_code
@@ -2081,7 +2081,7 @@ and data_seq_guard count elem regs label =
       range_code guard_label len_reg Z.zero (Z.of_int count) label
     in
     let rec walk index regs label =
-      if index = count then Ok ((fun tail -> tail), regs, label)
+      if index = count then Ok ((fun remainder -> remainder), regs, label)
       else
         let* lits =
           match zero_lits elem with
@@ -2101,18 +2101,18 @@ and data_seq_guard count elem regs label =
             | Some value -> Ok value
             | None -> Error Output_code
           in
-          let* tail, rest, label = walk (index + 1) rest label in
-          Ok ((fun out -> check (zero (tail out))), rest, label)
+          let* remainder, rest, label = walk (index + 1) rest label in
+          Ok ((fun out -> check (zero (remainder out))), rest, label)
     in
     let* items, rest, label = walk 0 values label in
-    Ok ((fun tail -> range (items tail)), rest, label)
+    Ok ((fun remainder -> range (items remainder)), rest, label)
 
 and data_guards count typ regs label =
-  if count = 0 then Ok ((fun tail -> tail), regs, label)
+  if count = 0 then Ok ((fun remainder -> remainder), regs, label)
   else
     let* first, regs, label = data_guard typ regs label in
     let* rest, regs, label = data_guards (count - 1) typ regs label in
-    Ok ((fun tail -> first (rest tail)), regs, label)
+    Ok ((fun remainder -> first (rest remainder)), regs, label)
 
 let guard_code typ regs =
   let* build, rest, label = data_guard typ regs 0 in

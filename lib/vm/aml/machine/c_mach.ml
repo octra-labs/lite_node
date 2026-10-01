@@ -231,19 +231,19 @@ let rec value typ input =
   | C_type.Pair (lhs, rhs), _ ->
     Option.bind (value lhs input) (fun (left, rest) ->
       Option.map
-        (fun (right, tail) -> C_eval.Pair (left, right), tail)
+        (fun (right, remainder) -> C_eval.Pair (left, right), remainder)
         (value rhs rest))
   | C_type.Sum (lhs, rhs), C_emit.Bool side :: rest ->
     if side then
-      Option.map (fun (item, tail) -> C_eval.Inl item, tail) (value lhs rest)
-    else Option.map (fun (item, tail) -> C_eval.Inr item, tail) (value rhs rest)
+      Option.map (fun (item, remainder) -> C_eval.Inl item, remainder) (value lhs rest)
+    else Option.map (fun (item, remainder) -> C_eval.Inr item, remainder) (value rhs rest)
   | _ -> None
 
 and values count typ input =
   if count = 0 then Some ([], input)
   else
     Option.bind (value typ input) (fun (first, rest) ->
-      Option.map (fun (tail, left) -> first :: tail, left)
+      Option.map (fun (remainder, left) -> first :: remainder, left)
         (values (count - 1) typ rest))
 
 let rec same_shape left right =
@@ -297,8 +297,8 @@ let rec same_shapes left right =
     same_shape lhs rhs && same_shapes lrest rrest
   | _ -> false
 
-let keep_shape tail = function
-  | value :: rest when same_shapes rest tail -> Some value
+let keep_shape remainder = function
+  | value :: rest when same_shapes rest remainder -> Some value
   | _ -> None
 
 let rec flow code stack =
@@ -311,103 +311,103 @@ let rec flow code stack =
   | Same rest | Different rest | Order (_, rest) | Join rest ->
     begin
       match stack with
-      | SAtom :: SAtom :: tail -> flow rest (SAtom :: tail)
+      | SAtom :: SAtom :: remainder -> flow rest (SAtom :: remainder)
       | _ -> None
     end
   | Negate rest | Absolute rest ->
     begin
       match stack with
-      | SAtom :: tail -> flow rest (SAtom :: tail)
+      | SAtom :: remainder -> flow rest (SAtom :: remainder)
       | _ -> None
     end
   | Clip (_, rest) | Skip (_, rest) ->
     begin
       match stack with
-      | SAtom :: tail -> flow rest (SAtom :: tail)
+      | SAtom :: remainder -> flow rest (SAtom :: remainder)
       | _ -> None
     end
   | Duo rest ->
     begin
       match stack with
-      | rhs :: lhs :: tail -> flow rest (SPair (lhs, rhs) :: tail)
+      | rhs :: lhs :: remainder -> flow rest (SPair (lhs, rhs) :: remainder)
       | _ -> None
     end
   | First rest ->
     begin
       match stack with
-      | SPair (lhs, _) :: tail -> flow rest (lhs :: tail)
+      | SPair (lhs, _) :: remainder -> flow rest (lhs :: remainder)
       | _ -> None
     end
   | Second rest ->
     begin
       match stack with
-      | SPair (_, rhs) :: tail -> flow rest (rhs :: tail)
+      | SPair (_, rhs) :: remainder -> flow rest (rhs :: remainder)
       | _ -> None
     end
   | Empty (elem, rest) -> flow rest (SVec (C_nat.zero, elem) :: stack)
   | Cons rest ->
     begin
       match stack with
-      | SVec (len, elem) :: item :: tail when same_shape item elem ->
+      | SVec (len, elem) :: item :: remainder when same_shape item elem ->
         Option.bind (C_nat.add len C_nat.one) (fun next ->
-          flow rest (SVec (next, elem) :: tail))
+          flow rest (SVec (next, elem) :: remainder))
       | _ -> None
     end
   | Append rest ->
     begin
       match stack with
-      | SVec (rn, re) :: SVec (ln, le) :: tail when same_shape le re ->
+      | SVec (rn, re) :: SVec (ln, le) :: remainder when same_shape le re ->
         Option.bind (C_nat.add ln rn) (fun len ->
-          flow rest (SVec (len, le) :: tail))
+          flow rest (SVec (len, le) :: remainder))
       | _ -> None
     end
   | Pick (index, rest) ->
     begin
       match stack with
-      | SVec (len, elem) :: tail when C_nat.lt index len ->
-        flow rest (elem :: tail)
+      | SVec (len, elem) :: remainder when C_nat.lt index len ->
+        flow rest (elem :: remainder)
       | _ -> None
     end
   | Unhead rest ->
     begin
       match stack with
-      | SVec (len, elem) :: tail ->
+      | SVec (len, elem) :: remainder ->
         Option.bind (C_nat.sub len C_nat.one) (fun next ->
-          flow rest (SPair (elem, SVec (next, elem)) :: tail))
+          flow rest (SPair (elem, SVec (next, elem)) :: remainder))
       | _ -> None
     end
   | Left rest | Right rest ->
     begin
       match stack with
-      | payload :: tail -> flow rest (SSum payload :: tail)
+      | payload :: remainder -> flow rest (SSum payload :: remainder)
       | [] -> None
     end
   | Pack (cap, typ, rest) ->
     begin
       match stack, shape_of typ with
-      | SVec (len, elem) :: tail, Some found
+      | SVec (len, elem) :: remainder, Some found
           when C_nat.le len cap && same_shape elem found ->
-        flow rest (SPair (SAtom, SVec (cap, elem)) :: tail)
+        flow rest (SPair (SAtom, SVec (cap, elem)) :: remainder)
       | _ -> None
     end
   | Fit (typ, rest) ->
     begin
       match stack, typ with
-      | SAtom :: tail, C_type.Num _ when C_type.valid typ ->
-        flow rest (SSum SAtom :: tail)
+      | SAtom :: remainder, C_type.Num _ when C_type.valid typ ->
+        flow rest (SSum SAtom :: remainder)
       | _ -> None
     end
   | Wide rest ->
     begin
       match stack with
-      | SAtom :: tail -> flow rest (SAtom :: tail)
+      | SAtom :: remainder -> flow rest (SAtom :: remainder)
       | _ -> None
     end
   | Close (kind, rest) ->
     begin
       match stack with
-      | SCap found :: tail when C_nat.equal kind found ->
-        flow rest (SUnit :: tail)
+      | SCap found :: remainder when C_nat.equal kind found ->
+        flow rest (SUnit :: remainder)
       | _ -> None
     end
   | Effect (_, _, body, rest) ->
@@ -415,19 +415,19 @@ let rec flow code stack =
   | Scope (_, body, rest) ->
     begin
       match stack with
-      | _ :: tail ->
-        Option.bind (flow body tail) (fun after ->
-          Option.bind (keep_shape tail after) (fun out ->
-            flow rest (out :: tail)))
+      | _ :: remainder ->
+        Option.bind (flow body remainder) (fun after ->
+          Option.bind (keep_shape remainder after) (fun out ->
+            flow rest (out :: remainder)))
       | [] -> None
     end
   | Scope2 (_, _, body, rest) ->
     begin
       match stack with
-      | SPair _ :: tail ->
-        Option.bind (flow body tail) (fun after ->
-          Option.bind (keep_shape tail after) (fun out ->
-            flow rest (out :: tail)))
+      | SPair _ :: remainder ->
+        Option.bind (flow body remainder) (fun after ->
+          Option.bind (keep_shape remainder after) (fun out ->
+            flow rest (out :: remainder)))
       | _ -> None
     end
   | Iter (len, item, state, body, rest) ->
@@ -435,14 +435,14 @@ let rec flow code stack =
       match item.C_term.mul, state.C_term.mul, stack,
           shape_of item.C_term.typ, shape_of state.C_term.typ with
       | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> None
-      | _, _, seed :: SVec (found, elem) :: tail, Some item_shape,
+      | _, _, seed :: SVec (found, elem) :: remainder, Some item_shape,
           Some state_shape
           when C_nat.equal len found
             && same_shape item_shape elem
             && same_shape state_shape seed ->
-        Option.bind (flow body tail) (fun after ->
-          Option.bind (keep_shape tail after) (fun out ->
-            if same_shape seed out then flow rest (out :: tail) else None))
+        Option.bind (flow body remainder) (fun after ->
+          Option.bind (keep_shape remainder after) (fun out ->
+            if same_shape seed out then flow rest (out :: remainder) else None))
       | _ -> None
     end
   | Iter_seq (cap, item, state, body, rest) ->
@@ -450,14 +450,14 @@ let rec flow code stack =
       match item.C_term.mul, state.C_term.mul, stack,
           shape_of item.C_term.typ, shape_of state.C_term.typ with
       | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> None
-      | _, _, seed :: SPair (SAtom, SVec (found, elem)) :: tail,
+      | _, _, seed :: SPair (SAtom, SVec (found, elem)) :: remainder,
           Some item_shape, Some state_shape
           when C_nat.equal cap found
             && same_shape item_shape elem
             && same_shape state_shape seed ->
-        Option.bind (flow body tail) (fun after ->
-          Option.bind (keep_shape tail after) (fun out ->
-            if same_shape seed out then flow rest (out :: tail) else None))
+        Option.bind (flow body remainder) (fun after ->
+          Option.bind (keep_shape remainder after) (fun out ->
+            if same_shape seed out then flow rest (out :: remainder) else None))
       | _ -> None
     end
   | Choice (left, yes, right, no, form, rest) ->
@@ -465,28 +465,28 @@ let rec flow code stack =
       match left.C_term.mul, right.C_term.mul, stack,
           shape_of left.C_term.typ, shape_of right.C_term.typ with
       | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> None
-      | _, _, SSum payload :: tail, Some left_shape, Some right_shape
+      | _, _, SSum payload :: remainder, Some left_shape, Some right_shape
           when same_shape payload left_shape
             && same_shape payload right_shape ->
-        Option.bind (flow yes tail) (fun yafter ->
-          Option.bind (flow no tail) (fun nafter ->
-            Option.bind (keep_shape tail yafter) (fun yout ->
-              Option.bind (keep_shape tail nafter) (fun nout ->
+        Option.bind (flow yes remainder) (fun yafter ->
+          Option.bind (flow no remainder) (fun nafter ->
+            Option.bind (keep_shape remainder yafter) (fun yout ->
+              Option.bind (keep_shape remainder nafter) (fun nout ->
                 if same_shape form yout && same_shape form nout then
-                  flow rest (form :: tail)
+                  flow rest (form :: remainder)
                 else None))))
       | _ -> None
     end
   | Fork (form, yes, no, rest) ->
     begin
       match stack with
-      | SAtom :: tail ->
-        Option.bind (flow yes tail) (fun yafter ->
-          Option.bind (flow no tail) (fun nafter ->
-            Option.bind (keep_shape tail yafter) (fun yout ->
-              Option.bind (keep_shape tail nafter) (fun nout ->
+      | SAtom :: remainder ->
+        Option.bind (flow yes remainder) (fun yafter ->
+          Option.bind (flow no remainder) (fun nafter ->
+            Option.bind (keep_shape remainder yafter) (fun yout ->
+              Option.bind (keep_shape remainder nafter) (fun nout ->
                 if same_shape form yout && same_shape form nout then
-                  flow rest (form :: tail)
+                  flow rest (form :: remainder)
                 else None))))
       | _ -> None
     end
@@ -501,53 +501,53 @@ let rec find_bind id = function
   | item :: _ when C_nat.equal id item.C_term.id -> Some item
   | _ :: rest -> find_bind id rest
 
-let rec continue code tail =
+let rec continue code remainder =
   match code with
-  | Done -> tail
-  | Push (value, rest) -> Push (value, continue rest tail)
-  | Void rest -> Void (continue rest tail)
-  | Get (id, shape, rest) -> Get (id, shape, continue rest tail)
-  | Plus rest -> Plus (continue rest tail)
-  | Minus rest -> Minus (continue rest tail)
-  | Times rest -> Times (continue rest tail)
-  | Quot rest -> Quot (continue rest tail)
-  | Rem rest -> Rem (continue rest tail)
-  | Negate rest -> Negate (continue rest tail)
-  | Absolute rest -> Absolute (continue rest tail)
-  | Same rest -> Same (continue rest tail)
-  | Different rest -> Different (continue rest tail)
-  | Order (rel, rest) -> Order (rel, continue rest tail)
-  | Join rest -> Join (continue rest tail)
-  | Clip (len, rest) -> Clip (len, continue rest tail)
-  | Skip (len, rest) -> Skip (len, continue rest tail)
-  | Duo rest -> Duo (continue rest tail)
-  | First rest -> First (continue rest tail)
-  | Second rest -> Second (continue rest tail)
-  | Empty (shape, rest) -> Empty (shape, continue rest tail)
-  | Cons rest -> Cons (continue rest tail)
-  | Append rest -> Append (continue rest tail)
-  | Pick (index, rest) -> Pick (index, continue rest tail)
-  | Unhead rest -> Unhead (continue rest tail)
-  | Left rest -> Left (continue rest tail)
-  | Right rest -> Right (continue rest tail)
-  | Pack (cap, typ, rest) -> Pack (cap, typ, continue rest tail)
-  | Fit (typ, rest) -> Fit (typ, continue rest tail)
-  | Wide rest -> Wide (continue rest tail)
-  | Close (kind, rest) -> Close (kind, continue rest tail)
+  | Done -> remainder
+  | Push (value, rest) -> Push (value, continue rest remainder)
+  | Void rest -> Void (continue rest remainder)
+  | Get (id, shape, rest) -> Get (id, shape, continue rest remainder)
+  | Plus rest -> Plus (continue rest remainder)
+  | Minus rest -> Minus (continue rest remainder)
+  | Times rest -> Times (continue rest remainder)
+  | Quot rest -> Quot (continue rest remainder)
+  | Rem rest -> Rem (continue rest remainder)
+  | Negate rest -> Negate (continue rest remainder)
+  | Absolute rest -> Absolute (continue rest remainder)
+  | Same rest -> Same (continue rest remainder)
+  | Different rest -> Different (continue rest remainder)
+  | Order (rel, rest) -> Order (rel, continue rest remainder)
+  | Join rest -> Join (continue rest remainder)
+  | Clip (len, rest) -> Clip (len, continue rest remainder)
+  | Skip (len, rest) -> Skip (len, continue rest remainder)
+  | Duo rest -> Duo (continue rest remainder)
+  | First rest -> First (continue rest remainder)
+  | Second rest -> Second (continue rest remainder)
+  | Empty (shape, rest) -> Empty (shape, continue rest remainder)
+  | Cons rest -> Cons (continue rest remainder)
+  | Append rest -> Append (continue rest remainder)
+  | Pick (index, rest) -> Pick (index, continue rest remainder)
+  | Unhead rest -> Unhead (continue rest remainder)
+  | Left rest -> Left (continue rest remainder)
+  | Right rest -> Right (continue rest remainder)
+  | Pack (cap, typ, rest) -> Pack (cap, typ, continue rest remainder)
+  | Fit (typ, rest) -> Fit (typ, continue rest remainder)
+  | Wide rest -> Wide (continue rest remainder)
+  | Close (kind, rest) -> Close (kind, continue rest remainder)
   | Effect (index, atom, body, rest) ->
-    Effect (index, atom, body, continue rest tail)
+    Effect (index, atom, body, continue rest remainder)
   | Scope (bind, body, rest) ->
-    Scope (bind, body, continue rest tail)
+    Scope (bind, body, continue rest remainder)
   | Scope2 (left, right, body, rest) ->
-    Scope2 (left, right, body, continue rest tail)
+    Scope2 (left, right, body, continue rest remainder)
   | Iter (len, item, state, body, rest) ->
-    Iter (len, item, state, body, continue rest tail)
+    Iter (len, item, state, body, continue rest remainder)
   | Iter_seq (cap, item, state, body, rest) ->
-    Iter_seq (cap, item, state, body, continue rest tail)
+    Iter_seq (cap, item, state, body, continue rest remainder)
   | Choice (left, yes, right, no, shape, rest) ->
-    Choice (left, yes, right, no, shape, continue rest tail)
+    Choice (left, yes, right, no, shape, continue rest remainder)
   | Fork (shape, yes, no, rest) ->
-    Fork (shape, yes, no, continue rest tail)
+    Fork (shape, yes, no, continue rest remainder)
 
 let rec build env term rest =
   match term with
@@ -709,9 +709,9 @@ let rec build env term rest =
 and build_vec env elem values rest =
   match values with
   | [] -> Some (Empty (elem, rest))
-  | first :: tail ->
-    Option.bind (build_vec env elem tail (Cons rest)) (fun tail_code ->
-      build env first tail_code)
+  | first :: remainder ->
+    Option.bind (build_vec env elem remainder (Cons rest)) (fun remainder_code ->
+      build env first remainder_code)
 
 let rec index_effects index = function
   | Done -> Done, index
@@ -1296,9 +1296,9 @@ let rec into_loc term mark rest =
 and loc_vec values marks at rest =
   match values, marks with
   | [], [] -> Some (LEmpty (at, rest))
-  | first :: tail, first_mark :: tail_marks ->
-    Option.bind (loc_vec tail tail_marks at (LCons (at, rest)))
-      (fun tail_loc -> into_loc first first_mark tail_loc)
+  | first :: remainder, first_mark :: remainder_marks ->
+    Option.bind (loc_vec remainder remainder_marks at (LCons (at, rest)))
+      (fun remainder_loc -> into_loc first first_mark remainder_loc)
   | _ -> None
 
 let rec same_loc code loc =
@@ -1408,7 +1408,7 @@ and machine_values typ = function
   | [] -> Some []
   | value :: rest ->
     Option.bind (machine_value typ value) (fun first ->
-      Option.map (fun tail -> first :: tail) (machine_values typ rest))
+      Option.map (fun remainder -> first :: remainder) (machine_values typ rest))
 
 let machine_zero typ =
   Option.bind (C_eval.zero typ) (machine_value typ)
@@ -1562,73 +1562,73 @@ let rec exec fuel code env stack plan =
     | Plus rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail ->
-          exec left rest env (VAtom (C_emit.Int (Z.add lhs rhs)) :: tail) plan
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder ->
+          exec left rest env (VAtom (C_emit.Int (Z.add lhs rhs)) :: remainder) plan
         | _ -> None
       end
     | Minus rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail ->
-          exec left rest env (VAtom (C_emit.Int (Z.sub lhs rhs)) :: tail) plan
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder ->
+          exec left rest env (VAtom (C_emit.Int (Z.sub lhs rhs)) :: remainder) plan
         | _ -> None
       end
     | Times rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail ->
-          exec left rest env (VAtom (C_emit.Int (Z.mul lhs rhs)) :: tail) plan
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder ->
+          exec left rest env (VAtom (C_emit.Int (Z.mul lhs rhs)) :: remainder) plan
         | _ -> None
       end
     | Quot rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder
             when not (Z.equal rhs Z.zero) ->
-          exec left rest env (VAtom (C_emit.Int (Z.div lhs rhs)) :: tail) plan
+          exec left rest env (VAtom (C_emit.Int (Z.div lhs rhs)) :: remainder) plan
         | _ -> None
       end
     | Rem rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder
             when not (Z.equal rhs Z.zero) ->
-          exec left rest env (VAtom (C_emit.Int (Z.rem lhs rhs)) :: tail) plan
+          exec left rest env (VAtom (C_emit.Int (Z.rem lhs rhs)) :: remainder) plan
         | _ -> None
       end
     | Negate rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int value) :: tail ->
-          exec left rest env (VAtom (C_emit.Int (Z.neg value)) :: tail) plan
+        | VAtom (C_emit.Int value) :: remainder ->
+          exec left rest env (VAtom (C_emit.Int (Z.neg value)) :: remainder) plan
         | _ -> None
       end
     | Absolute rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int value) :: tail ->
-          exec left rest env (VAtom (C_emit.Int (Z.abs value)) :: tail) plan
+        | VAtom (C_emit.Int value) :: remainder ->
+          exec left rest env (VAtom (C_emit.Int (Z.abs value)) :: remainder) plan
         | _ -> None
       end
     | Same rest ->
       begin
         match stack with
-        | VAtom rhs :: VAtom lhs :: tail ->
-          exec left rest env (VAtom (C_emit.Bool (equal lhs rhs)) :: tail) plan
+        | VAtom rhs :: VAtom lhs :: remainder ->
+          exec left rest env (VAtom (C_emit.Bool (equal lhs rhs)) :: remainder) plan
         | _ -> None
       end
     | Different rest ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail ->
-          exec left rest env (VAtom (C_emit.Bool (not (Z.equal lhs rhs))) :: tail)
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder ->
+          exec left rest env (VAtom (C_emit.Bool (not (Z.equal lhs rhs))) :: remainder)
             plan
         | _ -> None
       end
     | Order (rel, rest) ->
       begin
         match stack with
-        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: tail ->
+        | VAtom (C_emit.Int rhs) :: VAtom (C_emit.Int lhs) :: remainder ->
           let value =
             match rel with
             | C_term.Lt -> Z.lt lhs rhs
@@ -1636,56 +1636,56 @@ let rec exec fuel code env stack plan =
             | C_term.Gt -> Z.gt lhs rhs
             | C_term.Ge -> Z.geq lhs rhs
           in
-          exec left rest env (VAtom (C_emit.Bool value) :: tail) plan
+          exec left rest env (VAtom (C_emit.Bool value) :: remainder) plan
         | _ -> None
       end
     | Join rest ->
       begin
         match stack with
-        | VAtom (C_emit.Bytes rhs) :: VAtom (C_emit.Bytes lhs) :: tail ->
-          exec left rest env (VAtom (C_emit.Bytes (lhs ^ rhs)) :: tail) plan
+        | VAtom (C_emit.Bytes rhs) :: VAtom (C_emit.Bytes lhs) :: remainder ->
+          exec left rest env (VAtom (C_emit.Bytes (lhs ^ rhs)) :: remainder) plan
         | _ -> None
       end
     | Clip (len, rest) ->
       begin
         match stack with
-        | VAtom (C_emit.Bytes value) :: tail ->
+        | VAtom (C_emit.Bytes value) :: remainder ->
           let count = C_nat.to_int len in
           if count <= String.length value then
             exec left rest env
-              (VAtom (C_emit.Bytes (String.sub value 0 count)) :: tail) plan
+              (VAtom (C_emit.Bytes (String.sub value 0 count)) :: remainder) plan
           else None
         | _ -> None
       end
     | Skip (len, rest) ->
       begin
         match stack with
-        | VAtom (C_emit.Bytes value) :: tail ->
+        | VAtom (C_emit.Bytes value) :: remainder ->
           let first = C_nat.to_int len in
           let count = String.length value - first in
           if count >= 0 then
             exec left rest env
-              (VAtom (C_emit.Bytes (String.sub value first count)) :: tail) plan
+              (VAtom (C_emit.Bytes (String.sub value first count)) :: remainder) plan
           else None
         | _ -> None
       end
     | Duo rest ->
       begin
         match stack with
-        | rhs :: lhs :: tail ->
-          exec left rest env (VPair (lhs, rhs) :: tail) plan
+        | rhs :: lhs :: remainder ->
+          exec left rest env (VPair (lhs, rhs) :: remainder) plan
         | _ -> None
       end
     | First rest ->
       begin
         match stack with
-        | VPair (lhs, _) :: tail -> exec left rest env (lhs :: tail) plan
+        | VPair (lhs, _) :: remainder -> exec left rest env (lhs :: remainder) plan
         | _ -> None
       end
     | Second rest ->
       begin
         match stack with
-        | VPair (_, rhs) :: tail -> exec left rest env (rhs :: tail) plan
+        | VPair (_, rhs) :: remainder -> exec left rest env (rhs :: remainder) plan
         | _ -> None
       end
     | Empty (elem, rest) ->
@@ -1693,50 +1693,50 @@ let rec exec fuel code env stack plan =
     | Cons rest ->
       begin
         match stack with
-        | VVec (elem, values) :: item :: tail
+        | VVec (elem, values) :: item :: remainder
             when same_shape elem (value_shape item) ->
-          exec left rest env (VVec (elem, item :: values) :: tail) plan
+          exec left rest env (VVec (elem, item :: values) :: remainder) plan
         | _ -> None
       end
     | Append rest ->
       begin
         match stack with
-        | VVec (re, rhs) :: VVec (le, lhs) :: tail when same_shape le re ->
-          exec left rest env (VVec (le, lhs @ rhs) :: tail) plan
+        | VVec (re, rhs) :: VVec (le, lhs) :: remainder when same_shape le re ->
+          exec left rest env (VVec (le, lhs @ rhs) :: remainder) plan
         | _ -> None
       end
     | Pick (index, rest) ->
       begin
         match stack with
-        | VVec (_, values) :: tail ->
+        | VVec (_, values) :: remainder ->
           Option.bind (List.nth_opt values (C_nat.to_int index)) (fun item ->
-            exec left rest env (item :: tail) plan)
+            exec left rest env (item :: remainder) plan)
         | _ -> None
       end
     | Unhead rest ->
       begin
         match stack with
-        | VVec (elem, first :: values) :: tail ->
+        | VVec (elem, first :: values) :: remainder ->
           exec left rest env
-            (VPair (first, VVec (elem, values)) :: tail) plan
+            (VPair (first, VVec (elem, values)) :: remainder) plan
         | _ -> None
       end
     | Left rest ->
       begin
         match stack with
-        | payload :: tail -> exec left rest env (VSum (true, payload) :: tail) plan
+        | payload :: remainder -> exec left rest env (VSum (true, payload) :: remainder) plan
         | [] -> None
       end
     | Right rest ->
       begin
         match stack with
-        | payload :: tail -> exec left rest env (VSum (false, payload) :: tail) plan
+        | payload :: remainder -> exec left rest env (VSum (false, payload) :: remainder) plan
         | [] -> None
       end
     | Pack (cap, typ, rest) ->
       begin
         match stack, shape_of typ, machine_zero typ with
-        | VVec (form, values) :: tail, Some expected, Some zero
+        | VVec (form, values) :: remainder, Some expected, Some zero
             when List.length values <= C_nat.to_int cap
               && same_shape form expected
               && same_shape form (value_shape zero) ->
@@ -1749,15 +1749,15 @@ let rec exec fuel code env stack plan =
           let value =
             VPair (VAtom (C_emit.Int (Z.of_int count)), VVec (form, values @ pad))
           in
-          exec left rest env (value :: tail) plan
+          exec left rest env (value :: remainder) plan
         | _ -> None
       end
     | Fit (typ, rest) ->
       begin
         match stack with
-        | VAtom (C_emit.Int value) :: tail ->
+        | VAtom (C_emit.Int value) :: remainder ->
           let side = C_type.admits typ value in
-          exec left rest env (VSum (side, VAtom (C_emit.Int value)) :: tail) plan
+          exec left rest env (VSum (side, VAtom (C_emit.Int value)) :: remainder) plan
         | _ -> None
       end
     | Wide rest ->
@@ -1769,20 +1769,20 @@ let rec exec fuel code env stack plan =
     | Close (kind, rest) ->
       begin
         match stack with
-        | VAtom (C_emit.Cap (found, id)) :: tail when C_nat.equal kind found ->
+        | VAtom (C_emit.Cap (found, id)) :: remainder when C_nat.equal kind found ->
           let action = C_eval.held (C_eff.Close kind) C_eval.Unit kind id in
-          exec left rest env (VUnit :: tail) (action :: plan)
+          exec left rest env (VUnit :: remainder) (action :: plan)
         | _ -> None
       end
     | Scope (bind, body, rest) ->
       begin
         match stack with
-        | value :: tail ->
+        | value :: remainder ->
           Option.bind
             (open_slot bind value env)
             (fun opened ->
               Option.bind
-                (exec left body opened tail plan)
+                (exec left body opened remainder plan)
                 (fun (stack, prior, next_plan) ->
                   Option.bind (close_slot bind prior) (fun next ->
                     exec left rest next stack next_plan)))
@@ -1791,10 +1791,10 @@ let rec exec fuel code env stack plan =
     | Scope2 (lhs_bind, rhs_bind, body, rest) ->
       begin
         match stack with
-        | VPair (lhs, rhs) :: tail ->
+        | VPair (lhs, rhs) :: remainder ->
           Option.bind (open_slot lhs_bind lhs env) (fun first ->
             Option.bind (open_slot rhs_bind rhs first) (fun second ->
-              Option.bind (exec left body second tail plan)
+              Option.bind (exec left body second remainder plan)
                 (fun (stack, prior, next_plan) ->
                 Option.bind (close_slot rhs_bind prior) (fun last ->
                   Option.bind (close_slot lhs_bind last) (fun next ->
@@ -1806,7 +1806,7 @@ let rec exec fuel code env stack plan =
         match item_bind.C_term.mul, state_bind.C_term.mul, stack,
             shape_of item_bind.C_term.typ, shape_of state_bind.C_term.typ with
         | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> None
-        | _, _, state :: VVec (elem, values) :: tail, Some item_shape,
+        | _, _, state :: VVec (elem, values) :: remainder, Some item_shape,
             Some state_shape
             when List.length values = C_nat.to_int len
               && same_shape item_shape elem
@@ -1814,7 +1814,7 @@ let rec exec fuel code env stack plan =
               && List.for_all
                 (fun value -> same_shape elem (value_shape value))
                 values ->
-          exec_fold left body item_bind state_bind values env tail state plan rest
+          exec_fold left body item_bind state_bind values env remainder state plan rest
         | _ -> None
       end
     | Iter_seq (cap, item_bind, state_bind, body, rest) ->
@@ -1823,7 +1823,7 @@ let rec exec fuel code env stack plan =
             shape_of item_bind.C_term.typ, shape_of state_bind.C_term.typ with
         | C_type.Zero, _, _, _, _ | _, C_type.Zero, _, _, _ -> None
         | _, _, state :: VPair (VAtom (C_emit.Int len), VVec (elem, values))
-            :: tail, Some item_shape, Some state_shape
+            :: remainder, Some item_shape, Some state_shape
             when Z.sign len >= 0
               && Z.leq len (C_nat.to_z cap)
               && List.length values = C_nat.to_int cap
@@ -1840,23 +1840,23 @@ let rec exec fuel code env stack plan =
               | [] -> None
           in
           Option.bind (prefix (Z.to_int len) [] values) (fun active ->
-            exec_fold left body item_bind state_bind active env tail state plan rest)
+            exec_fold left body item_bind state_bind active env remainder state plan rest)
         | _ -> None
       end
     | Choice (left_bind, yes, right_bind, no, form, rest) ->
       begin
         match left_bind.C_term.mul, right_bind.C_term.mul, stack with
         | C_type.Zero, _, _ | _, C_type.Zero, _ -> None
-        | _, _, VSum (side, payload) :: tail ->
+        | _, _, VSum (side, payload) :: remainder ->
           let bind, branch = if side then left_bind, yes else right_bind, no in
           Option.bind (open_slot bind payload env) (fun opened ->
-            Option.bind (exec left branch opened tail plan)
+            Option.bind (exec left branch opened remainder plan)
               (fun (after, prior, next_plan) ->
               Option.bind (close_slot bind prior) (fun next ->
                 match after with
-                | item :: after_tail
+                | item :: after_remainder
                     when same_shape form (value_shape item)
-                      && same_value_shapes after_tail tail ->
+                      && same_value_shapes after_remainder remainder ->
                   exec left rest next after next_plan
                 | _ -> None)))
         | _, _, _ -> None
@@ -1864,9 +1864,9 @@ let rec exec fuel code env stack plan =
     | Fork (form, yes, no, rest) ->
       begin
         match stack with
-        | VAtom (C_emit.Bool value) :: tail ->
+        | VAtom (C_emit.Bool value) :: remainder ->
           let branch = if value then yes else no in
-          Option.bind (exec left branch env tail plan)
+          Option.bind (exec left branch env remainder plan)
             (fun (after, next, next_plan) ->
             match after with
             | item :: _ when same_shape form (value_shape item) ->
@@ -1884,19 +1884,19 @@ let rec exec fuel code env stack plan =
                 (actions @ (C_eval.direct atom payload :: plan)))
           | [] -> None)
 
-and exec_fold fuel body item_bind state_bind values env tail state plan rest =
+and exec_fold fuel body item_bind state_bind values env remainder state plan rest =
   match values with
-  | [] -> exec fuel rest env (state :: tail) plan
+  | [] -> exec fuel rest env (state :: remainder) plan
   | item :: values ->
     Option.bind (open_slot item_bind item env) (fun first ->
       Option.bind (open_slot state_bind state first) (fun opened ->
-        Option.bind (exec fuel body opened tail plan)
+        Option.bind (exec fuel body opened remainder plan)
           (fun (after, prior, next_plan) ->
           match after with
-          | next_state :: after_tail when same_value_shapes after_tail tail ->
+          | next_state :: after_remainder when same_value_shapes after_remainder remainder ->
             Option.bind (close_slot state_bind prior) (fun last ->
               Option.bind (close_slot item_bind last) (fun next ->
-                exec_fold fuel body item_bind state_bind values next tail
+                exec_fold fuel body item_bind state_bind values next remainder
                   next_state next_plan rest))
           | _ -> None)))
 

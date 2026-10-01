@@ -1,0 +1,4 @@
+(library
+ (name octra_recovery_case)
+ (wrapped false)
+ (libraries octra_core lwt.unix unix yojson))
