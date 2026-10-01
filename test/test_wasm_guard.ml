@@ -129,7 +129,7 @@ let () =
   let module R = Octra_core.Rule_graph in
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = Option.get (R.wasm_float_activation_for_chain chain_id) in
-  need (plan.activation_epoch = 1_611_500) "WASM float activation changed";
+  need (plan.activation_epoch = 1_614_500) "WASM float activation changed";
   need (R.fhe_work_activation_for_chain chain_id = Some plan)
     "WASM float and FHE activations differ";
   List.iter (fun epoch ->
@@ -155,7 +155,8 @@ let () =
          else Result.is_error (R.wasm_float graph ~epoch))
         "WASM float accepted unverified anchor")
       [R.Missing; R.Unreadable "read failed"; R.Root "wrong"])
-    [1_601_500; plan.activation_epoch - 1; plan.activation_epoch;
+    [1_601_500; 1_611_499; 1_611_500; 1_611_501; 1_612_999; 1_613_000; 1_613_001;
+     plan.activation_epoch - 1; plan.activation_epoch;
      plan.activation_epoch + 1];
   List.iter (fun chain_id ->
     let graph = R.create ~chain_id ~root_at:(fun _ -> R.Missing) in

@@ -218,7 +218,7 @@ let () =
   expect "exit profile golden" (raw_hex current = exit_golden);
   expect "exit profile commits parameters" (current = derived ~epoch devnet_env);
   expect "exit profile stable after activation"
-    (current = P.hash ~chain_id ~epoch:1_611_499 devnet_env);
+    (current = P.hash ~chain_id ~epoch:1_614_499 devnet_env);
   List.iter (fun epoch ->
     expect "withdrawn activation keeps released profile"
       (current = P.hash ~chain_id ~epoch devnet_env))
@@ -226,15 +226,16 @@ let () =
      1_588_999; 1_589_000; 1_589_001; 1_601_499; 1_601_500; 1_601_501;
      1_605_499; 1_605_500; 1_605_501;
      1_607_499; 1_607_500; 1_607_501; 1_609_499; 1_609_500; 1_609_501;
-     1_611_498; 1_611_499];
-  let envelope = P.hash ~chain_id ~epoch:1_611_500 devnet_env in
-  Printf.printf "event = tx_envelope_profile epoch = 1611500 hash = %s\n%!" (raw_hex envelope);
+     1_611_498; 1_611_499; 1_611_500; 1_611_501;
+     1_612_998; 1_612_999; 1_613_000; 1_613_001; 1_614_499];
+  let envelope = P.hash ~chain_id ~epoch:1_614_500 devnet_env in
+  Printf.printf "event = tx_envelope_profile epoch = 1614500 hash = %s\n%!" (raw_hex envelope);
   expect "envelope profile differs" (envelope <> current);
   expect "envelope profile golden"
-    (raw_hex envelope = "0f403e211c7e1fdc29d15828c1c5edd04340090ca87dba02f9889e987583eee0");
-  expect "envelope binds components" (envelope = derived ~epoch:1_611_500 devnet_env);
+    (raw_hex envelope = "1d46b19e336be6978b7a27b3fc04eda930cd58114858fd8a822c29c2e96ff13a");
+  expect "envelope binds components" (envelope = derived ~epoch:1_614_500 devnet_env);
   expect "envelope profile stable after activation"
-    (envelope = P.hash ~chain_id ~epoch:1_611_501 devnet_env
+    (envelope = P.hash ~chain_id ~epoch:1_614_501 devnet_env
      && envelope = P.hash ~chain_id ~epoch:max_int devnet_env);
   Printf.printf "event = exit_profile epoch = %d hash = %s\n" epoch (raw_hex current);
   List.iter (fun (applied_epoch, expected) ->
@@ -251,7 +252,9 @@ let () =
      1_605_499, false; 1_605_500, false; 1_605_501, false;
      1_607_499, false; 1_607_500, false; 1_607_501, false;
      1_609_499, false; 1_609_500, false; 1_609_501, false;
-     1_611_498, false; 1_611_499, true; 1_611_500, false; 1_611_501, false; max_int, false];
+     1_611_498, false; 1_611_499, false; 1_611_500, false; 1_611_501, false;
+     1_612_998, false; 1_612_999, false; 1_613_000, false; 1_613_001, false;
+     1_614_498, false; 1_614_499, true; 1_614_500, false; 1_614_501, false; max_int, false];
   List.iter (fun epoch ->
     expect "other chain profile preserved"
       (P.hash ~chain_id:"octra-mainnet" ~epoch getenv = compat);
@@ -263,7 +266,8 @@ let () =
      1_585_999; 1_586_000; 1_586_001; 1_588_999; 1_589_000; 1_589_001;
      1_601_499; 1_601_500; 1_601_501; 1_605_499; 1_605_500; 1_605_501;
      1_607_499; 1_607_500; 1_607_501; 1_609_499; 1_609_500; 1_609_501;
-     1_611_499; 1_611_500; 1_611_501; max_int];
+     1_611_499; 1_611_500; 1_611_501; 1_612_999; 1_613_000; 1_613_001;
+     1_614_499; 1_614_500; 1_614_501; max_int];
   expect "standard binds chain"
     (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" ~epoch:1_500_000 getenv)));
   print_endline "status = pass test = consensus_profile_golden"

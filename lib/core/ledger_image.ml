@@ -9,7 +9,7 @@ module Store = Store_irmin.Store
 type write_report = {
   commit : string;
   root : string;
-  records : int;
+  records : int64;
   bytes : int64;
   pvac_hashes : string list;
 }
@@ -17,7 +17,7 @@ type write_report = {
 type restore_report = {
   commit : string;
   root : string;
-  records : int;
+  records : int64;
   bytes : int64;
 }
 
@@ -28,17 +28,20 @@ type record =
 type sink = {
   channel : out_channel;
   buffer : Buffer.t;
-  mutable records : int;
+  mutable records : int64;
   mutable bytes : int64;
   mutable prior : string list option;
   mutable pvac_hashes : string list;
 }
 
-let magic = "octra-ledger-image\n"
-let max_records = 16_777_216
+let prior_magic = "octra-ledger-image\n"
+let path_magic = "octra-ledger-image-2\n"
+let magic = "octra-ledger-image-3\n"
+type format = Prior | Path64 | Full64
+let prior_records = 16_777_216L
 let max_path_parts = 1_024
-let max_part_bytes = 4_096
-let max_value_bytes = Transaction.circle_asset_max_encrypted_data_len
+let prior_part_bytes = 4_096
+let prior_value_bytes = Transaction.circle_asset_max_encrypted_data_len
 let drain_bytes = 4 * 1_024 * 1_024
 let import_batch = 4_096
 let import_reserve = Int64.mul 1_024L 1_024L |> Int64.mul 1_024L
@@ -92,48 +95,28 @@ let put_u32 buffer value =
   Buffer.add_char buffer (Char.chr ((value lsr 16) land 0xff));
   Buffer.add_char buffer (Char.chr ((value lsr 24) land 0xff))
 
-let put_string buffer value =
-  put_u32 buffer (String.length value);
-  Buffer.add_string buffer value
+let put_u64 buffer value =
+  let value = Int64.of_int value in
+  for index = 0 to 7 do
+    Buffer.add_char buffer
+      (Char.chr (Int64.to_int (Int64.logand 255L (Int64.shift_right_logical value (index * 8)))))
+  done
 
 let path_of_record = function
   | Node path
   | Value (path, _) -> path
 
 let validate_path path =
-  path <> []
-  && List.length path <= max_path_parts
-  && List.for_all
-       (fun part -> String.length part <= max_part_bytes)
-       path
+  let count = List.length path in
+  if count = 0 || count > max_path_parts then
+    Error (Printf.sprintf "ledger image path width exceeds limit: parts = %d limit = %d"
+      count max_path_parts)
+  else Ok ()
 
 let validate_order prior path =
   match prior with
   | None -> true
   | Some prior -> compare prior path < 0
-
-let encoded_record record =
-  let path = path_of_record record in
-  if not (validate_path path) then
-    Error "ledger image path is invalid"
-  else
-    let buffer = Buffer.create 256 in
-    put_u32 buffer (List.length path);
-    begin
-      match record with
-      | Node _ -> put_u8 buffer 1
-      | Value (_, value) ->
-          if String.length value > max_value_bytes then
-            raise (Invalid_argument "ledger image value exceeds limit");
-          put_u8 buffer 2
-    end;
-    List.iter (put_string buffer) path;
-    begin
-      match record with
-      | Node _ -> ()
-      | Value (_, value) -> put_string buffer value
-    end;
-    Ok (Buffer.contents buffer)
 
 let drain sink =
   if Buffer.length sink.buffer = 0 then Lwt.return_unit
@@ -146,6 +129,21 @@ let drain sink =
         flush sink.channel)
       ()
 
+let append sink value =
+  let rec loop offset =
+    if offset = String.length value then Lwt.return_unit
+    else if Buffer.length sink.buffer >= drain_bytes then
+      let* () = drain sink in
+      loop offset
+    else
+      let count = min (String.length value - offset)
+          (drain_bytes - Buffer.length sink.buffer) in
+      Buffer.add_substring sink.buffer value offset count;
+      sink.bytes <- Int64.add sink.bytes (Int64.of_int count);
+      loop (offset + count)
+  in
+  loop 0
+
 let add_pvac sink path value =
   match path with
   | ["pvac_hashes"; _] when value <> "none" ->
@@ -157,23 +155,33 @@ let add_pvac sink path value =
 
 let emit sink record =
   let path = path_of_record record in
-  if sink.records >= max_records then
-    Lwt.fail_with "ledger image record count exceeds limit"
-  else if not (validate_order sink.prior path) then
+  if not (validate_order sink.prior path) then
     Lwt.fail_with "ledger image paths are not strictly ordered"
   else
-    match encoded_record record with
+    match validate_path path with
     | Error reason -> Lwt.fail_with reason
-    | Ok encoded ->
-        sink.records <- sink.records + 1;
-        sink.bytes <- Int64.add sink.bytes (Int64.of_int (String.length encoded));
+    | Ok () ->
+        sink.records <- Int64.succ sink.records;
         sink.prior <- Some path;
         begin
           match record with
           | Node _ -> ()
           | Value (path, value) -> add_pvac sink path value
         end;
-        Buffer.add_string sink.buffer encoded;
+        put_u32 sink.buffer (List.length path);
+        put_u8 sink.buffer (match record with Node _ -> 1 | Value _ -> 2);
+        sink.bytes <- Int64.add sink.bytes 5L;
+        let* () = Lwt_list.iter_s (fun part ->
+          put_u64 sink.buffer (String.length part);
+          sink.bytes <- Int64.add sink.bytes 8L;
+          append sink part) path in
+        let* () = match record with
+          | Node _ -> Lwt.return_unit
+          | Value (_, value) ->
+              put_u64 sink.buffer (String.length value);
+              sink.bytes <- Int64.add sink.bytes 8L;
+              append sink value
+        in
         if Buffer.length sink.buffer >= drain_bytes then drain sink
         else Lwt.return_unit
 
@@ -233,7 +241,7 @@ let write store ~commit ~path =
                   let sink = {
                     channel;
                     buffer = Buffer.create drain_bytes;
-                    records = 0;
+                    records = 0L;
                     bytes = Int64.of_int (String.length magic);
                     prior = None;
                     pvac_hashes = [];
@@ -271,7 +279,9 @@ let write store ~commit ~path =
 
 type reader = {
   channel : in_channel;
-  mutable records : int;
+  size : int64;
+  format : format;
+  mutable records : int64;
   mutable prior : string list option;
 }
 
@@ -285,12 +295,22 @@ let read_u32 reader =
   let b3 = read_u8 reader in
   b0 lor (b1 lsl 8) lor (b2 lsl 16) lor (b3 lsl 24)
 
-let read_string reader ~max name =
-  let length = read_u32 reader in
-  if length < 0 || length > max then
+let read_u64 reader =
+  let rec loop index value =
+    if index = 8 then value
+    else
+      let byte = Int64.of_int (read_u8 reader) in
+      loop (index + 1) (Int64.logor value (Int64.shift_left byte (index * 8)))
+  in
+  loop 0 0L
+
+let read_string reader ~length ~max name =
+  if length < 0L || length > Int64.of_int max then
     failwith (name ^ " exceeds limit")
+  else if length > Int64.sub reader.size (LargeFile.pos_in reader.channel) then
+    failwith (name ^ " exceeds remaining file bytes")
   else
-    really_input_string reader.channel length
+    really_input_string reader.channel (Int64.to_int length)
 
 let read_path reader count =
   if count < 1 || count > max_path_parts then
@@ -298,7 +318,15 @@ let read_path reader count =
   let rec loop remaining path =
     if remaining = 0 then List.rev path
     else
-      let part = read_string reader ~max:max_part_bytes "ledger image path part" in
+      let index = count - remaining in
+      let length = match reader.format with
+        | Prior -> Int64.of_int (read_u32 reader)
+        | Path64 | Full64 -> read_u64 reader in
+      let max = match reader.format with
+        | Prior -> prior_part_bytes
+        | Path64 | Full64 -> Sys.max_string_length in
+      let name = Printf.sprintf "ledger image path part = %d bytes = %Ld" index length in
+      let part = read_string reader ~length ~max name in
       loop (remaining - 1) (part :: path)
   in
   loop count []
@@ -307,18 +335,23 @@ let read_record reader =
   let count = read_u32 reader in
   if count = 0 then None
   else begin
-    if reader.records >= max_records then
+    if reader.format <> Full64 && reader.records >= prior_records then
       failwith "ledger image record count exceeds limit";
     let kind = read_u8 reader in
+    if kind <> 1 && kind <> 2 then
+      failwith "ledger image record kind is invalid";
     let path = read_path reader count in
     if not (validate_order reader.prior path) then
       failwith "ledger image paths are not strictly ordered";
-    reader.records <- reader.records + 1;
+    reader.records <- Int64.succ reader.records;
     reader.prior <- Some path;
     match kind with
     | 1 -> Some (Node path)
     | 2 ->
-        let value = read_string reader ~max:max_value_bytes "ledger image value" in
+        let length, max = match reader.format with
+          | Prior | Path64 -> Int64.of_int (read_u32 reader), prior_value_bytes
+          | Full64 -> read_u64 reader, Sys.max_string_length in
+        let value = read_string reader ~length ~max "ledger image value" in
         Some (Value (path, value))
     | _ -> failwith "ledger image record kind is invalid"
   end
@@ -328,20 +361,37 @@ let exact_end reader =
   | _ -> failwith "ledger image has trailing bytes"
   | exception End_of_file -> ()
 
+let read_header channel =
+  let buffer = Buffer.create (String.length magic) in
+  let rec loop () =
+    if Buffer.length buffer >= String.length magic then
+      failwith "ledger image header is invalid";
+    let byte = input_char channel in
+    Buffer.add_char buffer byte;
+    if byte <> '\n' then loop ()
+    else match Buffer.contents buffer with
+      | value when value = prior_magic -> Prior
+      | value when value = path_magic -> Path64
+      | value when value = magic -> Full64
+      | _ -> failwith "ledger image header is invalid"
+  in
+  loop ()
+
 let restore_records store source =
   let channel = open_in_bin source in
   Lwt.finalize
     (fun () ->
       try
-        let got_magic = really_input_string channel (String.length magic) in
-        if got_magic <> magic then failwith "ledger image header is invalid";
-        let reader = { channel; records = 0; prior = None } in
+        let format = read_header channel in
+        let size = LargeFile.in_channel_length channel in
+        let reader = { channel; size; format; records = 0L; prior = None } in
         let commit tree =
           let* () = Irmin_store.commit_bulk store tree "state sync" in
           Store.flush store.Irmin_store.repo;
           Irmin_store.begin_bulk store
         in
-        let rec loop tree pending committed =
+        let rec loop tree pending bytes committed =
+          let offset = LargeFile.pos_in channel in
           match read_record reader with
           | None ->
               exact_end reader;
@@ -352,19 +402,21 @@ let restore_records store source =
                 Lwt.return reader.records
           | Some (Node path) ->
               let* tree = Store.Tree.add_tree tree path (Store.Tree.empty ()) in
-              next tree pending committed
+              next tree pending bytes offset committed
           | Some (Value (path, value)) ->
               let* tree = Store.Tree.add tree path value in
-              next tree pending committed
-        and next tree pending committed =
+              next tree pending bytes offset committed
+        and next tree pending bytes offset committed =
           let pending = pending + 1 in
-          if pending < import_batch then loop tree pending committed
+          let bytes = Int64.add bytes (Int64.sub (LargeFile.pos_in channel) offset) in
+          if pending < import_batch && bytes < Int64.of_int drain_bytes then
+            loop tree pending bytes committed
           else
             let* tree = commit tree in
-            loop tree 0 true
+            loop tree 0 0L true
         in
         let* tree = Irmin_store.begin_bulk store in
-        loop tree 0 false
+        loop tree 0 0L false
       with exn -> Lwt.fail exn)
     (fun () ->
       close_in_noerr channel;
@@ -435,7 +487,7 @@ let restore_with ~free ~source ~target ~expected_root =
           | Error _ as error -> Lwt.return error
           | Ok (commit, root) ->
               let size = (Unix.LargeFile.stat source).Unix.LargeFile.st_size in
-              Lwt.return_ok { commit; root; records = 0; bytes = size }
+              Lwt.return_ok { commit; root; records = 0L; bytes = size }
         end
       else begin
         remove_tree stage;

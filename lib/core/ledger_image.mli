@@ -4,7 +4,7 @@
 type write_report = {
   commit : string;
   root : string;
-  records : int;
+  records : int64;
   bytes : int64;
   pvac_hashes : string list;
 }
@@ -12,7 +12,7 @@ type write_report = {
 type restore_report = {
   commit : string;
   root : string;
-  records : int;
+  records : int64;
   bytes : int64;
 }
 

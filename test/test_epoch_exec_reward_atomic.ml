@@ -614,14 +614,14 @@ let test_upgrade_ready_refresh () =
 let test_reward_properties () =
   let max = Octra_core.Denomination.max_supply in
   let divisor = X.emission_divisor in
-  let suffix = X.emission_floor in
-  let threshold = Z.mul divisor suffix in
+  let floor = X.emission_floor in
+  let threshold = Z.mul divisor floor in
   let remaining_values = [
     Z.zero;
     Z.one;
-    Z.pred suffix;
-    suffix;
-    Z.succ suffix;
+    Z.pred floor;
+    floor;
+    Z.succ floor;
     Z.pred divisor;
     divisor;
     Z.succ divisor;

@@ -855,6 +855,41 @@ let test_hash_slices () =
          chunk_size - 1; chunk_size; chunk_size + 1; 2 * chunk_size + 17])
       [quantum - 1; quantum + 1; Manifest.chunk_size_min; 16 * 1024 * 1024])
 
+let test_image_signature () =
+  let root = Filename.concat "runtime_data"
+      (Printf.sprintf "image_signature_%d" (Unix.getpid ())) in
+  mkdir_p root;
+  Fun.protect ~finally:(fun () -> remove_tree root) (fun () ->
+    let wallets = List.init 5 (fun index -> wallet (index + 1)) in
+    let validators, _, _, exporters, initial = finalized_certificate wallets in
+    let path = Filename.concat root "ledger.dat" in
+    let with_header header =
+      let output = open_out_bin path in
+      Fun.protect ~finally:(fun () -> close_out_noerr output)
+        (fun () -> output_string output (header ^ String.make 4 '\000'));
+      let sha256, chunks = Manifest.hash_file_chunks ~chunk_size:Manifest.chunk_size_min path in
+      let files = List.map (fun (file : Manifest.file) ->
+        if file.path <> "ledger.dat" then file else
+          { file with sha256; chunks; size = (Unix.LargeFile.stat path).Unix.LargeFile.st_size }
+      ) initial.manifest.files in
+      let manifest = { initial.manifest with files;
+        total_size = List.fold_left (fun size (file : Manifest.file) -> Int64.add size file.size) 0L files;
+        chunks_root = Manifest.chunks_root files } in
+      { initial with manifest; manifest_hash = expect_ok (Manifest.manifest_hash manifest) }
+    in
+    let original = with_header "octra-ledger-image-3\n" in
+    let signature = expect_ok (Manifest.make_exporter_signature
+        ~wallet:(List.hd wallets) original.manifest) in
+    let original = { original with exporter_signatures = [signature] } in
+    ignore (expect_ok (Manifest.verify_reference_certificate
+      ~validator_set:validators ~exporter_set:exporters original));
+    let changed = with_header "octra-ledger-image-4\n" in
+    if changed.manifest_hash = original.manifest_hash then
+      fail "image header is outside signed manifest";
+    let changed = { changed with exporter_signatures = [signature] } in
+    expect_error (Manifest.verify_reference_certificate
+      ~validator_set:validators ~exporter_set:exporters changed))
+
 let test_large_manifest () =
   let root =
     Filename.concat
@@ -918,6 +953,7 @@ let () =
     fail "migration state is excluded from state sync";
   test_certificate ();
   test_reference_format ();
+  test_image_signature ();
   test_finalized_anchor ();
   test_manifest_shape ();
   test_hash32_encoder ();

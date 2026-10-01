@@ -89,6 +89,7 @@ sh -n controls/stat.sh
 sh -n controls/storage.sh
 sh -n controls/stop.sh
 sh -n controls/proof_gate.sh
+sh -n controls/image_gate.sh
 
 PYTHONDONTWRITEBYTECODE=1 python3 test/python_check.py
 
@@ -102,6 +103,7 @@ PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import syn
 if [ "$TESTS" -eq 1 ]; then
   PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest controls/lib/test_validator_tools.py
   sh controls/print_style_gate.sh
+  sh controls/image_gate.sh
   sh controls/proof_gate.sh
 fi
 if [ -f config/network.env ]; then

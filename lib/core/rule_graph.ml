@@ -120,7 +120,7 @@ let devnet_exit_activation = {
 }
 
 let devnet_tx_envelope_activation = {
-  devnet_set_plan_activation with activation_epoch = 1_611_500;
+  devnet_set_plan_activation with activation_epoch = 1_614_500;
 }
 
 let devnet_set_open_activation = {

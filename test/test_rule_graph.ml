@@ -89,7 +89,7 @@ let test_set_plan () =
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
   require
-    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000; 1_611_500])
+    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000; 1_614_500])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)

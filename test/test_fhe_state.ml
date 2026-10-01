@@ -27,12 +27,12 @@ let () =
       let graph = R.create ~chain_id ~root_at:(fun _ -> R.Missing) in
       expect "unscheduled rule active"
         (R.fhe_work graph ~epoch = Ok R.Prior && R.fhe_work_at ~chain_id ~epoch = R.Prior))
-      [0; 1_601_500; 1_607_500; 1_609_500; 1_611_500; max_int]) ["octra-mainnet"; "local"];
+      [0; 1_601_500; 1_607_500; 1_609_500; 1_611_500; 1_613_000; 1_614_500; max_int]) ["octra-mainnet"; "local"];
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = match R.fhe_work_activation_for_chain chain_id with
     | Some plan -> plan
     | None -> failwith "devnet FHE work activation missing" in
-  expect "FHE work epoch differs" (plan.activation_epoch = 1_611_500);
+  expect "FHE work epoch differs" (plan.activation_epoch = 1_614_500);
   expect "FHE and envelope epochs differ"
     (R.tx_envelope_activation_for_chain chain_id = Some plan);
   List.iter (fun epoch ->
@@ -49,6 +49,7 @@ let () =
          else Result.is_error (R.fhe_work graph ~epoch)))
       [R.Missing; R.Unreadable "read error"; R.Root "wrong"])
     [0; 1_589_000; 1_609_499; 1_609_500; 1_609_501;
+     1_611_499; 1_611_500; 1_611_501; 1_612_999; 1_613_000; 1_613_001;
      plan.activation_epoch - 1; plan.activation_epoch;
      plan.activation_epoch + 1; max_int];
   let pk, sk = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\001') in

@@ -992,7 +992,7 @@ let run_sync ?stage ?(verify_state = Verify.verify) certificate sources root =
       | Error reason -> Lwt.fail_with reason
       | Ok report ->
           Printf.printf
-            "event = sync_ledger_complete hash = %s epoch = %Ld records = %d root = %s\n%!"
+            "event = sync_ledger_complete hash = %s epoch = %Ld records = %Ld root = %s\n%!"
             certificate.manifest_hash
             checkpoint.epoch
             report.Image.records

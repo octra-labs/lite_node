@@ -72,6 +72,22 @@
  (libraries octra_core lwt.unix base64 zarith yojson octra_test_workspace))
 
 (test
+ (name test_image)
+ (modules test_image)
+ (libraries octra_core lwt.unix octra_test_workspace))
+
+(rule
+ (targets image_codec.ml)
+ (deps ../lib/core/ledger_image.ml)
+ (action (copy %{deps} %{targets})))
+
+(test
+ (name test_image_count)
+ (modules test_image_count image_codec)
+ (flags (:standard -open Octra_core))
+ (libraries octra_core lwt.unix octra_test_workspace))
+
+(test
  (name test_history_total)
  (modules test_history_total)
  (libraries octra_core base64 zarith yojson unix octra_test_workspace))

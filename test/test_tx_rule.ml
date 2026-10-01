@@ -166,12 +166,13 @@ let test_anchor () =
   let module Graph = Octra_core.Rule_graph in
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = Graph.tx_envelope_activation_for_chain chain_id |> Option.get in
-  expect "owner selected activation" (plan.activation_epoch = 1_611_500);
+  expect "owner selected activation" (plan.activation_epoch = 1_614_500);
   let missing = Graph.create ~chain_id ~root_at:(fun _ -> Graph.Missing) in
   List.iter (fun epoch ->
     expect "withdrawn activation stays prior"
       (Graph.tx_envelope missing ~epoch = Ok Graph.Prior))
-    [1_582_999; 1_583_000; 1_583_001; 1_585_999; 1_586_000; 1_586_001];
+    [1_582_999; 1_583_000; 1_583_001; 1_585_999; 1_586_000; 1_586_001;
+     1_611_499; 1_611_500; 1_611_501; 1_612_999; 1_613_000; 1_613_001];
   expect "history does not need new anchor"
     (Graph.tx_envelope missing ~epoch:(envelope_epoch - 1) = Ok Graph.Prior);
   List.iter (fun epoch ->
