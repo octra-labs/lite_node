@@ -43,6 +43,150 @@ let check_record base chain validator_set =
   | Journal.Invalid reason -> failwith reason
   | _ -> failwith "record unavailable"
 
+let check_refetch base validator_set (cert : Types.finalize) bundle =
+  let module Apply = Octra_node_runtime.Consensus_finalized_apply in
+  let stored = ref None in
+  let queries = ref 0 in
+  let released = ref false in
+  let response = Octra_consensus.C_driver.{responder_addr = "test";
+    tx_hashes = List.map Octra_node_runtime.Text.hash32_hex bundle.Journal.tx_hashes;
+    txs_json = List.map (fun tx -> Yojson.Safe.to_string (Tx.to_yojson tx)) bundle.txs;
+    receipts_json = bundle.receipts_json} in
+  let deps = Apply.{
+    check_finality = (fun value -> Log.check_write base (Log.of_finalize value));
+    write_finality = (fun value -> Log.write base (Log.of_finalize value));
+    persist_finality_certificate = (fun ~validator_set value ->
+      Journal.prepare base ~chain_id:cert.chain_id ~validator_set value);
+    store_proposer = ignore;
+    persist_finality_bundle = Journal.persist_bundle base;
+    chaos_after_finality_log = (fun () -> ());
+    cached_bundle = (fun ~proposal_id:_ -> Option.is_some !stored);
+    cached_bundle_data = (fun ~proposal_id:_ -> !stored);
+    cached_bundle_len = (fun ~proposal_id:_ ->
+      match !stored with None -> 0 | Some (_, txs, _) -> List.length txs);
+    header_has_empty_bundle = (fun _ -> false);
+    store_empty_bundle = (fun _ -> failwith "unexpected empty bundle");
+    query_bundle = (fun ~epoch_id ~proposal_id ~validate ->
+      incr queries;
+      expect "query targets certificate"
+        (epoch_id = cert.epoch_id && proposal_id = cert.proposal_id);
+      expect "bad peer bundle refused"
+        (not (validate {response with tx_hashes = []}));
+      expect "peer bundle accepted" (validate response);
+      Lwt.return_some response);
+    store_accepted_bundle = (fun ~proposal_id:_ accepted ->
+      let decoded = accepted.Octra_node_runtime.Consensus_bundle_fetch.bundle in
+      stored := Some (decoded.tx_hashes, decoded.txs, decoded.receipts_json));
+    sleep = (fun _ -> failwith "unexpected bundle wait");
+    bundle_wait_timeout_seconds = 1.;
+    bundle_wait_expired = (fun ~epoch_id:_ -> failwith "unexpected expiry");
+    bundle_wait_recovered = (fun ~epoch_id:_ -> ());
+    post_finalize = (fun ~epoch_id ~proposed_root ->
+      expect "release checks committed inputs"
+        (epoch_id = cert.epoch_id && proposed_root = cert.header.proposed_state_root);
+      check_record base cert.chain_id validator_set;
+      released := true;
+      Lwt.return_unit)} in
+  Lwt_main.run (Apply.run deps ~validator_set cert);
+  expect "refetch releases only durable bundle" (!released && !queries = 1)
+
+let check_set_drop validator_set (cert : Types.finalize) bundle =
+  let base = Test_workspace.unique_dir "journal-set" in
+  let head = Int64.to_int cert.epoch_id - 1 in
+  Journal.persist_certificate base ~validator_set cert;
+  Journal.persist_bundle base cert bundle;
+  Log.write base (Log.of_finalize cert);
+  let file = Filename.concat base "finality/pending_finalized.json" in
+  let before = read_file file in
+  let entries = Log.read base in
+  let other = Types.make_validator_set (List.tl validator_set.Types.validators) in
+  expect "different set refuses journal"
+    (match Journal.read_validated ~chain_id:cert.chain_id ~validator_set:other base with
+     | Journal.Invalid _ -> true | _ -> false);
+  expect "certified journal cannot be discarded"
+    (Result.is_error (Journal.drop_invalid_unapplied base ~head));
+  expect "set mismatch keeps journal bytes" (read_file file = before);
+  expect "set mismatch keeps finality" (Log.read base = entries);
+  let fields = Yojson.Safe.Util.to_assoc (Yojson.Safe.from_string before) in
+  let changed = `Assoc (("bundle", `Assoc [
+    "tx_hashes", `List [];
+    "txs", `List [];
+    "receipts_json", `List [];
+  ]) :: List.remove_assoc "bundle" fields) in
+  let broken = Yojson.Safe.to_string changed in
+  write_file file broken;
+  expect "different bundle refuses journal"
+    (match Journal.read_validated ~chain_id:cert.chain_id ~validator_set base with
+     | Journal.Invalid _ -> true | _ -> false);
+  expect "selected set still checks bundle"
+    (match Journal.read_selected ~chain_id:cert.chain_id
+      ~expected_set:(fun _ -> Ok validator_set) base with
+     | Error (Journal.Read_bundle _) -> true | _ -> false);
+  expect "bad bundle cannot discard certificate"
+    (Result.is_error (Journal.drop_invalid_unapplied base ~head));
+  expect "bad bundle keeps journal bytes" (read_file file = broken);
+  expect "bad bundle keeps finality" (Log.read base = entries);
+  List.iter (fun repair ->
+    expect "repair requires next epoch and parent root"
+      (Result.is_error (Journal.read_selected ~repair ~chain_id:cert.chain_id
+        ~expected_set:(fun _ -> Ok validator_set) base));
+    expect "invalid repair leaves bytes" (read_file file = broken))
+    [head - 1, cert.header.prev_state_root; head + 1, cert.header.prev_state_root;
+      head, String.make 32 '\000'];
+  expect "unknown set cannot repair"
+    (Result.is_error (Journal.read_selected ~repair:(head, cert.header.prev_state_root)
+      ~chain_id:cert.chain_id ~expected_set:(fun _ -> Ok other) base));
+  expect "unknown set retains bundle" (read_file file = broken);
+  expect "next certificate repaired without bundle"
+    (match Journal.read_selected ~repair:(head, cert.header.prev_state_root)
+      ~chain_id:cert.chain_id ~expected_set:(fun _ -> Ok validator_set) base with
+     | Ok (Journal.Valid record) -> record.finalize = cert && record.bundle = None
+     | _ -> false);
+  expect "repair preserves finality" (Log.read base = entries);
+  expect "restart keeps certificate"
+    (match Journal.read_selected ~chain_id:cert.chain_id
+      ~expected_set:(fun _ -> Ok validator_set) base with
+     | Ok (Journal.Valid record) -> record.finalize = cert && record.bundle = None
+     | _ -> false);
+  check_refetch base validator_set cert bundle;
+  check_record base cert.chain_id validator_set
+
+let check_bad_drop validator_set (cert : Types.finalize) =
+  let bad = {cert with precommits = List.map (fun (vote : Types.vote) ->
+    {vote with signature = String.make 64 '\000'}) cert.precommits} in
+  let head = Int64.to_int cert.epoch_id - 1 in
+  let base = Test_workspace.unique_dir "journal-bad" in
+  Journal.persist_certificate base ~validator_set bad;
+  Log.write base (Log.of_finalize bad);
+  expect "bad signature refuses journal"
+    (match Journal.read_validated ~chain_id:cert.chain_id ~validator_set base with
+     | Journal.Invalid _ -> true | _ -> false);
+  expect "selected set still checks signatures"
+    (match Journal.read_selected ~chain_id:cert.chain_id
+      ~expected_set:(fun _ -> Ok validator_set) base with
+     | Ok (Journal.Invalid _) -> true | _ -> false);
+  let file = Filename.concat base "finality/pending_finalized.json" in
+  let before = read_file file in
+  let entries = Log.read base in
+  expect "wrong head refuses removal"
+    (Result.is_error (Journal.drop_invalid_unapplied base ~head:(head - 1)));
+  expect "wrong head keeps journal" (read_file file = before);
+  expect "wrong head keeps finality" (Log.read base = entries);
+  expect "invalid certificate removed"
+    (Journal.drop_invalid_unapplied base ~head = Ok 1);
+  expect "invalid pending removed" (not (Journal.pending base));
+  expect "invalid finality removed" (Log.read base = []);
+  let base = Test_workspace.unique_dir "journal-other-log" in
+  Journal.persist_certificate base ~validator_set bad;
+  Log.write base (Log.of_finalize cert);
+  let file = Filename.concat base "finality/pending_finalized.json" in
+  let before = read_file file in
+  let entries = Log.read base in
+  expect "different certificate refuses removal"
+    (Result.is_error (Journal.drop_invalid_unapplied base ~head));
+  expect "different certificate keeps journal" (read_file file = before);
+  expect "different certificate keeps finality" (Log.read base = entries)
+
 let check_finish base validator_set (cert : Types.finalize) =
   let chain = cert.chain_id in
   let head = Int64.to_int cert.epoch_id in
@@ -268,7 +412,35 @@ let check_join_gate validator_set (cert : Types.finalize) bundle empty =
   let base = Test_workspace.unique_dir "join-empty" in
   Journal.persist_certificate base ~validator_set empty;
   resume base empty;
-  expect "empty bundle is reconstructed" (not (Journal.pending base))
+  expect "empty bundle is reconstructed" (not (Journal.pending base));
+  List.iter (fun broken ->
+    let base = Test_workspace.unique_dir "join-damaged" in
+    Journal.persist_certificate base ~validator_set cert;
+    Journal.persist_bundle base cert bundle;
+    Log.write base (Log.of_finalize cert);
+    let file = Filename.concat base "finality/pending_finalized.json" in
+    let fields = Yojson.Safe.Util.to_assoc (Yojson.Safe.from_string (read_file file)) in
+    let encoded = Yojson.Safe.to_string (`Assoc
+      (("bundle", broken) :: List.remove_assoc "bundle" fields)) in
+    write_file file encoded;
+    let entries = Log.read base in
+    let recover () = Journal.resume_join ~chain_id:cert.chain_id
+      ~set_hash:(fun _ -> Ok set_hash) ~head:11
+      ~root:cert.header.prev_state_root ~txid:0L base in
+    recover ();
+    expect "join retains verified certificate"
+      (match Journal.read_validated ~chain_id:cert.chain_id ~validator_set base with
+       | Journal.Valid record -> record.finalize = cert && record.bundle = None
+       | _ -> false);
+    expect "join repair keeps finality" (Log.read base = entries);
+    let repaired = read_file file in
+    recover ();
+    expect "join repair repeats without mutation" (read_file file = repaired);
+    check_refetch base validator_set cert bundle;
+    resume base cert;
+    expect "join repaired bundle completes" (not (Journal.pending base)))
+    [`String "invalid"; `Assoc ["tx_hashes", `List []; "txs", `List [];
+      "receipts_json", `List []]]
 
 let check_rebind validator_set (cert : Types.finalize) (later : Types.finalize) bundle =
   let legacy = Types.make_validator_set
@@ -286,7 +458,7 @@ let check_rebind validator_set (cert : Types.finalize) (later : Types.finalize) 
     let old_current = read_file current in
     let rebind () = Journal.rebind_committed ~chain_id:cert.chain_id
       ~validator_set ~entry base in
-    expect "rebind succeeds" (rebind () = Ok Journal.Rebound);
+    expect "rebind succeeds" (rebind () = Ok Journal.Rewritten);
     let repaired = read_file current in
     write_file history old;
     expect "rebind retry finishes interrupted copy" (rebind () = Ok Journal.Unchanged);
@@ -296,7 +468,7 @@ let check_rebind validator_set (cert : Types.finalize) (later : Types.finalize) 
        | Journal.Valid record -> Codec.encode_finalize record.finalize = Codec.encode_finalize original
        | _ -> false);
     write_file current old_current;
-    expect "rebind finishes history-first copy" (rebind () = Ok Journal.Rebound);
+    expect "rebind finishes history-first copy" (rebind () = Ok Journal.Rewritten);
     write_file history old;
     expect "seed finishes interrupted copy"
       (Journal.seed ~chain_id:cert.chain_id ~validator_set ~finalize:original base
@@ -331,7 +503,7 @@ let check_rebind validator_set (cert : Types.finalize) (later : Types.finalize) 
   let selected = { cert with precommits = List.rev cert.precommits |> List.tl } in
   expect "history may carry another valid round"
     (Journal.rebind_committed ~chain_id:cert.chain_id ~validator_set
-      ~entry:(Log.of_finalize selected) base = Ok Journal.Rebound);
+      ~entry:(Log.of_finalize selected) base = Ok Journal.Rewritten);
   expect "history round and set are replaced together"
     (match Journal.read_history_epoch_validated ~chain_id:cert.chain_id
       ~validator_set ~epoch:12L base with
@@ -353,7 +525,7 @@ let check_rebind validator_set (cert : Types.finalize) (later : Types.finalize) 
       Journal.repair_committed ~chain_id:cert.chain_id ~validator_set
         ~entry:(Log.of_finalize current) ~finalize:cert base = Ok Journal.Proof_repaired
     else Journal.rebind_committed ~chain_id:cert.chain_id ~validator_set
-      ~entry:(Log.of_finalize current) base = Ok Journal.Rebound in
+      ~entry:(Log.of_finalize current) base = Ok Journal.Rewritten in
     expect "different checked quorum permits repair" repaired;
     expect "other quorum repair completes history"
       (match Journal.read_history_epoch_validated ~chain_id:cert.chain_id
@@ -502,6 +674,8 @@ let check_hashes () =
   in
   let finalize = signed header in
   let bundle = Journal.{ tx_hashes = [raw]; txs = [tx]; receipts_json = [] } in
+  check_set_drop validator_set finalize bundle;
+  check_bad_drop validator_set finalize;
   check_rebind validator_set finalize (signed ~round:1 header) bundle;
   check_stage_order validator_set finalize
     (signed { header with proposed_state_root = String.make 32 'c' }) bundle;

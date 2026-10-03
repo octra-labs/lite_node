@@ -308,7 +308,18 @@ let test_certificate () =
   expect_error (Manifest.verify_certificate
     ~validator_set:validators
     ~exporter_set:exporters
-    mutated)
+    mutated);
+  List.iter (fun certificate ->
+    let expected = Manifest.verify_certificate ~validator_set:validators ~exporter_set:exporters certificate in
+    let yielded = ref false in
+    let tick = Lwt.map (fun () -> yielded := true) (Lwt.pause ()) in
+    let actual = Lwt_main.run (Lwt.bind
+      (Manifest.verify_certificate_lwt ~validator_set:validators ~exporter_set:exporters certificate)
+      (fun result ->
+        if not !yielded then fail "certificate verification did not yield";
+        Lwt.map (fun () -> result) tick)) in
+    if actual <> expected then fail "certificate verification paths differ")
+    [valid; short; duplicate; wrong_exporter; mutated]
 
 let test_reference_format () =
   let wallets = List.init 5 (fun index -> wallet (index + 1)) in
@@ -429,7 +440,29 @@ let test_finalized_anchor () =
     Base64.decode_exn encoded ^ "x"
     |> Base64.encode_exn
   in
-  expect_error (Sync_anchor.decode trailing)
+  expect_error (Sync_anchor.decode trailing);
+  List.iter (fun (trusted, checkpoint, encoded) ->
+    let expected = Sync_anchor.verify ~validator_set:trusted checkpoint encoded
+      |> Result.map Sync_anchor.encode in
+    let actual = Lwt_main.run (Sync_anchor.verify_lwt ~validator_set:trusted checkpoint encoded)
+      |> Result.map Sync_anchor.encode in
+    if actual <> expected then fail "anchor verification paths differ")
+    [validators, certificate.checkpoint, encoded;
+     other_validators, certificate.checkpoint, encoded;
+     validators, {certificate.checkpoint with state_root = sha "other-state"}, encoded;
+     validators, {certificate.checkpoint with ledger_state_root = String.make 128 'b'}, encoded;
+     validators, {certificate.checkpoint with epoch_index_root = Some (sha "other-index")}, encoded;
+     validators, {certificate.checkpoint with txid_hi = 100L}, encoded;
+     validators, {certificate.checkpoint with validator_set_hash = sha "other-set"}, encoded;
+     validators, {certificate.checkpoint with quorum_cert_hash = Some (sha "other-qc")}, encoded;
+     validators, certificate.checkpoint, Sync_anchor.encode duplicate;
+     validators, certificate.checkpoint, Sync_anchor.encode invalid;
+     validators, certificate.checkpoint, Sync_anchor.encode foreign;
+     validators, certificate.checkpoint, trailing];
+  let expected = Manifest.verify_certificate ~validator_set:validators ~exporter_set:exporters certificate in
+  let actual = Lwt_main.run (Manifest.verify_certificate_lwt
+    ~validator_set:validators ~exporter_set:exporters certificate) in
+  if actual <> expected then fail "finalized certificate paths differ"
 
 let test_manifest_shape () =
   let wallets = List.init 5 (fun index -> wallet (index + 1)) in
@@ -890,6 +923,55 @@ let test_image_signature () =
     expect_error (Manifest.verify_reference_certificate
       ~validator_set:validators ~exporter_set:exporters changed))
 
+let expect_write_error path json =
+  match Manifest.write_json path json with
+  | () -> fail "oversized document was published"
+  | exception Failure reason when reason = "manifest exceeds size limit" -> ()
+
+let test_json_size () =
+  let root = Filename.concat "runtime_data"
+      (Printf.sprintf "manifest_size_%d" (Unix.getpid ())) in
+  mkdir_p root;
+  Fun.protect ~finally:(fun () -> remove_tree root) (fun () ->
+    let path = Filename.concat root "current.json" in
+    let parse raw = Ok (Yojson.Safe.from_string raw) in
+    let sample = `Assoc [
+      "text", `String "\195\169\000\n\"\\";
+      "items", `List [`Null; `Bool true; `Int 7; `Float 0.5];
+    ] in
+    Manifest.write_json path sample;
+    let bytes = expect_ok (Manifest.load_limited (fun raw -> Ok raw) path) in
+    if bytes <> Yojson.Safe.to_string sample ^ "\n" then
+      fail "published json bytes differ";
+    let check character width =
+      let size = Manifest.manifest_limit - 3 in
+      let value = String.make (size / width) character
+          ^ String.make (size mod width) 'x' in
+      let json = `String value in
+      Manifest.write_json path json;
+      let before = Unix.stat path in
+      if before.Unix.st_size <> Manifest.manifest_limit then
+        fail "encoded size differs";
+      if expect_ok (Manifest.load_limited parse path) <> json then
+        fail "exact size document differs";
+      let oversized = `String (value ^ "x") in
+      expect_write_error path oversized;
+      let after = Unix.stat path in
+      if after.Unix.st_ino <> before.Unix.st_ino
+         || after.Unix.st_size <> before.Unix.st_size
+         || expect_ok (Manifest.load_limited parse path) <> json then
+        fail "size refusal changed published document";
+      let absent = Filename.concat root "absent" in
+      expect_write_error (Filename.concat absent "next.json") oversized;
+      if Sys.file_exists absent || Sys.readdir root <> [|"current.json"|] then
+        fail "size refusal created files";
+      Manifest.write_json path (`String "retry");
+      if expect_ok (Manifest.load_limited parse path) <> `String "retry" then
+        fail "write after refusal differs"
+    in
+    List.iter (fun (character, width) -> check character width)
+      ['x', 1; '"', 2; '\\', 2; '\000', 6])
+
 let test_large_manifest () =
   let root =
     Filename.concat
@@ -944,9 +1026,20 @@ let test_large_manifest () =
     manifest_hash = expect_ok (Manifest.manifest_hash manifest);
   } in
   let path = Filename.concat root "draft.json" in
-  Manifest.write_json path (Manifest.draft_json draft);
-  ignore (expect_ok (Manifest.load_draft path) |> Manifest.verify_draft |> expect_ok);
-  remove_tree root
+  Fun.protect ~finally:(fun () -> remove_tree root) (fun () ->
+    Manifest.write_json path (Manifest.draft_json draft);
+    ignore (expect_ok (Manifest.load_draft path) |> Manifest.verify_draft |> expect_ok);
+    let files = List.map (fun (file : Manifest.file) ->
+      { file with path = file.path ^ String.make 600 'k' }) files in
+    let manifest = { manifest with files; chunks_root = Manifest.chunks_root files } in
+    let oversized = { draft with manifest;
+      manifest_hash = expect_ok (Manifest.manifest_hash manifest) } in
+    ignore (expect_ok (Manifest.verify_draft oversized));
+    expect_write_error path (Manifest.draft_json oversized);
+    if expect_ok (Manifest.load_draft path) <> draft then
+      fail "size refusal replaced readable draft";
+    if Sys.readdir root <> [|"draft.json"|] then
+      fail "size refusal left staged draft")
 
 let () =
   if not (Octra_bootstrap.State_sync.path_allowed "pvac/migration_state.json") then
@@ -962,5 +1055,6 @@ let () =
   test_snapshot_roots ();
   test_chunks ();
   test_hash_slices ();
+  test_json_size ();
   test_large_manifest ();
   print_endline "status = pass test = state_sync_manifest"

@@ -4,13 +4,20 @@
 type t
 
 type total = private {
+  chain_id : string;
+  config_hash : string;
   address : string;
   first_epoch : int;
   last_epoch : int;
   state_root : string;
   source_cipher_hash : string;
+  records : int;
   sum : Octra_core.Claim_sum.summary;
 }
+
+val admission :
+  t -> activation_epoch:int -> total list ->
+  (Octra_core.Pvac_migration_admission.t, string) result
 
 val total :
   t -> Octra_core.Store_irmin.t -> Octra_core.Store_chaindata.t ->

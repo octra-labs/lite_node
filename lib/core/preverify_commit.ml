@@ -141,15 +141,21 @@ let add_used used lane cost =
     | Some value -> value
     | None -> Resource_lanes.zero in
   let next = Resource_lanes.add current cost in
-  List.map (fun (l, u) -> if l = lane then l, next else l, u) used
+  if List.mem_assoc lane used then
+    List.map (fun (l, u) -> if l = lane then l, next else l, u) used
+  else used @ [lane, next]
 
-let check_budget gate used tx =
-  let lane = Resource_lanes.of_op tx.Transaction.op_type in
-  let cost = Resource_lanes.cost tx in
+let reserve gate used lane cost =
   let next = Resource_lanes.add (Option.value (List.assoc_opt lane used) ~default:Resource_lanes.zero) cost in
   match Resource_lanes.over (gate.budgets lane) next with
   | Some e -> Error ("lane_budget:" ^ Resource_lanes.to_string lane ^ ":" ^ e)
   | None -> Ok (add_used used lane cost)
+
+let check_budget gate used tx =
+  reserve gate used (Resource_lanes.of_op tx.Transaction.op_type) (Resource_lanes.cost tx)
+
+let check_work gate used tx =
+  reserve gate used (Resource_lanes.of_op tx.Transaction.op_type) (Resource_lanes.work tx)
 
 let check_orphan txs r =
   match find_tx r.Preverify_receipt.tx_hash txs with

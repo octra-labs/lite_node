@@ -45,6 +45,7 @@ val last_epoch_or :
 
 val recovery_override_error :
   consensus_mode:bool ->
+  recovery_required:bool ->
   skip_recovery:bool ->
   skip_reconcile:bool ->
   string option

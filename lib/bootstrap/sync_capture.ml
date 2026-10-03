@@ -27,11 +27,11 @@ type report = {
   bytes : int64;
 }
 
-type bounds = {
+type point = {
   commit : string;
 }
 
-let bounds head =
+let point head =
   match head.Head.irmin_commit with
   | Some commit when commit <> "" -> Ok { commit }
   | _ -> Error "state sync head commit is missing"
@@ -63,12 +63,6 @@ let rec remove_tree path =
         Unix.rmdir path
     | _ -> Unix.unlink path
 
-let fsync_dir path =
-  let descriptor = Unix.openfile path [Unix.O_RDONLY] 0 in
-  Fun.protect
-    ~finally:(fun () -> Unix.close descriptor)
-    (fun () -> Unix.fsync descriptor)
-
 let rec write_all descriptor bytes offset length =
   if length > 0 then
     let count = Unix.write descriptor bytes offset length in
@@ -93,7 +87,7 @@ let copy_exact source target size =
   if before.Unix.LargeFile.st_kind <> Unix.S_REG then
     failwith "state sync source is not a regular file";
   if Int64.compare before.st_size size < 0 then
-    failwith "state sync source is shorter than checkpoint boundary";
+    failwith "state sync source is shorter than checkpoint end";
   mkdir_p (Filename.dirname target);
   let input = Unix.openfile source [Unix.O_RDONLY] 0 in
   let output =
@@ -113,7 +107,7 @@ let copy_exact source target size =
               (Int64.to_int (Int64.min remaining (Int64.of_int (Bytes.length buffer))))
           in
           let read = Unix.read input buffer 0 count in
-          if read = 0 then failwith "state sync source ended before checkpoint boundary";
+          if read = 0 then failwith "state sync source ended before checkpoint end";
           write_all output buffer 0 read;
           loop (Int64.sub remaining (Int64.of_int read))
         end
@@ -166,10 +160,17 @@ let snapshot_shape root =
     in
     files + 1, Int64.add bytes size) (0, 0L)
 
-let build source ~target =
-  match bounds source.head with
-  | Error _ as error -> Lwt.return error
-  | Ok bounds ->
+let remove_stage archive target =
+  try
+    if Sync_archive.marked_stage archive (Filename.basename target) then
+      remove_tree (target ^ ".next")
+  with _ -> ()
+
+let stage_owned archive source ~target =
+  match Sync_archive.owns archive target, point source.head with
+  | false, _ -> Lwt.return_error "state sync target differs from archive"
+  | true, (Error _ as error) -> Lwt.return error
+  | true, Ok point ->
       let reference = reference_head source.head in
       if Sys.file_exists target then
         Lwt.return_error "state sync target already exists"
@@ -180,11 +181,14 @@ let build source ~target =
         else
           Lwt.catch
             (fun () ->
-              mkdir_p (Filename.dirname target);
-              Unix.mkdir stage 0o750;
+              Lwt_preemptive.detach (fun () ->
+                mkdir_p (Filename.dirname target);
+                Unix.mkdir stage 0o750;
+                Sync_archive.mark_stage archive (Filename.basename target)) ()
+              >>= fun () ->
               Image.write
                 source.store
-                ~commit:bounds.commit
+                ~commit:point.commit
                 ~path:(Filename.concat stage "ledger.dat")
               >>= function
               | Error reason -> Lwt.fail_with reason
@@ -205,14 +209,11 @@ let build source ~target =
                       (Roots.encode source.roots);
                     State_sync.write_ready stage reference;
                     let files, bytes = snapshot_shape stage in
-                    fsync_dir stage;
-                    Unix.rename stage target;
-                    fsync_dir (Filename.dirname target);
                     {
                       epoch = source.head.epoch_id;
                       state_root = source.head.state_root;
                       ledger_root = Head.ledger_state_root source.head;
-                      irmin_commit = bounds.commit;
+                      irmin_commit = point.commit;
                       files;
                       bytes;
                     }) () >>= fun report ->
@@ -220,6 +221,23 @@ let build source ~target =
             (fun exn ->
               let reason = Printexc.to_string exn in
               Lwt_preemptive.detach
-                (fun () -> try remove_tree stage with _ -> ())
+                (fun () -> remove_stage archive target)
                 () >>= fun () ->
               Lwt.return_error reason)
+
+let build_owned archive source ~target =
+  Lwt.catch
+    (fun () ->
+      stage_owned archive source ~target >>= function
+      | Error _ as error -> Lwt.return error
+      | Ok report ->
+          Lwt_preemptive.detach (fun () ->
+            Sync_archive.publish_stage archive (Filename.basename target);
+            Ok report) ())
+    (fun exn ->
+      Lwt_preemptive.detach (fun () -> remove_stage archive target) () >>= fun () ->
+      Lwt.return_error (Printexc.to_string exn))
+
+let build source ~target =
+  Sync_archive.run_lwt (Filename.dirname target)
+    (fun archive -> build_owned archive source ~target)

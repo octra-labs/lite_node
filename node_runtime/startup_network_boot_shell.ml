@@ -86,6 +86,9 @@ let run deps =
       Int64.of_int (max (-1) (!(deps.current_epoch) - 1)));
     active_raw = deps.read_active_validator_meta;
     pending_raw = deps.read_pending_validator_meta;
+    relief = (fun through_height ->
+      Octra_consensus.C_relief_log.latest
+        (Octra_consensus.C_relief_log.disk ~data_dir:deps.data_dir) ~through_height);
   } in
   Startup_process_shell.log_node_start
     ~info:(Log.info "init" "%s")

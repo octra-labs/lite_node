@@ -14,16 +14,21 @@ let chain_id = "octra-devnet-9871-cluster"
 let envelope_epoch =
   (Option.get (Octra_core.Rule_graph.tx_envelope_activation_for_chain chain_id)).activation_epoch
 
-let signed ?(ou = Z.of_int 10_000) ?(duty = false) () =
-  let secret, public = Mirage_crypto_ec.Ed25519.generate () in
+let signed ?secret ?(nonce = 1) ?(ou = Z.of_int 10_000) ?(duty = false) ?(op = Tx.Standard)
+    ?message ?encrypted_data () =
+  let secret, public = match secret with
+    | None -> Mirage_crypto_ec.Ed25519.generate ()
+    | Some bytes ->
+      let key = Mirage_crypto_ec.Ed25519.priv_of_octets bytes |> Result.get_ok in
+      key, Mirage_crypto_ec.Ed25519.pub_of_priv key in
   let secret = Mirage_crypto_ec.Ed25519.priv_to_octets secret |> Base64.encode_exn in
   let public = Mirage_crypto_ec.Ed25519.pub_to_octets public |> Base64.encode_exn in
   let from = Octra_core.Crypto.Address.address_from_pubkey public in
   let tx = Tx.{from; to_ = "oct5TWVJk7LZmzEeU73KAwd8HRuQjt2sdBiagm3rxcWDzYH";
-    amount = (if duty then Z.zero else Z.one); nonce = 1; ou;
+    amount = (if duty then Z.zero else Z.one); nonce; ou;
     timestamp = Unix.gettimeofday (); signature = ""; public_key = Some public;
-    message = (if duty then Some {|{"consensus_pubkey":"key","head_epoch":"10","state_root":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}|} else None);
-    op_type = (if duty then ValidatorReady else Standard); encrypted_data = None} in
+    message = (if duty then Some {|{"consensus_pubkey":"key","head_epoch":"10","state_root":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}|} else message);
+    op_type = (if duty then ValidatorReady else op); encrypted_data} in
   Tx.sign_with_privkey tx secret
 
 let alias tx =
@@ -84,6 +89,7 @@ let test_selection () =
     read_prev_ledger_root = (fun () -> Lwt.return_none); next_txid = (fun () -> 0L);
     proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
     catchup_active = ref false; staging_epoch_capacity = Tx.ou_cost other;
+    save_drops = ignore;
     write_pending = ignore; validator_pubkeys_for_epoch = (fun ~wallet_addr:_ ~wallet_pub:_ ~epoch:_ -> [])} in
   Pool.clear ();
   Fun.protect ~finally:Pool.clear (fun () ->
@@ -97,6 +103,151 @@ let test_selection () =
       else expect "prior selection preserves old fee order" (selected = [bad]);
       expect "selection preserves staging evidence" (Pool.staging_size () = 3))
       [envelope_epoch - 1; envelope_epoch; envelope_epoch + 1])
+
+let test_circle_intake () =
+  let env = ["OCTRA_BFT_RELEASE_PROFILE", "devnet_full_v1"; "OCTRA_CONSENSUS_MODE", "bft"] in
+  let prior = List.map (fun (name, _) -> name, Sys.getenv_opt name) env in
+  List.iter (fun (name, value) -> Unix.putenv name value) env;
+  Fun.protect ~finally:(fun () -> List.iter (fun (name, value) ->
+    Unix.putenv name (Option.value ~default:"" value)) prior) (fun () ->
+  Test_workspace.with_dir "circle_queue" (fun dir ->
+    let store = Lwt_main.run (Store.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Pool.clear (); Lwt_main.run (Store.close store)) (fun () ->
+      let module Lane = Octra_core.Resource_lanes in
+      let budget = Lane.default_budget Lane.Circle_compute in
+      let secret = String.make 32 '\001' in
+      let call = signed ~message:"[]" ~encrypted_data:"run" ~op:Tx.CircleCall in
+      let allowed = call ~secret ~ou:budget.max_ou () in
+      let refused = call ~ou:(Z.succ budget.max_ou) () in
+      let ledger = Ledger.create store in
+      List.iter (fun tx ->
+        Ledger.add_account_with_pubkey ledger tx.Tx.from (Z.of_int 100_000_000)
+          (Option.get tx.public_key) |> Result.get_ok) [allowed; refused];
+      let seen = ref [] in
+      let drops = ref [] in
+      let runtime = Rest.{swarm_ref = ref None; duty_head = (fun () -> None);
+        preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
+        save_drops = (fun rows -> drops := rows @ !drops);
+        find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
+      let submit = Rest.add_tx_to_staging ~relay:false ~bft_mode:true runtime ledger in
+      Pool.clear ();
+      let accepted = submit allowed in
+      expect ("circle exact budget accepted: " ^
+        (match accepted with Ok hash -> hash | Error reason -> reason))
+        (accepted = Ok (Tx.hash allowed));
+      expect "circle positive control entered preverify" (!seen = [allowed]);
+      List.iter (fun encoding ->
+        let fields = match Tx.to_yojson refused with `Assoc fields -> fields | _ -> assert false in
+        let encoded = `Assoc (List.map (fun (key, value) ->
+          key, if key = "ou" then encoding else value) fields) in
+        let decoded = Tx.of_yojson encoded |> Result.get_ok in
+        expect "circle OU encoding preserves signature"
+          (decoded = refused && Tx.verify decoded (Option.get decoded.public_key));
+        expect "circle over budget refused before preverify" (Result.is_error (submit decoded)))
+        [`Int (Z.to_int refused.ou); `String (Z.to_string refused.ou);
+         `String ("0x" ^ Z.format "%x" refused.ou)];
+      expect "circle refusal preserves queue" (Pool.all () = [allowed] && !seen = [allowed] && !drops = []);
+      let replacement = call ~secret ~ou:(Z.mul budget.max_ou (Z.of_int 2)) () in
+      expect "circle replacement is signed" (Tx.verify replacement (Option.get allowed.public_key));
+      expect "circle invalid replacement refused" (Result.is_error (submit replacement));
+      expect "circle invalid replacement keeps original"
+        (Pool.find_by_hash (Tx.hash allowed) = Some allowed && !drops = [] && !seen = [allowed]);
+      Pool.clear ();
+      let first = call ~secret ~ou:(Z.of_int 10_000) () in
+      let next = call ~secret ~ou:(Z.of_int 11_000) () in
+      expect "circle small call accepted" (submit first = Ok (Tx.hash first));
+      expect "circle fee replacement accepted" (submit next = Ok (Tx.hash next));
+      expect "circle fee replacement replaces only original"
+        (Pool.all () = [next] && List.map (fun row -> row.Pool.d_hash) !drops = [Tx.hash first]);
+      Pool.clear ();
+      let huge = call ~secret ~ou:(Z.shift_left Z.one 100) () in
+      expect "circle large OU is signed" (Tx.verify huge (Option.get huge.public_key));
+      expect "circle large OU refused" (submit huge = Error "circle resource limit: ou");
+      let empty = signed ~secret ~op:Tx.CircleCall ~encrypted_data:"run" ~message:"[\"\\n\"]" () in
+      let count = budget.max_bytes - Lane.tx_bytes empty in
+      let sized extra =
+        {empty with Tx.message = Some ("[\"\\n" ^ String.make (count + extra) 'a' ^ "\"]")}
+        |> fun tx -> Tx.sign_with_privkey tx (Base64.encode_exn secret) in
+      let exact = sized 0 in
+      let carried = {exact with Tx.public_key = Some (String.make 44 '"')} in
+      expect "circle escaped signed size" (Lane.tx_bytes exact = budget.max_bytes);
+      expect "circle carried key inflates wire size" (Lane.tx_bytes carried = budget.max_bytes + 44);
+      expect "circle carried key resolves before admission" (Rest.prepare_tx ledger carried = Ok exact);
+      expect "circle normalized RPC control accepted"
+        (Rest.validate_and_submit_tx runtime ledger exact = Ok (Tx.hash exact));
+      Pool.clear ();
+      expect "circle RPC uses normalized byte size"
+        (Rest.validate_and_submit_tx runtime ledger carried = Ok (Tx.hash exact));
+      Pool.clear ();
+      expect "circle staging uses normalized byte size" (submit carried = Ok (Tx.hash exact));
+      let larger = sized 1 in
+      expect "circle signed byte excess refused" (submit larger = Error "circle resource limit: bytes");
+      expect "circle signed byte excess preserves accepted call" (Pool.all () = [exact]);
+      Pool.clear ();
+      expect "circle non-bft policy unchanged"
+        (Rest.add_tx_to_staging ~relay:false runtime ledger refused = Ok (Tx.hash refused));
+      expect "circle admission does not charge"
+        ((Ledger.find ledger allowed.from).nonce = 0
+         && Z.equal (Ledger.find ledger allowed.from).balance (Z.of_int 100_000_000)))))
+
+let test_circle_bytes () =
+  let module Lane = Octra_core.Resource_lanes in
+  let budget = Lane.default_budget Lane.Circle_compute in
+  let empty = signed ~op:Tx.CircleCall ~message:"" () in
+  let size = budget.max_bytes - Lane.tx_bytes empty in
+  let exact = {empty with Tx.message = Some (String.make size 'a')} in
+  let larger = {empty with Tx.message = Some (String.make (size + 1) 'a')} in
+  expect "circle byte count matches gate" (Lane.tx_bytes exact = budget.max_bytes);
+  expect "circle byte limit inclusive" (Lane.circle_admission exact = Ok ());
+  expect "circle byte excess refused"
+    (Lane.circle_admission larger = Error "circle resource limit: bytes");
+  expect "circle policy leaves other lanes unchanged"
+    (Lane.circle_admission {larger with Tx.op_type = ProgramExec; ou = Z.succ budget.max_ou} = Ok ())
+
+let test_circle_selection () =
+  let module Lane = Octra_core.Resource_lanes in
+  let budget = Lane.default_budget Lane.Circle_compute in
+  let secret = String.make 32 '\002' in
+  let bad = signed ~secret ~op:Tx.CircleCall ~ou:(Z.succ budget.max_ou) () in
+  let successor = signed ~secret ~nonce:2 () in
+  let other = signed () in
+  let current = ref (envelope_epoch - 2) in
+  let adapters = Wiring.node_standard_adapters Wiring.{chain_id;
+    getenv = (fun _ -> None); get_meta = (fun _ -> None);
+    duty_state = (fun _ -> Ok Octra_core.Set_fold.empty);
+    wallet_addr = other.from; wallet_pub = Option.get other.public_key;
+    find_account = (fun _ -> Some {Ledger.empty_account with balance = Z.of_int 100_000_000});
+    cached_head = (fun () -> Some (head !current));
+    read_prev_ledger_root = (fun () -> Lwt.return_none); next_txid = (fun () -> 0L);
+    proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
+    catchup_active = ref false; staging_epoch_capacity = Z.mul (Z.of_int 2) (Tx.ou_cost other);
+    save_drops = ignore;
+    write_pending = ignore; validator_pubkeys_for_epoch = (fun ~wallet_addr:_ ~wallet_pub:_ ~epoch:_ -> [])} in
+  Pool.clear ();
+  Fun.protect ~finally:Pool.clear (fun () ->
+    List.iter (fun tx -> Pool.add_smart ~lookup:(fun _ -> Some (Z.of_int 100_000_000, 0)) tx
+      |> Result.get_ok |> ignore) [bad; successor; other];
+    List.iter (fun epoch ->
+      current := epoch - 1;
+      expect "circle over budget cannot consume capacity or release successor"
+        (adapters.staging_epoch_txs () = [other]);
+      expect "circle selection preserves queue evidence" (Pool.staging_size () = 3))
+      [envelope_epoch - 1; envelope_epoch; envelope_epoch + 1];
+    Pool.clear ();
+    let first = signed ~secret ~op:Tx.CircleCall ~ou:(Z.of_int 100_000) () in
+    let successor = signed ~secret ~nonce:2 ~ou:(Z.of_int 50_000) () in
+    List.iter (fun tx ->
+      expect "circle nonce controls signed" (Tx.verify tx (Option.get tx.Tx.public_key));
+      Pool.add_smart ~lookup:(fun _ -> Some (Z.of_int 100_000_000, 0)) tx
+      |> Result.get_ok |> ignore) [first; successor];
+    expect "circle nonce order preserved" (adapters.staging_epoch_txs () = [first; successor]);
+    Pool.add_smart ~lookup:(fun _ -> Some (Z.of_int 100_000_000, 0)) other
+    |> Result.get_ok |> ignore;
+    expect "priced circle did not consume queue capacity"
+      (adapters.staging_epoch_txs () = [first; successor]);
+    expect "circle turn did not free queue capacity or released dependent nonce"
+      (adapters.staging_epoch_txs ~circles:false () = [other]);
+    expect "circle turn removed deferred transactions" (Pool.staging_size () = 3))
 
 let test_delivery () =
   let module Delivery = Octra_node_runtime.Set_delivery in
@@ -193,9 +344,13 @@ let test_proposal () =
       read_prev_ledger_root = (fun () -> Lwt.return_some (String.make 32 'a'));
       cached_head = (fun () -> Some (head (epoch - 1))); current_round = (fun () -> 0);
       parent_commit = (fun ~epoch_id:_ -> Ok None); frozen_bundle = (fun _ -> None);
+      parent_txs = (fun _ -> None);
       store_bundle = (fun ~proposal_id:_ ~tx_hashes:_ ~txs:_ ~receipts_json ->
         expect "invalid envelope must not become a rejection receipt" (receipts_json = []));
-      staging_txs = (fun () -> [bad; good]); admits_tx = (fun _ -> true);
+      staging_txs = (fun ?(circles = true) () ->
+        if circles then [bad; good] else Octra_node_runtime.Circle_refill.without [bad; good]);
+      admits_tx = (fun _ -> true);
+      evict_preview = (fun _ -> failwith "unexpected preview eviction");
       build_preverify_once = (fun ~state_root:_ ~tx_hashes:_ inputs ->
         Lwt.return Octra_core.Preverify_worker.{ready = List.map (fun tx -> {tx; receipt = None}) inputs; skipped = []});
       staging_total = (fun () -> 2); proposer = (fun () -> good.from);
@@ -225,5 +380,6 @@ let () =
     with exn -> Printf.eprintf "event = test name = %s status = failed error = %s\n%!"
       name (Printexc.to_string exn); Some name)
     ["intake", test_intake; "selection", test_selection; "proposal", test_proposal;
-     "delivery", test_delivery] in
+     "delivery", test_delivery; "circle_intake", test_circle_intake;
+     "circle_selection", test_circle_selection; "circle_bytes", test_circle_bytes] in
   if failed <> [] then exit 1

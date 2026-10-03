@@ -91,7 +91,7 @@ let parse_signature path =
   | Error reason -> fail reason
 
 let load_finality () =
-  let raw = read_file_limited (require "finality" !finality_path) 4_000_000 in
+  let raw = read_file_limited (require "finality" !finality_path) Manifest.manifest_limit in
   let encoded =
     match try Some (Yojson.Safe.from_string raw) with _ -> None with
     | Some (`Assoc fields) ->

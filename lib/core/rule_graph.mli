@@ -36,6 +36,9 @@ val wasm_float_activation_for_chain : string -> activation option
 val wasm_float : t -> epoch:int -> (mode, fault) result
 val wasm_float_at : chain_id:string -> epoch:int -> mode
 
+val batch_activation_for_chain : string -> activation option
+val circle_batch : t -> epoch:int -> (mode, fault) result
+
 val create :
   chain_id:string ->
   root_at:(int -> root_read) ->

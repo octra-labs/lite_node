@@ -1068,9 +1068,13 @@ let test_spawn_budget () =
     constructor(target: address) { require(call(target, "value", []) == 1, "wrong value") }
   }|} in
   with_store "spawn_budget" (fun store ->
-    List.iter (fun (mode, depth, limit, success) ->
+    List.iter (fun (mode, bytes, depth, limit, success) ->
       let observed = ref None in
-      let ctx = {VM.default_ctx with fhe_work = mode;
+      let byte_work = if not bytes then None
+        else Some (Octra_vm.Byte_work.create (Option.get (Octra_vm.Byte_work.limits
+          ~key_bytes:64 ~value_bytes:128 ~copy_bytes:256 ~write_bytes:1024
+          ~alloc_bytes:1024 ~unit_bytes:32))) in
+      let ctx = {VM.default_ctx with fhe_work = mode; byte_work;
         call_contract = (fun _ _ _ _ scope -> observed := Some scope;
           Ok VM.{return_value = VInt Z.one; effort_used = 1; events = []})} in
       let journal = Journal.create () in
@@ -1083,19 +1087,22 @@ let test_spawn_budget () =
       if success then begin
         let scope = Option.get !observed in
         expect "constructor reset call depth"
-          (scope.depth = if mode = R.Prior then 1 else depth + 1);
+          (scope.depth = if mode = R.Prior && not bytes then 1 else depth + 1);
+        expect "constructor replaced byte owner" (Option.equal (==) scope.bytes byte_work);
         expect "constructor reset child budget"
           (match scope.limit with
-          | None -> mode = R.Prior
-          | Some value -> mode = R.Active && value >= 0 && value < limit)
+          | None -> mode = R.Prior && not bytes
+          | Some value -> (mode = R.Active || bytes) && value >= 0 && value < limit)
       end else begin
         expect "failed constructor staged program"
           (not (Journal.has_deploy journal (Contract.addr_from_code raw
             "oct11111111111111111111111111111111111111111111" 1)));
         expect "failed constructor called child" (!observed = None)
       end)
-      [R.Prior, 8, 10_000, true; R.Active, 7, 10_000, true;
-       R.Active, 8, 10_000, false; R.Active, 0, 1, false])
+      [R.Prior, false, 8, 10_000, true; R.Active, false, 7, 10_000, true;
+       R.Active, false, 8, 10_000, false; R.Active, false, 0, 1, false;
+       R.Prior, true, 7, 10_000, true; R.Prior, true, 8, 10_000, false;
+       R.Prior, true, 0, 1, false])
 
 let () =
   test_policy_abort ();

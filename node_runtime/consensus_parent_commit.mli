@@ -20,6 +20,11 @@ val load :
   epoch_id:int64 ->
   (Octra_consensus.C_types.parent_commit option, string) result
 
+val load_head :
+  source ->
+  epoch_id:int64 ->
+  (Octra_consensus.C_types.parent_commit option, string) result
+
 val verify :
   source ->
   epoch_id:int64 ->

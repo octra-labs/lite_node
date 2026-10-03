@@ -169,6 +169,9 @@ let run ~data ~cert_path ~range_paths ~output =
             current_height = (fun () -> Int64.pred cursor.J.epoch);
             active_raw = (fun () -> active);
             pending_raw = (fun () -> pending);
+            relief = (fun through_height ->
+              Octra_consensus.C_relief_log.latest
+                (Octra_consensus.C_relief_log.disk ~data_dir:data) ~through_height);
           } in
           let validators = R.get
             (Octra_node_runtime.Consensus_validator_anchor.expected_set source ~epoch:record.epoch_id) in

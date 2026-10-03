@@ -524,14 +524,17 @@ let amount_link_case () =
 let zero_proof_cache = ref None
 
 let zero_proof pk sk cipher amount blind =
+  let digest bytes = Digestif.SHA256.(digest_bytes bytes |> to_hex) in
+  let key = digest (P.serialize_pubkey pk), digest (P.serialize_cipher cipher),
+    amount, digest blind in
   match !zero_proof_cache with
-  | Some proof -> proof
-  | None ->
+  | Some (saved, proof) when saved = key -> proof
+  | _ ->
     let proof =
       P.make_zero_proof_bound pk sk cipher amount blind
       |> FB.encode_zero_proof
     in
-    zero_proof_cache := Some proof;
+    zero_proof_cache := Some (key, proof);
     proof
 
 let rec remove_tree path =
@@ -850,6 +853,159 @@ let process ?math ?artifacts ?keys ?field_policy ?result_policy
   Lwt_main.run
     (process_lwt ?math ?artifacts ?keys ?field_policy ?result_policy
        proof_mode store ledger transaction receipt)
+
+let batch_case () =
+  let module L = Octra_core.Ledger in
+  let module S = Octra_core.Store_irmin in
+  let module Gate = Octra_core.Preverify_commit in
+  let module Apply = Octra_core.Private_transition in
+  let path, store, ledger, pk, sk = setup "batch" in
+  Fun.protect
+    ~finally:(fun () ->
+      Lwt_main.run (S.close store);
+      clear_case path)
+    (fun () ->
+      let pk2, sk2 = P.keygen_from_seed (P.default_params ()) (bytes '\061') in
+      let first = tx (payload pk sk true) in
+      let second = {first with T.from = "oct" ^ String.make 44 '2';
+        to_ = "oct" ^ String.make 44 '2'; encrypted_data = Some (payload pk2 sk2 true)} in
+      let third = {first with T.from = "oct" ^ String.make 44 '3';
+        to_ = "oct" ^ String.make 44 '3'} in
+      let poor = {first with T.from = "oct" ^ String.make 44 '4';
+        to_ = "oct" ^ String.make 44 '4'} in
+      let inputs = [poor; first; second; third] in
+      List.iter (fun (item, key, balance) ->
+        expect (L.add_account ledger item.T.from balance = Ok ()) "batch account";
+        Lwt_main.run (L.set_pvac_pubkey ledger item.from
+          (P.serialize_pubkey key |> Bytes.to_string)))
+        [second, pk2, Z.of_int 1_000_000;
+         third, pk, Z.of_int 1_000_000; poor, pk, Z.zero];
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      let original = List.map (fun item -> L.find ledger item.T.from) inputs in
+      let root = Lwt_main.run (L.hash ledger) in
+      let artifacts = List.map (fun item ->
+        match Lwt_main.run (PL.preverify_private_artifact ~math:true
+            ~field_policy:PL.Unique_fields ~strict:true ledger item) with
+        | Ok artifact -> T.hash item, artifact
+        | Error error -> fail error.PL.reason) inputs in
+      let prepared item =
+        match List.assoc_opt (T.hash item) artifacts with
+        | None -> Lwt.return Octra_core.Preverify_availability.Unmanaged
+        | Some artifact ->
+          let open Lwt.Syntax in
+          let* result = PL.bind_private_artifact ~math:true
+            ~field_policy:PL.Unique_fields ~strict:true ledger item artifact in
+          match result with
+          | PL.Private_bound plan ->
+            Lwt.return (Octra_core.Preverify_availability.Ready plan)
+          | PL.Private_source_changed -> fail "batch artifact source differs"
+          | PL.Private_artifact_invalid error ->
+            fail ("batch artifact rejected: " ^ error.PL.private_preverify_reason)
+      in
+      let dependent = {first with T.nonce = 2} in
+      let payment = {first with T.nonce = 3; op_type = T.Standard;
+        amount = Z.one; encrypted_data = None} in
+      let checked = Lwt_main.run (W.run_many ~math:true ~ledger ~prepared
+        ~field_policy:PL.Unique_fields ~strict:true
+        [poor; first; dependent; payment; second; third]) in
+      expect (W.txs checked = inputs) "independent private batch was isolated";
+      expect (List.map (fun (item : W.skip) -> item.tx) checked.skipped
+        = [dependent; payment]) "private dependency order differs";
+      expect (List.for_all (fun (item : W.skip) -> item.kind = W.Deferred)
+        checked.skipped) "private dependency became invalid";
+      let receipts = List.filter_map (fun (item : W.ready) -> item.receipt) checked.ready in
+      let run limit txs =
+        let open Lwt.Syntax in
+        let selected = List.map T.hash txs in
+        let gate = Gate.create (List.filter (fun receipt ->
+          List.mem receipt.R.tx_hash selected) receipts)
+          |> Gate.with_artifacts artifacts in
+        let result = Lwt_main.run (Octra_core.State_preview.with_state
+          ~base_store:store ~base_ledger:ledger ~epoch_id:env.epoch_id
+          ~proposal_id:"private_batch" (fun store ledger ->
+            let* checked = Gate.check_bound ledger gate txs in
+            begin match checked with Ok () -> () | Error error -> fail error end;
+            let transition = Apply.create ~math:true ~preverify:(Some gate)
+              ~ledger ~epoch_id:env.epoch_id
+              ~owner_migration_mode:Octra_core.Rule_graph.Active
+              ~proof_mode:Octra_core.Rule_graph.Active
+              ~field_policy:PL.Unique_fields
+              ~result_policy:Octra_core.Private_result_policy.Recoverable
+              ~legacy_replay ~limits:Apply.{max_fhe = limit; max_stealth = limit} in
+            let backend = E.make_live_backend ~math:true store ledger in
+            let accounts () = List.map (fun item -> L.find ledger item.T.from) inputs in
+            let spent () = Hashtbl.fold (fun key () all -> key :: all)
+              ledger.L.spent_nonces [] |> List.sort compare in
+            let* () = S.begin_epoch_batch store in
+            let* results = Lwt_list.map_s (fun item ->
+              let before = accounts () in
+              let nonces = spent () in
+              let supply = ledger.total_supply in
+              let* result = Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+                Apply.process transition ~backend ~env item) in
+              if Result.is_error result then begin
+                expect (spent () = nonces) "private refusal changed spent nonces";
+                expect (Z.equal ledger.total_supply supply) "private refusal changed supply";
+                expect (accounts () = before) "private refusal changed account state"
+              end;
+              Lwt.return (T.hash item, result)) txs in
+            let state = accounts () in
+            let* () = L.flush_dirty_lwt ledger in
+            let* () = S.commit_epoch_batch store "private_batch" in
+            let* saved = Lwt_list.map_s (fun item -> S.get_account store item.T.from) inputs in
+            expect (saved = List.map Option.some state) "private batch was not persisted";
+            let* root = L.hash ledger in
+            Lwt.return_ok (results, state, root))) in
+        expect (List.map (fun item -> L.find ledger item.T.from) inputs = original)
+          "private batch changed live accounts";
+        expect (Lwt_main.run (L.hash ledger) = root) "private batch changed live root";
+        match result with Ok result -> result | Error error -> fail error
+      in
+      let check limit txs successes =
+        let results, accounts, post_root = run limit txs in
+        let ok = List.filter_map (fun (hash, result) ->
+          match result with Ok _ -> Some hash | Error _ -> None) results in
+        expect (ok = List.map T.hash successes) "private batch success set differs";
+        let fees = List.fold_left (fun sum (_, result) ->
+          match result with Ok fee -> Z.add sum fee | Error _ -> sum) Z.zero results in
+        expect (Z.equal fees (Z.of_int (List.length successes))) "private batch fees differ";
+        List.iter2 (fun item (account : Octra_core.Ledger_types.account) ->
+          let before = List.assoc item.T.from (List.map2 (fun item account ->
+            item.T.from, account) inputs original) in
+          if List.mem (T.hash item) ok then begin
+            expect (account.Octra_core.Ledger_types.nonce = 1) "batch nonce differs";
+            expect (Z.equal account.balance (Z.sub before.balance (Z.of_int 11)))
+              "batch public debit differs";
+            match account.encrypted_balance with
+            | None -> fail "batch encrypted balance missing"
+            | Some cipher ->
+              let key, secret = if item.from = second.from then pk2, sk2 else pk, sk in
+              let cipher = match FB.decode_cipher cipher with
+                | Ok cipher -> cipher
+                | Error error -> fail error in
+              let value = P.dec_value key secret cipher in
+              expect (value = 10L) "batch encrypted value differs"
+          end else expect (account = before) "batch changed refused account") inputs accounts;
+        List.iter (fun (hash, result) ->
+          match result with
+          | Ok _ -> ()
+          | Error (tag, _) ->
+            let expected = if hash = T.hash poor && limit > 0 then
+              "insufficient_balance" else "fhe_epoch_cap" in
+            expect (tag = expected) "batch refusal reason differs") results;
+        accounts, post_root
+      in
+      expect (check 0 inputs [] = (original, root)) "private refusals changed stored state";
+      ignore (check 1 inputs [first]);
+      let pair = check 2 inputs [first; second] in
+      expect (snd pair <> root) "private batch did not change stored root";
+      expect (pair = check 2 [first; second] [first; second])
+        "private refusals changed successful state";
+      expect (pair = check 2 [poor; second; first; third] [second; first])
+        "independent private order changed state";
+      expect (pair = check 2 inputs [first; second]) "private replay changed state";
+      ignore (check 2 [poor; second; third] [second; third]);
+      ignore (check 3 inputs [first; second; third]))
 
 let switch_reuse () =
   let path, store, ledger, pk, sk = setup "switch_reuse" in
@@ -1419,6 +1575,19 @@ let worker_retry_case () =
         Octra_core.Pvac_verify_worker.worker_path ()
         |> Option.get
       in
+      let module Cache = Octra_node_runtime.Consensus_bundle_cache in
+      let cache = Cache.create ~cap:4 in
+      let calls = ref 0 in
+      let root = Lwt_main.run (Octra_core.Ledger.hash ledger) in
+      let check transaction =
+        Lwt_main.run (Cache.run_preverify_once cache
+          ~purpose:Cache.Validate_proposal ~state_root:root
+          ~tx_hashes:[T.hash transaction] ~txs:[transaction]
+          (fun _ inputs ->
+            incr calls;
+            W.run_many ~field_policy:PL.Unique_fields ~strict:true
+              ~ledger inputs))
+      in
       let retried =
         Fun.protect
           ~finally:(fun () ->
@@ -1427,6 +1596,25 @@ let worker_retry_case () =
             Unix.putenv
               "OCTRA_PVAC_VERIFY_WORKER"
               "runtime_data/private_transition_receipt/absent_worker";
+            List.iter (fun _ ->
+              let batch = check transaction in
+              match batch.W.ready, batch.skipped with
+              | [], [skip] ->
+                expect (not (W.checked_cacheable (W.Checked_skip skip)))
+                  "worker failure cached as invalid"
+              | _ -> fail "worker failure batch") [0; 1];
+            expect (!calls = 2) "worker failure did not retry";
+            let module A = Octra_core.Preverify_availability in
+            List.iter (fun available ->
+              let batch = Lwt_main.run
+                (W.run_many ~field_policy:PL.Unique_fields ~strict:true ~ledger
+                  ~prepared:(fun _ -> Lwt.return available) [transaction]) in
+              match batch.W.ready, batch.skipped with
+              | [], [skip] ->
+                expect (skip.kind = W.Unavailable) "prepared retry became invalid"
+              | _ -> fail "prepared retry batch")
+              [A.Unmanaged; A.Ready (PL.Prepared_encrypt
+                {plan with current_cipher = "changed"})];
             try
               ignore
                 (process
@@ -1440,6 +1628,37 @@ let worker_retry_case () =
             | PL.Worker_retry _ -> true)
       in
       expect retried "worker failure became a transaction rejection";
+      let ready = check transaction in
+      expect (W.txs ready = [transaction] && ready.skipped = [])
+        "worker recovery did not verify";
+      ignore (check transaction);
+      expect (!calls = 3) "verified result was not reused";
+      let invalid = tx (payload pk sk false) in
+      let rejected = check invalid in
+      begin
+        match rejected.W.ready, rejected.skipped with
+        | [], [skip] ->
+          expect (skip.kind = W.Invalid) "invalid proof did not reject";
+          expect (W.checked_cacheable (W.Checked_skip skip))
+            "invalid proof was not cacheable"
+        | _ -> fail "invalid proof batch"
+      end;
+      ignore (check invalid);
+      expect (!calls = 4) "invalid proof was not reused";
+      let failure tag = Error PL.{tag; reason = "worker offline"; user_reason = "worker offline"} in
+      List.iter (fun tag ->
+        match W.prepared_result (failure tag) with
+        | Octra_core.Preverify_availability.Pending -> ()
+        | _ -> fail "worker failure tag became invalid")
+        ["private_worker_retry"; "key_switch_worker_retry"];
+      begin
+        match W.prepared_result (failure "key_switch_rejected") with
+        | Octra_core.Preverify_availability.Invalid reason ->
+          expect (reason = "worker offline") "invalid reason changed"
+        | _ -> fail "invalid proof reason was treated as retry tag"
+      end;
+      expect (Lwt_main.run (Octra_core.Ledger.hash ledger) = root)
+        "preverify changed state";
       match Octra_core.Ledger.find_opt ledger addr with
       | Some account ->
         expect (account.Octra_core.Ledger_types.nonce = 0) "retry nonce";
@@ -1542,7 +1761,7 @@ let recovered_bundle result =
   let stored = ref None in
   let recovery =
     JR.{
-      read_journal = (fun () -> result);
+      read_journal = (fun () -> Ok result);
       read_pending_epoch = (fun () -> Ok None);
       drop_invalid_unapplied = (fun ~head_epoch:_ -> Ok 0);
       head_epoch = (fun () -> 0);
@@ -1669,6 +1888,9 @@ let () =
     Unix.mkdir "runtime_data/private_transition_receipt" 0o755;
   Unix.putenv "OCTRA_BFT_CRYPTO_PROFILE" "private_v1";
   match Array.to_list Sys.argv with
+  | [_; "batch"] ->
+    batch_case ();
+    print_endline "status = pass test = private_transition_receipt case = batch"
   | [_; "collect"] ->
     collect_ops ();
     print_endline "status = pass test = private_transition_receipt case = collect"
@@ -1700,7 +1922,11 @@ let () =
   | [_; "switch_reuse"] ->
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt case = switch_reuse"
+  | [_; "worker_retry"] ->
+    worker_retry_case ();
+    print_endline "status = pass test = private_transition_receipt case = worker_retry"
   | [_] ->
+    batch_case ();
     collect_ops ();
     migration_case ();
     circle_policy_case ();
@@ -1726,4 +1952,4 @@ let () =
     reuse_case T.ClaimOp;
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt"
-  | _ -> fail "expected collect, cache_key, migration, math, circle_policy, valid, reuse, stealth_reuse, claim_reuse or switch_reuse"
+  | _ -> fail "unknown test case"

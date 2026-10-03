@@ -473,10 +473,11 @@ let pvac_status ~addr (status : Pvac_registry.status) =
 
 let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
     (status : Pvac_migration.status) admissions =
+  let module Admission = Octra_core.Pvac_migration_admission in
   let admission =
     if Pvac_migration.needs_history_migration status then
       Some
-        (Octra_core.Pvac_migration_admission.find
+        (Admission.lookup
            admissions
            ~epoch
            ~address:addr
@@ -500,12 +501,19 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
     | None -> `Null
     | Some result ->
       match result with
-      | Error reason ->
+      | Error error ->
+        let reason = Admission.lookup_message error in
+        let state = match error with
+          | Admission.Unavailable -> "unavailable"
+          | Admission.Not_active -> "not_active"
+          | Admission.Not_found -> "not_found"
+          | Admission.Cipher_mismatch -> "cipher_mismatch" in
         `Assoc [
           "total", `Int 0;
           "scanned", `Int 0;
           "complete", `Bool false;
-          "audit_class", `String "poisoned";
+          "admission_status", `String state;
+          "audit_class", `String "unavailable";
           "can_public_migrate", `Bool false;
           "public_net", `Null;
           "commitment_net", `Null;
@@ -515,6 +523,7 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
       | Ok entry ->
         let decision = entry.Octra_core.Pvac_migration_admission.decision in
         `Assoc [
+          "admission_status", `String "ready";
           "total", `Int entry.total;
           "scanned", `Int entry.total;
           "complete", `Bool true;

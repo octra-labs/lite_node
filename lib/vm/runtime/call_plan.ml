@@ -142,11 +142,7 @@ let value_effect ~from_addr ~target ~amount ~balance =
       };
     }
 
-let effort_limit ou =
-  max 1_000_000
-    (try Z.to_int ou with
-     | (Stack_overflow | Out_of_memory) as error -> raise error
-     | _ -> 1_000_000)
+let effort_limit = Octra_core.Resource_lanes.vm_limit
 
 let parse_params_json params_json =
   match Octra_core.Json_tree.read params_json with

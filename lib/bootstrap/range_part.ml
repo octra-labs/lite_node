@@ -41,28 +41,43 @@ let slice raw index =
   let length = min raw_max (String.length raw - offset) in
   String.sub raw offset length
 
-let reply ?index json =
+type encoded = {
+  raw : string;
+  digest : string option;
+}
+
+let encode json =
   let raw = Yojson.Safe.to_string json in
   let length = String.length raw in
   if length > full_max then Error "range response exceeds full limit"
-  else if length <= body_max then
-    match index with
-    | None -> Ok json
+  else Ok { raw; digest = if length > body_max then Some (hash raw) else None }
+
+let digest encoded = encoded.digest
+
+let render ?index encoded =
+  match encoded.digest with
+  | None ->
+    begin match index with
+    | None -> Ok encoded.raw
     | Some _ -> Error "range response has no parts"
-  else
-    let count = count length in
+    end
+  | Some digest ->
+    let count = count (String.length encoded.raw) in
     let index = Option.value ~default:0 index in
     if index < 0 || index >= count then Error "range part index is invalid"
     else
-      Ok
-        (`Assoc [
+      Ok (Yojson.Safe.to_string (`Assoc [
            "version", `String version;
            "status", `String "part";
-           "sha256", `String (hash raw);
+           "sha256", `String digest;
            "index", `Int index;
            "count", `Int count;
-           "data", `String (Base64.encode_exn (slice raw index));
-         ])
+           "data", `String (Base64.encode_exn (slice encoded.raw index));
+         ]))
+
+let reply ?index json =
+  Result.bind (encode json) (fun encoded ->
+    Result.map Yojson.Safe.from_string (render ?index encoded))
 
 let exact_fields fields =
   List.length fields = 6

@@ -165,6 +165,13 @@ type build_preview_request = {
   txs : Transaction.t list;
 }
 
+type prepared = {
+  execution : Octra_core.Epoch_exec.exec_result;
+  preverify : Octra_core.Preverify_commit.t;
+}
+
+type prepare = build_preview_request -> (prepared, string) result Lwt.t
+
 type make_proposal_deps = {
   current : unit -> bool;
   start_height : int64 -> unit Lwt.t;
@@ -178,6 +185,7 @@ type make_proposal_deps = {
   parent_commit :
     epoch_id:int64 ->
     (Octra_consensus.C_types.parent_commit option, string) result;
+  parent_txs : string -> Transaction.t list option;
   frozen_bundle : string -> Consensus_bundle_cache.frozen option;
   store_bundle :
     proposal_id:string ->
@@ -185,7 +193,8 @@ type make_proposal_deps = {
     txs:Transaction.t list ->
     receipts_json:string list ->
     unit;
-  staging_txs : unit -> Transaction.t list;
+  staging_txs : ?circles:bool -> unit -> Transaction.t list;
+  evict_preview : Transaction.t -> unit;
   admits_tx : Transaction.t -> bool;
   build_preverify_once :
     state_root:string ->
@@ -440,6 +449,56 @@ let first_underpriced_tx txs =
        Z.lt tx.Transaction.ou (Transaction.ou_cost tx))
     txs
 
+let precheck ~ordered ~run_many txs =
+  if not ordered then run_many txs
+  else
+    let module Worker = Octra_core.Preverify_worker in
+    let module Lanes = Octra_core.Resource_lanes in
+    let circle tx = tx.Transaction.op_type = Transaction.CircleCall in
+    let ordinary = List.filter (fun tx -> not (circle tx)) txs in
+    let open Lwt.Syntax in
+    let* (batch : Worker.batch) = run_many ordinary in
+    let isolated = List.exists (fun (item : Worker.ready) ->
+      Worker.snapshot_transition item.tx) batch.ready in
+    let gate = Octra_core.Preverify_commit.create [] in
+    let rec select used ready skipped = function
+      | [] ->
+        let ready = List.rev ready in
+        let skipped = batch.skipped @ List.rev skipped in
+        let included = Circle_refill.before
+          ~excluded:(List.map (fun (item : Worker.skip) -> item.tx) skipped)
+          (List.map (fun (item : Worker.ready) -> item.tx) ready)
+          |> List.fold_left (fun kept tx -> String_map.add (Transaction.hash tx) () kept) String_map.empty in
+        let ready, dependent = List.partition (fun (item : Worker.ready) ->
+          String_map.mem (Transaction.hash item.tx) included) ready in
+        let dependent = List.map (fun (item : Worker.ready) ->
+          let unavailable = List.exists (fun (prior : Worker.skip) ->
+            prior.kind = Worker.Unavailable && prior.tx.Transaction.from = item.tx.Transaction.from
+            && prior.tx.nonce <= item.tx.nonce) skipped in
+          Worker.{ tx = item.tx; reason = "predecessor deferred";
+            kind = if unavailable then Unavailable else Deferred }) dependent in
+        Lwt.return Worker.{ ready; skipped = skipped @ dependent }
+      | tx :: rest ->
+        let checked = if circle tx then Some Worker.{tx; receipt = None}
+          else List.find_opt (fun (item : Worker.ready) -> Transaction.hash item.tx = Transaction.hash tx)
+            batch.ready in
+        match checked with
+        | None -> select used ready skipped rest
+        | Some item ->
+          let verdict = if circle tx && isolated then Error "circle cell isolation"
+            else Octra_core.Preverify_commit.check_work gate used tx in
+          (match verdict with
+           | Ok used -> select used (item :: ready) skipped rest
+           | Error reason -> select used ready (Worker.{tx; reason; kind = Deferred} :: skipped) rest) in
+    select (List.map (fun lane -> lane, Lanes.zero) Lanes.all) [] [] txs
+
+let prepared_batch txs (prepared : prepared) =
+  let module Worker = Octra_core.Preverify_worker in
+  let ready = List.map (fun tx -> Worker.{
+    tx; receipt = Result.to_option (Octra_core.Preverify_commit.receipt_for_tx prepared.preverify tx);
+  }) txs in
+  Worker.{ ready; skipped = [] }
+
 let local_preverify_bundle ~run_many ~tx_hashes txs =
   match first_disabled_bft_tx txs with
   | Some tx ->
@@ -469,6 +528,22 @@ let local_preverify_bundle ~run_many ~tx_hashes txs =
       skipped_count = List.length batch.skipped;
       skipped_sample;
     }
+
+let capture_local (prepare : prepare) (request : build_preview_request)
+    (local : local_preverify_bundle) =
+  let module Worker = Octra_core.Preverify_worker in
+  let hashes = List.map Transaction.hash request.txs in
+  let receipts = Worker.receipts_for_hashes local.batch.ready hashes in
+  let request = { request with preverify = Octra_core.Preverify_commit.create receipts } in
+  let open Lwt.Syntax in
+  let+ result = Lwt.catch (fun () -> prepare request) (function
+    | Octra_core.Exec_resource.Exhausted (hash, resource) ->
+      Lwt.return_error ("execution unavailable:" ^ hash ^ ":" ^ Octra_core.Exec_resource.name resource)
+    | error -> Lwt.fail error) in
+  Result.map (fun prepared ->
+    let batch = prepared_batch request.txs prepared in
+    { local with batch; ready_txs = request.txs;
+      receipts_json = Worker.receipt_json_for_hashes batch.ready hashes }, prepared.execution) result
 
 let check_local_bundle ~expected_hashes
     (received : Consensus_bundle_fetch.proposal_bundle)
@@ -1501,7 +1576,7 @@ let time_verify (propose : Octra_consensus.C_types.propose) pid step run =
       write (match exn with Lwt.Canceled -> "cancelled" | _ -> "exception");
       Lwt.fail exn)
 
-let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_consensus.C_types.propose) =
+let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : Octra_consensus.C_types.propose) =
   let open Lwt.Syntax in
   let open Octra_consensus.C_types in
   let accept = Octra_consensus.C_driver.Proposal_accept in
@@ -1651,6 +1726,14 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
         let* local_ledger_root_for_preview = deps.read_local_ledger_root () in
         if not (deps.current ()) then Lwt.return wait else
         let pid = Octra_consensus.C_hash.proposal_id propose.header in
+        let request txs = {
+          epoch_id = propose.epoch_id; epoch_ts = propose.header.ts;
+          proposal_id = Printf.sprintf "verify-%Ld" propose.epoch_id;
+          expected_prev_root = local_ledger_root_for_preview; prev_state_root = our_root;
+          parent_commit = propose.parent_commit; proposer = propose.header.creator_addr;
+          validator_pubkeys = deps.validator_pubkeys propose.epoch_id;
+          preverify = Octra_core.Preverify_commit.create []; txs;
+        } in
         let staging_snapshot = deps.staging_txs () in
         let tx_list_local =
           select_staged
@@ -1662,11 +1745,11 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
           List.length tx_hashes_hex - List.length tx_list_local
         in
         let local_preverify txs =
-          let run_many txs =
+          let run_many txs = precheck ~ordered:(Option.is_some prepare) ~run_many:(fun txs ->
             deps.validate_preverify_once
               ~state_root:local_ledger_root_for_preview
-              ~tx_hashes:tx_hashes_hex
-              txs
+              ~tx_hashes:(if Option.is_some prepare then List.map Transaction.hash txs else tx_hashes_hex)
+              txs) txs
           in
           let* shaped =
             time_verify propose pid Checks (fun () -> local_preverify_bundle
@@ -1679,6 +1762,13 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
               "verify_proposal local_preverify_skipped = %d sample = %s"
               shaped.skipped_count
               shaped.skipped_sample;
+          let* shaped = match prepare with
+            | None -> Lwt.return shaped
+            | Some prepare ->
+              let+ captured = capture_local prepare (request txs) shaped in
+              match captured with
+              | Ok (local, _) -> local
+              | Error _ -> {shaped with ready_txs = []; receipts_json = []} in
           Lwt.return Consensus_bundle_fetch.{
             txs = shaped.ready_txs;
             receipts_json = shaped.receipts_json;
@@ -1751,11 +1841,11 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
           let input_hashes = List.map Transaction.hash verified.inputs in
           let* prepared =
             time_verify propose pid Checks (fun () -> local_preverify_bundle
-              ~run_many:(fun txs ->
+              ~run_many:(precheck ~ordered:(Option.is_some prepare) ~run_many:(fun txs ->
                 deps.validate_preverify_once
                   ~state_root:local_ledger_root_for_preview
-                  ~tx_hashes:input_hashes
-                  txs)
+                  ~tx_hashes:(if Option.is_some prepare then List.map Transaction.hash txs else input_hashes)
+                  txs))
               ~tx_hashes:input_hashes
               verified.inputs)
           in
@@ -1763,18 +1853,26 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
           let () =
             if prepared.skipped_count > 0 then
               Octra_log.warn "consensus"
-                "verify_proposal candidate_preverify_skipped = %d sample = %s"
+                "verify_proposal local_preverify_skipped = %d sample = %s"
                 prepared.skipped_count
                 prepared.skipped_sample
           in
           let prepared_hashes =
             List.map Transaction.hash prepared.ready_txs
           in
-          if prepared_hashes <> input_hashes then begin
-            Octra_log.warn "consensus"
-              "reject proposal reason = candidate_preverify_mismatch epoch = %Ld"
-              propose.epoch_id;
-            Lwt.return reject
+          if prepared_hashes <> input_hashes || prepared.skipped_count > 0 then begin
+            if Octra_core.Preverify_worker.may_retry
+                 ~inputs:verified.inputs prepared.batch then begin
+              Octra_log.warn "consensus"
+                "defer proposal reason = preverify_unavailable epoch = %Ld"
+                propose.epoch_id;
+              Lwt.return wait
+            end else begin
+              Octra_log.warn "consensus"
+                "reject proposal reason = local_preverify_mismatch epoch = %Ld"
+                propose.epoch_id;
+              Lwt.return reject
+            end
           end else
             let local = {
               prepared with
@@ -1784,6 +1882,19 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
                   prepared.batch.ready
                   tx_hashes_hex;
             } in
+            let* captured = match prepare with
+              | None -> Lwt.return_ok (local, None)
+              | Some prepare ->
+                let+ captured = capture_local prepare (request verified.txs) local in
+                Result.map (fun (local, execution) -> local, Some execution) captured in
+            if not (deps.current ()) then Lwt.return wait else
+            match captured with
+            | Error error ->
+              Octra_log.warn "consensus"
+                "event = proposal_prepare status = unavailable epoch = %Ld reason = %s"
+                propose.epoch_id error;
+              Lwt.return wait
+            | Ok (local, execution) ->
             match
               check_local_bundle
                 ~expected_hashes:tx_hashes_hex
@@ -1819,7 +1930,11 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
               | [] -> Lwt.return_ok ()
               | rejections ->
                 let* result =
-                  time_verify propose pid Outcomes (fun () -> deps.preview {
+                  time_verify propose pid Outcomes (fun () -> match prepare with
+                  | Some prepare ->
+                    Lwt.map (Result.map snd)
+                      (capture_local prepare (request verified.inputs) prepared)
+                  | None -> deps.preview {
                     epoch_id = propose.epoch_id;
                     epoch_ts = propose.header.ts;
                     proposal_id =
@@ -1833,16 +1948,23 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
                     txs = verified.inputs;
                   })
                 in
-                Lwt.return
-                  (verify_preview_partition
+                Lwt.return (match prepare, result with
+                  | Some _, Error error -> Error (`Unavailable error)
+                  | _ -> Result.map_error (fun error -> `Invalid error)
+                    (verify_preview_partition
                      ~inputs:verified.inputs
                      ~confirmed:tx_list
                      ~rejections
-                     result)
+                     result))
             in
             if not (deps.current ()) then Lwt.return wait else
             match rejection_partition with
-            | Error reason ->
+            | Error (`Unavailable reason) ->
+              Octra_log.warn "consensus"
+                "event = proposal_outcomes status = unavailable epoch = %Ld reason = %s"
+                propose.epoch_id reason;
+              Lwt.return wait
+            | Error (`Invalid reason) ->
               Octra_log.warn "consensus"
                 "reject proposal reason = rejection_partition_mismatch epoch = %Ld detail = %s"
                 propose.epoch_id
@@ -1850,7 +1972,9 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
               Lwt.return reject
             | Ok () ->
             let* preview_result =
-              time_verify propose pid State (fun () -> deps.preview {
+              time_verify propose pid State (fun () -> match execution with
+              | Some result -> Lwt.return_ok result
+              | None -> deps.preview {
                 epoch_id = propose.epoch_id;
                 epoch_ts = propose.header.ts;
                 proposal_id = Printf.sprintf "verify-%Ld" propose.epoch_id;
@@ -1950,7 +2074,7 @@ let verify_proposal (deps : verify_proposal_deps) ~chain_id (propose : Octra_con
               Lwt.return reject
             end
 
-let make_proposal ?private_slots (deps : make_proposal_deps)
+let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
     ~chain_id ~root_to_raw32 ~limits ~epoch_id =
   let private_slots =
     if Octra_core.Rule_graph.tx_envelope_at ~chain_id ~epoch:epoch_id
@@ -2036,17 +2160,31 @@ let make_proposal ?private_slots (deps : make_proposal_deps)
       end
     | None ->
       let tx_list_raw = deps.staging_txs () in
-      let tx_list_selected = List.filter (fun tx -> deps.admits_tx tx
-        && Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id ~epoch:epoch_id [tx])) tx_list_raw in
+      let select = List.filter (fun tx -> deps.admits_tx tx
+        && Result.is_ok (Octra_core.Resource_lanes.circle_admission tx)
+        && Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id ~epoch:epoch_id [tx])) in
+      let tx_list_selected = select tx_list_raw in
+      let tx_list_selected =
+        if epoch_id < 0L || epoch_id > Int64.of_int max_int
+           || Octra_core.Rule_graph.ready_exec_at ~chain_id ~epoch:(Int64.to_int epoch_id)
+              <> Octra_core.Rule_graph.Active
+           || not (List.exists Octra_core.Preverify_worker.snapshot_transition tx_list_selected)
+        then tx_list_selected
+        else
+          let previous = Circle_turn.previous ~chain_id ~epoch:epoch_id
+            ~lookup:deps.parent_txs parent_commit in
+          let ordinary = select (deps.staging_txs ~circles:false ()) in
+          Circle_turn.select ~ordered:(Option.is_some prepare)
+            ~epoch:epoch_id ~previous ~ordinary tx_list_selected in
       let selected_hashes = List.map Transaction.hash tx_list_selected in
       let* pre_shape =
         build_preverify
           ?private_slots
-          ~run_many:(fun txs ->
+          ~run_many:(precheck ~ordered:(Option.is_some prepare) ~run_many:(fun txs ->
             deps.build_preverify_once
               ~state_root:prev_ledger_root
-              ~tx_hashes:selected_hashes
-              txs)
+              ~tx_hashes:(if Option.is_some prepare then List.map Transaction.hash txs else selected_hashes)
+              txs))
           ~limits
           tx_list_selected
       in
@@ -2085,20 +2223,21 @@ let make_proposal ?private_slots (deps : make_proposal_deps)
               remaining_hashes
           in
           let preverify = Octra_core.Preverify_commit.create receipts in
+          let request = {
+            epoch_id; epoch_ts; proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
+            expected_prev_root = prev_ledger_root; prev_state_root = prev_root;
+            parent_commit; proposer; validator_pubkeys; preverify; txs = remaining;
+          } in
           let* preview_result =
             Lwt.catch
-              (fun () -> Lwt.map (fun value -> `Result value) (deps.preview {
-              epoch_id;
-              epoch_ts;
-              proposal_id = Printf.sprintf "propose-%Ld" epoch_id;
-              expected_prev_root = prev_ledger_root;
-              prev_state_root = prev_root;
-              parent_commit;
-              proposer;
-              validator_pubkeys;
-              preverify;
-              txs = remaining;
-            }))
+              (fun () ->
+                let* result = match prepare with
+                  | None -> Lwt.map (Result.map (fun execution -> execution, pre_shape.batch))
+                      (deps.preview request)
+                  | Some prepare -> Lwt.map (Result.map (fun prepared ->
+                      let confirmed = List.map fst prepared.execution.Octra_core.Epoch_exec.artifacts.confirmed in
+                      prepared.execution, prepared_batch confirmed prepared)) (prepare request) in
+                Lwt.return (`Result result))
               (function
                 | Octra_core.Exec_resource.Exhausted (hash, resource) ->
                   Lwt.return (`Exhausted (hash, resource))
@@ -2110,15 +2249,20 @@ let make_proposal ?private_slots (deps : make_proposal_deps)
             if not (List.exists (fun tx -> Transaction.hash tx = hash) remaining) then
               Lwt.return_error "preview_resource_identity"
             else
-              let retained = List.filter (fun tx -> Transaction.hash tx <> hash) inputs in
+              let exclude txs =
+                if Option.is_some prepare then
+                  Circle_refill.before
+                    ~excluded:(List.filter (fun tx -> Transaction.hash tx = hash) remaining) txs
+                else List.filter (fun tx -> Transaction.hash tx <> hash) txs in
+              let retained = exclude inputs in
               Octra_log.warn "consensus"
                 "event = proposal_resource_deferred epoch = %Ld hash = %s resource = %s remaining = %d"
                 epoch_id hash (Octra_core.Exec_resource.name resource) (List.length retained);
-              let pool = List.filter (fun tx -> Transaction.hash tx <> hash) pool in
+              let pool = exclude pool in
               preview_until_stable (attempt + 1) measure pool retained retained []
           | `Result (Stdlib.Error error) ->
             Lwt.return_error error
-          | `Result (Stdlib.Ok result) ->
+          | `Result (Stdlib.Ok (result, batch)) ->
             let artifacts = result.Octra_core.Epoch_exec.artifacts in
             let confirmed = List.map fst artifacts.confirmed in
             let current_rejections = artifacts.rejected in
@@ -2150,7 +2294,7 @@ let make_proposal ?private_slots (deps : make_proposal_deps)
                          ~prev_ledger_root
                          ~fallback_ledger_root:prev_root
                          ~input_txs:stable_txs
-                         ~batch:pre_shape.batch
+                         ~batch
                          ~rejections
                          ~preview_result:(Stdlib.Ok result))
                 end
@@ -2222,6 +2366,13 @@ let make_proposal ?private_slots (deps : make_proposal_deps)
         let build_plan = build_output.plan in
         let final_tx_list = build_plan.final_txs in
         let final_tx_hashes = build_plan.final_hashes in
+        match Circle_refill.select ~selected:tx_list ~confirmed:final_tx_list
+          ~rejected:build_output.rejected_count tx_list_selected with
+        | Some remaining ->
+          List.iter deps.evict_preview tx_list;
+          let deps = {deps with staging_txs = (fun ?circles:_ () -> remaining)} in
+          make_proposal ?prepare ?private_slots deps ~chain_id ~root_to_raw32 ~limits ~epoch_id
+        | None ->
         log_preview_result ~epoch_id (List.length final_tx_list) build_plan;
         deps.set_proposal final_tx_list final_tx_hashes;
         let proposal_envelope =

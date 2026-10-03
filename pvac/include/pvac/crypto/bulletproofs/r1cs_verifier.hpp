@@ -230,19 +230,16 @@ inline bool r1cs_verify(
     Scalar x6 = transcript.ops.mul(x5, xc);
 
     Scalar y_inv = transcript.ops.inv(y);
-    std::vector<Scalar> y_n(N), y_inv_n(N);
-    y_n[0] = Scalar{{1,0,0,0}};
+    std::vector<Scalar> y_inv_n(N);
     y_inv_n[0] = Scalar{{1,0,0,0}};
-    for (size_t i = 1; i < N; i++) {
-        y_n[i] = transcript.ops.mul(y_n[i-1], y);
+    for (size_t i = 1; i < N; i++)
         y_inv_n[i] = transcript.ops.mul(y_inv_n[i-1], y_inv);
-    }
 
-    std::vector<Scalar> wL(N, sc_zero()), wR(N, sc_zero()), wO(N, sc_zero());
-    std::vector<Scalar> wV(m, sc_zero());
-    Scalar wc = sc_zero();
-
+    RistrettoPoint P, Q;
     {
+        std::vector<Scalar> wL(N, sc_zero()), wR(N, sc_zero()), wO(N, sc_zero());
+        std::vector<Scalar> wV(m, sc_zero());
+        Scalar wc = sc_zero();
         Scalar zp = Scalar{{1,0,0,0}};
         for (size_t qi = 0; qi < q; qi++) {
             for (const auto& [var, coeff] : cs.constraints[qi].lc.terms) {
@@ -267,46 +264,44 @@ inline bool r1cs_verify(
             }
             zp = transcript.ops.mul(zp, z);
         }
-    }
 
-    Scalar delta = sc_zero();
-    for (size_t i = 0; i < N; i++)
-        delta = sc_add(delta, transcript.ops.mul(transcript.ops.mul(y_inv_n[i], wR[i]), wL[i]));
+        Scalar delta = sc_zero();
+        for (size_t i = 0; i < N; i++)
+            delta = sc_add(delta, transcript.ops.mul(transcript.ops.mul(y_inv_n[i], wR[i]), wL[i]));
 
-    RistrettoPoint T_lhs = pedersen_commit(proof.t_x, proof.t_x_blinding);
+        RistrettoPoint T_lhs = pedersen_commit(proof.t_x, proof.t_x_blinding);
 
-    {
-        std::vector<Scalar> sc;
-        std::vector<RistrettoPoint> pt;
-        sc.reserve(m + 6);
-        pt.reserve(m + 6);
+        {
+            std::vector<Scalar> sc;
+            std::vector<RistrettoPoint> pt;
+            sc.reserve(m + 6);
+            pt.reserve(m + 6);
 
-        sc.push_back(transcript.ops.mul(x2, sc_sub(delta, wc)));
-        pt.push_back(pedersen_B());
+            sc.push_back(transcript.ops.mul(x2, sc_sub(delta, wc)));
+            pt.push_back(pedersen_B());
 
-        for (size_t j = 0; j < m; j++) {
-            sc.push_back(sc_neg(transcript.ops.mul(x2, wV[j])));
-            pt.push_back(proof.V[j]);
+            for (size_t j = 0; j < m; j++) {
+                sc.push_back(sc_neg(transcript.ops.mul(x2, wV[j])));
+                pt.push_back(proof.V[j]);
+            }
+
+            sc.push_back(xc); pt.push_back(proof.T_1);
+
+            sc.push_back(x3); pt.push_back(proof.T_3);
+
+            sc.push_back(x4); pt.push_back(proof.T_4);
+
+            sc.push_back(x5); pt.push_back(proof.T_5);
+
+            sc.push_back(x6); pt.push_back(proof.T_6);
+
+            RistrettoPoint T_rhs = multi_scalar_mul(sc, pt);
+
+            if (T_lhs != T_rhs) return false;
         }
 
-        sc.push_back(xc); pt.push_back(proof.T_1);
+        Q = rist_scalarmul(pedersen_B(), w_ch);
 
-        sc.push_back(x3); pt.push_back(proof.T_3);
-
-        sc.push_back(x4); pt.push_back(proof.T_4);
-
-        sc.push_back(x5); pt.push_back(proof.T_5);
-
-        sc.push_back(x6); pt.push_back(proof.T_6);
-
-        RistrettoPoint T_rhs = multi_scalar_mul(sc, pt);
-
-        if (T_lhs != T_rhs) return false;
-    }
-
-    RistrettoPoint Q = rist_scalarmul(pedersen_B(), w_ch);
-
-    {
         const auto& gen = generators();
         gen.precompute(N);
 
@@ -344,13 +339,10 @@ inline bool r1cs_verify(
         sc.push_back(transcript.ops.mul(proof.t_x, w_ch));
         pt.push_back(pedersen_B());
 
-        RistrettoPoint P = multi_scalar_mul(sc, pt);
-
-        if (!ipp_verify_with_y(transcript, P, Q, proof.ipp, N, y_inv_n))
-            return false;
+        P = multi_scalar_mul(sc, pt);
     }
 
-    return true;
+    return ipp_verify_with_y(transcript, P, Q, proof.ipp, N, y_inv_n);
 }
 
 }

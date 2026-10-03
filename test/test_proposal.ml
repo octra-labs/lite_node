@@ -721,11 +721,14 @@ let make_proposal_deps ?(state_attested = true) ?(quarantine_active = false)
     cached_head = (fun () -> cached_head);
     current_round = (fun () -> round);
     parent_commit = (fun ~epoch_id:_ -> Ok None);
+    parent_txs = (fun _ -> None);
     frozen_bundle = (fun _ -> frozen);
     store_bundle = (fun ~proposal_id ~tx_hashes ~txs ~receipts_json ->
       stored_bundles :=
         (proposal_id, tx_hashes, txs, receipts_json) :: !stored_bundles);
-    staging_txs = (fun () -> staging);
+    staging_txs = (fun ?(circles = true) () ->
+      if circles then staging else Octra_node_runtime.Circle_refill.without staging);
+    evict_preview = (fun _ -> failwith "unexpected preview eviction");
     admits_tx = admits;
     build_preverify_once;
     staging_total = (fun () -> List.length staging);
@@ -754,6 +757,37 @@ let run_make_proposal deps =
        ~root_to_raw32:(fun root -> root)
        ~limits:generous_limits
        ~epoch_id:12L)
+
+let test_circle_budget () =
+  let module Lane = Octra_core.Resource_lanes in
+  let module Commit = Octra_core.Preverify_commit in
+  let budget = Lane.default_budget Lane.Circle_compute in
+  let circle ou = {(tx 1) with Transaction.op_type = CircleCall; ou} in
+  let ordinary = {(tx 1) with Transaction.from = "oct_other"} in
+  let build_preverify_once ~state_root:_ ~tx_hashes:_ inputs =
+    match inputs with
+    | item :: _ when item.Transaction.op_type = CircleCall -> fake_batch [item]
+    | _ -> fake_batch inputs in
+  let preview_result request =
+    let checked = List.fold_left (fun used item ->
+      Result.bind used (fun used -> Commit.check_budget (Commit.create []) used item))
+      (Ok []) request.C.txs in
+    Result.bind checked (fun _ ->
+      exec_result ~confirmed:request.txs ~rejected:[] ~post_state_root:(raw 'l')) in
+  let exact = circle budget.max_ou in
+  let control, control_probe = make_proposal_deps ~staging:[exact]
+    ~build_preverify_once ~preview_result () in
+  expect "circle budget control builds" (Option.is_some (run_make_proposal control));
+  expect "circle budget control reaches preview"
+    (List.map (fun request -> request.C.txs) !(control_probe.preview_requests) = [[exact]]);
+  expect "circle budget control enters proposal"
+    (!(control_probe.set_proposals) = [[exact], [Transaction.hash exact]]);
+  let deps, probe = make_proposal_deps ~staging:[circle (Z.succ budget.max_ou); ordinary]
+    ~build_preverify_once ~preview_result () in
+  List.iter (fun _ ->
+    expect "circle excess budget cannot block proposal" (Option.is_some (run_make_proposal deps))) [0; 1];
+  expect "circle excess omitted before preview"
+    (List.for_all (fun request -> request.C.txs = [ordinary]) !(probe.preview_requests))
 
 let test_build_head_progress () =
   List.iter (fun phase ->
@@ -1252,6 +1286,49 @@ let test_verify_bundle_success () =
     expect "verified tx count" (List.length verified.C.txs = 1);
     expect "verified receipts" (verified.receipts_json = [])
   | Error _ -> fail "verify bundle success"
+
+let test_circle_receipt () =
+  let module Lane = Octra_core.Resource_lanes in
+  let module Receipt = Octra_core.Preverify_receipt in
+  let env = "OCTRA_BFT_RELEASE_PROFILE" in
+  let prior = Sys.getenv_opt env in
+  Unix.putenv env "devnet_full_v1";
+  Fun.protect ~finally:(fun () -> Unix.putenv env (Option.value ~default:"" prior)) (fun () ->
+    let key = Mirage_crypto_ec.Ed25519.priv_of_octets (String.make 32 '\003') |> Result.get_ok in
+    let public = Mirage_crypto_ec.Ed25519.pub_of_priv key
+      |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn in
+    let secret = Mirage_crypto_ec.Ed25519.priv_to_octets key |> Base64.encode_exn in
+    let address = Octra_core.Crypto.Address.address_from_pubkey public in
+    let budget = Lane.default_budget Lane.Circle_compute in
+    let empty = {(tx 1) with Transaction.op_type = CircleCall; from = address; to_ = address;
+      ou = budget.max_ou; public_key = Some public; encrypted_data = Some "run"; message = Some ""}
+      |> fun item -> Transaction.sign_with_privkey item secret in
+    let count = budget.max_bytes - Lane.tx_bytes empty in
+    let circle = Receipt.{snapshot_hash = String.make 64 'a'; circle_id = address;
+      code_hash = String.make 64 'b'; stable_root = String.make 64 'c';
+      public_reads_hash = String.make 64 'd'; context_hash = String.make 64 'e'; transcript = []} in
+    let limits = C.limits ~max_txs:1 ~max_bytes:(budget.max_bytes + 1) ~max_ou:budget.max_ou in
+    let deps = C.{public_key_for_tx = (fun _ -> Some public);
+      verify_address_pubkey = (fun ~addr ~pubkey -> Octra_core.Crypto.Address.verify_address_pubkey addr pubkey);
+      verify_tx_signature = (fun item ~pubkey -> Transaction.verify item pubkey)} in
+    List.iter (fun (size, ou, reason) ->
+      let item = {empty with Transaction.message = Some (String.make size 'a'); ou}
+        |> fun item -> Transaction.sign_with_privkey item secret in
+      let receipt = Receipt.make_circle ~tx_hash:(Transaction.hash item)
+        ~input_hash:(W.circle_input_hash item circle) ~output_hash:(W.circle_output_hash item circle "ok")
+        ~circle ~ok:true ~reason:"" ~cost:(Lane.cost item) |> Result.get_ok in
+      expect "circle receipt passes structural and cost verification"
+        (Octra_core.Preverify_commit.check_receipt item receipt = Ok ());
+      let receipts_json = [Yojson.Safe.to_string (Receipt.to_yojson receipt)] in
+      let result = verify ~deps ~limits ~receipts_json [item] in
+      match reason, result with
+      | None, Ok verified -> expect "circle exact budget retained" (verified.C.txs = [item])
+      | Some reason, Error (C.Preverify_gate_failed actual) ->
+        expect "circle validator rejects resource excess" (actual = "lane_budget:circle_compute:" ^ reason)
+      | _ -> fail "circle receipt budget verdict")
+      [count, budget.max_ou, None;
+       count + 1, budget.max_ou, Some "bytes";
+       count, Z.succ budget.max_ou, Some "ou"])
 
 let test_verify_bundle_missing_txs () =
   match verify ~expected_tx_count:2 [tx 1] with
@@ -2056,6 +2133,66 @@ let test_verify_local_preview () =
   expect "verify accept shared" (!shared = [[item]]);
   expect "verify accept stores twice" (List.length !stores = 2)
 
+let test_verify_worker_retry () =
+  List.iter (fun partial ->
+    let first = tx 1 in
+    let second = tx 2 in
+    let inputs = if partial then [first; second] else [first] in
+    let online = ref false in
+    let proposal = proposal_for_txs inputs in
+    let deps, quarantines, prev, state, _, stores, proposals, previews =
+      verify_proposal_deps ~prev_streak:2 ~state_streak:2
+        ~cached_bundle:(fun ~proposal_id:_ -> Some (received inputs))
+        ~validate_preverify_once:(fun ~state_root:_ ~tx_hashes:_ inputs ->
+          if !online then fake_batch inputs
+          else if partial then
+            Lwt.return W.{(defer "worker offline" [second]) with
+              ready = [{tx = first; receipt = None}]}
+          else Lwt.return (W.defer "worker offline" inputs)) ()
+    in
+    let verify () =
+      Lwt_main.run (C.verify_proposal deps ~chain_id:"octra-test" proposal)
+    in
+    List.iter (fun _ ->
+      expect "unavailable verification waits" (verdict_waits (verify ()))) [0; 1];
+    expect "worker failure preserved counters" (!prev = 2 && !state = 2);
+    expect "worker failure no quarantine" (!quarantines = []);
+    expect "worker failure no effects"
+      (!stores = [] && !proposals = [] && !previews = []);
+    online := true;
+    expect "same proposal recovers" (verdict_accepts (verify ()));
+    expect "recovery previewed once" (List.length !previews = 1))
+    [false; true]
+
+let test_verify_worker_refusal () =
+  let first = tx 1 in
+  let second = tx 2 in
+  let inputs = [first; second] in
+  let pending = W.defer "worker offline" [first] in
+  let skip kind = W.{tx = second; reason = "refused"; kind} in
+  let batches = [
+    W.{pending with skipped = pending.skipped @ [skip Invalid]};
+    W.{pending with skipped = pending.skipped @ [skip Deferred]};
+    pending;
+    W.defer "worker offline" [first; first];
+    W.defer "worker offline" [first; tx 3];
+    W.{ready = [{tx = first; receipt = None}; {tx = second; receipt = None}];
+      skipped = [skip Invalid]};
+  ] in
+  List.iter (fun batch ->
+    let deps, quarantines, _, _, _, stores, proposals, previews =
+      verify_proposal_deps
+        ~cached_bundle:(fun ~proposal_id:_ -> Some (received inputs))
+        ~validate_preverify_once:(fun ~state_root:_ ~tx_hashes:_ _ ->
+          Lwt.return batch) ()
+    in
+    expect "invalid or incomplete verification rejects"
+      (verdict_rejects (Lwt_main.run
+        (C.verify_proposal deps ~chain_id:"octra-test" (proposal_for_txs inputs))));
+    expect "refused verification no effects"
+      (!quarantines = [] && !stores = [] && !proposals = [] && !previews = []))
+    batches
+
 let test_verify_head_progress () =
   List.iter (fun phase ->
     let item = tx 1 in
@@ -2116,6 +2253,7 @@ let test_verify_staging_lookup () =
       proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
       catchup_active = ref false;
       staging_epoch_capacity = Z.of_int 10_000;
+      save_drops = ignore;
       chain_id = "proposal-test";
       duty_state = (fun _ -> Ok Octra_core.Set_fold.empty);
       write_pending = (fun _ -> ());
@@ -2997,6 +3135,16 @@ let test_precommit_write_failure () =
   expect "write failure no pending" (!pending = [])
 
 let () =
+  if Array.length Sys.argv = 6 && Sys.argv.(1) = "circle-store" then
+    Circle_store.child ();
+  Circle_proposal.run ~limits:generous_limits
+    ~make_deps:(fun ~epoch ~staging ~root ->
+      fst (make_proposal_deps ~current_epoch:epoch ~staging ~ledger_root:root ()))
+    ~verify_deps:(fun ~staging ~root ~ledger_root ->
+      let deps, _, _, _, _, _, _, _ =
+        verify_proposal_deps ~staging ~root ~ledger_root () in
+      deps);
+  Circle_store.run ();
   test_totals ();
   test_within_limits ();
   test_cap_count ();
@@ -3029,6 +3177,7 @@ let () =
   test_preverify_single_flight ();
   test_build_head_progress ();
   test_make_reuse_frozen_bundle ();
+  test_circle_budget ();
   test_make_preview_rejections ();
   test_private_apply_slot ();
   test_private_refill_cap ();
@@ -3040,6 +3189,7 @@ let () =
   test_preview_resources ();
   test_make_partition_error_defer ();
   test_verify_bundle_success ();
+  test_circle_receipt ();
   test_verify_bundle_missing_txs ();
   test_bundle_zero_count_tx ();
   test_bundle_disabled_op ();
@@ -3072,6 +3222,8 @@ let () =
   test_prev_time_retry ();
   test_verify_missing_bundle_wait ();
   test_verify_local_preview ();
+  test_verify_worker_retry ();
+  test_verify_worker_refusal ();
   test_verify_head_progress ();
   test_verify_staging_lookup ();
   test_verify_ledger_preverify ();

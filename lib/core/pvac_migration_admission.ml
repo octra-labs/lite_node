@@ -3,7 +3,7 @@
 
 module Replay = Pvac_legacy_public_replay
 
-type classifier = Prior_v1 | Capped_v1
+type classifier = Prior_v1 | Capped_v1 | Receipt_v1
 
 type entry = {
   address : string;
@@ -26,6 +26,18 @@ type t =
   | Disabled of string
   | Enabled of enabled
 
+type lookup_error =
+  | Unavailable
+  | Not_active
+  | Not_found
+  | Cipher_mismatch
+
+let lookup_message = function
+  | Unavailable -> "migration entitlement artifact unavailable"
+  | Not_active -> "migration entitlement is not active"
+  | Not_found -> "migration entitlement not found"
+  | Cipher_mismatch -> "migration entitlement source ciphertext mismatch"
+
 let schema = function
   | None -> "octra_pvac_migration_entitlements_v2"
   | Some _ -> "octra_pvac_migration_entitlements_v3"
@@ -33,6 +45,7 @@ let schema = function
 let classifier_name = function
   | Prior_v1 -> "prior_v1"
   | Capped_v1 -> "capped_v1"
+  | Receipt_v1 -> "receipt_v1"
 
 let max_artifact_bytes = 64 * 1024 * 1024
 let max_entries = 1_000_000
@@ -162,29 +175,36 @@ let validate_decision decision =
   | _ ->
     Ok ()
 
-let validate_entry entry =
+let validate_entry classifier entry =
   if not (Crypto.Address.is_valid_address entry.address) then
     Error ("invalid migration address = " ^ entry.address)
   else if not (valid_hash entry.source_cipher_hash) then
     Error ("invalid migration source hash for address = " ^ entry.address)
   else if entry.total < 0 then
     Error ("invalid migration history count for address = " ^ entry.address)
+  else if classifier = Some Receipt_v1
+      && (entry.decision.audit_class <> Replay.Hidden_witness
+          || entry.decision.can_public_migrate
+          || Option.is_some entry.decision.public_net
+          || Option.is_none entry.decision.commitment_net
+          || entry.decision.blockers <> []) then
+    Error "receipt admission requires a private commitment"
   else
     Result.map_error
       (fun reason -> reason ^ " address = " ^ entry.address)
       (validate_decision entry.decision)
 
-let rec validate_entries seen = function
+let rec validate_entries classifier seen = function
   | [] -> Ok ()
   | entry :: rest ->
     if Hashtbl.mem seen entry.address then
       Error ("duplicate migration address = " ^ entry.address)
     else
-      match validate_entry entry with
+      match validate_entry classifier entry with
       | Error error -> Error error
       | Ok () ->
         Hashtbl.add seen entry.address ();
-        validate_entries seen rest
+        validate_entries classifier seen rest
 
 let create ?classifier ~chain_id ~snapshot_epoch ~state_root ~activation_epoch entries =
   if chain_id = "" then
@@ -203,7 +223,7 @@ let create ?classifier ~chain_id ~snapshot_epoch ~state_root ~activation_epoch e
     let entries =
       List.sort (fun left right -> String.compare left.address right.address) entries
     in
-    match validate_entries (Hashtbl.create (List.length entries)) entries with
+    match validate_entries classifier (Hashtbl.create (List.length entries)) entries with
     | Error error -> Error error
     | Ok () ->
       let table = Hashtbl.create (List.length entries) in
@@ -280,21 +300,24 @@ let exact_fields scope expected fields =
   else
     Ok ()
 
-let find t ~epoch ~address ~cipher =
+let lookup t ~epoch ~address ~cipher =
   match t with
   | Disabled _ ->
-    Error "migration entitlement artifact unavailable"
+    Error Unavailable
   | Enabled value when epoch < value.activation_epoch ->
-    Error "migration entitlement is not active"
+    Error Not_active
   | Enabled value ->
     begin
       match Hashtbl.find_opt value.entries address with
-      | None -> Error "migration entitlement not found"
+      | None -> Error Not_found
       | Some entry when
           not (String.equal entry.source_cipher_hash (source_cipher_hash cipher)) ->
-        Error "migration entitlement source ciphertext mismatch"
+        Error Cipher_mismatch
       | Some entry -> Ok entry
     end
+
+let find t ~epoch ~address ~cipher =
+  lookup t ~epoch ~address ~cipher |> Result.map_error lookup_message
 
 let decision t ~epoch ~address ~cipher =
   match find t ~epoch ~address ~cipher with
@@ -413,6 +436,7 @@ let load_json ~chain_id ~expected_root = function
         begin match name with
         | "prior_v1" -> Ok (Some Prior_v1)
         | "capped_v1" -> Ok (Some Capped_v1)
+        | "receipt_v1" -> Ok (Some Receipt_v1)
         | _ -> Error ("unsupported migration classifier = " ^ name)
         end
       else Error ("unsupported migration schema = " ^ artifact_schema)

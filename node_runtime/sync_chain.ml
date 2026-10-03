@@ -37,44 +37,31 @@ let same_set left right =
   C_config.validator_set_hash left = C_config.validator_set_hash right
 
 let of_certificate trusted certificate =
-  let* encoded =
-    match Manifest.finality certificate with
-    | Some value -> Ok value
-    | None -> Error "state sync certificate has no finality anchor"
-  in
-  let* anchor =
-    Anchor.verify
-      ~validator_set:trusted
-      certificate.Manifest.checkpoint
-      encoded
-  in
-  Ok {
-    rev_steps = List.rev (Anchor.steps anchor);
-    validator_set = Anchor.validator_set anchor;
-    epoch = certificate.Manifest.checkpoint.epoch;
-  }
+  match Manifest.finality certificate with
+  | None -> Lwt.return_error "state sync certificate has no finality anchor"
+  | Some encoded ->
+      Anchor.verify_lwt
+        ~validator_set:trusted
+        certificate.Manifest.checkpoint
+        encoded >|= Result.map (fun anchor -> {
+          rev_steps = List.rev (Anchor.steps anchor);
+          validator_set = Anchor.validator_set anchor;
+          epoch = certificate.Manifest.checkpoint.epoch;
+        })
 
 let load trusted path =
-  if not (Sys.file_exists path) then None
-  else
-    match Manifest.load_certificate path with
-    | Error _ -> None
-    | Ok certificate ->
-        begin
-          match of_certificate trusted certificate with
-          | Error _ -> None
-          | Ok chain -> Some chain
-        end
+  Lwt_preemptive.detach Manifest.load_certificate path >>= function
+  | Error _ -> Lwt.return_none
+  | Ok certificate ->
+      of_certificate trusted certificate >|= Result.to_option
 
 let stored deps trusted =
-  match
+  Lwt_list.filter_map_s (load trusted)
     [
       State_sync.anchor_path deps.data_dir;
       deps.certificate_path ();
-    ]
-    |> List.filter_map (load trusted)
-    |> List.sort (fun left right -> Int64.compare right.epoch left.epoch)
-  with
+    ] >|= fun chains ->
+  match List.sort (fun left right -> Int64.compare right.epoch left.epoch) chains with
   | first :: _ -> Some first
   | [] -> None
 
@@ -434,7 +421,7 @@ let build deps ~head_epoch trusted active =
                     "state sync active validator set differs from history"
             in
             begin
-              match stored deps trusted with
+              stored deps trusted >>= function
               | Some stop when not (same_set stop.validator_set trusted_raw) ->
                   begin
                     run stop >>= function

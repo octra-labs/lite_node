@@ -1213,7 +1213,7 @@ let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
         Contract.execute_view_call
           ?running
           ~trusted
-          ~ctx:{view_ctx with fhe_memory = scope.memory}
+          ~ctx:{view_ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
           ~depth:scope.depth
           ~limit:(Option.fold ~none:view_effort_limit ~some:(min view_effort_limit) scope.limit)
           store

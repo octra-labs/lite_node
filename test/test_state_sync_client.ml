@@ -114,7 +114,7 @@ let manifest_file path payload chunk_size =
     chunks = chunks payload chunk_size;
   }
 
-let sample wallets payload state_label =
+let sample ?(valid_for = 3_600L) wallets payload state_label =
   let validators = signer_set wallets in
   let exporters = signer_set [List.hd wallets] in
   let state_root = sha state_label in
@@ -144,7 +144,7 @@ let sample wallets payload state_label =
       ~config_hash
       ~validator_set_hash:(Manifest.set_hash validators)
       ~created_at:(Int64.sub now 10L)
-      ~valid_until:(Int64.add now 3_600L)
+      ~valid_until:(Int64.add now valid_for)
       head
   in
   let checkpoint_hash = expect_ok (Checkpoint.hash checkpoint) in
@@ -746,6 +746,305 @@ let salt_for_first left right chunk =
   in
   loop 0
 
+let test_cert_model trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let query = Cache.{ path = "first"; trust; trust_hash = trust_hash trust } in
+  let bytes = Cache.{ raw = "bytes"; digest = sha "bytes" } in
+  let state, effects = Cache.delta Cache.empty (Ask (1L, query, 0.)) in
+  begin match effects with
+  | [Cache.Read_file job] when job.id = 1L && job.generation = 0L -> ()
+  | _ -> fail "certificate read admission differs"
+  end;
+  let same, duplicate = Cache.delta state (Ask (1L, query, 0.)) in
+  if Cache.stats same <> Cache.stats state || duplicate <> [] then
+    fail "duplicate certificate request changed state";
+  let full = List.fold_left (fun state id ->
+    let next, effects = Cache.delta state (Ask (Int64.of_int id, query, 0.)) in
+    if effects <> [] then fail "queued certificate started early";
+    next) state (List.init (Cache.capacity - 1) (fun index -> index + 2)) in
+  let full, effects = Cache.delta full (Ask (100L, query, 0.)) in
+  begin match effects with
+  | [Cache.Reply (100L, Error Cache.Busy)] -> ()
+  | _ -> fail "certificate queue exceeded capacity"
+  end;
+  if (Cache.stats full).active + (Cache.stats full).queued <> Cache.capacity then
+    fail "certificate queue size differs";
+  let expired, _ = Cache.delta full (Tick (Cache.lifetime +. 1.)) in
+  let expired, effects = Cache.delta expired (Read (1L, 0L, Cache.lifetime +. 1., Ok bytes)) in
+  if effects <> [] || (Cache.stats expired).active <> 0 || (Cache.stats expired).queued <> 0 then
+    fail "expired certificate work was reused";
+  let stopped, effects = Cache.delta full Stop in
+  let replies = List.filter (function Cache.Reply _ -> true | _ -> false) effects in
+  if List.length replies <> Cache.capacity then fail "stop lost certificate requests";
+  let stopped, effects = Cache.delta stopped (Read (1L, 0L, 1., Ok bytes)) in
+  if effects <> [] || (Cache.stats stopped).cached <> 0 then fail "old read entered stopped actor";
+  let checked, effects = Cache.delta state (Read (1L, 0L, 1., Ok bytes)) in
+  begin match effects with
+  | [Cache.Verify (job, "bytes")] when job.id = 1L -> ()
+  | _ -> fail "certificate verification was skipped"
+  end;
+  let stopped, _ = Cache.delta checked Stop in
+  let stopped, effects = Cache.delta stopped (Checked (1L, 0L, 2., Ok certificate)) in
+  if effects <> [] || (Cache.stats stopped).cached <> 0 then fail "old verification entered stopped actor";
+  let checked, _ = Cache.delta checked (Cancel 1L) in
+  let checked, effects = Cache.delta checked (Checked (1L, 0L, 2., Ok certificate)) in
+  if effects <> [] || (Cache.stats checked).cached <> 0 then fail "cancelled verification was published";
+  let checking, _ = Cache.delta state (Read (1L, 0L, 1., Ok bytes)) in
+  let checked, effects = Cache.delta checking (Checked (1L, 0L, Cache.lifetime +. 1., Ok certificate)) in
+  begin match effects with
+  | [Cache.Reply (1L, Error Cache.Expired)] -> ()
+  | _ -> fail "late verification did not expire its waiter"
+  end;
+  if (Cache.stats checked).cached <> 1 then fail "late valid verification was discarded";
+  let checked, _ = Cache.delta checked (Ask (2L, query, Cache.lifetime +. 2.)) in
+  let _, effects = Cache.delta checked (Read (2L, 0L, Cache.lifetime +. 3., Ok bytes)) in
+  begin match effects with
+  | [Cache.Parse (_, "bytes")] -> ()
+  | _ -> fail "late valid verification was repeated"
+  end
+
+let test_cert_actor trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let raw = Yojson.Safe.to_string (Manifest.certificate_json certificate) in
+  let reads = ref 0 in
+  let verifies = ref 0 in
+  let body = ref raw in
+  let now = ref 1. in
+  let deps = Cache.{
+    now = (fun () -> !now);
+    read = (fun _ -> incr reads; Lwt.return_ok !body);
+    verify = (fun ~cancelled trust raw ->
+      incr verifies;
+      match Manifest.parse_certificate_string raw with
+      | Error reason -> Lwt.return_error reason
+      | Ok certificate -> Manifest.verify_certificate_lwt
+          ~cancelled ~validator_set:trust.validators ~exporter_set:trust.exporters certificate);
+  } in
+  let actor = Cache.create deps in
+  Lwt.finalize (fun () ->
+    Lwt_list.iter_s (fun path ->
+      Cache.load actor ~path trust >|= fun result ->
+      let loaded = match result with Ok loaded -> loaded | Error error -> fail (Cache.reason error) in
+      if loaded.raw <> raw then fail "certificate bytes changed")
+      ["current"; "archive"; "current"; "archive"] >>= fun () ->
+    if !reads <> 4 || !verifies <> 1 then fail "same certificate was verified repeatedly";
+    Lwt_list.iter_p (fun path -> Cache.load actor ~path trust >|= fun result ->
+      if Result.is_error result then fail "concurrent certificate read failed")
+      ["current"; "archive"; "current"; "archive"] >>= fun () ->
+    if !reads <> 8 || !verifies <> 1 then fail "concurrent certificate checks were repeated";
+    let changed = Cache.{ trust with config = sha "changed" } in
+    Cache.load actor ~path:"current" changed >>= fun result ->
+    if Result.is_error result then fail "changed trust read failed";
+    if !verifies <> 2 then fail "trust change reused certificate verification";
+    body := "{\"invalid\":true}";
+    Cache.load actor ~path:"current" trust >>= fun result ->
+    begin match result with
+    | Error _ -> ()
+    | Ok _ -> fail "changed certificate reused old success"
+    end;
+    let calls = !verifies in
+    Cache.load actor ~path:"archive" trust >>= fun result ->
+    begin match result with
+    | Error _ when !verifies = calls -> ()
+    | _ -> fail "invalid certificate was not cached"
+    end;
+    now := !now +. Cache.negative_seconds +. 1.;
+    Cache.load actor ~path:"archive" trust >>= fun result ->
+    begin match result with
+    | Error _ when !verifies = calls + 1 -> ()
+    | _ -> fail "expired failure was reused"
+    end;
+    body := raw;
+    Cache.load actor ~path:"current" trust >>= fun result ->
+    if Result.is_error result then fail "restored certificate read failed";
+    let count = 10 in
+    let bodies = List.init count (fun index -> raw ^ String.make (index + 1) ' ') in
+    let before = !verifies in
+    Lwt_list.iter_s (fun raw ->
+      body := raw;
+      Cache.load actor ~path:"retained" trust >|= fun result ->
+      if Result.is_error result then fail "retained certificate read failed") (bodies @ bodies) >|= fun () ->
+    if !verifies <> before + count then fail "retained certificates evicted one another")
+    (fun () -> Cache.shutdown actor)
+
+let test_cert_cache trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let query = Cache.{ path = "current"; trust; trust_hash = trust_hash trust } in
+  let save state index =
+    let id = Int64.of_int index in
+    let raw = string_of_int index in
+    let state, _ = Cache.delta state (Ask (id, query, 0.)) in
+    let state, _ = Cache.delta state (Read (id, 0L, 1., Ok Cache.{ raw; digest = sha raw })) in
+    let state, _ = Cache.delta state (Checked (id, 0L, 2., Ok certificate)) in
+    if (Cache.stats state).cached > Cache.cache_capacity then fail "certificate cache exceeds capacity";
+    state
+  in
+  let state = List.fold_left save Cache.empty (List.init (Cache.cache_capacity + 2) (fun i -> i + 1)) in
+  if (Cache.stats state).cached <> Cache.cache_capacity then fail "certificate cache size differs";
+  let state, _ = Cache.delta state (Ask (100L, query, 3.)) in
+  let _, effects = Cache.delta state (Read (100L, 0L, 4., Ok Cache.{ raw = "1"; digest = sha "1" })) in
+  begin match effects with
+  | [Cache.Verify (_, "1")] -> ()
+  | _ -> fail "evicted certificate was reused"
+  end
+
+let test_http_cert root wallets certificate validators =
+  let path = Filename.concat root "http-certificate.json" in
+  let keys = ["OCTRA_STATE_SYNC_ENABLE"; "OCTRA_STATE_SYNC_CERT";
+    "OCTRA_VALIDATORS"; "OCTRA_STATE_SYNC_EXPORTERS"; "OCTRA_CONSENSUS_CONFIG_HASH"] in
+  let saved = List.map (fun key -> key, Option.value ~default:"" (Sys.getenv_opt key)) keys in
+  let config_hash = certificate.Manifest.checkpoint.config_hash in
+  let chain_id = certificate.checkpoint.chain_id in
+  let member wallet = wallet.Octra_core.Crypto.Wallet.address ^ ":" ^ wallet.pub in
+  let configured = String.concat "," (List.map member wallets) in
+  let exporter = member (List.hd wallets) in
+  let write certificate = Manifest.write_json path (Manifest.certificate_json certificate) in
+  let snapshot = Int64.to_int certificate.checkpoint.epoch in
+  let read ?(chain = chain_id) ?(epoch = snapshot + 1_061) status =
+    Http.handle_manifest ~data_dir:root ~chain_id:chain ~config_hash
+      ~validator_set:validators ~current_epoch:(ref epoch) >>= fun (response, body) ->
+    Cohttp_lwt.Body.to_string body >|= fun raw ->
+    if Cohttp.Response.status response <> status then
+      fail (Printf.sprintf "certificate HTTP status differs lag = %d expected = %d actual = %d"
+        (epoch - snapshot - 1) (Cohttp.Code.code_of_status status)
+        (Cohttp.Code.code_of_status (Cohttp.Response.status response)));
+    if status = `OK && Manifest.parse_certificate_string raw <> Ok certificate then
+      fail "certificate HTTP bytes differ"
+  in
+  let read_lag lag =
+    let status, expected = if lag <= 3_000 then `OK, "ready"
+      else `Service_unavailable, "old_epoch" in
+    let epoch = snapshot + lag + 1 in
+    read ~epoch status >>= fun () ->
+    Http.handle_head ~data_dir:root ~chain_id ~config_hash
+      ~validator_set:validators ~current_epoch:(ref epoch) >>= fun (response, body) ->
+    Cohttp_lwt.Body.to_string body >|= fun raw ->
+    if Cohttp.Response.status response <> `OK then fail "snapshot head is unavailable";
+    let json = Yojson.Safe.from_string raw in
+    let field name = Yojson.Safe.Util.member name json in
+    if field "snapshot_status" <> `String expected
+       || field "snapshot_lag" <> `Int lag
+       || field "snapshot_lag_limit" <> `Int 3_000 then
+      fail "snapshot head and manifest decisions differ"
+  in
+  Unix.putenv "OCTRA_STATE_SYNC_ENABLE" "1";
+  Unix.putenv "OCTRA_STATE_SYNC_CERT" path;
+  Unix.putenv "OCTRA_VALIDATORS" configured;
+  Unix.putenv "OCTRA_STATE_SYNC_EXPORTERS" exporter;
+  Unix.putenv "OCTRA_CONSENSUS_CONFIG_HASH" config_hash;
+  mkdir_p root;
+  write certificate;
+  Lwt.finalize (fun () ->
+    let active = List.init Octra_node_runtime.Sync_cert.capacity (fun _ ->
+      Http.handle_manifest ~data_dir:root ~chain_id ~config_hash
+        ~validator_set:validators ~current_epoch:(ref 778)) in
+    let file = List.hd certificate.manifest.files in
+    let chunk = List.hd file.chunks in
+    let snapshot_id = certificate.manifest.snapshot_id in
+    mkdir_p (State_sync.snapshot_dir root snapshot_id);
+    Http.handle_chunk ~data_dir:root ~chain_id ~config_hash ~validator_set:validators
+      ["snapshot", [snapshot_id]; "path", [file.path]; "index", [string_of_int chunk.index];
+       "sha256", [chunk.sha256]] >>= fun (response, body) ->
+    Cohttp_lwt.Body.drain_body body >>= fun () ->
+    if Cohttp.Response.status response <> `Too_many_requests
+       || Cohttp.Header.get (Cohttp.Response.headers response) "Retry-After" <> Some "1" then
+      fail "certificate overload did not apply HTTP backpressure";
+    Http.handle_head ~data_dir:root ~chain_id ~config_hash ~validator_set:validators
+      ~current_epoch:(ref 778) >>= fun (response, body) ->
+    Cohttp_lwt.Body.drain_body body >>= fun () ->
+    if Cohttp.Response.status response <> `Too_many_requests then
+      fail "certificate overload reported a missing snapshot";
+    Lwt_list.iter_s (fun work -> work >>= fun (_, body) -> Cohttp_lwt.Body.drain_body body) active >>= fun () ->
+    read `OK >>= fun () ->
+    read ~chain:"other-chain" `Service_unavailable >>= fun () ->
+    read `OK >>= fun () ->
+    Unix.putenv "OCTRA_CONSENSUS_CONFIG_HASH" (sha "other-config");
+    read `Service_unavailable >>= fun () ->
+    Unix.putenv "OCTRA_CONSENSUS_CONFIG_HASH" config_hash;
+    read `OK >>= fun () ->
+    Unix.putenv "OCTRA_STATE_SYNC_EXPORTERS" (member (wallet 21));
+    read `Service_unavailable >>= fun () ->
+    Unix.putenv "OCTRA_STATE_SYNC_EXPORTERS" exporter;
+    Unix.putenv "OCTRA_VALIDATORS" (member (wallet 22));
+    read `Service_unavailable >>= fun () ->
+    Unix.putenv "OCTRA_VALIDATORS" configured;
+    read `OK >>= fun () ->
+    Lwt_list.iter_s read_lag [0; 720; 721; 1_060; 3_000; 3_001; 4_096; 5_000] >>= fun () ->
+    write { certificate with exporter_signatures = List.map (fun item ->
+      Checkpoint.{ item with signature = Base64.encode_exn (String.make 64 '\000') })
+      certificate.exporter_signatures };
+    read `Service_unavailable >>= fun () ->
+    write { certificate with authority = Manifest.Checkpoint_quorum [] };
+    read `Service_unavailable >>= fun () ->
+    let _, _, _, _, expired = sample ~valid_for:(-1L) wallets "payload" "expired" in
+    write expired;
+    read `Service_unavailable >>= fun () ->
+    write certificate;
+    read `OK >>= fun () ->
+    Unix.unlink path;
+    Unix.mkfifo path 0o600;
+    Lwt_unix.with_timeout 1. (fun () -> read `Service_unavailable) >>= fun () ->
+    Unix.unlink path;
+    write certificate;
+    let output = Unix.openfile path [Unix.O_WRONLY] 0o600 in
+    Unix.ftruncate output (Manifest.manifest_limit + 1);
+    Unix.close output;
+    read `Service_unavailable >>= fun () ->
+    write certificate;
+    read `OK)
+    (fun () -> List.iter (fun (key, value) -> Unix.putenv key value) saved; Lwt.return_unit)
+
+let test_cert_cancel trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let pending, finish = Lwt.wait () in
+  let reads = ref 0 in
+  let verifies = ref 0 in
+  let actor = Cache.create {
+    now = (fun () -> 0.);
+    read = (fun _ -> incr reads; pending);
+    verify = (fun ~cancelled:_ _ _ -> incr verifies; Lwt.return_ok certificate);
+  } in
+  let first = Cache.load actor ~path:"first" trust in
+  Lwt.cancel first;
+  let second = Cache.load actor ~path:"second" trust in
+  if !reads <> 1 then fail "cancel released a running certificate read";
+  let stopped = Cache.shutdown actor in
+  if not (Lwt.is_sleeping stopped) then fail "shutdown did not wait for the running read";
+  second >>= fun result ->
+  begin match result with
+  | Error Cache.Stopped -> ()
+  | _ -> fail "queued request survived stop"
+  end;
+  Lwt.wakeup_later finish (Ok "bytes");
+  stopped >>= fun () ->
+  if !reads <> 1 || !verifies <> 0 then fail "stopped actor launched more work";
+  Cache.load actor ~path:"after" trust >|= function
+  | Error Cache.Stopped -> ()
+  | _ -> fail "stopped actor accepted work"
+
+let test_verify_cancel trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let entered, enter = Lwt.wait () in
+  let pending, finish = Lwt.wait () in
+  let later = ref 0 in
+  let actor = Cache.create {
+    now = (fun () -> 0.);
+    read = (fun _ -> Lwt.return_ok "bytes");
+    verify = (fun ~cancelled _ _ ->
+      Lwt.wakeup_later enter ();
+      pending >|= fun () ->
+      if cancelled () then Error "cancelled"
+      else begin incr later; Ok certificate end);
+  } in
+  let request = Cache.load actor ~path:"first" trust in
+  entered >>= fun () ->
+  Lwt.cancel request;
+  let stopped = Cache.shutdown actor in
+  if not (Lwt.is_sleeping stopped) then fail "shutdown left verification running";
+  Lwt.wakeup_later finish ();
+  stopped >|= fun () ->
+  if !later <> 0 then fail "cancelled verification launched another stage"
+
 let run () =
   let root =
     Filename.concat
@@ -764,6 +1063,15 @@ let run () =
   let validators, exporters, config_hash, head_json, certificate =
     sample wallets payload "state"
   in
+  let trust = Octra_node_runtime.Sync_cert.{
+    validators; exporters; config = config_hash; chain = certificate.checkpoint.chain_id;
+  } in
+  test_cert_model trust certificate;
+  test_cert_cache trust certificate;
+  test_cert_actor trust certificate >>= fun () ->
+  test_cert_cancel trust certificate >>= fun () ->
+  test_verify_cancel trust certificate >>= fun () ->
+  test_http_cert root wallets certificate validators >>= fun () ->
   let runtime_validators = runtime_set wallets in
   let snapshot_id = certificate.Manifest.manifest.snapshot_id in
   let good_snapshot = State_sync.snapshot_dir good_data snapshot_id in

@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type resource = Memory | Stack
+type resource = Memory | Stack | Host
 
 exception Unavailable of resource
 exception Exhausted of string * resource

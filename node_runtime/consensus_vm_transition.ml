@@ -397,7 +397,7 @@ let circle_cell_transition_hash preverify tx =
         end
     end
 
-let preverify_circle
+let capture_circle
     ~circle_mode
     ~wasm_compute_mode
     ~backend
@@ -419,7 +419,20 @@ let preverify_circle
       env
       tx
   in
-  match result, !capture with
+  Lwt.return (result, !capture)
+
+let preverify_circle
+    ~circle_mode
+    ~wasm_compute_mode
+    ~backend
+    ~env
+    ~program_trust
+    ~object_cost
+    tx =
+  let open Lwt.Syntax in
+  let* result, capture = capture_circle ~circle_mode ~wasm_compute_mode
+    ~backend ~env ~program_trust ~object_cost tx in
+  match result, capture with
   | Ok (Epoch_exec.Confirmed _), Some binding -> Lwt.return_ok binding
   | Ok (Epoch_exec.Rejected_after_fee rejected), Some binding ->
     begin

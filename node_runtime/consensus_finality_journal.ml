@@ -27,8 +27,13 @@ type read_result =
   | Valid of record
   | Invalid of string
 
+type read_error =
+  | Read_set of string
+  | Read_record of string
+  | Read_bundle of string
+
 type rebind_result =
-  | Rebound
+  | Rewritten
   | Unchanged
 
 type proof_result =
@@ -197,7 +202,7 @@ let bundle_of_json json =
       |> List.map to_string;
   }
 
-let record_of_json json =
+let record_of_json ?(read_bundle = true) json =
   let open Yojson.Safe.Util in
   let got_schema = json |> member "schema" |> to_string in
   if got_schema <> schema then failwith "finality journal schema mismatch";
@@ -210,7 +215,7 @@ let record_of_json json =
       |> Base64.decode_exn
       |> C_codec.decode_validator_set;
     bundle =
-      match member "bundle" json with
+      match if read_bundle then member "bundle" json else `Null with
       | `Null -> None
       | value -> Some (bundle_of_json value);
   }
@@ -532,6 +537,54 @@ let read_validated ~chain_id ~validator_set base =
     ~validator_set
     (path base)
 
+let read_checked ?repair ~chain_id ~check_set base =
+  let saved =
+    try Ok (Option.map (fun encoded ->
+      let json = Yojson.Safe.from_string encoded in
+      record_of_json ~read_bundle:false json, json) (read_bytes (path base)))
+    with exn -> Error (Printexc.to_string exn)
+  in
+  match saved with
+  | Error reason -> Error (Read_record reason)
+  | Ok None -> Ok Missing
+  | Ok (Some (record, json)) ->
+    let trusted =
+      try check_set record
+      with exn -> Error (Printexc.to_string exn)
+    in
+    Result.bind (Result.map_error (fun reason -> Read_set reason) trusted) (fun () ->
+        match validate_qc ~chain_id ~validator_set:record.validator_set record.finalize with
+        | Error reason -> Ok (Invalid reason)
+        | Ok () ->
+          let bundle = try
+            match Yojson.Safe.Util.member "bundle" json with
+            | `Null -> Ok None
+            | value -> Ok (Some (bundle_of_json value))
+          with exn -> Error (Printexc.to_string exn) in
+          let checked = Result.bind bundle (fun bundle ->
+            let record = {record with bundle} in
+            match bundle with
+            | None -> Ok (Valid record)
+            | Some bundle ->
+              Result.map (fun () -> Valid record) (validate_bundle record.finalize bundle)) in
+          match checked, repair with
+          | Error _, Some (head, root)
+            when head >= 0 && head < max_int
+              && Int64.equal record.finalize.epoch_id (Int64.succ (Int64.of_int head))
+              && String.equal record.finalize.header.prev_state_root root ->
+            (try
+               write_record base record;
+               Ok (Valid record)
+             with exn -> Error (Read_record (Printexc.to_string exn)))
+          | _ -> Result.map_error (fun reason -> Read_bundle reason) checked)
+
+let read_selected ?repair ~chain_id ~expected_set base =
+  read_checked ?repair ~chain_id ~check_set:(fun record ->
+    Result.bind (expected_set record.finalize.C_types.epoch_id) (fun validator_set ->
+      if C_config.validator_set_hash validator_set
+         = C_config.validator_set_hash record.validator_set then Ok ()
+      else Error "finality journal validator set mismatch")) base
+
 let read_pending_epoch base =
   try
     Ok
@@ -698,7 +751,7 @@ let rebind_committed ~chain_id ~validator_set ~entry base =
                 ignore (check_history base replacement);
                 write_encoded target (bytes replacement);
                 archive_record base replacement;
-                Ok Rebound
+                Ok Rewritten
               end
       end
   with exn ->
@@ -910,7 +963,7 @@ let committed_epochs base =
   in
   List.sort_uniq Int64.compare (historical @ current)
 
-let read_replay_backlog ~chain_id ~validator_set ~head_epoch ~head_root base =
+let read_replay_backlog ~chain_id ~expected_set ~head_epoch ~head_root base =
   try
     let epochs =
       committed_epochs base
@@ -921,7 +974,7 @@ let read_replay_backlog ~chain_id ~validator_set ~head_epoch ~head_root base =
       | epoch :: _ when not (Int64.equal epoch expected_epoch) ->
         Error "committed finality history height gap"
       | epoch :: rest ->
-        begin
+        Result.bind (expected_set epoch) (fun validator_set ->
           match
             read_committed_epoch_validated
               ~chain_id
@@ -945,8 +998,7 @@ let read_replay_backlog ~chain_id ~validator_set ~head_epoch ~head_root base =
                   (Int64.succ epoch)
                   header.C_types.proposed_state_root
                   (replay :: records)
-                  rest
-        end
+                  rest)
     in
     loop (Int64.succ head_epoch) head_root [] epochs
   with exn ->
@@ -1003,6 +1055,10 @@ let drop_invalid_unapplied base ~head =
       let expected = Finality_log.of_finalize record.finalize in
       if expected.Finality_log.height <> head + 1 then
         Error "pending finality journal is not next after durable head"
+      else if Result.is_ok (validate_qc
+          ~chain_id:record.finalize.chain_id
+          ~validator_set:record.validator_set record.finalize) then
+        Error "pending finality certificate verifies"
       else
         begin
           match
@@ -1093,7 +1149,7 @@ let promote_record base ~allow_gap pending_record =
         committed_record.finalize.C_types.epoch_id
       in
       if Int64.compare pending_epoch committed_epoch < 0 then
-        failwith "finality journal promotion height regression"
+        failwith "finality journal promotion height decreased"
       else if Int64.equal pending_epoch committed_epoch
               && not (same_record pending_record committed_record) then
         refuse base "conflicting committed finality journal" pending_record.finalize
@@ -1117,7 +1173,7 @@ let pending_with_bundle base =
   | None ->
     failwith "finality journal promotion requires pending record"
   | Some { bundle = None; _ } ->
-    failwith "finality journal promotion requires canonical bundle"
+    failwith "finality journal promotion requires verified bundle"
   | Some pending_record ->
     pending_record
 
@@ -1138,19 +1194,17 @@ let promote_applied base ~epoch ~state_root =
   end
 
 let resume_join ~chain_id ~set_hash ~head ~root ~txid base =
-  match read_record (path base) with
-  | None -> ()
-  | Some record ->
+  let checked = read_checked ~repair:(head, root) ~chain_id
+    ~check_set:(fun record ->
+      Result.bind (set_hash record.finalize.C_types.epoch_id) (fun expected ->
+        if C_config.validator_set_hash record.validator_set = expected then Ok ()
+        else Error "finality journal validator set mismatch")) base in
+  match checked with
+  | Ok Missing -> ()
+  | Error (Read_set reason | Read_record reason | Read_bundle reason)
+  | Ok (Invalid reason) -> failwith reason
+  | Ok (Valid record) ->
     let epoch = record.finalize.C_types.epoch_id in
-    let expected = match set_hash epoch with
-      | Ok hash -> hash
-      | Error reason -> failwith reason in
-    if C_config.validator_set_hash record.validator_set <> expected then
-      failwith "finality journal validator set mismatch";
-    begin match validate_record ~chain_id record with
-    | Error reason -> failwith reason
-    | Ok () -> ()
-    end;
     if Int64.equal epoch (Int64.of_int head) then begin
       if root = zero_root || record.finalize.header.proposed_state_root <> root then
         failwith "finality journal applied root mismatch";

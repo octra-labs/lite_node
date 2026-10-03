@@ -187,7 +187,7 @@ let seed_epoch ~validator = function
   | Some (Consensus_join_rpc.Synced synced)
     when validator && synced.count > 0 -> Some synced.epoch
   | Some (Consensus_join_rpc.Synced _)
-  | Some (Consensus_join_rpc.Leader_stale _)
+  | Some (Consensus_join_rpc.Leader_behind _)
   | Some (Consensus_join_rpc.Source_unavailable _)
   | None -> None
 

@@ -53,7 +53,7 @@ type synced = {
 
 type outcome =
   | Synced of synced
-  | Leader_stale of {
+  | Leader_behind of {
       local_head : int64;
       leader_head : int64;
     }
@@ -284,7 +284,7 @@ let local_eic_from_head = function
 let head_url base =
   base ^ "/state-sync/head"
 
-let range_url ?part base ~from_epoch ~max_epochs =
+let range_url ?part ?hash base ~from_epoch ~max_epochs =
   let fields =
     [
       "from_epoch", [Int64.to_string from_epoch];
@@ -296,6 +296,9 @@ let range_url ?part base ~from_epoch ~max_epochs =
     | None -> fields
     | Some index -> fields @ ["part", [string_of_int index]]
   in
+  let fields = match hash with
+    | None -> fields
+    | Some value -> fields @ ["sha256", [value]] in
   base ^ "/state-sync/range?" ^ Uri.encoded_of_query fields
 
 let read_http_body body =
@@ -339,8 +342,8 @@ let http_get_json ?(timeout = 20.0) url =
 
 let fetch_range_json fetch_json base ~from_epoch ~max_epochs =
   let open Lwt.Syntax in
-  let get ?part () =
-    fetch_json (range_url ?part base ~from_epoch ~max_epochs)
+  let get ?part ?hash () =
+    fetch_json (range_url ?part ?hash base ~from_epoch ~max_epochs)
   in
   let* first_json = get () in
   match Range_part.view first_json with
@@ -357,12 +360,13 @@ let fetch_range_json fetch_json base ~from_epoch ~max_epochs =
         | Ok json -> Lwt.return json
         | Error error -> Lwt.fail (Fetch_retry error)
       else
-        let* json = get ~part:index () in
+        let* json = get ~part:index ~hash:first.hash () in
         match Range_part.view json with
-        | Ok (Range_part.Part part) when part.index = index ->
+        | Ok (Range_part.Part part) when part.index = index
+            && part.count = first.count && part.hash = first.hash ->
           collect (index + 1) (part :: parts)
         | Ok (Range_part.Part _) ->
-          Lwt.fail (Fetch_retry "range part index does not match")
+          Lwt.fail (Fetch_retry "range part identity does not match")
         | Ok (Range_part.Full _) ->
           Lwt.fail (Fetch_retry "range part response is incomplete")
         | Error error -> Lwt.fail (Fetch_retry error)
@@ -725,7 +729,7 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
           record.finality.finalize
           reward
       with
-      | Ok bound -> bound
+      | Ok verified -> verified
       | Error error -> failwith ("join reward binding: " ^ error)
   in
   let partition =
@@ -892,7 +896,7 @@ let run_catchup (deps : run_deps) base =
           match sync_plan ~local_next ~local_root:(deps.local_root ()) head with
       | Local_ahead p ->
         Lwt.return
-          (Leader_stale {
+          (Leader_behind {
              local_head = p.local_head;
              leader_head = p.leader_head;
            })
@@ -1022,7 +1026,7 @@ let run_node_catchup (deps : node_deps) base =
         Octra_log.info "join"
           "RPC catchup complete local_next = %d"
           (deps.current_epoch ())
-    | Leader_stale p ->
+    | Leader_behind p ->
         Octra_log.warn "join"
           "event = join_source_stale local_head = %Ld source_head = %Ld action = continue_unattested"
           p.local_head
@@ -1253,7 +1257,7 @@ let run_configured_node_catchup (deps : node_runtime_deps) =
       match outcome with
       | Synced _ when Consensus_finality_journal.pending deps.data_dir -> run rest
       | Synced _ as synced -> Lwt.return_some synced
-      | Leader_stale _
+      | Leader_behind _
       | Source_unavailable _ -> run rest
   and run sources =
     match Sync_mark.read ~data_dir:deps.data_dir ~chain:deps.chain_id with

@@ -67,7 +67,7 @@ let test_call_success_keeps_effects () =
     receipt ()
   in
   let ctx = Shell.make_contract_ctx (deps ~state ~pending ~call ~deploy:default_deploy) in
-  let result = ctx.call_contract "caller" "target" "method" [] {depth = 1; limit = None; memory = ctx.fhe_memory} in
+  let result = ctx.call_contract "caller" "target" "method" [] {depth = 1; limit = None; memory = ctx.fhe_memory; bytes = None} in
   expect "call success" (Result.is_ok result);
   expect "state kept" (!state = 1);
   expect "pending kept" (!pending = 1)
@@ -81,7 +81,7 @@ let test_call_restore () =
     receipt ~success:false ~error:"boom" ()
   in
   let ctx = Shell.make_contract_ctx (deps ~state ~pending ~call ~deploy:default_deploy) in
-  let result = ctx.call_contract "caller" "target" "method" [] {depth = 1; limit = None; memory = ctx.fhe_memory} in
+  let result = ctx.call_contract "caller" "target" "method" [] {depth = 1; limit = None; memory = ctx.fhe_memory; bytes = None} in
   expect "call failure" (Result.is_error result);
   expect "state restored" (!state = 0);
   expect "pending restored" (!pending = 0)
@@ -95,7 +95,7 @@ let test_deploy_restore () =
     Error "bad deploy"
   in
   let ctx = Shell.make_contract_ctx (deps ~state ~pending ~call:default_call ~deploy) in
-  let result = ctx.deploy_contract "deployer" "bytecode" 1 {depth = 1; limit = None; memory = ctx.fhe_memory} [] in
+  let result = ctx.deploy_contract "deployer" "bytecode" 1 {depth = 1; limit = None; memory = ctx.fhe_memory; bytes = None} [] in
   expect "deploy failure" (Result.is_error result);
   expect "state restored" (!state = 0);
   expect "pending restored" (!pending = 0)
@@ -123,7 +123,7 @@ let test_shared_memory () =
     Error "refused" in
   let ctx = Shell.make_contract_ctx
     {(deps ~state ~pending ~call ~deploy) with fhe_work = Octra_core.Rule_graph.Active} in
-  let scope = ContractVM.{depth = 1; limit = Some 1000; memory = Some owner} in
+  let scope = ContractVM.{depth = 1; limit = Some 1000; memory = Some owner; bytes = None} in
   expect "nested call unexpectedly succeeded"
     (Result.is_error (ctx.call_contract "caller" "target" "method" [] scope));
   expect "failed call refunded reservation" (Z.equal (Memory.used owner) Z.one);
@@ -131,6 +131,43 @@ let test_shared_memory () =
     (Result.is_error (ctx.deploy_contract "sender" "code" 1 scope []));
   expect "failed constructor refunded reservation" (Z.equal (Memory.used owner) (Z.of_int 2));
   expect "state rollback changed" (!state = 0 && !pending = 0)
+
+let test_shared_bytes () =
+  let module Bytes = Octra_vm.Byte_work in
+  let rules = Option.get (Bytes.limits ~key_bytes:16 ~value_bytes:32
+    ~copy_bytes:64 ~write_bytes:64 ~alloc_bytes:1024 ~unit_bytes:32) in
+  let owner = Bytes.create rules in
+  let spend (ctx : ContractVM.exec_ctx) =
+    match ctx.byte_work with
+    | None -> fail "nested byte budget missing"
+    | Some budget ->
+      expect "nested byte owner changed" (budget == owner);
+      expect "nested byte debit refused"
+        (Bytes.charge budget ~used:0 ~limit:10 ~base:0
+          [Bytes.Write (1, 1); Bytes.Copy (16, 16)] = Some 2) in
+  let state = ref 0 in
+  let pending = ref 0 in
+  let call ~ctx ~depth:_ ~limit:_ ~target:_ ~method_name:_ ~params:_ ~caller:_ ~amount:_ =
+    spend ctx;
+    incr state;
+    incr pending;
+    receipt ~success:false ~error:"refused" () in
+  let deploy ~ctx ~depth:_ ~limit:_ ~params:_ ~deployer:_ ~bytecode_raw:_ ~nonce:_ =
+    spend ctx;
+    incr state;
+    incr pending;
+    Error "refused" in
+  let ctx = Shell.make_contract_ctx (deps ~state ~pending ~call ~deploy) in
+  let scope = ContractVM.{depth = 1; limit = Some 1000; memory = None; bytes = Some owner} in
+  expect "nested call accepted"
+    (Result.is_error (ctx.call_contract "caller" "target" "method" [] scope));
+  expect "call refunded bytes" (Bytes.remaining owner = 62);
+  expect "call refunded allocation" (Bytes.available owner = 992);
+  expect "nested deploy accepted"
+    (Result.is_error (ctx.deploy_contract "sender" "code" 1 scope []));
+  expect "constructor refunded bytes" (Bytes.remaining owner = 60);
+  expect "constructor refunded allocation" (Bytes.available owner = 960);
+  expect "byte accounting broke state rollback" (!state = 0 && !pending = 0)
 
 let test_transfer_and_context_fields () =
   let state = ref 0 in
@@ -967,6 +1004,7 @@ let () =
   test_call_restore ();
   test_deploy_restore ();
   test_shared_memory ();
+  test_shared_bytes ();
   test_transfer_and_context_fields ();
   test_direct_exec_success ();
   test_direct_exec_reject ();

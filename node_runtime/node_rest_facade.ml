@@ -94,6 +94,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
   match Tx_view.bft_op_admission ~bft_mode tx with
   | Error (_, reason) -> Error reason
   | Ok () ->
+    let* () = if bft_mode then Octra_core.Resource_lanes.circle_admission tx else Ok () in
     match Tx_view.staging_submit_admission
             ~min_ou:(Rest_read_rpc.stealth_floor ())
             ~min_relay_fee:(Staging.min_relay_fee tx)

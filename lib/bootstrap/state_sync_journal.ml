@@ -29,11 +29,11 @@ let mkdir_p path =
   in
   loop path
 
-let fsync_parent path =
+let fsync_parent ?(sync = Unix.fsync) path =
   let descriptor = Unix.openfile (Filename.dirname path) [Unix.O_RDONLY] 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close descriptor)
-    (fun () -> Unix.fsync descriptor)
+    (fun () -> sync descriptor)
 
 let safe_child root relative =
   match Manifest.normalize_path relative with
@@ -308,17 +308,18 @@ let verify_completed_chunk ~partial (chunk : Manifest.chunk) =
   | Ok hash -> Ok (hash = chunk.sha256)
   | Error _ as error -> error
 
-let finalize_file ~destination ~partial (file : Manifest.file) =
+let finalize_file ?(sync = Unix.fsync) ~destination ~partial (file : Manifest.file) =
   let source =
     if Sys.file_exists destination then destination else partial in
   let* hash = hash_file source in
   if hash <> file.Manifest.sha256 then Error "file hash mismatch"
-  else if source = destination then Ok ()
   else
     protect (fun () ->
-      Unix.rename partial destination;
-      Unix.chmod destination 0o600;
-      fsync_parent destination)
+      if source <> destination then begin
+        Unix.rename partial destination;
+        Unix.chmod destination 0o600
+      end;
+      fsync_parent ~sync destination)
 
 let stage_lock stage =
   protect (fun () ->

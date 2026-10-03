@@ -17,4 +17,10 @@ type report = {
   bytes : int64;
 }
 
+val stage_owned :
+  Sync_archive.t -> source -> target:string -> (report, string) result Lwt.t
+
+val build_owned :
+  Sync_archive.t -> source -> target:string -> (report, string) result Lwt.t
+
 val build : source -> target:string -> (report, string) result Lwt.t

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 #include <tuple>
+#include <utility>
 #include <cassert>
 #include <stdexcept>
 #include "transcript.hpp"
@@ -25,15 +26,28 @@ class R1CSProver {
     std::vector<CommittedVar> committed_;
     std::vector<Gate> gates_;
     std::vector<Constraint> constraints_;
+    bool values_ = true;
+    size_t gate_total_ = 0;
+    size_t commit_total_ = 0;
+
+    R1CSProver(ScalarRule rule, bool values) : values_(values), ops(rule) {}
 
 public:
     const ScalarOps ops;
 
     explicit R1CSProver(ScalarRule rule = ScalarRule::Prior) : ops(rule) {}
 
+    static R1CSProver verification(ScalarRule rule = ScalarRule::Prior) {
+        return R1CSProver(rule, false);
+    }
+
     Variable commit(const Scalar& value, const Scalar& blinding) {
-        size_t j = committed_.size();
-        committed_.push_back({value, blinding});
+        size_t j = num_committed();
+        if (values_) {
+            committed_.push_back({value, blinding});
+        } else {
+            ++commit_total_;
+        }
         return Variable::committed(j);
     }
 
@@ -41,8 +55,12 @@ public:
         const Scalar& a_L_val,
         const Scalar& a_R_val
     ) {
-        size_t i = gates_.size();
-        gates_.push_back({a_L_val, a_R_val, ops.mul(a_L_val, a_R_val)});
+        size_t i = num_gates();
+        if (values_) {
+            gates_.push_back({a_L_val, a_R_val, ops.mul(a_L_val, a_R_val)});
+        } else {
+            ++gate_total_;
+        }
         return {Variable::mult_left(i), Variable::mult_right(i), Variable::mult_out(i)};
     }
 
@@ -50,10 +68,14 @@ public:
         const LinearCombination& lc_left,
         const LinearCombination& lc_right
     ) {
-        size_t i = gates_.size();
-        Scalar aL = eval_lc(lc_left);
-        Scalar aR = eval_lc(lc_right);
-        gates_.push_back({aL, aR, ops.mul(aL, aR)});
+        size_t i = num_gates();
+        if (values_) {
+            Scalar aL = eval_lc(lc_left);
+            Scalar aR = eval_lc(lc_right);
+            gates_.push_back({aL, aR, ops.mul(aL, aR)});
+        } else {
+            ++gate_total_;
+        }
 
         LinearCombination cl = lc_left;
         cl -= LinearCombination(Variable::mult_left(i));
@@ -70,9 +92,9 @@ public:
         constraints_.push_back({lc});
     }
 
-    size_t num_gates() const { return gates_.size(); }
+    size_t num_gates() const { return values_ ? gates_.size() : gate_total_; }
     size_t num_constraints() const { return constraints_.size(); }
-    size_t num_committed() const { return committed_.size(); }
+    size_t num_committed() const { return values_ ? committed_.size() : commit_total_; }
     size_t constraint_terms() const {
         size_t count = 0;
         for (const auto& constraint : constraints_) {
@@ -82,12 +104,16 @@ public:
         }
         return count;
     }
-    std::vector<Constraint> get_constraints() const { return constraints_; }
+    std::vector<Constraint> get_constraints() const & { return constraints_; }
+
+    std::vector<Constraint> get_constraints() && { return std::move(constraints_); }
 
     R1CSProof prove(
         Transcript& transcript,
         R1CSLimitProfile profile = R1CSLimitProfile::Default
     ) {
+        if (!values_)
+            throw std::runtime_error("pvac: proof witness is missing");
         if (transcript.ops.rule != ops.rule)
             throw std::runtime_error("pvac: scalar rule mismatch");
         R1CSProof proof;

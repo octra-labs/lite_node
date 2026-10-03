@@ -64,8 +64,46 @@ let const_of_v = function
   | Contract_vm.VCipher ct -> CBytes (Bytes.to_string (Pvac_ffi.serialize_cipher ct))
   | Contract_vm.VPubKey pk -> CBytes (Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
 
+module Integers : sig
+  val read : string -> Z.t
+end = struct
+  type entry = { raw : string; hash : string; value : Z.t; bytes : int }
+
+  let max_bytes = 32 * 1024 * 1024
+  let max_entries = 512
+  let entries = ref []
+  let lock = Mutex.create ()
+
+  let rec keep slots bytes = function
+    | entry :: rest when slots > 0 && entry.bytes <= bytes ->
+      entry :: keep (slots - 1) (bytes - entry.bytes) rest
+    | _ -> []
+
+  let read raw =
+    if String.length raw < 65536 || String.length raw > max_const_len then
+      Z.of_string raw
+    else begin
+      let hash = Digestif.SHA256.(digest_string raw |> to_raw_string) in
+      Mutex.lock lock;
+      Fun.protect ~finally:(fun () -> Mutex.unlock lock) (fun () ->
+        match List.find_opt (fun entry ->
+          String.equal entry.hash hash && String.equal entry.raw raw) !entries with
+        | Some entry ->
+          entries := entry :: List.filter (fun item -> item != entry) !entries;
+          entry.value
+        | None ->
+          let value = Z.of_string raw in
+          let word = Sys.word_size / 8 in
+          let bytes = 128 + word * (String.length raw / word + 2)
+            + word * Obj.reachable_words (Obj.repr value) in
+          if bytes <= max_bytes then
+            entries := keep max_entries max_bytes ({raw; hash; value; bytes} :: !entries);
+          value)
+    end
+end
+
 let v_of_const = function
-  | CInt s -> Contract_vm.VInt (Z.of_string s)
+  | CInt s -> Contract_vm.VInt (Integers.read s)
   | CBool b -> Contract_vm.VBool b
   | CStr s -> Contract_vm.VString s
   | CBytes b -> Contract_vm.VBytes b
@@ -738,7 +776,7 @@ let const_at active pc consts index =
     failwith (Printf.sprintf "constant reference %d at pc %d" index pc);
   consts.(index)
 
-let decode_instr ~active s pos consts pc =
+let decode_instr ~active s pos consts values pc =
   let tag = get_u8 s pos in
   let p = pos + 1 in
   match tag with
@@ -756,7 +794,7 @@ let decode_instr ~active s pos consts pc =
   | 0x0B ->
     let d = get_u8 s p in
     let ci = get_u16le s (p+1) in
-    (Contract_vm.LDI (d, v_of_const (const_at active pc consts ci)), p+3)
+    (Contract_vm.LDI (d, Lazy.force (const_at active pc values ci)), p+3)
   | 0x0C -> (Contract_vm.MOV (get_u8 s p, get_u8 s (p+1)), p+2)
   | 0x0D ->
     let d = get_u8 s p in
@@ -778,7 +816,7 @@ let decode_instr ~active s pos consts pc =
   | (0x89 | 0x8A) when active ->
     let ci = get_u16le s p in
     let kind =
-      match v_of_const (const_at active pc consts ci) with
+      match Lazy.force (const_at active pc values ci) with
       | Contract_vm.VInt value -> value
       | _ -> Z.minus_one
     in
@@ -971,6 +1009,7 @@ let decode_image ?(active = true) raw =
         None, None, None, None
     in
     let consts = Array.map (fun cell -> cell.value) const_cells in
+    let values = Array.map (fun value -> lazy (v_of_const value)) consts in
     let text_at = !pos in
     let cells = Array.make n_instrs { pc = 0; at = 0; size = 0 } in
     let code : Contract_vm.instr array =
@@ -986,11 +1025,11 @@ let decode_image ?(active = true) raw =
         let at = !pos in
         let instr, next =
           if active then
-            try decode_instr ~active s at consts pc
+            try decode_instr ~active s at consts values pc
             with Invalid_argument _ ->
               failwith (Printf.sprintf "truncated instruction at pc %d" pc)
           else
-            decode_instr ~active s at consts pc
+            decode_instr ~active s at consts values pc
         in
         pos := next;
         code.(pc) <- instr;

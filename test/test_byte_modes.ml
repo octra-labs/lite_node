@@ -50,6 +50,85 @@ let check_decoder () =
   require (Bytecode.decode ~active:true raw = Bytecode.decode ~active:false raw)
     "historical instruction differs"
 
+let pool_image consts ops =
+  let output = Buffer.create 128 in
+  Buffer.add_string output Bytecode.magic;
+  Bytecode.put_u16le output Bytecode.version;
+  Bytecode.put_u16le output (List.length consts);
+  Bytecode.put_u32le output (Array.length ops);
+  List.iter (fun value ->
+    let data = Bytecode.const_data value in
+    Bytecode.put_u8 output (Bytecode.const_tag value);
+    Bytecode.put_u32le output (String.length data);
+    Buffer.add_string output data) consts;
+  Array.iter (Buffer.add_string output) ops;
+  Buffer.contents output
+
+let check_pool_share () =
+  let ldi = "\x0b\x00\x00\x00" in
+  let check active text ops =
+    let raw = pool_image [Bytecode.CInt text] ops in
+    let code = match Bytecode.decode ~active raw with
+      | Ok code -> code
+      | Error reason -> failwith reason in
+    let number = function
+      | LDI (_, VInt value) | CAP_CHECK (value, _) | CAP_CLOSE (value, _) -> value
+      | _ -> failwith "constant instruction differs" in
+    let first = number code.(0) in
+    require (Z.equal first (Z.of_string text)) "constant value differs";
+    Array.iter (fun op ->
+      require (number op == first) "integer pool is copied per reference") code;
+    if String.length text >= 65536 then
+      match Bytecode.decode ~active raw with
+      | Ok copy ->
+        require (number copy.(0) == first) "integer pool decoded again";
+        require (copy != code) "code array shared"
+      | Error reason -> failwith reason in
+  List.iter (fun active ->
+    List.iter (fun text ->
+      check active text [|ldi|];
+      check active text (Array.make 16 ldi))
+      ["123456789012345678901234567890";
+       "-123456789012345678901234567890";
+       "0x123456789abcdef123456789abcdef"])
+    [false; true];
+  check true "123456789012345678901234567890"
+    [|ldi; "\x89\x00\x00\x01"; "\x8a\x00\x00\x01"; ldi|];
+  List.iter (fun active ->
+    check active ("0x" ^ String.make (1024 * 1024) 'a') (Array.make 100_000 ldi))
+    [false; true]
+
+let check_pool_errors () =
+  List.iter (fun active ->
+    let raw = pool_image [Bytecode.CInt "invalid"] [|"\x17"|] in
+    require (Bytecode.decode ~active raw = Ok [|STOP|]) "unused integer was parsed";
+    let raw = pool_image [Bytecode.CInt "invalid"] [|"\xff"|] in
+    let expected = if active then "unknown opcode 0xff at pc 0"
+      else "unknown opcode 0xff at 24" in
+    require (Bytecode.decode ~active raw = Error expected) "unused integer changed error order";
+    let raw = pool_image [Bytecode.CInt "1"] [|"\x0b\x00\x01\x00"|] in
+    let expected = if active then "constant reference 1 at pc 0"
+      else "Invalid_argument(\"index out of bounds\")" in
+    require (Bytecode.decode ~active raw = Error expected) "constant index error differs";
+    let raw = pool_image [Bytecode.CStr "name"; Bytecode.CBool true]
+      [|"\x0b\x00\x00\x00"; "\x0b\x01\x01\x00"; "\x17"|] in
+    require (Bytecode.decode ~active raw = Ok [|LDI (0, VString "name"); LDI (1, VBool true); STOP|])
+      "constant type differs";
+    List.iter (fun text ->
+      let consts = [Bytecode.CInt text; Bytecode.CInt "987654321098765432109876543210"] in
+      let raw = pool_image consts
+        [|"\x0b\x00\x00\x00"; "\x0b\x01\x01\x00"; "\x0b\x02\x00\x00"; "\x17"|] in
+      match Bytecode.decode_image ~active raw with
+      | Error reason -> failwith reason
+      | Ok image ->
+        require (Array.to_list (Array.map (fun cell -> cell.Bytecode.value) image.consts) = consts)
+          "constant image differs";
+        require (image.code = [|LDI (0, VInt (Z.of_string text));
+          LDI (1, VInt (Z.of_string "987654321098765432109876543210"));
+          LDI (2, VInt (Z.of_string text)); STOP|]) "constant index value differs")
+      ["123456789012345678901234567890"; "-123456789012345678901234567890"])
+    [false; true]
+
 let check_object_charge () =
   let run object_cost =
     let storage = Hashtbl.create 2 in
@@ -81,6 +160,8 @@ let () =
   check_concat ();
   check_substr ();
   check_decoder ();
+  check_pool_share ();
+  check_pool_errors ();
   check_object_charge ();
   check_reg_spans ();
   Printf.printf "byte_modes = pass pairs = 144 slices = 6\n"

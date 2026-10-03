@@ -70,6 +70,14 @@ let test_live_chain () =
   require (Graph.live_chain ~chain_id:"octra-devnet-9871-cluster")
     "devnet plan rejected";
   List.iter (fun chain_id ->
+    let graph = Graph.create ~chain_id ~root_at:(fun _ -> fail "batch anchor read") in
+    require (Graph.batch_activation_for_chain chain_id = None)
+      "circle batch date assigned";
+    List.iter (fun epoch ->
+      require (Graph.circle_batch graph ~epoch = Ok Graph.Prior)
+        "circle batch active without approval") [0; 1_614_500; max_int])
+    ["octra-devnet-9871-cluster"; "octra-mainnet"; "octra-test"];
+  List.iter (fun chain_id ->
     require (not (Graph.live_chain ~chain_id)) "missing live plan accepted";
     let prior = Graph.create ~chain_id ~root_at:(fun _ -> fail "anchor read") in
     require (Graph.standard prior ~epoch:max_int = Ok Graph.Prior)

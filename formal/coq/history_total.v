@@ -245,3 +245,79 @@ Proof.
 Qed.
 
 End Account.
+
+Module Admission.
+
+Record scope := {
+  network : nat;
+  config : nat;
+  epoch : nat;
+  root : nat
+}.
+
+Definition same (left right : scope) : bool :=
+  (network left =? network right) && (config left =? config right) &&
+  (epoch left =? epoch right) && (root left =? root right).
+
+Lemma same_exact : forall left right,
+  same left right = true -> left = right.
+Proof.
+  intros [ln lc le lr] [rn rc re rr] accepted.
+  unfold same in accepted. simpl in accepted.
+  repeat rewrite andb_true_iff in accepted.
+  repeat rewrite Nat.eqb_eq in accepted.
+  destruct accepted as [[[network config] epoch] root]. subst. reflexivity.
+Qed.
+
+Record checked := {
+  origin : scope;
+  address : nat;
+  cipher : nat;
+  commitment : Z
+}.
+
+Fixpoint collect (pin : scope) (values : list checked) : option (list checked) :=
+  match values with
+  | [] => Some []
+  | value :: rest =>
+    if same (origin value) pin then
+      match collect pin rest with
+      | None => None
+      | Some rest => Some (value :: rest)
+      end
+    else None
+  end.
+
+Theorem complete : forall values pin result,
+  collect pin values = Some result ->
+  result = values /\ Forall (fun value => origin value = pin) values.
+Proof.
+  induction values as [|value rest next]; intros pin result accepted; simpl in accepted.
+  - inversion accepted. split; [reflexivity | constructor].
+  - destruct (same (origin value) pin) eqn:matches; try discriminate.
+    destruct (collect pin rest) as [items|] eqn:collected; try discriminate.
+    apply next in collected as [equal origins].
+    inversion accepted; subst. split; [reflexivity | constructor].
+    + apply same_exact. exact matches.
+    + exact origins.
+Qed.
+
+Theorem foreign_refused : forall values pin value,
+  In value values -> origin value <> pin -> collect pin values = None.
+Proof.
+  intros values pin value present differs.
+  destruct (collect pin values) as [result|] eqn:collected; [|reflexivity].
+  apply complete in collected as [_ origins].
+  rewrite Forall_forall in origins. specialize (origins value present). contradiction.
+Qed.
+
+Theorem commitments_preserved : forall values pin result,
+  collect pin values = Some result ->
+  map commitment result = map commitment values /\
+  map cipher result = map cipher values /\ map address result = map address values.
+Proof.
+  intros values pin result accepted.
+  apply complete in accepted as [equal _]. subst. auto.
+Qed.
+
+End Admission.

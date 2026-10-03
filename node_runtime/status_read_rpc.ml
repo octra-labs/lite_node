@@ -149,7 +149,7 @@ let head_proposal_id ~source ~chain_id ~(head : Octra_core.Head_manifest.t) =
   else
     Result.bind source (fun source ->
       Result.bind
-        (Consensus_parent_commit.load source ~epoch_id:(Int64.succ (Int64.of_int head.epoch_id)))
+        (Consensus_parent_commit.load_head source ~epoch_id:(Int64.of_int head.epoch_id))
         (function
         | None -> Error "committed head certificate is unavailable"
         | Some parent ->

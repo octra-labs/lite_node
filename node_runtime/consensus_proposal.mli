@@ -164,6 +164,13 @@ type build_preview_request = {
   txs : Transaction.t list;
 }
 
+type prepared = {
+  execution : Octra_core.Epoch_exec.exec_result;
+  preverify : Octra_core.Preverify_commit.t;
+}
+
+type prepare = build_preview_request -> (prepared, string) result Lwt.t
+
 type make_proposal_deps = {
   current : unit -> bool;
   start_height : int64 -> unit Lwt.t;
@@ -177,6 +184,7 @@ type make_proposal_deps = {
   parent_commit :
     epoch_id:int64 ->
     (Octra_consensus.C_types.parent_commit option, string) result;
+  parent_txs : string -> Transaction.t list option;
   frozen_bundle : string -> Consensus_bundle_cache.frozen option;
   store_bundle :
     proposal_id:string ->
@@ -184,7 +192,8 @@ type make_proposal_deps = {
     txs:Transaction.t list ->
     receipts_json:string list ->
     unit;
-  staging_txs : unit -> Transaction.t list;
+  staging_txs : ?circles:bool -> unit -> Transaction.t list;
+  evict_preview : Transaction.t -> unit;
   admits_tx : Transaction.t -> bool;
   build_preverify_once :
     state_root:string ->
@@ -616,12 +625,14 @@ val log_frozen_proposal :
   unit
 
 val verify_proposal :
+  ?prepare:prepare ->
   verify_proposal_deps ->
   chain_id:string ->
   Octra_consensus.C_types.propose ->
   Octra_consensus.C_driver.proposal_verdict Lwt.t
 
 val make_proposal :
+  ?prepare:prepare ->
   ?private_slots:Octra_core.Private_slots.limits ->
   make_proposal_deps ->
   chain_id:string ->

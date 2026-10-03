@@ -220,7 +220,7 @@ type node_driver_runtime = {
     reason:string ->
     unit Lwt.t;
   chain_id : string;
-  validator_set : C_types.validator_set;
+  select_set : epoch:int64 -> round:int -> (C_types.validator_set, string) result;
   store_bundle :
     proposal_id:string ->
     tx_hashes:string list ->
@@ -271,10 +271,10 @@ let node_driver_runtime runtime =
         Legacy
       | Some _, Some _ ->
         match
-          recover_record
-            ~chain_id:runtime.chain_id
-            ~validator_set:runtime.validator_set
-            pending
+          Result.bind
+            (runtime.select_set ~epoch:(Int64.of_int pending.epoch_id) ~round:pending.round)
+            (fun validator_set -> recover_record
+              ~chain_id:runtime.chain_id ~validator_set pending)
         with
         | Error error ->
           Invalid error
@@ -388,7 +388,7 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
     let expected_epoch = head + 1 in
     let future =
       List.filter
-        (fun candidate -> candidate.Wal.epoch_id <> expected_epoch)
+        (fun entry -> entry.Wal.epoch_id <> expected_epoch)
         pending
     in
     if future <> [] then begin
@@ -402,8 +402,8 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
     end else
       let latest =
         List.fold_left
-          (fun selected candidate ->
-            if candidate.Wal.round > selected.Wal.round then candidate
+          (fun selected entry ->
+            if entry.Wal.round > selected.Wal.round then entry
             else selected)
           (List.hd pending)
           (List.tl pending)

@@ -3,6 +3,17 @@
 
 exception Policy_unavailable of string
 
+val capture_circle :
+  circle_mode:Octra_core.Rule_graph.mode ->
+  wasm_compute_mode:Octra_core.Rule_graph.mode ->
+  backend:Octra_core.Epoch_exec.backend ->
+  env:Octra_core.Epoch_exec.env ->
+  program_trust:Octra_vm.Program_trust.t ->
+  object_cost:bool ->
+  Octra_core.Transaction.t ->
+  ((Octra_core.Epoch_exec.tx_effect, string * string) result *
+   Octra_circle_runtime.Circle_exec.hfhe_binding option) Lwt.t
+
 val preverify_circle :
   circle_mode:Octra_core.Rule_graph.mode ->
   wasm_compute_mode:Octra_core.Rule_graph.mode ->

@@ -72,9 +72,19 @@
  (libraries octra_core lwt.unix base64 zarith yojson octra_test_workspace))
 
 (test
+ (name test_migration_status)
+ (modules test_migration_status)
+ (libraries octra_core octra_node_runtime pvac_ffi base64 zarith))
+
+(test
  (name test_image)
  (modules test_image)
  (libraries octra_core lwt.unix octra_test_workspace))
+
+(test
+ (name test_sync_files)
+ (modules test_sync_files)
+ (libraries octra_bootstrap unix digestif octra_test_workspace))
 
 (rule
  (targets image_codec.ml)
@@ -95,7 +105,7 @@
 (test
  (name test_claim_history)
  (modules test_claim_history)
- (libraries octra_core octra_bootstrap octra_consensus pvac_ffi base64 zarith yojson digestif lwt.unix
+ (libraries octra_core octra_bootstrap octra_node_runtime octra_consensus pvac_ffi base64 zarith yojson digestif lwt.unix
   mirage-crypto-ec octra_test_workspace)
  (action
   (setenv OCTRA_PVAC_VERIFY_WORKER %{exe:../bin/octra_pvac_worker.exe}
@@ -105,6 +115,15 @@
  (name test_claim_limits)
  (modules test_claim_limits)
  (libraries octra_core lwt.unix zarith yojson octra_test_workspace))
+
+(test
+ (name test_migration_apply)
+ (modules test_migration_apply)
+ (libraries octra_core pvac_ffi base64 zarith yojson digestif lwt.unix
+  mirage-crypto-ec mirage-crypto-rng.unix octra_test_workspace)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{exe:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
 
 (test
  (name test_validator_lifecycle)
@@ -139,6 +158,15 @@
  (modules test_epoch_exec_reward_atomic)
  (libraries octra_core octra_consensus octra_net octra_node_runtime
   base64 yojson zarith lwt.unix))
+
+(test
+ (name test_fee_market)
+ (modules test_fee_market)
+ (libraries octra_core zarith))
+
+(rule
+ (alias fee_market)
+ (action (run %{exe:test_fee_market.exe})))
 
 (test
  (name test_private_ledger)
@@ -180,13 +208,13 @@
 
 (test
  (name test_proposal)
- (modules test_proposal)
- (libraries octra_node_runtime octra_core zarith))
+ (modules test_proposal circle_proposal circle_store)
+ (libraries octra_node_runtime octra_core zarith octra_test_workspace octra_recovery_case))
 
 (test
  (name test_driver_boot)
  (modules test_driver_boot)
- (libraries octra_node_runtime))
+ (libraries octra_node_runtime octra_test_workspace))
 
 (test
  (name test_sync_mark)
@@ -216,6 +244,46 @@
 (test
  (name test_byte_modes)
  (modules test_byte_modes)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_object_quorum)
+ (modules test_object_quorum)
+ (libraries octra_core octra_vm digestif zarith))
+
+(test
+ (name test_byte_work)
+ (modules test_byte_work)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_decode_work)
+ (modules test_decode_work)
+ (libraries octra_vm zarith base64))
+
+(test
+ (name test_decode_policy)
+ (modules test_decode_policy)
+ (libraries octra_vm base64 zarith mirage-crypto-ec threads))
+
+(test
+ (name test_int_text)
+ (modules test_int_text)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_index_work)
+ (modules test_index_work)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_mem_span)
+ (modules test_mem_span)
+ (libraries octra_vm zarith))
+
+(test
+ (name test_vector_space)
+ (modules test_vector_space)
  (libraries octra_vm zarith))
 
 (test
@@ -542,8 +610,8 @@
 
 (test
  (name test_state_sync_reliability)
- (modules test_state_sync_reliability)
- (libraries octra_bootstrap octra_node_runtime unix))
+ (modules test_state_sync_reliability sync_archive_case)
+ (libraries octra_bootstrap octra_node_runtime octra_test_workspace unix))
 
 (test
  (name test_state_sync_manifest)
@@ -558,9 +626,21 @@
 
 (test
  (name test_sync_chain)
- (modules test_sync_chain)
+ (modules test_sync_chain sync_cli_case sync_retry_case)
+ (action (run %{test} %{exe:../bin/octra_state_sync_manifest.exe}))
  (libraries octra_node_runtime octra_bootstrap octra_core octra_consensus
   octra_net octra_test_workspace lwt.unix base64 zarith digestif mirage-crypto-ec))
+
+(test
+ (name test_sync_range)
+ (modules test_sync_range)
+ (libraries octra_bootstrap octra_core octra_consensus octra_net octra_node_runtime
+  octra_test_workspace lwt.unix base64 zarith yojson mirage-crypto-ec))
+
+(test
+ (name test_range_actor)
+ (modules test_range_actor)
+ (libraries octra_node_runtime octra_consensus octra_core lwt.unix cohttp-lwt-unix))
 
 (test
  (name test_grpc)
@@ -611,7 +691,11 @@
 
 (rule
  (alias runtest)
- (action (run ./native_math.exe)))
+ (deps cases/r1cs.bin)
+ (action
+  (progn
+   (run ./native_math.exe)
+   (run ./native_math.exe peak-read %{dep:cases/r1cs.bin}))))
 
 (rule
  (alias runtest)

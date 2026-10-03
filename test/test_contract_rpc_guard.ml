@@ -659,12 +659,28 @@ let test_nested_view_stop () =
     let compiled = Octra_vm.Oct_compile.compile
       "contract ViewCase { view fn echo(): int { return 7 } }" in
     if compiled.error <> None then fail "nested view compile";
+    let module V = Octra_vm in
+    let number = Z.of_string ("0x" ^ String.make 300_000 'a') in
+    let prefix = V.Bytecode.decode_exn compiled.bytecode in
+    let code = Array.concat [prefix;
+      [|V.Contract_vm.LDI (0, V.Contract_vm.VInt number);
+        V.Contract_vm.LDI (1, V.Contract_vm.VString (String.make (15 * 1024 * 1024) 'v'));
+        V.Contract_vm.STOP|];
+      Array.make 60_000 (V.Contract_vm.ADD (2, 0, 0))] in
+    let raw = V.Bytecode.encode code in
+    let constant () = match V.Contract.decode_loaded raw with
+      | Some loaded ->
+        (match loaded.code.(Array.length prefix) with
+         | V.Contract_vm.LDI (_, V.Contract_vm.VInt value) -> value
+         | _ -> fail "nested integer missing")
+      | None -> fail "nested code refused" in
+    let first = constant () in
     Lwt_main.run
       (Octra_core.Store_irmin.deploy_contract store
         ~address
-        ~code_hash:Digestif.SHA256.(digest_string compiled.bytecode |> to_hex)
+        ~code_hash:Digestif.SHA256.(digest_string raw |> to_hex)
         ~version:"1" ~owner:address ~ctype:"CUSTOM" ~admission:"bytecode"
-        ~bytecode_b64:(Base64.encode_exn compiled.bytecode));
+        ~bytecode_b64:(Base64.encode_exn raw));
     let ledger = Octra_core.Ledger.create store in
     let run running =
       let ctx = Octra_vm.Contract_rpc.make_view_ctx ~trusted:[] ~running ~store ~ledger
@@ -674,12 +690,13 @@ let test_nested_view_stop () =
                   wasm_float = Octra_core.Rule_graph.Prior}
         ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
-        (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory}) ())
+        (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory; bytes = None}) ())
     in
     begin match run (fun () -> true) with
     | Ok value when value.Octra_vm.Contract_vm.return_value = Octra_vm.Contract_vm.VInt (Z.of_int 7) -> ()
     | _ -> fail "nested view control"
     end;
+    if constant () != first then fail "nested view decoded large integer again";
     let steps = ref 0 in
     let result = run (fun () -> incr steps; !steps <= 1) in
     if !steps <> 2 then fail "nested stop not reached";
@@ -747,7 +764,7 @@ let test_view_release_keys () =
       let ctx = V.Contract_rpc.make_view_ctx ~trusted ~profile ~store ~ledger
         ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
-        (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory}) ()) in
+        (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory; bytes = None}) ()) in
     with_chaindata (fun chaindata ->
       let abi ?(point_ops = true) trusted = Lwt_main.run
         (V.Contract_rpc.abi_params ~trusted ~point_ops ~store ~chaindata
@@ -781,7 +798,50 @@ let test_view_release_keys () =
     | Error reason -> fail ("signed nested read refused: " ^ reason)
     | Ok _ -> fail "signed nested result differs")
 
+let test_view_cache_upgrade () =
+  let module V = Octra_vm in
+  let compile value =
+    let result = V.Oct_compile.compile
+      (Printf.sprintf "contract CacheRead { public view fn read(): int { return %d } }" value) in
+    match result.error with
+    | None -> Base64.encode_exn result.bytecode
+    | Some reason -> fail reason in
+  let first = compile 7 in
+  let second = compile 8 in
+  let third = compile 9 in
+  with_store (fun store ->
+    let address = token_address '4' in
+    Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
+      ~code_hash:"stored-code" ~version:"1" ~owner:address ~ctype:"CUSTOM"
+      ~admission:"binary" ~bytecode_b64:first);
+    let journal = V.Program_journal.create () in
+    let call value =
+      let run () = V.Contract.execute_call ~journal store address "read" [] address Z.zero in
+      let result = run () in
+      if not result.success || result.return_value <> Some (V.Contract_vm.VInt (Z.of_int value)) then
+        fail "program journal selected wrong code";
+      if run () <> result then fail "cached execution changed receipt" in
+    call 7;
+    V.Program_journal.add_deploy journal {
+      address; code_hash = "stored-code"; bytecode_b64 = second;
+      owner = address; ctype = "CUSTOM"; admission = "binary"; version = "1";
+      storage = Hashtbl.create 0;
+    };
+    call 8;
+    let saved = V.Program_journal.snapshot journal in
+    V.Program_journal.add_upgrade journal {
+      address; expected_code_hash = "stored-code"; code_hash = "next-code";
+      bytecode_b64 = third; owner = address; ctype = "CUSTOM";
+      admission = "binary"; version = "1";
+    };
+    call 9;
+    V.Program_journal.restore journal saved;
+    call 8;
+    V.Program_journal.discard journal;
+    call 7)
+
 let () =
+  test_view_cache_upgrade ();
   test_view_release_keys ();
   test_view_profile ();
   test_view_effort_limit ();

@@ -53,7 +53,7 @@ val prepare :
   steps:Octra_bootstrap.Sync_anchor.step list ->
   head:Octra_core.Head_manifest.t ->
   Consensus_finality_journal.record ->
-  (prepared, string) result
+  (prepared, string) result Lwt.t
 
 val retention_plan :
   retain:int ->
@@ -65,6 +65,15 @@ val remove_snapshots :
   string ->
   string list ->
   (string * string) list
+
+val retain :
+  string ->
+  retain:int ->
+  current:(unit -> string) ->
+  (string * string) list
+
+val clear_stage :
+  Octra_bootstrap.Sync_archive.t -> string -> unit Lwt.t
 
 val publisher_addresses :
   Octra_consensus.C_types.validator_set ->
@@ -84,6 +93,10 @@ val capture_epochs :
   target:int64 ->
   Octra_core.Head_manifest.t option ->
   int64 list
+
+val monitor_capture :
+  deps -> prepared -> string ->
+  ('a, string) result Lwt.t -> ('a, string) result Lwt.t
 
 val run :
   deps ->

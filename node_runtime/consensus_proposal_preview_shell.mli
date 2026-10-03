@@ -1,8 +1,12 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type backend = {
-  run :
+type prepared = Consensus_proposal.prepared = {
+  execution : Octra_core.Epoch_exec.exec_result;
+  preverify : Octra_core.Preverify_commit.t;
+}
+
+type 'a runner =
     epoch_id:int ->
     proposal_id:string ->
     expected_prev_root:string option ->
@@ -11,7 +15,11 @@ type backend = {
     reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
     txs:Octra_core.Transaction.t list ->
-    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+    ('a, string) result Lwt.t
+
+type backend = {
+  run : Octra_core.Epoch_exec.exec_result runner;
+  prepare : prepared runner;
 }
 
 type deps = {
@@ -50,3 +58,13 @@ val run :
   ?catch_exn:bool ->
   Consensus_proposal.build_preview_request ->
   (Octra_core.Epoch_exec.exec_result, string) result Lwt.t
+
+val prepare :
+  deps ->
+  ?catch_exn:bool ->
+  Consensus_proposal.prepare
+
+val prepare_at :
+  mode:(epoch:int -> (Octra_core.Rule_graph.mode, Octra_core.Rule_graph.fault) result) ->
+  deps ->
+  Consensus_driver_wiring.prepare_at

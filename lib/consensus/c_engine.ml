@@ -836,10 +836,8 @@ let restored_precommit_lock t (proposal : propose) =
   in
   Int64.equal proposal.epoch_id t.state.height
   && t.state.locked_round = proposal.round
-  && t.state.valid_round = proposal.round
   && t.state.round >= proposal.round + 1
   && same_value t.state.locked_value
-  && same_value t.state.valid_value
 
 let restore_precommit_lock t (proposal : propose) =
   if proposal.chain_id <> t.chain_id then

@@ -209,6 +209,22 @@ let cost tx = {
   proof = proof_cost tx.Transaction.op_type;
 }
 
+let vm_floor = 1_000_000
+
+let vm_limit ou =
+  max vm_floor
+    (try Z.to_int ou with
+     | (Stack_overflow | Out_of_memory) as error -> raise error
+     | _ -> vm_floor)
+
+let work tx =
+  let declared = cost tx in
+  let allowance = match of_op tx.Transaction.op_type with
+    | Program | Circle_compute -> Z.of_int (vm_limit tx.Transaction.ou)
+    | Program_deploy -> Z.of_int vm_floor
+    | Standard | Circle_metadata | Circle_assets | Pvac | Fhe -> Z.zero in
+  {declared with ou = Z.max declared.ou allowance}
+
 let add a b = {
   txs = a.txs + b.txs;
   bytes = a.bytes + b.bytes;
@@ -225,6 +241,12 @@ let over b u =
 
 let within b u =
   over b u = None
+
+let circle_admission tx =
+  if tx.Transaction.op_type <> Transaction.CircleCall then Ok ()
+  else match over (default_budget Circle_compute) (cost tx) with
+    | None -> Ok ()
+    | Some reason -> Error ("circle resource limit: " ^ reason)
 
 let admit b u tx =
   let next = add u (cost tx) in

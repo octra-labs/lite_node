@@ -19,6 +19,7 @@ type skip = {
 
 and skip_kind =
   | Deferred
+  | Unavailable
   | Invalid
 
 type batch = {
@@ -208,7 +209,10 @@ let verify_private ~math strict field_policy result_policy ledger tx =
   in
   Lwt.return
     (Result.map_error
-       (fun rejection -> rejection.Private_ledger.private_preverify_reason)
+       (fun rejection -> {
+         rejection.Private_ledger.private_error with
+         reason = rejection.private_preverify_reason;
+       })
        result)
 
 let verify_key_switch ~math strict field_policy ?legacy_replay ledger tx =
@@ -236,7 +240,7 @@ let verify_key_switch ~math strict field_policy ?legacy_replay ledger tx =
   match plan with
   | Ok plan ->
     Lwt.return_ok (Private_ledger.Prepared_key_switch plan)
-  | Error failure -> Lwt.return_error failure.Private_ledger.reason
+  | Error failure -> Lwt.return_error failure
 
 let prepared_matches tx prepared =
   match tx.T.op_type, prepared with
@@ -247,21 +251,26 @@ let prepared_matches tx prepared =
   | T.ClaimOp, Private_ledger.Prepared_claim _ -> true
   | _ -> false
 
+let prepared_result = function
+  | Ok value -> A.Ready value
+  | Error failure ->
+    match Private_ledger.failure_action failure with
+    | Private_ledger.Retry -> A.Pending
+    | Private_ledger.Reject -> A.Invalid failure.Private_ledger.reason
+
 let prepared_operation ~field_policy ~ledger ~cap verify prepared tx =
   let open Lwt.Syntax in
   match prepared with
   | None ->
     let* result = verify tx in
-    Lwt.return (Result.fold ~ok:(fun value -> A.Ready value)
-      ~error:(fun reason -> A.Invalid reason) result)
+    Lwt.return (prepared_result result)
   | Some lookup ->
     let* available = lookup tx in
     begin
       match available with
       | A.Unmanaged ->
         let* result = verify tx in
-        Lwt.return (Result.fold ~ok:(fun value -> A.Ready value)
-          ~error:(fun reason -> A.Invalid reason) result)
+        Lwt.return (prepared_result result)
       | A.Pending -> Lwt.return A.Pending
       | A.Invalid reason -> Lwt.return (A.Invalid reason)
       | A.Ready value when prepared_matches tx value ->
@@ -276,11 +285,7 @@ let prepared_operation ~field_policy ~ledger ~cap verify prepared tx =
         if current then Lwt.return (A.Ready value)
         else
           let* result = verify tx in
-          Lwt.return
-            (Result.fold
-               ~ok:(fun value -> A.Ready value)
-               ~error:(fun reason -> A.Invalid reason)
-               result)
+          Lwt.return (prepared_result result)
       | A.Ready _ ->
         Lwt.return (A.Invalid "prepared operation mismatch")
     end
@@ -302,11 +307,7 @@ let run_heavy ~math
       let* result =
         verify_key_switch ~math strict field_policy ?legacy_replay ledger tx
       in
-      Lwt.return
-        (Result.fold
-           ~ok:(fun value -> A.Ready value)
-           ~error:(fun reason -> A.Invalid reason)
-           result)
+      Lwt.return (prepared_result result)
     else
       prepared_operation
         ~field_policy
@@ -602,8 +603,8 @@ let run_checked verify txs =
     end
 
 let checked_of_single_batch tx batch =
-  let same_hash candidate =
-    String.equal (T.hash tx) (T.hash candidate)
+  let same_hash item =
+    String.equal (T.hash tx) (T.hash item)
   in
   match batch.ready, batch.skipped with
   | [item], [] when same_hash item.tx ->
@@ -653,7 +654,7 @@ let run_many ?(math=false)
       | Ready receipt ->
         Lwt.return (Checked_ready { tx; receipt = Some receipt })
       | Defer reason ->
-        Lwt.return (Checked_skip { tx; reason; kind = Deferred })
+        Lwt.return (Checked_skip { tx; reason; kind = Unavailable })
       | Skip reason ->
         Lwt.return (Checked_skip { tx; reason; kind = Invalid })
   in
@@ -663,11 +664,17 @@ let checked_cacheable = function
   | Checked_ready _ -> true
   | Checked_skip item -> item.kind = Invalid
 
+let may_retry ~inputs batch =
+  batch.skipped <> []
+  && List.for_all (fun item -> item.kind = Unavailable) batch.skipped
+  && let hashes txs = List.sort String.compare (List.map T.hash txs) in
+     hashes inputs = hashes (txs batch @ List.map (fun item -> item.tx) batch.skipped)
+
 let defer reason txs =
   {
     ready = [];
     skipped =
       List.map
-        (fun tx -> { tx; reason; kind = Deferred })
+        (fun tx -> { tx; reason; kind = Unavailable })
         txs;
   }

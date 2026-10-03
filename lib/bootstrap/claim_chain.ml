@@ -9,19 +9,26 @@ module M = State_sync_manifest
 module Tx = Octra_core.Transaction
 module H = Octra_core.Claim_history
 module Sum = Octra_core.Claim_sum
+module Admission = Octra_core.Pvac_migration_admission
+module Replay = Octra_core.Pvac_legacy_public_replay
 module Epochs = Map.Make (Int)
 
 type t = {
+  chain_id : string;
+  config_hash : string;
   headers : T.epoch_header Epochs.t;
   rules : R.t;
 }
 
 type total = {
+  chain_id : string;
+  config_hash : string;
   address : string;
   first_epoch : int;
   last_epoch : int;
   state_root : string;
   source_cipher_hash : string;
+  records : int;
   sum : Sum.summary;
 }
 
@@ -76,7 +83,7 @@ let read ~chain_id ~config_hash ~validator_set ~exporter_set ~certificate
       | None -> R.Missing
       | Some header -> R.Root
           (State_sync_checkpoint.raw_to_hex header.T.proposed_state_root) in
-    Ok {headers; rules = R.create ~chain_id ~root_at}
+    Ok {chain_id; config_hash; headers; rules = R.create ~chain_id ~root_at}
   with exn -> Error ("history finality read failed: " ^ Printexc.to_string exn)
 
 let math value ~epoch =
@@ -173,23 +180,59 @@ let total value store archive ~address ~first_epoch ~last_epoch ~max_txs ~max_re
       | Tx.CircleIngressCommit | Tx.CircleCall | Tx.ValidatorSetUpdate | Tx.ValidatorReady
       | Tx.ValidatorBond | Tx.ValidatorExit | Tx.ValidatorWithdraw | Tx.ValidatorEvidence ->
         Ok Sum.Keep in
-    let rec scan epoch sum =
-      if epoch = last_epoch then Ok sum
+    let rec scan epoch sum records =
+      if epoch = last_epoch then Ok (sum, records)
       else
         let next = epoch + 1 in
         let* current = read next max_txs in
-        let* sum = A.fold current ~init:sum ~f:(fun sum entry tx ->
+        let* sum, records = A.fold current ~init:(sum, records) ~f:(fun (sum, records) entry tx ->
           let* change = change current next entry tx in
-          Sum.apply sum ~hash:entry.H.hash change) in
-        scan next sum in
-    let* sum = scan first_epoch (Sum.create ~address) in
+          let* sum = Sum.apply sum ~hash:entry.H.hash change in
+          let records = records + (if tx.Tx.from = address || tx.to_ = address then 1 else 0) in
+          Ok (sum, records)) in
+        scan next sum records in
+    let* sum, records = scan first_epoch (Sum.create ~address) 0 in
     let sum = Sum.finish sum in
     let* () = require
       (Int64.of_int sum.records = Int64.sub final.next_txid initial.next_txid)
       "history interval record count differs" in
     let* cipher = A.cipher_at store final address in
-    let source_cipher_hash = Octra_core.Pvac_migration_admission.source_cipher_hash
+    let source_cipher_hash = Admission.source_cipher_hash
       (Option.value ~default:"0" cipher) in
-    Ok {address; first_epoch; last_epoch; state_root = final.state_root;
-      source_cipher_hash; sum}
+    Ok {chain_id = value.chain_id; config_hash = value.config_hash;
+      address; first_epoch; last_epoch; state_root = final.state_root;
+      source_cipher_hash; records; sum}
   with exn -> Error ("history interval read failed: " ^ Printexc.to_string exn)
+
+let admission (value : t) ~activation_epoch totals =
+  let* first = match totals with
+    | [] -> Error "history admission has no accounts"
+    | first :: _ -> Ok first in
+  let* header = match Epochs.find_opt first.last_epoch value.headers with
+    | None -> Error "history admission epoch is not authenticated"
+    | Some header -> Ok header in
+  let state_root = State_sync_checkpoint.raw_to_hex header.T.proposed_state_root in
+  let rec entries acc = function
+    | [] -> Ok (List.rev acc)
+    | item :: rest ->
+      let* () = require
+        (item.chain_id = value.chain_id && item.config_hash = value.config_hash)
+        "history admission network differs" in
+      let* () = require
+        (item.last_epoch = first.last_epoch && item.state_root = state_root)
+        "history admission checkpoint differs" in
+      let audit = Replay.{
+        audit_class = Hidden_witness;
+        can_public_migrate = false;
+        public_net = None;
+        commitment_net = Some item.sum.commitment;
+        blockers = [];
+        effects = [];
+        reason = "authenticated history requires commitment proof";
+      } in
+      let entry = Admission.{address = item.address;
+        source_cipher_hash = item.source_cipher_hash; total = item.records; decision = audit} in
+      entries (entry :: acc) rest in
+  let* entries = entries [] totals in
+  Admission.create ~classifier:Admission.Receipt_v1 ~chain_id:value.chain_id
+    ~snapshot_epoch:first.last_epoch ~state_root ~activation_epoch entries

@@ -555,6 +555,8 @@ let state_sensitive_http req =
 let start (cfg : config) =
   let { Wallet.address; _ } = cfg.wallet in
   let token_rpc = Octra_vm.Token_rpc_actor.create ~store:cfg.store () in
+  let ranges = Sync_range_read.create ~chaindata:cfg.chaindata
+    ~data_dir:cfg.data_dir ~chain_id:cfg.chain_id in
   let pvac_status =
     Pvac_status_actor.create {
       load_pubkey = (fun ~addr ->
@@ -606,7 +608,7 @@ let start (cfg : config) =
       ~config_hash:!(cfg.consensus_config_hash_ref)
       ~validator_set:!(cfg.consensus_validator_set_ref)
       ~current_epoch:cfg.current_epoch
-      ~chaindata:cfg.chaindata
+      ~ranges
       ~encrypted_supply:cfg.deps.encrypted_supply
       req
       body
@@ -639,5 +641,6 @@ let start (cfg : config) =
     (fun () -> serve)
     (fun () ->
       let open Lwt.Syntax in
+      let* () = Sync_range.shutdown ranges in
       let* () = Pvac_status_actor.shutdown pvac_status in
       Octra_vm.Token_rpc_actor.shutdown token_rpc)

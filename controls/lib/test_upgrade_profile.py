@@ -75,6 +75,33 @@ def effects(states):
         yield mocks
 
 class UpgradeProfileTest(unittest.TestCase):
+    def test_snapshot_recovery_floor(self):
+        head = 1_620_000
+        for lag, floor, limit, accepted in (
+            (721, 1_614_500, 5000, True),
+            (1060, 1_614_500, 5000, True),
+            (3000, 1_614_500, 5000, True),
+            (3000, 1_617_000, 5000, True),
+            (3000, 1_617_001, 5000, False),
+            (3000, 1_614_500, 3000, True),
+            (3000, 1_614_500, 2999, False),
+            (5001, 1_614_500, 5000, False),
+        ):
+            values = {**VALUES, "OCTRA_CATCHUP_MAX_LAG": str(limit)}
+            need = upgrade.make(MARKER["chain_id"], "root", floor, floor - 1, None)
+            tip = {"head": head, "snapshot": head - lag}
+            with self.subTest(lag = lag, floor = floor, limit = limit), \
+                mock.patch.object(upgrade, "sync_head", return_value = tip), \
+                mock.patch.object(upgrade, "emit"), \
+                mock.patch.object(upgrade.time, "sleep") as sleep:
+                if accepted:
+                    result = upgrade.sync_wait(values, need, 0, 1)
+                    self.assertEqual(result, {**tip, "required": max(floor, head - limit)})
+                else:
+                    with self.assertRaisesRegex(ValidatorError, "signed snapshot is below recovery"):
+                        upgrade.sync_wait(values, need, 0, 1)
+                sleep.assert_not_called()
+
     def test_profile_fields(self):
         version = {
             "source_commit": MARKER["source_commit"],

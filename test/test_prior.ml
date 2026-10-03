@@ -31,7 +31,7 @@ let compiler_files () =
     "prior_gen.ml", "b0c5d166fb4b0a7615d28c6e65d01aae6fb89d4897f8079673c002da3cdbe631";
     "prior_lang.ml", "8b57b70ca6ef70f759545aa6b9b874afa26992ea70ee9e6e09adc07f1a2635fb";
     "prior_lex.ml", "ccd669e0f5b5ad3b853b5552c2f5db6ca06c63707078319cb31d6a02b64488fc";
-    "prior_parse.ml", "57cf17c223f9ffa8127442d1065a8a42d524bc4972cd9c0e6b6b21010fb662e7";
+    "prior_parse.ml", "8a3f43a05e9df9defa4b42cf92268a7adbab6a97101ec1ae9e5c6eabe5cafc88";
     "prior_verify.ml", "1517d5e46f6850413fe8d730e8a2812fccd9c724daaa30b229df19258c14a18e";
   ] in
   let root = if Sys.file_exists "lib/vm/compiler/prior" then "." else ".." in

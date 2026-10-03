@@ -224,6 +224,94 @@ let test_full_lengths () =
         [19; 23; 24; 25; 31; 32; 33; 39; String.length valid - 1]));
   print_endline "status = pass test = image_lengths"
 
+let test_foreign_path () =
+  W.with_dir "image-path" (fun dir ->
+    with_store (Filename.concat dir "origin") (fun store ->
+      let commit, root = seed store [["a"], "one"] in
+      let path = Filename.concat dir "ledger.dat" in
+      let destination = Filename.concat dir "absent" in
+      Unix.symlink destination path;
+      expect "image replaced an existing path"
+        (Result.is_error (run (I.write store ~commit ~path)));
+      let preserved = try (Unix.lstat path).Unix.st_kind = Unix.S_LNK
+        with Unix.Unix_error (Unix.ENOENT, _, _) -> false in
+      expect "image removed a path it did not create" preserved;
+      expect "image changed existing link" (Unix.readlink path = destination);
+      expect "image wrote through existing link" (not (Sys.file_exists destination));
+      expect "image refusal changed source" (run (S.get_head_hash store) = Some root)));
+  print_endline "status = pass test = image_path"
+
+let read path =
+  let channel = open_in_bin path in
+  Fun.protect ~finally:(fun () -> close_in_noerr channel)
+    (fun () -> really_input_string channel (in_channel_length channel))
+
+let test_write_yield () =
+  W.with_dir "image-write" (fun dir ->
+    with_store (Filename.concat dir "origin") (fun store ->
+      let pairs = List.init 1024 (fun index -> ["values"; string_of_int index], "one") in
+      let commit, root = seed store pairs in
+      let source = Filename.concat dir "ledger.dat" in
+      let completed = ref false in
+      let changed = ref false in
+      let open Lwt.Syntax in
+      let control =
+        let* () = Lwt.pause () in
+        changed := not !completed;
+        let* tree = S.begin_bulk store in
+        let* tree = S.bulk_add tree ["values"; "0"] "two" in
+        S.commit_bulk store tree "image concurrent write" in
+      let export =
+        let* written = I.write store ~commit ~path:source in
+        completed := true;
+        Lwt.return written in
+      let written, () = run (Lwt.both export control) in
+      let written = ok written in
+      expect "image export did not allow another operation" !changed;
+      expect "image export changed selected root" (written.root = root);
+      expect "image export lost concurrent write"
+        (run (S.read store ["values"; "0"]) = Some "two");
+      expect "image export restored old head" (run (S.get_commit_hash store) <> Some commit);
+      let records = record ~full:true ~wide:true ~kind:1 ["values"] ""
+        :: List.map (fun (path, value) -> record ~full:true ~wide:true ~kind:2 path value)
+          (List.sort compare pairs) in
+      let expected = image ~full:true ~wide:true records in
+      expect "image export changed encoded bytes" (read source = expected);
+      expect "image export changed byte count" (written.bytes = Int64.of_int (String.length expected));
+      expect "image export changed record count" (written.records = 1025L);
+      let target = Filename.concat dir "restored" in
+      let restored = run (I.restore ~source ~target ~expected_root:root) |> ok in
+      expect "image export restored another root" (restored.root = root);
+      with_store target (fun store ->
+        List.iter (fun (path, value) ->
+          expect "image export included concurrent write" (run (S.read store path) = Some value)) pairs)));
+  print_endline "status = pass test = image_write_yield"
+
+let test_replaced_path () =
+  W.with_dir "image-replace" (fun dir ->
+    with_store (Filename.concat dir "origin") (fun store ->
+      let pairs = List.init 1024 (fun index -> ["a"; string_of_int index], "one") in
+      let commit, root = seed store (("z" :: List.init 1024 (fun _ -> "x"), "one") :: pairs) in
+      let source = Filename.concat dir "ledger.dat" in
+      let held = Filename.concat dir "held.dat" in
+      let open Lwt.Syntax in
+      let control =
+        let* () = Lwt.pause () in
+        expect "image replacement did not find an open export" (Sys.file_exists source);
+        Unix.rename source held;
+        write source "preserved";
+        Lwt.return_unit in
+      let result, () = run (Lwt.both (I.write store ~commit ~path:source) control) in
+      begin match result with
+      | Error reason -> expect "replacement export refusal differs" (contains reason "parts = 1025")
+      | Ok _ -> failwith "replacement export accepted invalid path"
+      end;
+      expect "image removed replacement path" (Sys.file_exists source);
+      expect "image changed replacement contents" (read source = "preserved");
+      expect "image removed moved export" (Sys.file_exists held);
+      expect "image replacement changed source" (run (S.get_head_hash store) = Some root)));
+  print_endline "status = pass test = image_replaced_path"
+
 let test_empty () =
   W.with_dir "image-empty" (fun dir ->
     with_store (Filename.concat dir "origin") (fun store ->
@@ -235,6 +323,31 @@ let test_empty () =
       expect "empty image has records" (written.records = 0L && restored.records = 0L);
       expect "empty root differs" (restored.root = root)));
   print_endline "status = pass test = image_empty"
+
+let test_restore_path () =
+  W.with_dir "image-restore-path" (fun dir ->
+    let target = Filename.concat dir "restored" in
+    let commit, root = with_store target (fun store ->
+      seed store [["value"], "kept"]) in
+    let stage = target ^ ".next" in
+    Unix.mkdir stage 0o750;
+    let held = Filename.concat stage "held" in
+    write held "other import";
+    let source = Filename.concat dir "missing.dat" in
+    expect "missing source accepted for existing store"
+      (Result.is_error (run (I.restore ~source ~target ~expected_root:root)));
+    expect "existing restore removed unrelated stage" (Sys.file_exists held);
+    expect "existing restore changed unrelated stage" (read held = "other import");
+    with_store target (fun store ->
+      expect "existing restore changed commit" (run (S.get_commit_hash store) = Some commit));
+    write source "unused";
+    let restored = run (I.restore ~source ~target ~expected_root:root) |> ok in
+    expect "existing restore returned another commit" (restored.commit = commit);
+    expect "existing restore removed retained stage" (read held = "other import");
+    expect "existing restore accepted another root"
+      (Result.is_error (run (I.restore ~source ~target ~expected_root:(String.make 128 '0'))));
+    expect "root refusal changed retained stage" (read held = "other import"));
+  print_endline "status = pass test = image_restore_path"
 
 let test_live source commit dir =
   Unix.mkdir dir 0o750;
@@ -256,6 +369,7 @@ let test_live source commit dir =
 let () =
   match Array.to_list Sys.argv with
   | [_] ->
+      test_restore_path ();
       test_large_value ();
       test_circle_value ();
       test_roundtrip ();
@@ -263,6 +377,9 @@ let () =
       test_invalid ();
       test_full_lengths ();
       test_export_failure ();
+      test_foreign_path ();
+      test_write_yield ();
+      test_replaced_path ();
       test_empty ()
   | [_; "--store"; source; commit; dir] -> test_live source commit dir
   | _ -> failwith "image test arguments are invalid"

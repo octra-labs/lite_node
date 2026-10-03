@@ -15,7 +15,7 @@ let expect label cond =
 
 let synced = function
   | Join.Synced _ -> true
-  | Join.Leader_stale _ | Join.Source_unavailable _ -> false
+  | Join.Leader_behind _ | Join.Source_unavailable _ -> false
 
 let raw ch =
   String.make 32 ch
@@ -244,24 +244,41 @@ let with_http_response ?(delay = 0.0) response f =
     | Unix.ADDR_INET (_, port) -> port
     | _ -> fail "unexpected socket address"
   in
-  let server () =
+  let server =
     let* fd, _ = Lwt_unix.accept socket in
-    let ic = Lwt_io.of_fd ~mode:Lwt_io.input fd in
-    let oc = Lwt_io.of_fd ~mode:Lwt_io.output fd in
+    let close () = Lwt.return_unit in
+    let ic = Lwt_io.of_fd ~close ~mode:Lwt_io.input fd in
+    let oc = Lwt_io.of_fd ~close ~mode:Lwt_io.output fd in
     let rec drain () =
       let* line = Lwt_io.read_line_opt ic in
       match line with
       | Some "" | None -> Lwt.return_unit
       | Some _ -> drain ()
     in
-    let* () = drain () in
-    let* () = Lwt_unix.sleep delay in
-    Lwt_io.write oc response
+    Lwt.finalize
+      (fun () ->
+        let* () = drain () in
+        let* () = Lwt_unix.sleep delay in
+        let* () = Lwt_io.write oc response in
+        Lwt_io.flush oc)
+      (fun () ->
+        let* () = Lwt_io.abort ic in
+        let* () = Lwt_io.abort oc in
+        Lwt_unix.close fd)
   in
-  Lwt.async server;
   Lwt.finalize
     (fun () -> f (Printf.sprintf "http://127.0.0.1:%d" port))
-    (fun () -> Lwt_unix.close socket)
+    (fun () ->
+      Lwt.cancel server;
+      let* () = Lwt.catch (fun () -> server) (fun _ -> Lwt.return_unit) in
+      Lwt_unix.close socket)
+
+let test_http_cancel () =
+  for _ = 1 to 4 do
+    Lwt_main.run (Lwt_unix.with_timeout 5. (fun () ->
+      with_http_response "" (fun _ -> Lwt.return_unit)));
+    Lwt_main.run (Lwt.pause ())
+  done
 
 let test_http_get_json () =
   let ok_response =
@@ -890,7 +907,7 @@ let test_http_parts () =
   let payload =
     match range_json [record_json ()] with
     | `Assoc fields ->
-      `Assoc (("padding", `String (String.make Parts.body_max 'x')) :: fields)
+      `Assoc (("padding", `String (String.make (Parts.body_max + 2_000_000) 'x')) :: fields)
     | _ -> fail "range shape"
   in
   let part index =
@@ -898,13 +915,17 @@ let test_http_parts () =
     | Ok json -> json
     | Error error -> fail error
   in
-  let first = part 0 and second = part 1 in
+  let first = part 0 and second = part 1 and third = part 2 in
+  let hash = match Parts.view first with
+    | Ok (Parts.Part value) -> value.hash
+    | _ -> fail "part hash missing" in
   let calls = ref 0 in
   let fetch_json url =
     incr calls;
     let json =
       if url = Join.range_url "http://primary" ~from_epoch:12L ~max_epochs:1 then first
-      else if url = Join.range_url ~part:1 "http://primary" ~from_epoch:12L ~max_epochs:1 then second
+      else if url = Join.range_url ~part:1 ~hash "http://primary" ~from_epoch:12L ~max_epochs:1 then second
+      else if url = Join.range_url ~part:2 ~hash "http://primary" ~from_epoch:12L ~max_epochs:1 then third
       else fail "unexpected part source"
     in
     Lwt.map (fun () -> json) (Lwt_unix.sleep 0.2)
@@ -914,7 +935,27 @@ let test_http_parts () =
       (Join.http_range ~fetch_json ~timeout:0.3 http_env ~from_epoch:12L
          ~max_epochs:1 ~validate:(fun _ -> true))
   in
-  expect "each part has its own deadline" (Option.is_some result && !calls = 2);
+  expect "each part has its own deadline" (Option.is_some result && !calls = 3);
+  List.iter (fun (key, value) ->
+    let changed = match second with
+      | `Assoc fields -> `Assoc ((key, value) :: List.remove_assoc key fields)
+      | _ -> fail "part shape" in
+    calls := 0;
+    let fetch_json _ =
+      incr calls;
+      if !calls = 1 then Lwt.return first
+      else if !calls = 2 then Lwt.return changed
+      else Lwt.fail (Failure "read after changed part") in
+    let stopped = Lwt_main.run (Lwt.catch
+      (fun () -> Lwt.map (fun _ -> false)
+        (Join.fetch_range_json fetch_json "http://primary" ~from_epoch:12L ~max_epochs:1))
+      (function
+        | Join.Fetch_retry "range part identity does not match" -> Lwt.return_true
+        | _ -> Lwt.return_false)) in
+    expect "part identity checked before collection" (stopped && !calls = 2)) [
+      "sha256", `String (String.make 64 '0');
+      "count", `Int 2;
+    ];
   let excess =
     match first with
     | `Assoc fields ->
@@ -1021,24 +1062,24 @@ let test_catchup_old_epoch_leader () =
   let deps = Join.{
     fetch_head = (fun _ ->
       Lwt.return (head_json ~epoch:11L ~root:(hex_of_raw (raw 'r'))));
-    fetch_range = (fun _ ~from_epoch:_ ~max_epochs:_ -> fail "stale fetched range");
+    fetch_range = (fun _ ~from_epoch:_ ~max_epochs:_ -> fail "old source fetched range");
     local_next = (fun () -> 13L);
     local_root = (fun () -> hex_of_raw (raw 's'));
-    cursor = (fun ~from_epoch:_ -> fail "stale cursor");
-    apply_range = (fun ~cursor:_ _ -> fail "stale apply");
+    cursor = (fun ~from_epoch:_ -> fail "old source cursor");
+    apply_range = (fun ~cursor:_ _ -> fail "old source apply");
     write_ready = (fun ~base:_ ~ready_epoch:_ ~state_root:_ ~records_verified:_ ->
-      fail "stale ready");
-    sleep = (fun _ -> fail "stale sleep");
+      fail "old source ready");
+    sleep = (fun _ -> fail "old source sleep");
     log_start = (fun ~base:_ -> ());
-    log_applied = (fun ~applied:_ -> fail "stale applied");
-    log_retry = (fun ~phase:_ ~delay:_ ~error:_ -> fail "stale retry");
+    log_applied = (fun ~applied:_ -> fail "old source applied");
+    log_retry = (fun ~phase:_ ~delay:_ ~error:_ -> fail "old source retry");
   } in
   match Lwt_main.run (Join.run_catchup deps "http://leader") with
-  | Join.Leader_stale p ->
-    expect "stale local" (p.local_head = 12L);
-    expect "stale leader" (p.leader_head = 11L)
-  | Join.Synced _ -> fail "stale leader synced"
-  | Join.Source_unavailable _ -> fail "stale leader source unavailable"
+  | Join.Leader_behind p ->
+    expect "old source local head" (p.local_head = 12L);
+    expect "old source head" (p.leader_head = 11L)
+  | Join.Synced _ -> fail "old source synced"
+  | Join.Source_unavailable _ -> fail "old source unavailable"
 
 let test_catchup_retry_apply_ready () =
   let record = parse_one_record () in
@@ -1141,7 +1182,7 @@ let test_run_catchup_transport_retry () =
     expect "transport sleeps"
       (List.rev !sleeps = [1.0; 2.0])
   | Join.Synced _ -> fail "transport unexpectedly synced"
-  | Join.Leader_stale _ -> fail "transport leader became stale"
+  | Join.Leader_behind _ -> fail "transport source fell behind"
 
 let test_run_node_catchup_ready () =
   let fetched = ref [] in
@@ -1377,8 +1418,8 @@ let test_pending_start () =
   let module Recovery = Octra_node_runtime.Consensus_finality_journal_recovery in
   let unused () = fail "applied journal must not execute again" in
   let recovered = Recovery.run {
-    read_journal = (fun () -> Journal.read_validated
-      ~chain_id:"octra-test" ~validator_set:finality_validator_set dir);
+    read_journal = (fun () -> Ok (Journal.read_validated
+      ~chain_id:"octra-test" ~validator_set:finality_validator_set dir));
     read_pending_epoch = (fun () -> Journal.read_pending_epoch dir);
     drop_invalid_unapplied = (fun ~head_epoch:_ -> unused ());
     head_epoch = (fun () -> 12);
@@ -1469,7 +1510,7 @@ let test_http_pending () =
   let module Journal = Octra_node_runtime.Consensus_finality_journal in
   let module Mark = Octra_node_runtime.Sync_mark in
   let module Log = Octra_consensus.Finality_log in
-  List.iter (fun (applied_before, round) ->
+  List.iter (fun (applied_before, round, damaged) ->
     let dir = Test_workspace.unique_dir "join-http-pending" in
     let record = parse_one_record () in
     let prepared = Join.prepare_record ~chain_id:"octra-test"
@@ -1481,6 +1522,12 @@ let test_http_pending () =
       tx_hashes = record.tx_hashes; txs = prepared.txs;
       receipts_json = record.receipts_json;
     };
+    if damaged then begin
+      let path = Filename.concat dir "finality/pending_finalized.json" in
+      let fields = Yojson.Safe.Util.to_assoc (Yojson.Safe.from_file path) in
+      Yojson.Safe.to_file path (`Assoc
+        (("bundle", `String "invalid") :: List.remove_assoc "bundle" fields))
+    end;
     Log.write dir (Log.of_finalize cert);
     let height = ref (if applied_before then 13 else 12) in
     let applied = ref 0 in
@@ -1507,8 +1554,10 @@ let test_http_pending () =
       put_proposer = (fun _ _ -> ());
       put_root_raw = (fun _ _ -> ());
       sleep = (fun _ -> fail "local recovery must not retry");
-      apply = (fun ~txs:_ ~receipts_json:_ ~proposer_info ~reward:_ ~epoch_ts:_
+      apply = (fun ~txs ~receipts_json ~proposer_info ~reward:_ ~epoch_ts:_
           ~validator_set:_ ~parent_commit:_ ->
+        expect "join retains all transactions" (txs = prepared.txs);
+        expect "join retains all receipts" (receipts_json = record.receipts_json);
         saved_round := Option.map (fun value -> value.Octra_core.Epochlog.commit_round) proposer_info;
         incr applied; height := 13; Lwt.return_unit);
       write_entry = Log.write dir;
@@ -1532,7 +1581,8 @@ let test_http_pending () =
       ignore (Join.prepare_record ~chain_id:"octra-test"
         ~expected_validator_set_hash:trusted_validator_set_hash ~cursor:(cursor ()) record)
     | _ -> fail "committed proof is missing"
-  ) [false, 4; true, 4; false, 5]
+  ) [false, 4, false; true, 4, false; false, 5, false;
+     false, 4, true; false, 5, true]
 
 let test_catchup_no_env () =
   let touched = ref false in
@@ -1672,8 +1722,8 @@ let test_ready_params () =
     (Result.is_error (P.validate ~runtime:{ chain_id; config_hash }
        ~head_epoch:1_503_094L claim));
   expect "ready params no snapshot" (Result.is_error (read (Error "head missing")));
-  let other = Option.map (fun (candidate : Octra_core.Validator_admission.candidate) ->
-    { candidate with Octra_core.Validator_admission.pubkey = raw 'q' }) snapshot.candidate in
+  let other = Option.map (fun (entry : Octra_core.Validator_admission.candidate) ->
+    { entry with Octra_core.Validator_admission.pubkey = raw 'q' }) snapshot.candidate in
   expect "ready params identity" (Result.is_error (read (Ok { snapshot with candidate = other })))
 
 let () =
@@ -1682,6 +1732,7 @@ let () =
   test_join_conflict ();
   test_ready_params ();
   test_normalize_base ();
+  test_http_cancel ();
   test_http_get_json ();
   test_retry_delay ();
   test_head_roots ();

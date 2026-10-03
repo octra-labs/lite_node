@@ -33,11 +33,7 @@ let json_z = function
   | _ -> None
 
 let raw_bytes32 value =
-  if String.length value = 32 then Some value
-  else
-    match Base64.decode value with
-    | Ok raw when String.length raw = 32 -> Some raw
-    | _ -> None
+  Contract_vm.decode_raw_or_b64_len 32 value
 
 let value kind json =
   match kind, json with

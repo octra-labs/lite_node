@@ -102,6 +102,7 @@ type node_start_runtime = {
 
 type node_start = {
   view : node_view;
+  prepare_set : epoch:int64 -> Octra_consensus.C_types.validator_set -> (unit, string) result;
   load_scheduled_validator_set_config :
     unit ->
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;

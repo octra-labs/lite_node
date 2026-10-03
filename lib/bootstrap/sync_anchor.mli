@@ -42,6 +42,18 @@ val derive :
   t ->
   (Octra_consensus.C_types.validator_set, string) result
 
+val derive_lwt :
+  ?cancelled:(unit -> bool) ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  t ->
+  (Octra_consensus.C_types.validator_set, string) result Lwt.t
+
+val compact_lwt :
+  ?cancelled:(unit -> bool) ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  t ->
+  (t, string) result Lwt.t
+
 val raw_validator_set :
   Octra_consensus.C_types.validator_set ->
   (Octra_consensus.C_types.validator_set, string) result
@@ -68,3 +80,10 @@ val verify :
   State_sync_checkpoint.body ->
   string ->
   (t, string) result
+
+val verify_lwt :
+  ?cancelled:(unit -> bool) ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  State_sync_checkpoint.body ->
+  string ->
+  (t, string) result Lwt.t

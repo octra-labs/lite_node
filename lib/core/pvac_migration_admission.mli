@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type classifier = Prior_v1 | Capped_v1
+type classifier = Prior_v1 | Capped_v1 | Receipt_v1
 
 type entry = {
   address : string;
@@ -11,6 +11,21 @@ type entry = {
 }
 
 type t
+
+type lookup_error =
+  | Unavailable
+  | Not_active
+  | Not_found
+  | Cipher_mismatch
+
+val lookup_message : lookup_error -> string
+
+val lookup :
+  t ->
+  epoch:int ->
+  address:string ->
+  cipher:string ->
+  (entry, lookup_error) result
 
 val state_relative_path : string
 

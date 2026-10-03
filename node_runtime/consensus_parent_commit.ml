@@ -53,6 +53,22 @@ let floor_parent source expected_epoch =
       |> Result.map Option.some
   | Ok _ -> Ok None
 
+let record_parent (record : Journal.record) =
+  validate C_types.{
+    certificate = certificate_of_finalize record.finalize;
+    validator_set = record.validator_set;
+  }
+
+let load_head source ~epoch_id =
+  if epoch_id < 0L then Error "committed head epoch is invalid"
+  else
+    match Journal.read_committed_epoch ~chain_id:source.chain_id
+      ~epoch:epoch_id source.data_dir with
+    | Journal.Missing -> floor_parent source epoch_id
+    | Journal.Invalid reason ->
+      Error ("committed head journal is invalid: " ^ reason)
+    | Journal.Valid record -> Result.map Option.some (record_parent record)
+
 let load source ~epoch_id =
   if Int64.compare epoch_id 0L <= 0 then
     missing source epoch_id "parent commit unavailable at genesis"
@@ -89,12 +105,7 @@ let load source ~epoch_id =
         | Journal.Invalid reason ->
           Error ("parent commit journal is invalid: " ^ reason)
         | Journal.Valid record ->
-          let parent = C_types.{
-            certificate =
-              certificate_of_finalize record.Journal.finalize;
-            validator_set = record.validator_set;
-          } in
-          Result.map Option.some (validate parent)
+          Result.map Option.some (record_parent record)
 
 let verify source ~epoch_id incoming =
   match load source ~epoch_id with

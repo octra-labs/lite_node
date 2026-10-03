@@ -71,10 +71,75 @@ let admit ~program ~point_ops code =
 
 let of_code ?(point_ops = false) code = admit ~program:false ~point_ops code
 
+module Decode : sig
+  val code : active:bool -> string -> (Contract_vm.instr array, string) result
+end = struct
+  type key = { active : bool; hash : string; raw : string }
+  type entry = { key : key; code : Contract_vm.instr array; bytes : int }
+  type _ message =
+    | Read : key -> Contract_vm.instr array option message
+    | Keep : entry -> unit message
+
+  let max_entries = 64
+  let max_bytes = 32 * 1024 * 1024
+
+  let same left right =
+    left.active = right.active && String.equal left.hash right.hash
+    && String.equal left.raw right.raw
+
+  let rec take slots bytes = function
+    | entry :: rest when slots > 0 && entry.bytes <= bytes ->
+      entry :: take (slots - 1) (bytes - entry.bytes) rest
+    | _ -> []
+
+  let step : type a. entry list -> a message -> entry list * a = fun entries -> function
+    | Read key ->
+      (match List.find_opt (fun entry -> same entry.key key) entries with
+       | None -> entries, None
+       | Some entry ->
+         take max_entries max_bytes
+           (entry :: List.filter (fun item -> not (same item.key key)) entries),
+         Some entry.code)
+    | Keep entry ->
+      let rest = List.filter (fun item -> not (same item.key entry.key)) entries in
+      take max_entries max_bytes (entry :: rest), ()
+
+  let entries = ref []
+  let lock = Mutex.create ()
+
+  let request : type a. a message -> a = fun message ->
+    Mutex.lock lock;
+    Fun.protect ~finally:(fun () -> Mutex.unlock lock) (fun () ->
+      let next, reply = step !entries message in
+      entries := next;
+      reply)
+
+  let code ~active raw =
+    let length = String.length raw in
+    if length > max_bytes - 1024 then Bytecode.decode ~active raw
+    else
+      let key = { active; raw; hash = Digestif.SHA256.(digest_string raw |> to_raw_string) } in
+      match request (Read key) with
+      | Some code -> Ok (Array.copy code)
+      | None ->
+        match Bytecode.decode ~active raw with
+        | Error error -> Error error
+        | Ok code ->
+          let word = Sys.word_size / 8 in
+          let bytes = 1024 + word * (length / word + 2) in
+          let words = Obj.reachable_words (Obj.repr code) in
+          if bytes > max_bytes || words > (max_bytes - bytes) / word then Ok code
+          else begin
+            let bytes = bytes + word * words in
+            request (Keep { key; code; bytes });
+            Ok (Array.copy code)
+          end
+end
+
 let decode ?(point_ops = false) raw =
-  match Bytecode.decode_image ~active:point_ops raw with
+  match Decode.code ~active:point_ops raw with
   | Error err -> Error (Decode_error err)
-  | Ok image -> of_code ~point_ops image.code
+  | Ok code -> of_code ~point_ops code
 
 let of_program ?(point_ops = false) ?(facts = Program_type_flow.empty_facts) code =
   match admit ~program:true ~point_ops code with
@@ -346,22 +411,22 @@ let decode_program ?(trusted = []) ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
   | Ok envelope ->
-    match Bytecode.decode_image ~active:point_ops envelope.code with
+    match Decode.code ~active:point_ops envelope.code with
     | Error error -> Error (Decode_error error)
-    | Ok image ->
+    | Ok code ->
       match
         verify_program_cert
           ~attested:true
           ~trusted
           envelope.code
-          image.code
+          code
           envelope.cert
       with
       | Error error -> Error (Verify_error error)
       | Ok (facts, version) ->
         Result.map
           (fun program -> { program with compiler_version = Some version })
-          (of_program ~point_ops ~facts image.code)
+          (of_program ~point_ops ~facts code)
 
 let decode_deploy ?(trusted = []) ?(point_ops = false) raw =
   if Program_envelope.is_program raw then decode_program ~trusted ~point_ops raw
@@ -371,22 +436,22 @@ let decode_program_source ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
   | Ok envelope ->
-    match Bytecode.decode_image ~active:point_ops envelope.code with
+    match Decode.code ~active:point_ops envelope.code with
     | Error error -> Error (Decode_error error)
-    | Ok image ->
+    | Ok code ->
       match
         verify_program_cert
           ~attested:false
           ~trusted:[]
           envelope.code
-          image.code
+          code
           envelope.cert
       with
       | Error error -> Error (Verify_error error)
       | Ok (facts, version) ->
         Result.map
           (fun program -> { program with compiler_version = Some version })
-          (of_program ~point_ops ~facts image.code)
+          (of_program ~point_ops ~facts code)
 
 let compiler_version program = program.compiler_version
 

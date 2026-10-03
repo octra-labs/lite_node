@@ -3,15 +3,119 @@
 
 #include "pvac_serialize.hpp"
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <new>
 #include <thread>
 #include <type_traits>
 #ifdef PVAC_C_API
 #include "pvac_c_api.h"
 #endif
 
+thread_local bool measure_alloc = false;
+thread_local size_t allocated_bytes = 0;
+struct LiveAllocation {
+    void* pointer;
+    size_t size;
+};
+thread_local std::array<LiveAllocation, 4096> live_allocations{};
+thread_local bool measure_peak = false;
+thread_local bool peak_overflow = false;
+thread_local size_t live_bytes = 0;
+thread_local size_t peak_bytes = 0;
+
+void* operator new(size_t size) {
+    if (measure_alloc) allocated_bytes += size;
+    if (void* ptr = std::malloc(size == 0 ? 1 : size)) {
+        if (measure_peak) {
+            auto slot = std::find_if(live_allocations.begin(), live_allocations.end(),
+                [](const auto& item) { return item.pointer == nullptr; });
+            if (slot == live_allocations.end()) peak_overflow = true;
+            else {
+                *slot = {ptr, size};
+                live_bytes += size;
+                peak_bytes = std::max(peak_bytes, live_bytes);
+            }
+        }
+        return ptr;
+    }
+    throw std::bad_alloc();
+}
+
+void* operator new[](size_t size) { return ::operator new(size); }
+void operator delete(void* ptr) noexcept {
+    if (ptr && measure_peak) {
+        auto slot = std::find_if(live_allocations.begin(), live_allocations.end(),
+            [ptr](const auto& item) { return item.pointer == ptr; });
+        if (slot != live_allocations.end()) {
+            live_bytes -= slot->size;
+            *slot = {};
+        }
+    }
+    std::free(ptr);
+}
+void operator delete[](void* ptr) noexcept { ::operator delete(ptr); }
+void operator delete(void* ptr, size_t) noexcept { ::operator delete(ptr); }
+void operator delete[](void* ptr, size_t) noexcept { ::operator delete(ptr); }
+
+template<typename Run>
+size_t allocation_size(Run run) {
+    allocated_bytes = 0;
+    measure_alloc = true;
+    try {
+        run();
+    } catch (...) {
+        measure_alloc = false;
+        throw;
+    }
+    measure_alloc = false;
+    return allocated_bytes;
+}
+
 void check(bool value, const char* name) {
     if (!value) throw std::runtime_error(name);
+}
+
+template<typename Run>
+size_t allocation_peak(Run run) {
+    check(!measure_peak, "nested allocation measurement");
+    live_allocations.fill({});
+    live_bytes = 0;
+    peak_bytes = 0;
+    peak_overflow = false;
+    measure_peak = true;
+    try {
+        run();
+    } catch (...) {
+        measure_peak = false;
+        throw;
+    }
+    measure_peak = false;
+    check(!peak_overflow && live_bytes == 0, "allocation measurement incomplete");
+    return peak_bytes;
+}
+
+void peak_meter_cases() {
+    void* earlier = ::operator new(1000);
+    const auto peak = allocation_peak([&] {
+        ::operator delete(earlier);
+        void* first = ::operator new(128);
+        void* second = ::operator new[](256);
+        ::operator delete(first);
+        void* third = ::operator new(64);
+        ::operator delete[](second);
+        ::operator delete(third);
+    });
+    check(peak == 384, "allocation peak differs");
+    bool raised = false;
+    try {
+        allocation_peak([] { throw 7; });
+    } catch (int value) {
+        raised = value == 7;
+    }
+    check(raised && !measure_peak, "allocation exception state");
 }
 
 std::string hex(const uint8_t* data, size_t size) {
@@ -361,6 +465,281 @@ void proof_math_cases() {
     }
 }
 
+size_t r1cs_peak_limit(size_t gates) {
+    using namespace pvac;
+    using namespace pvac::bp;
+    const auto count = next_power_of_2(gates);
+    const auto depth = log2_size(count);
+    const auto msm = [](size_t size) {
+        size_t width = 0;
+        for (size_t value = size; value; value >>= 1) ++width;
+        const auto buckets = (size_t{1} << std::min(width, size_t{16})) - 1;
+        return size * (sizeof(Scalar) + sizeof(RistrettoPoint) + sizeof(ExtPoint) + 32)
+            + buckets * sizeof(ExtPoint);
+    };
+    const auto outer = (4 * count + 1) * sizeof(Scalar) + msm(2 * count + 5);
+    const auto inner = (3 * count + 3 * depth) * sizeof(Scalar) + msm(2 * count + 2 * depth + 2);
+    return std::max(outer, inner) + 4096;
+}
+
+void proof_peak_cases(const std::string& mode, const std::string& path) {
+    using namespace pvac;
+    using namespace pvac::bp;
+    peak_meter_cases();
+    const bool writing = mode == "peak-write";
+    const bool reading = mode == "peak-read";
+    std::vector<uint8_t> input;
+    if (reading) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        check(file.good() && file.tellg() > 0 && file.tellg() < 1'000'000, "proof file size");
+        input.resize(static_cast<size_t>(file.tellg()));
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(input.data()), input.size());
+        check(file.good(), "proof file read");
+    }
+    pvac_ser::Reader reader(input.data(), input.size());
+    pvac_ser::Writer output;
+    for (const auto rule : {ScalarRule::Prior, ScalarRule::Wide}) {
+        for (size_t gates : {1, 3, 17, 256, 1024}) {
+            R1CSProver prover(rule);
+            const auto committed = prover.commit(sc_from_u64(3), sc_from_u64(17));
+            for (size_t i = 0; i < gates; ++i) {
+                const auto [left, right, product] = prover.multiply(LinearCombination(committed),
+                    LinearCombination(Variable::one(), sc_from_u64(4)));
+                prover.constrain(LinearCombination(product) -
+                    LinearCombination(Variable::one(), sc_from_u64(12)));
+            }
+            ConstraintSystem system{prover.num_gates(), prover.num_committed(), prover.get_constraints()};
+            R1CSProof proof;
+            if (reading) {
+                check(reader.u8() == static_cast<uint8_t>(rule) && reader.u64() == gates,
+                    "proof file order");
+                proof = pvac_ser::read_r1cs_proof_raw(reader);
+                check(!reader.failed, "proof file decode");
+            } else {
+                Transcript proving("peak", rule);
+                proof = prover.prove(proving);
+                if (writing) {
+                    output.u8(static_cast<uint8_t>(rule));
+                    output.u64(gates);
+                    pvac_ser::write_r1cs_proof_raw(output, proof);
+                }
+            }
+            generators().precompute(system.padded_gates());
+            for (int variant = 0; variant < (writing ? 7 : 8); ++variant) {
+                auto altered = proof;
+                auto relation = system;
+                if (variant == 1) altered.t_x = sc_add(altered.t_x, sc_from_u64(1));
+                if (variant == 2) altered.ipp.a = sc_add(altered.ipp.a, sc_from_u64(1));
+                if (variant == 3) relation.constraints.front().lc +=
+                    LinearCombination(Variable::one(), sc_from_u64(1));
+                if (variant == 4) altered.V.clear();
+                if (variant == 5) altered.A_I1.fill(255);
+                if (variant == 6) altered.ipp.R.push_back(rist_identity());
+                if (variant == 7) altered.e_blinding = sc_add(altered.e_blinding, sc_from_u64(1));
+                bool accepted = false;
+                Transcript checked("peak", rule);
+                const auto peak = allocation_peak([&] {
+                    accepted = r1cs_verify(checked, relation, altered);
+                });
+                check(accepted == (variant == 0), "proof outcome differs");
+                const auto challenge = checked.challenge_scalar("after_verify");
+                if (writing) {
+                    output.u8(accepted);
+                    output.scalar(challenge);
+                }
+                if (reading && variant < 7) {
+                    check(reader.u8() == accepted && scalar_eq(reader.scalar(), challenge),
+                        "proof transcript changed");
+                    check(!reader.failed, "proof result decode");
+                }
+                std::cout << "event = r1cs_peak gates = " << gates
+                    << " math = " << (rule == ScalarRule::Wide) << " variant = " << variant
+                    << " peak = " << peak << " limit = " << r1cs_peak_limit(gates) << "\n";
+                if (!writing) check(peak <= r1cs_peak_limit(gates), "r1cs peak retention");
+            }
+        }
+    }
+    if (reading) check(reader.remaining() == 0, "proof file extra bytes");
+    if (writing) {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(output.buf.data()), output.buf.size());
+        file.close();
+        check(file.good(), "proof file write");
+    }
+}
+
+bool same_constraints(const std::vector<pvac::bp::Constraint>& left,
+    const std::vector<pvac::bp::Constraint>& right) {
+    if (left.size() != right.size()) return false;
+    for (size_t i = 0; i < left.size(); ++i) {
+        const auto& a = left[i].lc.terms;
+        const auto& b = right[i].lc.terms;
+        if (a.size() != b.size()) return false;
+        for (size_t j = 0; j < a.size(); ++j) {
+            if (a[j].first.type != b[j].first.type || a[j].first.index != b[j].first.index ||
+                !scalar_eq(a[j].second, b[j].second)) return false;
+        }
+    }
+    return true;
+}
+
+void build_relation(pvac::bp::R1CSProver& builder, bool witness) {
+    using namespace pvac;
+    using namespace pvac::bp;
+    const auto x = builder.commit(sc_from_u64(witness ? 3 : 0), sc_from_u64(17));
+    auto [a, b, product] = builder.multiply(LinearCombination(x),
+        LinearCombination(Variable::one(), sc_from_u64(4)));
+    builder.constrain(LinearCombination(product) -
+        LinearCombination(Variable::one(), sc_from_u64(12)));
+    const auto [c, d, sum] = builder.allocate(sc_from_u64(witness ? 7 : 0), sc_from_u64(1));
+    builder.constrain(LinearCombination(sum) -
+        LinearCombination(Variable::one(), sc_from_u64(7)));
+    builder.multiply(LinearCombination(product) + LinearCombination(sum), LinearCombination(x));
+}
+
+void build_cases() {
+    using namespace pvac;
+    using namespace pvac::bp;
+    for (const auto rule : {ScalarRule::Prior, ScalarRule::Wide}) {
+        R1CSProver prover(rule);
+        R1CSProver prior(rule);
+        auto checked = R1CSProver::verification(rule);
+        build_relation(prover, true);
+        build_relation(prior, false);
+        build_relation(checked, false);
+        const auto expected = prior.get_constraints();
+        check(same_constraints(prover.get_constraints(), expected), "witness changes constraints");
+        check(same_constraints(checked.get_constraints(), expected), "verification constraints differ");
+        check(checked.num_gates() == prior.num_gates(), "verification gate count");
+        check(checked.num_committed() == prior.num_committed(), "verification commitment count");
+        check(checked.constraint_terms() == prior.constraint_terms(), "verification term count");
+        Transcript signing("builder", rule);
+        const auto proof = prover.prove(signing);
+        ConstraintSystem system;
+        system.num_gates = checked.num_gates();
+        system.num_committed = checked.num_committed();
+        const auto copied = allocation_size([&] { system.constraints = prior.get_constraints(); });
+        check(copied > 0, "allocation probe inactive");
+        const auto moved = allocation_size([&] { system.constraints = std::move(checked).get_constraints(); });
+        check(moved == 0, "verification constraint copy");
+        check(same_constraints(system.constraints, expected), "transferred constraints differ");
+        Transcript verifying("builder", rule);
+        check(r1cs_verify(verifying, system, proof), "verification builder rejects proof");
+        auto altered = system;
+        altered.constraints.back().lc += LinearCombination(Variable::one(), sc_from_u64(1));
+        Transcript invalid("builder", rule);
+        check(!r1cs_verify(invalid, altered, proof), "verification ignores constraint");
+        auto measured = R1CSProver::verification(rule);
+        R1CSProver control(rule);
+        const auto populate = [&](R1CSProver& builder) {
+            for (size_t i = 0; i < 4096; ++i) {
+                const auto value = sc_from_u64(i);
+                const auto committed = builder.commit(value, value);
+                const auto [left, right, out] = builder.allocate(value, value);
+                check(committed.index == i && left.index == i && right.index == i && out.index == i,
+                    "verification variable index");
+            }
+        };
+        const auto retained = allocation_size([&] { populate(control); });
+        const auto skipped = allocation_size([&] { populate(measured); });
+        check(retained > 0, "witness allocation probe inactive");
+        check(skipped == 0, "verification witness allocation");
+        check(measured.num_gates() == 4096 && measured.num_committed() == 4096,
+            "verification totals differ");
+        bool refused = false;
+        try {
+            Transcript missing("builder", rule);
+            checked.prove(missing);
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()) == "pvac: proof witness is missing";
+        }
+        check(refused, "verification creates proof");
+        std::cout << "event = r1cs_storage copied = " << copied << " moved = " << moved
+            << " witness = " << retained << " verification = " << skipped << "\n";
+    }
+}
+
+std::string system_digest(const std::vector<pvac::bp::Constraint>& constraints) {
+    pvac::Sha256 hash;
+    hash.init();
+    pvac_ser::Writer writer;
+    writer.u64(constraints.size());
+    hash.update(writer.buf.data(), writer.buf.size());
+    for (const auto& constraint : constraints) {
+        writer.buf.clear();
+        writer.u64(constraint.lc.terms.size());
+        for (const auto& term : constraint.lc.terms) {
+            writer.u8(static_cast<uint8_t>(term.first.type));
+            writer.u64(term.first.index);
+            for (uint64_t word : term.second.v) writer.u64(word);
+        }
+        hash.update(writer.buf.data(), writer.buf.size());
+    }
+    uint8_t digest[32];
+    hash.finish(digest);
+    return hex(digest, sizeof(digest));
+}
+
+void circuit_cases() {
+    using namespace pvac;
+    Params params;
+    PubKey key;
+    SecKey secret;
+    uint8_t seed[32] = {37};
+    keygen_from_seed(params, key, secret, seed);
+    const auto first = enc_value_seeded(key, secret, 0, seed);
+    seed[0] = 38;
+    const auto second = enc_value_seeded(key, secret, 0, seed);
+    const auto product = ct_mul_seeded(key, first, second, seed);
+    for (const auto& cipher : {first, product}) {
+        const auto bases = base_layer_indices(cipher);
+        const auto coefficients = compute_layer_coeffs(key, cipher);
+        for (const auto rule : {ScalarRule::Prior, ScalarRule::Wide}) {
+            for (int kind : {0, 1, 2}) {
+                std::string expected;
+                size_t gates = 0;
+                size_t committed = 0;
+                size_t terms = 0;
+                size_t prior_bytes = 0;
+                double prior_ms = 0;
+                for (bool fast : {false, true}) {
+                    auto builder = fast ? bp::R1CSProver::verification(rule) : bp::R1CSProver(rule);
+                    detail::AmountBinding amount;
+                    amount.range_bits = kind == 2 ? 64 : 0;
+                    const auto start = std::chrono::steady_clock::now();
+                    const auto bytes = allocation_size([&] {
+                        detail::build_key_bound_circuit(builder, key, nullptr, cipher,
+                            coefficients, bases, nullptr, nullptr, kind == 0 ? nullptr : &amount);
+                    });
+                    const auto ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+                    if (!fast) {
+                        gates = builder.num_gates();
+                        committed = builder.num_committed();
+                        terms = builder.constraint_terms();
+                        prior_bytes = bytes;
+                        prior_ms = ms;
+                        expected = system_digest(std::move(builder).get_constraints());
+                    } else {
+                        check(builder.num_gates() == gates, "circuit gate count");
+                        check(builder.num_committed() == committed, "circuit commitment count");
+                        check(builder.constraint_terms() == terms, "circuit term count");
+                        check(system_digest(std::move(builder).get_constraints()) == expected,
+                            "circuit constraints differ");
+                        check(bytes < prior_bytes, "circuit witness retained");
+                        std::cout << "event = r1cs_build layers = " << cipher.L.size()
+                            << " math = " << (rule == ScalarRule::Wide)
+                            << " kind = " << kind << " gates = " << gates << " terms = " << terms
+                            << " prior_bytes = " << prior_bytes << " next_bytes = " << bytes
+                            << " prior_ms = " << prior_ms << " next_ms = " << ms << "\n";
+                    }
+                }
+            }
+        }
+    }
+}
+
 bool field_eq(const pvac::Fp& a, const pvac::Fp& b) {
     return a.lo == b.lo && a.hi == b.hi;
 }
@@ -460,6 +839,11 @@ int main(int argc, char** argv) {
         const std::string mode = argc > 1 ? argv[1] : "all";
         if (mode == "vector") { std::cout << "vector = " << vector_digest() << "\n"; return 0; }
         if (mode == "wire") { product_case(true); return 0; }
+        if (mode == "peak-write" || mode == "peak-read") {
+            check(argc == 3, "proof file missing");
+            proof_peak_cases(mode, argv[2]);
+            return 0;
+        }
         if (mode == "all") check(vector_digest() == "ef53594fe19cae770e67aea7ac2f7ead7b881e968843c40fd881f9441f440839", "prior vector");
         if (mode == "all" || mode == "shake") shake_cases();
         if (mode == "all" || mode == "sample") sample_cases();
@@ -469,6 +853,9 @@ int main(int argc, char** argv) {
         if (mode == "all" || mode == "table") table_cases();
         if (mode == "all" || mode == "scalar") scalar_cases();
         if (mode == "all" || mode == "proof") proof_math_cases();
+        if (mode == "all" || mode == "peak") proof_peak_cases(mode, "");
+        if (mode == "all" || mode == "build") build_cases();
+        if (mode == "all" || mode == "circuit") circuit_cases();
         if (mode == "all" || mode == "cipher") cipher_math_cases();
 #ifdef PVAC_C_API
         if (mode == "all" || mode == "api") api_proof_cases();

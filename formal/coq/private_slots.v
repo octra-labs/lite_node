@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-From Stdlib Require Import ZArith Bool Lia List.
+From Stdlib Require Import ZArith Bool Lia List Sorting.Permutation.
 Open Scope Z_scope.
 
 Record slots := Slots { fhe : Z; stealth : Z }.
@@ -114,3 +114,100 @@ Theorem preview_maximum : forall pool inputs phase,
   0 <= inputs <= pool -> 0 <= phase <= 1 ->
   preview_measure pool inputs phase <= 4 * pool + 1.
 Proof. intros. unfold preview_measure. lia. Qed.
+
+Definition valid_cost c := 0 <= fhe_cost c /\ 0 <= stealth_cost c.
+
+Theorem consume_enough : forall costs s,
+  Forall valid_cost costs -> valid s ->
+  total_fhe costs <= fhe s -> total_stealth costs <= stealth s ->
+  consume s costs = Some
+    (Slots (fhe s - total_fhe costs) (stealth s - total_stealth costs)).
+Proof.
+  induction costs as [|c rest IH]; intros s safe initial f t.
+  - destruct s. simpl. f_equal. f_equal; lia.
+  - inversion safe as [|c' rest' first remaining]; subst.
+    destruct first as [cf ct].
+    assert (nonnegative : forall xs,
+      Forall valid_cost xs -> 0 <= total_fhe xs /\ 0 <= total_stealth xs).
+    { intros xs values. induction values as [|x xs one all both].
+      - simpl. lia.
+      - destruct one. destruct both. simpl. lia. }
+    destruct (nonnegative rest remaining) as [rf rt].
+    simpl in f, t. simpl. unfold reserve.
+    assert (admit : (0 <=? fhe_cost c) && (fhe_cost c <=? fhe s) &&
+      (0 <=? stealth_cost c) && (stealth_cost c <=? stealth s) = true).
+    { repeat rewrite andb_true_iff. repeat split; apply Z.leb_le; lia. }
+    rewrite admit.
+    rewrite IH; try assumption; unfold valid; simpl; try lia.
+    f_equal. f_equal; lia.
+Qed.
+
+Theorem totals_order : forall xs ys,
+  Permutation xs ys ->
+  total_fhe xs = total_fhe ys /\ total_stealth xs = total_stealth ys.
+Proof.
+  intros xs ys order. induction order; simpl in *; intuition lia.
+Qed.
+
+Theorem consume_order : forall xs ys s,
+  Permutation xs ys -> Forall valid_cost xs -> valid s ->
+  consume s xs = consume s ys.
+Proof.
+  intros xs ys s order safe initial.
+  pose proof (totals_order xs ys order) as [f t].
+  assert (other : Forall valid_cost ys).
+  { eapply Permutation_Forall; eauto. }
+  destruct (consume s xs) as [left|] eqn:a;
+    destruct (consume s ys) as [right|] eqn:b; try reflexivity.
+  - pose proof (batch_exact xs s left initial a) as [_ [af ast]].
+    pose proof (batch_exact ys s right initial b) as [_ [bf bt]].
+    destruct left. destruct right. simpl in *. f_equal. f_equal; lia.
+  - pose proof (no_overbook xs s left initial a) as [af ast].
+    rewrite f in af. rewrite t in ast.
+    rewrite (consume_enough ys s other initial af ast) in b. discriminate.
+  - pose proof (no_overbook ys s right initial b) as [af ast].
+    rewrite <- f in af. rewrite <- t in ast.
+    rewrite (consume_enough xs s safe initial af ast) in a. discriminate.
+Qed.
+
+Fixpoint applied (attempts : list (bool * cost)) : list cost :=
+  match attempts with
+  | nil => nil
+  | cons (ok, c) rest => if ok then cons c (applied rest) else applied rest
+  end.
+
+Fixpoint settle s (attempts : list (bool * cost)) : option slots :=
+  match attempts with
+  | nil => Some s
+  | cons (ok, c) rest =>
+    if ok then
+      match reserve s c with
+      | None => None
+      | Some next => settle next rest
+      end
+    else settle s rest
+  end.
+
+Theorem settle_applied : forall attempts s,
+  settle s attempts = consume s (applied attempts).
+Proof.
+  induction attempts as [|[ok c] rest IH]; intros s; simpl; [reflexivity|].
+  destruct ok; simpl; [destruct (reserve s c)|]; auto.
+Qed.
+
+Theorem settle_exact : forall attempts s final,
+  valid s -> settle s attempts = Some final ->
+  valid final /\
+  fhe final + total_fhe (applied attempts) = fhe s /\
+  stealth final + total_stealth (applied attempts) = stealth s.
+Proof.
+  intros attempts s final initial accepted.
+  rewrite settle_applied in accepted. eapply batch_exact; eauto.
+Qed.
+
+Theorem settle_order : forall xs ys s,
+  Permutation (applied xs) (applied ys) ->
+  Forall valid_cost (applied xs) -> valid s -> settle s xs = settle s ys.
+Proof.
+  intros. repeat rewrite settle_applied. apply consume_order; assumption.
+Qed.

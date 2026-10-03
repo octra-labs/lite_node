@@ -21,8 +21,13 @@ type read_result =
   | Valid of record
   | Invalid of string
 
+type read_error =
+  | Read_set of string
+  | Read_record of string
+  | Read_bundle of string
+
 type rebind_result =
-  | Rebound
+  | Rewritten
   | Unchanged
 
 type proof_result =
@@ -80,6 +85,13 @@ val read_validated :
 val read_pending_epoch :
   string ->
   (int64 option, string) result
+
+val read_selected :
+  ?repair:(int * string) ->
+  chain_id:string ->
+  expected_set:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
+  string ->
+  (read_result, read_error) result
 
 val seed :
   chain_id:string ->
@@ -175,7 +187,7 @@ val replayable :
 
 val read_replay_backlog :
   chain_id:string ->
-  validator_set:Octra_consensus.C_types.validator_set ->
+  expected_set:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   head_epoch:int64 ->
   head_root:string ->
   string ->

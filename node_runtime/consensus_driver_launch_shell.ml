@@ -59,14 +59,25 @@ let recover_before_start ~recover_pending ~replay_stashed ~recovery_pending =
 let health_runtime (input : health_runtime_input) =
   let health = Consensus_health_wiring.node_driver_health_deps input.health in
   let pending =
-    Consensus_pending_commit_recovery.node_driver_runtime input.pending
-  in
+    Consensus_pending_commit_recovery.node_driver_runtime input.pending in
   let pending_recovery driver =
-    recover_before_start
-      ~recover_pending:(fun () ->
-        Consensus_pending_commit_recovery.run_with_driver pending driver)
-      ~replay_stashed:input.replay_stashed
-      ~recovery_pending:input.recovery_pending
+    let open Lwt.Syntax in
+    let* ready =
+      recover_before_start
+        ~recover_pending:(fun () ->
+          Consensus_pending_commit_recovery.run_with_driver pending driver)
+        ~replay_stashed:input.replay_stashed
+        ~recovery_pending:input.recovery_pending in
+    if not ready then Lwt.return_false
+    else
+      let* restored = Octra_consensus.C_driver.restore_relief driver in
+      match restored with
+      | Error reason ->
+        Octra_log.error "consensus"
+          "event = pending_commit_recovery action = hold reason = relief_proof error = %s"
+          reason;
+        Lwt.return_false
+      | Ok () -> Lwt.return_true
   in
   let validator_set = input.validator_set in
   Consensus_health_wiring.{

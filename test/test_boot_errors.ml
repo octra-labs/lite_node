@@ -5,7 +5,7 @@ module C = Recovery_case
 module Start = Octra_node_runtime.Wal_start
 module Boot = Octra_node_runtime.Startup_node_boot_shell
 
-let boot dir =
+let boot ?(single = false) ?(overrides = []) dir =
   flush_all ();
   match Unix.fork () with
   | 0 ->
@@ -19,10 +19,11 @@ let boot dir =
             data_dir = dir; store; chaindata; ledger = Octra_core.Ledger.create store;
             total_tx_count = ref 0; observer_mode = true;
             wallet = {address = "octFROM"; pub = ""};
-            consensus_mode = true; voting_consensus_mode = false;
+            consensus_mode = not single; voting_consensus_mode = false;
             consensus_port_configured = (fun () -> true);
             validators = (fun () -> []); int_value = (fun _ value -> value);
-            env = (fun _ -> None); exit_fatal;
+            env = (fun name -> if List.mem name overrides then Some "1" else None);
+            exit_fatal;
           }) with
         | Ok _ -> ()
         | Error error ->
@@ -67,4 +68,50 @@ let run root =
       true) false ["hash"; "reference"; "receipt"; "aux"; "fork"; "valid"] in
   if failed then exit 1
 
-let () = Test_workspace.with_dir "boot_errors" run
+let override_guard root =
+  let module Marker = Octra_core.Epoch_commit_marker in
+  List.iteri (fun index overrides ->
+    List.iter (fun (name, mark) ->
+      let dir = Filename.concat root (Printf.sprintf "%s_%d" name index) in
+      Unix.mkdir dir 0o700;
+      ignore (C.prepare dir);
+      mark dir;
+      let before = C.evidence dir in
+      for _ = 1 to 2 do
+        C.expect "single mode bypassed recovery barrier"
+          (boot ~single:true ~overrides dir = Unix.WEXITED 78);
+        C.expect "refused override changed storage" (C.evidence dir = before);
+        C.expect "refused override removed recovery barrier"
+          (Sys.file_exists (Marker.recovery_path dir)
+           || Sys.file_exists (Marker.marker_path dir))
+      done;
+      Printf.printf "event = passed case = %s option = %d\n%!" name index)
+      ["required", Marker.require_recovery;
+       "phase", (fun dir -> Marker.write_marker dir 1 "wal_written");
+       "directory", (fun dir -> Unix.mkdir (Marker.recovery_path dir) 0o700);
+       "symlink", (fun dir -> Unix.symlink "HEAD.json" (Marker.recovery_path dir));
+       "damaged", (fun dir ->
+         let channel = open_out_bin (Marker.marker_path dir) in
+         Fun.protect ~finally:(fun () -> close_out channel)
+           (fun () -> output_string channel "{"))])
+    [["OCTRA_SKIP_RECOVERY"];
+     ["OCTRA_SKIP_RECONCILE"];
+     ["OCTRA_SKIP_RECOVERY"; "OCTRA_SKIP_RECONCILE"]]
+
+let override_policy () =
+  List.iter (fun consensus_mode ->
+    List.iter (fun recovery_required ->
+      List.iter (fun skip_recovery ->
+        List.iter (fun skip_indexes ->
+          let actual = Boot.recovery_override_error ~consensus_mode
+            ~recovery_required ~skip_recovery ~skip_reconcile:skip_indexes in
+          let refused = (consensus_mode || recovery_required)
+            && (skip_recovery || skip_indexes) in
+          C.expect "recovery override policy differs"
+            (Option.is_some actual = refused)) [false; true]) [false; true])
+      [false; true]) [false; true]
+
+let () = Test_workspace.with_dir "boot_errors" (fun root ->
+  override_policy ();
+  run root;
+  override_guard root)

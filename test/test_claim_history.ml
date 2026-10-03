@@ -19,6 +19,8 @@ module Anchor = Octra_bootstrap.Sync_anchor
 module F = Octra_consensus.C_types
 module Hash = Octra_consensus.C_hash
 module Sum = Octra_core.Claim_sum
+module Admission = Octra_core.Pvac_migration_admission
+module Replay = Octra_core.Pvac_legacy_public_replay
 
 let check name valid =
   if not valid then failwith ("test_claim_history: " ^ name)
@@ -76,14 +78,16 @@ let members ?(encoded = false) (wallet : Octra_core.Crypto.Wallet.t) =
   let pubkey = if encoded then wallet.pub else Base64.decode_exn wallet.pub in
   F.make_validator_set [F.{address = wallet.address; pubkey}]
 
-let finalized ?(version = F.proto_version_current) wallet parent (pin : R.pin) =
+let finalized ?(version = F.proto_version_current) ?(txs = []) ?(receipts = [])
+    wallet parent (pin : R.pin) =
   let prev = match parent with
     | None -> String.make 32 '\000'
     | Some value -> value.F.certificate.header.proposed_state_root in
   let header = F.{
     proto_version = version; chain_id; epoch_id = Int64.of_int pin.epoch;
-    prev_state_root = prev; tx_list_hash = Hash.tx_list_hash [];
-    receipt_root = Hash.receipt_root []; proposed_state_root = raw pin.state_root;
+    prev_state_root = prev;
+    tx_list_hash = Octra_consensus.C_engine.tx_list_hash_for_header (List.map T.hash txs);
+    receipt_root = Hash.receipt_root receipts; proposed_state_root = raw pin.state_root;
     parent_commit_hash = Hash.parent_commit_hash_opt parent;
     creator_addr = wallet.Octra_core.Crypto.Wallet.address;
     txid_hi = Int64.pred pin.next_txid; ts = float_of_int pin.epoch;
@@ -100,13 +104,13 @@ let parent wallet finalize = F.{
   certificate = F.certificate_of_finalize finalize; validator_set = members wallet;
 }
 
-let certificate wallet finalize ledger_root index_root =
+let certificate ?(config_hash = digest "claim-history-config") wallet finalize ledger_root index_root =
   let set = members wallet in
   let checkpoint = CP.{
     chain_id; epoch = finalize.F.epoch_id;
     state_root = CP.raw_to_hex finalize.header.proposed_state_root;
     ledger_state_root = ledger_root; txid_hi = finalize.header.txid_hi;
-    config_hash = digest "claim-history-config";
+    config_hash;
     validator_set_hash = CP.raw_to_hex (Octra_consensus.C_config.validator_set_hash set);
     quorum_cert_hash = Some (Anchor.finalize_hash finalize);
     epoch_index_hash = Some (digest "index"); epoch_index_root = Some index_root;
@@ -127,10 +131,27 @@ let certificate wallet finalize ledger_root index_root =
     exporter_signatures = [signature];
     authority = Finalized (Anchor.make ~steps:[] ~finalize ~validator_set:set |> Anchor.encode)}
 
-let chain_read ?(first_epoch = 0) ?(max_epochs = 2) wallet certificate read_finality =
-  Chain.read ~chain_id ~config_hash:(digest "claim-history-config")
+let chain_read ?(first_epoch = 0) ?(max_epochs = 2)
+    ?(config_hash = digest "claim-history-config") wallet certificate read_finality =
+  Chain.read ~chain_id ~config_hash
     ~validator_set:(members ~encoded:true wallet) ~exporter_set:(members ~encoded:true wallet)
     ~certificate ~first_epoch ~max_epochs ~read_finality
+
+let journal_case () =
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let pin = R.{epoch = 0; next_txid = 0L; state_root = digest "journal-state";
+    index_root = E.genesis_root} in
+  let record = finalized sender_wallet None pin in
+  let bundle = Journal.{tx_hashes = []; txs = []; receipts_json = []} in
+  ignore (Journal.validate_bundle record bundle |> unwrap);
+  Test_workspace.with_dir "claim_journal" (fun dir ->
+    Journal.persist_certificate dir ~validator_set:(members sender_wallet) record;
+    Journal.persist_bundle dir record bundle;
+    Journal.promote_applied dir ~epoch:0L ~state_root:record.header.proposed_state_root;
+    check "committed journal input"
+      (match Journal.read_committed_epoch ~chain_id ~epoch:0L dir with
+       | Journal.Valid item -> item.finalize = record
+       | _ -> false))
 
 let chain_rules () =
   let rules = Octra_core.Rule_graph.create ~chain_id
@@ -202,7 +223,8 @@ let material () =
   let secret = bytes '\004' in
   let delta = P.enc_value_seeded pk sk 7L (bytes '\005') in
   let cipher = P.enc_value_seeded rpk rsk 7L (bytes '\006') in
-  let balance = P.enc_value_seeded pk sk 93L (bytes '\014') in
+  let deposit_cipher = P.enc_value_seeded pk sk 100L (bytes '\022') in
+  let balance = P.ct_sub pk deposit_cipher delta in
   let transfer = PT.{
     version = 5;
     delta_cipher = FB.encode_cipher delta;
@@ -631,6 +653,77 @@ let interval_write dir mode sender_key receiver_key transfer receipt deposit wit
     let last = save third 4 [] (fun () -> ()) in
     [initial; first; second; third; last], final_cipher)
 
+let admission_case chain result cipher =
+  let artifact = Chain.admission chain ~activation_epoch:5 [result] |> unwrap in
+  check "admission snapshot" (Admission.snapshot_epoch artifact = Some result.Chain.last_epoch);
+  check "admission state root" (Admission.state_root artifact = Some result.state_root);
+  let decision = Admission.decision artifact ~epoch:5 ~address:receiver ~cipher in
+  check "incoming receipt admitted"
+    (decision.audit_class = Replay.Hidden_witness
+     && decision.commitment_net = Some result.sum.commitment);
+  check "no public entitlement"
+    (not decision.can_public_migrate && decision.public_net = None);
+  let entry = Admission.lookup artifact ~epoch:5 ~address:receiver ~cipher in
+  check "account record count" (match entry with Ok item -> item.total = 2 | _ -> false);
+  check "activation required"
+    (Admission.lookup artifact ~epoch:4 ~address:receiver ~cipher = Error Admission.Not_active);
+  check "source cipher required"
+    (Admission.lookup artifact ~epoch:5 ~address:receiver ~cipher:"other"
+     = Error Admission.Cipher_mismatch);
+  refused "admission duplicate address"
+    (Chain.admission chain ~activation_epoch:5 [result; result]);
+  refused "admission precedes snapshot"
+    (Chain.admission chain ~activation_epoch:result.last_epoch [result]);
+  rejected "admission empty" "history admission has no accounts"
+    (Chain.admission chain ~activation_epoch:5 []);
+  Test_workspace.with_dir "claim_admission" (fun dir ->
+    let path = Admission.state_path dir in
+    Unix.mkdir (Filename.dirname path) 0o700;
+    let json = Admission.to_yojson artifact |> unwrap in
+    check "receipt classifier" (Yojson.Safe.Util.member "classifier" json = `String "receipt_v1");
+    let channel = open_out_bin path in
+    Fun.protect ~finally:(fun () -> close_out channel)
+      (fun () -> output_string channel (Yojson.Safe.to_string json));
+    let load root = Admission.load_env ~chain_id ~data_dir:dir
+      ~getenv:(function "OCTRA_PVAC_MIGRATION_ROOT" -> Some root | _ -> None) in
+    let restored = load (Option.get (Admission.root artifact)) |> unwrap in
+    check "admission reload" (Admission.decision restored ~epoch:5 ~address:receiver ~cipher = decision);
+    refused "admission unpinned root" (load (digest "other-root"));
+    refused "admission wrong snapshot"
+      (Admission.bind_snapshot restored (fun _ -> Ok (digest "other-state")));
+    ignore (Admission.bind_snapshot restored (fun _ -> Ok result.state_root) |> unwrap));
+  decision
+
+let admission_proof result receiver_key =
+  let pk, sk = P.keygen_from_seed (P.default_params ()) (bytes '\002') in
+  let pk_blob = Bytes.to_string (P.serialize_pubkey pk) in
+  check "proof key" (pk_blob = receiver_key.H.blob);
+  let verify amount commitment =
+    let cipher = P.enc_value_seeded pk sk amount (bytes '\029') in
+    let proof = P.make_zero_proof_bound pk sk cipher amount (bytes '\003') in
+    Octra_core.Pvac_verify_worker.verify_claim_sync ~math:false ~strict:true
+      ~pubkey:pk_blob ~cipher:(FB.encode_cipher cipher)
+      ~proof:(FB.encode_zero_proof proof) ~commitment in
+  let commitment = Option.get result.Replay.commitment_net in
+  ignore (verify 3L commitment |> unwrap);
+  refused "receipt cannot mint" (verify 4L commitment);
+  refused "receipt cannot replace point"
+    (verify 3L (b64 (P.pedersen_commit_amount 4L (bytes '\003'))))
+
+let persist_journal ?(last = 2) ?(transactions = fun _ -> []) ?(receipts = fun _ -> [])
+    dir records =
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  Array.iteri (fun index record ->
+    if index <= last then begin
+      let txs = transactions index in
+      let bundle = Journal.{tx_hashes = List.map T.hash txs; txs; receipts_json = receipts index} in
+      ignore (Journal.validate_bundle record bundle |> unwrap);
+      Journal.persist_certificate dir ~validator_set:(members sender_wallet) record;
+      Journal.persist_bundle dir record bundle;
+      Journal.promote_applied dir ~epoch:record.F.epoch_id
+        ~state_root:record.header.proposed_state_root
+    end) records
+
 let interval_case mode sender_key receiver_key transfer receipt deposit withdraw =
   Test_workspace.with_dir "claim_interval" (fun dir ->
     let pins, cipher = interval_write dir mode sender_key receiver_key transfer receipt deposit withdraw in
@@ -661,6 +754,16 @@ let interval_case mode sender_key receiver_key transfer receipt deposit withdraw
           (total ())
       else begin
       let result = total () |> unwrap in
+      let current = R.read store archive ~before:(List.nth pins 1)
+        ~after:(List.nth pins 2) ~max_txs:2 |> unwrap in
+      let rows = R.fold current ~init:[] ~f:(fun rows item _ ->
+        Ok (Yojson.Safe.from_string item.H.json :: rows)) |> unwrap |> List.rev in
+      let raw = Replay.replay_history ~addr:receiver rows in
+      check "raw negative subtotal is not entitlement"
+        (raw.audit_class = Replay.Poisoned && raw.commitment_net = None);
+      let audit = admission_case chain result cipher in
+      admission_proof audit receiver_key;
+      persist_journal dir records;
       check "interval amount point"
         (result.sum.commitment = b64 (P.pedersen_commit_amount 3L (bytes '\003')));
       check "interval rejected records excluded"
@@ -671,6 +774,25 @@ let interval_case mode sender_key receiver_key transfer receipt deposit withdraw
       check "source before empty starting state"
         (suffix.sum.commitment = result.sum.commitment && suffix.sum.records = 2);
       let sender_total = total ~address:sender ~last_epoch:1 ~max_records:2 () |> unwrap in
+      rejected "admission mixes epochs" "history admission checkpoint differs"
+        (Chain.admission chain ~activation_epoch:5 [result; sender_total]);
+      let config_hash = digest "other-config" in
+      let other_cert = certificate ~config_hash sender_wallet records.(4) view.state_root
+        (List.nth pins 4).R.index_root in
+      let other_chain = chain_read ~max_epochs:5 ~config_hash sender_wallet other_cert
+        (fun epoch -> Ok records.(Int64.to_int epoch)) |> unwrap in
+      rejected "admission mixes networks" "history admission network differs"
+        (Chain.admission other_chain ~activation_epoch:5 [result]);
+      let index_root = digest "other-index" in
+      let state_root = E.folded_state_root ~ledger_state_root:view.state_root ~epoch_index_root:index_root in
+      let changed = {(List.nth pins 2) with R.state_root; index_root} in
+      let prior = Some (parent sender_wallet records.(1)) in
+      let final = finalized sender_wallet prior changed in
+      let cert = certificate sender_wallet final view.state_root index_root in
+      let other = chain_read ~max_epochs:3 sender_wallet cert
+        (fun epoch -> Ok records.(Int64.to_int epoch)) |> unwrap in
+      rejected "admission mixes roots" "history admission checkpoint differs"
+        (Chain.admission other ~activation_epoch:5 [result]);
       check "interval unclaimed sender debit" (sender_total.sum.commitment =
         b64 (P.pedersen_sub (P.pedersen_commit_amount 100L (bytes '\000'))
           (Bytes.of_string (Base64.decode_exn transfer.PT.amount_commitment))));
@@ -705,9 +827,140 @@ let interval_case mode sender_key receiver_key transfer receipt deposit withdraw
       Printf.printf "event = claim_history phase = interval status = pass\n%!"
       end))
 
+let execution_case sender_key receiver_key transfer receipt deposit withdraw =
+  let module X = Octra_core.Epoch_exec in
+  let module L = Octra_core.Ledger in
+  let module G = Octra_core.Rule_graph in
+  let module Private = Octra_core.Private_transition in
+  let module W = Octra_core.Preverify_worker in
+  let module Build = Octra_node_runtime.Migration_build in
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let run = Lwt_main.run in
+  let funds = Z.of_int 1_000_000 in
+  let receipt = {receipt with SC.output_id = 0} in
+  let txs = [|
+    [];
+    [tx ~amount:(Z.of_int 100) sender sender T.EncryptOp deposit];
+    [tx ~nonce:2 sender "stealth" T.StealthOp (PT.to_json transfer)];
+    [tx receiver receiver T.ClaimOp (SC.to_json receipt)];
+    [tx ~nonce:2 ~amount:(Z.of_int 4) receiver receiver T.DecryptOp withdraw];
+  |] in
+  let receipts = Array.make (Array.length txs) [] in
+  Test_workspace.with_dir "claim_execution" (fun dir ->
+    let path = Filename.concat dir "irmin_store" in
+    let history = Filename.concat dir "chaindata" in
+    let store = run (S.open_store path) in
+    let archive = C.open_chaindata history in
+    let pins, cipher = Fun.protect
+      ~finally:(fun () -> C.close archive; run (S.close store)) (fun () ->
+      let ledger = L.create store in
+      List.iter (fun (address, public, key) ->
+        L.add_account_with_pubkey ledger address funds public |> unwrap;
+        run (L.set_pvac_pubkey ledger address key.H.blob);
+        L.set_pvac_kat ledger address (Octra_core.Pvac_registry.expected_kat ()))
+        [sender, sender_public, sender_key; receiver, receiver_public, receiver_key];
+      run (L.flush_dirty_lwt ledger);
+      run (S.set_meta store "total_supply" (Z.to_string (Z.mul (Z.of_int 2) funds)));
+      run (S.set_meta store "emission_remaining" "0");
+      run (S.set_meta store "last_epoch" "0");
+      run (S.tag_epoch store 0);
+      let root = run (S.state_hash store) in
+      let initial = R.{epoch = 0; index_root = E.genesis_root; next_txid = 0L;
+        state_root = E.folded_state_root ~ledger_state_root:root
+          ~epoch_index_root:E.genesis_root} in
+      let step prior epoch =
+        let backend = X.make_live_backend ~proof_mode:G.Active ~math:false
+          ~emission_policy:Octra_core.Emission_policy.Guard
+          ~emission_schedule:(Octra_core.Emission_schedule.of_env_exn (fun _ -> None))
+          ~validator_policy:(Octra_core.Validator_policy.of_env_exn (fun _ -> None))
+          store ledger in
+        let checked = List.map (fun tx ->
+          match run (W.run ~math:false ~field_policy:Octra_core.Private_ledger.Unique_fields
+            ~strict:true ~ledger tx) with
+          | W.Ready receipt -> receipt
+          | W.Defer reason | W.Skip reason -> failwith reason) txs.(epoch) in
+        receipts.(epoch) <- W.json_of_receipts checked;
+        let preverify = Octra_core.Preverify_commit.create checked in
+        let transition = Private.create ~math:false ~preverify:(Some preverify) ~ledger
+          ~epoch_id:epoch ~owner_migration_mode:G.Prior ~proof_mode:G.Active
+          ~field_policy:Octra_core.Private_ledger.Unique_fields
+          ~result_policy:Octra_core.Private_result_policy.Recoverable
+          ~legacy_replay:(Admission.decision (Admission.disabled ~chain_id))
+          ~limits:Private.{max_fhe = 1; max_stealth = 1} in
+        let env : X.env = {chain_id; epoch_id = epoch; proposer_addr = sender;
+          validator_addrs = [sender]; validator_pubkeys = [];
+          prev_state_root = run (L.hash ledger); epoch_ts = float_of_int epoch;
+          ready_state_root_at = None; ready_max_lag = 0} in
+        let result = run (X.run_checked ~preverify ~backend ~env ~txs:txs.(epoch)
+          ~process_tx:(Private.process transition)) |> unwrap in
+        check "execution confirmed"
+          (List.map fst result.artifacts.confirmed = txs.(epoch)
+           && result.artifacts.rejected = []);
+        C.begin_batch archive;
+        List.iter (fun (tx, _) ->
+          C.save_tx archive ~hash:(T.hash tx) ~epoch_id:epoch
+            ~from_addr:tx.T.from ~to_addr:tx.to_
+            ~tx_json:(Yojson.Safe.to_string (T.to_yojson tx))
+            ~op_type:(T.op_type_to_string tx.op_type)
+            ~encrypted_data:(Option.value ~default:"" tx.encrypted_data) ~message:"")
+          result.artifacts.confirmed;
+        let items = List.mapi (fun index (tx, _) -> E.item
+          ~txid:(Int64.add prior.R.next_txid (Int64.of_int index)) ~hash:(T.hash tx))
+          result.artifacts.confirmed in
+        let epoch_hash, index_root = E.next_root ~prev:prior.index_root ~epoch_id:epoch items in
+        let pin = R.{epoch; index_root; next_txid = Int64.succ prior.next_txid;
+          state_root = E.folded_state_root ~ledger_state_root:result.post_state_root
+            ~epoch_index_root:index_root} in
+        C.set_epoch archive {Octra_core.Epochlog.empty_epoch_header with
+          id = epoch; state_root = pin.state_root; prev_state_root = prior.state_root;
+          start_txid = prior.next_txid; tx_count = 1};
+        C.set_epoch_index_commitment archive ~epoch_id:epoch ~epoch_hash ~root:index_root;
+        C.commit_batch archive;
+        run (S.tag_epoch store epoch);
+        pin in
+      let pins = List.fold_left (fun pins epoch ->
+        step (List.hd pins) epoch :: pins) [initial] [1; 2; 3; 4] |> List.rev in
+      let account = L.find ledger receiver in
+      check "execution nonce" (account.nonce = 2);
+      let cipher = Option.get account.encrypted_balance in
+      let pk, sk = P.keygen_from_seed (P.default_params ()) (bytes '\002') in
+      check "execution private amount" (FB.get_balance pk sk cipher = Ok (Z.of_int 3));
+      check "execution supply"
+        (Z.equal (Z.add (L.get_total_supply ledger) (Z.of_int 96)) (Z.mul (Z.of_int 2) funds));
+      pins, cipher) in
+    let store = run (S.open_store ~readonly:true path) in
+    Fun.protect ~finally:(fun () -> run (S.close store)) (fun () ->
+      let records = List.fold_left (fun records pin ->
+        let prior = match records with [] -> None | record :: _ -> Some (parent sender_wallet record) in
+        finalized ~txs:txs.(pin.R.epoch) ~receipts:receipts.(pin.epoch)
+          sender_wallet prior pin :: records)
+        [] pins |> List.rev |> Array.of_list in
+      let expected = b64 (P.pedersen_commit_amount 3L (bytes '\003')) in
+      persist_journal ~last:4 ~transactions:(Array.get txs) ~receipts:(Array.get receipts)
+        dir records;
+      let view = run (S.capture_read_snapshot_epoch store ~epoch_id:4L) |> unwrap in
+      let cert = certificate sender_wallet records.(4) view.state_root (List.nth pins 4).R.index_root in
+      let request = Build.{data_dir = dir; chain_id; config_hash = digest "claim-history-config";
+        certificate = cert; validator_set = members ~encoded:true sender_wallet;
+        exporter_set = members ~encoded:true sender_wallet; first_epoch = 0;
+        activation_epoch = 5; addresses = [receiver]; max_epochs = 5; max_txs = 1; max_records = 4} in
+      let artifact = Build.read request |> unwrap in
+      let decision = Admission.decision artifact ~epoch:5 ~address:receiver ~cipher in
+      check "execution admission point" (decision.commitment_net = Some expected);
+      check "execution admission no public mint"
+        (decision.public_net = None && not decision.can_public_migrate);
+      admission_proof decision receiver_key;
+      Array.iteri (fun index record ->
+        match Journal.read_committed_epoch ~chain_id ~epoch:(Int64.of_int index) dir with
+        | Journal.Valid item -> check "execution journal" (item.finalize = record)
+        | _ -> failwith "execution journal missing") records));
+  Printf.printf "event = claim_history phase = execution status = pass\n%!"
+
 let run () =
+  journal_case ();
   chain_rules ();
   let sender_key, receiver_key, transfer, receipt, deposit, withdraw = material () in
+  execution_case sender_key receiver_key transfer receipt deposit withdraw;
   amount_case sender_key receiver_key deposit withdraw;
   let send_json = PT.to_json transfer in
   let claim_json = SC.to_json receipt in

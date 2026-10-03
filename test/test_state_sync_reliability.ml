@@ -101,24 +101,33 @@ let test_read_only_retention () =
 
 let test_manifest_epoch_limit () =
   let limit = Http.manifest_epoch_limit in
-  begin
-    match
-      Http.snapshot_epoch_state
-        ~current_epoch:1_000L
-        ~snapshot_epoch:(Int64.sub 1_000L limit)
-    with
-    | `Ready lag when lag = limit -> ()
-    | _ -> fail "snapshot at lag limit was rejected"
-  end;
-  begin
-    match
-      Http.snapshot_epoch_state
-        ~current_epoch:1_000L
-        ~snapshot_epoch:(Int64.pred (Int64.sub 1_000L limit))
-    with
-    | `Old_epoch lag when lag = Int64.succ limit -> ()
-    | _ -> fail "old snapshot was accepted"
-  end
+  if limit <> 3_000L then fail "snapshot lag allowance differs";
+  if limit >= Octra_node_runtime.Consensus_finality_journal.history_limit then
+    fail "snapshot exceeds retained finality";
+  List.iter (fun lag ->
+    let actual = Http.snapshot_epoch_state
+      ~current_epoch:10_000L ~snapshot_epoch:(Int64.sub 10_000L lag) in
+    let expected = if lag <= 3_000L then `Ready lag else `Old_epoch lag in
+    if actual <> expected then fail "snapshot lag decision differs")
+    [0L; 360L; 720L; 721L; 1_060L; 2_999L; 3_000L; 3_001L; 4_096L; 5_000L]
+
+let test_staged_retention () =
+  Test_workspace.with_dir "sync_archive" (fun root ->
+    let key = "OCTRA_STATE_SYNC_SNAPSHOT_DIR" in
+    let prior = Sys.getenv_opt key in
+    Fun.protect
+      ~finally:(fun () -> Unix.putenv key (Option.value ~default:"" prior))
+      (fun () ->
+        Unix.putenv key root;
+        let stage = Filename.concat root (String.make 64 'b' ^ ".next") in
+        Unix.mkdir stage 0o750;
+        ignore (Octra_bootstrap.Sync_archive.run root (fun archive ->
+          Octra_bootstrap.Sync_archive.mark_stage archive (String.make 64 'b'))
+          |> expect_ok);
+        write (Filename.concat stage "ledger.dat") "unfinished";
+        let errors = Publish.retain root ~retain:2 ~current:(fun () -> String.make 64 'c') in
+        if errors <> [] then fail "staged retention rejected its own path";
+        if Sys.file_exists stage then fail "abandoned stage remains"))
 
 let test_committed_epoch () =
   let current = ref 1_001 in
@@ -158,6 +167,8 @@ let () =
   test_published_epoch ();
   test_published_before_capture ();
   test_read_only_retention ();
+  test_staged_retention ();
+  Sync_archive_case.run ();
   test_manifest_epoch_limit ();
   test_committed_epoch ();
   test_busy_delay ();

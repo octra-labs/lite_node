@@ -122,6 +122,14 @@ let test_payload_forms () =
     unresolved "claim encoding" (read (history @ [receipt]))) [receipt; encoded];
   check "equivalent encoding" (read [receipt] = read [encoded])
 
+let test_public_subtotal () =
+  let values = [claim (); tx ~amount:"4" "decrypt"] in
+  let decision = read values in
+  check "unverified negative subtotal refused" (decision.audit_class = R.Poisoned);
+  check "unverified credit has no point" (decision.commitment_net = None);
+  check "unverified credit has no public amount" (decision.public_net = None);
+  check "unverified credit cannot migrate" (not decision.can_public_migrate)
+
 let entry replay = A.{
   address = addr;
   source_cipher_hash = A.source_cipher_hash cipher;
@@ -133,6 +141,23 @@ let artifact decision =
   A.create ~chain_id:"octra-devnet" ~snapshot_epoch:99
     ~state_root:(String.make 64 '1') ~activation_epoch:100 [entry decision]
   |> unwrap
+
+let test_receipt_shape () =
+  let decision = R.{audit_class = Hidden_witness; can_public_migrate = false;
+    public_net = None; commitment_net = Some (encode (point 3L '\003'));
+    blockers = []; effects = []; reason = "authenticated history requires commitment proof"} in
+  let create decision = A.create ~classifier:A.Receipt_v1 ~chain_id:"octra-devnet"
+    ~snapshot_epoch:99 ~state_root:(String.make 64 '1') ~activation_epoch:100 [entry decision] in
+  ignore (create decision |> unwrap);
+  List.iter (fun invalid ->
+    check "receipt decision rejected" (match create invalid with Error _ -> true | _ -> false)) [
+    {decision with audit_class = R.Public_clean};
+    {decision with audit_class = R.Poisoned};
+    {decision with can_public_migrate = true};
+    {decision with public_net = Some Z.zero};
+    {decision with commitment_net = None};
+    {decision with blockers = ["history incomplete"]};
+  ]
 
 let with_artifact decision action =
   W.with_dir "history_total" (fun root ->
@@ -196,6 +221,8 @@ let () =
   test_unresolved ();
   test_carried_points ();
   test_payload_forms ();
+  test_public_subtotal ();
+  test_receipt_shape ();
   test_artifact ();
   test_store ();
   print_endline "status = pass test = history_total"

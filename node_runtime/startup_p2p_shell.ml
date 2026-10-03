@@ -102,6 +102,7 @@ type node_start_runtime = {
 
 type node_start = {
   view : node_view;
+  prepare_set : epoch:int64 -> Octra_consensus.C_types.validator_set -> (unit, string) result;
   load_scheduled_validator_set_config :
     unit ->
     Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t;
@@ -331,19 +332,24 @@ let runtime_config_hash runtime view active scheduled =
   else
     raw32_zero
 
-let install_runtime_validator_config runtime view active scheduled =
+let install_set runtime view active scheduled =
   let config_hash = runtime_config_hash runtime view active scheduled in
   match
     Octra_net.P2p_swarm.set_validator_pubkeys
       view.swarm
       (validator_pubkeys active)
   with
-  | Error error -> Lwt.fail_with error
+  | Error _ as error -> error
   | Ok () ->
     runtime.install.set_consensus_validator_set active;
     runtime.install.set_scheduled_validator_set scheduled;
     runtime.install.set_consensus_config_hash config_hash;
-    Lwt.return_unit
+    Ok ()
+
+let install_runtime_validator_config runtime view active scheduled =
+  match install_set runtime view active scheduled with
+  | Ok () -> Lwt.return_unit
+  | Error reason -> Lwt.fail_with reason
 
 let start_node runtime =
   match build_node_view (request_of_runtime runtime) with
@@ -360,6 +366,26 @@ let start_node runtime =
         view.validator_config;
     let active = ref view.active_vs in
     let scheduled = ref view.scheduled_validator_set_config in
+    let select validator_set fingerprint =
+      let next =
+        match !scheduled with
+        | Some config when
+            same_validator_set validator_set
+              (Octra_consensus.C_types.validator_set_for_epoch
+                 ~chain_id:runtime.chain_id ~epoch_id:config.activate_epoch
+                 config.validator_set)
+            && String.equal fingerprint config.fingerprint -> None
+        | current -> current
+      in
+      let light = Validator_config.light_scheduled_of_driver
+        ~chain_id:runtime.chain_id next in
+      match install_set runtime view validator_set light with
+      | Error _ as error -> error
+      | Ok () ->
+        active := validator_set;
+        scheduled := next;
+        Ok ()
+    in
     let install scheduled_driver =
       let light =
         Validator_config.light_scheduled_of_driver
@@ -379,6 +405,11 @@ let start_node runtime =
     in
     {
       view;
+      prepare_set = (fun ~epoch validator_set ->
+        let fingerprint = match !scheduled with
+          | Some config when Int64.compare epoch config.activate_epoch >= 0 -> config.fingerprint
+          | _ -> "" in
+        select validator_set fingerprint);
       load_scheduled_validator_set_config = (fun () ->
         let open Lwt.Syntax in
         let* loaded = load_runtime_persistent_update runtime in
@@ -404,21 +435,9 @@ let start_node runtime =
           in
           Lwt.return next);
       activate_validator_set = (fun validator_set fingerprint ->
-        let next =
-          match !scheduled with
-          | Some config when
-              same_validator_set
-                validator_set
-                (Octra_consensus.C_types.validator_set_for_epoch
-                   ~chain_id:runtime.chain_id
-                   ~epoch_id:config.activate_epoch
-                   config.validator_set)
-              && String.equal fingerprint config.fingerprint ->
-            None
-          | current -> current
-        in
-        active := validator_set;
-        install next);
+        match select validator_set fingerprint with
+        | Ok () -> Lwt.return_unit
+        | Error reason -> Lwt.fail_with reason);
       activate_validator_set_relief = (fun validator_set _ ->
         active := validator_set;
         install !scheduled);

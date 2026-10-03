@@ -475,7 +475,8 @@ let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~dept
             "event = spawn_start addr = %s deployer = %s nonce = %d depth = %d"
             addr (String.sub deployer 0 (min 12 (String.length deployer))) nonce depth;
           let storage_tbl = Hashtbl.create 100 in
-          let depth = if ctx.fhe_work = Octra_core.Rule_graph.Active then depth else 0 in
+          let depth = if ctx.fhe_work = Octra_core.Rule_graph.Active
+            || ctx.byte_work <> None then depth else 0 in
           let state = Contract_vm.create_state ~ctx ~depth ~limit ~strict_values ~storage_kinds
             ~caller:deployer ~origin:deployer ~address:addr ~value:Z.zero
             ~storage:storage_tbl () in

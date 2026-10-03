@@ -67,6 +67,7 @@ type deps = {
     ?catch_exn:bool ->
     Consensus_proposal.build_preview_request ->
     (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+  prepare_at : Consensus_driver_wiring.prepare_at;
   apply_catchup_record :
     Consensus_catchup_shell.validated_record ->
     unit Lwt.t;
@@ -88,6 +89,7 @@ type deps = {
     epoch:int ->
     (string * string) list;
   proposal_capacity : Z.t;
+  save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   quarantine_mismatch_threshold : int;
   soft_catchup_max_lag : int;
   quarantine_ahead_streak_threshold : int;

@@ -9,6 +9,11 @@ type runtime = {
   env : pre_state_root:string -> Octra_core.Epoch_exec.env;
 }
 
+val circle_state :
+  string ->
+  Octra_circle_runtime.Circle_exec.hfhe_binding ->
+  Octra_core.Preverify_receipt.circle_state
+
 val run :
   runtime ->
   pre_state_hash:string ->

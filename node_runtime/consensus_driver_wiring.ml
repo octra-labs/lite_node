@@ -5,6 +5,8 @@ module Transaction = Octra_core.Transaction
 module Address = Octra_core.Crypto.Address
 module Staging = Octra_core.Tx_staging
 
+type prepare_at = int64 -> (Consensus_proposal.prepare option, string) result
+
 type gates = {
   consensus_mode : unit -> bool;
   voting : unit -> bool;
@@ -75,6 +77,7 @@ type node_standard_adapter_runtime = {
   proposal_state : Consensus_proposal_state.t;
   catchup_active : bool ref;
   staging_epoch_capacity : Z.t;
+  save_drops : Staging.drop_record list -> unit;
   write_pending : Octra_core.Wal.pending_commit -> unit;
   validator_pubkeys_for_epoch :
     wallet_addr:string ->
@@ -96,9 +99,10 @@ type standard_adapters = {
   next_txid : unit -> int64;
   read_prev_ledger_root : unit -> string option Lwt.t;
   staging_txs : unit -> Transaction.t list;
-  staging_epoch_txs : unit -> Transaction.t list;
+  staging_epoch_txs : ?circles:bool -> unit -> Transaction.t list;
   staging_total : unit -> int;
   proposer : unit -> string;
+  evict_preview : Transaction.t -> unit;
   head_txid_hi : unit -> int64 option;
   set_proposal : Transaction.t list -> string list -> unit;
   current_tx_hashes : unit -> string list;
@@ -107,7 +111,7 @@ type standard_adapters = {
   set_catchup_active : bool -> unit;
 }
 
-type proposal_preview_runtime = {
+type 'a proposal_preview_runtime = {
   chain_id : string;
   ready_state_root_at : int -> string option Lwt.t;
   ready_max_lag : int;
@@ -116,7 +120,7 @@ type proposal_preview_runtime = {
     Consensus_proposal.build_preview_request ->
     reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
-    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+    ('a, string) result Lwt.t;
 }
 
 type deps = {
@@ -135,9 +139,10 @@ type deps = {
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
   staging_txs : unit -> Transaction.t list;
-  staging_epoch_txs : unit -> Transaction.t list;
+  staging_epoch_txs : ?circles:bool -> unit -> Transaction.t list;
   staging_total : unit -> int;
   build_preverify : Consensus_preverify_role.build;
+  evict_preview : Transaction.t -> unit;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
@@ -260,6 +265,7 @@ type config_with_standard_input = {
 }
 
 type node_driver_config_runtime = {
+  prepare_at : prepare_at;
   standard : node_standard_adapter_runtime;
   chain_id : string;
   my_addr : string;
@@ -415,7 +421,16 @@ let node_standard_adapters
     next_txid = runtime.next_txid;
     read_prev_ledger_root = runtime.read_prev_ledger_root;
     staging_txs = Staging.all;
-    staging_epoch_txs = (fun () ->
+    evict_preview = (fun tx ->
+      match Staging.drop_preview tx with
+      | None -> ()
+      | Some row ->
+        runtime.save_drops [row];
+        Preverify_cache.remove row.d_hash;
+        Octra_log.info "staging"
+          "event = proposal_drop hash = %s reason = preview_rejected" row.d_hash;
+        Node_rest_facade.notify_staging_update ());
+    staging_epoch_txs = (fun ?(circles = true) () ->
       let head = runtime.cached_head () in
       let accept = match head with
         | Some head when head.epoch_id < max_int
@@ -444,7 +459,10 @@ let node_standard_adapters
                    | Error _ -> false))
         | _ -> (fun _ -> true)
       in
-      let accept tx = accept tx && match head with
+      let accept tx = accept tx
+        && (circles || not (Octra_core.Preverify_worker.snapshot_transition tx))
+        && Result.is_ok (Octra_core.Resource_lanes.circle_admission tx)
+        && match head with
         | Some head when head.epoch_id < max_int ->
           Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id:runtime.chain_id
             ~epoch:(Int64.of_int (head.epoch_id + 1)) [tx])
@@ -487,7 +505,7 @@ let preview_with_optional_catch ~catch_exn ~warn run =
     run ()
 
 let node_proposal_preview
-    (runtime : proposal_preview_runtime)
+    (runtime : 'a proposal_preview_runtime)
     ?(catch_exn = false)
     (request : Consensus_proposal.build_preview_request) =
   let run () =
@@ -696,9 +714,13 @@ let make_proposal_deps (deps : deps) =
     cached_head = deps.cached_head;
     current_round = deps.current_round;
     parent_commit = deps.load_parent_commit;
+    parent_txs = (fun pid ->
+      Consensus_bundle_cache.cached_with_log deps.proposal_bundles pid
+      |> Option.map (fun (bundle : Consensus_bundle_cache.decoded) -> bundle.txs));
     frozen_bundle = Consensus_bundle_cache.find_frozen deps.proposal_bundles;
     store_bundle = deps.store_bundle;
     staging_txs = deps.staging_epoch_txs;
+    evict_preview = deps.evict_preview;
     admits_tx = (fun tx ->
       (not (deps.gates.consensus_mode ()))
       || Transaction.bft_consensus_admits_op
@@ -775,7 +797,14 @@ let before_precommit (deps : deps) ~epoch_id ~round ~proposal_id ~proposed_state
       ~proposal_wire
       ~vote_wire)
 
-let config ?private_slots (deps : deps) =
+let config ?private_slots ?(prepare_at = fun _ -> Ok None) (deps : deps) =
+  let prepare_for epoch =
+    let result = prepare_at epoch in
+    Result.iter_error (fun reason ->
+      Octra_log.warn "consensus"
+        "event = proposal_rule_wait epoch = %Ld reason = %s" epoch reason) result;
+    result
+  in
   Octra_consensus.C_driver.{
     chain_id = deps.chain_id;
     my_addr = deps.my_addr;
@@ -797,10 +826,14 @@ let config ?private_slots (deps : deps) =
     can_vote = (fun () -> can_vote deps);
     execute_fn = (fun _propose -> true);
     verify_proposal = (fun propose ->
-      Consensus_proposal.verify_proposal
-        (verify_proposal_deps deps)
-        ~chain_id:deps.chain_id
-        propose);
+      match prepare_for propose.epoch_id with
+      | Error _ -> Lwt.return Octra_consensus.C_driver.Proposal_wait
+      | Ok prepare ->
+        Consensus_proposal.verify_proposal
+          ?prepare
+          (verify_proposal_deps deps)
+          ~chain_id:deps.chain_id
+          propose);
     verify_parent_commit = deps.verify_parent_commit;
     on_finalized = (fun ~validator_set finalize ->
       Consensus_finalized_shell.handle
@@ -808,13 +841,17 @@ let config ?private_slots (deps : deps) =
         ~validator_set
         finalize);
     make_proposal = (fun epoch_id ->
-      Consensus_proposal.make_proposal
-        ?private_slots
-        (make_proposal_deps deps)
-        ~chain_id:deps.chain_id
-        ~root_to_raw32:deps.root_to_raw32
-        ~limits:deps.proposal_limits
-        ~epoch_id);
+      match prepare_for epoch_id with
+      | Error _ -> Lwt.return_none
+      | Ok prepare ->
+        Consensus_proposal.make_proposal
+          ?prepare
+          ?private_slots
+          (make_proposal_deps deps)
+          ~chain_id:deps.chain_id
+          ~root_to_raw32:deps.root_to_raw32
+          ~limits:deps.proposal_limits
+          ~epoch_id);
     before_precommit_broadcast = before_precommit deps;
     lookup_epoch_root = Consensus_driver_read.epoch_root deps.driver_read_deps;
     local_head_epoch = (fun () ->
@@ -829,9 +866,9 @@ let config ?private_slots (deps : deps) =
     resource_committee_config = None;
   }
 
-let config_with_standard ?private_slots (input : config_with_standard_input) =
+let config_with_standard ?private_slots ?prepare_at (input : config_with_standard_input) =
   let standard = input.standard in
-  config ?private_slots
+  config ?private_slots ?prepare_at
     {
       chain_id = input.chain_id;
       my_addr = input.my_addr;
@@ -850,6 +887,7 @@ let config_with_standard ?private_slots (input : config_with_standard_input) =
       staging_txs = standard.staging_txs;
       staging_epoch_txs = standard.staging_epoch_txs;
       staging_total = standard.staging_total;
+      evict_preview = standard.evict_preview;
       build_preverify = input.build_preverify;
       validate_preverify = input.validate_preverify;
       proposal_bundles = input.proposal_bundles;
@@ -898,6 +936,7 @@ let node_driver_config (runtime : node_driver_config_runtime) =
       Option.value ~default (Option.bind (getenv name) int_of_string_opt));
   } in
   config_with_standard
+    ~prepare_at:runtime.prepare_at
     ~private_slots:Octra_core.Private_slots.{
       fhe = private_limits.max_fhe_per_epoch;
       stealth = private_limits.max_stealth_per_epoch;

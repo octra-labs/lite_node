@@ -174,7 +174,7 @@ type t = {
   jobs : (string, job) Hashtbl.t;
   job_order : string Queue.t;
   caller_jobs : (string, int) Hashtbl.t;
-  cancelled_sessions : (string, int64) Hashtbl.t;
+  cancelled_sessions : (string, string * int64) Hashtbl.t;
   committee_leases : (string, committee_lease) Hashtbl.t;
   background_tasks : (int, unit Lwt.t) Hashtbl.t;
   mutable next_background_id : int;
@@ -196,6 +196,7 @@ let max_offers = 64
 let max_requests = 128
 let max_jobs = 32
 let max_cancelled_sessions = 256
+let max_caller_sessions = max_jobs
 let max_committee_leases = 256
 let max_offer_records = 256
 let max_pending_reveals_per_node = 4
@@ -256,7 +257,7 @@ let rec enqueue_wait t command =
     enqueue_wait t command
 
 let actor_call_with enqueue t message =
-  let result, set_result = Lwt.wait () in
+  let result, set_result = Lwt.task () in
   let command = Command {
     generation = t.actor_generation;
     message;
@@ -1618,32 +1619,25 @@ let release_job_lease t (job : job) =
 
 let prune_cancelled_sessions t epoch_id =
   Hashtbl.filter_map_inplace
-    (fun _ expires_epoch ->
+    (fun _ ((_, expires_epoch) as entry) ->
       if Int64.compare expires_epoch epoch_id < 0 then None
-      else Some expires_epoch)
+      else Some entry)
     t.cancelled_sessions
-
-let evict_cancelled_session t =
-  if Hashtbl.length t.cancelled_sessions >= max_cancelled_sessions then begin
-    let oldest =
-      Hashtbl.fold
-        (fun key expires_epoch current ->
-          match current with
-          | None -> Some (key, expires_epoch)
-          | Some (current_key, current_epoch) ->
-            if
-              Int64.compare expires_epoch current_epoch < 0
-              || (Int64.equal expires_epoch current_epoch
-                  && String.compare key current_key < 0)
-            then Some (key, expires_epoch)
-            else current)
-        t.cancelled_sessions
-        None in
-    Option.iter (fun (key, _) -> Hashtbl.remove t.cancelled_sessions key) oldest
-  end
 
 let session_cancelled t caller session_id =
   Hashtbl.mem t.cancelled_sessions (cancellation_key caller session_id)
+
+let cancel_available t caller session_id =
+  let count, own = Hashtbl.fold (fun _ (owner, _) (count, own) ->
+    count + 1, own + (if owner = caller then 1 else 0))
+    t.cancelled_sessions (0, 0) in
+  let count, own, reserved = Hashtbl.fold (fun _ (job : job) (count, own, reserved) ->
+    if job.lease_active && not (session_cancelled t job.caller job.session_id) then
+      count + 1, own + (if job.caller = caller then 1 else 0),
+      reserved || (job.caller = caller && job.session_id = session_id)
+    else count, own, reserved) t.jobs (count, own, false) in
+  session_cancelled t caller session_id || reserved
+  || (count < max_cancelled_sessions && own < max_caller_sessions)
 
 let verify_cancellation t (cancellation : cancellation) =
   let public_key_b64 = Base64.encode_exn cancellation.caller_public_key in
@@ -1700,29 +1694,29 @@ let cancel_session_direct t (cancellation : cancellation) =
     | Error message -> Error message
     | Ok head ->
       prune_cancelled_sessions t head.epoch_id;
-      evict_cancelled_session t;
-      Hashtbl.replace
-        t.cancelled_sessions
-        (cancellation_key cancellation.caller cancellation.session_id)
-        (Int64.add head.epoch_id call_ttl);
-      Hashtbl.remove
-        t.committee_leases
-        (cancellation_key cancellation.caller cancellation.session_id);
-      let cancelled =
-        Hashtbl.fold
-          (fun _ (job : job) count ->
-            if
-              job.caller = cancellation.caller
-              && job.session_id = cancellation.session_id
-              && Lwt.is_sleeping job.result
-            then begin
-              release_job_lease t job;
-              Lwt.cancel job.result;
-              count + 1
-            end else count)
-          t.jobs
-          0 in
-      Ok cancelled
+      let key = cancellation_key cancellation.caller cancellation.session_id in
+      if not (cancel_available t cancellation.caller cancellation.session_id)
+      then Error "resource compute cancellation table full"
+      else begin
+        Hashtbl.replace t.cancelled_sessions key
+          (cancellation.caller, Int64.add head.epoch_id call_ttl);
+        Hashtbl.remove t.committee_leases key;
+        let cancelled =
+          Hashtbl.fold
+            (fun _ (job : job) count ->
+              if
+                job.caller = cancellation.caller
+                && job.session_id = cancellation.session_id
+                && Lwt.is_sleeping job.result
+              then begin
+                release_job_lease t job;
+                Lwt.cancel job.result;
+                count + 1
+              end else count)
+            t.jobs
+            0 in
+        Ok cancelled
+      end
 
 let compute_new t request validator_set_root offer =
   Log.info "compute" "event = committee status = offered";
@@ -1812,6 +1806,8 @@ let start_job_direct t request =
             Error "resource compute job table full"
           | None when not (caller_admitted t request.caller) ->
             Error "resource compute caller already active"
+          | None when not (cancel_available t request.caller request.session_id) ->
+            Error "resource compute cancellation table full"
           | None ->
             let computation =
               match committee_lease_for_request t request head validator_set_root with
@@ -1907,11 +1903,28 @@ let stop_direct t =
   Lwt_condition.broadcast t.channel_ready ();
   Lwt_condition.broadcast t.channel_space ()
 
+let prune_work t =
+  match current_head t with
+  | Error _ -> ()
+  | Ok head ->
+    prune_cancelled_sessions t head.epoch_id;
+    Hashtbl.filter_map_inplace (fun _ (state : offer_state) ->
+      if head.epoch_id <= state.offer.Protocol.expires_epoch then Some state
+      else None) t.offers;
+    Hashtbl.filter_map_inplace (fun _ (state : request_state) ->
+      if head.epoch_id <= state.call.Protocol.request.expires_epoch then Some state
+      else None) t.requests
+
 let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
   fun t message ->
     match message with
     | Apply_protocol { wire_key; message } ->
-      if not (Octra_consensus.C_seen.remember t.seen wire_key) then
+      prune_work t;
+      let cancelled = match message with
+        | Protocol.Call call ->
+          session_cancelled t call.request.caller call.request.session_id
+        | _ -> false in
+      if cancelled || not (Octra_consensus.C_seen.remember t.seen wire_key) then
         Lwt.return_false
       else
         apply_message_direct t message

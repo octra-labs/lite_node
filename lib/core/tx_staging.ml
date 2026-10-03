@@ -544,6 +544,14 @@ let remove_processed hashes =
   ) hashes;
   clear_virtual_state touched
 
+let drop_preview tx =
+  let hash = Transaction.hash tx in
+  match Hashtbl.find_opt hash_index hash with
+  | None -> None
+  | Some entry ->
+    remove_processed [hash];
+    Some (record_drop hash entry.tx Evicted "preview rejected")
+
 let expire_duty ?sender ?(mode = Rule_graph.Prior) ~head () =
   match head with
   | None -> []

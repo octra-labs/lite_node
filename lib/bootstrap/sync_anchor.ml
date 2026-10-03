@@ -221,7 +221,7 @@ let verify_anchor_finalize ~chain_id ~validator_set finalize =
   if C_types.has_quorum vote_set signers then Ok ()
   else Error "finality qc signer quorum"
 
-let verify_step ~chain_id ~prior_epoch validator_set (step : step) =
+let step_input ~chain_id ~prior_epoch validator_set (step : step) =
   let epoch = step.finalize.C_types.epoch_id in
   match prior_epoch with
   | Some prior when Int64.compare epoch prior <= 0 ->
@@ -266,23 +266,20 @@ let verify_step ~chain_id ~prior_epoch validator_set (step : step) =
       if Checkpoint.raw_to_hex step.finalize.header.proposed_state_root <> folded then
         Error "validator transition folded root mismatch"
       else
-        let* value =
-          Irmin.verify_merkle_proof_det
-            ~ledger_state_root:step.ledger_state_root
-            ~path
-            ~proof:step.proof
-        in
-        if value <> Some step.update then
-          Error "validator transition state proof mismatch"
-        else
-          let* next = Update.validator_set update in
-          let next =
-            C_types.validator_set_for_epoch
-              ~chain_id
-              ~epoch_id:update.activate_epoch
-              next
-          in
-          Ok (Some epoch, next)
+        Ok (epoch, update, path)
+
+let step_output ~chain_id step (epoch, update, path) =
+  let* value = Irmin.verify_merkle_proof_det
+    ~ledger_state_root:step.ledger_state_root ~path ~proof:step.proof in
+  if value <> Some step.update then Error "validator transition state proof mismatch"
+  else
+    let* next = Update.validator_set update in
+    let next = C_types.validator_set_for_epoch ~chain_id ~epoch_id:update.activate_epoch next in
+    Ok (Some epoch, next)
+
+let verify_step ~chain_id ~prior_epoch validator_set step =
+  let* input = step_input ~chain_id ~prior_epoch validator_set step in
+  step_output ~chain_id step input
 
 let derive ~validator_set:trusted value =
   let* trusted = raw_validator_set trusted in
@@ -358,3 +355,95 @@ let verify ~validator_set checkpoint encoded =
   else
     let* () = verify_checkpoint checkpoint value in
     Ok value
+
+let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
+  let open Lwt.Syntax in
+  if cancelled () then Lwt.return_error "state sync verification cancelled" else
+  match raw_validator_set validator_set with
+  | Error reason -> Lwt.return_error reason
+  | Ok trusted ->
+      let rec loop prior current = function
+        | [] ->
+          let* () = Lwt.pause () in
+          if cancelled () then Lwt.return_error "state sync verification cancelled"
+          else if not (same_set current value.validator_set) then
+            Lwt.return_error "finality validator transition is incomplete"
+          else Lwt.return_ok current
+        | (step : step) :: rest ->
+          let* () = Lwt.pause () in
+          if cancelled () then Lwt.return_error "state sync verification cancelled"
+          else if Int64.compare step.finalize.epoch_id value.finalize.epoch_id >= 0 then
+            Lwt.return_error "validator transition is not before checkpoint"
+          else
+            let chain_id = value.finalize.chain_id in
+            let* input = Lwt_preemptive.detach
+              (fun () -> step_input ~chain_id ~prior_epoch:prior current step) () in
+            if cancelled () then Lwt.return_error "state sync verification cancelled"
+            else match Result.bind input (step_output ~chain_id step) with
+            | Error reason -> Lwt.return_error reason
+            | Ok (prior, current) -> loop prior current rest
+      in
+      loop None trusted value.steps
+
+module Paths = Map.Make(String)
+
+type path = {
+  length : int;
+  reversed : step list;
+}
+
+let compact_lwt ?(cancelled = fun () -> false) ~validator_set value =
+  let open Lwt.Syntax in
+  let* checked = derive_lwt ~cancelled ~validator_set value in
+  match checked with
+  | Error _ as error -> Lwt.return error
+  | Ok _ ->
+      let empty = { length = 0; reversed = [] } in
+      let initial = Result.map C_config.validator_set_hash (raw_validator_set validator_set) in
+      begin match initial with
+      | Error reason -> Lwt.return_error reason
+      | Ok initial ->
+          let rec loop paths selected = function
+            | [] -> Lwt.return_ok { value with steps = List.rev selected.reversed }
+            | step :: rest ->
+                let* () = Lwt.pause () in
+                if cancelled () then Lwt.return_error "state sync verification cancelled"
+                else
+                  let* next = Lwt_preemptive.detach (fun () ->
+                    Result.bind (Update.of_string step.update) (fun update ->
+                      Result.map (fun next ->
+                        C_types.validator_set_for_epoch
+                          ~chain_id:value.finalize.chain_id ~epoch_id:update.activate_epoch next
+                        |> C_config.validator_set_hash)
+                        (Update.validator_set update))) () in
+                  match next with
+                  | Error reason -> Lwt.return_error reason
+                  | Ok next ->
+                      let extended = { length = selected.length + 1;
+                        reversed = step :: selected.reversed } in
+                      let selected = match Paths.find_opt next paths with
+                        | Some prior when prior.length <= extended.length -> prior
+                        | _ -> extended in
+                      loop (Paths.add next selected paths) selected rest
+          in
+          let* result = loop (Paths.singleton initial empty) empty value.steps in
+          match result with
+          | Error _ as error -> Lwt.return error
+          | Ok reduced ->
+              let* verified = derive_lwt ~cancelled ~validator_set reduced in
+              Lwt.return (Result.map (fun _ -> reduced) verified)
+      end
+
+let verify_lwt ?(cancelled = fun () -> false) ~validator_set checkpoint encoded =
+  let open Lwt.Syntax in
+  if cancelled () then Lwt.return_error "state sync verification cancelled" else
+  let* decoded = Lwt_preemptive.detach decode encoded in
+  match decoded with
+  | Error reason -> Lwt.return_error reason
+  | Ok value ->
+      let* derived = derive_lwt ~cancelled ~validator_set value in
+      match derived with
+      | Error reason -> Lwt.return_error reason
+      | Ok _ ->
+          Lwt_preemptive.detach (fun () ->
+            Result.map (fun () -> value) (verify_checkpoint checkpoint value)) ()

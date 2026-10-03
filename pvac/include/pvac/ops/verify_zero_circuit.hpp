@@ -656,13 +656,13 @@ inline bool verify_zero(
     }
 
     auto A = compute_layer_coeffs(pk, ct);
-    bp::R1CSProver dummy(rule);
+    auto dummy = bp::R1CSProver::verification(rule);
     detail::build_key_bound_circuit(dummy, pk, nullptr, ct, A, bases, nullptr, nullptr);
 
     bp::ConstraintSystem cs;
     cs.num_gates = dummy.num_gates();
     cs.num_committed = dummy.num_committed();
-    cs.constraints = dummy.get_constraints();
+    cs.constraints = std::move(dummy).get_constraints();
 
     bp::Transcript transcript("pvac.verify_zero.key_bound", rule);
     transcript.append_u64("nL", nL);
@@ -811,7 +811,7 @@ inline bool verify_zero_bound_checked(
     if (proof.proof.V[amount_idx] != amount_commitment) return false;
 
     detail::AmountBinding dummy_bind;
-    bp::R1CSProver dummy(rule);
+    auto dummy = bp::R1CSProver::verification(rule);
     detail::build_key_bound_circuit(
         dummy,
         pk,
@@ -828,7 +828,7 @@ inline bool verify_zero_bound_checked(
     bp::ConstraintSystem cs;
     cs.num_gates = dummy.num_gates();
     cs.num_committed = dummy.num_committed();
-    cs.constraints = dummy.get_constraints();
+    cs.constraints = std::move(dummy).get_constraints();
 
     bp::Transcript transcript(transcript_label, rule);
     transcript.append_u64("nL", nL);
@@ -1061,7 +1061,7 @@ inline bool verify_zero_bound_range_checked(
 
     detail::AmountBinding dummy_bind;
     dummy_bind.range_bits = 64;
-    bp::R1CSProver dummy(rule);
+    auto dummy = bp::R1CSProver::verification(rule);
     detail::build_key_bound_circuit(
         dummy,
         pk,
@@ -1078,7 +1078,7 @@ inline bool verify_zero_bound_range_checked(
     bp::ConstraintSystem cs;
     cs.num_gates = dummy.num_gates();
     cs.num_committed = dummy.num_committed();
-    cs.constraints = dummy.get_constraints();
+    cs.constraints = std::move(dummy).get_constraints();
 
     bp::Transcript transcript("pvac.verify_zero_bound_range.key_bound", rule);
     transcript.append_u64("nL", nL);

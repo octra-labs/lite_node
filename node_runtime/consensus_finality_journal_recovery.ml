@@ -16,7 +16,7 @@ type invalid_plan =
   | Block_invalid
 
 type deps = {
-  read_journal : unit -> Journal.read_result;
+  read_journal : unit -> (Journal.read_result, Journal.read_error) result;
   read_pending_epoch : unit -> (int64 option, string) result;
   drop_invalid_unapplied : head_epoch:int -> (int, string) result;
   head_epoch : unit -> int;
@@ -203,8 +203,19 @@ let recover deps record =
 
 let run deps =
   match deps.read_journal () with
-  | Journal.Missing -> Continue
-  | Journal.Invalid reason ->
+  | Error error ->
+    let action, prefix, reason = match error with
+      | Journal.Read_set reason -> "wait_set", "finality_journal_set_unavailable:", reason
+      | Journal.Read_record reason -> "wait_record", "finality_journal_record_unreadable:", reason
+      | Journal.Read_bundle reason -> "wait_bundle", "finality_journal_bundle_invalid:", reason in
+    deps.clear_state_attested ();
+    deps.mark_quarantine (prefix ^ reason);
+    Log.warn "finality"
+      "event = finality_journal_recovery action = %s reason = %s"
+      action reason;
+    Blocked
+  | Ok Journal.Missing -> Continue
+  | Ok (Journal.Invalid reason) ->
     invalid deps reason
-  | Journal.Valid record ->
+  | Ok (Journal.Valid record) ->
     recover deps record

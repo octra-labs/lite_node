@@ -57,12 +57,14 @@ let last_epoch_or ~default header =
   | Some epoch -> epoch
   | None -> default
 
-let recovery_override_error ~consensus_mode ~skip_recovery ~skip_reconcile =
-  if not consensus_mode then None
-  else if skip_recovery then
+let recovery_override_error ~consensus_mode ~recovery_required
+    ~skip_recovery ~skip_reconcile:skip_indexes =
+  if consensus_mode && skip_recovery then
     Some "consensus mode rejects OCTRA_SKIP_RECOVERY"
-  else if skip_reconcile then
+  else if consensus_mode && skip_indexes then
     Some "consensus mode rejects OCTRA_SKIP_RECONCILE"
+  else if recovery_required && (skip_recovery || skip_indexes) then
+    Some "recovery marker rejects startup overrides"
   else None
 
 let get_meta (deps : deps) key =
@@ -288,15 +290,26 @@ let run_store deps =
 
 let run_node deps =
   let skip_recovery = deps.env "OCTRA_SKIP_RECOVERY" = Some "1" in
-  let skip_reconcile = deps.env "OCTRA_SKIP_RECONCILE" = Some "1" in
+  let skip_indexes = deps.env "OCTRA_SKIP_RECONCILE" = Some "1" in
+  let recovery_required =
+    if not (skip_recovery || skip_indexes) then false
+    else
+      let module Marker = Octra_core.Epoch_commit_marker in
+      try
+        Marker.recovery_required deps.data_dir
+        || Marker.file_exists (Marker.marker_path deps.data_dir)
+      with exn ->
+        raise (Octra_core.Startup_recovery.Refused
+          ("recovery marker unavailable: " ^ Printexc.to_string exn))
+  in
   match recovery_override_error
     ~consensus_mode:deps.consensus_mode
+    ~recovery_required
     ~skip_recovery
-    ~skip_reconcile with
+    ~skip_reconcile:skip_indexes with
   | Some reason ->
     Octra_log.fatal "init" "event = recovery_policy reason = %s" reason;
-    deps.exit_fatal ();
-    -1
+    raise (Octra_core.Startup_recovery.Refused reason)
   | None ->
     run_fork_chain deps;
     run_recovery deps;

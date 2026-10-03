@@ -90,3 +90,172 @@ Theorem journal_retry : forall (visible : bool) results,
   acknowledge (if visible then journal_plan else journal_plan) results = true ->
   results = [true; true; true].
 Proof. intros visible results accepted. destruct visible; apply journal_barriers; exact accepted. Qed.
+
+Module Snapshot.
+
+Record state := Image {
+  files : bool;
+  visible : bool;
+  archive : bool;
+  marked : bool;
+  ready : bool
+}.
+
+Inductive event := FilesAck | MoveAck | ArchiveAck | UnmarkAck | ImageAck | Failure.
+
+Definition initial := Image false false false true false.
+
+Definition step value input :=
+  match input with
+  | FilesAck => Image true (visible value) (archive value) (marked value) (ready value)
+  | MoveAck =>
+      if files value then Image true true (archive value) (marked value) (ready value)
+      else value
+  | ArchiveAck =>
+      if visible value then Image (files value) true true (marked value) (ready value)
+      else value
+  | UnmarkAck =>
+      if archive value then Image (files value) (visible value) true false (ready value)
+      else value
+  | ImageAck =>
+      if archive value && negb (marked value)
+      then Image (files value) (visible value) true false true
+      else value
+  | Failure => value
+  end.
+
+Definition safe value :=
+  (visible value = true -> files value = true) /\
+  (archive value = true -> visible value = true) /\
+  (marked value = false -> archive value = true) /\
+  (ready value = true -> archive value = true /\ marked value = false).
+
+Definition run value inputs := fold_left step inputs value.
+
+Theorem early_unmark_refused : step initial UnmarkAck = initial.
+Proof. reflexivity. Qed.
+
+Theorem initial_safe : safe initial.
+Proof. unfold safe, initial. simpl. intuition discriminate. Qed.
+
+Theorem step_safe : forall value input,
+  safe value -> safe (step value input).
+Proof.
+  intros [file moved parent owned done] input valid.
+  destruct file, moved, parent, owned, done, input;
+    unfold safe, step in *; simpl in *; intuition discriminate.
+Qed.
+
+Theorem trace_safe : forall inputs value,
+  safe value -> safe (run value inputs).
+Proof.
+  induction inputs as [|input rest induction]; intros value valid.
+  - exact valid.
+  - simpl. apply induction. apply step_safe. exact valid.
+Qed.
+
+Theorem failure_preserves : forall value, step value Failure = value.
+Proof. reflexivity. Qed.
+
+Theorem successful_order :
+  run initial [FilesAck; MoveAck; ArchiveAck; UnmarkAck; ImageAck]
+  = Image true true true false true.
+Proof. reflexivity. Qed.
+
+Print Assumptions early_unmark_refused.
+Print Assumptions step_safe.
+Print Assumptions trace_safe.
+Print Assumptions failure_preserves.
+Print Assumptions successful_order.
+
+End Snapshot.
+
+Module Publication.
+
+Record state := Phase {
+  certificate : bool;
+  files : bool;
+  moved : bool;
+  archive : bool;
+  published : bool
+}.
+
+Inductive event := SealAck | FilesAck | MoveAck | ArchiveAck | PublishAck | Failure.
+
+Definition initial := Phase false false false false false.
+
+Definition step value input :=
+  match input with
+  | SealAck => Phase true (files value) (moved value) (archive value) (published value)
+  | FilesAck =>
+      if certificate value
+      then Phase true true (moved value) (archive value) (published value)
+      else value
+  | MoveAck =>
+      if files value
+      then Phase (certificate value) true true (archive value) (published value)
+      else value
+  | ArchiveAck =>
+      if moved value
+      then Phase (certificate value) (files value) true true (published value)
+      else value
+  | PublishAck =>
+      if archive value
+      then Phase (certificate value) (files value) (moved value) true true
+      else value
+  | Failure => value
+  end.
+
+Definition safe value :=
+  (files value = true -> certificate value = true) /\
+  (moved value = true -> files value = true) /\
+  (archive value = true -> moved value = true) /\
+  (published value = true -> archive value = true).
+
+Definition run value inputs := fold_left step inputs value.
+
+Theorem initial_safe : safe initial.
+Proof. unfold safe, initial. simpl. intuition discriminate. Qed.
+
+Theorem step_safe : forall value input,
+  safe value -> safe (step value input).
+Proof.
+  intros [sealed synced placed parent announced] input valid.
+  destruct sealed, synced, placed, parent, announced, input;
+    unfold safe, step in *; simpl in *; intuition discriminate.
+Qed.
+
+Theorem trace_safe : forall inputs value,
+  safe value -> safe (run value inputs).
+Proof.
+  induction inputs as [|input rest induction]; intros value valid.
+  - exact valid.
+  - simpl. apply induction. apply step_safe. exact valid.
+Qed.
+
+Theorem duplicate_event : forall value input,
+  step (step value input) input = step value input.
+Proof.
+  intros [sealed synced placed parent announced] input.
+  destruct sealed, synced, placed, parent, announced, input; reflexivity.
+Qed.
+
+Theorem unsigned_refused :
+  run initial [FilesAck; MoveAck; ArchiveAck; PublishAck] = initial.
+Proof. reflexivity. Qed.
+
+Theorem parent_required :
+  published (run initial [SealAck; FilesAck; MoveAck; PublishAck]) = false.
+Proof. reflexivity. Qed.
+
+Theorem successful_order :
+  run initial [SealAck; FilesAck; MoveAck; ArchiveAck; PublishAck]
+  = Phase true true true true true.
+Proof. reflexivity. Qed.
+
+Print Assumptions trace_safe.
+Print Assumptions duplicate_event.
+Print Assumptions unsigned_refused.
+Print Assumptions parent_required.
+
+End Publication.

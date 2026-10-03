@@ -231,35 +231,56 @@ let view_pubkey ledger ~addr =
            ~view_pubkey:(Some view_pub_b64)
            ~reason:None)
 
-let stealth_from_epoch = function
-  | `List (`Int n :: _) ->
-    n
-  | `List (`String s :: _) ->
+let epoch_string raw =
+  match int_of_string_opt raw with
+  | Some epoch when epoch >= 0 ->
+    let sign = if raw.[0] = '+' || raw.[0] = '-' then 1 else 0 in
+    let exact =
+      if String.length raw > sign + 2
+         && raw.[sign] = '0'
+         && (raw.[sign + 1] = 'u' || raw.[sign + 1] = 'U') then
+        String.sub raw 0 sign
+        ^ String.sub raw (sign + 2) (String.length raw - sign - 2)
+      else raw in
     begin
-      try int_of_string s with _ -> 0
+      match Z.of_string exact with
+      | value when Z.equal value (Z.of_int epoch) -> Some epoch
+      | _ -> None
+      | exception (Invalid_argument _ | Failure _) -> None
     end
-  | _ ->
-    0
+  | _ -> None
+
+let stealth_from_epoch params =
+  let parsed = match params with
+    | `List [] -> Some 0
+    | `List (`Int epoch :: _) when epoch >= 0 -> Some epoch
+    | `List (`String raw :: _) -> epoch_string raw
+    | _ -> None in
+  match parsed with
+  | Some epoch -> Ok epoch
+  | None -> Error "from_epoch must be a nonnegative integer"
 
 let stealth_outputs store ~params =
-  let from_epoch = max 0 (stealth_from_epoch params) in
-  let open Lwt.Syntax in
-  let* page =
-    Octra_core.Store_irmin.get_stealth_outputs_page
-      store
-      ~from_epoch
-      ~before_id:None
-      ~limit:256
-  in
-  let outputs = public_outputs page.outputs in
-  ok
-    (Rpc_view.stealth_outputs_page
-       ~from_epoch
-       ~before_id:None
-       ~outputs
-       ~next_before_id:page.next_before_id
-       ~has_more:page.has_more
-       ~scanned:page.scanned)
+  match stealth_from_epoch params with
+  | Error reason -> Lwt.return (Error (Rpc.invalid_params reason))
+  | Ok from_epoch ->
+    let open Lwt.Syntax in
+    let* page =
+      Octra_core.Store_irmin.get_stealth_outputs_page
+        store
+        ~from_epoch
+        ~before_id:None
+        ~limit:256
+    in
+    let outputs = public_outputs page.outputs in
+    ok
+      (Rpc_view.stealth_outputs_page
+         ~from_epoch
+         ~before_id:None
+         ~outputs
+         ~next_before_id:page.next_before_id
+         ~has_more:page.has_more
+         ~scanned:page.scanned)
 
 let int64_value = function
   | `Int value -> Some (Int64.of_int value)
@@ -270,7 +291,7 @@ let int64_value = function
   | _ -> None
 
 let stealth_page_params params =
-  let from_epoch = max 0 (stealth_from_epoch params) in
+  let from_epoch = stealth_from_epoch params in
   let before_id =
     match Rpc.param_json params 1 with
     | None | Some `Null -> Ok None
@@ -287,9 +308,9 @@ let stealth_page_params params =
     | Some (`Int value) when value >= 1 && value <= 256 -> Ok value
     | _ -> Error "limit must be between 1 and 256"
   in
-  match before_id, limit with
-  | Ok before_id, Ok limit -> Ok (from_epoch, before_id, limit)
-  | Error reason, _ | _, Error reason -> Error reason
+  match from_epoch, before_id, limit with
+  | Ok from_epoch, Ok before_id, Ok limit -> Ok (from_epoch, before_id, limit)
+  | Error reason, _, _ | _, Error reason, _ | _, _, Error reason -> Error reason
 
 let stealth_outputs_page store ~params =
   match stealth_page_params params with

@@ -32,6 +32,8 @@ val configured_config_hash :
   unit ->
   (string, string) result
 
+val shutdown : unit -> unit Lwt.t
+
 val read_body :
   Cohttp_lwt.Body.t ->
   (string, string) result Lwt.t
@@ -60,6 +62,12 @@ val handle_chunk :
   (string * string list) list ->
   (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
 
+val handle_range :
+  ranges:Sync_range.t ->
+  validator_set:Octra_consensus.C_types.validator_set ->
+  (string * string list) list ->
+  (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+
 val handle :
   data_dir:string ->
   ledger:Octra_core.Ledger.t ->
@@ -69,7 +77,7 @@ val handle :
   config_hash:string ->
   validator_set:Octra_consensus.C_types.validator_set ->
   current_epoch:int ref ->
-  chaindata:Octra_core.Store_chaindata.t ->
+  ranges:Sync_range.t ->
   encrypted_supply:(unit -> Z.t) ->
   Cohttp.Request.t ->
   Cohttp_lwt.Body.t ->

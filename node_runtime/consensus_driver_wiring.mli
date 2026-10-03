@@ -3,6 +3,8 @@
 
 module Transaction = Octra_core.Transaction
 
+type prepare_at = int64 -> (Consensus_proposal.prepare option, string) result
+
 type gates = {
   consensus_mode : unit -> bool;
   voting : unit -> bool;
@@ -73,6 +75,7 @@ type node_standard_adapter_runtime = {
   proposal_state : Consensus_proposal_state.t;
   catchup_active : bool ref;
   staging_epoch_capacity : Z.t;
+  save_drops : Octra_core.Tx_staging.drop_record list -> unit;
   write_pending : Octra_core.Wal.pending_commit -> unit;
   validator_pubkeys_for_epoch :
     wallet_addr:string ->
@@ -94,9 +97,10 @@ type standard_adapters = {
   next_txid : unit -> int64;
   read_prev_ledger_root : unit -> string option Lwt.t;
   staging_txs : unit -> Octra_core.Transaction.t list;
-  staging_epoch_txs : unit -> Octra_core.Transaction.t list;
+  staging_epoch_txs : ?circles:bool -> unit -> Octra_core.Transaction.t list;
   staging_total : unit -> int;
   proposer : unit -> string;
+  evict_preview : Octra_core.Transaction.t -> unit;
   head_txid_hi : unit -> int64 option;
   set_proposal : Octra_core.Transaction.t list -> string list -> unit;
   current_tx_hashes : unit -> string list;
@@ -105,7 +109,7 @@ type standard_adapters = {
   set_catchup_active : bool -> unit;
 }
 
-type proposal_preview_runtime = {
+type 'a proposal_preview_runtime = {
   chain_id : string;
   ready_state_root_at : int -> string option Lwt.t;
   ready_max_lag : int;
@@ -114,7 +118,7 @@ type proposal_preview_runtime = {
     Consensus_proposal.build_preview_request ->
     reward:Consensus_reward_attribution.t ->
     env:Octra_core.Epoch_exec.env ->
-    (Octra_core.Epoch_exec.exec_result, string) result Lwt.t;
+    ('a, string) result Lwt.t;
 }
 
 type deps = {
@@ -133,9 +137,10 @@ type deps = {
   sleep : float -> unit Lwt.t;
   quarantine_mismatch_threshold : int;
   staging_txs : unit -> Transaction.t list;
-  staging_epoch_txs : unit -> Transaction.t list;
+  staging_epoch_txs : ?circles:bool -> unit -> Transaction.t list;
   staging_total : unit -> int;
   build_preverify : Consensus_preverify_role.build;
+  evict_preview : Transaction.t -> unit;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
@@ -258,6 +263,7 @@ type config_with_standard_input = {
 }
 
 type node_driver_config_runtime = {
+  prepare_at : prepare_at;
   standard : node_standard_adapter_runtime;
   chain_id : string;
   my_addr : string;
@@ -351,18 +357,20 @@ val preview_with_optional_catch :
   ('a, string) result Lwt.t
 
 val node_proposal_preview :
-  proposal_preview_runtime ->
+  'a proposal_preview_runtime ->
   ?catch_exn:bool ->
   Consensus_proposal.build_preview_request ->
-  (Octra_core.Epoch_exec.exec_result, string) result Lwt.t
+  ('a, string) result Lwt.t
 
 val config :
   ?private_slots:Octra_core.Private_slots.limits ->
+  ?prepare_at:prepare_at ->
   deps ->
   Octra_consensus.C_driver.config
 
 val config_with_standard :
   ?private_slots:Octra_core.Private_slots.limits ->
+  ?prepare_at:prepare_at ->
   config_with_standard_input ->
   Octra_consensus.C_driver.config
 

@@ -6,11 +6,22 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
 cd "$ROOT"
-opam exec -- dune build --root . --build-dir "$BUILD_DIR" test/test_tx_staging_selection.exe test/test_proposal.exe
+opam exec -- dune build --root . --build-dir "$BUILD_DIR" \
+  test/test_tx_staging_selection.exe test/test_proposal.exe test/test_tx_queue.exe \
+  test/test_rule_graph.exe test/test_consensus_profile_golden.exe \
+  test/test_private_transition_receipt.exe bin/octra_pvac_worker.exe
+opam exec -- "$BUILD_DIR/default/test/test_rule_graph.exe"
+opam exec -- "$BUILD_DIR/default/test/test_consensus_profile_golden.exe"
 opam exec -- "$BUILD_DIR/default/test/test_tx_staging_selection.exe"
 opam exec -- "$BUILD_DIR/default/test/test_proposal.exe"
+opam exec -- "$BUILD_DIR/default/test/test_tx_queue.exe"
+WORKER=$(CDPATH= cd -- "$BUILD_DIR/default/bin" && pwd)/octra_pvac_worker.exe
+OCTRA_PVAC_VERIFY_WORKER="$WORKER" \
+  opam exec -- "$BUILD_DIR/default/test/test_private_transition_receipt.exe" batch
 opam exec -- coqc -Q formal/coq '' formal/coq/private_slots.v
-context=$(opam exec -- coqchk -silent -o -Q formal/coq '' private_slots 2>&1)
+opam exec -- coqc -Q formal/coq '' formal/coq/circle_refill.v
+opam exec -- coqc -Q formal/coq '' formal/coq/fhe_work.v
+context=$(opam exec -- coqchk -silent -o -Q formal/coq '' private_slots circle_refill fhe_work 2>&1)
 for claim in \
   '* Axioms: <none>' \
   '* Constants/Inductives relying on type-in-type: <none>' \

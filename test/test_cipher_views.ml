@@ -29,9 +29,9 @@ let test_bad_balance () =
     ["hfhe_v1|broken"; "hfhe_v1|";
      "hfhe_v1|" ^ Base64.encode_exn "invalid cipher bytes"]
 
-let insert store cipher =
+let insert ?(epoch = 1) store cipher =
   Lwt_main.run (S.insert_stealth_output store ~stealth_tag:"tag"
-    ~eph_pub:"eph" ~enc_amount:"enc" ~amount:"1" ~epoch_id:1
+    ~eph_pub:"eph" ~enc_amount:"enc" ~amount:"1" ~epoch_id:epoch
     ~tx_hash:(String.make 64 'a') ~sender_addr:"owner" ~claim_pub:"claim"
     ~delta_cipher_stored:cipher ~amount_hash:"hash" ~amount_commitment:"point")
   |> get |> Int64.to_int
@@ -117,10 +117,96 @@ let test_legacy_bytes () =
   | Ok response -> expect "legacy bytes changed"
       (Yojson.Safe.Util.member "cipher" response = `String cipher)
 
+let test_stealth_params () =
+  let module Rpc = Octra_core.Rpc in
+  let field = Yojson.Safe.Util.member in
+  let invalid = Rpc.invalid_params "from_epoch must be a nonnegative integer" in
+  let overflow = Z.to_string (Z.succ (Z.of_int max_int)) in
+  let unsigned = Z.to_string (Z.pred (Z.shift_left Z.one Sys.int_size)) in
+  let params = [
+    `Null; `Int 0; `Assoc []; `String "0";
+    `List [`Null]; `List [`Bool true]; `List [`Float 0.]; `List [`List []];
+    `List [`Assoc []]; `List [`Int (-1)]; `List [`String ""];
+    `List [`String "oct7J2jiPsscsN1ESBD7W3tYnHFzGb2CeVusTDJnWjqWVfr"];
+    `List [`String "-1"]; `List [`String "1.0"]; `List [`String "1e3"];
+    `List [`String " 7"]; `List [`String "7 "]; `List [`String overflow];
+    `List [`Intlit overflow]; `List [`String ("0u" ^ unsigned)];
+    `List [`String ("-0x" ^ Z.format "%x" (Z.of_string unsigned))];
+    `List [`String ("-" ^ overflow)];
+    `List [`String "0x_7"]; `List [`String "0u_7"];
+  ] in
+  with_store "stealth_params" (fun store ->
+    let older = insert ~epoch:1 store "0" in
+    let newer = insert ~epoch:7 store "0" in
+    let handlers = ["octra_stealthOutputs", R.stealth_outputs;
+      "octra_stealthOutputsPage", R.stealth_outputs_page] in
+    List.iter (fun (_, handler) ->
+      List.iter (fun params ->
+        expect "invalid epoch refused" (Lwt_main.run (handler store ~params) = Error invalid)) params;
+      List.iter (fun (params, epoch, ids) ->
+        match Lwt_main.run (handler store ~params) with
+        | Error _ -> failwith "valid epoch refused"
+        | Ok value ->
+          expect "epoch preserved" (field "from_epoch" value = `Int epoch);
+          expect "epoch filter preserved"
+            (field "outputs" value |> Yojson.Safe.Util.to_list |> List.map (field "id")
+             = List.map (fun id -> `Int id) ids))
+        [`List [], 0, [older; newer]; `List [`Int 0], 0, [older; newer];
+         `List [`String "0"], 0, [older; newer]; `List [`Int 7], 7, [newer];
+         `List [`String "7"], 7, [newer]; `List [`String "+7"], 7, [newer];
+         `List [`String "0x7"], 7, [newer]; `List [`String "0o7"], 7, [newer];
+         `List [`String "0b111"], 7, [newer]; `List [`String "0u7"], 7, [newer];
+         `List [`String "+0u7"], 7, [newer]; `List [`String "-0"], 0, [older; newer];
+         `List [`String "1_0"], 10, []; `List [`Int max_int], max_int, [];
+         `List [`String (string_of_int max_int)], max_int, []]) handlers;
+    List.iter (fun (params, reason) ->
+      expect "page parameter error preserved"
+        (Lwt_main.run (R.stealth_outputs_page store ~params)
+         = Error (Rpc.invalid_params reason)))
+      [`List [`Int 0; `Int (-1)], "before_id must be a nonnegative integer or null";
+       `List [`Int 0; `Null; `Int 0], "limit must be between 1 and 256";
+       `List [`Int 0; `Null; `Int 257], "limit must be between 1 and 256"];
+    List.iter (fun (params, ids) ->
+      match Lwt_main.run (R.stealth_outputs_page store ~params) with
+      | Error _ -> failwith "valid page refused"
+      | Ok value -> expect "page selection preserved"
+          (field "outputs" value |> Yojson.Safe.Util.to_list |> List.map (field "id")
+           = List.map (fun id -> `Int id) ids))
+      [`List [`Int 0; `Null; `Int 1], [newer];
+       `List [`Int 0; `Int newer; `Int 1], [older];
+       `List [`Int 0; `Null; `Int 256], [older; newer]];
+    List.iter (fun (method_, handler) ->
+      List.iter (fun (argument, expected) ->
+        let json = "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"" ^ method_ ^ "\"" ^ argument ^ "}" in
+        let request = match Rpc.parse_body json with
+          | Ok (`Single request) -> request
+          | _ -> failwith "request parsing failed" in
+        let response = match Lwt_main.run (handler store ~params:request.params) with
+          | Ok value -> Rpc.Result (value, request.id)
+          | Error error -> Rpc.Error_ (error, request.id) in
+        let value = Rpc.response_json response in
+        expect "rpc request id preserved" (field "id" value = `Int 19);
+        let code = match field "error" value with
+          | `Null -> `Null
+          | error -> field "code" error in
+        expect "rpc epoch error code" (code = expected))
+        ["", `Null; ",\"params\":[]", `Null;
+         ",\"params\":null", `Int (-32602); ",\"params\":[1e3]", `Int (-32602);
+         ",\"params\":[" ^ overflow ^ "]", `Int (-32602)]) handlers;
+    Lwt_main.run (S.write store ["index"; "stealth_counter"] "invalid");
+    List.iter (fun (_, handler) ->
+      let scanned = try
+        ignore (Lwt_main.run (handler store ~params:(`List [`Int 0]))); false
+        with Failure _ -> true in
+      expect "scan tripwire active" scanned;
+      List.iter (fun params ->
+        expect "invalid epoch rejected before store read"
+          (Lwt_main.run (handler store ~params) = Error invalid)) params) handlers)
+
 let () =
   let cases = ["bad_balance", test_bad_balance; "bad_output", test_bad_output;
     "unknown_deposit", test_unknown_deposit; "valid_views", test_valid_views;
-    "legacy_bytes", test_legacy_bytes] in
+    "legacy_bytes", test_legacy_bytes; "stealth_params", test_stealth_params] in
   let failures = List.filter_map (fun (name, action) ->
     match action () with
     | () -> Printf.printf "event = test name = %s status = passed\n%!" name; None

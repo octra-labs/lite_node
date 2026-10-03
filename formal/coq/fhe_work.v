@@ -1,7 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-From Stdlib Require Import ZArith Bool Lia.
+From Stdlib Require Import ZArith Bool Lia List.
+Import ListNotations.
 Open Scope Z_scope.
 
 Definition reserve (used limit cost : Z) : option Z :=
@@ -107,6 +108,116 @@ Proof.
   rewrite over. rewrite andb_false_r. reflexivity.
 Qed.
 
+Module Vm.
+
+Definition floor : Z := 1000000.
+
+Definition allowance (minimum maximum fee : Z) : Z :=
+  Z.max floor
+    (if (minimum <=? fee) && (fee <=? maximum) then fee else floor).
+
+Definition cost (minimum maximum fee : Z) : Z :=
+  Z.max fee (allowance minimum maximum fee).
+
+Fixpoint admit minimum maximum used limit fees : option Z :=
+  match fees with
+  | [] => Some used
+  | fee :: rest =>
+    match reserve used limit (cost minimum maximum fee) with
+    | None => None
+    | Some next => admit minimum maximum next limit rest
+    end
+  end.
+
+Definition total minimum maximum fees :=
+  fold_right (fun fee sum => cost minimum maximum fee + sum) 0 fees.
+
+Theorem allowance_floor : forall minimum maximum fee,
+  floor <= allowance minimum maximum fee.
+Proof. intros. unfold allowance. apply Z.le_max_l. Qed.
+
+Theorem cost_covers : forall minimum maximum fee,
+  fee <= cost minimum maximum fee /\
+  allowance minimum maximum fee <= cost minimum maximum fee /\
+  0 <= cost minimum maximum fee.
+Proof.
+  intros. pose proof (allowance_floor minimum maximum fee).
+  unfold cost. pose proof (Z.le_max_l fee (allowance minimum maximum fee)).
+  pose proof (Z.le_max_r fee (allowance minimum maximum fee)).
+  unfold floor in *. repeat split; lia.
+Qed.
+
+Theorem admit_exact : forall fees minimum maximum used limit final,
+  0 <= used <= limit -> admit minimum maximum used limit fees = Some final ->
+  final = used + total minimum maximum fees /\ used <= final <= limit.
+Proof.
+  induction fees as [|fee rest step]; intros minimum maximum used limit final initial ok.
+  - simpl in ok. injection ok as same. subst final. unfold total. simpl. lia.
+  - simpl in ok.
+    destruct (reserve used limit (cost minimum maximum fee)) as [next|] eqn:accepted;
+      [|discriminate].
+    apply reserve_limit in accepted.
+    destruct accepted as [u [c [inc [cap sum]]]].
+    specialize (step minimum maximum next limit final ltac:(lia) ok).
+    destruct step as [exact range]. unfold total in *. simpl. split; lia.
+Qed.
+
+Theorem total_positive : forall fees minimum maximum,
+  0 <= total minimum maximum fees.
+Proof.
+  induction fees as [|fee rest step]; intros minimum maximum; unfold total in *; simpl.
+  - lia.
+  - specialize (step minimum maximum).
+    pose proof (cost_covers minimum maximum fee) as [_ [_ positive]]. lia.
+Qed.
+
+Theorem admit_capacity : forall fees minimum maximum used limit,
+  0 <= used -> used + total minimum maximum fees <= limit ->
+  admit minimum maximum used limit fees = Some (used + total minimum maximum fees).
+Proof.
+  induction fees as [|fee rest step]; intros minimum maximum used limit positive capacity.
+  - unfold total. simpl. f_equal. lia.
+  - simpl. pose proof (cost_covers minimum maximum fee) as [_ [_ nonnegative]].
+    pose proof (total_positive rest minimum maximum) as remaining.
+    assert (accepted : reserve used limit (cost minimum maximum fee) =
+      Some (used + cost minimum maximum fee)).
+    { apply child_budget; unfold total in *; simpl in *; lia. }
+    rewrite accepted. rewrite step; unfold total in *; simpl in *; try lia.
+    f_equal. lia.
+Qed.
+
+Theorem work_capacity : forall fees spent minimum maximum used limit final,
+  Forall2 (fun fee work => 0 <= work <= allowance minimum maximum fee) fees spent ->
+  0 <= used <= limit -> admit minimum maximum used limit fees = Some final ->
+  used + fold_right Z.add 0 spent <= final /\ final <= limit.
+Proof.
+  intros fees spent minimum maximum used limit final execution initial accepted.
+  apply admit_exact in accepted; [|exact initial].
+  destruct accepted as [exact [_ cap]].
+  assert (actual : fold_right Z.add 0 spent <= total minimum maximum fees).
+  { clear exact cap initial.
+    induction execution as [|fee work fees spent within rest step].
+    - unfold total. simpl. lia.
+    - unfold total in *. simpl in *.
+      pose proof (cost_covers minimum maximum fee) as [_ [covers _]]. lia. }
+  split; lia.
+Qed.
+
+Example exact_capacity :
+  admit (-4611686018427387904) 4611686018427387903 0 10000000
+    (repeat 10000 10) = Some 10000000.
+Proof. reflexivity. Qed.
+
+Example over_capacity :
+  admit (-4611686018427387904) 4611686018427387903 0 10000000
+    (repeat 10000 11) = None.
+Proof. reflexivity. Qed.
+
+End Vm.
+
+Print Assumptions Vm.admit_exact.
+Print Assumptions Vm.admit_capacity.
+Print Assumptions Vm.work_capacity.
 Print Assumptions reserve_limit.
 Print Assumptions child_budget.
 Print Assumptions repeated_work.

@@ -85,7 +85,8 @@ type node_driver_runtime = {
     reason:string ->
     unit Lwt.t;
   chain_id : string;
-  validator_set : Octra_consensus.C_types.validator_set;
+  select_set :
+    epoch:int64 -> round:int -> (Octra_consensus.C_types.validator_set, string) result;
   store_bundle :
     proposal_id:string ->
     tx_hashes:string list ->

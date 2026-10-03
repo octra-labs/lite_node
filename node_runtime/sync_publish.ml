@@ -4,6 +4,7 @@
 open Lwt.Infix
 
 module Anchor = Octra_bootstrap.Sync_anchor
+module Archive = Octra_bootstrap.Sync_archive
 module Capture = Octra_bootstrap.Sync_capture
 module Chain = Sync_chain
 module Checkpoint = Octra_bootstrap.State_sync_checkpoint
@@ -70,7 +71,7 @@ let epoch_head ~store ~chaindata epoch record =
     let epoch_id = Int64.to_int epoch in
     match Store.epoch_boundary chaindata epoch_id with
     | Error reason -> Lwt.return_error reason
-    | Ok boundary ->
+    | Ok entry ->
         Irmin.epoch_binding store epoch_id >|= function
         | Error _ as error -> error
         | Ok binding ->
@@ -80,19 +81,19 @@ let epoch_head ~store ~chaindata epoch record =
             let folded =
               Octra_core.Epoch_index_commitment.folded_state_root
                 ~ledger_state_root:binding.Irmin.root
-                ~epoch_index_root:boundary.Store.index_root
+                ~epoch_index_root:entry.Store.index_root
             in
-            if boundary.header.Epochlog.id <> epoch_id then
+            if entry.header.Epochlog.id <> epoch_id then
               Error "state sync epoch header differs from target"
-            else if boundary.header.state_root <> state_root
+            else if entry.header.state_root <> state_root
                     || folded <> state_root then
               Error "state sync historical state root differs from finality"
-            else if boundary.txid_hi <> finality.txid_hi then
+            else if entry.txid_hi <> finality.txid_hi then
               Error "state sync historical transaction high-water differs"
-            else if boundary.header.finalized_at <> finality.ts then
+            else if entry.header.finalized_at <> finality.ts then
               Error "state sync historical time differs from finality"
-            else if boundary.header.proposer.creator_addr <> finality.creator_addr
-                    || boundary.header.proposer.commit_round
+            else if entry.header.proposer.creator_addr <> finality.creator_addr
+                    || entry.header.proposer.commit_round
                        <> finalize.commit_round then
               Error "state sync historical proposer differs from finality"
             else
@@ -103,18 +104,18 @@ let epoch_head ~store ~chaindata epoch record =
                 state_root;
                 ledger_state_root = Some binding.root;
                 irmin_commit = Some binding.commit;
-                txid_hi = boundary.txid_hi;
-                txlog_seg = Some boundary.txlog_seg;
-                txlog_off = Some boundary.txlog_off;
-                epochlog_off = Some boundary.epochlog_off;
+                txid_hi = entry.txid_hi;
+                txlog_seg = Some entry.txlog_seg;
+                txlog_off = Some entry.txlog_off;
+                epochlog_off = Some entry.epochlog_off;
                 commit_id = Anchor.finalize_hash finalize;
                 ts = finality.ts;
                 quorum_cert_hash = None;
-                epoch_index_hash = Some boundary.index_hash;
-                epoch_index_root = Some boundary.index_root;
+                epoch_index_hash = Some entry.index_hash;
+                epoch_index_root = Some entry.index_root;
               }
 
-let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
+let prepare_body ~chain_id ~config_hash ~validator_set
     ~steps ~head record =
   let header = record.Consensus_finality_journal.finalize.C_types.header in
   let epoch = record.finalize.epoch_id in
@@ -170,20 +171,35 @@ let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
             ~valid_until:(Int64.add created_at validity)
             head
         in
-        let* () = Anchor.verify_checkpoint checkpoint anchor in
-        let* derived = Anchor.derive ~validator_set:trusted_validator_set anchor in
-        if C_config.validator_set_hash derived <> active_hash then
-          Error "state sync validator transition does not reach active set"
-        else
-        let* checkpoint_hash = Checkpoint.hash checkpoint in
-        Ok {
-          head;
-          checkpoint;
-          checkpoint_hash;
-          anchor;
-          trusted_validator_set;
-          roots = [];
-        }
+        Ok (head, checkpoint, anchor)
+
+let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
+    ~steps ~head record =
+  match prepare_body ~chain_id ~config_hash ~validator_set
+    ~steps ~head record with
+  | Error reason -> Lwt.return_error reason
+  | Ok (head, checkpoint, anchor) ->
+      Lwt_preemptive.detach
+        (fun () -> Anchor.verify_checkpoint checkpoint anchor)
+        () >>= function
+      | Error reason -> Lwt.return_error reason
+      | Ok () ->
+          Anchor.compact_lwt ~validator_set:trusted_validator_set anchor
+          >|= fun result ->
+            let* anchor = result in
+            if C_config.validator_set_hash (Anchor.validator_set anchor)
+               <> C_config.validator_set_hash validator_set then
+              Error "state sync validator transition does not reach active set"
+            else
+              let* checkpoint_hash = Checkpoint.hash checkpoint in
+              Ok {
+                head;
+                checkpoint;
+                checkpoint_hash;
+                anchor;
+                trusted_validator_set;
+                roots = [];
+              }
 
 let retention_plan ~retain ~current snapshots =
   let ordered =
@@ -222,16 +238,21 @@ let rec remove_tree path =
           Unix.rmdir path
       | _ -> Unix.unlink path
 
-let remove_snapshots root ids =
+let remove_snapshots_owned archive ids =
   ids
   |> List.filter_map (fun id ->
     if not (State_sync.valid_snapshot_id id) then
       Some (id, "state sync snapshot id is invalid")
     else
       try
-        remove_tree (Filename.concat root id);
+        remove_tree (Archive.path archive id);
         None
       with exn -> Some (id, Printexc.to_string exn))
+
+let remove_snapshots root ids =
+  match Archive.run root (fun archive -> remove_snapshots_owned archive ids) with
+  | Ok errors -> errors
+  | Error reason -> [root, reason]
 
 let snapshot_entries root =
   if not (Sys.file_exists root) then []
@@ -263,29 +284,45 @@ let active_lease ~now root (id, _) =
     Sync_lease.read ~now ~published_at ~snapshot_id:id snapshot
   with Unix.Unix_error _ -> None
 
+let retain_owned archive root ~retain ~current =
+  let snapshots = snapshot_entries root in
+  let leased =
+    snapshots
+    |> List.filter_map (active_lease ~now:(Unix.gettimeofday ()) root)
+    |> Sync_lease.retained
+  in
+  let removed =
+    snapshots
+    |> retention_plan ~retain ~current
+    |> List.filter (fun id -> not (List.mem id leased))
+  in
+  let failed = remove_snapshots_owned archive removed in
+  let staged =
+    Sys.readdir root
+    |> Array.to_list
+    |> List.filter staged_snapshot
+  in
+  let failed_stages =
+    List.filter_map (fun name ->
+      let id = String.sub name 0 (String.length name - 5) in
+      try
+        if Archive.marked_stage archive id then begin
+          remove_tree (Archive.path archive id ^ ".next");
+          None
+        end else
+          Some (name, "state sync stage ownership is unknown")
+      with exn -> Some (name, Printexc.to_string exn)) staged
+  in
+  failed @ failed_stages
+
 let retain data_dir ~retain ~current =
   let root = State_sync.snapshot_root data_dir in
   if not (Sys.file_exists root) then []
-  else begin
-    let snapshots = snapshot_entries root in
-    let leased =
-      snapshots
-      |> List.filter_map (active_lease ~now:(Unix.gettimeofday ()) root)
-      |> Sync_lease.retained
-    in
-    let removed =
-      snapshots
-      |> retention_plan ~retain ~current
-      |> List.filter (fun id -> not (List.mem id leased))
-    in
-    let failed = remove_snapshots root removed in
-    let staged =
-      Sys.readdir root
-      |> Array.to_list
-      |> List.filter staged_snapshot
-    in
-    failed @ remove_snapshots root staged
-  end
+  else
+    match Archive.run root (fun archive ->
+      retain_owned archive root ~retain ~current:(current ())) with
+    | Ok errors -> errors
+    | Error reason -> [root, reason]
 
 let publisher_count = 2
 
@@ -335,9 +372,18 @@ let build_draft prepared target =
         ~chunk_size:(16 * 1024 * 1024))
     ()
 
-let clear_stage target =
+let clear_stage archive target =
   Lwt_preemptive.detach
-    (fun () -> remove_tree (target ^ ".next"))
+    (fun () ->
+      if not (Archive.owns archive target) then
+        invalid_arg "state sync target differs from archive";
+      match lstat (target ^ ".next") with
+      | None -> ()
+      | Some _ ->
+          if Archive.marked_stage archive (Filename.basename target) then
+            remove_tree (target ^ ".next")
+          else
+            failwith "state sync stage ownership is unknown")
     ()
 
 let stage_bytes target =
@@ -371,38 +417,64 @@ let monitor_capture deps prepared target capture =
                (quiet * 60));
         loop bytes quiet
   in
-  loop 0L 0
+  Lwt.finalize
+    (fun () -> loop 0L 0)
+    (fun () ->
+      Lwt.try_bind
+        (fun () -> Lwt.no_cancel capture)
+        (fun _ -> Lwt.return_unit)
+        (fun _ -> Lwt.return_unit))
 
 let write_certificate path certificate =
   Lwt_preemptive.detach
     (fun () -> Manifest.write_json path (Manifest.certificate_json certificate))
     ()
 
-let snapshot_certificate_path deps certificate =
-  State_sync.snapshot_dir deps.data_dir certificate.Manifest.manifest.snapshot_id
-  |> State_sync.snapshot_certificate_path
+let read_certificate deps exporter_set path =
+  match deps.config_hash (), deps.trusted_validator_set () with
+  | Error reason, _
+  | _, Error reason -> Lwt.return_error reason
+  | Ok config_hash, Ok validator_set ->
+      Lwt_preemptive.detach Manifest.load_certificate path >>= function
+      | Error reason -> Lwt.return_error reason
+      | Ok certificate
+        when not (Manifest.is_reference certificate)
+             || certificate.checkpoint.chain_id <> deps.chain_id
+             || certificate.checkpoint.config_hash <> config_hash ->
+          Lwt.return_error "state sync stored certificate network differs"
+      | Ok certificate ->
+          Manifest.verify_certificate_lwt ~validator_set ~exporter_set certificate
 
-let archive_current deps =
-  match Manifest.load_certificate (deps.certificate_path ()) with
+let archive_current deps exporter_set =
+  read_certificate deps exporter_set (deps.certificate_path ()) >>= function
   | Error _ -> Lwt.return_unit
   | Ok certificate ->
       let snapshot =
         State_sync.snapshot_dir deps.data_dir certificate.manifest.snapshot_id
       in
-      if Sys.file_exists snapshot then
-        write_certificate (State_sync.snapshot_certificate_path snapshot) certificate
-      else
-        Lwt.return_unit
+      begin match lstat snapshot with
+      | None -> Lwt.return_unit
+      | Some stat when stat.Unix.st_kind = Unix.S_DIR ->
+          write_certificate (State_sync.snapshot_certificate_path snapshot) certificate
+      | Some _ -> Lwt.fail_with "state sync previous snapshot is not a directory"
+      end
 
-let published_manifest_hash deps checkpoint_hash =
-  match Manifest.load_certificate (deps.certificate_path ()) with
-  | Ok certificate when certificate.checkpoint_hash = checkpoint_hash ->
-      Some certificate.manifest_hash
-  | Ok _
-  | Error _ -> None
+let stored_manifest_hash deps exporter_set prepared target =
+  let rec read reason = function
+    | [] -> Lwt.return_error reason
+    | path :: rest ->
+        read_certificate deps exporter_set path >>= function
+        | Error reason -> read reason rest
+        | Ok certificate when certificate.checkpoint_hash <> prepared.checkpoint_hash ->
+            read "state sync stored checkpoint differs" rest
+        | Ok certificate -> Lwt.return_ok certificate.manifest_hash
+  in
+  read "state sync snapshot has no local certificate"
+    [State_sync.snapshot_certificate_path target; deps.certificate_path ()]
 
-let publish deps ~force exporter_set prepared =
-  let target = State_sync.snapshot_dir deps.data_dir prepared.checkpoint_hash in
+let publish_owned archive deps ~force exporter_set prepared =
+  let target = Archive.path archive prepared.checkpoint_hash in
+  let stage = target ^ ".next" in
   deps.info
     (Printf.sprintf
        "event = sync_capture_start epoch = %Ld checkpoint = %s"
@@ -410,11 +482,16 @@ let publish deps ~force exporter_set prepared =
        prepared.checkpoint_hash);
   Lwt.catch
     (fun () ->
-      let existing () =
-        match published_manifest_hash deps prepared.checkpoint_hash with
-        | None -> Lwt.return_error "state sync snapshot has no local certificate"
-        | Some expected_hash ->
-            build_draft prepared target >|= function
+      let existing source phase =
+        let directory = match lstat source with
+          | Some stat -> stat.Unix.st_kind = Unix.S_DIR
+          | None -> false in
+        if not directory then Lwt.return_error "state sync snapshot is not a directory"
+        else
+        stored_manifest_hash deps exporter_set prepared source >>= function
+        | Error reason -> Lwt.return_error reason
+        | Ok expected_hash ->
+            build_draft prepared source >|= function
             | Error reason -> Error reason
             | Ok draft when draft.manifest_hash <> expected_hash ->
                 Error "state sync snapshot differs from local certificate"
@@ -426,16 +503,17 @@ let publish deps ~force exporter_set prepared =
                       Ok
                         (draft,
                          draft.manifest.file_count,
-                         draft.manifest.total_size)
+                         draft.manifest.total_size,
+                         phase)
                 end
       in
       let fresh () =
-        clear_stage target >>= fun () ->
+        clear_stage archive target >>= fun () ->
         monitor_capture
           deps
           prepared
           target
-          (Capture.build
+          (Capture.stage_owned archive
              Capture.{
                data_dir = deps.data_dir;
                head = prepared.head;
@@ -445,21 +523,20 @@ let publish deps ~force exporter_set prepared =
              ~target) >>= function
         | Error reason -> Lwt.return_error reason
         | Ok report ->
-            build_draft prepared target >|= function
+            build_draft prepared stage >|= function
           | Error reason -> Error reason
-          | Ok draft -> Ok (draft, report.files, report.bytes)
+          | Ok draft -> Ok (draft, report.files, report.bytes, `Staged)
       in
       let capture () =
-        if not (Sys.file_exists target) then fresh ()
-        else
-          existing () >>= function
-          | Ok _ as ready -> Lwt.return ready
-          | Error _ ->
-              Lwt_preemptive.detach (fun () -> remove_tree target) () >>= fresh
+        if Sys.file_exists target then existing target `Published
+        else if Archive.marked_stage archive prepared.checkpoint_hash
+                && Sys.file_exists (State_sync.snapshot_certificate_path stage) then
+          existing stage `Staged
+        else fresh ()
       in
       capture () >>= function
       | Error reason -> Lwt.return_error reason
-      | Ok (draft, files, bytes) ->
+      | Ok (draft, files, bytes, phase) ->
           begin
             match Manifest.validate_reference_body draft.manifest with
             | Error reason -> Lwt.return_error reason
@@ -474,25 +551,35 @@ let publish deps ~force exporter_set prepared =
                         draft.manifest with
                       | Error reason -> Lwt.return_error reason
                       | Ok exporter_signature ->
+                          Lwt_preemptive.detach Anchor.encode prepared.anchor
+                          >>= fun encoded ->
                           let certificate = Manifest.{
                             checkpoint = prepared.checkpoint;
                             checkpoint_hash = prepared.checkpoint_hash;
-                            authority = Finalized (Anchor.encode prepared.anchor);
+                            authority = Finalized encoded;
                             manifest = draft.manifest;
                             manifest_hash = draft.manifest_hash;
                             exporter_signatures = [exporter_signature];
                           } in
                           begin
-                            match Manifest.verify_certificate
+                            Manifest.verify_certificate_lwt
                               ~validator_set:prepared.trusted_validator_set
                               ~exporter_set
-                              certificate with
+                              certificate >>= function
                             | Error reason -> Lwt.return_error reason
                             | Ok verified ->
-                                archive_current deps >>= fun () ->
+                                let source = match phase with
+                                  | `Staged -> stage
+                                  | `Published -> target in
+                                archive_current deps exporter_set >>= fun () ->
                                 write_certificate
-                                  (snapshot_certificate_path deps verified)
+                                  (State_sync.snapshot_certificate_path source)
                                   verified >>= fun () ->
+                                Lwt_preemptive.detach (fun () ->
+                                  match phase with
+                                  | `Published -> Archive.finish_publish archive prepared.checkpoint_hash
+                                  | `Staged -> Archive.publish_stage archive prepared.checkpoint_hash)
+                                  () >>= fun () ->
                                 write_certificate
                                   (deps.certificate_path ())
                                   verified >>= fun () ->
@@ -510,13 +597,16 @@ let publish deps ~force exporter_set prepared =
           end)
     (fun exn -> Lwt.return_error (Printexc.to_string exn))
 
+let publish deps ~force exporter_set prepared =
+  Archive.run_lwt (State_sync.snapshot_root deps.data_dir)
+    (fun archive -> publish_owned archive deps ~force exporter_set prepared)
+
 let load_published deps exporter_set =
   let path = deps.certificate_path () in
-  if not (Sys.file_exists path) then Lwt.return_none
-  else
+  Lwt_preemptive.detach Manifest.load_certificate path >>= fun loaded ->
     match deps.config_hash (),
       deps.trusted_validator_set (),
-      Manifest.load_certificate path with
+      loaded with
     | Ok expected_config, Ok validator_set, Ok certificate
       when Manifest.is_reference certificate
            && certificate.checkpoint.chain_id = deps.chain_id
@@ -525,10 +615,10 @@ let load_published deps exporter_set =
                 ~now:(Int64.of_float (deps.now ()))
                 certificate ->
         begin
-          match Manifest.verify_certificate
+          Manifest.verify_certificate_lwt
             ~validator_set
             ~exporter_set
-            certificate with
+            certificate >>= function
           | Error _ -> Lwt.return_none
           | Ok _ ->
               let target =
@@ -623,16 +713,14 @@ let read_prepared deps epoch =
                     | Error reason -> Lwt.return_error reason
                     | Ok steps ->
                         begin
-                          match
-                            prepare
+                          prepare
                               ~chain_id:deps.chain_id
                               ~config_hash
                               ~trusted_validator_set
                               ~validator_set
                               ~steps
                               ~head
-                              record
-                          with
+                              record >>= function
                           | Error _ as error -> Lwt.return error
                           | Ok prepared ->
                               let rec collect current left acc =
@@ -651,25 +739,17 @@ let read_prepared deps epoch =
                                       Lwt.return_error
                                         ("ready root finality is invalid: " ^ reason)
                                   | Consensus_finality_journal.Valid item ->
-                                      begin
-                                        match
+                                      Lwt_preemptive.detach (fun () ->
+                                        let* next =
                                           Roots.bind
                                             ~current
                                             ~validator_set:item.validator_set
-                                            item.finalize
-                                        with
-                                        | Error _ as error -> Lwt.return error
-                                        | Ok next ->
-                                            begin
-                                              match Roots.verify ~anchor:current [next] with
-                                              | Error _ as error -> Lwt.return error
-                                              | Ok _ ->
-                                                  collect
-                                                    next
-                                                    (left - 1)
-                                                    (next :: acc)
-                                            end
-                                      end
+                                            item.finalize in
+                                        let* _ = Roots.verify ~anchor:current [next] in
+                                        Ok next) () >>= function
+                                      | Error _ as error -> Lwt.return error
+                                      | Ok next ->
+                                          collect next (left - 1) (next :: acc)
                               in
                               collect
                                 (Anchor.finality prepared.anchor)
@@ -737,21 +817,27 @@ let rec perform deps ~force exporter_set state effects =
         match Cycle.published state with
         | None -> perform deps ~force exporter_set state rest
         | Some _ ->
-            let current =
-              match Manifest.load_certificate (deps.certificate_path ()) with
-              | Ok certificate -> certificate.manifest.snapshot_id
-              | Error _ -> ""
-            in
             Lwt.catch
               (fun () ->
-                Lwt_preemptive.detach
-                  (fun () -> retain deps.data_dir ~retain:count ~current)
-                  () >|= List.iter (fun (snapshot, reason) ->
-                    deps.warn
-                      (Printf.sprintf
-                         "event = sync_retention_failed snapshot = %s reason = %s"
-                         snapshot
-                         reason)))
+                let path = deps.certificate_path () in
+                read_certificate deps exporter_set path >>= function
+                | Error reason -> Lwt.fail_with reason
+                | Ok verified ->
+                    let current () =
+                      match Manifest.load_certificate path with
+                      | Ok certificate when certificate = verified ->
+                          certificate.manifest.snapshot_id
+                      | Ok _ -> failwith "state sync certificate changed before retention"
+                      | Error reason -> failwith reason
+                    in
+                    Lwt_preemptive.detach
+                      (fun () -> retain deps.data_dir ~retain:count ~current)
+                      () >|= List.iter (fun (snapshot, reason) ->
+                        deps.warn
+                          (Printf.sprintf
+                             "event = sync_retention_failed snapshot = %s reason = %s"
+                             snapshot
+                             reason)))
               (fun exn ->
                 deps.warn
                   ("event = sync_retention_failed reason = "

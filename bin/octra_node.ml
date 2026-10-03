@@ -1236,33 +1236,35 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~root_to_raw32
         ~cached_head:Octra_core.Head_manifest.get_cached
     in
-    let proposal_preview =
-      Consensus_proposal_preview_shell.run
-        Consensus_proposal_preview_shell.{
-          chain_id;
-          program_trust;
-          backend =
-            Consensus_proposal_preview_shell.node_backend
-              ~private_artifacts:
-                (Consensus_private_preverify.artifacts private_preverify)
-              ~key_artifacts:
-                (Consensus_key_switch_preverify.artifacts key_switch_preverify)
-              ~program_trust
-              ~rules
-              ~legacy_replay
-              ~private_result_policy
-              ~max_fhe:max_fhe_per_epoch
-              ~max_stealth:max_stealth_per_epoch
-              store
-              ledger;
-          ready_state_root_at;
-          ready_max_lag = validator_ready_max_lag;
-          warn = (fun reason ->
-            Log.warn "consensus"
-              "event = preview_exception reason = %s"
-              reason);
-        }
+    let preview_runtime =
+      Consensus_proposal_preview_shell.{
+        chain_id;
+        program_trust;
+        backend =
+          Consensus_proposal_preview_shell.node_backend
+            ~private_artifacts:
+              (Consensus_private_preverify.artifacts private_preverify)
+            ~key_artifacts:
+              (Consensus_key_switch_preverify.artifacts key_switch_preverify)
+            ~program_trust
+            ~rules
+            ~legacy_replay
+            ~private_result_policy
+            ~max_fhe:max_fhe_per_epoch
+            ~max_stealth:max_stealth_per_epoch
+            store
+            ledger;
+        ready_state_root_at;
+        ready_max_lag = validator_ready_max_lag;
+        warn = (fun reason ->
+          Log.warn "consensus"
+            "event = preview_exception reason = %s"
+            reason);
+      }
     in
+    let proposal_preview = Consensus_proposal_preview_shell.run preview_runtime in
+    let prepare_at = Consensus_proposal_preview_shell.prepare_at
+      ~mode:(Octra_core.Rule_graph.circle_batch rules) preview_runtime in
     let apply_catchup_record (validated : Consensus_catchup_shell.validated_record) =
       let record = validated.record in
       let now = Unix.gettimeofday () in
@@ -1957,6 +1959,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         build_preverify;
         validate_preverify;
         proposal_preview;
+        prepare_at;
         apply_catchup_record;
         catchup_base_eic = catchup_base_eic_root;
         next_txid = (fun () -> Store_chaindata.next_txid chaindata);
@@ -1972,6 +1975,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         mark_quarantine;
         validator_pubkeys_for_epoch;
         proposal_capacity = Staging.max_ou_per_epoch;
+        save_drops;
         quarantine_mismatch_threshold;
         soft_catchup_max_lag;
         quarantine_ahead_streak_threshold;
@@ -2124,8 +2128,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~validator_enrollment:(fun () -> !enrollment_ref)
     in
     Startup_node_launch_shell.run
-      ~shutdown:(fun () -> Octra_node_runtime.Drop_sink.finish
-        ~close:(fun () -> Tx_drop.close drop_db) drop_sink)
+      ~shutdown:(fun () ->
+        Lwt.bind (State_sync_http.shutdown ()) (fun () ->
+          Octra_node_runtime.Drop_sink.finish ~close:(fun () -> Tx_drop.close drop_db) drop_sink))
       ~duty_head:rest_runtime.duty_head
       ~bft_mode:consensus_mode
       Startup_node_launch_shell.{

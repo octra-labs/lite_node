@@ -5,6 +5,8 @@ type write =
   | Set of string * string
   | Del of string
 
+type quorum = Machine | Exact
+
 type result = {
   version : int64;
   writes : write list;
@@ -181,16 +183,21 @@ let validate_transition_policy
           Ok ()
       end
 
-let validate_quorum (policy : Circle_object_policy.t) ~bootstrap ~active_member_count ~next_active_member_count =
+let validate_quorum ?(mode = Machine) (policy : Circle_object_policy.t)
+    ~bootstrap ~active_member_count ~next_active_member_count =
   match policy.member_quorum with
   | Some member_quorum ->
-    let required = Int64.to_int member_quorum in
     let satisfied_count =
       if bootstrap then
         next_active_member_count
       else
         active_member_count in
-    if satisfied_count < required then
+    let satisfied = match mode with
+      | Machine -> satisfied_count >= Int64.to_int member_quorum
+      | Exact ->
+          satisfied_count >= 0 && Int64.compare member_quorum 0L >= 0
+          && Int64.compare (Int64.of_int satisfied_count) member_quorum >= 0 in
+    if not satisfied then
       Error "object member quorum not met"
     else
       Ok ()
@@ -270,6 +277,7 @@ let normalize_transition_inputs
 
 let apply
     ?member_refs
+    ?(quorum = Machine)
     ~current_epoch
     ~storage_tbl
     ~transition_ref
@@ -351,6 +359,7 @@ let apply
                     ~detached_members,
                   validate_required_proof_kind policy proof_kind,
                   validate_quorum
+                    ~mode:quorum
                     policy
                     ~bootstrap
                     ~active_member_count:(List.length active_members_before)

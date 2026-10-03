@@ -458,7 +458,7 @@ let validate_body (body : body) =
     let paths =
       List.rev (List.rev_map (fun file -> file.path) body.files)
     in
-    if paths <> List.sort_uniq String.compare paths then Error "file paths are not canonical"
+    if paths <> List.sort_uniq String.compare paths then Error "file path order is invalid"
     else
       let chunk_count =
         List.fold_left (fun total file -> total + List.length file.chunks) 0 body.files
@@ -588,7 +588,7 @@ let verify_exporters ~exporter_set ~required ~message signatures =
         signature
     ) (Ok ()) signatures
 
-let verify_certificate ~validator_set ~exporter_set certificate =
+let certificate_message ~validator_set ~exporter_set certificate =
   let* () = validate_validator_set validator_set in
   let* () = validate_validator_set exporter_set in
   let draft = {
@@ -598,45 +598,56 @@ let verify_certificate ~validator_set ~exporter_set certificate =
     manifest_hash = certificate.manifest_hash;
   } in
   let* _ = verify_draft draft in
-  let* message =
-    let* () = validate_body certificate.manifest in
-    Ok (manifest_hash_raw certificate.manifest)
-  in
+  let* () = validate_body certificate.manifest in
+  Ok (manifest_hash_raw certificate.manifest)
+
+let verify_authority ~validator_set certificate =
   match certificate.authority with
   | Checkpoint_quorum signatures ->
       if certificate.checkpoint.validator_set_hash <> set_hash validator_set then
         Error "checkpoint validator set hash mismatch"
       else
-        let* () =
-          Checkpoint.verify_quorum
-            ~validator_set
-            certificate.checkpoint
-            signatures
-        in
-        let* () =
-          verify_exporters
-            ~exporter_set
-            ~required:1
-            ~message
-            certificate.exporter_signatures
-        in
-        Ok certificate
+        Checkpoint.verify_quorum ~validator_set certificate.checkpoint signatures
   | Finalized finality ->
       let* () = validate_reference_body certificate.manifest in
-      let* _ =
-        Sync_anchor.verify
-          ~validator_set
-          certificate.checkpoint
-          finality
-      in
-      let* () =
-        verify_exporters
-          ~exporter_set
-          ~required:1
-          ~message
-          certificate.exporter_signatures
-      in
-      Ok certificate
+      Result.map (fun _ -> ())
+        (Sync_anchor.verify ~validator_set certificate.checkpoint finality)
+
+let certificate_exporters ~exporter_set ~message certificate =
+  let* () = verify_exporters ~exporter_set ~required:1 ~message certificate.exporter_signatures in
+  Ok certificate
+
+let verify_certificate ~validator_set ~exporter_set certificate =
+  let* message = certificate_message ~validator_set ~exporter_set certificate in
+  let* () = verify_authority ~validator_set certificate in
+  certificate_exporters ~exporter_set ~message certificate
+
+let verify_certificate_lwt ?(cancelled = fun () -> false) ~validator_set ~exporter_set certificate =
+  let open Lwt.Syntax in
+  let* () = Lwt.pause () in
+  if cancelled () then Lwt.return_error "state sync verification cancelled" else
+  let* message = Lwt_preemptive.detach
+    (certificate_message ~validator_set ~exporter_set) certificate in
+  match message with
+  | Error reason -> Lwt.return_error reason
+  | Ok message ->
+    if cancelled () then Lwt.return_error "state sync verification cancelled" else
+    let* authority = match certificate.authority with
+      | Checkpoint_quorum _ -> Lwt_preemptive.detach (verify_authority ~validator_set) certificate
+      | Finalized finality ->
+        let* reference = Lwt_preemptive.detach validate_reference_body certificate.manifest in
+        match reference with
+        | Error reason -> Lwt.return_error reason
+        | Ok () ->
+          let* checked = Sync_anchor.verify_lwt ~cancelled ~validator_set certificate.checkpoint finality in
+          Lwt.return (Result.map (fun _ -> ()) checked)
+    in
+    match authority with
+    | Error reason -> Lwt.return_error reason
+    | Ok () ->
+      let* () = Lwt.pause () in
+      if cancelled () then Lwt.return_error "state sync verification cancelled"
+      else Lwt_preemptive.detach (certificate_exporters ~exporter_set ~message) certificate
 
 let verify_reference_certificate ~validator_set ~exporter_set certificate =
   match certificate.authority with
@@ -812,6 +823,10 @@ let load_certificate path =
   load_limited parse_certificate_string path
 
 let write_json path json =
+  let buffer = Buffer.create 4096 in
+  Yojson.Safe.to_buffer ~suf:"\n" buffer json;
+  if Buffer.length buffer > manifest_limit then
+    failwith "manifest exceeds size limit";
   let parent = Filename.dirname path in
   let rec mkdir current =
     if current = "" || current = "." || Sys.file_exists current then ()
@@ -836,8 +851,7 @@ let write_json path json =
       Fun.protect
         ~finally:(fun () -> close_out_noerr output)
         (fun () ->
-          Yojson.Safe.to_channel output json;
-          output_char output '\n';
+          Buffer.output_buffer output buffer;
           flush output;
           Unix.fsync (Unix.descr_of_out_channel output))
     with exn ->

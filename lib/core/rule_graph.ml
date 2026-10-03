@@ -247,6 +247,8 @@ let fhe_work_activation_for_chain = tx_envelope_activation_for_chain
 
 let wasm_float_activation_for_chain = tx_envelope_activation_for_chain
 
+let batch_activation_for_chain _ : activation option = None
+
 let profile_epochs ~chain_id =
   [standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
@@ -256,7 +258,8 @@ let profile_epochs ~chain_id =
    program_source_activation_for_chain chain_id;
    tx_envelope_activation_for_chain chain_id;
    fhe_work_activation_for_chain chain_id;
-   wasm_float_activation_for_chain chain_id]
+   wasm_float_activation_for_chain chain_id;
+   batch_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -356,6 +359,10 @@ let consensus_id ~chain_id ~epoch =
     match wasm_float_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
+  |> (fun plans ->
+    match batch_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -442,6 +449,7 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       tx_envelope_activation_for_chain chain_id;
       fhe_work_activation_for_chain chain_id;
       wasm_float_activation_for_chain chain_id;
+      batch_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -563,6 +571,8 @@ let tx_envelope t ~epoch =
 let fhe_work t ~epoch = mode t (fhe_work_activation_for_chain t.chain_id) ~epoch
 
 let wasm_float t ~epoch = mode t (wasm_float_activation_for_chain t.chain_id) ~epoch
+
+let circle_batch t ~epoch = mode t (batch_activation_for_chain t.chain_id) ~epoch
 
 let wasm_float_at ~chain_id ~epoch =
   match wasm_float_activation_for_chain chain_id with

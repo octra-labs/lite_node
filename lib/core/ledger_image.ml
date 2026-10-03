@@ -71,11 +71,20 @@ let rec remove_tree path =
         Unix.rmdir path
     | _ -> Unix.unlink path
 
-let fsync_dir path =
+let sync_path sync path =
   let descriptor = Unix.openfile path [Unix.O_RDONLY] 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close descriptor)
-    (fun () -> Unix.fsync descriptor)
+    (fun () -> sync descriptor)
+
+let rec sync_tree sync path =
+  match (Unix.lstat path).Unix.st_kind with
+  | Unix.S_DIR ->
+      Sys.readdir path |> Array.to_list |> List.sort String.compare
+      |> List.iter (fun name -> sync_tree sync (Filename.concat path name));
+      sync_path sync path
+  | Unix.S_REG -> sync_path sync path
+  | _ -> failwith "restored ledger entry is not a regular file or directory"
 
 let lower_hex_64 value =
   String.length value = 64
@@ -183,14 +192,23 @@ let emit sink record =
               append sink value
         in
         if Buffer.length sink.buffer >= drain_bytes then drain sink
+        else if Int64.rem sink.records 256L = 0L then Lwt.pause ()
         else Lwt.return_unit
 
 let sorted_entries tree =
-  let* entries = Store.Tree.list tree [] in
-  Lwt.return
-    (List.sort
-       (fun (left, _) (right, _) -> String.compare left right)
-       entries)
+  let* sequence = Store.Tree.seq tree [] in
+  let rec collect count entries sequence =
+    match sequence () with
+    | Seq.Nil -> Lwt.return (count, entries)
+    | Seq.Cons (entry, rest) ->
+        let count = count + 1 in
+        let* () = if count mod 256 = 0 then Lwt.pause () else Lwt.return_unit in
+        collect count (entry :: entries) rest in
+  let* count, entries = collect 0 [] sequence in
+  let sort entries =
+    List.sort (fun (left, _) (right, _) -> String.compare left right) entries in
+  if count < 256 then Lwt.return (sort entries)
+  else Lwt_preemptive.detach sort entries
 
 let rec write_tree sink tree prefix =
   let* entries = sorted_entries tree in
@@ -211,6 +229,19 @@ let rec write_tree sink tree prefix =
           write_tree sink child path
       | None -> Lwt.fail_with "ledger image entry disappeared")
     entries
+
+let discard channel path =
+  let owned = try Some (Unix.fstat (Unix.descr_of_out_channel channel))
+    with _ -> None in
+  close_out_noerr channel;
+  match owned with
+  | None -> ()
+  | Some owned ->
+      try
+        let current = Unix.lstat path in
+        if current.st_kind = Unix.S_REG && current.st_dev = owned.st_dev
+           && current.st_ino = owned.st_ino then Unix.unlink path
+      with _ -> ()
 
 let write store ~commit ~path =
   if Sys.file_exists path then
@@ -238,17 +269,17 @@ let write store ~commit ~path =
                       0o640
                       path
                   in
-                  let sink = {
-                    channel;
-                    buffer = Buffer.create drain_bytes;
-                    records = 0L;
-                    bytes = Int64.of_int (String.length magic);
-                    prior = None;
-                    pvac_hashes = [];
-                  } in
-                  output_string channel magic;
                   Lwt.catch
                     (fun () ->
+                      let sink = {
+                        channel;
+                        buffer = Buffer.create drain_bytes;
+                        records = 0L;
+                        bytes = Int64.of_int (String.length magic);
+                        prior = None;
+                        pvac_hashes = [];
+                      } in
+                      output_string channel magic;
                       let* () = write_tree sink tree [] in
                       put_u32 sink.buffer 0;
                       sink.bytes <- Int64.add sink.bytes 4L;
@@ -269,11 +300,9 @@ let write store ~commit ~path =
                           List.sort_uniq String.compare sink.pvac_hashes;
                       })
                     (fun exn ->
-                      close_out_noerr channel;
-                      (try Unix.unlink path with _ -> ());
+                      discard channel path;
                       Lwt.return_error (Printexc.to_string exn)))
                 (fun exn ->
-                  (try Unix.unlink path with _ -> ());
                   Lwt.return_error (Printexc.to_string exn))
         end
 
@@ -476,8 +505,26 @@ let build ~free source stage expected_root =
         let* _ = close_store store in
         Lwt.fail exn)
 
-let restore_with ~free ~source ~target ~expected_root =
+let restore_new ~sync ~free ~source ~target ~expected_root =
   let stage = target ^ ".next" in
+  Lwt.catch
+    (fun () ->
+      remove_tree stage;
+      let* result = build ~free source stage expected_root in
+      match result with
+      | Error _ as error ->
+          remove_tree stage;
+          Lwt.return error
+      | Ok report ->
+          sync_tree sync stage;
+          Unix.rename stage target;
+          sync_path sync (Filename.dirname target);
+          Lwt.return_ok report)
+    (fun exn ->
+      (try remove_tree stage with _ -> ());
+      Lwt.fail exn)
+
+let restore_run ~sync ~free ~source ~target ~expected_root =
   Lwt.catch
     (fun () ->
       if Sys.file_exists target then
@@ -487,23 +534,16 @@ let restore_with ~free ~source ~target ~expected_root =
           | Error _ as error -> Lwt.return error
           | Ok (commit, root) ->
               let size = (Unix.LargeFile.stat source).Unix.LargeFile.st_size in
+              sync_tree sync target;
+              sync_path sync (Filename.dirname target);
               Lwt.return_ok { commit; root; records = 0L; bytes = size }
         end
-      else begin
-        remove_tree stage;
-        let* result = build ~free source stage expected_root in
-        match result with
-        | Error _ as error ->
-            remove_tree stage;
-            Lwt.return error
-        | Ok report ->
-            Unix.rename stage target;
-            fsync_dir (Filename.dirname target);
-            Lwt.return_ok report
-      end)
+      else restore_new ~sync ~free ~source ~target ~expected_root)
     (fun exn ->
-      (try remove_tree stage with _ -> ());
       Lwt.return_error (Printexc.to_string exn))
+
+let restore_with ~free ~source ~target ~expected_root =
+  restore_run ~sync:Unix.fsync ~free ~source ~target ~expected_root
 
 let restore ~source ~target ~expected_root =
   restore_with ~free:disk_free ~source ~target ~expected_root

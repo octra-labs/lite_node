@@ -47,7 +47,7 @@ type synced = {
 
 type outcome =
   | Synced of synced
-  | Leader_stale of {
+  | Leader_behind of {
       local_head : int64;
       leader_head : int64;
     }
@@ -256,6 +256,7 @@ val head_url : string -> string
 
 val range_url :
   ?part:int ->
+  ?hash:string ->
   string ->
   from_epoch:int64 ->
   max_epochs:int ->

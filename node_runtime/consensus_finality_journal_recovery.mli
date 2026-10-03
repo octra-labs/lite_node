@@ -11,7 +11,8 @@ type invalid_plan =
   | Block_invalid
 
 type deps = {
-  read_journal : unit -> Consensus_finality_journal.read_result;
+  read_journal : unit ->
+    (Consensus_finality_journal.read_result, Consensus_finality_journal.read_error) result;
   read_pending_epoch : unit -> (int64 option, string) result;
   drop_invalid_unapplied : head_epoch:int -> (int, string) result;
   head_epoch : unit -> int;

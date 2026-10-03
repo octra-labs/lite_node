@@ -196,6 +196,8 @@ let check_head_root () =
   let module Chain = Octra_core.Store_chaindata in
   let module Source = Octra_node_runtime.Consensus_parent_commit in
   let module Status = Octra_node_runtime.Status_read_rpc in
+  let module Journal = Octra_node_runtime.Consensus_finality_journal in
+  let module Log = Octra_consensus.Finality_log in
   let module Text = Octra_node_runtime.Text in
   let module Guard = Octra_node_runtime.Consensus_epoch_apply_guard in
   Mirage_crypto_rng_unix.use_default ();
@@ -208,7 +210,8 @@ let check_head_root () =
     ~ledger_state_root:ledger_root ~epoch_index_root in
   let header = C.{
     proto_version = proto_version_current; chain_id = "set-post-test"; epoch_id = 100L;
-    prev_state_root = String.make 32 'a'; tx_list_hash = Hash.tx_list_hash [];
+    prev_state_root = String.make 32 'a';
+    tx_list_hash = Octra_consensus.C_engine.tx_list_hash_for_header [];
     receipt_root = Hash.receipt_root []; proposed_state_root = Guard.raw32_of_pre_root state_root;
     parent_commit_hash = Octra_net.Hash_domain.nil_hash; creator_addr = "octA";
     txid_hi = 0L; ts = 1.;
@@ -260,7 +263,64 @@ let check_head_root () =
        state_root ^ String.make 63 'f' ^ "g"];
     expect "head epoch must match verified floor" (Result.is_error (read { head with epoch_id = 101 }));
     expect "head chain must match certificate"
-      (Result.is_error (Status.head_proposal_id ~source ~chain_id:"another-chain" ~head))));
+      (Result.is_error (Status.head_proposal_id ~source ~chain_id:"another-chain" ~head));
+    let finalize header =
+      let proposal_id = Hash.proposal_id header in
+      let vote = { vote with C.epoch_id = header.C.epoch_id; proposal_id } in
+      let vote = { vote with C.signature = Mirage_crypto_ec.Ed25519.sign
+        ~key (Hash.vote_sign_bytes vote) } in
+      C.{ chain_id = header.chain_id; epoch_id = header.epoch_id;
+        commit_round = 0; header; proposal_id; precommits = [vote]; parent_commit = None }
+    in
+    let next = finalize { header with epoch_id = 101L } in
+    Log.write data_dir (Log.of_finalize next);
+    expect "floor proof survives next finality"
+      (read head = Ok (Text.raw_to_hex proposal_id));
+    expect "consensus parent still refuses next finality"
+      (Source.load (Result.get_ok source) ~epoch_id:101L
+       = Error "parent finality entry is ahead");
+    let stage proof =
+      Journal.stage data_dir ~chain_id:header.chain_id ~validator_set
+        ~bundle:Journal.{ tx_hashes = []; txs = []; receipts_json = [] } proof
+      |> ignore
+    in
+    stage next;
+    let next_head = { head with epoch_id = 101 } in
+    expect "pending certificate cannot attest head"
+      (Result.is_error (read next_head));
+    Journal.promote_applied data_dir ~epoch:101L
+      ~state_root:next.header.proposed_state_root;
+    let proof_id = Text.raw_to_hex next.proposal_id in
+    expect "committed certificate attests head" (read next_head = Ok proof_id);
+    let future = finalize { header with epoch_id = 102L } in
+    Log.write data_dir (Log.of_finalize future);
+    stage future;
+    expect "pending next finality preserves committed proof"
+      (read next_head = Ok proof_id);
+    expect "new head cannot use prior certificate"
+      (Result.is_error (read { head with epoch_id = 102 }));
+    Journal.promote_applied data_dir ~epoch:102L
+      ~state_root:future.header.proposed_state_root;
+    expect "archived certificate attests its exact head" (read next_head = Ok proof_id);
+    expect "archived certificate rejects wrong root"
+      (Result.is_error (read { next_head with state_root = String.make 64 '0' }));
+    let path = Filename.concat data_dir "finality/committed_finalized.json" in
+    let saved = Yojson.Safe.from_file path in
+    let fields = Yojson.Safe.Util.to_assoc saved in
+    Fun.protect ~finally:(fun () -> Yojson.Safe.to_file path saved) (fun () ->
+      List.iter (fun proof ->
+        let encoded = Octra_consensus.C_codec.encode_finalize proof
+          |> Base64.encode_exn in
+        Yojson.Safe.to_file path (`Assoc
+          (("finalize", `String encoded) :: List.remove_assoc "finalize" fields));
+        expect "unverified certificate cannot attest head"
+          (Result.is_error (read { head with epoch_id = 102 })))
+        [{ future with precommits = [] };
+         { future with precommits = List.map (fun (vote : C.vote) ->
+             { vote with C.signature = String.make 64 '\000' }) future.precommits }];
+      Yojson.Safe.to_file path (`Assoc []);
+      expect "corrupt journal cannot select floor proof"
+        (Result.is_error (read head)))));
   expect "test storage removed" (not (Sys.file_exists data_dir))
 
 let check_duty_state () =

@@ -424,7 +424,7 @@ let make_contract_ctx (deps : (_, _) deps) =
         let params = List.map Receipt_view.nested_call_arg_json args in
         let r =
           deps.execute_call
-            ~ctx:{ctx with fhe_memory = scope.memory}
+            ~ctx:{ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
             ~depth:scope.depth
             ~limit:scope.limit
             ~target
@@ -441,7 +441,7 @@ let make_contract_ctx (deps : (_, _) deps) =
         let program = deps.snapshot_program () in
         match
           deps.deploy_internal
-            ~ctx:{ctx with fhe_memory = scope.memory}
+            ~ctx:{ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
             ~depth:scope.depth
             ~limit:scope.limit
             ~params

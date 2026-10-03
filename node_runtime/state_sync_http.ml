@@ -10,8 +10,6 @@ module Metrics = Octra_core.Metrics
 module Request = Cohttp.Request
 module Server = Cohttp_lwt_unix.Server
 module State_sync = Octra_bootstrap.State_sync
-module Cycle = Octra_bootstrap.Sync_cycle
-module Range_part = Octra_bootstrap.Range_part
 module Manifest = Octra_bootstrap.State_sync_manifest
 module Tree = Octra_core.Tree
 
@@ -103,7 +101,7 @@ let state_sync_enabled () =
        (Sys.getenv_opt "OCTRA_STATE_SYNC_EXPORTERS")
 
 let manifest_epoch_limit =
-  Int64.mul 2L (Cycle.interval Cycle.default)
+  Int64.min 3_000L (Int64.pred Consensus_finality_journal.history_limit)
 
 let snapshot_epoch_state ~current_epoch ~snapshot_epoch =
   let lag = Int64.max 0L (Int64.sub current_epoch snapshot_epoch) in
@@ -127,23 +125,7 @@ let respond_state_sync_disabled () =
     `Forbidden
     "state sync RPC is disabled"
 
-type loaded_certificate = {
-  raw : string;
-  certificate : Manifest.certificate;
-}
-
-type certificate_cache = {
-  path : string;
-  inode : int;
-  modified : float;
-  size : int;
-  validator_hash : string;
-  checked_at : float;
-  outcome : (loaded_certificate, string) result;
-}
-
-let certificate_cache = ref None
-let negative_cache_seconds = 5.0
+type loaded_certificate = Sync_cert.loaded
 let manifest_warning_at = ref 0.0
 let manifest_warning_seconds = 30.0
 let active_chunk_reads = ref 0
@@ -229,32 +211,54 @@ let configured_config_hash () =
   | Some value -> hash_hex (String.trim value)
   | None -> Error "state sync config hash is not configured"
 
-let read_file_limited path limit =
-  let input = open_in_bin path in
-  Fun.protect
-    ~finally:(fun () -> close_in_noerr input)
-    (fun () ->
-      let size = in_channel_length input in
-      if size > limit then failwith "state sync certificate exceeds size limit";
-      really_input_string input size)
+let certificate_stat left right =
+  left.Unix.st_kind = Unix.S_REG && right.Unix.st_kind = Unix.S_REG
+  && left.st_dev = right.st_dev && left.st_ino = right.st_ino
+  && left.st_size = right.st_size && left.st_mtime = right.st_mtime
+  && left.st_ctime = right.st_ctime
 
-let cache_matches cached path stat validator_hash =
-  cached.path = path
-  && cached.inode = stat.Unix.st_ino
-  && cached.modified = stat.Unix.st_mtime
-  && cached.size = stat.Unix.st_size
-  && cached.validator_hash = validator_hash
+let read_certificate path =
+  Lwt_preemptive.detach (fun () ->
+    try
+      let descriptor = Unix.openfile path [Unix.O_RDONLY; Unix.O_NONBLOCK] 0 in
+      let input = Unix.in_channel_of_descr descriptor in
+      Fun.protect ~finally:(fun () -> close_in_noerr input) (fun () ->
+        let before = Unix.fstat descriptor in
+        if before.st_kind <> Unix.S_REG then Error "state sync certificate is not a file"
+        else if before.st_size > Manifest.manifest_limit then
+          Error "state sync certificate exceeds size limit"
+        else
+          let raw = really_input_string input before.st_size in
+          if certificate_stat before (Unix.fstat descriptor)
+             && certificate_stat before (Unix.stat path) then Ok raw
+          else Error "state sync certificate changed during read")
+    with _ -> Error "state sync certificate read failed") ()
 
-let cached_outcome now cached =
-  match cached.outcome with
-  | Ok loaded ->
-      if Manifest.fresh ~now:(Int64.of_float now) loaded.certificate then
-        Some (Ok loaded)
-      else
-        Some (Error "state sync certificate is outside its validity window")
-  | Error reason when now -. cached.checked_at <= negative_cache_seconds ->
-      Some (Error reason)
-  | Error _ -> None
+let verify_certificate ~cancelled (trust : Sync_cert.trust) raw =
+  Lwt_preemptive.detach Manifest.parse_certificate_string raw >>= function
+  | Error reason -> Lwt.return_error reason
+  | Ok certificate ->
+    Manifest.verify_certificate_lwt ~cancelled ~validator_set:trust.validators
+      ~exporter_set:trust.exporters certificate >|= function
+    | Error reason -> Error reason
+    | Ok certificate ->
+      if certificate.checkpoint.chain_id <> trust.chain then
+        Error "state sync certificate chain mismatch"
+      else if certificate.checkpoint.config_hash <> trust.config then
+        Error "state sync certificate config mismatch"
+      else Ok certificate
+
+let certificate_actor = lazy (
+  let clock = Mtime_clock.counter () in
+  Sync_cert.create {
+    now = (fun () -> Mtime.Span.to_float_ns (Mtime_clock.count clock) /. 1e9);
+    read = read_certificate;
+    verify = verify_certificate;
+  })
+
+let shutdown () =
+  if Lazy.is_val certificate_actor then Sync_cert.shutdown (Lazy.force certificate_actor)
+  else Lwt.return_unit
 
 let warn_manifest_unavailable reason =
   let now = Unix.gettimeofday () in
@@ -264,104 +268,61 @@ let warn_manifest_unavailable reason =
   end
 
 let load_certificate_at ~path ~chain_id =
-  match configured_validator_set () with
-  | Error _ as error -> error
-  | Ok configured_validators ->
-      try
-        let stat = Unix.stat path in
-        if stat.Unix.st_kind <> Unix.S_REG then Error "state sync certificate is not a file"
-        else
-          let configured_hash =
-            Octra_consensus.C_config.validator_set_hash configured_validators
-            |> Manifest.raw_to_hex
-          in
-          match exporter_set (), configured_config_hash () with
-          | Error _ as error, _
-          | _, (Error _ as error) -> error
-          | Ok exporter_set, Ok expected_config ->
-              let exporter_hash =
-                Octra_consensus.C_config.validator_set_hash exporter_set
-                |> Manifest.raw_to_hex
-              in
-              let cache_hash =
-                configured_hash ^ exporter_hash ^ chain_id ^ expected_config
-              in
-              let now = Unix.gettimeofday () in
-              let cached =
-                match !certificate_cache with
-                | Some cached when cache_matches cached path stat cache_hash ->
-                    cached_outcome now cached
-                | _ -> None
-              in
-              begin
-                match cached with
-                | Some outcome -> outcome
-                | None ->
-                    let outcome =
-                      try
-                        let raw = read_file_limited path Manifest.manifest_limit in
-                        match Manifest.parse_certificate_string raw with
-                        | Error _ as error -> error
-                        | Ok certificate ->
-                            begin
-                              match Manifest.verify_certificate
-                                ~validator_set:configured_validators
-                                ~exporter_set
-                                certificate with
-                              | Error _ as error -> error
-                              | Ok certificate ->
-                                  if certificate.checkpoint.chain_id <> chain_id then
-                                    Error "state sync certificate chain mismatch"
-                                  else if certificate.checkpoint.config_hash <> expected_config then
-                                    Error "state sync certificate config mismatch"
-                                  else if not (Manifest.fresh
-                                    ~now:(Int64.of_float now)
-                                    certificate) then
-                                    Error "state sync certificate is outside its validity window"
-                                  else
-                                    Ok { raw; certificate }
-                            end
-                      with exn -> Error (Printexc.to_string exn)
-                    in
-                    certificate_cache := Some {
-                      path;
-                      inode = stat.Unix.st_ino;
-                      modified = stat.Unix.st_mtime;
-                      size = stat.Unix.st_size;
-                      validator_hash = cache_hash;
-                      checked_at = now;
-                      outcome;
-                    };
-                    outcome
-              end
-      with exn -> Error (Printexc.to_string exn)
+  let configured () =
+    match configured_validator_set (), exporter_set (), configured_config_hash () with
+    | Ok validators, Ok exporters, Ok config ->
+      Ok Sync_cert.{ validators; exporters; config; chain = chain_id }
+    | Error reason, _, _ | _, Error reason, _ | _, _, Error reason -> Error (Sync_cert.Invalid reason)
+  in
+  match configured () with
+  | Error reason -> Lwt.return_error reason
+  | Ok trust ->
+    Sync_cert.load (Lazy.force certificate_actor) ~path trust >|= function
+    | Error reason -> Error reason
+    | Ok loaded ->
+      match configured () with
+      | Error reason -> Error reason
+      | Ok current when Sync_cert.trust_hash current <> Sync_cert.trust_hash trust ->
+        Error (Sync_cert.Invalid "state sync trust changed during verification")
+      | Ok _ ->
+        if Manifest.fresh ~now:(Int64.of_float (Unix.gettimeofday ())) loaded.certificate then
+          Ok loaded
+        else Error (Sync_cert.Invalid "state sync certificate is outside its validity window")
 
 let load_certificate ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ =
   match configured_certificate_path ~data_dir with
-  | Error _ as error -> error
+  | Error reason -> Lwt.return_error (Sync_cert.Invalid reason)
   | Ok path -> load_certificate_at ~path ~chain_id
 
 let load_snapshot_certificate ~data_dir ~chain_id ~snapshot_id =
   let snapshot = State_sync.snapshot_dir data_dir snapshot_id in
   let archived = State_sync.snapshot_certificate_path snapshot in
-  let matches loaded =
+  let matches (loaded : loaded_certificate) =
     loaded.certificate.Manifest.manifest.snapshot_id = snapshot_id
   in
-  match load_certificate_at ~path:archived ~chain_id with
-  | Ok loaded when matches loaded -> Ok loaded
-  | Ok _ -> Error "state sync snapshot certificate mismatch"
+  load_certificate_at ~path:archived ~chain_id >>= function
+  | Ok loaded when matches loaded -> Lwt.return_ok loaded
+  | Ok _ -> Lwt.return_error (Sync_cert.Invalid "state sync snapshot certificate mismatch")
+  | Error reason when Sync_cert.retryable reason -> Lwt.return_error reason
   | Error archived_error ->
       begin
         match configured_certificate_path ~data_dir with
-        | Error _ -> Error archived_error
+        | Error _ -> Lwt.return_error archived_error
         | Ok current ->
-            match load_certificate_at ~path:current ~chain_id with
+            load_certificate_at ~path:current ~chain_id >|= function
             | Ok loaded when matches loaded -> Ok loaded
-            | Ok _ -> Error "state sync snapshot is not retained"
+            | Ok _ -> Error (Sync_cert.Invalid "state sync snapshot is not retained")
+            | Error reason when Sync_cert.retryable reason -> Error reason
             | Error _ -> Error archived_error
       end
 
-let respond_certificate cached =
+let certificate_error ~error_type status error =
+  let reason = Sync_cert.reason error in
+  if Sync_cert.retryable error then
+    respond_error_after ~seconds:1 ~error_type:"state_sync_busy" `Too_many_requests reason
+  else respond_error ~error_type status reason
+
+let respond_certificate (cached : loaded_certificate) =
   Server.respond_string
     ~status:`OK
     ~headers:(Header.of_list [
@@ -376,13 +337,10 @@ let handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set ~current_epo
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
-    match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
+    load_certificate ~data_dir ~chain_id ~config_hash ~validator_set >>= function
     | Error reason ->
-        warn_manifest_unavailable reason;
-        respond_error
-          ~error_type:"state_sync_unavailable"
-          `Service_unavailable
-          reason
+        warn_manifest_unavailable (Sync_cert.reason reason);
+        certificate_error ~error_type:"state_sync_unavailable" `Service_unavailable reason
     | Ok cached ->
         let head_epoch = committed_epoch current_epoch in
         let snapshot_epoch = cached.certificate.Manifest.checkpoint.epoch in
@@ -400,57 +358,38 @@ let handle_manifest ~data_dir ~chain_id ~config_hash ~validator_set ~current_epo
                 reason
         end
 
-let field_string ~default name json =
-  match json with
-  | `Assoc fields ->
-      begin
-        match List.assoc_opt name fields with
-        | Some (`String s) -> s
-        | _ -> default
-      end
-  | _ -> default
-
-let field_list_len name json =
-  match json with
-  | `Assoc fields ->
-      begin
-        match List.assoc_opt name fields with
-        | Some (`List values) -> List.length values
-        | _ -> 0
-      end
-  | _ -> 0
-
 let handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
-    let snapshot_epoch =
-      match load_certificate ~data_dir ~chain_id ~config_hash ~validator_set with
-      | Ok cached -> Some cached.certificate.Manifest.checkpoint.epoch
-      | Error _ -> None
-    in
-    let head_epoch = committed_epoch current_epoch in
-    let snapshot_status, snapshot_lag =
-      match snapshot_epoch with
-      | None -> "missing", `Null
-      | Some epoch ->
-          begin
-            match snapshot_epoch_state ~current_epoch:head_epoch ~snapshot_epoch:epoch with
-            | `Ready lag -> "ready", `Intlit (Int64.to_string lag)
-            | `Old_epoch lag -> "old_epoch", `Intlit (Int64.to_string lag)
-          end
-    in
-    let response =
-      match State_sync.head_json ~current_epoch ~snapshot_epoch with
-      | `Assoc fields ->
-          `Assoc (fields @ [
-            "snapshot_status", `String snapshot_status;
-            "snapshot_lag", snapshot_lag;
-            "snapshot_lag_limit", `Intlit (Int64.to_string manifest_epoch_limit);
-          ])
-      | other -> other
-    in
-    respond_json response
+    load_certificate ~data_dir ~chain_id ~config_hash ~validator_set >>= function
+    | Error reason when Sync_cert.retryable reason ->
+      certificate_error ~error_type:"state_sync_unavailable" `Service_unavailable reason
+    | result ->
+      let snapshot_epoch = Result.to_option result
+        |> Option.map (fun cached -> cached.Sync_cert.certificate.Manifest.checkpoint.epoch) in
+      let head_epoch = committed_epoch current_epoch in
+      let snapshot_status, snapshot_lag =
+        match snapshot_epoch with
+        | None -> "missing", `Null
+        | Some epoch ->
+            begin
+              match snapshot_epoch_state ~current_epoch:head_epoch ~snapshot_epoch:epoch with
+              | `Ready lag -> "ready", `Intlit (Int64.to_string lag)
+              | `Old_epoch lag -> "old_epoch", `Intlit (Int64.to_string lag)
+            end
+      in
+      let response =
+        match State_sync.head_json ~current_epoch ~snapshot_epoch with
+        | `Assoc fields ->
+            `Assoc (fields @ [
+              "snapshot_status", `String snapshot_status;
+              "snapshot_lag", snapshot_lag;
+              "snapshot_lag_limit", `Intlit (Int64.to_string manifest_epoch_limit);
+            ])
+        | other -> other
+      in
+      respond_json response
 
 let handle_client_progress body =
   if not (state_sync_enabled ()) then
@@ -479,7 +418,7 @@ let handle_readiness ~data_dir =
           `Internal_server_error
           "readiness marker is corrupt"
 
-let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
+let handle_range ~ranges ~validator_set query =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
@@ -503,11 +442,18 @@ let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
       | None -> true
       | Some index -> index >= 0
     in
-    if Int64.compare from_epoch 0L < 0 || max_epochs <= 0 || not part_valid then
+    let hash = query_param query "sha256" in
+    let hash_valid = match hash with
+      | None -> true
+      | Some value -> part <> None && String.length value = 64
+          && String.for_all (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false) value in
+    if Int64.compare from_epoch 0L < 0
+       || from_epoch > Int64.sub (Int64.of_int max_int) 16L
+       || max_epochs <= 0 || not part_valid || not hash_valid then
       respond_error
         ~error_type:"state_sync_bad_range_request"
         `Bad_request
-        "invalid from_epoch/max_epochs/part"
+        "invalid range parameters"
     else
       let validator_pubkeys =
         List.map
@@ -519,62 +465,29 @@ let handle_range ~data_dir ~chaindata ~chain_id ~validator_set query =
       let validator_policy =
         Octra_core.Validator_policy.of_env_exn Sys.getenv_opt
       in
-      let json =
-        State_sync.range_json
-          ~chain_id
-          ~data_dir:(Some data_dir)
-          ~chaindata
-          ~on_stop:(fun ~epoch ~reason ->
-            Log.warn "state_sync"
-              "event = catchup_range_stop epoch = %Ld reason = %s"
-              epoch
-              reason)
-          ~reward_source:
-            (fun _ header ->
-              Consensus_reward_attribution.epoch_source
-                ~validator_activation_epoch:
-                  (Octra_core.Validator_policy.activation_epoch
-                     validator_policy)
-                ~validator_pubkeys
-                header)
-          ~read_finality:
-            (fun epoch ->
-              match
-                Consensus_finality_journal.read_committed_epoch
-                  ~chain_id
-                  ~epoch:(Int64.of_int epoch)
-                  data_dir
-              with
-              | Consensus_finality_journal.Valid record ->
-                Some Octra_consensus.C_codec.{
-                  finalize = record.finalize;
-                  validator_set = record.validator_set;
-                }
-              | Consensus_finality_journal.Missing ->
-                None
-              | Consensus_finality_journal.Invalid reason ->
-                Log.error "state_sync"
-                  "event = finality_read_failed epoch = %d reason = %s"
-                  epoch
-                  reason;
-                None)
-          ~from_epoch
-          ~max_epochs
-      in
-      let status = field_string ~default:"unknown" "status" json in
-      let records = field_list_len "records" json in
-      Log.info "state_sync"
-        "range from_epoch = %Ld max_epochs = %d part = %d status = %s records = %d"
-        from_epoch max_epochs (Option.value ~default:(-1) part) status records;
-      begin
-        match Range_part.reply ?index:part json with
-        | Ok reply -> respond_json reply
-        | Error reason ->
-          respond_error
-            ~error_type:"state_sync_range_part"
-            `Bad_request
-            reason
-      end
+      Sync_range.load ranges {
+        from_epoch; max_epochs; part; hash;
+        head = Octra_core.Head_manifest.get_cached ();
+        pubkeys = validator_pubkeys;
+        activation = Octra_core.Validator_policy.activation_epoch validator_policy;
+      } >>= function
+      | Ok reply ->
+        Log.info "state_sync"
+          "range from_epoch = %Ld max_epochs = %d part = %d status = %s records = %d"
+          from_epoch max_epochs (Option.value ~default:(-1) part) reply.status reply.records;
+        Server.respond_string ~status:`OK ~headers:cors_headers ~body:reply.body ()
+      | Error (Sync_range.Invalid reason) ->
+        respond_error ~error_type:"state_sync_range_part" `Bad_request reason
+      | Error error ->
+        let reason = match error with
+          | Sync_range.Busy -> "range read busy"
+          | Sync_range.Expired -> "range read expired"
+          | Sync_range.Stopped -> "range read stopped"
+          | Sync_range.Changed -> "range head changed"
+          | Sync_range.Missing -> "range response unavailable"
+          | Sync_range.Invalid reason -> reason in
+        respond_error_after ~seconds:2 ~error_type:"state_sync_range_busy"
+          `Service_unavailable reason
 
 let int_query_param query name default_value =
   match query_param query name with
@@ -610,12 +523,9 @@ let handle_chunk ~data_dir ~chain_id ~config_hash:_ ~validator_set:_ query =
         `Gone
         "state sync snapshot expired; restart with the current manifest"
     else
-    match load_snapshot_certificate ~data_dir ~chain_id ~snapshot_id with
+    load_snapshot_certificate ~data_dir ~chain_id ~snapshot_id >>= function
     | Error reason ->
-        respond_error
-          ~error_type:"state_sync_snapshot_unavailable"
-          `Not_found
-          reason
+        certificate_error ~error_type:"state_sync_snapshot_unavailable" `Not_found reason
     | Ok cached ->
         let certificate = cached.certificate in
         let body = certificate.Manifest.manifest in
@@ -706,7 +616,7 @@ let handle
     ~config_hash
     ~validator_set
     ~current_epoch
-    ~chaindata
+    ~ranges
     ~encrypted_supply
     req
     body =
@@ -742,7 +652,7 @@ let handle
   | `GET, "/state-sync/readiness" ->
       handle_readiness ~data_dir
   | `GET, "/state-sync/range" ->
-      handle_range ~data_dir ~chaindata ~chain_id ~validator_set query
+      handle_range ~ranges ~validator_set query
   | `GET, "/state-sync/chunk" ->
       handle_chunk ~data_dir ~chain_id ~config_hash ~validator_set query
   | `GET, "/metrics" ->

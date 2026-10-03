@@ -7,9 +7,16 @@ type source = {
   current_height : unit -> int64;
   active_raw : unit -> string option;
   pending_raw : unit -> string option;
+  relief : int64 -> (Octra_consensus.C_relief.mark option, string) result;
 }
 
 val expected_set :
+  ?round:int ->
+  source ->
+  epoch:int64 ->
+  (Octra_consensus.C_types.validator_set, string) result
+
+val stake_set :
   source ->
   epoch:int64 ->
   (Octra_consensus.C_types.validator_set, string) result

@@ -2,11 +2,304 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 From Stdlib Require Import Arith.PeanoNat.
+From Stdlib Require Import Bool.Bool.
 From Stdlib Require Import Lists.List.
 From Stdlib Require Import Lia.
 From Stdlib Require Import ZArith.
 
 Import ListNotations.
+
+Module Expiry.
+Section Entries.
+Context {A : Type}.
+Variable deadline : A -> Z.
+
+Definition retain now (entries : list A) :=
+  filter (fun entry => Z.leb now (deadline entry)) entries.
+
+Definition remove now (entries : list A) :=
+  filter (fun entry => negb (Z.leb now (deadline entry))) entries.
+
+Theorem retain_exact : forall now entries entry,
+  In entry (retain now entries) <->
+  In entry entries /\ (now <= deadline entry)%Z.
+Proof.
+  intros now entries entry. unfold retain.
+  rewrite filter_In, Z.leb_le. reflexivity.
+Qed.
+
+Theorem expiry_count : forall now entries,
+  length (retain now entries) + length (remove now entries) = length entries.
+Proof.
+  intros now entries. induction entries as [|entry rest ih].
+  - reflexivity.
+  - unfold retain, remove in *. simpl.
+    destruct (Z.leb now (deadline entry)); simpl; lia.
+Qed.
+
+Theorem room_after_expiry : forall now entries cap,
+  length entries <= cap ->
+  (exists entry, In entry entries /\ (deadline entry < now)%Z) ->
+  length (retain now entries) < cap.
+Proof.
+  intros now entries cap fits [entry [member expired]].
+  assert (In entry (remove now entries)) as removed.
+  { unfold remove. apply filter_In. split; [exact member|].
+    apply Bool.negb_true_iff, Z.leb_gt. exact expired. }
+  pose proof (expiry_count now entries).
+  destruct (remove now entries); simpl in *; [contradiction|lia].
+Qed.
+
+Theorem no_live_eviction : forall now entries,
+  Forall (fun entry => (now <= deadline entry)%Z) entries ->
+  retain now entries = entries.
+Proof.
+  intros now entries live. induction live as [|entry rest valid live ih].
+  - reflexivity.
+  - unfold retain in *. simpl.
+    apply Z.leb_le in valid. rewrite valid, ih. reflexivity.
+Qed.
+
+Theorem retain_advance : forall entries earlier later,
+  (earlier <= later)%Z ->
+  retain later (retain earlier entries) = retain later entries.
+Proof.
+  induction entries as [|entry rest ih]; intros earlier later monotone.
+  - reflexivity.
+  - unfold retain in *. simpl.
+    destruct (Z.leb earlier (deadline entry)) eqn:old;
+      destruct (Z.leb later (deadline entry)) eqn:current; simpl.
+    + rewrite current, ih by exact monotone. reflexivity.
+    + rewrite current, ih by exact monotone. reflexivity.
+    + apply Z.leb_gt in old. apply Z.leb_le in current. lia.
+    + apply ih. exact monotone.
+Qed.
+
+Print Assumptions retain_exact.
+Print Assumptions expiry_count.
+Print Assumptions room_after_expiry.
+Print Assumptions no_live_eviction.
+Print Assumptions retain_advance.
+End Entries.
+End Expiry.
+
+Module Cancellation.
+Definition entries := list (nat * Z).
+
+Fixpoint contains key (state : entries) :=
+  match state with
+  | [] => false
+  | (current, _) :: rest => Nat.eqb key current || contains key rest
+  end.
+
+Fixpoint put key expiry (state : entries) :=
+  match state with
+  | [] => [(key, expiry)]
+  | (current, previous) :: rest =>
+    if Nat.eqb key current then (key, expiry) :: rest
+    else (current, previous) :: put key expiry rest
+  end.
+
+Definition record cap now ttl key state :=
+  let live := Expiry.retain snd now state in
+  if contains key live || Nat.ltb (length live) cap
+  then (put key (now + ttl)%Z live, true)
+  else (live, false).
+
+Lemma put_size : forall state key expiry,
+  length (put key expiry state) =
+    if contains key state then length state else S (length state).
+Proof.
+  induction state as [|[current previous] rest ih]; intros key expiry.
+  - reflexivity.
+  - simpl. destruct (Nat.eqb key current); simpl; [reflexivity|].
+    rewrite ih. destruct (contains key rest); reflexivity.
+Qed.
+
+Lemma put_present : forall state key expiry,
+  In (key, expiry) (put key expiry state).
+Proof.
+  induction state as [|[current previous] rest ih]; intros key expiry.
+  - simpl. auto.
+  - simpl. destruct (Nat.eqb key current); simpl; auto.
+Qed.
+
+Lemma put_other : forall state key expiry old deadline,
+  old <> key -> In (old, deadline) state ->
+  In (old, deadline) (put key expiry state).
+Proof.
+  induction state as [|[current previous] rest ih]; intros key expiry old deadline ne member.
+  - contradiction.
+  - simpl in *. destruct (Nat.eqb key current) eqn:same.
+    + apply Nat.eqb_eq in same. simpl.
+      destruct member as [equal|member]; [inversion equal; subst; contradiction|auto].
+    + simpl. destruct member as [equal|member]; [auto|].
+      right. eapply ih; eauto.
+Qed.
+
+Theorem capacity_kept : forall cap now ttl key state,
+  length state <= cap ->
+  length (fst (record cap now ttl key state)) <= cap.
+Proof.
+  intros cap now ttl key state fits.
+  pose proof (Expiry.expiry_count snd now state) as count.
+  unfold record. destruct (contains key (Expiry.retain snd now state)) eqn:found;
+    destruct (Nat.ltb (length (Expiry.retain snd now state)) cap) eqn:room;
+    simpl; try rewrite put_size, found; try lia.
+  apply Nat.ltb_lt in room. lia.
+Qed.
+
+Theorem acknowledged_present : forall cap now ttl key state,
+  snd (record cap now ttl key state) = true ->
+  In (key, (now + ttl)%Z) (fst (record cap now ttl key state)).
+Proof.
+  intros cap now ttl key state accepted. unfold record in *.
+  destruct (contains key (Expiry.retain snd now state)
+    || Nat.ltb (length (Expiry.retain snd now state)) cap);
+    simpl in *; [apply put_present|discriminate].
+Qed.
+
+Theorem full_refused : forall cap now ttl key state,
+  contains key (Expiry.retain snd now state) = false ->
+  cap <= length (Expiry.retain snd now state) ->
+  record cap now ttl key state = (Expiry.retain snd now state, false).
+Proof.
+  intros cap now ttl key state absent full. unfold record.
+  rewrite absent. apply Nat.ltb_ge in full. rewrite full. reflexivity.
+Qed.
+
+Theorem live_cancel_kept : forall cap now ttl key old deadline state,
+  old <> key -> In (old, deadline) state -> (now <= deadline)%Z ->
+  In (old, deadline) (fst (record cap now ttl key state)).
+Proof.
+  intros cap now ttl key old deadline state ne member live.
+  assert (In (old, deadline) (Expiry.retain snd now state)) as retained.
+  { apply Expiry.retain_exact. simpl. auto. }
+  unfold record. destruct (contains key (Expiry.retain snd now state)
+    || Nat.ltb (length (Expiry.retain snd now state)) cap); simpl.
+  - apply put_other; assumption.
+  - exact retained.
+Qed.
+
+Theorem flood_preserves_cancel : forall keys cap now ttl old deadline state,
+  Forall (fun key => old <> key) keys ->
+  In (old, deadline) state -> (now <= deadline)%Z ->
+  In (old, deadline)
+    (fold_left (fun state key => fst (record cap now ttl key state)) keys state).
+Proof.
+  induction keys as [|key rest ih]; intros cap now ttl old deadline state distinct member live.
+  - exact member.
+  - inversion distinct; subst. simpl. apply ih; try assumption.
+    apply live_cancel_kept; assumption.
+Qed.
+
+Print Assumptions capacity_kept.
+Print Assumptions acknowledged_present.
+Print Assumptions full_refused.
+Print Assumptions live_cancel_kept.
+Print Assumptions flood_preserves_cancel.
+End Cancellation.
+
+Module Slots.
+Definition owned (owner : nat -> nat) caller (slots : list nat) :=
+  length (filter (fun key => Nat.eqb (owner key) caller) slots).
+
+Definition claim cap quota owner key slots :=
+  if existsb (Nat.eqb key) slots then (slots, true)
+  else if Nat.ltb (length slots) cap
+    && Nat.ltb (owned owner (owner key) slots) quota
+  then (key :: slots, true)
+  else (slots, false).
+
+Lemma present : forall key slots,
+  existsb (Nat.eqb key) slots = true <-> In key slots.
+Proof.
+  intros key slots. rewrite existsb_exists. split.
+  - intros [value [member equal]]. apply Nat.eqb_eq in equal. subst. exact member.
+  - intros member. exists key. split; [exact member|apply Nat.eqb_refl].
+Qed.
+
+Theorem quotas_kept : forall cap quota owner key slots,
+  length slots <= cap ->
+  (forall caller, owned owner caller slots <= quota) ->
+  length (fst (claim cap quota owner key slots)) <= cap
+  /\ (forall caller, owned owner caller (fst (claim cap quota owner key slots)) <= quota).
+Proof.
+  intros cap quota owner key slots global local. unfold claim.
+  destruct (existsb (Nat.eqb key) slots); simpl; [auto|].
+  destruct (Nat.ltb (length slots) cap
+    && Nat.ltb (owned owner (owner key) slots) quota) eqn:room; simpl; [|auto].
+  apply andb_true_iff in room. destruct room as [space own].
+  apply Nat.ltb_lt in space. apply Nat.ltb_lt in own. split; [lia|].
+  intros caller. unfold owned. simpl.
+  destruct (Nat.eqb (owner key) caller) eqn:same; simpl.
+  - apply Nat.eqb_eq in same. subst caller. unfold owned in own. lia.
+  - apply local.
+Qed.
+
+Theorem reserved_cancel : forall cap quota owner key slots,
+  In key slots -> claim cap quota owner key slots = (slots, true).
+Proof.
+  intros cap quota owner key slots member. unfold claim.
+  apply present in member. rewrite member. reflexivity.
+Qed.
+
+Theorem acknowledged_present : forall cap quota owner key slots,
+  snd (claim cap quota owner key slots) = true ->
+  In key (fst (claim cap quota owner key slots)).
+Proof.
+  intros cap quota owner key slots accepted. unfold claim in *.
+  destruct (existsb (Nat.eqb key) slots) eqn:member; simpl; [apply present; exact member|].
+  destruct (Nat.ltb (length slots) cap
+    && Nat.ltb (owned owner (owner key) slots) quota); simpl in *; [auto|discriminate].
+Qed.
+
+Theorem caller_full : forall cap quota owner key slots,
+  ~ In key slots -> quota <= owned owner (owner key) slots ->
+  claim cap quota owner key slots = (slots, false).
+Proof.
+  intros cap quota owner key slots absent full. unfold claim.
+  destruct (existsb (Nat.eqb key) slots) eqn:member.
+  - apply present in member. contradiction.
+  - apply Nat.ltb_ge in full. rewrite full, andb_false_r. reflexivity.
+Qed.
+
+Theorem distinct_kept : forall cap quota owner key slots,
+  NoDup slots -> NoDup (fst (claim cap quota owner key slots)).
+Proof.
+  intros cap quota owner key slots unique. unfold claim.
+  destruct (existsb (Nat.eqb key) slots) eqn:member; simpl; [exact unique|].
+  destruct (Nat.ltb (length slots) cap
+    && Nat.ltb (owned owner (owner key) slots) quota); simpl; [|exact unique].
+  constructor; [|exact unique]. intro found. apply present in found. congruence.
+Qed.
+
+Theorem reservation_kept : forall cap quota owner key saved slots,
+  In saved slots -> In saved (fst (claim cap quota owner key slots)).
+Proof.
+  intros cap quota owner key saved slots member. unfold claim.
+  destruct (existsb (Nat.eqb key) slots); simpl; [exact member|].
+  destruct (Nat.ltb (length slots) cap
+    && Nat.ltb (owned owner (owner key) slots) quota); simpl; auto.
+Qed.
+
+Theorem flood_preserves_slot : forall attempts cap quota owner saved slots,
+  In saved slots ->
+  In saved (fold_left (fun state key => fst (claim cap quota owner key state)) attempts slots).
+Proof.
+  induction attempts as [|key rest ih]; intros cap quota owner saved slots member.
+  - exact member.
+  - simpl. apply ih. apply reservation_kept. exact member.
+Qed.
+
+Print Assumptions quotas_kept.
+Print Assumptions reserved_cancel.
+Print Assumptions acknowledged_present.
+Print Assumptions caller_full.
+Print Assumptions distinct_kept.
+Print Assumptions reservation_kept.
+Print Assumptions flood_preserves_slot.
+End Slots.
 
 Fixpoint path_ok (index : nat) (sides : list bool) : bool :=
   match sides with

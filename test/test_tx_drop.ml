@@ -23,13 +23,7 @@ let row ?(from_addr = "octFrom") ?(to_addr = "octTo") index =
     dropped_at = float_of_int index;
   }
 
-let data_dir name =
-  let path =
-    Test_workspace.path
-      (name ^ "_" ^ string_of_int (Unix.getpid ()))
-  in
-  if not (Sys.file_exists path) then Unix.mkdir path 0o700;
-  path
+let data_dir = Test_workspace.unique_dir
 
 let test_reopen () =
   let path = data_dir "tx_drop_reopen" in
@@ -244,6 +238,7 @@ let () =
   test_write_after_lookup ();
   test_address_history ();
   test_replace ();
+  test_map_full ();
   test_map_full ();
   test_legacy_files ();
   test_bad_batch ();

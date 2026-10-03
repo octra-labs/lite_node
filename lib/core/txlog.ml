@@ -298,6 +298,28 @@ let read_at t ~seg_id ~offset length =
     let fd = Unix.openfile (seg_path t.dir seg_id) [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 in
     Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> read fd)
 
+let read_location ~dir ~seg_id ~offset ~len =
+  if seg_id < 0 || offset < header_size || len < 8 || len > max_record_len then
+    failwith "txlog: invalid read location";
+  let fd = Unix.openfile (seg_path dir seg_id)
+    [Unix.O_RDONLY; Unix.O_CLOEXEC; Unix.O_NONBLOCK] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+    let stat = Unix.fstat fd in
+    if stat.Unix.st_kind <> Unix.S_REG then failwith "txlog: segment is not regular";
+    if validate_header fd <> seg_id then failwith "txlog: segment header identity differs";
+    if offset > stat.st_size || stat.st_size - offset < 4
+       || len > stat.st_size - offset - 4 then
+      failwith "txlog: read location exceeds segment";
+    let prefix = Bytes.create 4 in
+    ignore (Unix.lseek fd offset Unix.SEEK_SET);
+    if not (read_exact fd prefix 0 4) || read_u32_le prefix 0 <> len then
+      failwith "txlog: record_len mismatch";
+    match read_scan_record fd ~segment:seg_id ~offset ~size:stat.st_size
+      ~check_checksum:true with
+    | Ok record when record.length = len -> record.epoch, record.payload
+    | Ok _ -> failwith "txlog: record_len mismatch"
+    | Error error -> failwith (scan_error_message error))
+
 let rec append t ~epoch_id ~payload =
   if t.readonly then failwith "txlog: append on read-only log";
   if t.cut <> None then failwith "txlog: cut is incomplete";

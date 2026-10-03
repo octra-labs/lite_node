@@ -2483,6 +2483,8 @@ let maybe_activate_relief t =
 
 let restore_relief t =
   let open Lwt.Syntax in
+  if Option.is_some t.relief_plan then Lwt.return (Ok ())
+  else
   let height = t.engine.state.height in
   match C_relief_log.latest t.relief_log ~through_height:height with
   | Error reason -> Lwt.return (Error reason)
