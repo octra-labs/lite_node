@@ -42,6 +42,8 @@ val commit :
   credit:(string -> Z.t -> (unit, string) result) ->
   (unit, string) result
 
+val snapshot_effort : t -> Z.t
+
 val snapshot :
   t ->
   snapshot

@@ -61,6 +61,8 @@ let completed chaindata input head (entry : Wal.entry) =
     if header.start_txid <> entry.start_txid || header.tx_count <> entry.tx_count
        || entry.tx_count < 0 || entry.start_txid < 0L then
       refuse "completed WAL transaction range differs";
+    if header.parent_commit <> entry.parent_commit then
+      refuse "completed WAL tree commit differs";
     let _, root = SC.get_epoch_index_commitment chaindata entry.epoch_id in
     let expected = match root with
       | None -> entry.post_state_root
@@ -71,7 +73,10 @@ let completed chaindata input head (entry : Wal.entry) =
        && entry.post_state_root <> Head.ledger_state_root head then
       refuse "completed WAL post root differs from HEAD";
     if entry.epoch_id = head.epoch_id
-       && input.Phase.irmin_parent <> Some (entry.parent_commit, entry.pre_state_root) then
+       && not (match input.Phase.irmin_parent with
+         | Some (hash, root) -> root = entry.pre_state_root
+           && (match entry.irmin_parent with None -> true | Some expected -> hash = expected)
+         | None -> false) then
       refuse "completed WAL predecessor differs from Irmin parent"
   end
 

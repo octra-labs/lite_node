@@ -285,7 +285,7 @@ let metadata_json
       "returned_bytes", `Int (String.length body);
     ])
 
-let load_one store snapshot_root current_epoch (declaration : declaration) =
+let load_one ?charge store snapshot_root current_epoch (declaration : declaration) =
   let* info_opt = Store_irmin.get_circle_info store declaration.circle_id in
   match info_opt with
   | None ->
@@ -312,6 +312,13 @@ let load_one store snapshot_root current_epoch (declaration : declaration) =
              || not (String.equal meta.Circles.canonical_path declaration.canonical_path) ->
         Lwt.return (Error "wasm public read asset is not public")
       | Some meta ->
+        let size = meta.Circles.size_bytes in
+        let size_ok = Int64.compare size 0L >= 0 && Int64.compare size (Int64.of_int max_source_bytes) <= 0 in
+        let accepted = match charge with
+          | None -> true
+          | Some charge -> size_ok && charge (Int64.to_int size * byte_effort) in
+        if not accepted then Lwt.return (Error "wasm public read effort exceeds limit")
+        else
         let* policy =
           load_path_policy
             store
@@ -330,6 +337,9 @@ let load_one store snapshot_root current_epoch (declaration : declaration) =
             | None ->
               Lwt.return (Error "wasm public read body not found")
             | Some body_b64 ->
+              if Option.is_some charge && String.length body_b64 > ((Int64.to_int size + 2) / 3) * 4
+              then Lwt.return (Error "wasm public read body size invalid")
+              else
               begin
                 try
                   let raw = Base64.decode_exn body_b64 in
@@ -361,7 +371,9 @@ let load_one store snapshot_root current_epoch (declaration : declaration) =
                              body;
                          body;
                        })
-                with _ ->
+                with
+                | (Out_of_memory | Stack_overflow) as error when Option.is_some charge -> raise error
+                | _ ->
                   Lwt.return (Error "invalid wasm public read body")
               end
           end
@@ -379,9 +391,14 @@ let current_snapshot_root store =
          Circles.h256_hex "circle_public_read_snapshot_v1" [value])
        root)
 
-let load store current_epoch (declarations : declaration list) =
+let load ?charge store current_epoch (declarations : declaration list) =
+  let used = ref 0 in
+  let charge = Option.map (fun charge cost ->
+    if charge cost then (used := !used + cost; true) else false) charge in
   if declarations = [] then
     Lwt.return (Ok { snapshots = []; effort_used = 0 })
+  else if Option.fold ~none:false ~some:(fun pay -> not (pay base_effort)) charge then
+    Lwt.return (Error "wasm public read effort exceeds limit")
   else
     let* snapshot_root_opt = current_snapshot_root store in
     match snapshot_root_opt with
@@ -408,11 +425,12 @@ let load store current_epoch (declarations : declaration list) =
             Lwt.return
               (Ok {
                  snapshots = List.rev snapshots;
-                 effort_used = base_effort + (total_bytes * byte_effort);
+                 effort_used = if Option.is_some charge then !used
+                   else base_effort + (total_bytes * byte_effort);
                })
           | declaration :: rest ->
             let* snapshot_result =
-              load_one store snapshot_root current_epoch declaration in
+              load_one ?charge store snapshot_root current_epoch declaration in
             begin
               match snapshot_result with
               | Error e -> Lwt.return (Error e)

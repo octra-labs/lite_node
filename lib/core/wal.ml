@@ -6,6 +6,7 @@ type entry = {
   pre_state_root : string;
   post_state_root : string;
   parent_commit : string;
+  irmin_parent : string option;
   start_txid : int64;
   tx_count : int;
   finalized_by : string;
@@ -19,6 +20,7 @@ let to_json e =
     "pre_state_root", `String e.pre_state_root;
     "post_state_root", `String e.post_state_root;
     "parent_commit", `String e.parent_commit;
+    "irmin_parent", (match e.irmin_parent with Some hash -> `String hash | None -> `Null);
     "start_txid", `String (Int64.to_string e.start_txid);
     "tx_count", `Int e.tx_count;
     "finalized_by", `String e.finalized_by;
@@ -34,6 +36,10 @@ let of_json s =
     pre_state_root = j |> member "pre_state_root" |> to_string;
     post_state_root = j |> member "post_state_root" |> to_string;
     parent_commit = j |> member "parent_commit" |> to_string;
+    irmin_parent = (match j |> member "irmin_parent" with
+      | `Null -> None
+      | `String hash when hash <> "" -> Some hash
+      | _ -> failwith "WAL Irmin parent is invalid");
     start_txid = Int64.of_string (j |> member "start_txid" |> to_string);
     tx_count = j |> member "tx_count" |> to_int;
     finalized_by = j |> member "finalized_by" |> to_string;

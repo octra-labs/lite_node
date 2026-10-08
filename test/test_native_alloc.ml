@@ -17,15 +17,26 @@ let refused label count run =
 
 let () =
   expect "allocation injector cannot unwind" (probe ());
+  let args = Array.to_list Sys.argv |> List.tl in
+  if args = ["--fhe"] || args = ["--fhe-session"] then begin
+    Fun.protect ~finally:(fun () -> arm (-1)) (fun () ->
+      arm 0;
+      if args = ["--fhe-session"] then Octra_core.Fhe_calc.serve_session ()
+      else Octra_core.Fhe_calc.serve ());
+    exit 0
+  end;
   let pk, sk = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\005') in
   let cipher = Pvac_ffi.enc_value_seeded pk sk 7L (Bytes.make 32 '\006') in
   let encoded = Pvac_ffi.serialize_cipher cipher in
+  let key = Pvac_ffi.serialize_pubkey pk in
   if Array.length Sys.argv > 1 then begin
     if Array.to_list Sys.argv |> List.tl <> ["--preview"] then failwith "unknown allocation test option";
-    Preview_alloc.run arm encoded;
+    let zero = Pvac_ffi.enc_zero_seeded pk sk (Bytes.make 32 '\007') in
+    let proof = Pvac_ffi.make_zero_proof pk sk zero
+      |> Octra_core.Crypto.FheBalance.encode_zero_proof in
+    Preview_alloc.run arm key (Pvac_ffi.serialize_cipher zero) proof;
     exit 0
   end;
-  let key = Pvac_ffi.serialize_pubkey pk in
   let public = Octra_core.Crypto.FheBalance.encode_cipher cipher in
   refused "cipher_decode" 0 (fun () -> Octra_core.Crypto.FheBalance.decode_cipher public);
   refused "cipher_parse" 0 (fun () -> Pvac_ffi.deserialize_cipher encoded);
@@ -54,12 +65,15 @@ let () =
     let state = VM.create_state ~limit:10_000_000 ~ctx:VM.default_ctx ~is_view:true
       ~caller:"sender" ~origin:"sender" ~address:"program" ~value:Z.zero
       ~storage:(Hashtbl.create 1) () in
-    state.regs.(0) <- VM.VPubKey pk;
-    state.regs.(1) <- VM.VCipher cipher;
+    state.regs.(0) <- VM.VPubKey (Octra_core.Fhe_image.of_key pk);
+    state.regs.(1) <- VM.VCipher (Octra_core.Fhe_image.of_cipher cipher);
     state.regs.(2) <- VM.VString (Bytes.to_string encoded |> Base64.encode_exn);
     state.regs.(3) <- VM.VString (Bytes.to_string key |> Base64.encode_exn);
-    refused label 0 (fun () -> VM.run state [|op; VM.STOP|]);
-    expect "memory exhaustion reverted transaction" (not state.reverted))
+    let result = Fun.protect ~finally:(fun () -> arm (-1)) (fun () ->
+      arm 0;
+      VM.run state [|op; VM.STOP|]) in
+    expect ("vm used parent native allocation: " ^ label) (result && not state.reverted);
+    expect "isolated operation lost output" (state.regs.(4) <> VM.VInt Z.zero))
     ["vm_add", VM.FHE_ADD (4, 0, 1, 1);
      "vm_cipher_parse", VM.FHE_DESER (4, 2);
      "vm_key_parse", VM.FHE_DESER_PK (4, 3);
@@ -112,5 +126,6 @@ let () =
   expect "invalid bytes reported as memory error"
     (try ignore (Pvac_ffi.deserialize_cipher (Bytes.of_string "invalid")); false
      with Failure _ -> true | _ -> false);
-  Preview_alloc.run arm encoded;
+  Preview_alloc.run arm key (Pvac_ffi.serialize_cipher zero)
+    (Octra_core.Crypto.FheBalance.encode_zero_proof proof);
   print_endline "status = pass test = native_alloc"

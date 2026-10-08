@@ -43,6 +43,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
   object_cost : bool;
   int_work : Octra_vm.Int_work.mode;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   current_epoch : int;
   epoch_time_ms : int64;
@@ -91,7 +92,7 @@ type multi_exec_deps = {
     params:Yojson.Safe.t list ->
     caller:string ->
     amount:Z.t ->
-    Contract.exec_result;
+    Contract.exec_result Lwt.t;
   save_receipt_raw : tx_hash:string -> json:string -> unit;
   commit_effects : unit -> unit;
   log_success : calls:int -> effort:int -> unit;
@@ -172,7 +173,7 @@ type vm_tx_deps = {
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
-    deploy_result;
+    deploy_result Lwt.t;
   program_prepare :
     Transaction.t ->
     (Octra_vm.Program_package.admitted, string) result Lwt.t;
@@ -223,7 +224,7 @@ type vm_tx_deps = {
     params:Yojson.Safe.t list ->
     caller:string ->
     amount:Z.t ->
-    Contract.exec_result;
+    Contract.exec_result Lwt.t;
   save_receipt_raw : tx_hash:string -> json:string -> unit;
   reject_malformed : string -> unit Lwt.t;
   max_multi_exec_calls : int;
@@ -235,6 +236,7 @@ type vm_tx_deps = {
 
 val prepare_program_package :
   ?preview:Octra_core.Rule_graph.mode ->
+  ?proof_exec:Octra_core.Rule_graph.mode ->
   overlap:bool ->
   program_mode:Octra_core.Rule_graph.mode ->
   point_ops:bool ->
@@ -283,6 +285,7 @@ type live_contract_ctx_args = {
   get_fhe_pubkey : string -> ContractVM.fhe_key option;
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   object_cost : bool;
@@ -321,6 +324,7 @@ type live_sender_vm_tx_args = {
   object_cost : bool;
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
@@ -439,7 +443,7 @@ val make_multi_exec_deps :
     params:Yojson.Safe.t list ->
     caller:string ->
     amount:Z.t ->
-    Contract.exec_result) ->
+    Contract.exec_result Lwt.t) ->
   save_receipt_raw:(tx_hash:string -> json:string -> unit) ->
   log_success:(calls:int -> effort:int -> unit) ->
   log_failed:(string -> unit) ->
@@ -464,7 +468,7 @@ val run_contract_deploy :
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
-    deploy_result) ->
+    deploy_result Lwt.t) ->
   ensure_account:(string -> unit) ->
   commit_effects:(unit -> unit) ->
   log_deployed:(string -> int -> unit) ->
@@ -484,7 +488,7 @@ val run_deploy_tx :
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
-    deploy_result) ->
+    deploy_result Lwt.t) ->
   ensure_account:(string -> unit) ->
   commit_effects:(unit -> unit) ->
   log_deployed:(string -> int -> unit) ->
@@ -502,7 +506,7 @@ val run_deploy_tx_runtime :
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
-    deploy_result) ->
+    deploy_result Lwt.t) ->
   ensure_account:(string -> unit) ->
   unit Lwt.t
 

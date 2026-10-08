@@ -62,10 +62,42 @@ let with_env name value f =
 let sample_path () =
   Sys.executable_name
 
+let timeout_config () =
+  List.iter (fun raw ->
+    with_env "OCTRA_PVAC_VERIFY_TIMEOUT_SEC" raw (fun () ->
+      check "invalid worker deadline accepted" (W.timeout_seconds () = 600.)))
+    ["nan"; "infinity"; "-infinity"; "0.5"; "1800.1"; "invalid"];
+  List.iter (fun (raw, seconds) ->
+    with_env "OCTRA_PVAC_VERIFY_TIMEOUT_SEC" raw (fun () ->
+      check "worker deadline changed" (W.timeout_seconds () = seconds)))
+    ["1", 1.; "1800", 1800.; "600", 600.]
+
 let run_sample mode =
   match mode with
+  | "old_session" ->
+    if Array.length Sys.argv > 1 then Unix.sleepf 10.
+    else begin
+      let raw = Octra_core.Fhe_calc.read_request () in
+      let request = match P.request_of_string raw with
+        | Ok value -> value | Error reason -> failwith reason in
+      D.response request |> P.response_bytes |> print_endline
+    end
+  | "protocol" ->
+    let raw = Octra_core.Fhe_calc.read_request () in
+    let request = match P.request_of_string raw with
+      | Ok value -> value | Error reason -> failwith reason in
+    P.response_bytes {request_hash = P.request_hash request; accepted = false; reason = "op_invalid"}
+    |> print_endline
   | "sleep" ->
     Unix.sleepf 2.
+  | "wait" ->
+    let path = Sys.getenv "OCTRA_PVAC_WORKER_PID" in
+    let staged = path ^ ".next" in
+    let channel = open_out staged in
+    Fun.protect ~finally:(fun () -> close_out channel)
+      (fun () -> output_string channel (string_of_int (Unix.getpid ())));
+    Unix.rename staged path;
+    Unix.sleepf 10.
   | "malformed" ->
     print_endline "malformed"
   | "exit" ->
@@ -176,6 +208,14 @@ let health_succeeds () =
   match W.ready_sync () with
   | Ok () -> ()
   | Error reason -> failwith reason
+
+let session_required () =
+  with_env "OCTRA_PVAC_VERIFY_WORKER" (sample_path ()) (fun () ->
+    with_env "OCTRA_PVAC_WORKER_SAMPLE_MODE" "old_session" (fun () ->
+      check "old proof protocol unavailable" (W.result_sync P.Ping = Ok ());
+      let started = W.monotonic_seconds () in
+      check "old session passed startup" (W.ready_sync () = Error "worker_session_unavailable");
+      check "session startup waited proof deadline" (W.monotonic_seconds () -. started < 7.)))
 
 let actual_worker_rejects () =
   match Lwt_main.run (W.run request) with
@@ -327,6 +367,49 @@ let timeout_keeps_lwt_responsive () =
         end;
         check "worker blocked Lwt heartbeat" (!ticks >= 5))))
 
+let cancel_worker () =
+  Test_workspace.with_dir "proof-cancel" (fun path ->
+    let path = Filename.concat path "pid" in
+    with_env "OCTRA_PVAC_VERIFY_WORKER" (sample_path ()) (fun () ->
+      with_env "OCTRA_PVAC_WORKER_SAMPLE_MODE" "wait" (fun () ->
+        with_env "OCTRA_PVAC_WORKER_PID" path (fun () ->
+          with_env "OCTRA_PVAC_VERIFY_TIMEOUT_SEC" "20" (fun () ->
+            let pending = W.run request in
+            let rec wait () =
+              let open Lwt.Syntax in
+              if Sys.file_exists path then Lwt.return_unit
+              else let* () = Lwt_unix.sleep 0.01 in wait () in
+            Lwt_main.run (Lwt_unix.with_timeout 5. wait);
+            let channel = open_in path in
+            let pid = Fun.protect ~finally:(fun () -> close_in channel)
+              (fun () -> int_of_string (input_line channel)) in
+            let rec drain () =
+              let open Lwt.Syntax in
+              if (W.channel_stats ()).active = 0 then Lwt.return_unit
+              else let* () = Lwt_unix.sleep 0.01 in drain () in
+            Fun.protect ~finally:(fun () ->
+              Lwt.cancel pending;
+              Lwt_main.run (Lwt_unix.with_timeout 12. drain))
+              (fun () ->
+                check "worker did not start" ((W.channel_stats ()).active = 1);
+                Lwt.cancel pending;
+                check "worker cancellation lost"
+                  (match Lwt.state pending with Lwt.Fail Lwt.Canceled -> true | _ -> false);
+                let stopped = try
+                  Lwt_main.run (Lwt_unix.with_timeout 2. drain);
+                  true
+                with Lwt_unix.Timeout -> false in
+                check "cancelled worker retained its slot" stopped;
+                let reaped = try Unix.kill pid 0; false with
+                  | Unix.Unix_error (Unix.ESRCH, _, _) -> true in
+                check "cancelled worker still runs" reaped)))))
+  );
+  let pipes = ref 0 in
+  let pipe () = incr pipes; Unix.pipe ~cloexec:true () in
+  let result = W.run_process ~pipe ~control:(Atomic.make W.Cancel) "unused" request in
+  check "cancelled request started"
+    (result = W.Unavailable "worker_cancelled" && !pipes = 0)
+
 let memory_limit_kills_worker () =
   if Sys.file_exists "/proc" then
     with_env "OCTRA_PVAC_VERIFY_WORKER" (sample_path ()) (fun () ->
@@ -414,11 +497,19 @@ let () =
   | Some mode ->
     run_sample mode
   | None ->
+    let worker = match W.worker_path () with
+      | Some path -> path | None -> failwith "worker missing" in
+    Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker;
+    with_env "OCTRA_PVAC_WORKER_SAMPLE_MODE" "protocol" (fun () ->
+      check "old worker became proof rejection"
+        (W.run_process (sample_path ()) P.Ping = W.Unavailable "worker_protocol_op_invalid"));
+    run "timeout_config" timeout_config;
     run "protocol_roundtrip" protocol_roundtrip;
     run "math_protocol" math_protocol;
     run "rss_status_parser" rss_status_parser;
     run "worker_capacity_disjoint" worker_capacity_disjoint;
     run "health_succeeds" health_succeeds;
+    run "session_required" session_required;
     run "actual_worker_rejects" actual_worker_rejects;
     run "wide_descriptors" wide_descriptors;
     run "pipe_cleanup" pipe_cleanup;
@@ -427,6 +518,7 @@ let () =
     run "malformed_worker_fails" malformed_worker_fails;
     run "timeout_kills_worker" timeout_kills_worker;
     run "timeout_keeps_lwt_responsive" timeout_keeps_lwt_responsive;
+    run "cancel_worker" cancel_worker;
     run "memory_limit_kills_worker" memory_limit_kills_worker;
     run "oversized_output_fails" oversized_output_fails;
     run "wrong_hash_fails" wrong_hash_fails;

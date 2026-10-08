@@ -247,7 +247,12 @@ let fhe_work_activation_for_chain = tx_envelope_activation_for_chain
 
 let wasm_float_activation_for_chain = tx_envelope_activation_for_chain
 
-let batch_activation_for_chain _ : activation option = None
+let proof_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some { devnet_set_plan_activation with activation_epoch = 1_663_000 }
+  else None
+
+let batch_activation_for_chain = proof_activation_for_chain
 
 let profile_epochs ~chain_id =
   [standard_activation_for_chain chain_id;
@@ -259,7 +264,8 @@ let profile_epochs ~chain_id =
    tx_envelope_activation_for_chain chain_id;
    fhe_work_activation_for_chain chain_id;
    wasm_float_activation_for_chain chain_id;
-   batch_activation_for_chain chain_id]
+   batch_activation_for_chain chain_id;
+   proof_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -363,6 +369,10 @@ let consensus_id ~chain_id ~epoch =
     match batch_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
+  |> (fun plans ->
+    match proof_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -450,6 +460,7 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       fhe_work_activation_for_chain chain_id;
       wasm_float_activation_for_chain chain_id;
       batch_activation_for_chain chain_id;
+      proof_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -573,6 +584,13 @@ let fhe_work t ~epoch = mode t (fhe_work_activation_for_chain t.chain_id) ~epoch
 let wasm_float t ~epoch = mode t (wasm_float_activation_for_chain t.chain_id) ~epoch
 
 let circle_batch t ~epoch = mode t (batch_activation_for_chain t.chain_id) ~epoch
+
+let proof_exec t ~epoch = mode t (proof_activation_for_chain t.chain_id) ~epoch
+
+let proof_exec_at ~chain_id ~epoch =
+  match proof_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
 
 let wasm_float_at ~chain_id ~epoch =
   match wasm_float_activation_for_chain chain_id with

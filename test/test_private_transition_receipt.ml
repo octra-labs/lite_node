@@ -1007,6 +1007,67 @@ let batch_case () =
       ignore (check 2 [poor; second; third] [second; third]);
       ignore (check 3 inputs [first; second; third]))
 
+let migration_retry () =
+  let path, store, ledger, pk, sk = setup "migration_retry" in
+  let module L = Octra_core.Ledger in
+  let module M = Octra_core.Pvac_migration in
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (Octra_core.Store_irmin.close store);
+    clear_case path) (fun () ->
+    let worker = VW.worker_path () |> Option.get in
+    let next_pk, next_sk = P.keygen_from_seed (P.default_params ()) (bytes '\071') in
+    let old_key = P.serialize_pubkey_legacy_v2 pk |> Bytes.to_string in
+    Lwt_main.run (L.set_pvac_pubkey ledger addr old_key);
+    List.iter (fun (mode, amount) ->
+      let source = P.enc_value_seeded pk sk amount (bytes '\072') |> FB.encode_cipher in
+      expect (L.update_enc_balance ledger addr source = Ok ()) "migration source refused";
+      expect (M.needs_history_migration (M.status_of_state ~cap:true
+        ~cipher:source ~pubkey:(Some old_key))) "migration test used direct route";
+      let next = P.enc_value_seeded next_pk next_sk amount (bytes '\073') in
+      let blind = bytes '\074' in
+      let b64 value = Base64.encode_exn (Bytes.to_string value) in
+      let commitment = b64 (P.pedersen_commit_amount amount blind) in
+      let proof = P.make_zero_proof_bound next_pk next_sk next amount blind |> FB.encode_zero_proof in
+      let payload proof = Yojson.Safe.to_string (`Assoc [
+        "new_pubkey", `String (b64 (P.serialize_pubkey next_pk));
+        "aes_kat", `String (FB.aes_kat_hex ());
+        "migration_mode", `String mode;
+        "new_cipher", `String (FB.encode_cipher next);
+        "new_zero_proof", `String proof;
+        "amount_commitment", `String commitment;
+        "amount_blinding", `String (b64 blind);
+      ]) in
+      let transaction proof = {(tx (payload proof)) with T.op_type = T.KeySwitch; amount = Z.zero} in
+      let replay = Octra_core.Pvac_legacy_public_replay.{audit_class = Public_clean;
+        can_public_migrate = true; public_net = Some (Z.of_int64 amount);
+        commitment_net = Some commitment; blockers = []; effects = []; reason = ""} in
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      let account = L.find_opt ledger addr in
+      let root = Lwt_main.run (L.hash ledger) in
+      let plan proof = PL.key_switch_plan ~strict:true ~field_policy:PL.Unique_fields
+        ~legacy_public_replay:replay ledger (transaction proof) in
+      Fun.protect ~finally:(fun () -> Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker) (fun () ->
+        Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" "runtime_data/absent_worker";
+        begin match Lwt_main.run (plan proof) with
+        | Error error -> expect (PL.failure_action error = PL.Retry) "migration worker became rejection"
+        | Ok _ -> fail "migration skipped worker"
+        end;
+        if mode = "verified_zero_reset" then
+          match Lwt_main.run (PL.preverify_key_switch_artifact ~strict:true
+              ~field_policy:PL.Unique_fields ledger (transaction proof)) with
+          | Error error -> expect (PL.failure_action error = PL.Retry) "worker became rejected artifact"
+          | Ok _ -> fail "worker failure produced artifact");
+      expect (L.find_opt ledger addr = account) "migration failure changed account";
+      expect (Lwt_main.run (L.get_pvac_pubkey ledger addr) = Some old_key)
+        "migration failure changed key";
+      expect (Lwt_main.run (L.hash ledger) = root) "migration failure changed root";
+      begin match Lwt_main.run (plan "invalid") with
+      | Error error -> expect (PL.failure_action error = PL.Reject) "invalid proof became retry"
+      | Ok _ -> fail "invalid migration proof accepted"
+      end;
+      expect (Result.is_ok (Lwt_main.run (plan proof))) "migration did not retry")
+      ["verified_zero_reset", 0L; "public_history", 17L; "commitment_history", 17L])
+
 let switch_reuse () =
   let path, store, ledger, pk, sk = setup "switch_reuse" in
   Fun.protect
@@ -1922,6 +1983,9 @@ let () =
   | [_; "switch_reuse"] ->
     switch_reuse ();
     print_endline "status = pass test = private_transition_receipt case = switch_reuse"
+  | [_; "migration_retry"] ->
+    migration_retry ();
+    print_endline "status = pass test = private_transition_receipt case = migration_retry"
   | [_; "worker_retry"] ->
     worker_retry_case ();
     print_endline "status = pass test = private_transition_receipt case = worker_retry"
@@ -1945,6 +2009,7 @@ let () =
     mismatch_case ();
     worker_retry_case ();
     circle_reject_case ();
+    migration_retry ();
     recovery_case ();
     reuse_case T.EncryptOp;
     reuse_case T.DecryptOp;

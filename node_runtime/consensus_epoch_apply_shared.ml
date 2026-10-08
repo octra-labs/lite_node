@@ -121,26 +121,11 @@ let first_disabled_bft_tx txs =
 let consensus_order txs =
   Transaction.consensus_order txs
 
-let worker_waits = [| 0.25; 0.5; 1.; 2.; 4.; 5. |]
-
-let worker_retry ?(wait=Lwt_unix.sleep) apply =
-  let rec loop step =
-    Lwt.catch
-      apply
-      (function
-        | Octra_core.Private_ledger.Worker_retry reason ->
-          let pos = min step (Array.length worker_waits - 1) in
-          let delay = worker_waits.(pos) in
-          Log.warn "epoch"
-            "event = proof_worker_retry delay = %.2f reason = %s"
-            delay
-            reason;
-          let open Lwt.Syntax in
-          let* () = wait delay in
-          loop (min (pos + 1) (Array.length worker_waits - 1))
-        | error -> Lwt.fail error)
-  in
-  loop 0
+let worker_retry ?wait apply =
+  Octra_core.Private_ledger.worker_retry ?wait
+    ~report:(fun delay reason ->
+      Log.warn "epoch" "event = proof_worker_retry delay = %.2f reason = %s"
+        delay reason) apply
 
 let private_field_policy_at rules epoch =
   Octra_core.Rule_graph.private_payload rules ~epoch

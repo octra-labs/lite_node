@@ -13,6 +13,10 @@ type failure = {
 }
 
 exception Worker_retry of string
+exception Worker_stopped of string
+
+val worker_retry : ?wait:(float -> unit Lwt.t) -> ?report:(float -> string -> unit) ->
+  (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 type failure_action = Reject | Retry
 

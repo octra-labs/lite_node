@@ -21,8 +21,8 @@ let admit_octb ~point_ops program_trust code_b64 =
   | Ok _ -> Ok ()
   | Error reason -> reject reason
 
-let admit_deploy ~point_ops program_trust tx =
-  match Epoch_exec.parse_circle_deploy_payload tx with
+let admit_deploy ~resource_errors ~point_ops program_trust tx =
+  match Epoch_exec.parse_circle_deploy_payload ~resource_errors tx with
   | Error error -> Lwt.return_error error
   | Ok { Circles.runtime = Circles.Wasm_v1; _ }
   | Ok { code_b64 = None; _ } ->
@@ -30,8 +30,8 @@ let admit_deploy ~point_ops program_trust tx =
   | Ok { runtime = Circles.Octb; code_b64 = Some code_b64; _ } ->
     Lwt.return (admit_octb ~point_ops program_trust code_b64)
 
-let admit_update ~point_ops store program_trust tx =
-  match Epoch_exec.parse_circle_program_update_payload tx with
+let admit_update ~resource_errors ~point_ops store program_trust tx =
+  match Epoch_exec.parse_circle_program_update_payload ~resource_errors tx with
   | Error error -> Lwt.return_error error
   | Ok payload ->
     let open Lwt.Syntax in
@@ -46,11 +46,11 @@ let admit_update ~point_ops store program_trust tx =
           (admit_octb ~point_ops program_trust payload.Circles.code_b64)
     end
 
-let admit ~store ~program_trust ~point_ops tx =
+let admit ?(resource_errors = false) ~store ~program_trust ~point_ops tx =
   match tx.Transaction.op_type with
   | Transaction.CircleDeploy ->
-    admit_deploy ~point_ops program_trust tx
+    admit_deploy ~resource_errors ~point_ops program_trust tx
   | Transaction.CircleProgramUpdate ->
-    admit_update ~point_ops store program_trust tx
+    admit_update ~resource_errors ~point_ops store program_trust tx
   | _ ->
     Lwt.return_ok ()

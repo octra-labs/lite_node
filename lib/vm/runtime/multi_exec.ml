@@ -13,10 +13,10 @@ type result = {
   outcome : (unit, string) Stdlib.result;
 }
 
-let run ~from_addr ~calls ~effort_limit ~balance ~exec =
+let run_with ~return ~bind ~from_addr ~calls ~effort_limit ~balance ~exec =
   let rec go index trace = function
     | [] ->
-      { trace; outcome = Ok () }
+      return { trace; outcome = Ok () }
     | call :: remainder ->
       match Call_plan.plan_multi_exec_step
         ~from_addr
@@ -26,17 +26,16 @@ let run ~from_addr ~calls ~effort_limit ~balance ~exec =
         ~balance:(balance from_addr)
       with
       | Call_plan.Multi_exec_effort_exhausted ->
-        { trace; outcome = Error "effort limit exceeded" }
+        return { trace; outcome = Error "effort limit exceeded" }
       | Call_plan.Multi_exec_insufficient_value ->
-        { trace; outcome = Error "insufficient balance for program value" }
+        return { trace; outcome = Error "insufficient balance for program value" }
       | Call_plan.Multi_exec_ready planned ->
-        let receipt =
-          exec {
+        bind (exec {
             index;
             call;
             remaining_effort = planned.remaining_effort;
             value_effect = planned.value_effect;
-          } in
+          }) (fun receipt ->
         let trace =
           Receipt_view.add_multi_exec_trace
             trace
@@ -56,6 +55,10 @@ let run ~from_addr ~calls ~effort_limit ~balance ~exec =
           ~error:receipt.Contract.error
         with
         | None -> go (index + 1) trace remainder
-        | Some err -> { trace; outcome = Error err }
+        | Some err -> return { trace; outcome = Error err })
   in
   go 0 Receipt_view.empty_multi_exec_trace calls
+
+let run = run_with ~return:Fun.id ~bind:(fun value next -> next value)
+
+let run_async = run_with ~return:Lwt.return ~bind:Octra_core.Exec_resource.bind

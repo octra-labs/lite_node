@@ -5,6 +5,7 @@ open Lwt.Syntax
 
 module Contract = Octra_vm.Contract
 module ContractVM = Octra_vm.Contract_vm
+module Fhe = Octra_vm.Fhe_task
 
 exception Execution_unavailable of string
 
@@ -17,6 +18,7 @@ type call_result = {
   encrypted_assets : Octra_core.Circle_wasm_host.encrypted_asset_put list;
   caller : string;
   tx_hash : string;
+  calls : bool;
   hfhe_binding : hfhe_binding;
 }
 
@@ -31,6 +33,7 @@ and hfhe_binding = {
 
 type runtime_hfhe_details = {
   exec_ctx : ContractVM.exec_ctx;
+  calls : bool;
   policy : Octra_core.Circle_hfhe_policy.t;
   owner : string;
   active_relay : string option;
@@ -366,6 +369,7 @@ let failed_receipt error = {
 }
 
 let failed_call_result error = {
+  calls = false;
   receipt = failed_receipt error;
   storage_tbl = Hashtbl.create 0;
   baseline_storage_tbl = Hashtbl.create 0;
@@ -641,21 +645,46 @@ let runtime_key_policy_live store circle_id current_epoch key_id_opt =
   | None ->
     Lwt.return false
 
-let restrict_runtime_exec_ctx (ctx : ContractVM.exec_ctx) =
+let restrict_runtime_exec_ctx ?(calls = false) (ctx : ContractVM.exec_ctx) =
+  let ctx = if calls && ctx.proof_exec = Octra_core.Rule_graph.Active then ctx
+    else {
+      ctx with
+      do_transfer = (fun _ _ _ -> false);
+      call_contract = (fun _ _ _ _ _ -> Error "circle runtime xcall disabled");
+      call_async = (fun _ _ _ _ _ -> Lwt.return (Error "circle runtime xcall disabled"));
+    } in
   {
     ctx with
-    do_transfer = (fun _ _ _ -> false);
-    call_contract = (fun _ _ _ _ _ -> Error "circle runtime xcall disabled");
     deploy_contract = (fun _ _ _ _ _ -> Error "circle runtime spawn disabled");
+    deploy_async = (fun _ _ _ _ _ -> Lwt.return (Error "circle runtime spawn disabled"));
   }
 
+let check_call_storage before storage (ctx : ContractVM.exec_ctx) =
+  if ctx.proof_exec <> Octra_core.Rule_graph.Active then ctx
+  else {ctx with call_async = (fun caller target method_name params scope ->
+    let limit = Option.value ~default:1_000_000 scope.ContractVM.limit in
+    let cost = Z.add (Octra_vm.Program_journal.storage_effort before)
+      (Octra_vm.Program_journal.storage_effort storage) in
+    match Octra_vm.Cost.charge_z ~used:0 ~cost ~limit with
+    | None -> Lwt.return (Error "circle storage effort exceeds limit")
+    | Some spent ->
+      match Circle_runtime_storage.validate_runtime_storage_delta
+          ~proof_mode:Octra_core.Rule_graph.Active before storage with
+      | Error (_, key, _) -> Lwt.return (Error ("circle reserved key write: " ^ key))
+      | Ok () ->
+        let* result = ctx.call_async caller target method_name params
+          {scope with limit = Some (limit - spent)} in
+        Lwt.return (Result.map (fun (result : ContractVM.subcall_result) ->
+          {result with effort_used = spent + result.effort_used}) result))}
+
 let with_circle_spawn ctx circle_id caller spawns =
-  let deploy_contract parent payload_json _nonce _depth params =
+  let resource_errors = ctx.ContractVM.proof_exec = Octra_core.Rule_graph.Active in
+  let prepare_spawn parent payload_json spawn_nonce params =
     if not (String.equal parent circle_id) then
       Error "circle spawn parent mismatch"
     else if String.equal ctx.ContractVM.tx_hash "" then
       Error "circle spawn requires transaction hash"
-    else if List.length !spawns >= spawn_cap then
+    else if spawn_nonce >= spawn_cap then
       Error "circle spawn cap exceeded"
     else
       match params with
@@ -665,10 +694,9 @@ let with_circle_spawn ctx circle_id caller spawns =
           | Error error -> Error error
           | Ok owner_mode ->
             begin
-              match Octra_core.Circle_deploy.decode_spawn_payload_json payload_json with
+              match Octra_core.Circle_deploy.decode_spawn_payload_json ~resource_errors payload_json with
               | Error (_, error) -> Error error
               | Ok payload ->
-                let spawn_nonce = List.length !spawns in
                 let source =
                   Octra_core.Circle_deploy.Spawn
                     {
@@ -681,7 +709,7 @@ let with_circle_spawn ctx circle_id caller spawns =
                     }
                 in
                 begin
-                  match Octra_core.Circle_deploy.prepare source payload with
+                  match Octra_core.Circle_deploy.prepare ~resource_errors source payload with
                   | Error (_, error) -> Error error
                   | Ok prepared ->
                     let spawn =
@@ -692,21 +720,35 @@ let with_circle_spawn ctx circle_id caller spawns =
                         payload_json;
                       }
                     in
-                    spawns := !spawns @ [spawn];
                     Ok
-                      {
+                      (spawn, {
                         ContractVM.spawned_addr = prepared.circle_id;
                         effort_used = 0;
                         events = [];
-                      }
+                      })
                 end
             end
         end
       | _ -> Error "circle spawn owner mode missing"
   in
-  { ctx with ContractVM.deploy_contract }
+  let record = Result.map (fun (spawn, result) ->
+    spawns := !spawns @ [spawn];
+    result) in
+  let deploy_contract parent payload _nonce _scope params =
+    record (prepare_spawn parent payload (List.length !spawns) params) in
+  {
+    ctx with
+    ContractVM.deploy_contract;
+    deploy_async = (fun parent payload _nonce _scope params ->
+      let count = List.length !spawns in
+      let run () = prepare_spawn parent payload count params in
+      let* result = if resource_errors then Lwt.return (run ())
+        else Octra_core.Exec_resource.detach run () in
+      Lwt.return (record result));
+  }
 
 let empty_runtime_hfhe_details (ctx : ContractVM.exec_ctx) owner = {
+  calls = false;
   exec_ctx =
     {
       (restrict_runtime_exec_ctx ctx) with
@@ -726,7 +768,10 @@ let load_runtime_hfhe_ctx ?(receipt_linked = false)
   | None ->
     Lwt.return (Error "circle not found")
   | Some info ->
-    let runtime_ctx = restrict_runtime_exec_ctx ctx in
+    let* calls = if ctx.proof_exec = Octra_core.Rule_graph.Active then
+      Octra_core.Circle_deploy.calls_enabled store info
+    else Lwt.return_false in
+    let runtime_ctx = restrict_runtime_exec_ctx ~calls ctx in
     let* policy = Octra_core.Circle_policy_store.load_hfhe_policy store circle_id in
     let* transport_policy = Octra_core.Circle_policy_store.load_transport_policy store circle_id in
     let owner = info.owner in
@@ -844,6 +889,7 @@ let load_runtime_hfhe_ctx ?(receipt_linked = false)
     in
     Lwt.return
       (Ok {
+         calls;
          exec_ctx = { runtime_ctx with get_fhe_pubkey; get_fhe_keypair; allow_fhe_capability };
          policy;
          owner;
@@ -897,7 +943,7 @@ let wasm_hfhe_caps_of_runtime_ctx ?(has_active_keypair = false) (ctx : ContractV
     "fhe_verify_bound";
   List.rev !caps
 
-let wasm_hfhe_pubkeys_of_runtime_ctx
+let wasm_pubkeys
     (ctx : ContractVM.exec_ctx)
     (policy : Octra_core.Circle_hfhe_policy.t)
     ~owner
@@ -909,7 +955,7 @@ let wasm_hfhe_pubkeys_of_runtime_ctx
   if not load_pk_string_allowed then
     []
   else
-    let candidates =
+    let addresses =
       let from_allowlist =
         match policy.pk_allowlist with
         | Some values -> values
@@ -924,7 +970,7 @@ let wasm_hfhe_pubkeys_of_runtime_ctx
         (fun acc addr ->
           if List.mem addr acc then acc else addr :: acc)
         []
-        candidates
+        addresses
       |> List.rev in
     List.filter_map
       (fun requested_addr ->
@@ -936,20 +982,15 @@ let wasm_hfhe_pubkeys_of_runtime_ctx
             ~requested_addr
             ~active_relay
         then
-          match Option.bind (ctx.get_fhe_pubkey requested_addr)
-            (ContractVM.load_fhe_key ?memory:ctx.fhe_memory) with
-          | Some pk ->
-            let pubkey_b64 =
-              Base64.encode_exn
-                (Bytes.to_string (Pvac_ffi.serialize_pubkey pk)) in
-            Some (requested_addr, pubkey_b64)
-          | None ->
-            None
+          match ctx.get_fhe_pubkey requested_addr with
+          | Some source ->
+            Some (requested_addr, source)
+          | _ -> None
         else
           None)
       unique
 
-let wasm_hfhe_active_key_of_runtime_ctx
+let wasm_active_key
     (ctx : ContractVM.exec_ctx) =
   let key_ops_allowed =
     ctx.allow_fhe_capability ContractVM.Fhe_encrypt_cap
@@ -962,17 +1003,90 @@ let wasm_hfhe_active_key_of_runtime_ctx
   | Some key_id ->
     begin
       match ctx.get_fhe_keypair key_id with
-      | Some (pk, sk) ->
-        Some
-          ( key_id,
-            Base64.encode_exn (Bytes.to_string (Pvac_ffi.serialize_pubkey pk)),
-            Base64.encode_exn (Bytes.to_string (Pvac_ffi.serialize_seckey sk)) )
-      | None ->
-        None
+      | Some (pk, sk) -> Some (key_id, pk, sk)
+      | None -> None
     end
 
-let prepare_octb_call ~ctx ~depth ~limit ~caller ~address ~value ~method_name ~params
+let wasm_key_effort active public =
+  let module M = Octra_vm.Fhe_memory in
+  let add total cost = Option.bind total (fun total ->
+    Option.map (fun cost -> Z.add total (Z.of_int cost)) cost) in
+  let total = match active with
+    | None -> Some Z.zero
+    | Some (_, key, secret) ->
+      add (Option.map Z.of_int (M.key_write_effort ~active:true key))
+        (M.key_effort ~active:true (Z.of_int (String.length secret))) in
+  let total = List.fold_left (fun total (_, source) ->
+    let read, write = match source with
+      | ContractVM.Key_value key ->
+        let cost = M.key_write_effort ~active:true key in
+        cost, cost
+      | Key_bytes raw ->
+        M.key_read_effort ~active:true raw,
+        Option.bind (M.key_image raw) (M.key_effort ~active:true) in
+    add (add total read) write) total public in
+  Option.bind total (fun cost ->
+    if Z.fits_int cost then Some (Z.to_int cost) else None)
+
+let wasm_keys ~limit ~view ~circle_id runtime caller =
+  let ctx = runtime.exec_ctx in
+  let active = wasm_active_key ctx in
+  let public = wasm_pubkeys ctx runtime.policy
+    ~owner:runtime.owner ~caller ~active_relay:runtime.active_relay in
+  let charged = view || ctx.proof_exec = Octra_core.Rule_graph.Active in
+  let cost = if charged
+    then wasm_key_effort active public else Some 0 in
+  match cost with
+  | None -> Lwt.return (Error "wasm key size invalid")
+  | Some cost when charged && cost > limit -> Lwt.return (Error "wasm key effort exceeds limit")
+  | Some cost ->
+  let public = List.filter (fun (_, source) ->
+    ContractVM.key_allowed ?memory:ctx.fhe_memory source) public in
+  match active, public with
+  | None, [] -> Lwt.return (Ok ([], None, cost))
+  | _ ->
+    let now = Mtime_clock.elapsed_ns () in
+    let seconds = if view then 10. else Octra_core.Pvac_verify_worker.timeout_seconds () in
+    let deadline = Int64.add now (Int64.of_float (seconds *. 1_000_000_000.)) in
+    if deadline <= now then raise (Octra_core.Exec_resource.Unavailable Host);
+    let ticket = Octra_vm.Proof_wait.{
+      request = "circle_keys";
+      generation = ContractVM.deterministic_seed [
+        circle_id; caller; ctx.tree_hash; ctx.tx_hash; string_of_int ctx.current_epoch;
+      ] |> Bytes.to_string;
+    } in
+    let run request =
+      let* result = Fhe.run ~urgent:(not view) ~ticket ~deadline request in
+      match result with
+      | Error (Fhe.Resource resource) ->
+        Lwt.fail (Octra_core.Exec_resource.Unavailable resource)
+      | result -> Lwt.return result in
+    let encode request =
+      let* result = run request in
+      match result with
+      | Ok (Fhe.Text text) -> Lwt.return text
+      | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host) in
+    let* active = match active with
+      | None -> Lwt.return_none
+      | Some (id, key, secret) ->
+        let* public = encode (Fhe.Write_key key) in
+        let* secret = encode (Fhe.Write_secret secret) in
+        Lwt.return_some (id, public, secret) in
+    let* public = Lwt_list.filter_map_s (fun (address, source) ->
+      let* decoded = match source with
+        | ContractVM.Key_value key -> Lwt.return (Ok (Fhe.Key key))
+        | Key_bytes raw -> run (Fhe.Load_key raw) in
+      match decoded with
+      | Ok (Fhe.Key key) ->
+        let* encoded = encode (Fhe.Write_key key) in
+        Lwt.return_some (address, encoded)
+      | Error Fhe.Invalid -> Lwt.return_none
+      | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host)) public in
+    Lwt.return (Ok (public, active, cost))
+
+let prepare_octb_call ~calls ~ctx ~depth ~limit ~caller ~address ~value ~method_name ~params
     ~bytecode ~profile ~storage_tbl =
+  let ctx = {ctx with ContractVM.async_exec = true} in
   let fixed = Contract.fix_jumps bytecode in
   match Contract.extract_method_target fixed method_name with
   | None -> Error "method not found"
@@ -980,10 +1094,33 @@ let prepare_octb_call ~ctx ~depth ~limit ~caller ~address ~value ~method_name ~p
     match Contract.runtime_params profile target params with
     | Error error -> Error (Octra_vm.Program_input.error_message error)
     | Ok values ->
+      let storage_kinds = if calls then Contract.storage_kinds profile else [] in
       Ok (fixed, Contract.setup_call_state_values
         ~ctx ~depth ~limit ~strict_values:(Contract.strict_values profile)
+        ~storage_kinds
         ~caller ~address ~value ~storage_tbl
         ~method_name ~params:values ())
+
+let run_octb ?running state fixed =
+  let stopped = ref false in
+  let running () =
+    let ready = Option.fold ~none:true ~some:(fun check -> check ()) running in
+    if not ready then stopped := true;
+    ready
+  in
+  Lwt.catch
+    (fun () -> Contract.run_fixed_async ~running state fixed)
+    (function
+      | Octra_core.Exec_resource.Unavailable _ when state.ContractVM.is_view && !stopped ->
+        Lwt.return {
+          Contract.success = false;
+          return_value = None;
+          effort_used = state.effort_used;
+          events = List.rev !(state.logs);
+          error = Some "execution reverted";
+          storage_writes = Contract.count_storage_writes state;
+        }
+      | error -> Lwt.fail error)
 
 let wasm_fuel_limit limit =
   max 0 (min limit 20_000_000)
@@ -993,6 +1130,7 @@ let wasm_compute_fuel_limit limit =
 
 let execute_wasm_view
     execution
+    ~proof_mode
     ~code_b64
     ~export_name
     ~request_bytes
@@ -1011,49 +1149,35 @@ let execute_wasm_view
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
-  match execution with
-  | Circle_program.Standard ->
-    Octra_core.Circle_wasm_host.execute
-      ~code_b64
-      ~export_name
-      ~request_bytes
-      ~storage_tbl
-      ~storage_cache_key
-      ~caller
-      ~address
-      ~tx_hash
-      ~current_epoch
-      ~hfhe_caps
-      ~hfhe_pubkeys
-      ~hfhe_active_key
-      ~hfhe_strict
-      ~math
-      ~float_mode
-      ~hfhe_mode
-      ~public_reads
-      ~fuel_limit:(wasm_fuel_limit fuel_limit)
-      ~is_view:true
-      ~update_policy:false
-  | Circle_program.Compute ->
-    Octra_core.Circle_wasm_host.execute_compute
-      ~math
-      ~float_mode
-      ~code_b64
-      ~export_name
-      ~request_bytes
-      ~storage_tbl
-      ~storage_cache_key
-      ~caller
-      ~address
-      ~tx_hash
-      ~current_epoch
-      ~hfhe_caps
-      ~hfhe_pubkeys
-      ~hfhe_active_key
-      ~hfhe_strict
-      ~hfhe_mode
-      ~public_reads
-      ~fuel_limit:(wasm_compute_fuel_limit fuel_limit)
+  let execution_profile, fuel_limit = match execution with
+    | Circle_program.Standard -> Octra_core.Circle_wasm_host.Standard, wasm_fuel_limit fuel_limit
+    | Circle_program.Compute -> Octra_core.Circle_wasm_host.Compute, wasm_compute_fuel_limit fuel_limit in
+  Octra_core.Circle_wasm_host.execute_with_profile
+    ~proof_mode
+    ~call:None
+    ~code_b64
+    ~export_name
+    ~request_bytes
+    ~storage_tbl
+    ~storage_cache_key
+    ~caller
+    ~address
+    ~tx_hash
+    ~current_epoch
+    ~hfhe_caps
+    ~hfhe_pubkeys
+    ~hfhe_active_key
+    ~hfhe_strict
+    ~math
+    ~float_mode
+    ~hfhe_mode
+    ~public_reads
+    ~fuel_limit
+    ~compute_storage_cache_key:None
+    ~compute_session_scope:None
+    ~execution_profile
+    ~is_view:true
+    ~update_policy:false
 
 let run_preview_prefetch ~clear task =
   Lwt.finalize
@@ -1148,6 +1272,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                 let storage_copy = Hashtbl.copy storage_tbl in
                 begin
                   match prepare_octb_call
+                      ~calls:runtime_hfhe.calls
                       ~ctx:runtime_hfhe.exec_ctx
                       ~depth
                       ~limit
@@ -1162,12 +1287,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                   | Error error -> finish (failed_receipt error)
                   | Ok (fixed, state) ->
                     state.ContractVM.is_view <- true;
-                    let* receipt =
-                      Octra_core.Exec_resource.detach
-                        (fun () ->
-                          Contract.run_fixed_from_dispatcher ?running state fixed)
-                        ()
-                    in
+                    let* receipt = run_octb ?running state fixed in
                     timing_mark "run_dispatcher";
                     finish receipt
                 end
@@ -1193,22 +1313,26 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
               | Error e ->
                 finish (failed_receipt e)
               | Ok runtime_hfhe ->
-                let hfhe_active_key =
-                  wasm_hfhe_active_key_of_runtime_ctx runtime_hfhe.exec_ctx in
+                let limit = match execution with
+                  | Circle_program.Standard -> wasm_fuel_limit limit
+                  | Circle_program.Compute -> wasm_compute_fuel_limit limit in
+                let* keys = wasm_keys ~limit ~view:true ~circle_id runtime_hfhe caller in
+                begin match keys with
+                | Error error -> finish (failed_receipt error)
+                | Ok (hfhe_pubkeys, hfhe_active_key, key_effort) ->
+                let used = ref key_effort in
+                let charge cost =
+                  if cost < 0 || cost > limit - !used then false
+                  else (used := !used + cost; true) in
+                let key_failed error =
+                  { (failed_receipt error) with effort_used = !used } in
                 let hfhe_caps =
                   wasm_hfhe_caps_of_runtime_ctx
                     ~has_active_keypair:(Option.is_some hfhe_active_key)
                     runtime_hfhe.exec_ctx in
-                let hfhe_pubkeys =
-                  wasm_hfhe_pubkeys_of_runtime_ctx
-                    runtime_hfhe.exec_ctx
-                    runtime_hfhe.policy
-                    ~owner:runtime_hfhe.owner
-                    ~caller
-                    ~active_relay:runtime_hfhe.active_relay in
                 match Octra_core.Circle_wasm_codec.encode_request ~method_name params with
                 | Error e ->
-                  finish (failed_receipt e)
+                  finish (key_failed e)
                 | Ok request_bytes ->
                   timing_mark "encode_request";
                   begin
@@ -1218,20 +1342,25 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                         method_name in
                     let* public_reads_result =
                       Octra_core.Circle_wasm_public_read.load
+                        ~charge
                         store
                         (Int64.of_int runtime_hfhe.exec_ctx.current_epoch)
                         declarations in
                     match public_reads_result with
                     | Error e ->
-                      finish (failed_receipt e)
+                      finish (key_failed e)
                     | Ok public_reads ->
-                      let wasm_limit = limit - public_reads.effort_used in
+                      let spent = key_effort + public_reads.effort_used in
+                      let rejected error =
+                        { (failed_receipt error) with effort_used = min limit spent } in
+                      let wasm_limit = limit - key_effort - public_reads.effort_used in
                       if wasm_limit <= 0 then
-                        finish (failed_receipt "wasm public read effort exceeds limit")
+                        finish (rejected "wasm public read effort exceeds limit")
                       else
                         let* wasm_result =
                           execute_wasm_view
                             execution
+                            ~proof_mode:runtime_hfhe.exec_ctx.proof_exec
                             ~code_b64:wasm.code_b64
                             ~export_name:"octra_query"
                             ~request_bytes
@@ -1255,11 +1384,12 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                           match wasm_result with
                           | Error (Octra_core.Circle_wasm_host.Rejected e)
                           | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
-                            finish (failed_receipt e)
+                            finish { (rejected e) with effort_used = limit }
                           | Ok result ->
                             match vm_response_value result.response_value with
                             | Error e ->
-                              finish (failed_receipt e)
+                              finish { (rejected e) with
+                                effort_used = min limit (spent + result.effort_used) }
                             | Ok return_value ->
                               let events =
                                 List.map
@@ -1274,7 +1404,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                               finish {
                                 Contract.success = result.success;
                                 return_value;
-                                effort_used = public_reads.effort_used + result.effort_used;
+                                effort_used = key_effort + public_reads.effort_used + result.effort_used;
                                 events;
                                 error =
                                   if result.success then None
@@ -1283,6 +1413,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                               }
                         end
                   end
+                end
             end
         end
     end
@@ -1434,7 +1565,7 @@ let execute_compute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(
     params
     caller
 
-let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
+let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(depth = 0)
     ?(limit = 1_000_000)
     ?(hfhe_strict = false)
     ?(hfhe_mode = Octra_core.Circle_hfhe_transcript.Direct)
@@ -1460,11 +1591,44 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
     if declared_execution = Circle_program.Compute then
       Lwt.return (failed_call_result "circle compute method cannot execute as update")
     else
-    let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
+    let limit = match loaded.code with
+      | Circle_program.Wasm_v1 _ when ctx.proof_exec = Octra_core.Rule_graph.Active ->
+        wasm_fuel_limit limit
+      | _ -> limit in
+    let staged = match journal, ctx.proof_exec with
+      | Some journal, Octra_core.Rule_graph.Active ->
+        Octra_vm.Program_journal.find_circle journal circle_id
+      | _ -> None in
+    let priced = ctx.proof_exec = Octra_core.Rule_graph.Active in
+    let read_effort = ref 0 in
+    let charge = if not priced then None else Some (fun cost ->
+      match Octra_vm.Cost.charge_z ~used:!read_effort ~cost ~limit with
+      | None -> false
+      | Some used -> read_effort := used; true) in
+    let* storage_result = match staged with
+      | Some storage -> Lwt.return (Ok storage)
+      | None -> Octra_core.Store_irmin.load_circle_stable_storage ?charge store circle_id in
     begin
       match storage_result with
-      | Error e -> Lwt.return (failed_call_result e)
+      | Error e ->
+        let result = failed_call_result e in
+        Lwt.return (if priced then
+          {result with receipt = {result.receipt with effort_used = limit}}
+          else result)
       | Ok storage_tbl ->
+        let storage_tbl = match journal, ctx.proof_exec with
+          | Some journal, Octra_core.Rule_graph.Active ->
+            Octra_vm.Program_journal.circle_storage journal circle_id storage_tbl
+          | _ -> storage_tbl in
+        let work = if priced then
+          Z.mul (Z.of_int 2) (Octra_vm.Program_journal.storage_effort storage_tbl)
+        else Z.zero in
+        begin match Octra_vm.Cost.charge_z ~used:!read_effort ~cost:work
+            ~limit:(if priced then limit else max_int) with
+        | None ->
+          let result = failed_call_result "circle storage effort exceeds limit" in
+          Lwt.return {result with receipt = {result.receipt with effort_used = limit}}
+        | Some spent ->
         let baseline_storage_tbl = Hashtbl.copy storage_tbl in
         begin
           match loaded.code with
@@ -1477,7 +1641,8 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
               | Ok runtime_hfhe ->
                 let spawns = ref [] in
                 let runtime_ctx =
-                  if receipt_mode hfhe_mode then
+                  if receipt_mode hfhe_mode
+                      && ctx.proof_exec = Octra_core.Rule_graph.Prior then
                     without_hfhe_verifiers runtime_hfhe.exec_ctx
                   else
                     runtime_hfhe.exec_ctx
@@ -1488,12 +1653,14 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                     circle_id
                     caller
                     spawns
+                  |> check_call_storage baseline_storage_tbl storage_tbl
                 in
                 begin
                   match prepare_octb_call
+                      ~calls:runtime_hfhe.calls
                       ~ctx:exec_ctx
                       ~depth
-                      ~limit
+                      ~limit:(limit - spent)
                       ~caller
                       ~address:circle_id
                       ~value
@@ -1504,13 +1671,20 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                       ~storage_tbl with
                   | Error error -> Lwt.return (failed_call_result error)
                   | Ok (fixed, state) ->
-                    let* receipt =
-                      Octra_core.Exec_resource.detach
-                        (fun () ->
-                          Contract.run_fixed_from_dispatcher state fixed)
-                        ()
-                    in
+                    let* receipt = run_octb state fixed in
+                    let receipt = if not priced then receipt else
+                      let work = if receipt.Contract.success then
+                        Z.add (Octra_vm.Program_journal.storage_effort storage_tbl)
+                          (Octra_vm.Program_journal.write_effort storage_tbl)
+                      else Z.zero in
+                      let work = Z.add work (Z.of_int spent) in
+                      match Octra_vm.Cost.charge_z
+                          ~used:receipt.effort_used ~cost:work ~limit with
+                      | Some effort_used -> {receipt with effort_used}
+                      | None -> {(failed_receipt "circle storage effort exceeds limit") with
+                          effort_used = limit} in
                     Lwt.return {
+                      calls = ctx.proof_exec = Octra_core.Rule_graph.Active;
                       receipt;
                       storage_tbl;
                       baseline_storage_tbl;
@@ -1548,22 +1722,28 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                 | Error e ->
                   Lwt.return (failed_call_result e)
                 | Ok runtime_hfhe ->
-                  let hfhe_active_key =
-                    wasm_hfhe_active_key_of_runtime_ctx runtime_hfhe.exec_ctx in
+                  let limit = if runtime_hfhe.exec_ctx.proof_exec = Octra_core.Rule_graph.Active
+                    then wasm_fuel_limit limit else limit in
+                  let* keys = wasm_keys ~limit:(limit - spent) ~view:false ~circle_id runtime_hfhe caller in
+                  begin match keys with
+                  | Error error -> Lwt.return (failed_call_result error)
+                  | Ok (hfhe_pubkeys, hfhe_active_key, key_effort) ->
+                  let priced = runtime_hfhe.exec_ctx.proof_exec = Octra_core.Rule_graph.Active in
+                  let used = ref (spent + key_effort) in
+                  let charge = if not priced then None else Some (fun cost ->
+                    if cost < 0 || cost > limit - !used then false
+                    else (used := !used + cost; true)) in
+                  let rejected effort error =
+                    let result = failed_call_result error in
+                    if not priced then result
+                    else {result with receipt = {result.receipt with effort_used = effort}} in
                   let hfhe_caps =
                     wasm_hfhe_caps_of_runtime_ctx
                       ~has_active_keypair:(Option.is_some hfhe_active_key)
                       runtime_hfhe.exec_ctx in
-                  let hfhe_pubkeys =
-                    wasm_hfhe_pubkeys_of_runtime_ctx
-                      runtime_hfhe.exec_ctx
-                      runtime_hfhe.policy
-                      ~owner:runtime_hfhe.owner
-                      ~caller
-                      ~active_relay:runtime_hfhe.active_relay in
                   match Octra_core.Circle_wasm_codec.encode_request ~method_name params with
                   | Error e ->
-                    Lwt.return (failed_call_result e)
+                    Lwt.return (rejected key_effort e)
                   | Ok request_bytes ->
                     begin
                       let declarations =
@@ -1572,20 +1752,31 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                           method_name in
                       let* public_reads_result =
                         Octra_core.Circle_wasm_public_read.load
+                          ?charge
                           store
                           (Int64.of_int runtime_hfhe.exec_ctx.current_epoch)
                           declarations in
                       match public_reads_result with
                       | Error e ->
-                        Lwt.return (failed_call_result e)
+                        Lwt.return (rejected !used e)
                       | Ok public_reads ->
-                        let wasm_limit = limit - public_reads.effort_used in
+                        let spent = min limit (spent + key_effort + public_reads.effort_used) in
+                        let wasm_limit = limit - spent in
                         if wasm_limit <= 0 then
                           Lwt.return
-                            (failed_call_result "wasm public read effort exceeds limit")
+                            (rejected spent "wasm public read effort exceeds limit")
                         else
+                          let* calls = if priced then
+                            Octra_core.Circle_deploy.calls_enabled store loaded.info
+                          else Lwt.return_false in
+                          let nested = ref [] in
+                          let call = if calls then Some (Wasm_call.dispatch
+                            ~ctx ~depth ~address:circle_id ~value ~storage:storage_tbl ~events:nested)
+                            else None in
                           let* wasm_result =
                             Octra_core.Circle_wasm_host.execute
+                              ~proof_mode:runtime_hfhe.exec_ctx.proof_exec
+                              ~call
                               ~math:runtime_hfhe.exec_ctx.math
                               ~float_mode:runtime_hfhe.exec_ctx.wasm_float
                               ~code_b64:wasm.code_b64
@@ -1605,17 +1796,17 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                               ~public_reads:public_reads.snapshots
                               ~fuel_limit:(wasm_fuel_limit wasm_limit)
                               ~is_view:false
-                              ~update_policy in
+                              ~update_policy:(update_policy || calls) in
                           begin
                             match wasm_result with
                             | Error (Octra_core.Circle_wasm_host.Rejected e) ->
-                              Lwt.return (failed_call_result e)
+                              Lwt.return (rejected limit e)
                             | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
                               Lwt.fail (Execution_unavailable e)
                             | Ok result ->
                               match vm_response_value result.response_value with
                               | Error e ->
-                                Lwt.return (failed_call_result e)
+                                Lwt.return (rejected (min limit (spent + result.effort_used)) e)
                               | Ok return_value ->
                                 let events =
                                   List.map
@@ -1626,18 +1817,31 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                                         event = event.Octra_core.Circle_wasm_host.topic;
                                         values = [ContractVM.VString event.data];
                                       })
-                                    result.events in
+                                    result.events
+                                  |> fun events -> Wasm_call.merge_events events !nested in
+                                if result.success && priced then begin
+                                  Hashtbl.reset storage_tbl;
+                                  Hashtbl.iter (Hashtbl.replace storage_tbl) result.storage_tbl
+                                end;
+                                let work = if priced && result.success then
+                                  Z.add (Octra_vm.Program_journal.storage_effort result.storage_tbl)
+                                    (Octra_vm.Program_journal.write_effort result.storage_tbl)
+                                else Z.zero in
+                                let effort = Octra_vm.Cost.charge_z
+                                  ~used:(spent + result.effort_used) ~cost:work ~limit in
                                 let receipt = {
-                                  Contract.success = result.success;
+                                  Contract.success = result.success && Option.is_some effort;
                                   return_value;
-                                  effort_used = public_reads.effort_used + result.effort_used;
+                                  effort_used = Option.value ~default:limit effort;
                                   events;
                                   error =
-                                    if result.success then None
+                                    if Option.is_none effort then Some "circle storage effort exceeds limit"
+                                    else if result.success then None
                                     else Some (Option.value ~default:"execution reverted" result.error);
                                   storage_writes = 0;
                                 } in
                                 Lwt.return {
+                                  calls = runtime_hfhe.exec_ctx.proof_exec = Octra_core.Rule_graph.Active;
                                   receipt;
                                   storage_tbl = result.storage_tbl;
                                   baseline_storage_tbl;
@@ -1661,8 +1865,10 @@ let execute_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0)
                                 }
                           end
                     end
+                  end
               end
             end
+        end
         end
     end
 
@@ -1747,7 +1953,8 @@ let commit_call_result
           if spawn.Octra_core.Circle_wasm_host.spawn_nonce <> idx then
             Lwt.return (Error ("circle spawn nonce mismatch"))
           else
-            match Octra_core.Circle_deploy.decode_spawn_payload_json spawn.payload_json with
+            match Octra_core.Circle_deploy.decode_spawn_payload_json
+                ~resource_errors:t.calls spawn.payload_json with
             | Error (_code, reason) ->
               Lwt.return (Error reason)
             | Ok payload ->
@@ -1767,6 +1974,7 @@ let commit_call_result
               else
                 let* checked =
                   Octra_core.Circle_deploy.check_available
+                    ~resource_errors:t.calls
                     ~execution_profile:deployment_profile
                     ~float_mode
                     store
@@ -1856,13 +2064,13 @@ let commit_call_result
                 | Some raw_path, None, None ->
                   begin
                     match Octra_core.Circles.path_key_of_raw_path raw_path with
-                    | Ok (canonical_path, path_key) ->
+                    | Ok (path, path_key) ->
                       Ok
-                        ( canonical_path,
+                        ( path,
                           path_key,
                           Octra_core.Circles.resource_key_of_path
                             ~circle_id:target
-                            ~canonical_path,
+                            ~canonical_path:path,
                           Octra_core.Circles.Path_locator,
                           None )
                     | Error e -> Error e
@@ -1870,9 +2078,9 @@ let commit_call_result
                 | None, Some raw_slot_ref, None ->
                   begin
                     match Octra_core.Circles.path_key_of_slot_ref raw_slot_ref with
-                    | Ok (slot_ref, canonical_path, path_key) ->
+                    | Ok (slot_ref, path, path_key) ->
                       Ok
-                        ( canonical_path,
+                        ( path,
                           path_key,
                           Octra_core.Circles.resource_key_of_slot_ref
                             ~circle_id:target
@@ -1884,9 +2092,9 @@ let commit_call_result
                 | None, None, Some raw_state_ref ->
                   begin
                     match Octra_core.Circles.path_key_of_state_ref raw_state_ref with
-                    | Ok (_state_ref, canonical_path, path_key) ->
+                    | Ok (_state_ref, path, path_key) ->
                       Ok
-                        ( canonical_path,
+                        ( path,
                           path_key,
                           Octra_core.Circles.resource_key_of_state_ref
                             ~circle_id:target
@@ -1915,7 +2123,7 @@ let commit_call_result
                     match Octra_core.Circles.path_key_of_raw_path asset.path with
                     | Error e ->
                       Lwt.return (Error e)
-                    | Ok (canonical_path, path_key) ->
+                    | Ok (path, path_key) ->
                       let effect_key = target ^ ":" ^ path_key in
                       if List.exists (String.equal effect_key) seen then
                         Lwt.return (Error "duplicate circle asset effect")
@@ -1956,7 +2164,7 @@ let commit_call_result
                               Hashtbl.replace usage_tbl target next_usage;
                               let meta = {
                                 Octra_core.Circles.path_key;
-                                canonical_path;
+                                canonical_path = path;
                                 content_type = asset.content_type;
                                 encoding = Option.value ~default:"identity" asset.encoding;
                                 size_bytes;
@@ -1968,7 +2176,7 @@ let commit_call_result
                                 resource_key =
                                   Octra_core.Circles.resource_key_of_path
                                     ~circle_id:target
-                                    ~canonical_path;
+                                    ~canonical_path:path;
                                 locator_mode = Octra_core.Circles.Path_locator;
                                 slot_ref = None;
                                 activate_after_epoch = None;
@@ -2014,7 +2222,7 @@ let commit_call_result
                     match resolve_encrypted_locator target asset with
                     | Error e ->
                       Lwt.return (Error e)
-                    | Ok (canonical_path, path_key, resource_key, locator_mode, slot_ref) ->
+                    | Ok (path, path_key, resource_key, locator_mode, slot_ref) ->
                       let effect_key = target ^ ":" ^ path_key in
                       if List.exists (String.equal effect_key) seen then
                         Lwt.return (Error "duplicate circle asset effect")
@@ -2055,7 +2263,7 @@ let commit_call_result
                               Hashtbl.replace usage_tbl target next_usage;
                               let meta = {
                                 Octra_core.Circles.path_key;
-                                canonical_path;
+                                canonical_path = path;
                                 content_type = asset.content_type;
                                 encoding = Option.value ~default:"identity" asset.encoding;
                                 size_bytes;
@@ -2126,10 +2334,14 @@ let commit_call_result
                 | Error e ->
                   Lwt.return (Error e)
                 | Ok _ ->
+                  let* calls = if t.calls then
+                    Octra_core.Circle_deploy.calls_enabled store info
+                    else Lwt.return_false in
                   let* written =
                     Lwt_list.map_s
                       (fun spawn ->
                         Octra_core.Circle_deploy.write_prepared
+                          ~calls
                           store
                           spawn.src
                           spawn.prepared

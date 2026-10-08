@@ -191,7 +191,7 @@ let check_split repo store split =
               (Printexc.to_string error);
             Lwt.return_none)
 
-let open_store ?(fresh=false) ?(readonly=false) path =
+let open_store ?(fresh=false) ?(readonly=false) ?(sync = true) path =
   let path = absolute_path path in
   let config = Irmin_pack.Conf.init
     ~fresh
@@ -199,7 +199,7 @@ let open_store ?(fresh=false) ?(readonly=false) path =
     ~lru_max_memory:(Some 67_108_864)
     ~index_log_size:2_500_000
     ~indexing_strategy:Irmin_pack.Indexing_strategy.minimal
-    ~use_fsync:true
+    ~use_fsync:sync
     path
   in
   let* repo = Store.Repo.v config in
@@ -278,17 +278,23 @@ let read_value tree path =
       Store.Tree.Contents.clear contents;
       Lwt.return value
 
-let read t path =
-  match t.batch_tree with
-  | Some tree -> read_value tree path
+let read ?snapshot t path =
+  match snapshot with
+  | Some (snapshot : read_snapshot) -> read_value snapshot.tree path
   | None ->
-    let* tree = Store.tree t.store in
-    read_value tree path
+    match t.batch_tree with
+    | Some tree -> read_value tree path
+    | None ->
+      let* tree = Store.tree t.store in
+      read_value tree path
 
-let read_tree t path =
-  match t.batch_tree with
-  | Some tree -> Store.Tree.find_tree tree path
-  | None -> Store.find_tree t.store path
+let read_tree ?snapshot t path =
+  match snapshot with
+  | Some (snapshot : read_snapshot) -> Store.Tree.find_tree snapshot.tree path
+  | None ->
+    match t.batch_tree with
+    | Some tree -> Store.Tree.find_tree tree path
+    | None -> Store.find_tree t.store path
 
 exception Irmin_remove_failed of string
 
@@ -345,6 +351,9 @@ let commit_epoch_batch t msg =
 let abort_epoch_batch t =
   t.batch_tree <- None;
   t.account_mode <- Rule_graph.Prior
+
+let batch_open t =
+  Option.is_some t.batch_tree
 
 let save_batch t =
   match t.batch_tree with
@@ -418,6 +427,15 @@ let account_from find find_tree addr data =
                  ~get:(fun id -> List.assoc_opt id parts))
         end
     end
+
+let get_balance ?snapshot t addr =
+  let* raw = read ?snapshot t (account_data_path addr) in
+  match raw with
+  | None -> Lwt.return Z.zero
+  | Some raw ->
+    match Account_pack.balance raw with
+    | Ok balance -> Lwt.return balance
+    | Error _ -> Lwt.fail (Exec_resource.Unavailable Host)
 
 let get_account t addr =
   let* v = read t (account_data_path addr) in
@@ -968,9 +986,14 @@ let pvac_is_bound t addr =
   | Some _
   | None -> Lwt.return false
 
-let get_pvac_pubkey t addr =
-  let* bound = read t (pvac_hash_path addr) in
-  match bound with
+let get_pvac_pubkey ?snapshot t addr =
+  let unavailable reason =
+    match snapshot with
+    | None -> Lwt.fail_with reason
+    | Some _ -> Lwt.fail (Exec_resource.Unavailable Host)
+  in
+  let* hash = read ?snapshot t (pvac_hash_path addr) in
+  match hash with
   | Some "none" -> Lwt.return_none
   | Some hash ->
     begin
@@ -978,12 +1001,14 @@ let get_pvac_pubkey t addr =
       | Some blob when String.equal (pvac_hash blob) hash ->
         Lwt.return_some blob
       | Some _ ->
-        Lwt.fail_with "pvac blob hash mismatch"
+        unavailable "pvac blob hash mismatch"
       | None ->
-        Lwt.fail_with "pvac blob unavailable"
+        unavailable "pvac blob unavailable"
     end
   | None ->
-    Lwt.return (read_file (pvac_legacy_path t addr))
+    match read_file (pvac_legacy_path t addr), snapshot with
+    | Some _, Some _ -> Lwt.fail (Exec_resource.Unavailable Host)
+    | value, _ -> Lwt.return value
 
 let set_pvac_pubkey t addr pk_blob =
   let hash = pvac_hash pk_blob in
@@ -1279,12 +1304,12 @@ let get_unclaimed_stealth_amount t =
        tree () in
   Lwt.return !sum
 
-let load_bytecode t addr =
-  read t ["contracts"; addr; "bytecode"]
+let load_bytecode ?snapshot t addr =
+  read ?snapshot t ["contracts"; addr; "bytecode"]
 
-let load_contract_storage t addr =
+let load_contract_storage ?snapshot t addr =
   let tbl = Hashtbl.create 100 in
-  let* tree_opt = read_tree t ["contracts"; addr; "storage"] in
+  let* tree_opt = read_tree ?snapshot t ["contracts"; addr; "storage"] in
   let* () = match tree_opt with
    | None -> Lwt.return ()
    | Some tree ->
@@ -1382,8 +1407,8 @@ let save_contract_certificate t addr certificate_json =
 let get_contract_certificate t addr =
   read t ["contracts"; addr; "certificate"]
 
-let get_contract_meta t addr =
-  let* v = read t ["contracts"; addr; "meta"] in
+let get_contract_meta ?snapshot t addr =
+  let* v = read ?snapshot t ["contracts"; addr; "meta"] in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -1482,8 +1507,8 @@ type contract_storage_page = {
   more : bool;
 }
 
-let list_contract_storage_page t addr ~limit ~value_limit =
-  let* tree_opt = read_tree t ["contracts"; addr; "storage"] in
+let list_contract_storage_page ?snapshot t addr ~limit ~value_limit =
+  let* tree_opt = read_tree ?snapshot t ["contracts"; addr; "storage"] in
   match tree_opt with
   | None -> Lwt.return { entries = []; more = false }
   | Some tree ->
@@ -1704,7 +1729,35 @@ let read_circle_stable_inline_value t circle_id raw_key =
   | Some { Circles.value = Circles.Inline value; _ } -> Lwt.return (Some value)
   | _ -> Lwt.return_none
 
-let load_circle_stable_storage t circle_id =
+let load_circle_stable_storage ?charge t circle_id =
+  match charge with
+  | Some charge ->
+    let exception Read_refused of string in
+    let fail reason = Lwt.fail (Read_refused reason) in
+    let values = Hashtbl.create 0 in
+    Lwt.catch (fun () ->
+      let* tree = read_tree t ["circles"; circle_id; "stable"; "by_hash"] in
+      let* () = match tree with
+        | None -> Lwt.return_unit
+        | Some tree ->
+          let* count = Store.Tree.length tree [] in
+          if not (charge (Z.mul (Z.of_int 16) (Z.of_int count))) then
+            fail "circle storage read effort exceeds limit"
+          else Store.Tree.fold ~order:`Sorted ~depth:(`Eq 1)
+            ~contents:(fun _ raw () ->
+              if not (charge (Z.cdiv (Z.of_int (String.length raw)) (Z.of_int 16))) then
+                fail "circle storage read effort exceeds limit"
+              else match Circles.stable_entry_of_yojson (Yojson.Safe.from_string raw) with
+                | Error error -> fail error
+                | Ok entry -> match entry.Circles.value with
+                  | Circles.Blob_ref _ -> fail "circle stable storage contains non-inline values"
+                  | Circles.Inline value ->
+                    Hashtbl.replace values entry.raw_key value;
+                    Lwt.return_unit)
+            tree () in
+      Lwt.return (Ok values))
+      (function Read_refused error -> Lwt.return (Error error) | error -> Lwt.fail error)
+  | None ->
   let tbl = Hashtbl.create 100 in
   let* entries = list_circle_stable_entries t circle_id in
   let inline_only = ref true in
@@ -2337,6 +2390,10 @@ type compact_store_result = {
 }
 
 let create_compact_store t ~expected_commit ~target =
+  let exists path =
+    try ignore (Unix.lstat path); true with
+    | Unix.Unix_error (Unix.ENOENT, _, _) -> false
+  in
   match Irmin.Type.of_string Store.Hash.t expected_commit with
   | Error _ -> Lwt.return (Error "source Irmin commit hash is invalid")
   | Ok hash when Irmin.Type.to_string Store.Hash.t hash <> expected_commit ->
@@ -2346,7 +2403,7 @@ let create_compact_store t ~expected_commit ~target =
       match commit with
       | None -> Lwt.return (Error "source Irmin commit is unavailable")
       | Some commit ->
-        if Sys.file_exists target then
+        if exists target then
           Lwt.return (Error "compact Irmin target already exists")
         else
           let commit_hash =
@@ -2358,34 +2415,89 @@ let create_compact_store t ~expected_commit ~target =
           in
           Lwt.catch
             (fun () ->
-              let* () =
-                Store.create_one_commit_store
-                  t.repo
-                  (Store.Commit.key commit)
-                  target
-              in
-              ignore (Store.Gc.cancel t.repo);
-              let* compact = open_store target in
-              Lwt.finalize
+              let source = Unix.realpath t.store_path in
+              let target = Filename.concat (Unix.realpath (Filename.dirname target))
+                (Filename.basename target) in
+              if source = target || String.starts_with ~prefix:(source ^ "/") target then
+                invalid_arg "copy target is inside source";
+              let rec reserve attempt =
+                if attempt > 32 then failwith "copy work paths occupied";
+                let path = target ^ ".next" ^
+                  (if attempt = 0 then "" else "." ^ string_of_int attempt) in
+                try Unix.mkdir path 0o700; path with
+                | Unix.Unix_error (Unix.EEXIST, _, _) -> reserve (attempt + 1) in
+              let staged = reserve 0 in
+              let path = Filename.concat staged "store" in
+              let* compact = open_store ~sync:false path in
+              let* result = Lwt.finalize
                 (fun () ->
-                  let* restored =
-                    Store.Commit.of_hash compact.repo (Store.Commit.hash commit)
+                  let root_key = match Store.Tree.key (Store.Commit.tree commit) with
+                    | Some (`Node _ as key) -> key
+                    | _ -> failwith "copy root key is unavailable"
                   in
-                  match restored with
-                  | None ->
-                    Lwt.return (Error "compact Irmin commit is unavailable")
-                  | Some restored ->
-                    let restored_tree_hash =
-                      Irmin.Type.to_string Store.Hash.t
-                        (Store.Tree.hash (Store.Commit.tree restored))
-                    in
-                    if restored_tree_hash <> tree_hash then
-                      Lwt.return (Error "compact Irmin tree hash mismatch")
-                    else
-                      let* () = Store.Head.set compact.store restored in
-                      Store.flush compact.repo;
-                      Lwt.return (Ok { commit_hash; tree_hash }))
-                (fun () -> close compact))
+                  let imported = Store.Snapshot.Import.v
+                    ~on_disk:(`Path (Filename.concat staged "import")) compact.repo in
+                  let root = ref None in
+                  let* () = Lwt.finalize (fun () ->
+                    let* _ = Store.Snapshot.export
+                      ~on_disk:(`Path (Filename.concat staged "export")) t.repo
+                      (fun item ->
+                        let* key = Store.Snapshot.Import.save_elt imported item in
+                        root := Some key;
+                        Lwt.return_unit)
+                      ~root_key in
+                    Lwt.return_unit)
+                    (fun () ->
+                      Store.Snapshot.Import.close imported compact.repo;
+                      Lwt.return_unit)
+                  in
+                  let key = match !root with
+                    | Some key -> key
+                    | None -> failwith "copy root is absent"
+                  in
+                  let* tree = Store.Tree.of_key compact.repo (`Node key) in
+                  let tree = match tree with
+                    | Some tree -> tree
+                    | None -> failwith "copy tree is absent"
+                  in
+                  let parents = Store.Commit.parents commit
+                    |> List.map (fun key -> Irmin_pack_unix.Pack_key.(v_indexed (to_hash key))) in
+                  let* restored = Store.Commit.v compact.repo
+                    ~info:(Store.Commit.info commit) ~parents tree in
+                  if Store.Commit.hash restored <> Store.Commit.hash commit then
+                    Lwt.fail_with "copy commit differs"
+                  else if Store.Tree.hash tree <> Store.Tree.hash (Store.Commit.tree commit) then
+                    Lwt.fail_with "copy root differs"
+                  else
+                    let* () = Store.Head.set compact.store restored in
+                    Store.flush compact.repo;
+                    Lwt.return (Ok { commit_hash; tree_hash }))
+                (fun () -> close compact) in
+              let* verified = open_store ~readonly:true path in
+              let* () = Lwt.finalize (fun () ->
+                let* copied_commit = get_commit_hash verified in
+                let* copied_root = get_head_hash verified in
+                if copied_commit <> Some commit_hash then Lwt.fail_with "copy commit differs"
+                else if copied_root <> Some tree_hash then Lwt.fail_with "copy root differs"
+                else Lwt.return_unit)
+                (fun () -> close verified) in
+              let rec sync_path path =
+                (match (Unix.lstat path).Unix.st_kind with
+                 | Unix.S_DIR ->
+                   Sys.readdir path |> Array.iter (fun name -> sync_path (Filename.concat path name))
+                 | Unix.S_REG -> ()
+                 | _ -> failwith "copy file kind is invalid");
+                let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+                Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd) in
+              sync_path path;
+              fsync_dir staged;
+              if exists target then Lwt.fail_with "copy target already exists"
+              else begin
+                Unix.rename path target;
+                fsync_dir (Filename.dirname target);
+                Unix.rmdir staged;
+                Lwt.return result
+              end)
             (fun exn ->
               Lwt.return
                 (Error ("compact Irmin export failed: " ^ Printexc.to_string exn)))

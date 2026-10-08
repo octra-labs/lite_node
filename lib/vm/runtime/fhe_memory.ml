@@ -44,19 +44,21 @@ let key_decode raw =
   Option.map (fun size -> Z.add key_scratch
     (Z.mul key_factor (Z.add (Z.of_int (String.length raw)) size))) (key_image raw)
 
-let key_effort volume =
-  let cost = Z.cdiv volume key_io_bytes in
-  if Z.sign cost < 0 || not (Z.fits_int cost) then None else Some (Z.to_int cost)
+let key_effort ?(active = false) volume =
+  let cost = Z.cdiv volume (if active then Z.of_int 16 else key_io_bytes) in
+  if Z.sign volume < 0 || not (Z.fits_int cost) then None else Some (Z.to_int cost)
 
-let key_read_effort raw =
+let key_read_effort ?(active = false) raw =
   Option.bind (key_image raw) (fun size ->
-    key_effort (Z.add (Z.of_int (String.length raw)) size))
+    key_effort ~active (Z.add (Z.of_int (String.length raw)) size))
 
-let key_write_effort key =
-  key_effort (Z.of_int (Pvac_ffi.pubkey_image_size key))
+let key_write_effort ?(active = false) key =
+  if active then Option.bind key.Octra_core.Fhe_image.size (fun size ->
+    key_effort ~active (Z.of_int size))
+  else key_effort (Z.of_int (Octra_core.Fhe_image.key_size key))
 
 let key_value key =
-  Z.add key_scratch (Z.mul key_factor (Z.of_int (Pvac_ffi.pubkey_image_size key)))
+  Z.add key_scratch (Z.mul key_factor (Z.of_int (Octra_core.Fhe_image.key_size key)))
 
 let cipher_decode raw =
   Z.add (Z.of_int 4096)

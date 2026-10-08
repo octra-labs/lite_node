@@ -6,10 +6,19 @@ type effects = {
   abort_store : unit -> unit;
   abort_history : unit -> unit;
   fatal : string -> unit;
-  exit : unit -> unit;
+  exit : exn -> unit;
 }
 
 val run :
   effects ->
   (unit -> 'a Lwt.t) ->
   'a Lwt.t
+
+val exit_store : ?code:int -> Octra_core.Store_irmin.t -> unit -> 'a
+
+val run_store :
+  ?fatal:(string -> unit) ->
+  store:Octra_core.Store_irmin.t ->
+  ledger:Octra_core.Ledger.t ->
+  chaindata:Octra_core.Store_chaindata.t ->
+  (unit -> 'a Lwt.t) -> 'a Lwt.t

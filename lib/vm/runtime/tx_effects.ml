@@ -93,6 +93,12 @@ let commit tx =
       tx.status <- Committed;
       Ok ()
   with
+  | (Out_of_memory | Stack_overflow | Lwt.Canceled
+    | Octra_core.Exec_resource.Unavailable _) as error ->
+    begin match rollback tx with
+    | Ok () -> raise error
+    | Error _ -> raise (Octra_core.Exec_resource.Unavailable Host)
+    end
   | Commit_failed _ as error -> raise error
   | error -> fail tx (Printexc.to_string error)
 

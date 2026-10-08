@@ -8,6 +8,32 @@ module Node = Octra_node_runtime
 
 let expect label value = if not value then failwith label
 
+let parent chain_id epoch =
+  let module C = Octra_consensus.C_types in
+  let module H = Octra_consensus.C_hash in
+  let module E = Mirage_crypto_ec.Ed25519 in
+  let keys = List.init 4 (fun index ->
+    let secret = E.priv_of_octets (String.make 32 (Char.chr (21 + index))) |> Result.get_ok in
+    let pubkey = E.pub_of_priv secret |> E.pub_to_octets in
+    let address = Core.Crypto.Address.address_from_pubkey (Base64.encode_exn pubkey) in
+    C.{address; pubkey}, secret) in
+  let first, secret = List.hd keys in
+  let owner = first.C.address in
+  let validator_set = C.make_validator_set (List.map fst keys) in
+  let header = C.{proto_version = proto_version_current; chain_id; epoch_id = epoch;
+    prev_state_root = String.make 32 '\001'; tx_list_hash = H.receipt_root [];
+    receipt_root = H.receipt_root []; proposed_state_root = String.make 32 '\002';
+    parent_commit_hash = Octra_net.Hash_domain.nil_hash; creator_addr = owner;
+    txid_hi = 0L; ts = 0.} in
+  let proposal_id = H.proposal_id header in
+  let precommits = List.map (fun (validator, secret) ->
+    let vote = C.{chain_id; epoch_id = epoch; round = 0; vote_type = Precommit;
+      proposal_id; validator = validator.C.address; signature = String.make 64 '\000'} in
+    {vote with signature = E.sign ~key:secret (H.vote_sign_bytes vote)}) keys in
+  C.{validator_set; certificate = {chain_id; epoch_id = epoch; commit_round = 0;
+    header; proposal_id; precommits}}, owner, first.pubkey,
+    (E.priv_to_octets secret |> Base64.encode_exn)
+
 let check_workers () =
   List.iter (fun (cause, resource) ->
     List.iter (fun action ->
@@ -17,31 +43,37 @@ let check_workers () =
       expect "worker lost resource identity" caught)
       [(fun () -> raise cause); (fun () -> Lwt.fail cause);
        (fun () -> Core.Exec_resource.detach (fun () -> raise cause) ())];
-    let result = Lwt_main.run (Octra_vm.Contract_rpc.run_view ~seconds:0.1
-      (fun () -> raise cause)) in
-    expect "view lost worker resource failure"
-      (match result with
-       | Error error -> error.Core.Rpc.code = -32005 &&
-           error.message = "Program view resources unavailable"
-       | Ok _ -> false);
-    expect "view did not release failed worker"
-      (Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> 7)) = Ok 7))
+    List.iter (fun action ->
+      let result = Lwt_main.run (Octra_vm.Contract_rpc.run_view ~seconds:0.1 action) in
+      expect "view lost worker resource failure"
+        (match result with
+         | Error error -> error.Core.Rpc.code = -32005 &&
+             error.message = "Program view resources unavailable"
+         | Ok _ -> false);
+      expect "view did not release failed worker"
+        (Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> Lwt.return 7)) = Ok 7))
+      [(fun () -> raise cause); (fun () -> Lwt.fail cause)])
     [Out_of_memory, Core.Exec_resource.Memory; Stack_overflow, Core.Exec_resource.Stack]
 
-let run arm cipher =
+let check arm key cipher proof epoch_id =
   Test_workspace.with_dir "preview_alloc" (fun dir ->
     let store = Lwt_main.run (Store.open_store (Filename.concat dir "irmin")) in
     Fun.protect ~finally:(fun () -> arm (-1); Lwt_main.run (Store.close store)) (fun () ->
-      let owner = "oct11111111111111111111111111111111111111111111" in
+      let chain_id = "octra-devnet-9871-cluster" in
+      let parent, owner, pubkey, secret = parent chain_id (Int64.of_int (epoch_id - 1)) in
       let circle_id = "oct" ^ String.make 44 '2' in
       let compiled = Octra_vm.Oct_compile.compile {|
 Program CipherWork {
   state { count: int }
   constructor() { self.count = 0 }
-  fn decode(data: string): int {
+  fn decode(data: string, evidence: string, verify: bool): int {
     self.count = 1
+    let pk = fhe_load_pk(caller)
     let ct = fhe_deser(data)
-    let encoded = fhe_ser(ct)
+    let encoded = fhe_ser(fhe_add(pk, ct, ct))
+    if verify {
+      require(fhe_verify_zero(pk, ct, evidence), "proof rejected")
+    }
     return self.count
   }
 }
@@ -61,28 +93,53 @@ Program CipherWork {
       let ledger = Core.Ledger.create store in
       expect "preview funding failed"
         (Core.Ledger.add_account ledger owner (Z.of_int 1_000_000_000) = Ok ());
+      Lwt_main.run (Core.Ledger.set_pvac_pubkey ledger owner (Bytes.to_string key));
       Lwt_main.run (Core.Ledger.flush_dirty_lwt ledger);
       Lwt_main.run (Store.set_meta store "total_supply" "1000000000");
       Lwt_main.run (Store.set_meta store "emission_remaining" "0");
       let root = Lwt_main.run (Core.Ledger.hash ledger) in
       let commit = Lwt_main.run (Store.get_commit_hash store) in
-      let rules = Core.Rule_graph.create ~chain_id:"preview-test"
-        ~root_at:(fun _ -> Core.Rule_graph.Missing) in
+      let rules = Core.Rule_graph.create ~chain_id ~root_at:(fun epoch ->
+        match Core.Rule_graph.root_after_floor ~chain_id ~floor_epoch:max_int ~epoch with
+        | None -> Core.Rule_graph.Missing
+        | Some root -> Core.Rule_graph.Root root) in
+      let active = Core.Rule_graph.proof_exec_at ~chain_id ~epoch:epoch_id = Core.Rule_graph.Active in
       let transaction = Core.Transaction.{from = owner; to_ = circle_id; amount = Z.zero;
-        nonce = 1; ou = Z.of_int 1_000_000; timestamp = 0.; signature = ""; public_key = None;
-        message = Some (Yojson.Safe.to_string (`List [`String (Base64.encode_exn (Bytes.to_string cipher))]));
+        nonce = 1; ou = Z.of_int 10_000_000; timestamp = 0.; signature = "";
+        public_key = Some (Base64.encode_exn pubkey);
+        message = Some (Yojson.Safe.to_string (`List [
+          `String (Base64.encode_exn (Bytes.to_string cipher));
+          `String proof; `Bool active]));
         op_type = CircleCall; encrypted_data = Some "decode"} in
-      let env = Epoch.{chain_id = "preview-test"; epoch_id = 7; proposer_addr = owner;
-        validator_addrs = [owner]; validator_pubkeys = [owner, String.make 32 'a']; prev_state_root = root;
+      let transaction = Core.Transaction.sign_with_privkey transaction secret in
+      let validators = parent.Octra_consensus.C_types.validator_set.validators in
+      let env = Epoch.{chain_id; epoch_id; proposer_addr = owner;
+        validator_addrs = List.map (fun value -> value.Octra_consensus.C_types.address) validators;
+        validator_pubkeys = List.map (fun value -> value.Octra_consensus.C_types.address, value.pubkey) validators;
+        prev_state_root = root;
         epoch_ts = 70.; ready_state_root_at = None; ready_max_lag = -1} in
       let runtime = Node.Consensus_circle_preverify.{store; ledger;
         program_trust = Octra_vm.Program_trust.empty; rules;
         env = (fun ~pre_state_root -> {env with prev_state_root = pre_state_root})} in
-      let batch = Lwt_main.run (Core.Preverify_worker.run_many
+      let batch_run () = Lwt_main.run (Core.Preverify_worker.run_many
         ~field_policy:Core.Private_ledger.Unique_fields ~strict:false ~ledger
         ~circle_preverify:(Node.Consensus_circle_preverify.run runtime) [transaction]) in
+      let batch = batch_run () in
       if batch.skipped <> [] then failwith ("preview receipt unavailable: " ^
         String.concat "; " (List.map (fun item -> item.Core.Preverify_worker.reason) batch.skipped));
+      let worker = match Core.Pvac_verify_worker.worker_path () with
+        | Some path -> path
+        | None -> failwith "preview worker missing" in
+      let failed = Fun.protect ~finally:(fun () ->
+        Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker) (fun () ->
+        Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" Sys.executable_name;
+        batch_run ()) in
+      if active then
+        expect "preverify worker failure produced receipt"
+          (failed.ready = [] && List.length failed.skipped = 1)
+      else
+        expect "prior preverify used worker"
+          (failed.skipped = [] && List.length failed.ready = 1);
       let preverify = Core.Preverify_commit.create
         (Core.Preverify_worker.receipts_for_hashes batch.ready [Core.Transaction.hash transaction]) in
       let backend = Node.Consensus_proposal_preview_shell.node_backend
@@ -92,8 +149,8 @@ Program CipherWork {
         ~max_fhe:1 ~max_stealth:1 store ledger in
       let reward = Node.Consensus_reward_attribution.full_set ~proposer_addr:owner
         ~validator_pubkeys:env.validator_pubkeys in
-      let preview () = backend.run ~epoch_id:7 ~proposal_id:"memory-check"
-        ~expected_prev_root:(Some root) ~preverify ~parent_commit:None ~reward ~env ~txs:[transaction] in
+      let preview () = backend.run ~epoch_id ~proposal_id:"memory-check"
+        ~expected_prev_root:(Some root) ~preverify ~parent_commit:(Some parent) ~reward ~env ~txs:[transaction] in
       let verify () =
         expect "preview changed store commit" (Lwt_main.run (Store.get_commit_hash store) = commit);
         expect "preview changed ledger" (Lwt_main.run (Core.Ledger.hash ledger) = root) in
@@ -105,11 +162,21 @@ Program CipherWork {
            failwith ("preview control rejected: " ^ String.concat "; "
              (List.map (fun row -> row.Epoch.reason) result.artifacts.rejected)));
       verify ();
-      let fault = Fun.protect ~finally:(fun () -> arm (-1)) (fun () ->
+      let isolated = Fun.protect ~finally:(fun () -> arm (-1)) (fun () ->
         arm 0;
+        try Ok (Lwt_main.run (preview ())) with error -> Error error) in
+      if active then expect "preview used parent native allocation" (isolated = Ok control)
+      else expect "prior preview lost native resource failure"
+        (match isolated with
+        | Error (Core.Exec_resource.Exhausted (hash, Memory)) -> hash = Core.Transaction.hash transaction
+        | _ -> false);
+      verify ();
+      let fault = Fun.protect ~finally:(fun () ->
+        Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker) (fun () ->
+        Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" Sys.executable_name;
         match Lwt_main.run (preview ()) with
-        | _ -> false
-        | exception Core.Exec_resource.Exhausted (hash, Memory) -> hash = Core.Transaction.hash transaction
+        | result -> not active && result = control
+        | exception Core.Exec_resource.Exhausted (hash, Memory) -> active && hash = Core.Transaction.hash transaction
         | exception _ -> false) in
       expect "production preview lost transaction allocation failure" fault;
       verify ();
@@ -117,3 +184,8 @@ Program CipherWork {
       verify ();
       check_workers ();
       print_endline "event = test name = preview_alloc status = passed"))
+
+let run arm key cipher proof =
+  let epoch = (Option.get (Core.Rule_graph.proof_activation_for_chain
+    "octra-devnet-9871-cluster")).activation_epoch in
+  List.iter (check arm key cipher proof) [epoch - 1; epoch]

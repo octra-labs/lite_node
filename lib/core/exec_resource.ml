@@ -11,6 +11,11 @@ let protect action input =
   | Out_of_memory -> raise (Unavailable Memory)
   | Stack_overflow -> raise (Unavailable Stack)
 
+let bind work next = Lwt.bind work (protect next)
+
+let catch action handler =
+  Lwt.catch (fun () -> protect action ()) (protect handler)
+
 let detach action input = Lwt_preemptive.detach (protect action) input
 
 let run ~hash action =

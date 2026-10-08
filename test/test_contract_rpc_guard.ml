@@ -32,6 +32,7 @@ let with_store run =
     Lwt_main.run
       (Octra_core.Store_irmin.open_store (Filename.concat root "irmin"))
   in
+  Lwt_main.run (Octra_core.Store_irmin.set_meta store "last_epoch" "0");
   Fun.protect
     ~finally:(fun () ->
       ignore (Lwt_main.run (Octra_core.Store_irmin.close store));
@@ -54,9 +55,11 @@ let with_chaindata run =
     (fun () -> run chaindata)
 
 let test_view_effort_limit () =
-  let expected = Octra_vm.Call_plan.effort_limit Z.zero in
+  let expected = Z.to_int (Octra_core.Resource_lanes.default_budget Program).max_ou in
   if Octra_vm.Contract_rpc.view_effort_limit <> expected then
-    fail "view effort limit changed"
+    fail "view effort exceeds program budget";
+  if Octra_vm.Call_plan.effort_limit Z.zero <> 1_000_000 then
+    fail "view policy changed transaction effort"
 
 let test_compile_limit () =
   let source = String.make 1_048_577 'x' in
@@ -114,11 +117,10 @@ let test_view_fhe_capability_gate () =
 let test_view_lane () =
   let first =
     Octra_vm.Contract_rpc.run_view (fun () ->
-      Thread.delay 0.05;
-      7)
+      Lwt.map (fun () -> 7) (Lwt_unix.sleep 0.05))
   in
   let second =
-    Octra_vm.Contract_rpc.run_view (fun () -> 8)
+    Octra_vm.Contract_rpc.run_view (fun () -> Lwt.return 8)
   in
   let pulse =
     let open Lwt.Syntax in
@@ -139,28 +141,32 @@ let test_view_lane () =
     | _ -> fail "concurrent view lane execution admitted"
   end;
   if not responsive then fail "view lane blocked Lwt";
-  match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> 9)) with
+  match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> Lwt.return 9)) with
   | Ok 9 -> ()
   | _ -> fail "view lane did not reset"
 
 let test_view_timeout () =
+  let busy seconds value () =
+    let work = Lwt.map (fun () -> value) (Lwt_unix.sleep seconds) in
+    Lwt.finalize (fun () -> Lwt.protected work)
+      (fun () -> Lwt.map (fun _ -> ()) (Lwt.protected work)) in
   let stopped = ref false in
   let work =
     Octra_vm.Contract_rpc.run_view ~seconds:0.01
       ~stop:(fun () -> stopped := true)
-      (fun () -> Thread.delay 0.1; 7)
+      (busy 0.1 7)
   in
   begin match Lwt_main.run work with
   | Error error when error.Octra_core.Rpc.message = "Program view time limit exceeded" -> ()
   | _ -> fail "view time limit missing"
   end;
   if not !stopped then fail "view stop not requested";
-  begin match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> 8)) with
+  begin match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> Lwt.return 8)) with
   | Error error when error.Octra_core.Rpc.code = -32005 -> ()
   | _ -> fail "view released before worker exit"
   end;
   Lwt_main.run (Lwt_unix.sleep 0.15);
-  begin match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> 9)) with
+  begin match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> Lwt.return 9)) with
   | Ok 9 -> ()
   | _ -> fail "view did not release after worker exit"
   end;
@@ -168,15 +174,26 @@ let test_view_timeout () =
   let work =
     Octra_vm.Contract_rpc.run_view
       ~stop:(fun () -> stopped := true)
-      (fun () -> Thread.delay 0.05; 0)
+      (busy 0.05 0)
   in
   Lwt.cancel work;
   if not !stopped then fail "cancel did not request stop";
-  begin match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> 1)) with
+  begin match Lwt_main.run (Octra_vm.Contract_rpc.run_view (fun () -> Lwt.return 1)) with
   | Error error when error.Octra_core.Rpc.code = -32005 -> ()
   | _ -> fail "cancel released active worker"
   end;
-  Lwt_main.run (Lwt_unix.sleep 0.1)
+  Lwt_main.run (Lwt_unix.sleep 0.1);
+  let cancelled = ref false in
+  let pending, _ = Lwt.task () in
+  Lwt.on_cancel pending (fun () -> cancelled := true);
+  let result = Lwt_main.run (Octra_vm.Contract_rpc.run_view ~seconds:0.01
+    (fun () -> pending)) in
+  if not !cancelled then fail "view timeout did not cancel execution";
+  begin match result with
+  | Error error when error.Octra_core.Rpc.code = -32005 -> ()
+  | _ -> fail "view timeout returned late value"
+  end;
+  if Octra_vm.Contract_rpc.view_active.contents then fail "cancelled view retained slot"
 
 let test_view_steps () =
   let open Octra_vm.Contract_vm in
@@ -404,10 +421,11 @@ let test_source_program_verify () =
       Lwt_main.run
         (Octra_vm.Contract_rpc.call
            ~trusted:[]
-           ~profile:{epoch = 0; math = false; point_ops = false;
+           ~profile:(fun ~epoch:_ -> Ok {epoch = 0; math = false; point_ops = false;
                      object_cost = false; int_work = Octra_vm.Int_work.Active;
                      fhe_work = Octra_core.Rule_graph.Prior;
-                     wasm_float = Octra_core.Rule_graph.Prior}
+                     proof_exec = Octra_core.Rule_graph.Prior;
+                     wasm_float = Octra_core.Rule_graph.Prior})
            ~store
            ~ledger
            ~get_fhe_pubkey:(fun _ -> None)
@@ -429,10 +447,11 @@ let test_balance_dispatch () =
     let ledger = Octra_core.Ledger.create store in
     let read method_name params =
       Lwt_main.run (V.Contract_rpc.call ~trusted:[]
-        ~profile:{epoch = 0; math = false; point_ops = true;
+        ~profile:(fun ~epoch:_ -> Ok {epoch = 0; math = false; point_ops = true;
           object_cost = false; int_work = V.Int_work.Active;
           fhe_work = Octra_core.Rule_graph.Prior;
-          wasm_float = Octra_core.Rule_graph.Prior}
+          proof_exec = Octra_core.Rule_graph.Prior;
+          wasm_float = Octra_core.Rule_graph.Prior})
         ~store ~ledger ~get_fhe_pubkey:(fun _ -> None)
         ~storage_json:(fun pairs -> `Assoc (List.map (fun (k, v) -> k, `String v) pairs))
         ~addr:address ~method_name ~call_params:params ~caller_addr:holder
@@ -687,6 +706,7 @@ let test_nested_view_stop () =
         ~profile:{epoch = 0; math = false; point_ops = false;
                   object_cost = false; int_work = Octra_vm.Int_work.Active;
                   fhe_work = Octra_core.Rule_graph.Prior;
+                  proof_exec = Octra_core.Rule_graph.Prior;
                   wasm_float = Octra_core.Rule_graph.Prior}
         ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
@@ -755,9 +775,10 @@ let test_view_release_keys () =
     let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = true;
       object_cost = false; int_work = V.Int_work.Active;
       fhe_work = Octra_core.Rule_graph.Prior;
+      proof_exec = Octra_core.Rule_graph.Prior;
       wasm_float = Octra_core.Rule_graph.Prior} in
     let read trusted =
-      V.Contract_rpc.call_params ~trusted ~profile ~store ~ledger
+      V.Contract_rpc.call_params ~trusted ~profile:(fun ~epoch:_ -> Ok profile) ~store ~ledger
         ~get_fhe_pubkey:(fun _ -> None) ~storage_json:(fun _ -> `Assoc [])
         (`List [`String address; `String "echo"; `List []]) |> Lwt_main.run in
     let nested trusted =

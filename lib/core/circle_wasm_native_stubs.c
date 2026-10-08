@@ -7,6 +7,7 @@
 #include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/threads.h>
+#include <caml/custom.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -22,6 +23,47 @@ extern int octra_circle_wasm_host_run_json(
 );
 
 extern void octra_circle_wasm_host_free_bytes(uint8_t* ptr, size_t len);
+
+extern void* octra_circle_call_new(void);
+extern void octra_circle_call_drop(void* port);
+extern int octra_circle_call_step(
+  void* port,
+  const uint8_t* input,
+  size_t length,
+  uint8_t** output,
+  size_t* size
+);
+
+static void call_release(value session) {
+  void** port = (void**)Data_custom_val(session);
+  octra_circle_call_drop(*port);
+  *port = NULL;
+}
+
+static struct custom_operations call_ops = {
+  "octra.circle.call",
+  call_release,
+  custom_compare_default,
+  custom_hash_default,
+  custom_serialize_default,
+  custom_deserialize_default,
+  custom_compare_ext_default,
+  custom_fixed_length_default
+};
+
+CAMLprim value caml_octra_circle_call_new(value unit) {
+  CAMLparam1(unit);
+  CAMLlocal1(session);
+  session = caml_alloc_custom(&call_ops, sizeof(void*), 0, 1);
+  *((void**)Data_custom_val(session)) = octra_circle_call_new();
+  CAMLreturn(session);
+}
+
+CAMLprim value caml_octra_circle_call_close(value session) {
+  CAMLparam1(session);
+  call_release(session);
+  CAMLreturn(Val_unit);
+}
 
 static void copy_to_malloc_string(value v_string, uint8_t** out_ptr, size_t* out_len) {
   size_t len = caml_string_length(v_string);
@@ -39,6 +81,30 @@ static void copy_to_malloc_string(value v_string, uint8_t** out_ptr, size_t* out
   if (out_len != NULL) {
     *out_len = len;
   }
+}
+
+CAMLprim value caml_octra_circle_call_step(value session, value input) {
+  CAMLparam2(session, input);
+  CAMLlocal2(body, result);
+  void* port = *((void**)Data_custom_val(session));
+  uint8_t* bytes = NULL;
+  size_t length = 0;
+  uint8_t* output = NULL;
+  size_t size = 0;
+  copy_to_malloc_string(input, &bytes, &length);
+  caml_release_runtime_system();
+  int code = octra_circle_call_step(port, bytes, length, &output, &size);
+  caml_acquire_runtime_system();
+  free(bytes);
+  body = caml_alloc_string(size);
+  if (size > 0 && output != NULL) {
+    memcpy(Bytes_val(body), output, size);
+  }
+  octra_circle_wasm_host_free_bytes(output, size);
+  result = caml_alloc_tuple(2);
+  Store_field(result, 0, Val_int(code));
+  Store_field(result, 1, body);
+  CAMLreturn(result);
 }
 
 CAMLprim value caml_octra_circle_wasm_host_run_json(value v_input) {

@@ -31,7 +31,13 @@ let fail_at_phase phase =
   match Sys.getenv_opt "OCTRA_CHAOS_FAIL_AT" with
   | Some target when target = phase ->
     Octra_log.error "chaos" "event = inject_failure phase = %s" phase;
-    raise (Chaos_injected_failure phase)
+    begin match Sys.getenv_opt "OCTRA_CHAOS_FAIL_KIND" with
+    | Some "memory" -> raise Out_of_memory
+    | Some "stack" -> raise Stack_overflow
+    | Some "host" -> raise (Exec_resource.Unavailable Host)
+    | Some "cancel" -> raise Lwt.Canceled
+    | Some _ | None -> raise (Chaos_injected_failure phase)
+    end
   | _ -> ()
 
 let inject phase =

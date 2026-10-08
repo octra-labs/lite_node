@@ -80,6 +80,7 @@ type fold_ctx = {
   program_mode : Rule_graph.mode;
   program_overlap : bool;
   fhe_work : Rule_graph.mode;
+  proof_exec : Rule_graph.mode;
   wasm_float : Rule_graph.mode;
   math : bool;
   cap_mode : Set_fold.cap_mode;
@@ -161,6 +162,7 @@ let prior_fold _ =
     program_mode = Rule_graph.Prior;
     program_overlap = false;
     fhe_work = Rule_graph.Prior;
+    proof_exec = Rule_graph.Prior;
     wasm_float = Rule_graph.Prior;
     math = false;
     cap_mode = Set_fold.Reject;
@@ -581,29 +583,41 @@ let apply_epoch_footer ~backend ~env ~plan =
     ~env
     ~plan
 
-let parse_circle_deploy_payload tx =
+let parse_circle_deploy_payload ?(resource_errors = false) tx =
   match tx.Transaction.message with
   | None -> Stdlib.Error ("malformed_transaction", "deploy_circle requires message payload")
   | Some payload_json ->
     begin
       try
-        match Circles.deploy_payload_of_yojson (Json_tree.read payload_json) with
+        Chaos.fail_at_phase "circle_payload";
+        let json = if resource_errors then Json_tree.read_plain payload_json
+          else Json_tree.read payload_json in
+        match Circles.deploy_payload_of_yojson json with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
-      with e ->
+      with
+      | (Out_of_memory | Stack_overflow | Lwt.Canceled | Exec_resource.Unavailable _) as error
+          when resource_errors -> raise error
+      | e ->
         Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
-let parse_circle_program_update_payload tx =
+let parse_circle_program_update_payload ?(resource_errors = false) tx =
   match tx.Transaction.message with
   | None -> Stdlib.Error ("malformed_transaction", "circle_program_update requires message payload")
   | Some payload_json ->
     begin
       try
-        match Circles.program_update_payload_of_yojson (Json_tree.read payload_json) with
+        Chaos.fail_at_phase "circle_payload";
+        let json = if resource_errors then Json_tree.read_plain payload_json
+          else Json_tree.read payload_json in
+        match Circles.program_update_payload_of_yojson json with
         | Ok payload -> Stdlib.Ok payload
         | Error e -> Stdlib.Error ("malformed_transaction", e)
-      with e ->
+      with
+      | (Out_of_memory | Stack_overflow | Lwt.Canceled | Exec_resource.Unavailable _) as error
+          when resource_errors -> raise error
+      | e ->
         Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e)
     end
 
@@ -980,12 +994,13 @@ let debit_fee ~(backend : backend) (tx : Transaction.t) =
   | Error err -> Stdlib.Error ("insufficient_balance", err)
 
 let process_circle_deploy_tx
+    ?(calls = false)
     ?(wasm_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
-  match parse_circle_deploy_payload tx with
+  match parse_circle_deploy_payload ~resource_errors:calls tx with
   | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
   | Stdlib.Ok payload ->
     let src = Circle_deploy.Direct { deployer = tx.from; nonce = tx.nonce } in
@@ -995,6 +1010,7 @@ let process_circle_deploy_tx
     else
       let* checked =
         Circle_deploy.check_available
+          ~resource_errors:calls
           ~execution_profile:wasm_profile
           ~float_mode
           backend.store
@@ -1008,18 +1024,19 @@ let process_circle_deploy_tx
         | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
         | Stdlib.Ok () ->
           let* written =
-            Circle_deploy.write_prepared backend.store src prepared payload in
+            Circle_deploy.write_prepared ~calls backend.store src prepared payload in
           match written with
           | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
           | Stdlib.Ok _ -> Lwt.return (Stdlib.Ok tx.ou)
 
 let process_circle_program_update_tx
+    ?(calls = false)
     ?(wasm_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
-  match parse_circle_program_update_payload tx with
+  match parse_circle_program_update_payload ~resource_errors:calls tx with
   | Stdlib.Error e -> Lwt.return (Stdlib.Error e)
   | Stdlib.Ok payload ->
     let* info_opt = Store_irmin.get_circle_info backend.store tx.to_ in
@@ -1033,6 +1050,7 @@ let process_circle_program_update_tx
         else
           begin
             try
+              Chaos.fail_at_phase "circle_update";
               let code_raw = Base64.decode_exn payload.Circles.code_b64 in
               let code_size = Int64.of_int (String.length code_raw) in
               if Int64.compare code_size info.limits.max_wasm_bytes > 0 then
@@ -1052,6 +1070,8 @@ let process_circle_program_update_tx
                       match validate_result with
                       | Ok _ ->
                         Lwt.return (Stdlib.Ok ())
+                      | Error (Circle_wasm_host.Unavailable _) when calls ->
+                        Lwt.fail (Exec_resource.Unavailable Host)
                       | Error e ->
                         Lwt.return
                           (Stdlib.Error
@@ -1078,9 +1098,16 @@ let process_circle_program_update_tx
                           ~version:next_version
                           ~code_hash
                           ~code_b64:payload.code_b64 in
+                      let* () = if calls then
+                        Circle_deploy.allow_calls backend.store {info with code_hash}
+                      else Lwt.return_unit in
                       Lwt.return (Stdlib.Ok tx.ou)
                 end
-            with e ->
+            with
+            | (Out_of_memory | Stack_overflow | Lwt.Canceled | Exec_resource.Unavailable _) as error ->
+              if calls then raise error else
+                Lwt.return (Stdlib.Error ("malformed_transaction_exception", Printexc.to_string error))
+            | e ->
               Lwt.return (Stdlib.Error ("malformed_transaction_exception", Printexc.to_string e))
           end
     end
@@ -3165,9 +3192,11 @@ let process_circle_operation_tx
   match tx.op_type with
   | CircleDeploy ->
     process_circle_deploy_tx ~wasm_profile
+      ~calls:((fold_at backend current_epoch).proof_exec = Rule_graph.Active)
       ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleProgramUpdate ->
     process_circle_program_update_tx ~wasm_profile
+      ~calls:((fold_at backend current_epoch).proof_exec = Rule_graph.Active)
       ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleAssetPut ->
     process_circle_asset_put_tx ~backend tx

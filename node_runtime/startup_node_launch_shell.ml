@@ -29,12 +29,13 @@ let log_observer_mode observer =
   if observer then
     Log.info "init" "event = observer_mode epoch_production = false p2p_shadow = true"
 
-let run ?duty_head ?bft_mode ?(shutdown = fun () -> Lwt.return_unit) deps =
+let run ?duty_head ?bft_mode ?exit_refused ?(shutdown = fun () -> Lwt.return_unit) deps =
   log_observer_mode deps.observer;
   Lwt_main.run (Lwt.finalize (fun () ->
     Startup_run_shell.run_node_runtime
       ?duty_head
       ?bft_mode
+      ?exit_refused
       Startup_run_shell.{
         p2p = p2p deps.p2p_port;
         rpc = deps.rpc;

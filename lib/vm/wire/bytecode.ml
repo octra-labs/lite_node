@@ -61,8 +61,8 @@ let const_of_v = function
   | Contract_vm.VU256 z -> CInt (Z.to_string z)
   | Contract_vm.VAddr a -> CAddr a
   | Contract_vm.VCap _ -> invalid_arg "capability cannot be a constant"
-  | Contract_vm.VCipher ct -> CBytes (Bytes.to_string (Pvac_ffi.serialize_cipher ct))
-  | Contract_vm.VPubKey pk -> CBytes (Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
+  | Contract_vm.VCipher ct -> CBytes ct.data
+  | Contract_vm.VPubKey pk -> CBytes pk.data
 
 module Integers : sig
   val read : string -> Z.t

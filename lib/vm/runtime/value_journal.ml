@@ -90,6 +90,9 @@ let commit t ~debit ~credit =
     discard t;
     result
 
+let snapshot_effort t =
+  Z.mul (Z.of_int 32) (Z.of_int (Hashtbl.length t.deltas))
+
 let snapshot t =
   {
     snap_transfers = !(t.transfers);

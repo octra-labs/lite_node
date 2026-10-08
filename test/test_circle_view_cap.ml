@@ -58,6 +58,19 @@ let test_timeout_and_cancel () =
     [false; true]
 
 let () =
+  List.iter (fun cancel ->
+    let capacity = Capacity.create ~limit:1 in
+    let pending, _ = Lwt.task () in
+    let stops = ref 0 in
+    let response = Capacity.with_slot
+      ~stop:(fun () -> incr stops)
+      ~timeout:(0.001, fun () -> Lwt.return "expired") capacity
+      ~busy:(fun () -> Lwt.return "busy") (fun () -> pending) in
+    if cancel then Lwt.cancel response
+    else if Lwt_main.run response <> "expired" then fail "timeout result";
+    if Lwt.state pending <> Lwt.Fail Lwt.Canceled then fail "view work survived stop";
+    if !stops <> 1 then fail "view stop repeated";
+    if Capacity.active capacity <> 0 then fail "cancelled view retained slot") [false; true];
   test_busy_and_release ();
   test_timeout_and_cancel ();
   print_endline "status = pass test = circle_view_cap"

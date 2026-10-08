@@ -44,6 +44,7 @@ val commit_ct : pubkey -> cipher -> bytes
 val cipher_has_key_bound_material : cipher -> bool
 val cipher_base_layers : cipher -> int
 val cipher_shape : cipher -> cipher_shape
+val cipher_matches_key : pubkey -> cipher -> bool
 val cipher_bit_words : cipher -> int
 val pubkey_bit_words : pubkey -> int
 type sampling = {

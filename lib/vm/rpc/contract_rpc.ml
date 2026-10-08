@@ -8,7 +8,8 @@ module Store_chaindata = Octra_core.Store_chaindata
 
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
-let view_effort_limit = 1_000_000
+let view_effort_limit =
+  Z.to_int (Octra_core.Resource_lanes.default_budget Program).max_ou
 let max_compile_source_bytes = 1_048_576
 let max_compile_total_bytes = 2_097_152
 let max_compile_files = 64
@@ -241,8 +242,8 @@ let verified_record_response ~published record =
      @ report
      @ certificate)
 
-let aml_result ~syntax source =
-  match Aml_source.compile ~syntax source with
+let aml_result ?(loops = false) ~syntax source =
+  match Aml_source.compile ~loops ~syntax source with
   | Error error -> Error error
   | Ok compiled ->
     Ok
@@ -251,8 +252,8 @@ let aml_result ~syntax source =
          ~source_material:source
          compiled)
 
-let aml_multi_result ~syntax resolver main_path sources =
-  match Aml_source.compile_multi ~syntax resolver main_path with
+let aml_multi_result ?(loops = false) ~syntax resolver main_path sources =
+  match Aml_source.compile_multi ~loops ~syntax resolver main_path with
   | Error error -> Error error
   | Ok compiled ->
     Ok
@@ -261,9 +262,9 @@ let aml_multi_result ~syntax resolver main_path sources =
          ~source_material:(Oct_compile.ordered_sources sources)
          compiled)
 
-let aml_source_result ?(main = "main.aml") ~syntax source files_json =
+let aml_source_result ?(loops = false) ?(main = "main.aml") ~syntax source files_json =
   match files_json with
-  | None -> aml_result ~syntax source
+  | None -> aml_result ~loops ~syntax source
   | Some files_json ->
     let file_map = Hashtbl.create 16 in
     List.iter
@@ -277,7 +278,7 @@ let aml_source_result ?(main = "main.aml") ~syntax source files_json =
     let sources =
       Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
     in
-    aml_multi_result ~syntax resolver main sources
+    aml_multi_result ~loops ~syntax resolver main sources
 
 let compile_assembly_response ~bytecode_b64 ~bytecode_size ~instructions =
   `Assoc [
@@ -349,9 +350,9 @@ let source_is_program source =
   with _ ->
     false
 
-let compile_program_source ?(compiler = Program_package.Protocol) ~point_ops source =
+let compile_program_source ?(loops = false) ?(compiler = Program_package.Protocol) ~point_ops source =
   match
-    Program_package.compile_with ~compiler
+    Program_package.compile_at ~loops ~compiler
       ~point_ops
       ~main:"main.aml"
       ~sources:[Program_package.{ path = "main.aml"; body = source }]
@@ -372,20 +373,21 @@ let compiler_syntax = function
   | Program_package.Protocol -> Oct_gen.Forms
   | Program_package.Source | Program_package.Preview -> Oct_gen.Source
 
-let compile_aml_with ~compiler ~point_ops ~program:_ ~source =
+let compile_aml_with ~compiler ~point_ops ~loops ~program:_ ~source =
   match validate_compile_input source None with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
-  | Ok () when source_is_program source ->
-    compile_program_source ~compiler ~point_ops source
   | Ok () ->
-    begin
-      match aml_result ~syntax:(compiler_syntax compiler) source with
-      | Error msg -> err_lwt (Rpc.err (-32000) msg None)
-      | Ok result ->
-      ok_lwt (compile_result_response result)
-    end
+    if source_is_program source then
+      compile_program_source ~loops ~compiler ~point_ops source
+    else
+      begin
+        match aml_result ~loops ~syntax:(compiler_syntax compiler) source with
+        | Error msg -> err_lwt (Rpc.err (-32000) msg None)
+        | Ok result -> ok_lwt (compile_result_response result)
+      end
 
-let compile_aml_request = compile_aml_with ~compiler:Program_package.Protocol
+let compile_aml_request =
+  compile_aml_with ~compiler:Program_package.Protocol ~loops:false
 
 let compile_aml ~source =
   compile_aml_request ~point_ops:true ~program:false ~source
@@ -406,7 +408,7 @@ let compile_file_map files_json =
   end;
   file_map
 
-let compile_aml_multi_with ~compiler ~point_ops ~json =
+let compile_aml_multi_with ~compiler ~point_ops ~loops ~json =
   match json with
   | None ->
     err_lwt (Rpc.invalid_params "expected {files, main}")
@@ -467,7 +469,7 @@ let compile_aml_multi_with ~compiler ~point_ops ~json =
           | _ -> []
         in
         begin
-          match Program_package.compile_with ~compiler ~point_ops ~main:main_path ~sources with
+          match Program_package.compile_at ~loops ~compiler ~point_ops ~main:main_path ~sources with
           | Error error ->
             err_lwt
               (Rpc.err
@@ -485,19 +487,19 @@ let compile_aml_multi_with ~compiler ~point_ops ~json =
           Hashtbl.fold (fun path body rows -> (path, body) :: rows) file_map []
         in
         begin
-          match aml_multi_result ~syntax:(compiler_syntax compiler) resolver main_path sources with
+          match aml_multi_result ~loops ~syntax:(compiler_syntax compiler) resolver main_path sources with
           | Error msg -> err_lwt (Rpc.err (-32000) msg None)
           | Ok result -> ok_lwt (compile_result_response result)
         end
 
 let compile_aml_multi_for ~point_ops ~json =
-  compile_aml_multi_with ~compiler:Program_package.Protocol ~point_ops ~json
+  compile_aml_multi_with ~compiler:Program_package.Protocol ~point_ops ~loops:false ~json
 
 let compile_aml_multi ~json =
   compile_aml_multi_for ~point_ops:true ~json
 
 let compile_aml_params ?(compiler = Program_package.Protocol)
-    ?(point_ops = true) params =
+    ?(point_ops = true) ?(loops = false) params =
   match Rpc.require_string params 0 "source" with
   | Error e ->
     err_lwt e
@@ -511,7 +513,7 @@ let compile_aml_params ?(compiler = Program_package.Protocol)
     begin
       match program with
       | Error error -> err_lwt error
-      | Ok program -> compile_aml_with ~compiler ~point_ops ~program ~source
+      | Ok program -> compile_aml_with ~compiler ~point_ops ~loops ~program ~source
     end
 
 let compute_address ~bytecode_b64 ~deployer ~nonce =
@@ -772,11 +774,14 @@ let verify_compilation ~main ~meta ~source ~files_json =
       ~point_ops:true ~main ~sources in
     let prior = Program_package.compile_for ~point_ops:false
       ~main ~sources in
+    let scoped = List.map (fun compiler ->
+      Program_package.compile_at ~loops:true ~compiler ~point_ops:true ~main ~sources)
+      [Program_package.Protocol; Program_package.Source; Program_package.Preview] in
     let results = List.filter_map (function
       | Ok (compiled : Program_package.compiled) ->
         Some (compiled.envelope, compiled.result)
       | Error _ -> None
-    ) [current; prior; source_result; preview] in
+    ) ([current; prior; source_result; preview] @ scoped) in
     begin
       match results, current with
       | [], Error error -> Error (Program_package.error_message error)
@@ -786,11 +791,13 @@ let verify_compilation ~main ~meta ~source ~files_json =
   | None ->
     let current = aml_source_result ~main ~syntax:Oct_gen.Source source files_json in
     let forms = aml_source_result ~main ~syntax:Oct_gen.Forms source files_json in
+    let scoped = aml_source_result ~loops:true ~main ~syntax:Oct_gen.Source source files_json in
+    let scoped_forms = aml_source_result ~loops:true ~main ~syntax:Oct_gen.Forms source files_json in
     let prior = compile_source ~main source files_json in
     let results =
       List.filter_map (function
         | Ok result -> Some (result.Oct_compile.bytecode, result)
-        | Error _ -> None) [current; forms]
+        | Error _ -> None) [current; forms; scoped; scoped_forms]
     in
     let results =
       match prior.error with
@@ -1136,10 +1143,10 @@ let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
     let work = Lwt.finalize
       (fun () ->
         Lwt.catch
-          (fun () -> Octra_core.Exec_resource.detach handler ()
-            |> Lwt.map (fun value -> Ok value))
+          (fun () -> Octra_core.Exec_resource.protect handler ()
+            |> Lwt.map (Octra_core.Exec_resource.protect (fun value -> Ok value)))
           (function
-            | Octra_core.Exec_resource.Unavailable _ ->
+            | Octra_core.Exec_resource.Unavailable _ | Out_of_memory | Stack_overflow ->
               Lwt.return_error (Rpc.err (-32005) "Program view resources unavailable" None)
             | error -> Lwt.fail error))
       (fun () ->
@@ -1152,7 +1159,7 @@ let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
       stop ();
       Lwt.return_error (Rpc.err (-32005) "Program view time limit exceeded" None)
     in
-    let response = Lwt.pick [Lwt.protected work; timer] in
+    let response = Lwt.pick [work; timer] in
     Lwt.on_cancel response stop;
     response
   end
@@ -1164,6 +1171,7 @@ type view_profile = {
   object_cost : bool;
   int_work : Int_work.mode;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
 }
 
@@ -1174,6 +1182,7 @@ let view_profile rules ~epoch =
   let* math = R.math rules ~epoch in
   let* object_cost = R.object_cost rules ~epoch in
   let* fhe_work = R.fhe_work rules ~epoch in
+  let* proof_exec = R.proof_exec rules ~epoch in
   let* wasm_float = R.wasm_float rules ~epoch in
   Ok {
     epoch;
@@ -1182,16 +1191,40 @@ let view_profile rules ~epoch =
     object_cost = object_cost = R.Active;
     int_work = if standard = R.Active then Int_work.Active else Int_work.Prior;
     fhe_work;
+    proof_exec;
     wasm_float;
   }
 
-let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
+let make_view_ctx ?snapshot ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
   let get_balance addr =
-    match Ledger.find_opt ledger addr with
-    | Some account -> account.Ledger.balance
-    | None -> Z.zero
+    match snapshot with
+    | Some snapshot -> Contract.run_s (Store_irmin.get_balance ~snapshot store addr)
+    | None ->
+      match Ledger.find_opt ledger addr with
+      | Some account -> account.Ledger.balance
+      | None -> Z.zero
+  in
+  let get_fhe_pubkey addr =
+    match snapshot with
+    | None -> get_fhe_pubkey addr
+    | Some snapshot ->
+      Contract.run_s (Store_irmin.get_pvac_pubkey ~snapshot store addr)
+      |> Option.map (fun bytes -> Contract_vm.Key_bytes bytes)
+  in
+  let call_result result =
+    match Contract.exec_result_to_result result with
+    | Ok value ->
+      Ok {
+        Contract_vm.return_value = value;
+        effort_used = result.Contract.effort_used;
+        events = result.Contract.events;
+      }
+    | Error error -> Error error
   in
   let allow_fhe_capability = view_fhe_capability_gate () in
+  let argument = match profile.proof_exec with
+    | Octra_core.Rule_graph.Prior -> Receipt_view.call_arg_json
+    | Octra_core.Rule_graph.Active -> Receipt_view.nested_call_arg_json ~typed:true in
   let rec view_ctx = {
     Contract_vm.default_ctx with
     get_balance;
@@ -1199,18 +1232,22 @@ let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
     allow_fhe_capability;
     int_work = profile.int_work;
     fhe_work = profile.fhe_work;
+    proof_exec = profile.proof_exec;
     wasm_float = profile.wasm_float;
     fhe_memory = Some (Fhe_memory.create ());
     point_ops = profile.point_ops;
     math = profile.math;
     object_cost = profile.object_cost;
     current_epoch = profile.epoch;
+    tree_hash = Option.fold ~none:""
+      ~some:(fun snapshot -> snapshot.Store_irmin.state_root) snapshot;
     do_transfer = (fun _ _ _ -> false);
     deploy_contract = (fun _ _ _ _ _ -> Error "deploy in view context");
     call_contract = (fun caller target method_name args scope ->
-      let params = List.map Receipt_view.call_arg_json args in
+      let params = List.map argument args in
       let result =
         Contract.execute_view_call
+          ?snapshot
           ?running
           ~trusted
           ~ctx:{view_ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
@@ -1222,26 +1259,27 @@ let make_view_ctx ?running ~trusted ~profile ~store ~ledger ~get_fhe_pubkey () =
           params
           caller
       in
-      match Contract.exec_result_to_result result with
-      | Ok value ->
-        Ok {
-          Contract_vm.return_value = value;
-          effort_used = result.Contract.effort_used;
-          events = result.Contract.events;
-        }
-      | Error err ->
-        Error err);
+      call_result result);
+    call_async = (fun caller target method_name args scope ->
+      let params = List.map argument args in
+      Contract.view_async ?snapshot ?running ~trusted
+        ~ctx:{view_ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
+        ~depth:scope.depth
+        ~limit:(Option.fold ~none:view_effort_limit ~some:(min view_effort_limit) scope.limit)
+        store target method_name params caller
+      |> Lwt.map (Octra_core.Exec_resource.protect call_result));
   } in
   view_ctx
 
 let view_storage_key_limit = 64
 let view_storage_value_limit = 4096
 
-let call_result ~store ~addr ~include_storage ~storage_json value =
-  let open Lwt.Syntax in
+let call_result ?snapshot ~store ~addr ~include_storage ~storage_json value =
+  let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
   if include_storage then
     let* page =
       Store_irmin.list_contract_storage_page
+        ?snapshot
         store
         addr
         ~limit:view_storage_key_limit
@@ -1258,35 +1296,39 @@ let call_result ~store ~addr ~include_storage ~storage_json value =
 
 let call ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json
     ~addr ~method_name ~call_params ~caller_addr ~include_storage =
-  let open Lwt.Syntax in
+  let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
   let running, stop = view_clock () in
-  let view_ctx = make_view_ctx ~trusted ~profile ~running ~store ~ledger ~get_fhe_pubkey () in
   let* executed =
     run_view ~stop (fun () ->
-      Contract.execute_view_call
-        ~running
-        ~trusted
-        ~ctx:view_ctx
-        ~limit:view_effort_limit
-        store
-        addr
-        method_name
-        call_params
-        caller_addr)
+      let* snapshot = Store_irmin.capture_read_snapshot store in
+      match snapshot with
+      | Error _ -> err_lwt (Rpc.err (-32005) "program snapshot unavailable" None)
+      | Ok snapshot when snapshot.epoch_id >= Int64.of_int max_int ->
+        err_lwt (Rpc.err (-32005) "program snapshot epoch invalid" None)
+      | Ok snapshot ->
+        match profile ~epoch:(Int64.to_int snapshot.epoch_id + 1) with
+        | Error error -> err_lwt error
+        | Ok profile ->
+          let view_ctx = make_view_ctx ~snapshot ~trusted ~profile ~running
+            ~store ~ledger ~get_fhe_pubkey () in
+          let* result = Contract.view_async
+            ~snapshot
+            ~running
+            ~trusted
+            ~ctx:view_ctx
+            ~limit:view_effort_limit
+            store
+            addr
+            method_name
+            call_params
+            caller_addr in
+          if result.Contract.success then
+            call_result ~snapshot ~store ~addr ~include_storage ~storage_json
+              (Receipt_view.return_json result.return_value)
+          else
+            err_lwt (Rpc.err (-32000) (Receipt_view.view_error result.error) None))
   in
-  match executed with
-  | Error error ->
-    Lwt.return_error error
-  | Ok result ->
-    if result.Contract.success then
-      call_result
-        ~store
-        ~addr
-        ~include_storage
-        ~storage_json
-        (Receipt_view.return_json result.return_value)
-    else
-      err_lwt (Rpc.err (-32000) (Receipt_view.view_error result.error) None)
+  Lwt.return (Result.join executed)
 
 let call_params ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json params =
   match Rpc.require_address params 0 "address",

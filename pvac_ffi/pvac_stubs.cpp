@@ -686,6 +686,7 @@ CAMLprim value caml_pvac_ct_scale_math(value v_math, value v_pk, value v_ct, val
 
     pvac::Fp s = math ? pvac::detail::fp_from_i64(scalar) : pvac::fp_from_u64(static_cast<uint64_t>(scalar));
     CAMLreturn(native_handle<pvac::Cipher>(&cipher_ops, [&] {
+        Runtime_scope scope;
         return pvac::ct_scale(pk, ct, s);
     }, cipher_mem));
 }
@@ -704,6 +705,7 @@ CAMLprim value caml_pvac_ct_add_const_math(value v_math, value v_pk, value v_ct,
     k.hi = hi;
 
     CAMLreturn(native_handle<pvac::Cipher>(&cipher_ops, [&] {
+        Runtime_scope scope;
         pvac::Cipher result = ct;
         if (math && result.c0.empty()) result.c0 = pvac::field::Op::zeros(result.slots);
         for (size_t j = 0; j < result.c0.size(); ++j)
@@ -722,6 +724,7 @@ CAMLprim value caml_pvac_ct_sub_const_math(value v_math, value v_pk, value v_ct,
     pvac::Fp neg_k = pvac::fp_neg(pvac::fp_from_u64(k));
 
     CAMLreturn(native_handle<pvac::Cipher>(&cipher_ops, [&] {
+        Runtime_scope scope;
         pvac::Cipher result = ct;
         if (math && result.c0.empty()) result.c0 = pvac::field::Op::zeros(result.slots);
         for (size_t j = 0; j < result.c0.size(); ++j)
@@ -745,6 +748,7 @@ CAMLprim value caml_pvac_ct_div_const(value v_pk, value v_ct, value v_lo, value 
     if ((k.lo | k.hi) == 0) caml_failwith("pvac: zero divisor");
 
     CAMLreturn(native_handle<pvac::Cipher>(&cipher_ops, [&] {
+        Runtime_scope scope;
         return pvac::ct_div_const(pk, ct, k);
     }, cipher_mem));
 }
@@ -796,6 +800,7 @@ CAMLprim value caml_pvac_commit_ct(value v_pk, value v_ct) {
     pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
 
     CAMLreturn(native_bytes([&] {
+        Runtime_scope scope;
         auto hash = pvac::commit_ct(pk, ct);
         return Native_bytes(hash.begin(), hash.end());
     }));
@@ -855,6 +860,16 @@ CAMLprim value caml_pvac_cipher_shape(value v_ct) {
     Store_field(v_shape, 3, Val_long(ct.c0.size()));
     Store_field(v_shape, 4, Val_long(base_layers));
     CAMLreturn(v_shape);
+}
+
+CAMLprim value caml_pvac_cipher_matches_key(value v_pk, value v_ct) {
+    CAMLparam2(v_pk, v_ct);
+    const pvac::PubKey& pk = *Handle_val(pvac::PubKey, v_pk);
+    const pvac::Cipher& ct = *Handle_val(pvac::Cipher, v_ct);
+    CAMLreturn(native_check([&] {
+        Runtime_scope scope;
+        return pvac::is_cipher_compatible_with_pubkey(pk, ct);
+    }));
 }
 
 CAMLprim value caml_pvac_cipher_bit_words(value v_ct) {
@@ -1201,7 +1216,10 @@ CAMLprim value caml_pvac_serialize_seckey(value v_sk) {
 
     pvac::SecKey& sk = *Handle_val(pvac::SecKey, v_sk);
 
-    CAMLreturn(native_bytes([&] { return pvac_ser::serialize_seckey(sk); }));
+    CAMLreturn(native_bytes([&] {
+        Runtime_scope scope;
+        return pvac_ser::serialize_seckey(sk);
+    }));
 }
 
 CAMLprim value caml_pvac_deserialize_seckey(value v_bytes) {

@@ -301,10 +301,15 @@ let fhe_pubkey_loader store addr =
   | None -> None
   | Some blob -> Some (Octra_vm.Contract_vm.Key_bytes blob)
 
+let profile_at ctx ~epoch =
+  Octra_vm.Contract_rpc.view_profile ctx.rules ~epoch
+  |> Result.map_error (fun fault ->
+    Rpc.err (-32005) (Octra_core.Rule_graph.fault_message fault) None)
+
 let view_profile ctx =
-  match Octra_vm.Contract_rpc.view_profile ctx.rules ~epoch:!(ctx.current_epoch) with
+  match profile_at ctx ~epoch:!(ctx.current_epoch) with
   | Ok profile -> profile
-  | Error fault -> failwith (Octra_core.Rule_graph.fault_message fault)
+  | Error error -> failwith error.Rpc.message
 
 let make_view_ctx ~trusted ~profile store ledger =
   let running, stop = Octra_vm.Contract_rpc.view_clock () in
@@ -323,7 +328,7 @@ let make_view_ctx ~trusted ~profile store ledger =
 let contract_call params ctx =
   Octra_vm.Contract_rpc.call_params
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
-    ~profile:(view_profile ctx)
+    ~profile:(profile_at ctx)
     ~store:ctx.store
     ~ledger:ctx.ledger
     ~get_fhe_pubkey:(fhe_pubkey_loader ctx.store)

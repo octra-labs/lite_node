@@ -137,6 +137,13 @@ let rec execute ?(math = false) request =
   | P.Math request -> execute ~math:true request
   | P.Ping ->
     Ok ()
+  | P.Groth16 value ->
+    if Zk_ffi.groth16_verify_bn254
+        (Bytes.of_string value.key)
+        (Bytes.of_string value.proof)
+        (Bytes.of_string value.inputs)
+    then Ok ()
+    else Error "groth16 proof rejected"
   | P.Encrypt value ->
     begin
       match proof_pubkey value.pubkey with

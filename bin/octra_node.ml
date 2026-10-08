@@ -292,9 +292,10 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let chaindata, store = require_wal (Wal_start.recover ~data_dir
       (fun () -> Startup_store_shell.open_stores ~lock_wait:(float_of_int lock_wait) data_dir)) in
     let exit_error = Octra_node_runtime.Startup_run_shell.exit_store store in
+    let exit_refused = Octra_node_runtime.Startup_run_shell.exit_store ~code:78 store in
     let require_sync = Octra_node_runtime.Startup_run_shell.require_sync
       ~data_dir ~chain:startup_network.chain_id ~store in
-    Startup_process_shell.configure_lwt ~exit_fatal:exit_error;
+    Startup_process_shell.configure_lwt ~exit_fatal:exit_error ~exit_refused;
     Log.info "init" "event = storage_ready path = %s cwd = %s"
       store_path (Sys.getcwd ());
     require_wal (Wal_start.recover ~data_dir (fun () -> Startup_node_boot_shell.run_store
@@ -1097,17 +1098,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         let open Lwt.Syntax in
         let* attempt =
           Epoch_visibility.try_apply epoch_visibility (fun () ->
-            Epoch_atomic.run
-              {
-                abort_ledger = (fun () ->
-                  match Ledger.abort_journal ledger with
-                  | Ok () -> ()
-                  | Error error -> failwith error);
-                abort_store = (fun () -> Store_irmin.abort_epoch_batch store);
-                abort_history = (fun () -> Store_chaindata.abort_batch chaindata);
-                fatal = Log.fatal "epoch" "%s";
-                exit = exit_error;
-              }
+            Epoch_atomic.run_store ~store ~ledger ~chaindata
               (fun () ->
                 apply_finalized_epoch
                   ?override_ordered_txs
@@ -1389,6 +1380,14 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let rest_runtime =
       Rest.{
         swarm_ref;
+        queue_head = (fun () -> Option.map (fun head ->
+          Int64.of_int head.Octra_core.Head_manifest.epoch_id)
+          (Octra_core.Head_manifest.get_cached ()));
+        proof_mode = (fun () ->
+          match Octra_core.Head_manifest.get_cached () with
+          | Some head when head.epoch_id < max_int ->
+            Rule_graph.proof_exec_at ~chain_id ~epoch:(head.epoch_id + 1)
+          | _ -> Rule_graph.Prior);
         duty_head = (fun () ->
           match Octra_core.Head_manifest.get_cached () with
           | Some head when permissionless_validator_lifecycle
@@ -2128,6 +2127,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~validator_enrollment:(fun () -> !enrollment_ref)
     in
     Startup_node_launch_shell.run
+      ~exit_refused
       ~shutdown:(fun () ->
         Lwt.bind (State_sync_http.shutdown ()) (fun () ->
           Octra_node_runtime.Drop_sink.finish ~close:(fun () -> Tx_drop.close drop_db) drop_sink))

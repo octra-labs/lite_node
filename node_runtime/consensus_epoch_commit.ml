@@ -84,6 +84,7 @@ let wal_entry ~epoch_id ~pre_state_root ~post_state_root ~parent_commit
     pre_state_root;
     post_state_root;
     parent_commit;
+    irmin_parent = None;
     start_txid;
     tx_count;
     finalized_by;
@@ -608,6 +609,7 @@ let history_incomplete_failure epoch_id =
 
 let run_commit_effects (effects : commit_effects) (request : commit_request) =
   let open Lwt.Syntax in
+  let* irmin_parent = effects.irmin_commit_hash () in
   let wal_entry =
     wal_entry
       ~epoch_id:request.epoch_id
@@ -629,7 +631,7 @@ let run_commit_effects (effects : commit_effects) (request : commit_request) =
        ~planned_state_root:request.post_consensus_root
        ~ts:request.finalized_at);
   effects.chaos "after_prepare";
-  effects.write_wal wal_entry;
+  effects.write_wal {wal_entry with irmin_parent};
   effects.chaos "after_wal";
   effects.write_marker request.epoch_id "wal_written";
   effects.write_marker request.epoch_id "begin";

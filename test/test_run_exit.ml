@@ -33,7 +33,33 @@ let gc_child path mode =
   | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), "flock", _) -> ());
   ignore (Sys.opaque_identity owner);
   let exit_fatal = S.exit_store store in
-  if mode = "sync" || mode = "sync-error" || mode = "sync-present" then begin
+  let exit_refused = S.exit_store ~code:78 store in
+  if mode = "worker-apply" || mode = "worker-apply-log" || mode = "apply" then begin
+    let module Ledger = Octra_core.Ledger in
+    let module History = Octra_core.Store_chaindata in
+    let ledger = Ledger.create store in
+    let history = History.open_chaindata (Filename.concat path "history") in
+    let fatal text =
+      let clean = not (Ledger.journal_active ledger) && History.next_txid history = 0L in
+      let output = open_out (Filename.concat path "abort.status") in
+      Fun.protect ~finally:(fun () -> close_out output) (fun () ->
+        output_string output (if clean then "clean" else "pending"));
+      if mode = "worker-apply-log" then raise (Sys_error "log unavailable");
+      print_endline text in
+    Octra_node_runtime.Epoch_atomic.run_store ~fatal ~store ~ledger ~chaindata:history
+      (fun () ->
+        ignore (Result.get_ok (Ledger.begin_journal ledger));
+        let* () = Store.begin_epoch_batch store in
+        History.begin_batch history;
+        History.save_tx history ~hash:(String.make 64 'a') ~epoch_id:4
+          ~from_addr:"sender" ~to_addr:"recipient" ~tx_json:"{}"
+          ~op_type:"transfer" ~encrypted_data:"" ~message:"";
+        let* () = Store.write store ["value"] "4" in
+        if mode = "apply" then Lwt.fail Out_of_memory
+        else Octra_core.Private_ledger.worker_retry
+          ~wait:(fun _ -> Lwt.pause ())
+          (fun () -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host)))
+  end else if mode = "sync" || mode = "sync-error" || mode = "sync-present" then begin
     let module Need = Octra_node_runtime.Sync_need in
     let module Mark = Octra_node_runtime.Sync_mark in
     let chain = "octra-test" in
@@ -45,14 +71,22 @@ let gc_child path mode =
     end else if mode = "sync-present" then
       ignore (Result.get_ok (Mark.write ~data_dir:path ~chain need));
     S.require_sync ~data_dir:path ~chain ~store need
-  end else if mode = "async" then begin
-    Octra_node_runtime.Startup_process_shell.configure_lwt ~exit_fatal;
-    !Lwt.async_exception_hook Out_of_memory;
+  end else if mode = "async" || mode = "worker-async" then begin
+    Octra_node_runtime.Startup_process_shell.configure_lwt ~exit_fatal ~exit_refused;
+    !Lwt.async_exception_hook (if mode = "async" then Out_of_memory
+      else Octra_core.Private_ledger.Worker_stopped "test");
     failwith "async memory failure returned"
   end else
-    S.run_join ~log:S.default_join_log
-      ~tasks:[Lwt.fail (Failure "GC owner task")]
-      ~exit_fatal
+    let log = match mode with
+      | "worker-log" -> {S.default_join_log with
+          fatal = (fun _ -> raise (Sys_error "log unavailable"))}
+      | "worker-warn" -> {S.default_join_log with
+          warn = (fun _ -> raise (Sys_error "log unavailable"))}
+      | _ -> S.default_join_log in
+    S.run_join ~log
+      ~tasks:[Lwt.fail (if String.starts_with ~prefix:"worker" mode then
+        Octra_core.Private_ledger.Worker_stopped "test" else Failure "GC owner task")]
+      ~exit_fatal ~exit_refused
 
 let gc_process mode = Test_workspace.with_dir "fatal_gc" (fun path ->
   let pid = Unix.create_process Sys.executable_name
@@ -60,10 +94,16 @@ let gc_process mode = Test_workspace.with_dir "fatal_gc" (fun path ->
   let rec reap () =
     try snd (Unix.waitpid [] pid)
     with Unix.Unix_error (Unix.EINTR, _, _) -> reap () in
-  if reap () <> Unix.WEXITED 1 then failwith "GC owner exit differs";
+  let code = if String.starts_with ~prefix:"worker" mode then 78 else 1 in
+  let status = reap () in
   let channel = open_in (Filename.concat path "gc.pid") in
   let worker = Fun.protect ~finally:(fun () -> close_in channel)
     (fun () -> int_of_string (input_line channel)) in
+  if status <> Unix.WEXITED code then begin
+    (try Unix.kill worker Sys.sigkill
+     with Unix.Unix_error (Unix.ESRCH, _, _) -> ());
+    failwith "GC owner exit differs"
+  end;
   let clock = Mtime_clock.counter () in
   let rec acquire () =
     match Lock.acquire path with
@@ -79,6 +119,17 @@ let gc_process mode = Test_workspace.with_dir "fatal_gc" (fun path ->
   Fun.protect ~finally:(fun () -> Lock.release owner) (fun () ->
     let module Need = Octra_node_runtime.Sync_need in
     let module Mark = Octra_node_runtime.Sync_mark in
+    if mode = "worker-apply" || mode = "worker-apply-log" || mode = "apply" then begin
+      let input = open_in (Filename.concat path "abort.status") in
+      let value = Fun.protect ~finally:(fun () -> close_in input) (fun () -> input_line input) in
+      if value <> "clean" then failwith "epoch abort left pending writes";
+      let module History = Octra_core.Store_chaindata in
+      let history = History.open_chaindata (Filename.concat path "history") in
+      Fun.protect ~finally:(fun () -> History.close history) (fun () ->
+        if History.next_txid history <> 0L then failwith "failed epoch published history");
+      if Mark.read ~data_dir:path ~chain:"octra-test" <> Mark.Missing then
+        failwith "worker fault requested snapshot"
+    end;
     if mode = "sync" || mode = "sync-present" then
       if Mark.read ~data_dir:path ~chain:"octra-test" <> Mark.Ready (Need.root ~epoch:4 ~head:3)
       then failwith "recovery marker was not preserved";
@@ -101,6 +152,7 @@ let ownership () = Test_workspace.with_dir "fatal_owner" (fun path ->
     let exited = ref false in
     Lwt_main.run (S.run_join ~log:S.default_join_log
       ~tasks:[Lwt.fail (Failure "runtime task")]
+      ~exit_refused:(fun () -> failwith "ordinary fault became worker stop")
       ~exit_fatal:(fun () ->
         exited := true;
         match Lock.acquire path with
@@ -136,8 +188,10 @@ let () =
     Stdlib.at_exit (fun () -> Unix.sleep 30);
     Lwt_main.run (S.run_join ~log:S.default_join_log
       ~tasks:[Lwt.fail (Failure "fatal child")]
+      ~exit_refused:(fun () -> failwith "ordinary fault became worker stop")
       ~exit_fatal:S.exit_fatal)
   end else if Array.length Sys.argv = 4 && Sys.argv.(1) = "--gc-child" then
     Lwt_main.run (gc_child Sys.argv.(2) Sys.argv.(3))
   else begin ownership (); fatal_process ();
-    List.iter gc_process ["task"; "async"; "sync"; "sync-error"; "sync-present"] end
+    List.iter gc_process ["task"; "async"; "worker"; "worker-async"; "worker-log"; "worker-warn";
+      "sync"; "sync-error"; "sync-present"; "worker-apply"; "worker-apply-log"; "apply"] end

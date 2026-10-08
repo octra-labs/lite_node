@@ -858,7 +858,7 @@ let check_post_failure () =
   List.iter (fun code -> expect "permanent HTTP refusal" (refused (Post.http_failure code)))
     [301; 400; 401; 403; 404];
   List.iter (fun code -> expect "RPC capacity retry" (retry (rpc code "")))
-    [104; 107; 110; 113; -32005];
+    [104; 107; 110; 113; 118; -32005];
   List.iter (fun data -> expect "RPC verification retry" (retry (rpc 105 data)))
     ["pre_verify_busy"; "pre_verify_busy reason = queue full";
      "pre_verify_unavailable reason = worker offline"];
@@ -913,6 +913,7 @@ let check_post_recovery () =
   let failures = [
     104, "insufficient balance";
     113, "fee too low";
+    118, "retry after epoch commit or replace transaction at same nonce";
     105, "pre_verify_unavailable reason = worker offline";
   ] in
   List.iter (fun (code, data) ->

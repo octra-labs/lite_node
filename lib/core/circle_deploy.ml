@@ -49,22 +49,29 @@ let circle_id_of_source source (payload : Circles.deploy_payload) =
       ~owner_mode
       ~payload_json
 
-let decode_payload_json payload_json =
+let decode_payload_json ?(resource_errors = false) payload_json =
   try
-    match Circles.deploy_payload_of_yojson (Yojson.Safe.from_string payload_json) with
+    Chaos.fail_at_phase "circle_payload";
+    let json = if resource_errors then Json_tree.read_plain payload_json
+      else Yojson.Safe.from_string payload_json in
+    match Circles.deploy_payload_of_yojson json with
     | Ok payload -> Ok payload
     | Error e -> Error ("malformed_transaction", e)
-  with _ ->
+  with
+  | (Out_of_memory | Stack_overflow | Lwt.Canceled | Exec_resource.Unavailable _) as error
+      when resource_errors -> raise error
+  | _ ->
     Error ("malformed_transaction", "circle deploy payload is invalid")
 
-let decode_spawn_payload_json payload_json =
+let decode_spawn_payload_json ?(resource_errors = false) payload_json =
   if String.length payload_json > spawn_payload_json_cap then
     Error ("malformed_transaction", "circle spawn payload exceeds max size")
   else
-    decode_payload_json payload_json
+    decode_payload_json ~resource_errors payload_json
 
-let prepare source (payload : Circles.deploy_payload) =
+let prepare ?(resource_errors = false) source (payload : Circles.deploy_payload) =
   try
+    Chaos.fail_at_phase "circle_prepare";
     let code_raw =
       match payload.Circles.code_b64 with
       | Some code_b64 -> Base64.decode_exn code_b64
@@ -103,10 +110,14 @@ let prepare source (payload : Circles.deploy_payload) =
           limits = payload.limits;
         } in
         Ok { circle_id; owner; code_raw; info }
-  with _ ->
+  with
+  | (Out_of_memory | Stack_overflow | Lwt.Canceled | Exec_resource.Unavailable _) as error
+      when resource_errors -> raise error
+  | _ ->
     Error ("malformed_transaction", "circle deploy input is invalid")
 
 let validate_runtime
+    ?(resource_errors = false)
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     (payload : Circles.deploy_payload) =
@@ -134,6 +145,8 @@ let validate_runtime
               | Ok _ -> Lwt.return (Ok ())
               | Error e -> Lwt.return (Error ("circle_runtime_invalid", e))
             end
+          | Error (Circle_wasm_host.Unavailable _) when resource_errors ->
+            Lwt.fail (Exec_resource.Unavailable Host)
           | Error e ->
             Lwt.return
               (Error
@@ -142,12 +155,13 @@ let validate_runtime
     end
 
 let check_available
+    ?(resource_errors = false)
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     store
     source
     (payload : Circles.deploy_payload) =
-  match prepare source payload with
+  match prepare ~resource_errors source payload with
   | Error e ->
     Lwt.return (Error e)
   | Ok prepared ->
@@ -155,7 +169,7 @@ let check_available
     if exists then
       Lwt.return (Error ("circle_exists", "circle already exists"))
     else
-      let* runtime_ok = validate_runtime ~execution_profile ~float_mode payload in
+      let* runtime_ok = validate_runtime ~resource_errors ~execution_profile ~float_mode payload in
       begin
         match runtime_ok with
         | Error e -> Lwt.return (Error e)
@@ -175,7 +189,14 @@ let save_origin store source circle_id =
     let* () = Store_irmin.write store (root @ ["spawn_nonce"]) (string_of_int spawn_nonce) in
     Store_irmin.write store (root @ ["owner_mode"]) (Circles.string_of_spawn_owner owner_mode)
 
-let write_prepared store source prepared (payload : Circles.deploy_payload) =
+let allow_calls store (info : Circles.circle_info) =
+  Store_irmin.write store ["circles"; info.circle_id; "call_code"] info.code_hash
+
+let calls_enabled store (info : Circles.circle_info) =
+  let* code = Store_irmin.read store ["circles"; info.circle_id; "call_code"] in
+  Lwt.return (code = Some info.code_hash)
+
+let write_prepared ?(calls = false) store source prepared (payload : Circles.deploy_payload) =
   let* () = Store_irmin.deploy_circle store prepared.info in
   let* () =
     match payload.Circles.code_b64 with
@@ -184,6 +205,7 @@ let write_prepared store source prepared (payload : Circles.deploy_payload) =
   in
   let* () = Store_irmin.set_circle_asset_usage_bytes store prepared.circle_id 0L in
   let* () = save_origin store source prepared.circle_id in
+  let* () = if calls then allow_calls store prepared.info else Lwt.return_unit in
   Lwt.return (Ok prepared.circle_id)
 
 let apply

@@ -248,6 +248,15 @@ let circle_admission tx =
     | None -> Ok ()
     | Some reason -> Error ("circle resource limit: " ^ reason)
 
+let queue_check ~mode tx =
+  match mode, of_op tx.Transaction.op_type with
+  | Rule_graph.Active, ((Program | Program_deploy | Circle_metadata) as lane) ->
+    begin match over (default_budget lane) (work tx) with
+    | None -> Ok ()
+    | Some reason -> Error (to_string lane ^ " resource limit: " ^ reason)
+    end
+  | _ -> circle_admission tx
+
 let admit b u tx =
   let next = add u (cost tx) in
   match over b next with

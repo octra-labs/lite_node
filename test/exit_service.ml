@@ -204,6 +204,8 @@ let saved node tx =
 
 let admit node =
   let runtime = Rest.{
+    proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+    queue_head = (fun () -> None);
     swarm_ref = ref None;
     duty_head = (fun () -> Some (Int64.of_int node.head,
       Octra_core.Rule_graph.ready_exec_at ~chain_id ~epoch:(node.head + 1)));

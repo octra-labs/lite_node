@@ -25,9 +25,20 @@ let entry epoch_id = Wal.{
   finalized_by = "tester";
   finalized_at = 1.;
   irmin_last_epoch_before = epoch_id - 1;
+  irmin_parent = None;
 }
 
 let test_roundtrip () =
+  let value = { (entry 1) with irmin_parent = Some (String.make 128 'a') } in
+  expect "Irmin parent lost" (Wal.of_json (Wal.to_json value) = value);
+  let fields = Wal.to_json value |> Yojson.Safe.from_string |> Yojson.Safe.Util.to_assoc in
+  let prior = `Assoc (List.remove_assoc "irmin_parent" fields) |> Yojson.Safe.to_string in
+  expect "old WAL rejected" (Wal.of_json prior = {value with irmin_parent = None});
+  List.iter (fun invalid ->
+    let raw = `Assoc (("irmin_parent", invalid) :: List.remove_assoc "irmin_parent" fields)
+      |> Yojson.Safe.to_string in
+    expect "invalid Irmin identity accepted" (rejects (fun () -> Wal.of_json raw)))
+    [`String ""; `Int 1; `Bool false; `List []];
   Test_workspace.with_dir "wal_roundtrip" (fun dir ->
     expect "missing WAL directory" (Wal.read_pending dir = []);
     Wal.write dir (entry 2);

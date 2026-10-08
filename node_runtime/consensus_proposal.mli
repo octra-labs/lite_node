@@ -193,7 +193,8 @@ type make_proposal_deps = {
     receipts_json:string list ->
     unit;
   staging_txs : ?circles:bool -> unit -> Transaction.t list;
-  evict_preview : Transaction.t -> unit;
+  evict_preview : ?epoch:int64 -> Transaction.t -> unit;
+  hold_preview : epoch:int64 -> Transaction.t -> unit;
   admits_tx : Transaction.t -> bool;
   build_preverify_once :
     state_root:string ->

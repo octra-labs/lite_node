@@ -29,7 +29,8 @@ let stay = Phase.{head = Some head; irmin_epoch = 0; irmin_root = head.ledger_st
   epoch_root = head.epoch_index_root; tx_position = 0, 100; epoch_offset = 100}
 
 let entry = Wal.{epoch_id = 1; pre_state_root = hash '1'; post_state_root = hash '3';
-  parent_commit = hash '2'; start_txid = 1L; tx_count = 0; finalized_by = "test";
+  parent_commit = hash '7'; irmin_parent = head.irmin_commit;
+  start_txid = 1L; tx_count = 0; finalized_by = "test";
   finalized_at = 0.; irmin_last_epoch_before = 0}
 
 let next_hash, next_root = Eic.next_root ~prev:head_root ~epoch_id:1 []
@@ -37,10 +38,10 @@ let state_root = Eic.folded_state_root ~ledger_state_root:entry.post_state_root 
 let prepare_record = Journal.Prepare {commit_id = "second"; prev_generation = 0; epoch_id = 1;
   planned_txid_hi = 0L; planned_state_root = state_root; ts = 0.}
 let last = Epoch.{empty_epoch_header with id = 1; state_root; prev_state_root = head.state_root;
-  start_txid = 1L; parent_commit = hash '2'}
+  start_txid = 1L; parent_commit = entry.parent_commit}
 let forward = Phase.{stay with irmin_epoch = 1; chain_epoch = 1;
   irmin_root = Some entry.post_state_root; irmin_commit = Some (hash '4');
-  irmin_parent = Some (entry.parent_commit, entry.pre_state_root);
+  irmin_parent = Some (Option.get head.irmin_commit, entry.pre_state_root);
   wal = [entry]; journal = [prepare_record]; last = Some last;
   epoch_hash = Some next_hash; epoch_root = Some next_root; epoch_offset = 200}
 
@@ -76,6 +77,18 @@ let run () =
     expect "publish high-water differs" (actual.txid_hi = 0L);
     expect "publish identity differs" (actual.commit_id = "second" && actual.irmin_commit = Some (hash '4'))
   | _ -> failwith "valid forward refused");
+  let old_head = {head with irmin_commit = None} in
+  expect "old head cut refused"
+    (Phase.decide {stay with head = Some old_head; wal = [entry]}
+      = Ok (Phase.Cut (old_head, entry, [])));
+  expect "old head forward refused"
+    (Phase.decide {forward with head = Some old_head} = Phase.decide forward);
+  List.iter (fun input ->
+    refused "old head accepted other WAL parent"
+      {input with head = Some old_head; wal = [{entry with irmin_parent = Some (hash '0')}]})
+    [stay; forward];
+  refused "old head accepted missing Irmin commit"
+    {stay with head = Some old_head; irmin_commit = None; wal = [entry]};
   let mutations = [
     "root", {stay with irmin_root = Some (hash '0')};
     "commit", {stay with irmin_commit = Some (hash '0')};
@@ -96,6 +109,8 @@ let run () =
     "wal_pre", {forward with wal = [{entry with pre_state_root = hash '0'}]};
     "wal_post", {forward with wal = [{entry with post_state_root = hash '0'}]};
     "wal_parent", {forward with wal = [{entry with parent_commit = hash '0'}]};
+    "wal_irmin", {forward with wal = [{entry with irmin_parent = Some (hash '0')}]};
+    "cut_irmin", {stay with wal = [{entry with irmin_parent = Some (hash '0')}]};
     "parent_missing", {forward with irmin_parent = None};
     "parent_other", {forward with irmin_parent = Some (hash '0', hash '1')};
     "parent_root", {forward with irmin_parent = Some (hash '2', hash '0')};

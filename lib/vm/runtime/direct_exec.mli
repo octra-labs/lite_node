@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+exception Receipt_mismatch of string
+
 type spec = {
   domain : Receipt_view.direct_call_domain;
   reject_domain : Call_plan.direct_exec_domain;

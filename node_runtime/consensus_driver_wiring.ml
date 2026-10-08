@@ -102,7 +102,8 @@ type standard_adapters = {
   staging_epoch_txs : ?circles:bool -> unit -> Transaction.t list;
   staging_total : unit -> int;
   proposer : unit -> string;
-  evict_preview : Transaction.t -> unit;
+  evict_preview : ?epoch:int64 -> Transaction.t -> unit;
+  hold_preview : epoch:int64 -> Transaction.t -> unit;
   head_txid_hi : unit -> int64 option;
   set_proposal : Transaction.t list -> string list -> unit;
   current_tx_hashes : unit -> string list;
@@ -142,7 +143,8 @@ type deps = {
   staging_epoch_txs : ?circles:bool -> unit -> Transaction.t list;
   staging_total : unit -> int;
   build_preverify : Consensus_preverify_role.build;
-  evict_preview : Transaction.t -> unit;
+  evict_preview : ?epoch:int64 -> Transaction.t -> unit;
+  hold_preview : epoch:int64 -> Transaction.t -> unit;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :
@@ -421,7 +423,14 @@ let node_standard_adapters
     next_txid = runtime.next_txid;
     read_prev_ledger_root = runtime.read_prev_ledger_root;
     staging_txs = Staging.all;
-    evict_preview = (fun tx ->
+    evict_preview = (fun ?epoch tx ->
+      let permitted = match epoch, runtime.cached_head () with
+        | None, _ -> true
+        | Some epoch, Some head ->
+          Staging.Preview.send (Refuse {
+            head = Int64.of_int head.epoch_id; epoch; hash = Transaction.hash tx }) = Ok ()
+        | Some _, None -> false in
+      if not permitted then raise (Octra_core.Exec_resource.Unavailable Host);
       match Staging.drop_preview tx with
       | None -> ()
       | Some row ->
@@ -430,6 +439,12 @@ let node_standard_adapters
         Octra_log.info "staging"
           "event = proposal_drop hash = %s reason = preview_rejected" row.d_hash;
         Node_rest_facade.notify_staging_update ());
+    hold_preview = (fun ~epoch tx ->
+      let result = match runtime.cached_head () with
+        | None -> Error "preview head unavailable"
+        | Some head -> Staging.Preview.send (Hold {
+            head = Int64.of_int head.epoch_id; epoch; hash = Transaction.hash tx }) in
+      if Result.is_error result then raise (Octra_core.Exec_resource.Unavailable Host));
     staging_epoch_txs = (fun ?(circles = true) () ->
       let head = runtime.cached_head () in
       let accept = match head with
@@ -459,9 +474,17 @@ let node_standard_adapters
                    | Error _ -> false))
         | _ -> (fun _ -> true)
       in
+      let mode = match head with
+        | Some head when head.epoch_id < max_int ->
+          Octra_core.Rule_graph.proof_exec_at ~chain_id:runtime.chain_id ~epoch:(head.epoch_id + 1)
+        | _ -> Octra_core.Rule_graph.Prior in
       let accept tx = accept tx
+        && (mode <> Octra_core.Rule_graph.Active
+          || Staging.Preview.send (Ready
+            (Option.map (fun head -> Int64.of_int head.Octra_core.Head_manifest.epoch_id) head,
+             Transaction.hash tx)) = Ok ())
         && (circles || not (Octra_core.Preverify_worker.snapshot_transition tx))
-        && Result.is_ok (Octra_core.Resource_lanes.circle_admission tx)
+        && Result.is_ok (Octra_core.Resource_lanes.queue_check ~mode tx)
         && match head with
         | Some head when head.epoch_id < max_int ->
           Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id:runtime.chain_id
@@ -721,6 +744,7 @@ let make_proposal_deps (deps : deps) =
     store_bundle = deps.store_bundle;
     staging_txs = deps.staging_epoch_txs;
     evict_preview = deps.evict_preview;
+    hold_preview = deps.hold_preview;
     admits_tx = (fun tx ->
       (not (deps.gates.consensus_mode ()))
       || Transaction.bft_consensus_admits_op
@@ -888,6 +912,7 @@ let config_with_standard ?private_slots ?prepare_at (input : config_with_standar
       staging_epoch_txs = standard.staging_epoch_txs;
       staging_total = standard.staging_total;
       evict_preview = standard.evict_preview;
+      hold_preview = standard.hold_preview;
       build_preverify = input.build_preverify;
       validate_preverify = input.validate_preverify;
       proposal_bundles = input.proposal_bundles;

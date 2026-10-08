@@ -49,6 +49,7 @@ let deps ~state ~pending ~call ~deploy =
     math = false;
     int_work = Octra_vm.Int_work.Prior;
     fhe_work = Octra_core.Rule_graph.Prior;
+    proof_exec = Octra_core.Rule_graph.Prior;
     wasm_float = Octra_core.Rule_graph.Prior;
   }
 
@@ -104,6 +105,7 @@ let test_shared_memory () =
   let module Memory = Octra_vm.Fhe_memory in
   let owner = Memory.create () in
   let spend (ctx : ContractVM.exec_ctx) =
+    expect "nested proof policy lost" (ctx.proof_exec = Octra_core.Rule_graph.Active);
     match ctx.fhe_memory with
     | None -> fail "nested operation lost memory budget"
     | Some budget ->
@@ -122,7 +124,8 @@ let test_shared_memory () =
     incr pending;
     Error "refused" in
   let ctx = Shell.make_contract_ctx
-    {(deps ~state ~pending ~call ~deploy) with fhe_work = Octra_core.Rule_graph.Active} in
+    {(deps ~state ~pending ~call ~deploy) with fhe_work = Octra_core.Rule_graph.Active;
+      proof_exec = Octra_core.Rule_graph.Active} in
   let scope = ContractVM.{depth = 1; limit = Some 1000; memory = Some owner; bytes = None} in
   expect "nested call unexpectedly succeeded"
     (Result.is_error (ctx.call_contract "caller" "target" "method" [] scope));
@@ -390,6 +393,7 @@ let test_direct_call_reject () =
 
 let circle_result ?(success = true) ?error () =
   Circle_exec.{
+    calls = false;
     receipt = receipt ~success ?error ();
     storage_tbl = Hashtbl.create 1;
     baseline_storage_tbl = Hashtbl.create 1;
@@ -575,7 +579,7 @@ let run_deploy_case ?balance ?(bytecode = true) ?(success = true) events =
               "deploy:%d:%d"
               (List.length params)
               (Array.length bytecode));
-         {
+         Lwt.return {
            Shell.contract_addr = Contract.addr_from_code bytecode_raw deployer nonce;
            receipt = receipt ~success ?error:(if success then None else Some "ctor") ();
          })
@@ -637,7 +641,7 @@ let multi_deps ?(success = true) ?(throw = false) events =
       push ("exec:" ^ method_name);
       if throw then failwith "boom";
       let error = if success then None else Some "boom" in
-      receipt ~success ?error ())
+      Lwt.return (receipt ~success ?error ()))
     ~save_receipt_raw:(fun ~tx_hash:_ ~json:_ -> push "save")
     ~log_success:(fun ~calls ~effort ->
       push (Printf.sprintf "ok:%d:%d" calls effort))
@@ -719,11 +723,57 @@ let test_multi_resource () =
         ~tx_hash:"tx" ~from_addr:"sender" ~message:(Some (multi_message ()))
         ~fee:(Z.of_int 10));
       false
-    with actual when actual = error -> true in
+    with actual when actual = (match error with
+      | Out_of_memory -> Octra_core.Exec_resource.Unavailable Memory
+      | Stack_overflow -> Octra_core.Exec_resource.Unavailable Stack
+      | failure -> failure) -> true in
     expect "multi resource exception preserved" raised;
     expect "multi resource has no receipt or charge"
       (List.rev !events = ["debit"; "apply"]))
-    [Stack_overflow; Out_of_memory]
+    [Stack_overflow; Out_of_memory; Lwt.Canceled; Octra_core.Exec_resource.Unavailable Host;
+     Circle_exec.Execution_unavailable "host unavailable"]
+
+let test_multi_suspend () =
+  List.iter (fun error ->
+    let events = ref [] in
+    let pending = ref 0 in
+    let resumed = ref false in
+    let deps = multi_deps events in
+    let deps = { deps with
+      Shell.with_debited_fee = (fun _ action ->
+        Lwt.finalize action (fun () -> pending := 0; Lwt.return_unit));
+      balance = (fun _ ->
+        if !resumed then raise error;
+        Z.of_int 100);
+      execute_call = (fun ~ctx:_ ~limit:_ ~target:_ ~method_name:_ ~params:_
+          ~caller:_ ~amount:_ ->
+        incr pending;
+        Lwt.bind (Lwt.pause ()) (fun () ->
+          resumed := true;
+          Lwt.return (receipt ())));
+    } in
+    let message = match Yojson.Safe.from_string (multi_message ()) with
+      | `List [call] -> Yojson.Safe.to_string (`List [call; call])
+      | _ -> fail "multi test payload"
+    in
+    let actual = try
+      Lwt_main.run (Shell.run_multi_exec deps ~max_calls:4 ~epoch:9
+        ~tx_hash:"tx" ~from_addr:"sender" ~message:(Some message)
+        ~fee:(Z.of_int 10));
+      None
+    with failure -> Some failure in
+    expect "multi suspended callback resumed" !resumed;
+    expect "multi suspended callback skipped rollback" (!pending = 0);
+    let expected = match error with
+      | Out_of_memory -> Octra_core.Exec_resource.Unavailable Memory
+      | Stack_overflow -> Octra_core.Exec_resource.Unavailable Stack
+      | failure -> failure
+    in
+    expect "multi suspended callback lost resource refusal" (actual = Some expected);
+    expect "multi suspended callback saved receipt or fee" (!events = ["apply"]))
+    [Out_of_memory; Stack_overflow; Lwt.Canceled;
+     Octra_core.Exec_resource.Unavailable Host;
+     Circle_exec.Execution_unavailable "host unavailable"]
 
 let vm_tx_deps events =
   let push event =
@@ -742,7 +792,7 @@ let vm_tx_deps events =
            (List.length params)
            (Array.length bytecode)
            (String.length bytecode_raw));
-      { contract_addr = "octDeploy"; receipt = receipt () });
+      Lwt.return { contract_addr = "octDeploy"; receipt = receipt () });
     program_prepare = (fun _ -> Lwt.return_error "not expected");
     ensure_account = (fun addr -> push ("ensure:" ^ addr));
     circle_exec = (fun _ ~ctx:_ call ->
@@ -765,7 +815,7 @@ let vm_tx_deps events =
     multi_execute_call = (fun ~ctx:_ ~limit:_ ~target:_ ~method_name
         ~params:_ ~caller:_ ~amount:_ ->
       push ("multi_exec:" ^ method_name);
-      receipt ());
+      Lwt.return (receipt ()));
     save_receipt_raw = (fun ~tx_hash:_ ~json:_ -> push "multi_save");
     reject_malformed = (fun reason ->
       push ("malformed:" ^ reason);
@@ -999,7 +1049,53 @@ let test_save_receipt () =
   | Some ("tx", "octProgram", "run", false, 7, _, Some "bad", 77) -> ()
   | _ -> fail "save receipt"
 
+let test_call_types () =
+  let module T = Octra_vm.Program_type_flow in
+  let module V = Octra_vm.Receipt_view in
+  let module VM = ContractVM in
+  List.iter (fun (kind, value) ->
+    expect "nested argument type changed"
+      (Octra_vm.Program_input.parse [kind] [V.nested_call_arg_json ~typed:true value]
+       = Ok [value])) [
+    T.Bool, VM.VBool false;
+    T.Bool, VM.VBool true;
+    T.Int, VM.VInt (Z.of_int (-7));
+    T.U64, VM.VU64 (Z.pred (Z.shift_left Z.one 64));
+    T.U128, VM.VU128 (Z.pred (Z.shift_left Z.one 128));
+    T.U256, VM.VU256 (Z.pred (Z.shift_left Z.one 256));
+    T.Bytes, VM.VBytes "\000\255false";
+    T.Bytes32, VM.VBytes32 (String.make 32 '\255');
+    T.String, VM.VString "false";
+    T.Addr, VM.VAddr "oct7xCozDD9JEsbeVpo5C7HXp2BJbKqfmNUHmDDCCTtWcGb";
+  ];
+  expect "historical nested bool changed"
+    (V.nested_call_arg_json (VM.VBool false) = `String "false");
+  expect "historical nested integer changed"
+    (V.nested_call_arg_json (VM.VU64 Z.one) = `String "1")
+
+let test_circle_journal () =
+  let module J = Octra_vm.Program_journal in
+  let journal = J.create () in
+  let table = Hashtbl.create 1 in
+  Hashtbl.replace table "value" "1";
+  let parent = J.circle_storage journal "a" table in
+  let saved = J.snapshot journal in
+  Hashtbl.replace parent "value" "2";
+  let child = J.circle_storage journal "b" (Hashtbl.create 1) in
+  Hashtbl.replace child "value" "3";
+  J.restore journal saved;
+  expect "circle restore replaced live table" (J.find_circle journal "a" = Some parent);
+  expect "circle restore lost parent value" (Hashtbl.find_opt parent "value" = Some "1");
+  expect "circle restore kept new table" (J.find_circle journal "b" = None);
+  expect "circle restore kept child reference" (Hashtbl.length child = 0);
+  expect "circle journal entered program namespace" (J.storage_entries journal = []);
+  J.discard journal;
+  expect "circle discard kept table" (J.find_circle journal "a" = None)
+
 let () =
+  test_call_types ();
+  test_circle_journal ();
+  test_multi_suspend ();
   test_call_success_keeps_effects ();
   test_call_restore ();
   test_deploy_restore ();

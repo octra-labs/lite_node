@@ -70,7 +70,9 @@ let check_next head (entry : Wal.entry) =
   let* () = require "WAL predecessor root differs from HEAD"
     (entry.pre_state_root = Head.ledger_state_root head) in
   require "WAL parent commit differs from HEAD"
-    (match head.irmin_commit with None -> true | Some hash -> entry.parent_commit = hash)
+    (match entry.irmin_parent, head.irmin_commit with
+     | Some hash, Some expected -> hash = expected
+     | _ -> true)
 
 let prepare input head epoch txid_hi state_root =
   let* attempts = Commit_attempt.read ~epoch ~generation:head.Head.generation input.journal in
@@ -96,7 +98,11 @@ let forward input head (entry : Wal.entry) =
   let* () = require "WAL post root differs from Irmin"
     (input.irmin_root = Some entry.post_state_root && input.irmin_commit <> None) in
   let* () = require "Irmin parent differs from WAL predecessor"
-    (input.irmin_parent = Some (entry.parent_commit, entry.pre_state_root)) in
+    (match input.irmin_parent with
+     | Some (hash, root) -> root = entry.pre_state_root
+       && (match head.irmin_commit with None -> true | Some expected -> hash = expected)
+       && (match entry.irmin_parent with None -> true | Some expected -> hash = expected)
+     | None -> false) in
   let* header = match input.last with
     | Some header when header.Epoch.id = entry.epoch_id -> Ok header
     | _ -> Error "forward epoch header is missing" in
@@ -165,6 +171,10 @@ let decide input =
         | _ -> Error "journal position is missing or precedes HEAD")
       | [entry] ->
         let* () = check_next head entry in
+        let* () = require "WAL parent commit differs from Irmin"
+          (match entry.irmin_parent with
+           | None -> true
+           | Some hash -> input.irmin_commit = Some hash) in
         let* () = require "journal epoch differs from pending commit"
           (input.chain_epoch = head.epoch_id || input.chain_epoch = entry.epoch_id) in
         let* attempts = retire input head in

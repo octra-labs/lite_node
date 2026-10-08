@@ -287,7 +287,16 @@ let verify_bound_cap ~math ~strict ~cap pk ciphertext proof amount_commitment =
   | _ ->
     Ok false
 
-let run_action_cap ~math ~cap fields =
+let cipher_pair ~pairs operation pk lhs rhs =
+  if pairs && (Pvac_ffi.cipher_shape lhs).slots <> (Pvac_ffi.cipher_shape rhs).slots then
+    error_json "hfhe slot count mismatch"
+  else if pairs && not
+      (Pvac_ffi.cipher_matches_key pk lhs && Pvac_ffi.cipher_matches_key pk rhs) then
+    error_json "hfhe key shape mismatch"
+  else
+    value_json (`String (Crypto.FheBalance.encode_cipher (operation pk lhs rhs)))
+
+let run_action_cap ~pairs ~math ~cap fields =
   let open Crypto.FheBalance in
   match List.assoc_opt "action" fields with
   | Some (`String "encrypt_value_seeded") ->
@@ -334,7 +343,7 @@ let run_action_cap ~math ~cap fields =
         begin
           match decode_cipher_cap ~cap lhs_ciphertext, decode_cipher_cap ~cap rhs_ciphertext with
           | Ok lhs, Ok rhs ->
-            value_json (`String (encode_cipher (Pvac_ffi.ct_add pk lhs rhs)))
+            cipher_pair ~pairs Pvac_ffi.ct_add pk lhs rhs
           | Error e, _
           | _, Error e ->
             error_json e
@@ -351,7 +360,7 @@ let run_action_cap ~math ~cap fields =
         begin
           match decode_cipher_cap ~cap lhs_ciphertext, decode_cipher_cap ~cap rhs_ciphertext with
           | Ok lhs, Ok rhs ->
-            value_json (`String (encode_cipher (Pvac_ffi.ct_sub pk lhs rhs)))
+            cipher_pair ~pairs Pvac_ffi.ct_sub pk lhs rhs
           | Error e, _
           | _, Error e ->
             error_json e
@@ -556,9 +565,15 @@ let run_action fields =
     | [_, `Bool math] -> Ok math
     | _ -> Error "invalid math"
   in
-  match require_cap fields, math with
-  | Ok cap, Ok math -> run_action_cap ~math ~cap fields
-  | Error e, _ | _, Error e -> error_json e
+  let pairs =
+    match List.filter (fun (name, _) -> name = "hfhe_pairs") fields with
+    | [] -> Ok false
+    | [_, `Bool pairs] -> Ok pairs
+    | _ -> Error "invalid hfhe_pairs"
+  in
+  match require_cap fields, math, pairs with
+  | Ok cap, Ok math, Ok pairs -> run_action_cap ~pairs ~math ~cap fields
+  | Error e, _, _ | _, Error e, _ | _, _, Error e -> error_json e
 
 let call_json input_json =
   let output_json =

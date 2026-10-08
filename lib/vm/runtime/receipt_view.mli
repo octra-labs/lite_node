@@ -10,6 +10,7 @@ val call_arg_json :
   Yojson.Safe.t
 
 val nested_call_arg_json :
+  ?typed:bool ->
   Contract_vm.v ->
   Yojson.Safe.t
 

@@ -15,6 +15,7 @@ type policy = {
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   cap_mode : Octra_core.Set_fold.cap_mode;

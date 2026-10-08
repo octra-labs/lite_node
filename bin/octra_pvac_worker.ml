@@ -53,9 +53,17 @@ let run () =
 
 let () =
   try
-    run ()
-    |> P.canonical_response
-    |> print_endline
+    if Array.length Sys.argv = 2 && Sys.argv.(1) = "--fhe-session" then begin
+      Pvac_ffi.isolate_worker ();
+      set_oom_priority ();
+      Octra_core.Fhe_calc.serve_session ()
+    end else if Array.length Sys.argv = 2 && Sys.argv.(1) = "--fhe" then begin
+      Pvac_ffi.isolate_worker ();
+      set_oom_priority ();
+      Octra_core.Fhe_calc.serve ()
+    end else if Array.length Sys.argv = 1 then
+      run () |> P.response_bytes |> print_endline
+    else failwith "worker arguments"
   with error ->
     Printf.eprintf
       "event = pvac_worker_failed reason = %s\n%!"

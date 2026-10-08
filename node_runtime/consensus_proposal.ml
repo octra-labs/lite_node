@@ -194,7 +194,8 @@ type make_proposal_deps = {
     receipts_json:string list ->
     unit;
   staging_txs : ?circles:bool -> unit -> Transaction.t list;
-  evict_preview : Transaction.t -> unit;
+  evict_preview : ?epoch:int64 -> Transaction.t -> unit;
+  hold_preview : epoch:int64 -> Transaction.t -> unit;
   admits_tx : Transaction.t -> bool;
   build_preverify_once :
     state_root:string ->
@@ -2074,7 +2075,7 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
               Lwt.return reject
             end
 
-let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
+let rec make_attempt ~refill ~steps ~deferred ~refusals ?prepare ?private_slots (deps : make_proposal_deps)
     ~chain_id ~root_to_raw32 ~limits ~epoch_id =
   let private_slots =
     if Octra_core.Rule_graph.tx_envelope_at ~chain_id ~epoch:epoch_id
@@ -2160,8 +2161,11 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
       end
     | None ->
       let tx_list_raw = deps.staging_txs () in
+      let mode = if epoch_id < 0L || epoch_id > Int64.of_int max_int then
+          Octra_core.Rule_graph.Prior
+        else Octra_core.Rule_graph.proof_exec_at ~chain_id ~epoch:(Int64.to_int epoch_id) in
       let select = List.filter (fun tx -> deps.admits_tx tx
-        && Result.is_ok (Octra_core.Resource_lanes.circle_admission tx)
+        && Result.is_ok (Octra_core.Resource_lanes.queue_check ~mode tx)
         && Result.is_ok (Octra_core.Tx_envelope.check_epoch ~chain_id ~epoch:epoch_id [tx])) in
       let tx_list_selected = select tx_list_raw in
       let tx_list_selected =
@@ -2209,13 +2213,17 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
       let proposer = deps.proposer () in
       let validator_pubkeys = deps.validator_pubkeys epoch_id in
       let epoch_ts = deps.now () in
+      let refused = ref [] in
       let rec preview_until_stable attempt ceiling pool inputs remaining accumulated =
         let measure = (2 * ((2 * List.length pool) - List.length inputs))
           + (if accumulated = [] then 1 else 0) in
         if not (deps.current ()) then Lwt.return_error "proposal context changed"
-        else if measure < 0 || measure >= ceiling then
+        else if Option.is_some prepare && !steps = 0 then
+          Lwt.return_error "preview_work_limit"
+        else if Option.is_none prepare && (measure < 0 || measure >= ceiling) then
           Lwt.return_error "preview_retry_limit"
         else
+          let () = if Option.is_some prepare then decr steps in
           let remaining_hashes = List.map Transaction.hash remaining in
           let receipts =
             Octra_core.Preverify_worker.receipts_for_hashes
@@ -2244,22 +2252,28 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
                 | error -> Lwt.fail error)
           in
           if not (deps.current ()) then Lwt.return_error "proposal context changed" else
+          let defer excluded resource =
+            if Option.is_some prepare then
+              deferred := Circle_refill.first (excluded @ !deferred);
+            let hashes = List.map Transaction.hash excluded in
+            let exclude txs =
+              if Option.is_some prepare then
+                Circle_refill.before
+                  ~excluded:(excluded
+                    @ List.map (fun row -> row.Octra_core.Epoch_exec.tx) accumulated) txs
+              else List.filter (fun tx -> not (List.mem (Transaction.hash tx) hashes)) txs in
+            let retained = exclude inputs in
+            Octra_log.warn "consensus"
+              "event = proposal_resource_deferred epoch = %Ld hash = %s count = %d resource = %s remaining = %d"
+              epoch_id (List.hd hashes) (List.length excluded) resource (List.length retained);
+            let pool = exclude pool in
+            preview_until_stable (attempt + 1) measure pool retained retained []
+          in
           match preview_result with
           | `Exhausted (hash, resource) ->
-            if not (List.exists (fun tx -> Transaction.hash tx = hash) remaining) then
-              Lwt.return_error "preview_resource_identity"
-            else
-              let exclude txs =
-                if Option.is_some prepare then
-                  Circle_refill.before
-                    ~excluded:(List.filter (fun tx -> Transaction.hash tx = hash) remaining) txs
-                else List.filter (fun tx -> Transaction.hash tx <> hash) txs in
-              let retained = exclude inputs in
-              Octra_log.warn "consensus"
-                "event = proposal_resource_deferred epoch = %Ld hash = %s resource = %s remaining = %d"
-                epoch_id hash (Octra_core.Exec_resource.name resource) (List.length retained);
-              let pool = exclude pool in
-              preview_until_stable (attempt + 1) measure pool retained retained []
+            let excluded = List.filter (fun tx -> Transaction.hash tx = hash) remaining in
+            if excluded = [] then Lwt.return_error "preview_resource_identity"
+            else defer excluded (Octra_core.Exec_resource.name resource)
           | `Result (Stdlib.Error error) ->
             Lwt.return_error error
           | `Result (Stdlib.Ok (result, batch)) ->
@@ -2285,6 +2299,10 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
                   | Error error ->
                     Lwt.return_error ("preview_outcome_invalid:" ^ error)
                   | Ok rejections ->
+                    if Option.is_some prepare then
+                      List.iter (fun (item : Octra_core.Epoch_exec.tx_reject) ->
+                        deps.evict_preview ~epoch:epoch_id item.tx;
+                        refused := item.tx :: !refused) accumulated;
                     Lwt.return_ok
                       (build_preview_output
                          ~root_to_raw32
@@ -2299,15 +2317,43 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
                          ~preview_result:(Stdlib.Ok result))
                 end
               | Preview_partition_retry { confirmed; rejections = current } ->
+                let unavailable = List.filter (fun row ->
+                  let code = row.Octra_core.Epoch_exec.error_type in
+                  code = "vm_transition_incomplete" || code = "vm_transition_exception") current in
+                let () = if Option.is_some prepare then
+                  let rejected = List.filter (fun row -> not (List.mem row unavailable)) current in
+                  refusals := Circle_refill.first
+                    (List.map (fun row -> row.Octra_core.Epoch_exec.tx) rejected @ !refusals) in
+                if Option.is_some prepare && unavailable <> [] then
+                  defer (List.map (fun row -> row.Octra_core.Epoch_exec.tx) unavailable) "execution"
+                else
+                let count = List.length inputs in
+                let inputs, confirmed, pool, current =
+                  if Option.is_none prepare || accumulated <> [] then inputs, confirmed, pool, current
+                  else
+                    let module Hashes = Set.Make (String) in
+                    let rejected = List.map (fun row -> row.Octra_core.Epoch_exec.tx) current
+                      |> Circle_refill.first in
+                    let hashes = List.map Transaction.hash rejected |> Hashes.of_list in
+                    let current = List.filter (fun row ->
+                      Hashes.mem (Transaction.hash row.Octra_core.Epoch_exec.tx) hashes) current in
+                    let retained = List.map Transaction.hash confirmed
+                      |> Hashes.of_list |> Hashes.union hashes in
+                    let inputs = List.filter (fun tx ->
+                      Hashes.mem (Transaction.hash tx) retained) inputs
+                      |> Circle_refill.through ~rejected in
+                    inputs, confirmed,
+                    Circle_refill.before ~excluded:rejected pool, current in
                 Octra_log.warn "consensus"
                   "event = proposal_preview_retry epoch = %Ld attempt = %d rejected = %d remaining = %d"
                   epoch_id
                   attempt
                   (List.length current)
                   (List.length confirmed);
-                let refill = match private_slots with
-                    | None -> None
-                    | Some slots ->
+                let refill = match prepare, private_slots with
+                    | Some _, _ -> None
+                    | None, None -> None
+                    | None, Some slots ->
                       let module Hashes = Set.Make (String) in
                       let included = List.map Transaction.hash inputs |> Hashes.of_list in
                       let fresh tx = not (Hashes.mem (Transaction.hash tx) included) in
@@ -2320,7 +2366,9 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
                 | Some extended ->
                   preview_until_stable (attempt + 1) measure pool extended extended []
                 | None ->
-                if accumulated = [] then begin
+                if Option.is_some prepare && List.length inputs <> count then
+                  preview_until_stable (attempt + 1) measure pool inputs inputs []
+                else if accumulated = [] then begin
                   preview_until_stable
                     (attempt + 1)
                     measure
@@ -2338,7 +2386,10 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
                     |> Hashes.of_list
                   in
                   let retained =
-                    List.filter
+                    if Option.is_some prepare then
+                      Circle_refill.before ~excluded:(List.map (fun row ->
+                        row.Octra_core.Epoch_exec.tx) current) inputs
+                    else List.filter
                       (fun tx -> not (Hashes.mem (Transaction.hash tx) deferred))
                       inputs
                   in
@@ -2347,7 +2398,7 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
                     epoch_id
                     (Hashes.cardinal deferred)
                     (List.length retained);
-                  let pool = List.filter (fun tx ->
+                  let pool = if Option.is_some prepare then pool else List.filter (fun tx ->
                     not (Hashes.mem (Transaction.hash tx) deferred)) pool in
                   preview_until_stable (attempt + 1) measure pool retained retained []
             end
@@ -2366,12 +2417,23 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
         let build_plan = build_output.plan in
         let final_tx_list = build_plan.final_txs in
         let final_tx_hashes = build_plan.final_hashes in
-        match Circle_refill.select ~selected:tx_list ~confirmed:final_tx_list
-          ~rejected:build_output.rejected_count tx_list_selected with
+        let refill = if Option.is_some prepare && (not refill || !steps < 2) then None
+          else if Option.is_some prepare then
+            Circle_refill.work ~selected:tx_list ~rejected:!refused tx_list_selected
+          else Circle_refill.select ~selected:tx_list ~confirmed:final_tx_list
+            ~rejected:build_output.rejected_count tx_list_selected in
+        match refill with
         | Some remaining ->
-          List.iter deps.evict_preview tx_list;
-          let deps = {deps with staging_txs = (fun ?circles:_ () -> remaining)} in
-          make_proposal ?prepare ?private_slots deps ~chain_id ~root_to_raw32 ~limits ~epoch_id
+          if List.length remaining >= List.length tx_list_selected then
+            Lwt.return_none
+          else
+          begin
+          if Option.is_none prepare then List.iter (fun tx -> deps.evict_preview tx) tx_list;
+          let deps = {deps with staging_txs = (fun ?(circles = true) () ->
+            if circles then remaining else Circle_refill.without remaining)} in
+          make_attempt ~refill:false ~steps ~deferred ~refusals ?prepare ?private_slots deps
+            ~chain_id ~root_to_raw32 ~limits ~epoch_id
+          end
         | None ->
         log_preview_result ~epoch_id (List.length final_tx_list) build_plan;
         deps.set_proposal final_tx_list final_tx_hashes;
@@ -2407,3 +2469,55 @@ let rec make_proposal ?prepare ?private_slots (deps : make_proposal_deps)
           parent_commit = proposal_envelope.parent_commit;
         }
     end
+
+let make_proposal ?prepare ?private_slots deps ~chain_id ~root_to_raw32 ~limits ~epoch_id =
+  let steps = ref 4 in
+  let deferred = ref [] in
+  let refusals = ref [] in
+  match prepare with
+  | None ->
+    make_attempt ~refill:true ~steps ~deferred ~refusals ?private_slots deps
+      ~chain_id ~root_to_raw32 ~limits ~epoch_id
+  | Some _ ->
+    let captured = ref None in
+    let removed = ref [] in
+    let deps = {deps with
+      staging_txs = (fun ?(circles = true) () ->
+        let txs = deps.staging_txs ~circles () in
+        if circles && Option.is_none !captured then captured := Some txs;
+        txs);
+      evict_preview = (fun ?epoch tx ->
+        deps.evict_preview ?epoch tx;
+        removed := tx :: !removed);
+    } in
+    let open Lwt.Syntax in
+    let* result = make_attempt ~refill:true ~steps ~deferred ~refusals ?prepare ?private_slots deps
+      ~chain_id ~root_to_raw32 ~limits ~epoch_id in
+    match result with
+    | None when !steps = 0 && deps.current () ->
+      let inputs = Option.value !captured ~default:[] in
+      let excluded = !removed @ !refusals @ !deferred in
+      let module Hashes = Set.Make (String) in
+      let held = ref Hashes.empty in
+      let hold () =
+        let removed = List.map Transaction.hash !removed |> Hashes.of_list in
+        List.iter (fun tx ->
+          let hash = Transaction.hash tx in
+          if not (Hashes.mem hash removed || Hashes.mem hash !held) then begin
+            deps.hold_preview ~epoch:epoch_id tx;
+            held := Hashes.add hash !held
+          end) (Circle_refill.first !refusals) in
+      hold ();
+      let retained = Circle_refill.before ~excluded inputs in
+      Octra_log.info "consensus"
+        "event = proposal_sender_reserve epoch = %Ld remaining = %d"
+        epoch_id (List.length retained);
+      let deps = {deps with staging_txs = (fun ?(circles = true) () ->
+        if circles then retained else Circle_refill.without retained)} in
+      let* result = make_attempt ~refill:false ~steps:(ref 2) ~deferred ~refusals
+        ?prepare ?private_slots deps
+        ~chain_id ~root_to_raw32 ~limits ~epoch_id
+      in
+      if deps.current () then hold ();
+      Lwt.return result
+    | _ -> Lwt.return result

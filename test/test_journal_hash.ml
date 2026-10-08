@@ -552,7 +552,8 @@ let check_stage_order validator_set (cert : Types.finalize) changed bundle =
     (not (Journal.pending base)
      && Mark.read ~data_dir:base ~chain:cert.chain_id = Mark.Missing)
 
-let check_live_round ?(reverse = false) validator_set (cert : Types.finalize) later bundle =
+let check_live_round ?(reverse = false) ?(worker = false)
+    validator_set (cert : Types.finalize) later bundle =
   let module R = Octra_node_runtime.Consensus_finality_runtime in
   let module S = Octra_node_runtime.Consensus_finalized_shell in
   let module State = Octra_node_runtime.Consensus_finality_state in
@@ -577,7 +578,9 @@ let check_live_round ?(reverse = false) validator_set (cert : Types.finalize) la
     consensus_finalized = ref false;
     current_epoch = ref epoch;
     committed_head_epoch = (fun () -> !head);
-    sleep = (fun _ -> if !head < epoch then pause else Lwt.return_unit);
+    sleep = (fun _ ->
+      if worker then Lwt.fail (Octra_core.Private_ledger.Worker_stopped "permanent")
+      else if !head < epoch then pause else Lwt.return_unit);
     read_pre_finalize_root = (fun () -> Some cert.header.prev_state_root);
     read_commit_root = (fun () -> Lwt.return (Some cert.header.proposed_state_root));
     read_local_root_raw = (fun () -> Lwt.return cert.header.proposed_state_root);
@@ -611,6 +614,13 @@ let check_live_round ?(reverse = false) validator_set (cert : Types.finalize) la
     replay_stashed_while_safe = runtime.replay_stashed_while_safe;
   } in
   let first = S.handle deps ~validator_set (if reverse then later else cert) in
+  if worker then begin
+    expect "finality lost worker stop"
+      (try Lwt_main.run first; false
+       with Octra_core.Private_ledger.Worker_stopped reason -> reason = "permanent");
+    expect "worker stop changed committed head" (!head = epoch - 1);
+    expect "worker stop removed certificate" (Journal.pending base)
+  end else begin
   expect "live apply is pending" (Lwt.state first = Lwt.Sleep);
   let second = S.handle deps ~validator_set (if reverse then cert else later) in
   let round () = Option.map (fun value -> value.Octra_core.Epochlog.commit_round)
@@ -641,7 +651,8 @@ let check_live_round ?(reverse = false) validator_set (cert : Types.finalize) la
     (Result.is_ok (Octra_consensus.C_catchup.verify_record_finality
       ~chain_id:cert.chain_id
       ~expected_validator_set_hash:(Octra_consensus.C_config.validator_set_hash validator_set)
-      ~expected_txid:(Int64.succ cert.header.txid_hi) ~record))
+      ~expected_txid:(Int64.succ cert.header.txid_hi) ~record));
+  end
 
 let check_hashes () =
   Mirage_crypto_rng_unix.use_default ();
@@ -680,6 +691,7 @@ let check_hashes () =
   check_stage_order validator_set finalize
     (signed { header with proposed_state_root = String.make 32 'c' }) bundle;
   check_live_round validator_set finalize (signed ~round:1 header) bundle;
+  check_live_round ~worker:true validator_set finalize (signed ~round:1 header) bundle;
   check_live_round ~reverse:true validator_set finalize (signed ~round:1 header) bundle;
   check_pending validator_set finalize
     (signed { header with epoch_id = 13L; prev_state_root = header.proposed_state_root }) bundle;

@@ -19,8 +19,8 @@ type v =
   | VU256 of Z.t
   | VAddr of string
   | VCap of cap
-  | VCipher of Pvac_ffi.cipher
-  | VPubKey of Pvac_ffi.pubkey
+  | VCipher of Octra_core.Fhe_image.cipher
+  | VPubKey of Octra_core.Fhe_image.key
 
 type reg = int
 
@@ -204,7 +204,7 @@ type fhe_capability =
   | Fhe_cipher_serde_cap
   | Fhe_pubkey_serde_cap
 
-type fhe_key = Key_bytes of string | Key_value of Pvac_ffi.pubkey
+type fhe_key = Key_bytes of string | Key_value of Octra_core.Fhe_image.key
 
 type call_scope = {
   depth : int;
@@ -214,12 +214,15 @@ type call_scope = {
 }
 
 type exec_ctx = {
+  async_exec : bool;
+  call_async : string -> string -> string -> v list -> call_scope -> (subcall_result, string) result Lwt.t;
+  deploy_async : string -> string -> int -> call_scope -> v list -> (spawn_result, string) result Lwt.t;
   get_balance : string -> Z.t;
   do_transfer : string -> string -> Z.t -> bool;
   call_contract : string -> string -> string -> v list -> call_scope -> (subcall_result, string) result;
   deploy_contract : string -> string -> int -> call_scope -> v list -> (spawn_result, string) result;
   get_fhe_pubkey : string -> fhe_key option;
-  get_fhe_keypair : string -> (Pvac_ffi.pubkey * Pvac_ffi.seckey) option;
+  get_fhe_keypair : string -> (Octra_core.Fhe_image.key * string) option;
   allow_fhe_capability : fhe_capability -> bool;
   cap_live : cap -> bool;
   circle_hfhe_key_id : string option;
@@ -231,6 +234,7 @@ type exec_ctx = {
   object_quorum : Octra_core.Circle_object_apply.quorum;
   int_work : Int_work.mode;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   fhe_memory : Fhe_memory.t option;
   byte_work : Byte_work.t option;
@@ -242,6 +246,9 @@ type exec_ctx = {
 }
 
 let default_ctx = {
+  async_exec = false;
+  call_async = (fun _ _ _ _ _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host));
+  deploy_async = (fun _ _ _ _ _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host));
   tx_hash = String.make 64 '0';
   get_balance = (fun _ -> Z.zero);
   do_transfer = (fun _ _ _ -> false);
@@ -260,6 +267,7 @@ let default_ctx = {
   object_quorum = Octra_core.Circle_object_apply.Machine;
   int_work = Int_work.Prior;
   fhe_work = Octra_core.Rule_graph.Prior;
+  proof_exec = Octra_core.Rule_graph.Prior;
   wasm_float = Octra_core.Rule_graph.Prior;
   fhe_memory = None;
   byte_work = None;
@@ -309,6 +317,7 @@ type s = {
   value : Z.t;
   logs : event_record list ref;
   ctx : exec_ctx;
+  fhe_local : Fhe_task.local;
   int_mode : Int_work.mode;
   byte_result : byte_result;
   mutable undo_stack : undo_entry list;
@@ -444,6 +453,7 @@ let create_state ?(limit = 1_000_000) ?(ctx = default_ctx) ?(depth = 0) ?(is_vie
     caller; origin; address; value;
     logs = ref [];
     ctx;
+    fhe_local = Fhe_task.local ();
     int_mode = ctx.int_work;
     byte_result;
     undo_stack = [];
@@ -639,6 +649,14 @@ type fhe_verification =
   | Fhe_rejected
   | Fhe_unavailable
 
+type suspension =
+  | Proof_wait of reg * Octra_core.Pvac_verify_protocol.request
+  | Fhe_wait of reg * string option * Fhe_task.request
+  | Call_wait of reg * string * string * v list
+  | Spawn_wait of reg * string * int * v list
+
+exception Suspend of suspension
+
 let fhe_verifier_lane = Mutex.create ()
 
 let with_fhe_verifier_lane f =
@@ -658,16 +676,10 @@ let fhe_verification_of_worker_result = function
   | Error Octra_core.Pvac_verify_worker.Worker_memory_exceeded
   | Error (Octra_core.Pvac_verify_worker.Worker_failed _) -> Fhe_unavailable
 
-let encoded_worker_pubkey pk =
-  Pvac_ffi.serialize_pubkey pk |> Bytes.to_string
-
-let encoded_worker_cipher cipher =
-  Octra_core.Crypto.FheBalance.encode_cipher cipher
-
 let fhe_verifier_cipher_allowed cipher =
   try
     Octra_core.Pvac_verify_policy.shape_allowed
-      (Pvac_ffi.cipher_shape cipher)
+      (Octra_core.Fhe_image.cipher_shape cipher)
   with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
     false
 
@@ -804,6 +816,11 @@ let cap_value kind = function
     && Z.to_int kind = cap.kind
   | _ -> false
 
+let state_proof_enabled st =
+  st.ctx.proof_exec = Octra_core.Rule_graph.Active
+  && st.ctx.fhe_work = Octra_core.Rule_graph.Active
+  && st.ctx.math
+
 let finish_fhe_verification st rd = function
   | Fhe_verified ->
     setr st rd (VBool true);
@@ -812,7 +829,15 @@ let finish_fhe_verification st rd = function
     setr st rd (VBool false);
     true
   | Fhe_unavailable ->
-    revert_with_reason st "fhe verifier unavailable"
+    if not st.is_view && state_proof_enabled st then
+      raise (Octra_core.Exec_resource.Unavailable Host)
+    else
+      revert_with_reason st "fhe verifier unavailable"
+
+let verify_proof st rd request =
+  if st.ctx.async_exec then raise (Suspend (Proof_wait (rd, request)));
+  Octra_core.Pvac_verify_worker.try_classified_result_sync ~math:st.ctx.math request
+  |> fhe_verification_of_worker_result
 
 let is_numeric = numeric_value
 
@@ -1466,7 +1491,7 @@ let add_object_scan_effort st =
     true
 
 let fhe_view_shape cipher =
-  let shape = Pvac_ffi.cipher_shape cipher in
+  let shape = Octra_core.Fhe_image.cipher_shape cipher in
   Fhe_view_policy.{
     slots = shape.Pvac_ffi.slots;
     layers = shape.layers;
@@ -1486,26 +1511,73 @@ let reserve_fhe ctx amount =
   | None -> true
   | Some memory -> Fhe_memory.reserve memory amount
 
-let load_fhe_key ?memory source =
+let key_allowed ?memory source =
   let permit amount = match memory with
     | None -> true
     | Some budget -> Fhe_memory.reserve budget amount in
   match source with
   | Key_value key ->
-    if permit (Fhe_memory.key_value key) then Some key else None
+    permit (Fhe_memory.key_value key)
   | Key_bytes raw ->
-    let allowed = match memory with
-      | None -> true
-      | Some _ -> Option.fold ~none:false ~some:permit (Fhe_memory.key_decode raw) in
-    if not allowed then None
-    else Result.to_option (Octra_core.Pvac_registry.load_pubkey raw)
+    match memory with
+    | None -> true
+    | Some _ -> Option.fold ~none:false ~some:permit (Fhe_memory.key_decode raw)
+
+let load_fhe_key ?memory source =
+  if not (key_allowed ?memory source) then None
+  else match source with
+    | Key_value key -> Some key
+    | Key_bytes raw ->
+      match Fhe_task.eval (Fhe_task.Load_key raw) with
+      | Ok (Fhe_task.Key key) -> Some key
+      | Error (Fhe_task.Resource resource) -> raise (Octra_core.Exec_resource.Unavailable resource)
+      | _ -> None
+
+let finish_fhe st rd reason = function
+  | Ok value ->
+    let value = match value with
+      | Fhe_task.Key key -> VPubKey key
+      | Fhe_task.Cipher cipher -> VCipher cipher
+      | Fhe_task.Text text -> VString text
+      | Fhe_task.Check _ | Fhe_task.Verified _ ->
+        raise (Octra_core.Exec_resource.Unavailable Host) in
+    setr st rd value;
+    true
+  | Error Fhe_task.Invalid ->
+    begin match reason with
+    | Some reason -> revert_with_reason st reason
+    | None -> revert st
+    end
+  | Error (Fhe_task.Resource Memory) -> raise Out_of_memory
+  | Error (Fhe_task.Resource Stack) -> raise Stack_overflow
+  | Error (Fhe_task.Resource Host) -> raise (Octra_core.Exec_resource.Unavailable Host)
+
+let eval_fhe ?reason st rd request =
+  let active = st.ctx.proof_exec = Octra_core.Rule_graph.Active in
+  if (active || st.is_view) && not (Option.fold ~none:false ~some:(add_dyn_effort st)
+      (Fhe_task.key_effort request)) then revert st
+  else if not st.is_view && not active then
+    finish_fhe st rd reason (Fhe_task.direct st.fhe_local request)
+  else if st.ctx.async_exec then raise (Suspend (Fhe_wait (rd, reason, request)))
+  else finish_fhe st rd reason (Fhe_task.eval request)
+
+let pack_proof st rd kind key cipher proof =
+  let task = Fhe_task.Pack (kind, key, cipher, proof) in
+  if st.ctx.async_exec then raise (Suspend (Fhe_wait (rd, None, task)));
+  match Fhe_task.eval task with
+  | Ok (Fhe_task.Check request) -> verify_proof st rd request
+  | Error Fhe_task.Invalid -> failwith "fhe proof encoding rejected"
+  | Error (Fhe_task.Resource Memory) -> raise Out_of_memory
+  | Error (Fhe_task.Resource Stack) -> raise Stack_overflow
+  | Ok _ | Error (Fhe_task.Resource Host) -> Fhe_unavailable
 
 let charge_fhe_key st source =
-  if not st.is_view && st.ctx.fhe_work = Octra_core.Rule_graph.Prior then true
+  let active = st.is_view || st.ctx.proof_exec = Octra_core.Rule_graph.Active in
+  if not active && st.ctx.fhe_work = Octra_core.Rule_graph.Prior then true
   else
     let cost = match source with
-      | Key_value key -> Fhe_memory.key_write_effort key
-      | Key_bytes raw -> Fhe_memory.key_read_effort raw in
+      | Key_value key -> Fhe_memory.key_write_effort ~active key
+      | Key_bytes raw -> Fhe_memory.key_read_effort ~active raw in
     Option.fold ~none:false ~some:(add_dyn_effort st) cost
 
 let prepare_fhe_work st op =
@@ -1533,17 +1605,17 @@ let prepare_fhe_work st op =
           | Some register ->
             match to_pubkey (getr st register) with
             | Some pk ->
-              let shape = Pvac_ffi.pubkey_sampling pk in
+              let shape = pk.Octra_core.Fhe_image.sampling in
               let samples = Fhe_view_policy.sampling ~rows:shape.rows ~columns:shape.columns
                 ~weight:shape.weight ~noise:shape.noise ~branches:shape.branches in
               if not (reserve_fhe st.ctx (Fhe_memory.key_value pk)) then -1, -1
-              else Pvac_ffi.pubkey_bit_words pk, Option.value samples ~default:(-1)
+              else Octra_core.Fhe_image.key_words pk, Option.value samples ~default:(-1)
             | None -> -1, -1 in
         match to_cipher (getr st left), to_cipher (getr st right) with
         | Some left, Some right ->
           begin match Fhe_view_policy.plan kind ~base:(effort_cost op)
-            ~left_words:(Pvac_ffi.cipher_bit_words left)
-            ~right_words:(Pvac_ffi.cipher_bit_words right)
+            ~left_words:(Octra_core.Fhe_image.cipher_words left)
+            ~right_words:(Octra_core.Fhe_image.cipher_words right)
             ~product_words ~sample_work
             ~left:(fhe_view_shape left) ~right:(fhe_view_shape right) with
           | Some (effort, memory) ->
@@ -3302,6 +3374,7 @@ let exec_one st op =
       let target = to_string (getr st rt) in
       let method_name = to_string (getr st rm) in
       let args = List.init nargs (fun i -> getr st (ra + i)) in
+      if st.ctx.async_exec then raise (Suspend (Call_wait (rd, target, method_name, args)));
       (match st.ctx.call_contract st.address target method_name args (child_scope st) with
        | Ok sub ->
          if not (add_dyn_effort st sub.effort_used) then revert st
@@ -3332,7 +3405,8 @@ let exec_one st op =
 
         let spawn_effort = 5000 + (String.length bytecode_raw / 100) in
         if not (add_dyn_effort st spawn_effort) then revert st
-        else
+        else begin
+        if st.ctx.async_exec then raise (Suspend (Spawn_wait (rd, bytecode_raw, nonce, [])));
         (match st.ctx.deploy_contract st.address bytecode_raw nonce (child_scope st) [] with
          | Ok sp ->
            if not (add_dyn_effort st sp.effort_used) then revert st
@@ -3346,6 +3420,7 @@ let exec_one st op =
              "event = spawn_reverted error = %s bytecode_bytes = %d"
              e (String.length bytecode_raw);
            storage_replace st nonce_key (string_of_int nonce); revert st)
+        end
         end)
   | SPAWN2 (rd, rs, base, nargs) ->
     if not (valid_reg_span base nargs) then revert st
@@ -3368,7 +3443,8 @@ let exec_one st op =
         storage_replace st nonce_key next;
         let spawn_effort = 5000 + (String.length bytecode_raw / 100) in
         if not (add_dyn_effort st spawn_effort) then revert st
-        else
+        else begin
+        if st.ctx.async_exec then raise (Suspend (Spawn_wait (rd, bytecode_raw, nonce, params)));
         (match st.ctx.deploy_contract st.address bytecode_raw nonce (child_scope st) params with
          | Ok sp ->
            if not (add_dyn_effort st sp.effort_used) then revert st
@@ -3382,6 +3458,7 @@ let exec_one st op =
              "event = spawn_reverted version = 2 error = %s bytecode_bytes = %d params = %d"
              e (String.length bytecode_raw) nargs;
            storage_replace st nonce_key (string_of_int nonce); revert st)
+        end
         end)
   | TRANSFER (rd, ra, rv) ->
     if not (view_guard st) then false
@@ -3473,18 +3550,20 @@ let exec_one st op =
       let addr = to_string (getr st rs) in
       (match st.ctx.get_fhe_pubkey addr with
        | Some source when not (charge_fhe_key st source) -> revert st
-       | source ->
-         (match Option.bind source (load_fhe_key ?memory:st.ctx.fhe_memory) with
-          | Some pk -> setr st rd (VPubKey pk); true
-          | None -> revert_with_reason st ("fhe pubkey not available: " ^ addr)))
+       | Some source when key_allowed ?memory:st.ctx.fhe_memory source ->
+         begin match source with
+         | Key_value key -> setr st rd (VPubKey key); true
+         | Key_bytes raw -> eval_fhe st rd
+             ~reason:("fhe pubkey not available: " ^ addr) (Fhe_task.Load_key raw)
+         end
+       | Some _ | None -> revert_with_reason st ("fhe pubkey not available: " ^ addr))
   | FHE_ADD (rd, rpk, ra, rb) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
       revert st
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
-         (try setr st rd (VCipher (Pvac_ffi.ct_add pk a b)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         eval_fhe st rd (Fhe_task.Add (pk, a, b))
        | _ -> revert st)
   | FHE_SUB (rd, rpk, ra, rb) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -3492,8 +3571,7 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st ra), to_cipher (getr st rb) with
        | Some pk, Some a, Some b ->
-         (try setr st rd (VCipher (Pvac_ffi.ct_sub pk a b)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         eval_fhe st rd (Fhe_task.Sub (pk, a, b))
        | _ -> revert st)
   | FHE_MUL (rd, rpk, ra, rb) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -3504,20 +3582,15 @@ let exec_one st op =
          if not (fhe_slots_match a b) then
            revert st
          else
-           (try
-              let seed = deterministic_seed [
-                "aml.fhe_mul";
-                st.ctx.tx_hash;
-                st.address;
-                string_of_int st.pc;
-                string_of_int rd;
-              ] in
-              let result =
-                if st.is_view || st.ctx.fhe_work = Octra_core.Rule_graph.Active then
-                  Pvac_ffi.ct_mul_work (st.ctx.math, Fhe_view_policy.sample_factor) pk a b seed
-                else Pvac_ffi.ct_mul_seeded ~math:st.ctx.math pk a b seed in
-              setr st rd (VCipher result); true
-            with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+           let seed = deterministic_seed [
+             "aml.fhe_mul";
+             st.ctx.tx_hash;
+             st.address;
+             string_of_int st.pc;
+             string_of_int rd;
+           ] |> Bytes.to_string in
+           let work = st.is_view || st.ctx.fhe_work = Octra_core.Rule_graph.Active in
+           eval_fhe st rd (Fhe_task.Mul (st.ctx.math, work, pk, a, b, seed))
        | _ -> revert st)
   | FHE_SCALE (rd, rpk, rct, rscalar) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -3525,10 +3598,8 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct) with
        | Some pk, Some ct ->
-         (try
-            let s = Z.to_int64 (to_z (getr st rscalar)) in
-            setr st rd (VCipher (Pvac_ffi.ct_scale ~math:st.ctx.math pk ct s)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         let amount = Z.to_int64 (to_z (getr st rscalar)) in
+         eval_fhe st rd (Fhe_task.Scale (st.ctx.math, pk, ct, amount))
        | _ -> revert st)
   | FHE_DIV_CONST (rd, rpk, rct, rdivisor) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -3540,10 +3611,7 @@ let exec_one st op =
          if Z.sign divisor <= 0 || Z.gt divisor (Z.of_int64 Int64.max_int) then
            revert_with_reason st "fhe_div_const divisor out of range"
          else
-           (try
-              let lo = Z.to_int64 divisor in
-              setr st rd (VCipher (Pvac_ffi.ct_div_const pk ct lo 0L)); true
-            with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+           eval_fhe st rd (Fhe_task.Divide (pk, ct, Z.to_int64 divisor))
        | _ -> revert st)
   | FHE_ADD_CONST (rd, rpk, rct, rconst) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -3551,15 +3619,8 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct) with
        | Some pk, Some ct ->
-         (try
-            let c = Z.to_int64 (to_z (getr st rconst)) in
-            let lo, hi =
-              if st.ctx.math && Int64.compare c 0L < 0 then
-                Int64.pred c, Int64.max_int
-              else c, 0L
-            in
-            setr st rd (VCipher (Pvac_ffi.ct_add_const ~math:st.ctx.math pk ct lo hi)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         let amount = Z.to_int64 (to_z (getr st rconst)) in
+         eval_fhe st rd (Fhe_task.Add_int (st.ctx.math, pk, ct, amount))
        | _ -> revert st)
   | FHE_SUB_CONST (rd, rpk, rct, rconst) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_arithmetic_cap) then
@@ -3567,20 +3628,13 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct) with
        | Some pk, Some ct ->
-         (try
-            let c = Z.to_int64 (to_z (getr st rconst)) in
-            let result =
-              if st.ctx.math && Int64.compare c 0L < 0 then
-                Pvac_ffi.ct_add_const ~math:true pk ct (Int64.neg c) 0L
-              else Pvac_ffi.ct_sub_const ~math:st.ctx.math pk ct c
-            in
-            setr st rd (VCipher result); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         let amount = Z.to_int64 (to_z (getr st rconst)) in
+         eval_fhe st rd (Fhe_task.Sub_int (st.ctx.math, pk, ct, amount))
        | _ -> revert st)
   | FHE_VERIFY_ZERO (rd, rpk, rct, rproof) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_zero_cap) then
       revert st
-    else if not st.is_view then
+    else if not st.is_view && not (state_proof_enabled st) then
       revert st
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct), to_bytes (getr st rproof) with
@@ -3596,19 +3650,14 @@ let exec_one st op =
                match worker_zero_proof proof_bytes with
                | None -> Fhe_rejected
                | Some proof ->
-                 Octra_core.Pvac_verify_worker.try_verify_zero_sync_classified
-                   ~math:st.ctx.math
-                   ~pubkey:(encoded_worker_pubkey pk)
-                   ~cipher:(encoded_worker_cipher ct)
-                   ~proof
-                 |> fhe_verification_of_worker_result)
+                 pack_proof st rd Fhe_task.Zero pk ct proof)
            in
            finish_fhe_verification st rd verification
        | _ -> revert st)
   | FHE_VERIFY_RANGE (rd, rpk, rct, rproof) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_range_cap) then
       revert st
-    else if not st.is_view then
+    else if not st.is_view && not (state_proof_enabled st) then
       revert st
     else
     (match to_pubkey (getr st rpk), to_cipher (getr st rct), to_bytes (getr st rproof) with
@@ -3624,18 +3673,12 @@ let exec_one st op =
              match worker_range_proof proof_bytes with
              | None -> Fhe_rejected
              | Some proof ->
-               Octra_core.Pvac_verify_worker.try_verify_range_sync_classified
-                 ~math:st.ctx.math
-                 ~strict:true
-                 ~pubkey:(encoded_worker_pubkey pk)
-                 ~cipher:(encoded_worker_cipher ct)
-                 ~proof
-               |> fhe_verification_of_worker_result)
+               pack_proof st rd Fhe_task.Range pk ct proof)
          in
          finish_fhe_verification st rd verification
      | _ -> revert st)
   | GROTH16_VERIFY_BN254 (rd, rvk, rproof, rinputs) ->
-    if not st.is_view then
+    if not st.is_view && not (state_proof_enabled st) then
       revert st
     else
     (match to_bytes (getr st rvk), to_bytes (getr st rproof), to_bytes (getr st rinputs) with
@@ -3663,6 +3706,12 @@ let exec_one st op =
               not (add_dyn_effort st (count * groth16_public_input_effort)) ->
             setr st rd (VBool false);
             true
+          | Some _ when state_proof_enabled st ->
+            verify_proof st rd (Octra_core.Pvac_verify_protocol.Groth16 {
+              key = vk_raw;
+              proof = proof_raw;
+              inputs = inputs_raw;
+            }) |> finish_fhe_verification st rd
           | Some _ ->
             Zk_ffi.initialize ();
             (try
@@ -3676,7 +3725,7 @@ let exec_one st op =
   | FHE_VERIFY_BOUND (rd, rpk, rct, rproof, rcommit) ->
     if not (st.ctx.allow_fhe_capability Fhe_verify_bound_cap) then
       revert st
-    else if not st.is_view then
+    else if not st.is_view && not (state_proof_enabled st) then
       revert st
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct),
@@ -3695,14 +3744,7 @@ let exec_one st op =
                  worker_commitment commit_bytes
                with
                | Some proof, Some commitment ->
-                 Octra_core.Pvac_verify_worker.try_verify_claim_sync_classified
-                   ~math:st.ctx.math
-                   ~strict:true
-                   ~pubkey:(encoded_worker_pubkey pk)
-                   ~cipher:(encoded_worker_cipher ct)
-                   ~proof
-                   ~commitment
-                 |> fhe_verification_of_worker_result
+                 pack_proof st rd (Fhe_task.Claim commitment) pk ct proof
                | _ -> Fhe_rejected)
            in
            finish_fhe_verification st rd verification
@@ -3713,10 +3755,7 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk), to_cipher (getr st rct) with
        | Some pk, Some ct ->
-         (try
-            let raw = Bytes.to_string (Pvac_ffi.commit_ct pk ct) in
-            setr st rd (VString (Base64.encode_exn raw)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         eval_fhe st rd (Fhe_task.Commit (pk, ct))
        | _ -> revert st)
   | FHE_PEDERSEN (rd, ramount, rblinding) ->
     if not (st.ctx.allow_fhe_capability Fhe_pedersen_cap) then
@@ -3771,10 +3810,7 @@ let exec_one st op =
     else
       (match to_cipher (getr st rct) with
        | Some ct ->
-         (try
-            let raw = Bytes.to_string (Pvac_ffi.serialize_cipher ct) in
-            setr st rd (VString (Base64.encode_exn raw)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         eval_fhe st rd (Fhe_task.Write_cipher ct)
        | None -> revert st)
   | FHE_DESER (rd, rbytes) ->
     if not (st.ctx.allow_fhe_capability Fhe_cipher_serde_cap) then
@@ -3788,17 +3824,9 @@ let exec_one st op =
             || not (reserve_fhe st.ctx (Fhe_memory.cipher_decode raw)) then
            revert st
          else
-           (try
-              let ct =
-                Pvac_ffi.deserialize_cipher
-                  ~strict:st.ctx.point_ops
-                  ~cap:(st.is_view || st.ctx.point_ops || st.ctx.fhe_work = Octra_core.Rule_graph.Active)
-                  (Bytes.of_string raw)
-              in
-              setr st rd (VCipher ct);
-              true
-            with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
-              revert st)
+           let cap = st.is_view || st.ctx.point_ops
+             || st.ctx.fhe_work = Octra_core.Rule_graph.Active in
+           eval_fhe st rd (Fhe_task.Read_cipher (st.ctx.point_ops, cap, raw))
        | Some _ -> revert st
        | None -> revert st)
   | FHE_SER_PK (rd, rpk) ->
@@ -3807,13 +3835,9 @@ let exec_one st op =
     else
       (match to_pubkey (getr st rpk) with
        | Some pk ->
-         (try
-            if not (charge_fhe_key st (Key_value pk))
-              || not (reserve_fhe st.ctx (Fhe_memory.key_value pk)) then revert st
-            else
-            let raw = Bytes.to_string (Pvac_ffi.serialize_pubkey pk) in
-            setr st rd (VString (Base64.encode_exn raw)); true
-          with (Out_of_memory | Stack_overflow) as error -> raise error | _ -> revert st)
+         if not (charge_fhe_key st (Key_value pk))
+           || not (reserve_fhe st.ctx (Fhe_memory.key_value pk)) then revert st
+         else eval_fhe st rd (Fhe_task.Write_key pk)
        | None -> revert st)
   | FHE_DESER_PK (rd, rbytes) ->
     if not (st.ctx.allow_fhe_capability Fhe_pubkey_serde_cap) then
@@ -3831,12 +3855,7 @@ let exec_one st op =
                 && (st.ctx.fhe_memory = None
                   || Option.fold ~none:false ~some:(reserve_fhe st.ctx)
                     (Fhe_memory.key_decode raw)) ->
-              (try
-                 let pk = Pvac_ffi.deserialize_pubkey (Bytes.of_string raw) in
-                 setr st rd (VPubKey pk);
-                 true
-               with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
-                 revert st)
+              eval_fhe st rd (Fhe_task.Read_key raw)
             | Some _ | None ->
               revert st)
        | Some _ -> revert st
@@ -3894,6 +3913,133 @@ let step state program =
   | Not_found
   | Division_by_zero ->
     refuse state
+
+let proof_host run =
+  Lwt.catch (fun () -> Octra_core.Exec_resource.protect run ()) (function
+    | Lwt.Canceled as error -> Lwt.fail error
+    | Octra_core.Exec_resource.Unavailable _ as error -> Lwt.fail error
+    | Out_of_memory -> Lwt.fail (Octra_core.Exec_resource.Unavailable Memory)
+    | Stack_overflow -> Lwt.fail (Octra_core.Exec_resource.Unavailable Stack)
+    | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host))
+
+let run_async ?(running = fun () -> true) state program =
+  let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
+  let valid () =
+    if not (running ()) then raise (Octra_core.Exec_resource.Unavailable Host)
+  in
+  let rec resume = function
+    | Fhe_wait (rd, reason, request) ->
+      let pc = state.pc in
+      let seconds = if state.is_view then 10. else Octra_core.Pvac_verify_worker.timeout_seconds () in
+      let now = Mtime_clock.elapsed_ns () in
+      let deadline = Int64.add now (Int64.of_float (seconds *. 1_000_000_000.)) in
+      if deadline <= now then raise (Octra_core.Exec_resource.Unavailable Host);
+      let ticket = Proof_wait.{
+        request = deterministic_seed [string_of_int pc; string_of_int state.effort_used]
+          |> Bytes.to_string;
+        generation = deterministic_seed [
+          string_of_int state.ctx.current_epoch; state.ctx.tree_hash;
+          state.ctx.tx_hash; state.address; string_of_int state.call_depth;
+        ] |> Bytes.to_string;
+      } in
+      let waiting = ref (Proof_wait.Waiting (ticket, deadline)) in
+      Lwt.finalize (fun () ->
+        let* result = proof_host (fun () ->
+          Fhe_task.run ~urgent:(not state.is_view) ~ticket ~deadline request) in
+        valid ();
+        let next, effects = Proof_wait.delta !waiting
+          (Proof_wait.Reply (ticket, Mtime_clock.elapsed_ns (), result)) in
+        waiting := next;
+        match effects with
+        | [Proof_wait.Deliver result] when state.pc = pc && not state.reverted ->
+          begin match result with
+          | Ok (Fhe_task.Check request) -> resume (Proof_wait (rd, request))
+          | result -> Lwt.return (finish_fhe state rd reason result)
+          end
+        | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host))
+        (fun () ->
+          waiting := fst (Proof_wait.delta !waiting Proof_wait.Cancel);
+          Lwt.return_unit)
+    | Proof_wait (rd, request) ->
+      let pc = state.pc in
+      let seconds = if state.is_view then 10. else Octra_core.Pvac_verify_worker.timeout_seconds () in
+      let now = Mtime_clock.elapsed_ns () in
+      let deadline = Int64.add now (Int64.of_float (seconds *. 1_000_000_000.)) in
+      if deadline <= now then raise (Octra_core.Exec_resource.Unavailable Host);
+      let ticket = Proof_wait.{
+        request = Octra_core.Pvac_verify_protocol.request_hash request;
+        generation = deterministic_seed [
+          string_of_int state.ctx.current_epoch; state.ctx.tree_hash;
+          state.ctx.tx_hash; state.address; string_of_int state.call_depth;
+          string_of_int pc; string_of_int state.effort_used;
+        ] |> Bytes.to_string;
+      } in
+      let waiting = ref (Proof_wait.Waiting (ticket, deadline)) in
+      Lwt.finalize (fun () ->
+        let* result = proof_host (fun () ->
+          Fhe_task.run ~urgent:(not state.is_view) ~ticket ~deadline
+            (Fhe_task.Verify (state.ctx.math, request))) in
+        valid ();
+        let next, effects = Proof_wait.delta !waiting
+          (Proof_wait.Reply (ticket, Mtime_clock.elapsed_ns (), result)) in
+        waiting := next;
+        match effects with
+        | [Proof_wait.Deliver result] when state.pc = pc && not state.reverted ->
+          let verification = match result with
+            | Ok (Fhe_task.Verified true) -> Fhe_verified
+            | Ok (Fhe_task.Verified false) -> Fhe_rejected
+            | Error (Fhe_task.Resource resource) ->
+              if not state.is_view && state_proof_enabled state then
+                raise (Octra_core.Exec_resource.Unavailable resource);
+              Fhe_unavailable
+            | Ok _ | Error Fhe_task.Invalid ->
+              raise (Octra_core.Exec_resource.Unavailable Host) in
+          Lwt.return (finish_fhe_verification state rd verification)
+        | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host))
+        (fun () ->
+          waiting := fst (Proof_wait.delta !waiting Proof_wait.Cancel);
+          Lwt.return_unit)
+    | Call_wait (rd, target, method_name, args) ->
+      let* result = state.ctx.call_async state.address target method_name args (child_scope state) in
+      valid ();
+      begin match result with
+      | Ok sub when add_dyn_effort state sub.effort_used ->
+        state.logs := List.rev_append sub.events !(state.logs);
+        setr state rd sub.return_value;
+        Lwt.return_true
+      | Ok _ | Error _ -> Lwt.return (revert state)
+      end
+    | Spawn_wait (rd, code, nonce, params) ->
+      let* result = state.ctx.deploy_async state.address code nonce (child_scope state) params in
+      valid ();
+      begin match result with
+      | Ok spawn when add_dyn_effort state spawn.effort_used ->
+        state.logs := List.rev_append spawn.events !(state.logs);
+        setr state rd (VAddr spawn.spawned_addr);
+        Lwt.return_true
+      | Ok _ | Error _ ->
+        storage_replace state "\x00spawn_nonce" (string_of_int nonce);
+        Lwt.return (revert state)
+      end
+  in
+  let rec loop quota =
+    valid ();
+    match step state program with
+    | Finished -> Lwt.return_true
+    | Refused -> Lwt.return_false
+    | Running when quota > 0 -> loop (quota - 1)
+    | Running ->
+      let* () = Lwt.pause () in
+      loop 4096
+    | exception Suspend request ->
+      let* continued = resume request in
+      if continued then loop 4096 else Lwt.return_false
+  in
+  Lwt.catch (fun () -> Octra_core.Exec_resource.protect (fun () -> loop 4096) ()) (fun error ->
+    ignore (refuse state);
+    match error with
+    | Lwt_unix.Timeout -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host)
+    | _ -> Lwt.fail error)
 
 module Verifier = struct
   type err =

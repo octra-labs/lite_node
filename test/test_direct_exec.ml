@@ -157,6 +157,11 @@ let test_commit_failure_bubbles () =
 let test_resource_failures () =
   List.iter (fun error ->
     List.iter (fun pending ->
+      let expected = if pending then error else match error with
+        | Out_of_memory -> Octra_core.Exec_resource.Unavailable Memory
+        | Stack_overflow -> Octra_core.Exec_resource.Unavailable Stack
+        | failure -> failure
+      in
       let saved = ref false in
       let charged = ref false in
       let raised = try
@@ -171,7 +176,7 @@ let test_resource_failures () =
           crash = (fun _ _ -> charged := true; Lwt.return_unit);
         });
         false
-      with actual when actual = error -> true in
+      with actual when actual = expected -> true in
       ok "resource exception preserved" raised;
       ok "resource exception has no receipt" (not !saved);
       ok "resource exception has no charge" (not !charged))
@@ -179,7 +184,12 @@ let test_resource_failures () =
 
 let test_resource_abort () =
   List.iter (fun error ->
-    List.iter (fun exec ->
+    List.iter (fun (sync, exec) ->
+      let expected = if not sync then error else match error with
+        | Out_of_memory -> Octra_core.Exec_resource.Unavailable Memory
+        | Stack_overflow -> Octra_core.Exec_resource.Unavailable Stack
+        | failure -> failure
+      in
       List.iter (fun delayed ->
         let changed = ref false in
         let events = ref [] in
@@ -189,7 +199,9 @@ let test_resource_abort () =
           abort_store = (fun () -> push "store");
           abort_history = (fun () -> push "history");
           fatal = (fun text -> push text);
-          exit = (fun () -> push "exit");
+          exit = (fun error ->
+            if error <> expected then failwith "atomic exit lost original fault";
+            push "exit");
         } in
         let apply () = D.run (spec ()) {
           apply = (fun _ -> changed := true);
@@ -205,17 +217,17 @@ let test_resource_abort () =
           Lwt_main.run (A.run effects (fun () ->
             if delayed then Lwt.bind (Lwt.pause ()) apply else apply ()));
           false
-        with actual when actual = error -> true in
+        with actual when actual = expected -> true in
         ok "atomic resource error preserved" raised;
         ok "atomic value restored" (not !changed);
         ok "atomic abort and exit order"
           (List.rev !events = ["ledger"; "store"; "history";
-            "event = epoch_apply_failed reason = " ^ Printexc.to_string error;
+            "event = epoch_apply_failed reason = " ^ Printexc.to_string expected;
             "exit"]);
         ok "event loop released" (Lwt_main.run (Lwt.return 7) = 7)
       ) [false; true]
-    ) [(fun error -> raise error); Lwt.fail;
-       (fun error -> Lwt_preemptive.detach (fun () -> raise error) ())]
+    ) [true, (fun error -> raise error); false, Lwt.fail;
+       false, (fun error -> Lwt_preemptive.detach (fun () -> raise error) ())]
   ) [Stack_overflow; Out_of_memory]
 
 let test_async_exit exits =
@@ -228,11 +240,16 @@ let test_async_exit exits =
 
 let () =
   let exits = ref 0 in
-  S.configure_lwt ~exit_fatal:(fun () -> incr exits);
+  let refused = ref 0 in
+  S.configure_lwt ~exit_fatal:(fun () -> incr exits)
+    ~exit_refused:(fun () -> incr refused);
   test_resource_failures ();
   test_resource_abort ();
   ok "handled resource failure avoids async exit" (!exits = 0);
   test_async_exit exits;
+  let before = !exits in
+  Lwt.async (fun () -> Lwt.fail (Octra_core.Private_ledger.Worker_stopped "test"));
+  ok "async worker failure became restart" (!exits = before && !refused = 1);
   test_success ();
   test_failed_receipt ();
   test_reject ();

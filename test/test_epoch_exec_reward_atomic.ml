@@ -108,6 +108,7 @@ let fold standard_mode =
     program_mode = Octra_core.Rule_graph.Prior;
     program_overlap = false;
     fhe_work = Octra_core.Rule_graph.Prior;
+    proof_exec = Octra_core.Rule_graph.Prior;
     wasm_float = Octra_core.Rule_graph.Prior;
     math = false;
     cap_mode = Octra_core.Set_fold.Prune;
@@ -496,6 +497,7 @@ let test_integer_work_gate () =
           get_fhe_pubkey = (fun _ -> None);
           proof_mode;
           fhe_work = Octra_core.Rule_graph.Prior;
+          proof_exec = Octra_core.Rule_graph.Prior;
           wasm_float = Octra_core.Rule_graph.Prior;
           math = false;
           object_cost = false;
@@ -1329,6 +1331,35 @@ let test_worker_retry_loop () =
   expect "worker retry result" (value = 7);
   expect "worker retry count" (!calls = 3);
   expect "worker retry waits" (List.rev !waits = [0.25; 0.5]);
+  calls := 0;
+  waits := [];
+  let stopped = try
+    A.worker_retry ~wait (fun () ->
+      incr calls;
+      if !calls > 4 then failwith "worker retry budget exceeded";
+      Lwt.fail (Octra_core.Private_ledger.Worker_retry "permanent"))
+    |> Lwt_main.run |> ignore;
+    false
+  with Octra_core.Private_ledger.Worker_stopped reason -> reason = "permanent" in
+  expect "worker failure did not stop" (stopped && !calls = 4);
+  expect "worker stop delay changed" (List.rev !waits = [0.25; 0.5; 1.]);
+  List.iter (fun (resource, attempts) ->
+    calls := 0;
+    waits := [];
+    let stopped = try
+      A.worker_retry ~wait (fun () ->
+        incr calls;
+        if !calls > 4 then failwith "worker retry budget exceeded";
+        Lwt.fail (Octra_core.Exec_resource.Unavailable resource))
+      |> Lwt_main.run |> ignore;
+      false
+    with
+    | Octra_core.Private_ledger.Worker_stopped _ -> true
+    | Octra_core.Exec_resource.Unavailable _ -> false in
+    expect "worker resource bypassed retry" (stopped && !calls = attempts);
+    let delays = if attempts = 4 then [0.25; 0.5; 1.] else [] in
+    expect "worker resource delay changed" (List.rev !waits = delays))
+    Octra_core.Exec_resource.[Host, 4; Memory, 1; Stack, 1];
   let failed =
     try
       A.worker_retry ~wait (fun () -> Lwt.fail (Failure "fatal"))
@@ -1339,7 +1370,76 @@ let test_worker_retry_loop () =
     | Failure reason -> String.equal reason "fatal"
     | _ -> false
   in
-  expect "worker retry preserves failure" failed
+  expect "worker retry preserves failure" failed;
+  let sleeping, _ = Lwt.task () in
+  let retry = A.worker_retry ~wait:(fun _ -> sleeping) (fun () ->
+    Lwt.fail (Octra_core.Private_ledger.Worker_retry "worker unavailable")) in
+  Lwt.cancel retry;
+  expect "worker retry ignored cancellation" (Lwt.state retry = Lwt.Fail Lwt.Canceled)
+
+let test_worker_stop_rollback () =
+  let module Private = Octra_core.Private_ledger in
+  let module Sender = Octra_node_runtime.Consensus_epoch_apply_sender in
+  List.iter (fun (resource, attempts) ->
+    with_store (fun store ->
+      let ledger = L.create store in
+      let tx = atomic_tx 1 in
+      expect "worker account added" (L.add_account ledger tx.from (Z.of_int 100) = Ok ());
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (S.begin_epoch_batch store);
+      let calls = ref 0 in
+      let stopped = try
+        Sender.run Sender.{
+          process = (fun _ ->
+            Private.worker_retry ~wait:(fun _ -> Lwt.return_unit) (fun () ->
+              incr calls;
+              if !calls > 4 then failwith "worker retry budget exceeded";
+              Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+                expect "worker attempt debit refused"
+                  (L.debit ledger tx.from (Z.of_int 40) tx.nonce = Ok ());
+                Lwt.fail (Octra_core.Exec_resource.Unavailable resource))) |> Lwt.map ignore);
+          fatal = (fun ~sender:_ error ->
+            failwith ("worker stop became fatal restart: " ^ Printexc.to_string error));
+        } [tx]
+        |> Lwt_main.run |> ignore;
+        false
+      with Private.Worker_stopped reason ->
+        reason = Octra_core.Exec_resource.name resource ^ " unavailable" in
+      expect "worker stop lost reason" (stopped && !calls = attempts);
+      expect "worker stop changed balance" (Z.equal (L.find ledger tx.from).L.balance (Z.of_int 100));
+      expect "worker stop changed nonce" ((L.find ledger tx.from).L.nonce = 0);
+      expect "worker stop retained journal" (not (L.journal_active ledger));
+      S.abort_epoch_batch store))
+    Octra_core.Exec_resource.[Host, 4; Memory, 1; Stack, 1]
+
+let test_key_retry () =
+  let module Shell = Octra_node_runtime.Consensus_epoch_key_switch_shell in
+  let module Private = Octra_core.Private_ledger in
+  let calls = ref 0 in
+  let confirmed = ref 0 in
+  let refused = ref 0 in
+  let failure = Private.{tag = "key_switch_worker_retry"; reason = "worker unavailable";
+    user_reason = "worker unavailable"} in
+  let unavailable = Private.Key_switch_rejected {failure; consume_nonce = false} in
+  let deps = Shell.{
+    gate = (fun () -> None);
+    apply = (fun () ->
+      incr calls;
+      Lwt.return (if !calls = 1 then unavailable
+        else Private.Key_switch_applied {old_key_hash = "old"; new_key_hash = "new";
+          migrated_cipher = true}));
+    reject_gate = (fun _ -> failwith "unexpected private gate");
+    reject_key_switch = (fun ~event:_ _ -> incr refused; Lwt.return_unit);
+    log_applied = (fun _ -> ());
+    incr_fhe = (fun () -> ());
+    confirm = (fun () -> incr confirmed; Lwt.return_unit);
+  } in
+  Lwt_main.run (Shell.run deps);
+  expect "key switch worker became rejection" (!calls = 2 && !confirmed = 1 && !refused = 0);
+  let retry = Shell.run {deps with apply = (fun () -> Lwt.return unavailable)} in
+  Lwt.cancel retry;
+  expect "key switch retry ignored cancellation" (Lwt.state retry = Lwt.Fail Lwt.Canceled);
+  expect "key switch cancellation wrote receipt" (!confirmed = 1 && !refused = 0)
 
 let () =
   test_standard_gate ();
@@ -1373,4 +1473,6 @@ let () =
   test_tx_exception_rollback ();
   test_worker_retry_rollback ();
   test_worker_retry_loop ();
+  test_worker_stop_rollback ();
+  test_key_retry ();
   print_endline "status = pass test = epoch_exec_reward_atomic"

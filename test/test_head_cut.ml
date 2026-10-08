@@ -69,7 +69,7 @@ let prepare dir =
     let entry = Wal.{epoch_id = 1; pre_state_root = ledger_root;
       post_state_root = hash '8'; parent_commit = Option.get irmin_commit; start_txid = suffix_start;
       tx_count = 1; finalized_by = "test"; finalized_at = 0.;
-      irmin_last_epoch_before = 0} in
+      irmin_last_epoch_before = 0; irmin_parent = None} in
     expect "unexpected recovery action"
       (Wal.decide_action ~entry ~chaindata_last_epoch:1 ~irmin_last_epoch:0
         = Wal.ForwardReplayIrmin);

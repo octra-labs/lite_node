@@ -43,7 +43,7 @@ let prepare dir =
       [Eic.item ~txid:start_txid ~hash:tx_hash] in
     let state_root = Eic.folded_state_root ~ledger_state_root:ledger_root
       ~epoch_index_root:root in
-    SC.set_epoch chain {EL.empty_epoch_header with id = 0; state_root;
+    SC.set_epoch chain {EL.empty_epoch_header with id = 0; state_root; parent_commit = parent;
       start_txid; tx_count = 1};
     SC.set_epoch_index_commitment chain ~epoch_id:0 ~epoch_hash ~root;
     SC.commit_batch chain;
@@ -58,7 +58,8 @@ let prepare dir =
     HM.atomic_write dir head;
     let entry = Wal.{epoch_id = 0; pre_state_root = pre_root;
       post_state_root = ledger_root; parent_commit = parent; start_txid; tx_count = 1;
-      finalized_by = "test"; finalized_at = 0.; irmin_last_epoch_before = -1} in
+      finalized_by = "test"; finalized_at = 0.; irmin_last_epoch_before = -1;
+      irmin_parent = Some parent} in
     head, entry)
 
 let read path =
@@ -135,7 +136,7 @@ let advance dir head =
     Wal.write dir Wal.{epoch_id = 1; pre_state_root = HM.ledger_state_root head;
       post_state_root = ledger_root; parent_commit = Option.get head.irmin_commit;
       start_txid; tx_count = 1; finalized_by = "test"; finalized_at = 0.;
-      irmin_last_epoch_before = 0};
+      irmin_last_epoch_before = 0; irmin_parent = head.irmin_commit};
     Marker.write_marker dir 1 "irmin_committed")
 
 let change_wal dir change =

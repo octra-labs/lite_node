@@ -24,7 +24,7 @@ type compiler = Protocol | Source | Preview
 val compiler_mode : ?preview:Octra_core.Rule_graph.mode -> Octra_core.Rule_graph.mode -> compiler
 val source_id : string
 val preview_id : string
-val admit_transition : point_ops:bool -> string -> (admitted, error) result
+val admit_transition : ?loops:bool -> point_ops:bool -> string -> (admitted, error) result
 
 val error_message : error -> string
 
@@ -44,6 +44,14 @@ val compile_with :
   sources:source list ->
   (compiled, error) result
 
+val compile_at :
+  loops:bool ->
+  compiler:compiler ->
+  point_ops:bool ->
+  main:string ->
+  sources:source list ->
+  (compiled, error) result
+
 val compile :
   main:string ->
   sources:source list ->
@@ -56,5 +64,6 @@ val validate_base64 :
 val admit_base64 :
   ?compiler:compiler ->
   ?point_ops:bool ->
+  ?loops:bool ->
   string ->
   (admitted, error) result

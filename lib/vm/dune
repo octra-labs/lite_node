@@ -9,7 +9,8 @@
   zk_ffi
   zarith
   threads
-  lwt
+  lwt.unix
+  mtime.clock.os
   base64
   mirage-crypto-ec
   yojson

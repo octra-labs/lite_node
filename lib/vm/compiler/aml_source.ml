@@ -145,8 +145,9 @@ let shape syntax ast =
     | Some name -> Error ("duplicate interface name = " ^ name)
     | None -> Ok ()
 
-let compile_ast ~syntax ast =
+let compile_ast ?(loops = false) ~syntax ast =
   let ( let* ) = Result.bind in
+  let* () = if loops then Oct_scope.check_loops ast else Ok () in
   let* () = shape syntax ast in
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
   let functions = List.length ast.funcs + List.length ast.forms in
@@ -163,7 +164,7 @@ let compile_ast ~syntax ast =
       match Oct_form.link ast with
       | Error reason -> Error reason
       | Ok (ast, direct, calls) ->
-        let code, seals = Oct_gen.generate ~syntax ~direct ~calls ast in
+        let code, seals = Oct_gen.generate ~syntax ~loops ~direct ~calls ast in
         if program && Array.length code > Program_limits.max_instructions then
           Error "program instruction count exceeds capacity"
         else
@@ -242,12 +243,12 @@ let caught ?source action =
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | Failure message | Invalid_argument message -> Error message
 
-let compile ~syntax source =
+let compile ?(loops = false) ~syntax source =
   caught (fun () ->
     let ast = Oct_parse.parse source in
-    compile_ast ~syntax ast)
+    compile_ast ~loops ~syntax ast)
 
-let compile_multi ~syntax resolver main_path =
+let compile_multi ?(loops = false) ~syntax resolver main_path =
   let cache = Hashtbl.create 16 in
   let load path =
     match Hashtbl.find_opt cache path with
@@ -312,6 +313,10 @@ let compile_multi ~syntax resolver main_path =
       | Error reason -> Error reason
       | Ok interfaces ->
         caught ~source:main_path (fun () ->
-          compile_ast ~syntax
+          compile_ast ~loops ~syntax
             { main with Oct_lang.interfaces = interfaces @ main.interfaces })
     end
+
+let check_loops ~syntax resolver main_path =
+  compile_multi ~loops:true ~syntax resolver main_path
+  |> Result.map (fun _ -> ())

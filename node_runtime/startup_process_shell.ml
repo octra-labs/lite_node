@@ -219,10 +219,14 @@ let initialize_crypto exit_fatal =
 let set_async_exception_hook report =
   Lwt.async_exception_hook := report
 
-let configure_lwt ~exit_fatal =
+let configure_lwt ~exit_fatal ~exit_refused =
   Lwt.Exception_filter.set Lwt.Exception_filter.handle_all;
   set_async_exception_hook (fun error ->
     match error with
+    | Octra_core.Private_ledger.Worker_stopped _ ->
+        Fun.protect ~finally:exit_refused (fun () ->
+          Octra_log.fatal "runtime"
+            "event = proof_worker_stopped error = %s" (Printexc.to_string error))
     | Stack_overflow | Out_of_memory ->
         Fun.protect ~finally:exit_fatal (fun () ->
           Octra_log.fatal "runtime"
@@ -234,7 +238,7 @@ let configure_lwt ~exit_fatal =
           (Printexc.to_string error))
 
 let configure_process ~exit_fatal =
-  configure_lwt ~exit_fatal;
+  configure_lwt ~exit_fatal ~exit_refused:(fun () -> Unix._exit 78);
   Octra_log.init_from_env ();
   Octra_log.info "init" "starting_node backend = irmin-pack";
   configure_lwt_engine ();

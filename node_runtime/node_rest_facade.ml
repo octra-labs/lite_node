@@ -14,6 +14,8 @@ module Wallet = Octra_core.Crypto.Wallet
 type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
   duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
+  proof_mode : unit -> Octra_core.Rule_graph.mode;
+  queue_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Staging.drop_record list -> unit;
   find_drop : string -> Octra_core.Tx_drop.row option;
@@ -94,7 +96,8 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
   match Tx_view.bft_op_admission ~bft_mode tx with
   | Error (_, reason) -> Error reason
   | Ok () ->
-    let* () = if bft_mode then Octra_core.Resource_lanes.circle_admission tx else Ok () in
+    let* () = if bft_mode then
+      Octra_core.Resource_lanes.queue_check ~mode:(runtime.proof_mode ()) tx else Ok () in
     match Tx_view.staging_submit_admission
             ~min_ou:(Rest_read_rpc.stealth_floor ())
             ~min_relay_fee:(Staging.min_relay_fee tx)
@@ -102,6 +105,8 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
     | Error e -> Error e
     | Ok _ ->
       let tx_hash = Transaction.hash tx in
+      let queue_head = runtime.queue_head () in
+      let* () = Staging.Preview.send (Check (queue_head, tx_hash)) in
       expire_duty ~sender:tx.from runtime ();
       if tx.Transaction.op_type = Transaction.ValidatorReady
          && Option.is_some (Staging.find_by_hash tx_hash) then Ok tx_hash
@@ -115,7 +120,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
         ~head ~confirmed_nonce tx with
       | Error _ as error -> error
       | Ok () ->
-      match Staging.add_smart ~lookup tx with
+      match Staging.add_smart ?head:queue_head ~lookup tx with
       | Error e -> Error e
       | Ok drops ->
         runtime.save_drops drops;

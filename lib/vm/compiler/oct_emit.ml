@@ -27,10 +27,11 @@ type env = {
   mutable fn_is_view : bool;
   mutable fn_is_pure : bool;
   checked : bool;
+  loops : bool;
   declaration : declaration;
 }
 
-let make_env checked declaration structs enums consts state events errors funcs = {
+let make_env loops checked declaration structs enums consts state events errors funcs = {
   structs; enums; consts; state; events; errors; funcs;
   func_labels = Hashtbl.create 16;
   locals = [];
@@ -41,6 +42,7 @@ let make_env checked declaration structs enums consts state events errors funcs 
   fn_is_view = false;
   fn_is_pure = false;
   checked;
+  loops;
   declaration;
 }
 
@@ -2433,6 +2435,8 @@ and gen_stmt env stmt =
 
   | SIf (cond, then_body, else_body) ->
     let rc = gen_expr env cond in
+    let locals = env.locals in
+    let base = env.base_reg in
     let then_label = alloc_label env in
     let end_label = alloc_label env in
     emit env (Contract_vm.JIF (rc, then_label));
@@ -2440,29 +2444,57 @@ and gen_stmt env stmt =
      | Some stmts -> List.iter (gen_stmt env) stmts
      | None -> ());
     emit env (Contract_vm.JMP end_label);
+    if env.loops then begin
+      env.locals <- locals;
+      env.base_reg <- base;
+      env.next_reg <- base
+    end;
     emit env (Contract_vm.JDEST then_label);
     List.iter (gen_stmt env) then_body;
-    emit env (Contract_vm.JDEST end_label)
+    emit env (Contract_vm.JDEST end_label);
+    if env.loops then begin
+      env.locals <- locals;
+      env.base_reg <- base;
+      env.next_reg <- base
+    end
 
   | SWhile (cond, body) ->
     guard_pure_while env;
+    let locals = env.locals in
+    let base = env.base_reg in
     let test_label = alloc_label env in
     let loop_label = alloc_label env in
     emit env (Contract_vm.JMP test_label);
     emit env (Contract_vm.JDEST loop_label);
     List.iter (gen_stmt env) body;
+    if env.loops then begin
+      env.locals <- locals;
+      env.base_reg <- base
+    end;
     emit env (Contract_vm.JDEST test_label);
     env.next_reg <- env.base_reg;
     let rc = gen_expr env cond in
     emit env (Contract_vm.JIF (rc, loop_label))
 
   | SFor (name, start_e, end_e, body) ->
+    let saved_base = env.base_reg in
+    let iter_r = saved_base in
+    let end_r = saved_base + 1 in
+    if env.loops then begin
+      if end_r > 63 then gerr env.line "register capacity exceeded maximum = 64";
+      env.base_reg <- end_r + 1;
+      env.next_reg <- env.base_reg
+    end;
     let rs = gen_expr env start_e in
     let re = gen_expr env end_e in
-    let iter_r = env.base_reg in
+    let iter_r = if env.loops then iter_r else env.base_reg in
     if iter_r > 63 then gerr env.line "too many local variables (max 63 registers)";
     emit env (Contract_vm.MOV (iter_r, rs));
-    env.base_reg <- iter_r + 1;
+    let re = if env.loops then begin
+      emit env (Contract_vm.MOV (end_r, re));
+      end_r
+    end else re in
+    if not env.loops then env.base_reg <- iter_r + 1;
     env.next_reg <- env.base_reg;
     let saved_locals = env.locals in
     env.locals <- (name, iter_r, TInt) :: env.locals;
@@ -2488,6 +2520,7 @@ and gen_stmt env stmt =
 
   | SMatch (expr, arms) ->
     check_match_exhaustive env arms;
+    let saved_locals = env.locals in
     let rv = gen_expr env expr in
     let match_r = env.base_reg in
     if rv <> match_r then emit env (Contract_vm.MOV (match_r, rv));
@@ -2506,11 +2539,17 @@ and gen_stmt env stmt =
     ) arms arm_labels;
     emit env Contract_vm.REVERT;
     List.iter2 (fun (_, _, body) label ->
+      if env.loops then begin
+        env.locals <- saved_locals;
+        env.base_reg <- match_r + 1;
+        env.next_reg <- env.base_reg
+      end;
       emit env (Contract_vm.JDEST label);
       List.iter (gen_stmt env) body;
       emit env (Contract_vm.JMP end_label)
     ) arms arm_labels;
     emit env (Contract_vm.JDEST end_label);
+    if env.loops then env.locals <- saved_locals;
     env.base_reg <- match_r;
     env.next_reg <- env.base_reg
 
@@ -2796,10 +2835,11 @@ let check_interfaces (ct : contract) =
     ) iface.if_methods
   ) ct.implements
 
-let generate ?(checked = false) (ct : contract) =
+let generate ?(loops = false) ?(checked = false) (ct : contract) =
   check_interfaces ct;
   let env =
     make_env
+      loops
       checked
       ct.declaration
       ct.structs

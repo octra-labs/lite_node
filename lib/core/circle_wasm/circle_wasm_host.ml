@@ -119,13 +119,16 @@ let decode_b64_field name = function
   | _ ->
     Error (Printf.sprintf "invalid %s encoding" name)
 
-let read_process_json payload =
+let read_process_json ?call payload =
   Circle_wasm_hfhe_backend.ensure_registered ();
   let body = Yojson.Safe.to_string payload in
-  let* native =
-    Exec_resource.detach
-      (fun () -> Circle_wasm_native.run_json_classified body)
-      ()
+  let* native = match call with
+    | None -> Exec_resource.detach
+        (fun () -> Circle_wasm_native.run_json_classified body) ()
+    | Some call ->
+      Circle_wasm_native.run_call (fun raw ->
+        let* response = call (Yojson.Safe.from_string raw) in
+        Lwt.return (Yojson.Safe.to_string response)) body
   in
   match native with
   | Error (Circle_wasm_native.Rejected e) ->
@@ -642,7 +645,21 @@ let describe ?(execution_profile=Standard) ?(float_mode=Rule_graph.Prior) code_b
 
 let execution_profile_name = profile_name
 
+let input_receipt_bytes =
+  let entry = Circle_hfhe_transcript.{
+    method_name = String.make 64 '\000';
+    request_hash = String.make 64 '0';
+    response_hash = String.make 64 '0';
+    result = None;
+  } in
+  List.init Circle_hfhe_transcript.max_entries (fun _ -> entry)
+  |> Circle_hfhe_transcript.entries_json
+  |> Yojson.Safe.to_string
+  |> String.length
+
 let execute_with_profile
+    ~proof_mode
+    ~call
     ~code_b64
     ~export_name
     ~request_bytes
@@ -667,6 +684,66 @@ let execute_with_profile
     ~is_view
     ~update_policy =
   let code_key = code_cache_key code_b64 in
+  let payload ~code ~storage ~storage_key ~hfhe_mode =
+    let fields = [
+      "action", `String "execute";
+      "float_mode", `Bool (float_enabled float_mode);
+      "code_cache_key", `String code_key;
+      "code_b64", code;
+      "export_name", `String export_name;
+      "request_b64", `String (Base64.encode_exn request_bytes);
+      "storage_cache_key", storage_key;
+      "storage_pairs", storage;
+      "caller", `String caller;
+      "address", `String address;
+      "tx_hash", `String tx_hash;
+      "current_epoch", `Int current_epoch;
+      "hfhe_caps", `List (List.map (fun value -> `String value) hfhe_caps);
+      "hfhe_pubkeys", `List (List.map (fun (addr, pubkey_b64) ->
+        `Assoc ["addr", `String addr; "pubkey_b64", `String pubkey_b64]) hfhe_pubkeys);
+      "hfhe_active_key", (match hfhe_active_key with
+        | Some (key_id, pubkey_b64, seckey_b64) ->
+          `Assoc ["key_id", `String key_id; "pubkey_b64", `String pubkey_b64;
+            "seckey_b64", `String seckey_b64]
+        | None -> `Null);
+      "hfhe_strict", `Bool hfhe_strict;
+      "math", `Bool math;
+      "hfhe_receipt_mode", `String (Circle_hfhe_transcript.mode_name hfhe_mode);
+      "hfhe_receipt_entries", Circle_hfhe_transcript.entries_json
+        (Circle_hfhe_transcript.mode_entries hfhe_mode);
+      "public_reads", `List (List.map Circle_wasm_public_read.yojson_of_snapshot public_reads);
+      "fuel_limit", `Int fuel_limit;
+      "compute_storage_cache_key", (match compute_storage_cache_key with
+        | Some key -> `String key | None -> `Null);
+      "compute_session_scope", (match compute_session_scope with
+        | Some scope -> `String scope | None -> `Null);
+      "execution_profile", `String (execution_profile_name execution_profile);
+      "is_view", `Bool is_view;
+      "update_policy", `Bool update_policy;
+    ] in
+    `Assoc (match proof_mode with
+      | Rule_graph.Prior -> fields
+      | Rule_graph.Active -> ("hfhe_pairs", `Bool true) :: fields) in
+  let input_check = match proof_mode with
+    | Rule_graph.Prior -> Ok ()
+    | Rule_graph.Active ->
+      let entries_bytes = Circle_hfhe_transcript.mode_entries hfhe_mode
+        |> Circle_hfhe_transcript.entries_json
+        |> Yojson.Safe.to_string
+        |> String.length in
+      if entries_bytes > input_receipt_bytes then Error "input too large"
+      else
+        let storage = make_storage_pairs_json storage_tbl in
+        let full = payload ~code:(`String code_b64)
+          ~storage:(`List storage)
+          ~storage_key:(match storage, storage_cache_key with
+            | _ :: _, Some key -> `String key | _ -> `Null)
+          ~hfhe_mode:Circle_hfhe_transcript.Capture in
+        let limit = match call with
+          | None -> Circle_wasm_native.max_input_bytes
+          | Some _ -> Circle_wasm_native.max_call_input_bytes in
+        if String.length (Yojson.Safe.to_string full) + input_receipt_bytes - 2 <= limit
+        then Ok () else Error "input too large" in
   let initial_allow_code_cache_only = code_seeded code_key in
   let initial_allow_cache_only =
     match storage_cache_key with
@@ -686,7 +763,8 @@ let execute_with_profile
       allow_cache_only
       && Option.value
            ~default:false
-           (Option.map (fun entry -> entry.seeded_in_native) storage_entry) in
+           (Option.map (fun entry -> entry.seeded_in_native
+             && (proof_mode = Rule_graph.Prior || entry.storage_json <> [])) storage_entry) in
     let use_code_cache_only =
       allow_code_cache_only
       && code_seeded code_key in
@@ -709,75 +787,10 @@ let execute_with_profile
         | `List [], _ -> `Null
         | _, Some key -> `String key
         | _, None -> `Null in
-    let payload =
-      `Assoc [
-        "action", `String "execute";
-        "float_mode", `Bool (float_enabled float_mode);
-        "code_cache_key", `String code_key;
-        "code_b64",
-        begin
-          if use_code_cache_only then `Null else `String code_b64
-        end;
-        "export_name", `String export_name;
-        "request_b64", `String (Base64.encode_exn request_bytes);
-        "storage_cache_key", storage_cache_key_json;
-        "storage_pairs", storage_json;
-        "caller", `String caller;
-        "address", `String address;
-        "tx_hash", `String tx_hash;
-        "current_epoch", `Int current_epoch;
-        "hfhe_caps", `List (List.map (fun value -> `String value) hfhe_caps);
-        "hfhe_pubkeys",
-        `List
-          (List.map
-             (fun (addr, pubkey_b64) ->
-               `Assoc [
-                 "addr", `String addr;
-                 "pubkey_b64", `String pubkey_b64;
-               ])
-             hfhe_pubkeys);
-        "hfhe_active_key",
-        begin
-          match hfhe_active_key with
-          | Some (key_id, pubkey_b64, seckey_b64) ->
-            `Assoc [
-              "key_id", `String key_id;
-              "pubkey_b64", `String pubkey_b64;
-              "seckey_b64", `String seckey_b64;
-            ]
-          | None ->
-            `Null
-        end;
-        "hfhe_strict", `Bool hfhe_strict;
-        "math", `Bool math;
-        "hfhe_receipt_mode",
-        `String (Circle_hfhe_transcript.mode_name hfhe_mode);
-        "hfhe_receipt_entries",
-        Circle_hfhe_transcript.entries_json
-          (Circle_hfhe_transcript.mode_entries hfhe_mode);
-        "public_reads",
-        `List
-          (List.map
-             Circle_wasm_public_read.yojson_of_snapshot
-             public_reads);
-        "fuel_limit", `Int fuel_limit;
-        "compute_storage_cache_key",
-        begin
-          match compute_storage_cache_key with
-          | Some key -> `String key
-          | None -> `Null
-        end;
-        "compute_session_scope",
-        begin
-          match compute_session_scope with
-          | Some scope -> `String scope
-          | None -> `Null
-        end;
-        "execution_profile", `String (execution_profile_name execution_profile);
-        "is_view", `Bool is_view;
-        "update_policy", `Bool update_policy;
-      ] in
-    let* json_result = read_process_json payload in
+    let payload = payload
+      ~code:(if use_code_cache_only then `Null else `String code_b64)
+      ~storage:storage_json ~storage_key:storage_cache_key_json ~hfhe_mode in
+    let* json_result = read_process_json ?call payload in
     match json_result with
     | Error (Rejected e)
       when use_code_cache_only
@@ -801,7 +814,9 @@ let execute_with_profile
       end;
       Lwt.return ok in
   let* json_result =
-    dispatch
+    match input_check with
+    | Error reason -> Lwt.return_error (Rejected reason)
+    | Ok () -> dispatch
       ~allow_cache_only:initial_allow_cache_only
       ~allow_code_cache_only:initial_allow_code_cache_only
   in
@@ -918,6 +933,8 @@ let execute_with_profile
     Lwt.return (Error (Rejected "invalid wasm execution response"))
 
 let execute
+    ~proof_mode
+    ~call
     ~code_b64
     ~export_name
     ~request_bytes
@@ -939,6 +956,8 @@ let execute
     ~is_view
     ~update_policy =
   execute_with_profile
+    ~proof_mode
+    ~call
     ~code_b64
     ~export_name
     ~request_bytes
@@ -985,6 +1004,8 @@ let execute_compute_with_storage_inner
     ~public_reads
     ~fuel_limit =
   execute_with_profile
+    ~proof_mode:Rule_graph.Prior
+    ~call:None
     ~code_b64
     ~export_name
     ~request_bytes

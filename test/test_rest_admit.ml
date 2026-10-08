@@ -42,6 +42,8 @@ let standard_tx () =
 let runtime () =
   R.{
     swarm_ref = ref None;
+    proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+    queue_head = (fun () -> None);
     duty_head = (fun () -> None);
     preverify_admit = (fun _ -> Ok ());
     save_drops = ignore;
@@ -101,6 +103,8 @@ let test_preverify () =
   let runtime =
     R.{
       swarm_ref = ref None;
+      proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun tx ->
         admitted := Transaction.hash tx :: !admitted;
@@ -121,6 +125,8 @@ let test_preverify () =
   let runtime =
     R.{
       swarm_ref = ref None;
+      proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Error "pre_verify_busy pending = 6 limit = 6");
       save_drops = ignore;
@@ -151,6 +157,8 @@ let test_eviction () =
   let runtime =
     R.{
       swarm_ref = ref None;
+      proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Ok ());
       save_drops = (fun drops -> saved := drops @ !saved);

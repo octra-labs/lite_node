@@ -20,7 +20,7 @@ let rpc_failure error =
     | _ -> None, None
   in
   match code, data with
-  | Some (`Int (104 | 107 | 110 | 113 | -32005)), _ -> Retry reason
+  | Some (`Int (104 | 107 | 110 | 113 | 118 | -32005)), _ -> Retry reason
   | Some (`Int (100 | 103 | 106)), _ -> Wait reason
   | Some (`Int 105), Some (`String "duplicate nonce (fee rate bump < 10%)") ->
     Wait reason

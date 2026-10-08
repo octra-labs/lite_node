@@ -1109,6 +1109,26 @@ let test_apply_chunk_records_apply () =
   assert_true "post point" (has "cached_point" events);
   assert_true "final point" (has "read_point" events)
 
+let test_worker_stop () =
+  let events = ref [] in
+  let point = apply_point ~epoch:10L () in
+  let apply = { (apply_deps events ~head_before_record:10 ~point) with
+    apply_record = (fun _ -> Lwt.fail (Octra_core.Private_ledger.Worker_stopped "test")) } in
+  let run_one ~target_epoch:_ ~reason:_ ~finish_success:_ ~fail_catchup:_ =
+    S.apply_chunk_records apply ~prev_eic:"eic0" ~start_txid:4L
+      (chunk ~records:[record ()] ()) |> Lwt.map ignore in
+  let stopped = try
+    run (S.run (deps events) ~run_one ~target_epoch:11L ~reason:"peer");
+    false
+  with Octra_core.Private_ledger.Worker_stopped reason -> reason = "test" in
+  assert_true "worker stop became catchup failure" stopped;
+  let events = snapshot events in
+  assert_true "worker stop lost certificate" (has "write:11" events);
+  assert_true "worker stop promoted certificate" (not (has "promote:11" events));
+  assert_true "worker stop advanced height" (not (has "advance:12" events));
+  assert_true "worker stop created quarantine"
+    (not (has "mark_quarantine:catchup_failed:unexpected" events))
+
 let test_saved_round () =
   let module Journal = Octra_node_runtime.Consensus_finality_journal in
   let module Log = Octra_consensus.Finality_log in
@@ -2104,6 +2124,7 @@ let tests = [
   "finality parent reward", test_finality_parent_reward;
   "finality reward mismatch", test_finality_reward_mismatch;
   "apply chunk records apply", test_apply_chunk_records_apply;
+  "worker stop", test_worker_stop;
   "apply chunk records skip", test_apply_chunk_records_skip;
   "apply chunk records retry", test_apply_chunk_records_retry;
   "apply chunk gate continue", test_apply_chunk_gate_continue;

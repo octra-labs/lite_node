@@ -5,18 +5,98 @@ let max_ou = Z.of_int 10_000_000_000
 let max_staging_txs = 100_000
 let staging_ttl = 600.
 
-let public_balance_cost (tx : Transaction.t) =
-  match tx.op_type with
-  | DecryptOp | ClaimOp | StealthOp | PrivateOp -> tx.ou
-  | _ -> Z.add tx.amount tx.ou
-
 type entry = {
   tx : Transaction.t;
   ou : Z.t;
   key : string;
   added_at : float;
   hash : string;
+  mutable preview_head : int64 option;
 }
+
+let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
+let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
+
+module Preview : sig
+  type state
+  type message =
+    | Check of int64 option * string
+    | Ready of int64 option * string
+    | Refuse of { head : int64; epoch : int64; hash : string }
+    | Hold of { head : int64; epoch : int64; hash : string }
+  val empty : state
+  val step : limit:int -> state -> message -> state * (unit, string) result
+  val send : message -> (unit, string) result
+end = struct
+  module Hashes = Set.Make (String)
+  type state = { head : int64; hashes : Hashes.t; size : int; full : bool }
+  type message =
+    | Check of int64 option * string
+    | Ready of int64 option * string
+    | Refuse of { head : int64; epoch : int64; hash : string }
+    | Hold of { head : int64; epoch : int64; hash : string }
+
+  let empty = { head = -1L; hashes = Hashes.empty; size = 0; full = false }
+
+  let advance state = function
+    | Some head when head > state.head -> { empty with head }
+    | _ -> state
+
+  let step ~limit state = function
+    | Check (head, hash) ->
+      let state = advance state head in
+      let result =
+        if Hashes.mem hash state.hashes then Error "preview refused in this epoch"
+        else if state.full then Error "staging full until epoch commit"
+        else Ok () in
+      state, result
+    | Ready (head, hash) ->
+      let state = advance state head in
+      state, (if Hashes.mem hash state.hashes then Error "preview refused in this epoch"
+        else Ok ())
+    | Refuse { head; epoch; hash } ->
+      if head < 0L || head = Int64.max_int || head < state.head
+         || epoch <> Int64.succ head then
+        state, Error "preview epoch changed"
+      else
+        let state = advance state (Some head) in
+        if Hashes.mem hash state.hashes then state, Ok ()
+        else if state.size >= limit then
+          { state with full = true }, Ok ()
+        else { state with hashes = Hashes.add hash state.hashes; size = state.size + 1 }, Ok ()
+    | Hold { head; epoch; hash = _ } ->
+      if head < 0L || head = Int64.max_int || head < state.head
+         || epoch <> Int64.succ head then
+        state, Error "preview epoch changed"
+      else advance state (Some head), Ok ()
+
+  let send =
+    let state = ref empty in
+    let lock = Mutex.create () in
+    fun message ->
+      if not (Mutex.try_lock lock) then Error "pre_verify_busy preview queue"
+      else Fun.protect ~finally:(fun () -> Mutex.unlock lock) (fun () ->
+        let next, result = step ~limit:max_staging_txs !state message in
+        let next, result = match message, result with
+          | Hold {head; hash; _}, Ok () ->
+            begin match Hashtbl.find_opt hash_index hash with
+            | None -> next, Ok ()
+            | Some entry -> entry.preview_head <- Some head; next, Ok ()
+            end
+          | (Check (_, hash) | Ready (_, hash)), _ ->
+            let held = match Hashtbl.find_opt hash_index hash with
+              | Some entry -> entry.preview_head = Some next.head
+              | None -> false in
+            next, (if held then Error "preview refused in this epoch" else result)
+          | _ -> next, result in
+        state := next;
+        result)
+end
+
+let public_balance_cost (tx : Transaction.t) =
+  match tx.op_type with
+  | DecryptOp | ClaimOp | StealthOp | PrivateOp -> tx.ou
+  | _ -> Z.add tx.amount tx.ou
 
 type queue_state =
   | Ready of { expires_at : float }
@@ -77,8 +157,6 @@ module Recent_index = Set.Make(struct
       if received <> 0 then received else String.compare a.hash b.hash
 end)
 
-let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
-let hash_index : (string, entry) Hashtbl.t = Hashtbl.create 200
 let view_index = ref Index.empty
 let evict_index = ref Evict_index.empty
 let recent_index = ref Recent_index.empty
@@ -267,7 +345,7 @@ let find_by_hash h =
 let insert tx ou =
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let hash = Transaction.hash tx in
-  let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash } in
+  let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash; preview_head = None } in
   Hashtbl.add staging key entry;
   Hashtbl.add hash_index hash entry;
   view_index := Index.add (index_key entry) entry !view_index;
@@ -338,7 +416,9 @@ let rbf_bump_ok new_tx new_ou old =
     (Z.mul (Z.mul new_tx.Transaction.ou old.ou) (Z.of_int 100))
     (Z.mul (Z.mul old.tx.Transaction.ou new_ou) (Z.of_int 110))
 
-let add_smart ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
+let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
+  let ( let* ) = Result.bind in
+  let* () = Preview.send (Check (head, Transaction.hash tx)) in
   let ou = Transaction.ou_cost tx in
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let total_cost = public_balance_cost tx in

@@ -9,7 +9,8 @@ type t = private {
   octb : string;
 }
 
-val compile_ast : syntax:Oct_gen.syntax -> Oct_lang.contract -> (t, string) result
-val compile : syntax:Oct_gen.syntax -> string -> (t, string) result
-val compile_multi : syntax:Oct_gen.syntax -> (string -> string option) -> string -> (t, string) result
+val compile_ast : ?loops:bool -> syntax:Oct_gen.syntax -> Oct_lang.contract -> (t, string) result
+val compile : ?loops:bool -> syntax:Oct_gen.syntax -> string -> (t, string) result
+val compile_multi : ?loops:bool -> syntax:Oct_gen.syntax -> (string -> string option) -> string -> (t, string) result
 val owns : string -> bool
+val check_loops : syntax:Oct_gen.syntax -> (string -> string option) -> string -> (unit, string) result

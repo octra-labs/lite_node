@@ -19,6 +19,7 @@ mod float_ops;
 #[cfg(test)]
 mod float_cases;
 mod native_bytes;
+mod call_step;
 use native_bytes::write_owned_bytes;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -230,6 +231,7 @@ struct Payload {
     hfhe_pubkeys: Option<Vec<HfhePubkeyJson>>,
     hfhe_active_key: Option<HfheActiveKey>,
     hfhe_strict: Option<bool>,
+    hfhe_pairs: Option<bool>,
     math: Option<bool>,
     float_mode: Option<bool>,
     hfhe_receipt_mode: Option<String>,
@@ -350,6 +352,7 @@ struct HostState {
     hfhe_pubkeys: HashMap<String, String>,
     hfhe_active_key: Option<HfheActiveKey>,
     hfhe_strict: bool,
+    hfhe_pairs: bool,
     math: bool,
     hfhe_receipt_mode: String,
     hfhe_receipt_expected: Vec<HfheReceiptEntryJson>,
@@ -370,6 +373,8 @@ struct HostState {
     assets: Vec<AssetPutJson>,
     encrypted_assets: Vec<EncryptedAssetPutJson>,
     circle_invoke_cache: Option<(Vec<u8>, Vec<u8>)>,
+    calls: bool,
+    call_request: Option<call_step::Request>,
     hfhe_invoke_cache: Option<(Vec<u8>, Vec<u8>)>,
     unavailable: Option<String>,
     compute_trace: Option<ComputeTrace>,
@@ -586,6 +591,12 @@ struct RequestFrame {
 enum HostFailure {
     Rejected(String),
     Unavailable(String),
+}
+
+impl From<String> for HostFailure {
+    fn from(error: String) -> Self {
+        Self::Rejected(error)
+    }
 }
 
 fn rejected<T>(result: Result<T, String>) -> Result<T, HostFailure> {
@@ -1156,9 +1167,15 @@ fn finish_execute(
 
 impl Runtime {
     fn instantiate(payload: &Payload, description_only: bool) -> Result<Self, String> {
+        Self::prepare(payload, description_only, false).map_err(|error| match error {
+            HostFailure::Rejected(reason) | HostFailure::Unavailable(reason) => reason,
+        })
+    }
+
+    fn prepare(payload: &Payload, description_only: bool, calls: bool) -> Result<Self, HostFailure> {
         let profile = ExecutionProfile::of_payload(payload)?;
         if payload.compute_session_scope.is_some() && profile != ExecutionProfile::Compute {
-            return Err("compute session scope requires compute execution profile".to_owned());
+            return Err(HostFailure::Rejected("compute session scope requires compute execution profile".to_owned()));
         }
         let code_b64_opt = payload.code_b64.as_deref();
         let module_key = match payload.code_cache_key.as_deref() {
@@ -1227,13 +1244,16 @@ impl Runtime {
             }
         };
 
+        if calls && (has_update_disabled_imports || has_compute_imports) {
+            return Err(HostFailure::Rejected("circle update imports invalid".to_owned()));
+        }
         if profile == ExecutionProfile::Standard && has_compute_imports {
             let name = module
                 .imports()
                 .find(|entry| COMPUTE_IMPORTS.contains(&entry.name()))
                 .map(|entry| entry.name().to_owned())
                 .unwrap_or_else(|| "<unknown>".to_owned());
-            return Err(format!("unsupported wasm import: {name}"));
+            return Err(HostFailure::Rejected(format!("unsupported wasm import: {name}")));
         }
 
         let mut store = Store::new(
@@ -1266,20 +1286,25 @@ impl Runtime {
 
         let mut linker = Linker::new(shared_engine());
         define_imports(&mut store, &mut linker)?;
-        let instance = linker
+        let started = linker
             .instantiate(&mut store, &module)
             .map_err(|e| format!("wasm instantiate failed: {e}"))?
-            .start(&mut store)
-            .map_err(|e| format!("wasm start failed: {e}"))?;
+            .start(&mut store);
+        if calls {
+            if let Some(reason) = store.data().unavailable.as_ref() {
+                return Err(HostFailure::Unavailable(reason.clone()));
+            }
+        }
+        let instance = started.map_err(|e| format!("wasm start failed: {e}"))?;
         let memory = instance
             .get_memory(&store, "memory")
             .ok_or_else(|| "wasm_v1 memory export missing".to_owned())?;
         let initial_pages = memory.data_size(&store) / PAGE_BYTES;
         if initial_pages > profile.max_initial_pages() {
-            return Err(format!(
+            return Err(HostFailure::Rejected(format!(
                 "wasm_v1 memory exceeds {} pages",
                 profile.max_initial_pages()
-            ));
+            )));
         }
         Ok(Self {
             store,
@@ -1427,6 +1452,7 @@ impl HostState {
             hfhe_pubkeys,
             hfhe_active_key: payload.hfhe_active_key.clone(),
             hfhe_strict,
+            hfhe_pairs: payload.hfhe_pairs.unwrap_or(false),
             math: payload.math.unwrap_or(false),
             hfhe_receipt_mode,
             hfhe_receipt_expected,
@@ -1447,6 +1473,8 @@ impl HostState {
             assets: Vec::new(),
             encrypted_assets: Vec::new(),
             circle_invoke_cache: None,
+            calls: false,
+            call_request: None,
             hfhe_invoke_cache: None,
             unavailable: None,
             compute_trace: None,
@@ -1743,6 +1771,15 @@ fn define_imports(
                  req_len: i32|
                  -> Result<i32, WasmiError> {
                     let request_bytes = read_guest_bytes(&mut caller, req_ptr, req_len)?;
+                    if caller.data().calls && call_step::is_request(&request_bytes) {
+                        if let Some((request, response)) = &caller.data().circle_invoke_cache {
+                            if request == &request_bytes {
+                                return Ok(response.len() as i32);
+                            }
+                        }
+                        charge_host_fuel(&mut caller, CIRCLE_INVOKE_FUEL)?;
+                        return call_step::suspend(&mut caller, request_bytes, None);
+                    }
                     charge_host_fuel(&mut caller, CIRCLE_INVOKE_FUEL)?;
                     let response_bytes = execute_circle_invoke(&mut caller, &request_bytes)
                         .map_err(WasmiError::new)?;
@@ -1771,6 +1808,11 @@ fn define_imports(
                         Some((cached_req, cached_res)) if cached_req == request_bytes => cached_res,
                         _ => {
                             charge_host_fuel(&mut caller, CIRCLE_INVOKE_FUEL)?;
+                            if caller.data().calls && call_step::is_request(&request_bytes) {
+                                return call_step::suspend(
+                                    &mut caller, request_bytes, Some((out_ptr, out_cap)),
+                                );
+                            }
                             execute_circle_invoke(&mut caller, &request_bytes)
                                 .map_err(WasmiError::new)?
                         }
@@ -6015,7 +6057,10 @@ fn execute_hfhe_invoke(
     let mode = caller.data().hfhe_receipt_mode.clone();
     let strict = caller.data().hfhe_strict;
     let is_verify = is_hfhe_verify_method(&method);
-    if mode == "capture" && caller.data().hfhe_receipt_entries.len() >= MAX_HFHE_RECEIPT_ENTRIES {
+    let pair = caller.data().hfhe_pairs && matches!(method.as_str(), "fhe_add" | "fhe_sub");
+    if (mode == "capture" || (mode == "consume" && pair))
+        && caller.data().hfhe_receipt_entries.len() >= MAX_HFHE_RECEIPT_ENTRIES
+    {
         return Err(HostFailure::Rejected(
             "hfhe receipt entry limit exceeded".to_owned(),
         ));
@@ -6059,8 +6104,17 @@ fn execute_hfhe_invoke(
             method
         )));
     }
-    let response = execute_hfhe_direct(caller, req_bytes)?;
-    let entry = rejected(hfhe_receipt_entry(strict, &method, req_bytes, &response))?;
+    let result = execute_hfhe_direct(caller, req_bytes);
+    let refusal;
+    let response = match &result {
+        Ok(response) => response.as_slice(),
+        Err(HostFailure::Rejected(reason)) if pair => {
+            refusal = [b"octra:circle_hfhe_refusal:v1\0".as_slice(), reason.as_bytes()].concat();
+            refusal.as_slice()
+        }
+        Err(_) => return result,
+    };
+    let entry = rejected(hfhe_receipt_entry(strict, &method, req_bytes, response))?;
     match mode.as_str() {
         "capture" => caller.data_mut().hfhe_receipt_entries.push(entry),
         "consume" => rejected(consume_hfhe_receipt_entry(caller, entry))?,
@@ -6071,7 +6125,7 @@ fn execute_hfhe_invoke(
             ))
         }
     }
-    Ok(response)
+    result
 }
 
 fn execute_hfhe_direct(
@@ -6169,7 +6223,7 @@ fn execute_hfhe_direct(
             let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
             let lhs_ciphertext = rejected(parse_string_param(&params, 1, "lhs_ciphertext"))?;
             let rhs_ciphertext = rejected(parse_string_param(&params, 2, "rhs_ciphertext"))?;
-            let value = call_hfhe_backend(json!({
+            let value = call_hfhe_pair(caller.data().hfhe_pairs, json!({
                 "action": "cipher_add",
                 "pubkey_b64": pubkey_b64,
                 "lhs_ciphertext": lhs_ciphertext,
@@ -6183,7 +6237,7 @@ fn execute_hfhe_direct(
             let pubkey_b64 = rejected(parse_string_param(&params, 0, "pubkey_b64"))?;
             let lhs_ciphertext = rejected(parse_string_param(&params, 1, "lhs_ciphertext"))?;
             let rhs_ciphertext = rejected(parse_string_param(&params, 2, "rhs_ciphertext"))?;
-            let value = call_hfhe_backend(json!({
+            let value = call_hfhe_pair(caller.data().hfhe_pairs, json!({
                 "action": "cipher_sub",
                 "pubkey_b64": pubkey_b64,
                 "lhs_ciphertext": lhs_ciphertext,
@@ -6326,6 +6380,13 @@ fn execute_hfhe_direct(
             request.method
         ))),
     }
+}
+
+fn call_hfhe_pair(pairs: bool, mut payload: JsonValue) -> Result<JsonValue, HostFailure> {
+    if pairs {
+        payload["hfhe_pairs"] = JsonValue::Bool(true);
+    }
+    call_hfhe_backend(payload)
 }
 
 fn call_hfhe_backend(payload: JsonValue) -> Result<JsonValue, HostFailure> {

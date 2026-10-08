@@ -22,6 +22,27 @@ type failure = {
 }
 
 exception Worker_retry of string
+exception Worker_stopped of string
+
+let worker_retry ?(wait = Lwt_unix.sleep) ?(report = fun _ _ -> ()) apply =
+  let delays = [|0.25; 0.5; 1.|] in
+  let rec loop step =
+    Lwt.catch apply (function
+      | (Worker_retry _ | Exec_resource.Unavailable Host) as error ->
+        let reason = match error with
+          | Worker_retry reason -> reason
+          | _ -> "host unavailable" in
+        if step >= Array.length delays then Lwt.fail (Worker_stopped reason)
+        else
+          let delay = delays.(step) in
+          report delay reason;
+          let open Lwt.Syntax in
+          let* () = wait delay in
+          loop (step + 1)
+      | Exec_resource.Unavailable resource ->
+        Lwt.fail (Worker_stopped (Exec_resource.name resource ^ " unavailable"))
+      | error -> Lwt.fail error) in
+  loop 0
 
 type failure_action = Reject | Retry
 
@@ -1162,13 +1183,13 @@ let legacy_audit_commitment = function
     | _, None -> Error "legacy commitment migration requires reconstructable commitment history")
   | None -> Error "legacy commitment migration requires node history audit"
 
-let verify_legacy_public_migration ?(math = false) ~strict new_pubkey amount payload =
+let verify_legacy_public_migration ?(math = false) ~worker_priority ~strict new_pubkey amount payload =
   match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
   | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
     begin
       match PM.classify_cipher ~cap:strict new_cipher with
     | PM.V3 ->
-      VW.verify_encrypt ~math
+      VW.verify_encrypt_classified_with_priority ~math worker_priority
         ~strict
         ~pubkey:new_pubkey
         ~cipher:new_cipher
@@ -1177,50 +1198,50 @@ let verify_legacy_public_migration ?(math = false) ~strict new_pubkey amount pay
         ~commitment:amount_commitment
         ~blinding:amount_blinding
     | _ ->
-      Lwt.return_error "new encrypted balance must be v3 key-bound"
+      Lwt.return_error (VW.Proof_rejected "new encrypted balance must be v3 key-bound")
     end
   | _ ->
-    Lwt.return_error
-      "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
+    Lwt.return_error (VW.Proof_rejected
+      "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding")
 
-let verify_legacy_commitment_migration ?(math = false) ~strict new_pubkey commitment payload =
+let verify_legacy_commitment_migration ?(math = false) ~worker_priority ~strict new_pubkey commitment payload =
   match payload.new_cipher, payload.new_zero_proof with
   | Some new_cipher, Some new_zero_proof ->
     if not (FB.cipher_is_wrapped_scalar ~cap:strict new_cipher) then
-      Lwt.return_error
-        "legacy commitment migration requires a wrapped scalar new cipher"
+      Lwt.return_error (VW.Proof_rejected
+        "legacy commitment migration requires a wrapped scalar new cipher")
     else
       begin
         match PM.classify_cipher ~cap:strict new_cipher with
       | PM.V3 ->
-        VW.verify_claim ~math
+        VW.verify_claim_classified_with_priority ~math worker_priority
           ~strict
           ~pubkey:new_pubkey
           ~cipher:new_cipher
           ~proof:new_zero_proof
           ~commitment
       | _ ->
-        Lwt.return_error
-          "legacy commitment migration requires a v3 key-bound new cipher"
+        Lwt.return_error (VW.Proof_rejected
+          "legacy commitment migration requires a v3 key-bound new cipher")
       end
   | _ ->
-    Lwt.return_error
-      "legacy commitment migration requires new_cipher and new_zero_proof"
+    Lwt.return_error (VW.Proof_rejected
+      "legacy commitment migration requires new_cipher and new_zero_proof")
 
-let verify_legacy_zero_reset ?(math = false) ~strict new_pubkey payload =
+let verify_legacy_zero_reset ?(math = false) ~worker_priority ~strict new_pubkey payload =
   match payload.old_bound_pubkey_b64, payload.old_bound_cipher, payload.old_zero_proof with
   | Some _, _, _
   | _, Some _, _
   | _, _, Some _ ->
-    Lwt.return_error
-      "legacy zero reset must not include old ciphertext binding fields"
+    Lwt.return_error (VW.Proof_rejected
+      "legacy zero reset must not include old ciphertext binding fields")
   | None, None, None ->
     match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
     | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
       begin
         match PM.classify_cipher ~cap:strict new_cipher with
       | PM.V3 ->
-        VW.verify_encrypt ~math
+        VW.verify_encrypt_classified_with_priority ~math worker_priority
           ~strict
           ~pubkey:new_pubkey
           ~cipher:new_cipher
@@ -1229,12 +1250,12 @@ let verify_legacy_zero_reset ?(math = false) ~strict new_pubkey payload =
           ~commitment:amount_commitment
           ~blinding:amount_blinding
       | _ ->
-        Lwt.return_error
-          "legacy zero reset requires a v3 key-bound new cipher"
+        Lwt.return_error (VW.Proof_rejected
+          "legacy zero reset requires a v3 key-bound new cipher")
       end
     | _ ->
-      Lwt.return_error
-        "legacy zero reset requires new_cipher, new_zero_proof, amount_commitment and amount_blinding"
+      Lwt.return_error (VW.Proof_rejected
+        "legacy zero reset requires new_cipher, new_zero_proof, amount_commitment and amount_blinding")
 
 let key_switch_value ~old_pubkey ~new_key_hash ~new_pubkey ~new_cipher
     ~source_cipher =
@@ -1246,7 +1267,7 @@ let verify_new_key new_pubkey label verify =
   let* result = verify new_pubkey in
   match result with
   | Error e ->
-    Lwt.return (error "key_switch_rejected" (label ^ e))
+    Lwt.return (key_switch_worker_error label e)
   | Ok () ->
     Lwt.return_ok ()
 
@@ -1515,7 +1536,7 @@ let verify_key_switch_plan ?(math = false)
               if payload.migration = Verified_zero_reset then
                   let* checked =
                     verify_new_key new_pubkey "legacy zero reset failed: "
-                    (fun pubkey -> verify_legacy_zero_reset ~math ~strict pubkey payload)
+                    (fun pubkey -> verify_legacy_zero_reset ~math ~worker_priority ~strict pubkey payload)
                 in
                 (match checked, payload.new_cipher with
                 | Error e, _ -> Lwt.return (Error e)
@@ -1563,7 +1584,7 @@ let verify_key_switch_plan ?(math = false)
                   let* checked =
                     verify_new_key new_pubkey "legacy commitment migration failed: "
                       (fun pubkey ->
-                        verify_legacy_commitment_migration ~math
+                        verify_legacy_commitment_migration ~math ~worker_priority
                           ~strict
                           pubkey
                           commitment
@@ -1588,7 +1609,7 @@ let verify_key_switch_plan ?(math = false)
                   let* checked =
                     verify_new_key new_pubkey "legacy public migration failed: "
                       (fun pubkey ->
-                        verify_legacy_public_migration ~math
+                        verify_legacy_public_migration ~math ~worker_priority
                           ~strict
                           pubkey
                           amount

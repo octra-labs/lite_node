@@ -228,6 +228,9 @@ let create_node deps =
       };
     }
     (fun finalize exn ->
+      match exn with
+      | Octra_core.Private_ledger.Worker_stopped _ -> Lwt.fail exn
+      | _ ->
       let epoch = finalize.Octra_consensus.C_types.epoch_id in
       Log.fatal "consensus"
         "event = finalized_apply_failure epoch = %Ld reason = %s action = exit"

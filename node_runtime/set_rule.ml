@@ -28,6 +28,7 @@ type policy = {
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
   fhe_work : Octra_core.Rule_graph.mode;
+  proof_exec : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   cap_mode : Octra_core.Set_fold.cap_mode;
@@ -46,6 +47,8 @@ let policy rules epoch =
   let* program_overlap = Octra_core.Rule_graph.program_overlap rules ~epoch
     |> Result.map_error Octra_core.Rule_graph.fault_message in
   let* fhe_work = Octra_core.Rule_graph.fhe_work rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
+  let* proof_exec = Octra_core.Rule_graph.proof_exec rules ~epoch
     |> Result.map_error Octra_core.Rule_graph.fault_message in
   let* wasm_float = Octra_core.Rule_graph.wasm_float rules ~epoch
     |> Result.map_error Octra_core.Rule_graph.fault_message in
@@ -94,6 +97,7 @@ let policy rules epoch =
       program_mode;
       program_overlap;
       fhe_work;
+      proof_exec;
       wasm_float;
       math;
       cap_mode;
@@ -119,6 +123,7 @@ let resolve rules ~chain_id ~parent epoch =
       program_mode = policy.program_mode;
       program_overlap = policy.program_overlap;
       fhe_work = policy.fhe_work;
+      proof_exec = policy.proof_exec;
       wasm_float = policy.wasm_float;
       math = policy.math;
       cap_mode = policy.cap_mode;
@@ -152,6 +157,7 @@ let resolve rules ~chain_id ~parent epoch =
               program_mode = policy.program_mode;
               program_overlap = policy.program_overlap;
               fhe_work = policy.fhe_work;
+              proof_exec = policy.proof_exec;
               wasm_float = policy.wasm_float;
               math = policy.math;
               cap_mode = policy.cap_mode;

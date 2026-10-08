@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+exception Receipt_mismatch of string
+
 type spec = {
   domain : Receipt_view.direct_call_domain;
   reject_domain : Call_plan.direct_exec_domain;
@@ -35,12 +37,12 @@ let plan spec =
     ~ou:spec.ou
 
 let run spec io =
-  Lwt.catch
+  Octra_core.Exec_resource.catch
     (fun () ->
       match plan spec with
       | Call_plan.Direct_exec_ready call ->
         io.apply call.value_effect;
-        let open Lwt.Syntax in
+        let ( let* ) = Octra_core.Exec_resource.bind in
         let* item = io.exec call in
         let receipt = io.receipt item in
         io.save call item;
@@ -57,7 +59,9 @@ let run spec io =
     (fun exn ->
       match exn with
       | Tx_effects.Commit_failed _
+      | Receipt_mismatch _
       | Stack_overflow
+      | Lwt.Canceled
       | Octra_core.Exec_resource.Unavailable _
       | Out_of_memory -> Lwt.fail exn
       | _ ->

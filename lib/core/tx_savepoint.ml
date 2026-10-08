@@ -11,7 +11,7 @@ let restore ledger store savepoint =
   | _, Error error -> failwith error
 
 let run ~ledger ~store apply =
-  let open Lwt.Syntax in
+  let ( let* ) = Exec_resource.bind in
   match Ledger.begin_journal ledger with
   | Error error -> Lwt.fail_with error
   | Ok () ->
@@ -21,7 +21,7 @@ let run ~ledger ~store apply =
         ignore (Ledger.abort_journal ledger);
         Lwt.fail_with error
       | Ok savepoint ->
-        Lwt.catch
+        Exec_resource.catch
           (fun () ->
             let* result = apply () in
             begin

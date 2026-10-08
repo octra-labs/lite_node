@@ -11,6 +11,7 @@ type syntax = Forms | Source
 
 type env = {
   syntax : syntax;
+  loops : bool;
   structs : struct_def list;
   enums : enum_def list;
   consts : const_def list;
@@ -22,6 +23,7 @@ type env = {
   direct : string list;
   func_labels : (string, int) Hashtbl.t;
   mutable locals : (string * int * typ) list;
+  mutable loop_regs : int list;
   mutable base_reg : int;
   mutable next_reg : int;
   mutable next_label : int;
@@ -38,11 +40,13 @@ type env = {
   declaration : declaration;
 }
 
-let make_env syntax declaration structs enums consts state events errors funcs forms direct = {
+let make_env ~loops syntax declaration structs enums consts state events errors funcs forms direct = {
   syntax;
+  loops;
   structs; enums; consts; state; events; errors; funcs; forms; direct;
   func_labels = Hashtbl.create 16;
   locals = [];
+  loop_regs = [];
   base_reg = 1; next_reg = 1; next_label = 10000;
   code = []; seals = []; line = 0; column = 0;
   has_payable = List.exists (fun f -> f.fn_payable) funcs;
@@ -2684,6 +2688,8 @@ and gen_stmt env stmt =
   | SAssign (name, expr) ->
     (match find_local env name with
      | Some (_, reg, t) ->
+       if env.loops && env.fn_is_pure && List.mem reg env.loop_regs then
+         gerr env.line ("pure loop index is immutable = " ^ name);
        require_type env "assignment type differs" t (typ_of_expr env expr);
        let r = gen_expr env expr in
        emit_type_check env r t;
@@ -2858,6 +2864,8 @@ and gen_stmt env stmt =
   | SIf (cond, then_body, else_body) ->
     require_type env "if condition type differs" TBool (typ_of_expr env cond);
     let rc = gen_expr env cond in
+    let locals = env.locals in
+    let base = env.base_reg in
     let then_label = alloc_label env in
     let end_label = alloc_label env in
     emit env (Contract_vm.JIF (rc, then_label));
@@ -2865,18 +2873,34 @@ and gen_stmt env stmt =
      | Some stmts -> List.iter (gen_stmt env) stmts
      | None -> ());
     emit env (Contract_vm.JMP end_label);
+    if env.loops then begin
+      env.locals <- locals;
+      env.base_reg <- base;
+      env.next_reg <- base
+    end;
     emit env (Contract_vm.JDEST then_label);
     List.iter (gen_stmt env) then_body;
-    emit env (Contract_vm.JDEST end_label)
+    emit env (Contract_vm.JDEST end_label);
+    if env.loops then begin
+      env.locals <- locals;
+      env.base_reg <- base;
+      env.next_reg <- base
+    end
 
   | SWhile (cond, body) ->
     guard_pure_while env;
     require_type env "while condition type differs" TBool (typ_of_expr env cond);
+    let locals = env.locals in
+    let base = env.base_reg in
     let test_label = alloc_label env in
     let loop_label = alloc_label env in
     emit env (Contract_vm.JMP test_label);
     emit env (Contract_vm.JDEST loop_label);
     List.iter (gen_stmt env) body;
+    if env.loops then begin
+      env.locals <- locals;
+      env.base_reg <- base
+    end;
     emit env (Contract_vm.JDEST test_label);
     env.next_reg <- env.base_reg;
     let rc = gen_expr env cond in
@@ -2902,7 +2926,10 @@ and gen_stmt env stmt =
     let loop_label = alloc_label env in
     emit env (Contract_vm.JMP test_label);
     emit env (Contract_vm.JDEST loop_label);
+    let saved_regs = env.loop_regs in
+    env.loop_regs <- iter_r :: end_r :: saved_regs;
     List.iter (gen_stmt env) body;
+    env.loop_regs <- saved_regs;
     env.next_reg <- env.base_reg;
     let one = alloc_reg env in
     emit env (Contract_vm.LDI (one, VInt Z.one));
@@ -2920,6 +2947,7 @@ and gen_stmt env stmt =
 
   | SMatch (expr, arms) ->
     check_match_exhaustive env arms;
+    let saved_locals = env.locals in
     let rv = gen_expr env expr in
     let match_r = env.base_reg in
     if rv <> match_r then emit env (Contract_vm.MOV (match_r, rv));
@@ -2938,11 +2966,17 @@ and gen_stmt env stmt =
     ) arms arm_labels;
     emit env Contract_vm.REVERT;
     List.iter2 (fun (_, _, body) label ->
+      if env.loops then begin
+        env.locals <- saved_locals;
+        env.base_reg <- match_r + 1;
+        env.next_reg <- env.base_reg
+      end;
       emit env (Contract_vm.JDEST label);
       List.iter (gen_stmt env) body;
       emit env (Contract_vm.JMP end_label)
     ) arms arm_labels;
     emit env (Contract_vm.JDEST end_label);
+    if env.loops then env.locals <- saved_locals;
     env.base_reg <- match_r;
     env.next_reg <- env.base_reg
 
@@ -3388,11 +3422,11 @@ let validate_depth env code =
   in
   check root_depth
 
-let generate ~syntax ?(direct = []) ?(calls = []) (ct : contract) =
+let generate ~syntax ?(loops = false) ?(direct = []) ?(calls = []) (ct : contract) =
   check_interfaces ct;
   let forms = List.map (fun value -> value.fm_name) ct.forms in
   let env =
-    make_env syntax ct.declaration ct.structs ct.enums ct.consts ct.state ct.events
+    make_env ~loops syntax ct.declaration ct.structs ct.enums ct.consts ct.state ct.events
       ct.errors ct.funcs forms direct
   in
   if forms <> [] then

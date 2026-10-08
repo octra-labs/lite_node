@@ -5,6 +5,57 @@ open Oct_lang
 
 module Names = Set.Make (String)
 
+let check_loops program =
+  let ( let* ) = Result.bind in
+  let rec block names line column = function
+    | [] -> Ok ()
+    | item :: rest ->
+      let* next = statement names line column item in
+      block next line column rest
+  and statement names line column = function
+    | SLocated (line, column, item) ->
+      statement names line column item
+    | SLet (name, _, _) ->
+      Ok (Names.remove name names)
+    | SLetTuple (items, _) ->
+      Ok (List.fold_left (fun names name -> Names.remove name names) names items)
+    | SAssign (name, _) when Names.mem name names ->
+      Error (Printf.sprintf
+        "line %d column %d: pure loop index is immutable = %s"
+        line column name)
+    | SFor (name, _, _, body) ->
+      let* () = block (Names.add name names) line column body in
+      Ok names
+    | SForEach (name, _, body) ->
+      let* () = block (Names.remove name names) line column body in
+      Ok names
+    | SIf (_, yes, no) ->
+      let* () = block names line column yes in
+      let* () = block names line column (Option.value ~default:[] no) in
+      Ok names
+    | SWhile (_, body) ->
+      let* () = block names line column body in
+      Ok names
+    | SMatch (_, arms) ->
+      let* () = List.fold_left
+        (fun result (_, _, body) ->
+          let* () = result in
+          block names line column body)
+        (Ok ()) arms
+      in
+      Ok names
+    | SAssign _ | SFieldSet _ | SIndexSet _ | SIndexUpdate _
+    | SReturn _ | SAssert _ | SRequire _ | SEmit _ | SFieldCall _
+    | SStoragePathSet _ | SStoragePathUpdate _ | SIndexFieldSet _
+    | SExpr _ | SRevertError _ ->
+      Ok names
+  in
+  List.fold_left
+    (fun result fn ->
+      let* () = result in
+      if fn.fn_pure then block Names.empty 0 0 fn.fn_body else Ok ())
+    (Ok ()) program.funcs
+
 type env = {
   values : Names.t;
   calls : Names.t;

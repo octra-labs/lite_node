@@ -58,11 +58,13 @@ let child action =
       Unix._exit 2)
   | pid -> Case.wait pid
 
-let commit ?(rollback = true) dir head point mode = child (fun () ->
+let commit ?(rollback = true) ?(legacy = false) dir head point mode = child (fun () ->
   Case.with_stores dir (fun chaindata store ->
     let ledger = Ledger.create store in
     let pre_state_root = Option.get (Lwt_main.run (Case.SI.get_head_hash store)) in
-    let parent_commit = Option.get (Lwt_main.run (Case.SI.get_commit_hash store)) in
+    let irmin_parent = Lwt_main.run (Case.SI.get_commit_hash store) in
+    let parent_commit = Octra_core.Tree.hash
+      (Octra_core.Tree.create ~epoch_id:1 ~parent_commit:"previous") in
     let start_txid = Case.SC.next_txid chaindata in
     Case.SC.begin_batch chaindata;
     save_aux chaindata 1;
@@ -125,6 +127,16 @@ let commit ?(rollback = true) dir head point mode = child (fun () ->
       ~rollback:(fun () -> Commit.run_rollback ~effects:rollback_effects (Commit.Rollback_to_head head)) in
     let original = Commit.live_commit_effects deps in
     let effects = {original with
+      Commit.write_wal = (fun entry ->
+        Case.expect "live wal lost irmin predecessor" (entry.Case.Wal.irmin_parent = irmin_parent);
+        Case.expect "live wal changed epoch tree" (entry.Case.Wal.parent_commit = parent_commit);
+        if legacy then begin
+          let fields = Case.Wal.to_json entry |> Yojson.Safe.from_string
+            |> Yojson.Safe.Util.to_assoc in
+          let bytes = `Assoc (List.remove_assoc "irmin_parent" fields)
+            |> Yojson.Safe.to_string in
+          original.write_wal (Case.Wal.of_json bytes)
+        end else original.write_wal entry);
       Commit.chaos = (fun event ->
         if not rollback then interrupt event;
         if rollback && mode <> "success" && event = "after_chaindata_committed" then raise Commit_stop);
@@ -200,9 +212,12 @@ let run_case root point mode =
   check_aux dir expected;
   Printf.printf "event = inline_cut point = %s mode = %s status = pass\n%!" point mode
 
-let run_forward root point mode expected =
-  let dir, head = prepare root ("forward_" ^ point ^ "_" ^ mode) in
-  let status = commit ~rollback:false dir head point mode in
+let run_forward ?(legacy = false) ?(old_head = false) root point mode expected =
+  let dir, head = prepare root
+    ((if old_head then "old_head_" else if legacy then "legacy_" else "forward_") ^ point ^ "_" ^ mode) in
+  let head = if old_head then {head with Case.HM.irmin_commit = None} else head in
+  if old_head then Case.HM.atomic_write dir head;
+  let status = commit ~rollback:false ~legacy dir head point mode in
   Case.expect "forward child status differs"
     (status = if mode = "kill" then Unix.WSIGNALED Sys.sigkill else Unix.WEXITED 0);
   Case.expect "forward recovery refused" (Case.recover dir = Unix.WEXITED 0);
@@ -218,6 +233,24 @@ let run_forward root point mode expected =
   check_aux dir expected;
   Printf.printf "event = aux_forward point = %s mode = %s head = %d status = pass\n%!"
     point mode expected
+
+let completed_wal root =
+  let dir, head = prepare root "completed_wal" in
+  Case.expect "completed wal cut did not stop"
+    (commit ~rollback:false dir head "after_head_write" "kill" = Unix.WSIGNALED Sys.sigkill);
+  let entry = match Case.Wal.read_pending dir with
+    | [entry] -> entry | _ -> failwith "completed wal missing" in
+  List.iter (fun (name, change) ->
+    Case.Wal.write dir (change entry);
+    let before = Case.evidence dir in
+    Case.expect ("completed wal accepted " ^ name) (Case.recover dir = Unix.WEXITED 2);
+    Case.expect "completed refusal changed evidence" (Case.evidence dir = before))
+    ["tree", (fun row -> {row with Case.Wal.parent_commit = Case.hash '0'});
+     "parent", (fun row -> {row with Case.Wal.irmin_parent = Some (Case.hash '0')});
+     "pre_root", (fun row -> {row with Case.Wal.pre_state_root = Case.hash '0'});
+     "post_root", (fun row -> {row with Case.Wal.post_state_root = Case.hash '0'})];
+  Case.Wal.write dir entry;
+  Case.expect "valid completed wal refused" (Case.recover dir = Unix.WEXITED 0)
 
 let damage_prior bytes =
   let changes = ref 0 in
@@ -323,6 +356,14 @@ let run_cut_prefix root kind stop after mode =
 
 let run root =
   let failed = ref false in
+  completed_wal root;
+  List.iter (fun (point, expected) ->
+    run_forward ~old_head:true root point "kill" expected)
+    ["after_wal", 0; "after_irmin_committed", 1];
+  List.iter (fun (point, expected) ->
+    run_forward ~legacy:true root point "kill" expected)
+    ["after_wal", 0; "after_irmin_committed", 1;
+     "before_head_write", 1; "after_head_write", 1];
   let cases = ["control", "success"; "control", "rollback"] @
     List.concat_map (fun point -> List.map (fun mode -> point, mode) ["error"; "kill"])
       ["before_cut"; "after_cut"; "before_wal"; "after_wal"; "before_marker"; "after_marker"] in

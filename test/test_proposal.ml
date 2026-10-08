@@ -728,7 +728,8 @@ let make_proposal_deps ?(state_attested = true) ?(quarantine_active = false)
         (proposal_id, tx_hashes, txs, receipts_json) :: !stored_bundles);
     staging_txs = (fun ?(circles = true) () ->
       if circles then staging else Octra_node_runtime.Circle_refill.without staging);
-    evict_preview = (fun _ -> failwith "unexpected preview eviction");
+    evict_preview = (fun ?epoch:_ _ -> failwith "unexpected preview eviction");
+    hold_preview = (fun ~epoch:_ _ -> failwith "unexpected preview hold");
     admits_tx = admits;
     build_preverify_once;
     staging_total = (fun () -> List.length staging);

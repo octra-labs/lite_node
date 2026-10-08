@@ -91,6 +91,10 @@ Program CircleRetry {
     self.count = 9
     return 9
   }
+  fn exhaust(): int {
+    while true { self.count = self.count + 1 }
+    return self.count
+  }
   fn advance(): int {
     require(self.count == 9, "order")
     self.count = 10
@@ -225,6 +229,12 @@ let test_select () =
       let sets = subsets rest in
       sets @ List.map (fun set -> item :: set) sets in
   List.iter (fun excluded ->
+    expect "refusal retained nonce successors"
+      (Node.Circle_refill.through ~rejected:excluded inputs = List.filter (fun tx ->
+        List.for_all (fun cut -> cut.T.from <> tx.T.from || tx.nonce <= cut.nonce) excluded) inputs);
+    expect "first refusal differs"
+      (Node.Circle_refill.first excluded = List.filter (fun tx ->
+        List.for_all (fun other -> tx.T.from <> other.T.from || tx.nonce <= other.nonce) excluded) excluded);
     let expected = List.filter (fun tx -> List.for_all (fun cut ->
       cut.T.from <> tx.T.from || tx.nonce < cut.nonce) excluded) inputs in
     let selected = Node.Circle_refill.before ~excluded inputs in
@@ -310,6 +320,19 @@ let test_turn () =
   let urgent = ready 9L in
   expect "circle consumed last ready epoch"
     (select ~epoch:12L ~previous:(Some false) (inputs @ [urgent]) = [payment; urgent]);
+  let module Graph = Octra_core.Rule_graph in
+  let graph = Graph.create ~chain_id:"octra-devnet-9871-cluster" ~root_at:(fun _ ->
+    Graph.Root "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d") in
+  List.iter (fun epoch ->
+    let ordered = Result.get_ok (Graph.circle_batch graph ~epoch) = Graph.Active in
+    let system = ready (Int64.of_int (epoch - 1)) in
+    let txs = inputs @ [system] in
+    let chosen = Turn.select ~ordered ~epoch:(Int64.of_int epoch)
+      ~previous:(Some true) ~ordinary:(Node.Circle_refill.without txs) txs in
+    expect "activation lost system work" (List.mem system chosen);
+    expect "activation did not select mixed work"
+      (chosen = if epoch < 1_663_000 then [payment; system] else txs))
+    [1_648_974; 1_662_999; 1_663_000; 1_663_001];
   List.iter (fun previous ->
     let choose inputs = Turn.select ~ordered:true ~epoch:12L ~previous
       ~ordinary:(Node.Circle_refill.without inputs) inputs in
@@ -357,6 +380,8 @@ let test_turn () =
       (Some (previous [payment])) = Some false)
 
 let run_epoch ~make_deps ~verify_deps ~limits epoch =
+  ignore (unwrap (Core.Tx_staging.Preview.send
+    (Check (Some (Int64.of_int (epoch - 1)), ""))));
   Test_workspace.with_dir "circle_proposal" (fun dir ->
     let store = Lwt_main.run (S.open_store (Filename.concat dir "irmin")) in
     Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store)) (fun () ->
@@ -389,6 +414,25 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
       Lwt_main.run (S.set_meta store Core.Validator_registry.meta_key
         (Core.Validator_registry.to_string registry));
       let circle = deploy store caller.address in
+      let program = (identity 10).address in
+      let code = Octra_vm.Oct_compile.compile {|
+program WorkCase {
+  state { count: int }
+  fn accept(): int {
+    self.count = 1
+    return 7
+  }
+  fn fresh(): int {
+    require(self.count == 0, "count")
+    return 7
+  }
+}
+|} in
+      expect "work program failed compilation" (code.error = None);
+      Lwt_main.run (S.deploy_contract store ~address:program ~owner:caller.address
+        ~ctype:"CUSTOM" ~version:"1" ~admission:"binary"
+        ~code_hash:(Core.Circles.sha256_hex code.bytecode)
+        ~bytecode_b64:(Base64.encode_exn code.bytecode));
       let wasm = install store caller.address ("oct" ^ String.make 44 '3')
         Core.Circles.Wasm_v1 (host_code ()) in
       let root = Lwt_main.run (L.hash ledger) in
@@ -513,6 +557,11 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
         let bad_gate = {prepared.preverify with Gate.receipts = List.map (fun receipt ->
           if receipt.Receipt.tx_hash = T.hash advance then old else receipt)
           prepared.preverify.receipts} in
+        if G.proof_exec_at ~chain_id:chain ~epoch = G.Active then begin
+          let refused = try Result.is_error (replay bad_gate inputs) with
+            | Octra_vm.Direct_exec.Receipt_mismatch hash -> hash = T.hash advance in
+          expect "receipt mismatch became a fee rejection" refused
+        end else begin
         let refused = replay bad_gate inputs |> unwrap in
         expect "previous storage receipt confirmed"
           (List.map fst refused.artifacts.confirmed = T.consensus_order [ready; payment; good]);
@@ -524,6 +573,7 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
            | _ -> false);
         expect "previous storage receipt changed no result"
           (refused.post_state_root <> prepared.execution.post_state_root);
+        end;
         unchanged ();
         expect "duplicate circle admitted" (Result.is_error (prepare preverify [good; good]));
         unchanged ();
@@ -575,6 +625,13 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
       in
       ordered ();
       let drops = ref [] in
+      let head = Core.Head_manifest.{
+        schema_version = 3; generation = 1; epoch_id = epoch - 1;
+        state_root = root; ledger_state_root = Some root; irmin_commit = commit;
+        txid_hi = 6L; txlog_seg = None; txlog_off = None; epochlog_off = None;
+        commit_id = Option.get commit; ts = 1.; quorum_cert_hash = None;
+        epoch_index_hash = None; epoch_index_root = None;
+      } in
       let standard = Node.Consensus_driver_wiring.{
         chain_id = chain; duty_state = (fun _ -> Ok Core.Set_fold.empty);
         getenv = (fun _ -> None); get_meta = (fun _ -> None);
@@ -615,13 +672,6 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
           if cached then Cache.store_with_log bundles ~pid:proposal_id ~tx_hashes ~txs ~receipts_json in
         let runner state_root txs = checked ~state_root ~tx_hashes:(List.map T.hash txs) txs in
         let driver_ref = ref None in
-        let head = Core.Head_manifest.{
-          schema_version = 3; generation = 1; epoch_id = epoch - 1;
-          state_root = root; ledger_state_root = Some root; irmin_commit = commit;
-          txid_hi = 6L; txlog_seg = None; txlog_off = None; epochlog_off = None;
-          commit_id = Option.get commit; ts = 1.; quorum_cert_hash = None;
-          epoch_index_hash = None; epoch_index_root = None;
-        } in
         let standard = {standard with cached_head = (fun () -> Some head)} in
         let validator_set = CT.make_validator_set (List.map (fun (item : identity) ->
           CT.{address = item.address; pubkey = item.public}) validators) in
@@ -727,12 +777,22 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
         (T.consensus_order [good; payment; ready]);
       driver_batch ~active:true ~cached:false [good; payment; ready]
         (T.consensus_order [good; payment; ready]);
-      let run ?next ?starved ?(busy = false) ?(ordered = false) ?(cached = true) ?(rejects = 0)
+      let check_work () =
+        expect "proposal exceeded preview credits" (List.length !captures <= 6)
+      in
+      let run ?next ?fault ?(live = false) ?(starved = []) ?(after_refusal = false)
+          ?(after_preview = false) ?(held = []) ?(resume = false) ?(cut = false)
+          ?(busy = false) ?(ordered = false) ?(cached = true) ?(rejects = 0)
+          ?(removed = []) ?(drain = false)
           ?(history = []) ?(missing = false) ?(excluded = []) txs expected =
+        let adapters = if live then Node.Consensus_driver_wiring.node_standard_adapters
+          {standard with cached_head = (fun () -> Some head)} else adapters in
         let prepare = if ordered then Some prepare else None in
         let parent = if history = [] then parent
           else make_parent ~txs:history (Int64.of_int (epoch - 1)) validators in
         Core.Tx_staging.clear ();
+        if live then ignore (unwrap (Core.Tx_staging.Preview.send
+          (Check (Some (Int64.of_int head.epoch_id), ""))));
         drops := [];
         List.iter (fun tx ->
           ignore (unwrap (Core.Tx_staging.add_smart
@@ -745,7 +805,11 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
         let frozen = ref None in
         let deps = make_deps ~epoch ~staging:txs ~root in
         let deps = C.{deps with
-          evict_preview = adapters.evict_preview;
+          hold_preview = (fun ~epoch tx ->
+            expect "unexpected preview hold" (List.mem tx held);
+            if live then adapters.hold_preview ~epoch tx);
+          evict_preview = (fun ?epoch tx ->
+            adapters.evict_preview ?epoch:(if live then epoch else None) tx);
           staging_txs = (match next with
             | None -> (fun ?(circles = true) () ->
               if circles then txs else Node.Circle_refill.without txs)
@@ -765,17 +829,38 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
           store_bundle = (fun ~proposal_id:_ ~tx_hashes ~txs ~receipts_json ->
             bundles := Some (tx_hashes, txs, receipts_json));
         } in
+        let unavailable = ref true in
+        let checking = ref true in
         let build = Option.map (fun prepare request ->
-          match starved with
-          | Some tx when List.mem tx request.C.txs ->
+          if !checking then expect "retry retained rejected nonce successors"
+            (List.for_all (fun tx -> List.for_all (fun row ->
+              tx.T.from <> row.Core.Tx_staging.d_from || tx.nonce < row.d_nonce) !drops)
+              request.C.txs);
+          match List.find_opt (fun tx -> !unavailable && List.mem tx starved
+            && (not after_preview || !captures <> [])
+            && (not after_refusal || !drops <> [])) request.C.txs with
+          | Some tx ->
+            captures := request :: !captures;
             Lwt.fail (Core.Exec_resource.Exhausted (T.hash tx, Memory))
-          | _ -> prepare request) prepare in
+          | None ->
+            Lwt.map (Result.map (fun result ->
+              match fault with
+              | None -> result
+              | Some error_type ->
+                let execution = result.Node.Consensus_proposal_preview_shell.execution in
+                let artifacts = execution.X.artifacts in
+                let rejected = List.map (fun row ->
+                  if row.X.tx = bad then {row with X.error_type} else row) artifacts.rejected in
+                {result with execution = {execution with artifacts = {artifacts with rejected}}}))
+              (prepare request)) prepare in
         let make ?(occupied = busy) deps =
           let action () = C.make_proposal ?prepare:build deps ~chain_id:chain ~root_to_raw32:root_raw
             ~limits ~epoch_id:(Int64.of_int epoch) |> Lwt_main.run in
           if occupied then with_host_busy action else action () in
         let proposal = match make deps with
           | Some value -> value | None -> failwith "circle proposal unavailable" in
+        checking := false;
+        if ordered then check_work ();
         unchanged ();
         expect ("circle selection mismatch: " ^ String.concat "; " !errors)
           (proposal.tx_hashes = List.map T.hash expected);
@@ -788,12 +873,12 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
             (match Core.Tx_staging.lookup_dropped (T.hash bad) with
              | Some ("evicted", "preview rejected", _, _, _, _, _, _) -> true
              | _ -> false)
-        end else expect "unexpected queue eviction" (!drops = []);
+        end else expect "unexpected queue eviction"
+          (List.sort String.compare (List.map (fun row -> row.Core.Tx_staging.d_hash) !drops)
+           = List.sort String.compare (List.map T.hash removed));
         let hashes, confirmed, receipts = Option.get !bundles in
         expect "cached hash list differs" (hashes = proposal.tx_hashes);
         let prepared = Core.Tx_outcome.split_admit receipts |> unwrap in
-        if ordered then expect "deferred work became a chain rejection"
-          (List.length prepared.rejections = rejects);
         if not ordered && expected <> [] then
           expect "refill carried circle rejection" (prepared.rejections = []);
         let reads = List.length !batches in
@@ -824,6 +909,30 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
         let verdict = C.verify_proposal ?prepare deps ~chain_id:chain wire |> Lwt_main.run in
         expect "validator refused circle selection"
           (verdict = Octra_consensus.C_driver.Proposal_accept);
+        if ordered then expect "deferred work became a chain rejection"
+          (List.length prepared.rejections = rejects);
+        if live then List.iter (fun tx ->
+          let result = Core.Tx_staging.Preview.send
+            (Check (Some (Int64.of_int head.epoch_id), T.hash tx)) in
+          expect "live refusal differs from stable witness"
+            (result = if List.mem tx (removed @ held) then Error "preview refused in this epoch" else Ok ())) txs;
+        if held <> [] then begin
+          captures := [];
+          frozen := None;
+          let again = make {build_deps with current_round = (fun () -> 4);
+            staging_txs = adapters.staging_epoch_txs} in
+          expect "held sender blocked independent work"
+            (match again with
+             | Some value -> List.for_all (fun tx -> List.mem (T.hash tx) value.tx_hashes) expected
+             | None -> false);
+          expect "held sender executed twice"
+            (List.for_all (fun request -> List.for_all (fun tx ->
+              List.for_all (fun item -> tx.T.from <> item.T.from || tx.nonce < item.nonce) held)
+              request.C.txs) !captures);
+          expect "hold deleted pending work"
+            (List.for_all (fun tx -> Core.Tx_staging.find_by_hash (T.hash tx) = Some tx) held);
+          check_work ()
+        end;
         unchanged ();
         if ordered then begin
           expect "ordered execution changed its context" (List.for_all (fun request ->
@@ -840,8 +949,9 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
             expect "remaining inputs were not prepared" (saw expected)
           end;
           List.iter (fun tx ->
-            expect "ordered selection removed pending work"
-              (Core.Tx_staging.find_by_hash (T.hash tx) = Some tx)) txs;
+            expect "ordered selection changed pending work"
+              (Core.Tx_staging.find_by_hash (T.hash tx)
+               = if List.mem tx removed then None else Some tx)) txs;
           if List.exists (fun tx -> tx.T.to_ = wasm) confirmed then begin
             expect "busy host rejected a valid proposal"
               (with_host_busy (fun () -> C.verify_proposal ?prepare deps ~chain_id:chain wire
@@ -871,7 +981,8 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
           expect "dependency changed unavailable work to invalid"
             (C.verify_proposal ?prepare {deps with validate_preverify_once = delayed}
                ~chain_id:chain wire |> Lwt_main.run
-             = Octra_consensus.C_driver.Proposal_wait);
+             = if confirmed = [] then Octra_consensus.C_driver.Proposal_accept
+               else Octra_consensus.C_driver.Proposal_wait);
           unchanged ();
           if prepared.rejections <> [] then begin
             let outcomes request =
@@ -904,6 +1015,56 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
              = Some [T.hash tx]);
           expect "next selection repeated drop" (List.length !drops = 1);
           unchanged ()) next;
+        if cut then begin
+          let completed = !captures in
+          frozen := None;
+          captures := [];
+          bundles := None;
+          let stopped = {build_deps with current = (fun () -> List.length !captures < 2)} in
+          expect "reselection ignored round cancellation" (make stopped = None);
+          expect "cancelled reselection published a bundle" (!bundles = None);
+          unchanged ();
+          captures := completed
+        end;
+        if drain then begin
+          let rec rounds index =
+            if index > 3 then failwith "rejected queue did not drain";
+            let prior = List.map (fun row -> row.Core.Tx_staging.d_hash) !drops in
+            captures := [];
+            frozen := None;
+            let next = make {build_deps with current_round = (fun () -> 3 + index);
+              staging_txs = adapters.staging_epoch_txs} in
+            check_work ();
+            expect "next round repeated a rejected call"
+              (List.for_all (fun request -> List.for_all (fun tx ->
+                not (List.mem (T.hash tx) prior)) request.C.txs) !captures);
+            expect "next round failed to propose" (Option.is_some next);
+            unchanged ();
+            if List.length !drops <> List.length prior then rounds (index + 1)
+          in
+          rounds 1
+        end;
+        if resume then begin
+          List.iter (fun round ->
+            frozen := None;
+            captures := [];
+            let proposal = make {build_deps with current_round = (fun () -> round);
+              staging_txs = adapters.staging_epoch_txs} in
+            expect "technical failures prevented ordinary proposal"
+              (Option.map (fun (value : Octra_consensus.C_driver.proposal_plan) -> value.tx_hashes)
+                proposal = Some (List.map T.hash expected));
+            check_work ();
+            expect "technical failures removed pending work" (!drops = []);
+            unchanged ()) [4; 5];
+          unavailable := false;
+          frozen := None;
+          let proposal = make {build_deps with current_round = (fun () -> 6);
+            staging_txs = adapters.staging_epoch_txs} in
+          expect "recovered calls stayed excluded"
+            (Option.map (fun (value : Octra_consensus.C_driver.proposal_plan) -> value.tx_hashes)
+              proposal = Some (List.map T.hash (T.consensus_order txs)));
+          unchanged ()
+        end;
         Core.Tx_staging.clear ()
       in
       run [payment; ready] [payment; ready];
@@ -948,11 +1109,64 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
         (T.consensus_order [first; second; payment; ready]);
       run ~ordered:true ~history:[good] [payment; good]
         (T.consensus_order [payment; good]);
-      run ~ordered:true ~rejects:1 [bad; payment; ready] (T.consensus_order [payment; ready]);
-      run ~ordered:true ~rejects:10 (calls 11 @ [payment; ready])
+      let denied = signed caller ~op_type:T.ProgramExec ~to_:program ~nonce:1
+        ~message:"[]" ~method_:(Some "absent") in
+      let set = signed caller ~op_type:T.ProgramExec ~to_:program ~nonce:2
+        ~message:"[]" ~method_:(Some "accept") in
+      let read = signed other ~op_type:T.ProgramExec ~to_:program ~nonce:1
+        ~message:"[]" ~method_:(Some "fresh") in
+      let later = signed caller ~op_type:T.ProgramExec ~to_:program ~nonce:3
+        ~message:"[]" ~method_:(Some "absent") in
+      let independent = signed other ~op_type:T.ProgramExec ~to_:program ~nonce:1
+        ~message:"[]" ~method_:(Some "accept") in
+      run ~ordered:true ~rejects:1 ~removed:[denied]
+        [denied; dependent; later; independent; payment; ready]
+        (T.consensus_order [independent; payment; ready]);
+      let independent = signed other ~op_type:T.CircleCall ~to_:circle ~nonce:1
+        ~message:"[]" ~method_:(Some "accept") in
+      run ~ordered:true ~rejects:1 ~removed:[denied]
+        [denied; dependent; later; independent; payment; ready]
+        (T.consensus_order [independent; payment; ready]);
+      run ~ordered:true ~rejects:1 ~removed:[denied] [denied; dependent; later; payment; ready]
         (T.consensus_order [payment; ready]);
-      run ~ordered:true ~starved:good [good; dependent; payment; ready]
+      run ~ordered:true ~rejects:1 ~removed:[denied]
+        [denied; set; read; payment; ready] (T.consensus_order [read; payment; ready]);
+      run ~ordered:true ~rejects:1 ~removed:[bad] [bad] [];
+      run ~ordered:true ~rejects:1 ~removed:[bad] [bad; payment; ready] (T.consensus_order [payment; ready]);
+      run ~ordered:true ~rejects:1 ~removed:(List.filter (fun tx -> tx.T.nonce = 1) (calls 11)) (calls 11 @ [payment; ready])
         (T.consensus_order [payment; ready]);
+      run ~ordered:true ~starved:[good] [good; dependent; payment; ready]
+        (T.consensus_order [payment; ready]);
+      let blocked = List.init 4 (fun index ->
+        signed ~ou:1_000_000 (List.nth identities index) ~op_type:T.ProgramExec
+          ~to_:program ~nonce:1 ~message:"[]" ~method_:(Some "accept")) in
+      run ~ordered:true ~starved:blocked ~resume:true
+        (blocked @ [dependent; payment; ready]) (T.consensus_order [payment; ready]);
+      let independent = signed other ~op_type:T.ProgramExec ~to_:program ~nonce:1
+        ~message:"[]" ~method_:(Some "accept") in
+      run ~ordered:true ~starved:blocked
+        (blocked @ [dependent; independent; payment; ready])
+        (T.consensus_order [independent; payment; ready]);
+      let cell = signed other ~op_type:T.CircleBalanceCellPut ~to_:circle ~nonce:1
+        ~message:"{}" ~method_:None in
+      let reserve_parent = make_parent ~txs:[good] (Int64.of_int (epoch - 1)) validators in
+      let reserve_message = match Yojson.Safe.from_string ready_message with
+        | `Assoc fields -> `Assoc (List.map (fun (name, value) ->
+            if name = "head_proposal_id" then name,
+              `String (Octra_bootstrap.State_sync_checkpoint.raw_to_hex
+                reserve_parent.certificate.proposal_id)
+            else name, value) fields) |> Yojson.Safe.to_string
+        | _ -> failwith "ready payload invalid" in
+      let reserve_ready = signed member ~op_type:T.ValidatorReady ~to_:member.address
+        ~nonce:1 ~message:reserve_message ~method_:None in
+      run ~ordered:true ~starved:blocked ~history:[good] ~excluded:[cell]
+        (blocked @ [cell; transfer other 2; dependent; payment; reserve_ready])
+        (T.consensus_order [payment; reserve_ready]);
+      let independent = signed other ~op_type:T.CircleCall ~to_:circle ~nonce:1
+        ~message:"[]" ~method_:(Some "accept") in
+      run ~ordered:true ~starved:blocked
+        (blocked @ [dependent; independent; payment; ready])
+        (T.consensus_order [independent; payment; ready]);
       run ~ordered:true [good; next; transfer other 2; payment; ready]
         (T.consensus_order [good; payment; ready]);
       let clock = circle_tx "clock" 1 in
@@ -962,8 +1176,45 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
         ~message:"[]" ~method_:(Some "absent") in
       let watch = signed ~ou:19_000_000 other ~op_type:T.CircleCall ~to_:circle ~nonce:1
         ~message:(Yojson.Safe.to_string (`List [`String caller.address])) ~method_:(Some "watch") in
-      run ~ordered:true ~rejects:1 [absent; watch; payment; ready]
-        (T.consensus_order [watch; payment; ready])))
+      run ~ordered:true ~rejects:1 ~removed:[absent] [absent; watch; payment; ready]
+        (T.consensus_order [watch; payment; ready]);
+      let large = signed ~ou:10_000_000 caller ~op_type:T.ProgramExec
+        ~to_:(identity 9).address ~nonce:1 ~message:"[]" ~method_:(Some "absent") in
+      let replacement = signed other ~op_type:T.ProgramExec
+        ~to_:program ~nonce:1 ~message:"[]" ~method_:(Some "accept") in
+      run ~ordered:true ~after_refusal:true ~starved:[replacement] ~removed:[large]
+        [large; replacement; payment; ready] (T.consensus_order [payment; ready]);
+      run ~ordered:true ~removed:[large] [large; replacement; payment; ready]
+        (T.consensus_order [replacement; payment; ready]);
+      expect "rejected work retained lane reservation"
+        (List.exists (fun request -> List.mem replacement request.C.txs) !captures);
+      let rejected op_type to_ method_ ou = List.init 5 (fun index ->
+        signed ~ou (List.nth identities index) ~op_type ~to_ ~nonce:1
+          ~message:"[]" ~method_:(Some method_)) in
+      let refused = rejected T.ProgramExec (identity 9).address "absent" 10_000_000 in
+      run ~ordered:true ~cut:true ~drain:true ~rejects:1 ~removed:(List.filteri (fun i _ -> i < 2) refused)
+        (refused @ [replacement; payment; ready]) (T.consensus_order [payment; ready]);
+      let alternate = signed ~ou:19_000_000 other ~op_type:T.CircleCall ~to_:circle
+        ~nonce:1 ~message:"[]" ~method_:(Some "accept") in
+      let refused = rejected T.CircleCall circle "exhaust" 19_000_000 in
+      run ~ordered:true ~drain:true ~rejects:1 ~removed:(List.filteri (fun i _ -> i < 2) refused)
+        (refused @ [alternate; payment; ready]) (T.consensus_order [payment; ready]);
+      run ~ordered:true ~rejects:1 ~removed:[bad] [bad; alternate; dependent; payment; ready]
+        (T.consensus_order [payment; ready]);
+      List.iter (fun fault ->
+        run ~ordered:true ~fault [bad; dependent; payment; ready]
+          (T.consensus_order [payment; ready]))
+        ["vm_transition_incomplete"; "vm_transition_exception"];
+      run ~ordered:true ~live:true ~after_refusal:true ~starved:[replacement] ~removed:[large]
+        [large; replacement; payment; ready] (T.consensus_order [payment; ready]);
+      if epoch >= 1_663_000 then begin
+        let blocked = List.init 3 (fun index ->
+          signed (List.nth identities (index + 1)) ~op_type:T.ProgramExec
+            ~to_:program ~nonce:1 ~message:"[]" ~method_:(Some "accept")) in
+        run ~ordered:true ~live:true ~after_preview:true ~starved:blocked ~held:[denied]
+          ([denied; dependent; later; replacement; payment] @ blocked)
+          (T.consensus_order [replacement; payment])
+      end))
 
 let run ~make_deps ~verify_deps ~limits =
   test_work ();
@@ -977,4 +1228,5 @@ let run ~make_deps ~verify_deps ~limits =
   Fun.protect ~finally:(fun () -> List.iter (fun (name, value) ->
     Unix.putenv name value) before) (fun () ->
     List.iter (fun (name, value) -> Unix.putenv name value) settings;
-    List.iter (run_epoch ~make_deps ~verify_deps ~limits) [1_614_499; 1_614_500])
+    List.iter (run_epoch ~make_deps ~verify_deps ~limits)
+      [1_614_499; 1_614_500; 1_662_999; 1_663_000; 1_663_001])

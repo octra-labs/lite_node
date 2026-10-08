@@ -448,7 +448,9 @@ let run deps txs =
     (fun batch ->
        Lwt.catch
          (fun () -> deps.process batch.txs)
-         (fun exn ->
+         (function
+          | Octra_core.Private_ledger.Worker_stopped _ as exn -> Lwt.fail exn
+          | exn ->
             deps.fatal ~sender:batch.sender exn;
             Lwt.return_unit))
     (group txs)

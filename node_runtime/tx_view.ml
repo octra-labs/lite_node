@@ -398,6 +398,8 @@ let submit_rpc_error etype reason =
   | "insufficient_balance" -> Rpc.insufficient_balance
   | "duplicate_transaction" ->
     { Rpc.duplicate_tx with data = Some (`String reason) }
+  | "preview_refused" ->
+    Rpc.err 118 "preview refused" (Some (`String reason))
   | "self_transfer" -> Rpc.self_transfer
   | "invalid_address" -> Rpc.invalid_address reason
   | "staging_full" -> Rpc.staging_full
@@ -717,6 +719,8 @@ let staging_error msg =
   let m = String.lowercase_ascii msg in
   if m = "duplicate transaction" then
     "duplicate_transaction", "tx already in staging"
+  else if m = "preview refused in this epoch" then
+    "preview_refused", "retry after epoch commit or replace transaction at same nonce"
   else if String.starts_with ~prefix:"duplicate nonce" m then
     "duplicate_transaction", msg
   else if m = "nonce too low (already used)" then

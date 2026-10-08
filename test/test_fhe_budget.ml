@@ -59,9 +59,9 @@ let () =
     let ctx = {VM.default_ctx with fhe_work = Octra_core.Rule_graph.Active; math = true} in
     let st = VM.create_state ~ctx ~limit ~caller:"sender" ~origin:"sender"
       ~address:"program" ~value:Z.zero ~storage:(Hashtbl.create 1) () in
-    st.regs.(0) <- VM.VPubKey key;
-    st.regs.(1) <- VM.VCipher left;
-    st.regs.(2) <- VM.VCipher right;
+    st.regs.(0) <- VM.VPubKey (Octra_core.Fhe_image.of_key key);
+    st.regs.(1) <- VM.VCipher (Octra_core.Fhe_image.of_cipher left);
+    st.regs.(2) <- VM.VCipher (Octra_core.Fhe_image.of_cipher right);
     st in
   let op = VM.FHE_MUL (3, 0, 1, 2) in
   let accepted = VM.prepare_fhe_work (state 1_000_000 sparse cipher cipher) op in

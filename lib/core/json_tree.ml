@@ -5,7 +5,7 @@ type frame =
   | Array of Yojson.Safe.t list
   | Object of string * (string * Yojson.Safe.t) list
 
-let read raw =
+let parse ~extensions raw =
   let lex = Lexing.from_string raw in
   let state = Yojson.Safe.init_lexer () in
   let space () = Yojson.Safe.read_space state lex in
@@ -23,6 +23,8 @@ let read raw =
   let rec value frames =
     space ();
     match peek () with
+    | Some ('(' | '<') when not extensions ->
+      Yojson.json_error "JSON container is invalid"
     | Some '[' ->
       Yojson.Safe.read_lbr state lex;
       space ();
@@ -75,6 +77,10 @@ let read raw =
       state.lnum bytes (String.sub raw start count))
   end;
   json
+
+let read raw = parse ~extensions:true raw
+
+let read_plain raw = parse ~extensions:false raw
 
 type output =
   | Value of bool * Yojson.Safe.t

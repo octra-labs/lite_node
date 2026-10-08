@@ -7,8 +7,12 @@ type run_error =
 
 val max_input_bytes : int
 
+val max_call_input_bytes : int
+
 val error_message : run_error -> string
 
 val run_json_classified : string -> (string, run_error) result
+
+val run_call : (string -> string Lwt.t) -> string -> (string, run_error) result Lwt.t
 
 val run_json : string -> (string, string) result

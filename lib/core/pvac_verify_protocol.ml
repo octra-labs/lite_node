@@ -20,6 +20,11 @@ type circle_cell = {
 type request =
   | Math of request
   | Ping
+  | Groth16 of {
+      key : string;
+      proof : string;
+      inputs : string;
+    }
   | Encrypt of {
       pubkey : string;
       cipher : string;
@@ -121,7 +126,7 @@ let lower_hex_64 value =
   String.length value = 64
   && String.for_all lower_hex_char value
 
-let bounded name limit value =
+let sized name limit value =
   if String.length value > limit then Error (name ^ "_too_large")
   else Ok value
 
@@ -134,7 +139,7 @@ let decode_pubkey encoded =
   else
     try
       let raw = Base64.decode_exn encoded in
-      bounded "pubkey" max_pubkey_bytes raw
+      sized "pubkey" max_pubkey_bytes raw
     with _ ->
       Error "pubkey_invalid"
 
@@ -166,6 +171,14 @@ let rec request_fields request =
   match request with
   | Math (Math _) -> invalid_arg "nested math request"
   | Math value -> request_fields value @ ["math", `Bool true]
+  | Groth16 value ->
+    [
+      "schema", `String schema;
+      "op", `String "groth16_bn254";
+      "key", `String (Base64.encode_exn value.key);
+      "proof", `String (Base64.encode_exn value.proof);
+      "inputs", `String (Base64.encode_exn value.inputs);
+    ]
   | Ping ->
     [
       "schema", `String schema;
@@ -240,7 +253,14 @@ let parse_amount fields =
       with _ -> Error "amount_invalid")
 
 let parse_value name fields =
-  bind (string_field name fields) (bounded name max_value_bytes)
+  bind (string_field name fields) (sized name max_value_bytes)
+
+let parse_bytes name limit fields =
+  bind (string_field name fields) (fun encoded ->
+    bind (sized name (((limit + 2) / 3) * 4) encoded) (fun encoded ->
+      match Base64.decode encoded with
+      | Error _ -> Error (name ^ "_invalid")
+      | Ok raw -> sized name limit raw))
 
 let call_of_json = function
   | `Assoc fields ->
@@ -251,6 +271,11 @@ let call_of_json = function
         match op with
         | "ping" ->
           Ok Ping
+        | "groth16_bn254" ->
+          bind (parse_bytes "key" 2570 fields) (fun key ->
+          bind (parse_bytes "proof" 262 fields) (fun proof ->
+          bind (parse_bytes "inputs" 1024 fields) (fun inputs ->
+            Ok (Groth16 { key; proof; inputs }))))
         | "encrypt" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
@@ -384,7 +409,7 @@ let response_json response =
     "reason", `String response.reason;
   ]
 
-let canonical_response response =
+let response_bytes response =
   Yojson.Safe.to_string (response_json response)
 
 let response_of_json = function

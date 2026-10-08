@@ -26,7 +26,8 @@
   octra_net
   octra_consensus
   octra_crypto_guard
-  pvac_ffi))
+  pvac_ffi
+  zk_ffi))
 
 (rule
  (targets circle_wasm_native_clib_flags.sexp liboctra_circle_wasm_host.a)

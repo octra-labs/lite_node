@@ -165,7 +165,7 @@ val default_join_log :
   join_log
 
 val exit_fatal : unit -> 'a
-val exit_store : Octra_core.Store_irmin.t -> unit -> 'a
+val exit_store : ?code:int -> Octra_core.Store_irmin.t -> unit -> 'a
 val require_sync : data_dir:string -> chain:string -> store:Octra_core.Store_irmin.t ->
   Sync_need.t -> 'a
 
@@ -173,9 +173,11 @@ val run_join :
   log:join_log ->
   tasks:unit Lwt.t list ->
   exit_fatal:(unit -> unit) ->
+  exit_refused:(unit -> unit) ->
   unit Lwt.t
 
 val run_launch_tasks :
+  ?exit_refused:(unit -> unit) ->
   unit Lwt.t launch_tasks ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t
@@ -183,6 +185,7 @@ val run_launch_tasks :
 val run_node_launch_tasks :
   ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
   ?bft_mode:bool ->
+  ?exit_refused:(unit -> unit) ->
   node_launch_deps ->
   exit_fatal:(unit -> unit) ->
   unit Lwt.t
@@ -190,5 +193,6 @@ val run_node_launch_tasks :
 val run_node_runtime :
   ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->
   ?bft_mode:bool ->
+  ?exit_refused:(unit -> unit) ->
   node_launch_runtime ->
   unit Lwt.t

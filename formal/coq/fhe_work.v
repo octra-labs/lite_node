@@ -16,6 +16,55 @@ Definition projected (cells layers words : Z) : bool :=
 
 Definition storage_cost (cells words : Z) := 16 * cells + words.
 
+Definition key_cost (volume : Z) := (volume + 63) / 64.
+
+Theorem key_cost_covers : forall volume,
+  0 <= volume -> volume <= 64 * key_cost volume < volume + 64.
+Proof.
+  intros volume positive. unfold key_cost.
+  pose proof (Z.div_mod (volume + 63) 64 ltac:(lia)).
+  pose proof (Z.mod_pos_bound (volume + 63) 64 ltac:(lia)). lia.
+Qed.
+
+Theorem key_volume_limit : forall volumes budget,
+  Forall (fun volume => 0 <= volume) volumes ->
+  fold_right (fun volume cost => key_cost volume + cost) 0 volumes <= budget ->
+  fold_right Z.add 0 volumes <= 64 * budget.
+Proof.
+  intros volumes budget positive capacity.
+  assert (covers : fold_right Z.add 0 volumes <=
+    64 * fold_right (fun volume cost => key_cost volume + cost) 0 volumes).
+  { clear capacity. induction positive as [|volume rest valid all step]; cbn [fold_right]; [lia|].
+    pose proof (key_cost_covers volume valid). lia. }
+  lia.
+Qed.
+
+Definition transfer_cost (volume : Z) := (volume + 15) / 16.
+
+Theorem transfer_covers : forall volume,
+  0 <= volume -> volume <= 16 * transfer_cost volume < volume + 16.
+Proof.
+  intros volume positive. unfold transfer_cost.
+  pose proof (Z.div_mod (volume + 15) 16 ltac:(lia)).
+  pose proof (Z.mod_pos_bound (volume + 15) 16 ltac:(lia)). lia.
+Qed.
+
+Theorem transfer_limit : forall volumes budget,
+  Forall (fun volume => 0 <= volume) volumes ->
+  fold_right (fun volume cost => transfer_cost volume + cost) 0 volumes <= budget ->
+  fold_right Z.add 0 volumes <= 16 * budget.
+Proof.
+  intros volumes budget positive capacity.
+  assert (covers : fold_right Z.add 0 volumes <=
+    16 * fold_right (fun volume cost => transfer_cost volume + cost) 0 volumes).
+  { clear capacity. induction positive as [|volume rest valid all step]; cbn [fold_right]; [lia|].
+    pose proof (transfer_covers volume valid). lia. }
+  lia.
+Qed.
+
+Print Assumptions transfer_covers.
+Print Assumptions transfer_limit.
+
 Theorem reserve_limit : forall used limit cost next,
   reserve used limit cost = Some next ->
   0 <= used /\ 0 <= cost /\ used <= next /\ next <= limit /\ next = used + cost.
@@ -49,6 +98,23 @@ Proof.
   destruct first as [a [b [c [d e]]]].
   destruct second as [f [g [h [i j]]]]. split; lia.
 Qed.
+
+Theorem key_execution_limit : forall volumes used limit next work,
+  Forall (fun volume => 0 <= volume) volumes ->
+  reserve used limit
+    (fold_right (fun volume cost => transfer_cost volume + cost) 0 volumes) = Some next ->
+  0 <= work <= limit - next ->
+  next + work <= limit /\
+  fold_right Z.add 0 volumes <= 16 * (limit - used - work).
+Proof.
+  intros volumes used limit next work positive accepted execution.
+  apply reserve_limit in accepted.
+  destruct accepted as [u [c [step [cap exact]]]].
+  split; [lia|].
+  apply transfer_limit; [exact positive|]. lia.
+Qed.
+
+Print Assumptions key_execution_limit.
 
 Theorem storage_range : forall cells layers words,
   projected cells layers words = true -> 0 <= storage_cost cells words <= 2097152.
@@ -219,6 +285,8 @@ Print Assumptions Vm.admit_exact.
 Print Assumptions Vm.admit_capacity.
 Print Assumptions Vm.work_capacity.
 Print Assumptions reserve_limit.
+Print Assumptions key_cost_covers.
+Print Assumptions key_volume_limit.
 Print Assumptions child_budget.
 Print Assumptions repeated_work.
 Print Assumptions storage_range.

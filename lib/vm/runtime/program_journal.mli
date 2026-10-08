@@ -27,6 +27,9 @@ type snapshot
 type t
 
 val create : unit -> t
+val storage_effort : (string, string) Hashtbl.t -> Z.t
+val write_effort : (string, string) Hashtbl.t -> Z.t
+val snapshot_effort : t -> Z.t
 val snapshot : t -> snapshot
 val restore : t -> snapshot -> unit
 val discard : t -> unit
@@ -45,3 +48,6 @@ val checkout_storage :
 val deploys : t -> deploy list
 val upgrades : t -> upgrade list
 val storage_entries : t -> (string * (string, string) Hashtbl.t) list
+val circle_storage :
+  t -> string -> (string, string) Hashtbl.t -> (string, string) Hashtbl.t
+val find_circle : t -> string -> (string, string) Hashtbl.t option

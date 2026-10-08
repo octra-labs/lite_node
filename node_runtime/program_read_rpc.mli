@@ -6,7 +6,7 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 val compile_at :
   chain_id:string -> epoch:int ->
   (compiler:Octra_vm.Program_package.compiler ->
-   point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
+   point_ops:bool -> loops:bool -> Yojson.Safe.t -> rpc_result) ->
   Yojson.Safe.t -> rpc_result
 
 type 'handler dispatch_adapters = {
@@ -30,7 +30,7 @@ type 'handler dispatch_adapters = {
     'handler;
   compile_read :
     (compiler:Octra_vm.Program_package.compiler ->
-     point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
+     point_ops:bool -> loops:bool -> Yojson.Safe.t -> rpc_result) ->
     'handler;
   program_info : 'handler;
   program_list : 'handler;

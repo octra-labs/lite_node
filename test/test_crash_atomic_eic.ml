@@ -123,6 +123,7 @@ let leave_chaindata_residue data_dir chaindata ~prev_eic_root ~pre_state_root =
     finalized_by = "tester";
     finalized_at = Unix.gettimeofday ();
     irmin_last_epoch_before = 0;
+    irmin_parent = None;
   };
   start_txid
 
@@ -171,6 +172,7 @@ let leave_irmin_committed_head_lag data_dir chaindata store ~prev_eic_root =
     finalized_by = "tester";
     finalized_at = Unix.gettimeofday ();
     irmin_last_epoch_before = 0;
+    irmin_parent = None;
   };
   Octra_core.Epoch_commit_marker.write_marker data_dir epoch_id "irmin_committed";
   epoch_hash, root, ledger_root, folded

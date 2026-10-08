@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val admit :
+  ?resource_errors:bool ->
   store:Octra_core.Store_irmin.t ->
   program_trust:Octra_vm.Program_trust.t ->
   point_ops:bool ->

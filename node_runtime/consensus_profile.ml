@@ -338,10 +338,20 @@ let standard_hash ~chain_id ~epoch getenv =
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "transaction_envelope" Octra_core.Tx_envelope.consensus_id
     end;
-    match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
+    begin match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
-      put_standard_component buf "program_preview" Octra_vm.Program_package.preview_id)
+      put_standard_component buf "program_preview" Octra_vm.Program_package.preview_id
+    end;
+    match Octra_core.Rule_graph.proof_exec_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "proof_exec"
+        "fhe_zero_range_commit:groth16_bn254:journal_undo:resource_abort:pure_loop_index:match_scope:if_scope:while_scope:fhe_key_io_16:fhe_key_load_16:circle_key_effort:circle_read_effort:circle_fhe_proofs:circle_value_calls:circle_storage_kinds:typed_call_args:octb_nested:circle_code_optin:circle_storage_io_16:circle_stream_io_16:call_journal_entries_32:circle_batch:circle_nested_optin:circle_spawn_optin:circle_payload_stack:circle_receipt_abort:circle_json_io_16";
+      put_standard_component buf "wasm_calls"
+        "suspend_v1:code_optin:update_policy:journal_storage:exchange_bytes_16:exchange_entries_32:circle_delta_v1:shared_fuel:transfer_50:depth_8";
+      put_standard_component buf "wasm_limits"
+        "full_request_v2:receipt_9233:direct_16777216:session_67108864:response_2097152:reply_67108864:guest_refusal:error_utf8_256_v1:hfhe_pairs_v2")
 
 let hash ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with

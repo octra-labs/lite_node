@@ -215,7 +215,118 @@ Proof.
   split; intros valid cut present address; apply valid; try assumption;
     apply same; assumption.
 Qed.
+
+Theorem rejected_removed : forall excluded inputs item,
+  In item excluded -> ~ In item (select excluded inputs).
+Proof.
+  intros excluded inputs item removed present.
+  apply selected_exact in present. destruct present as [_ earlier].
+  specialize (earlier item removed eq_refl). lia.
+Qed.
+
+Theorem last_pass_simple : forall inputs item,
+  In item (select (filter isolated inputs) inputs) -> isolated item = false.
+Proof.
+  intros inputs item kept.
+  pose proof (proj1 (selected_exact (filter isolated inputs) inputs item) kept)
+    as [present earlier].
+  destruct (isolated item) eqn:heavy; [|reflexivity].
+  exfalso. eapply (rejected_removed (filter isolated inputs) inputs item).
+  - apply filter_In. auto.
+  - exact kept.
+Qed.
+
+Theorem retry_decreases : forall excluded inputs item,
+  In item excluded -> In item inputs ->
+  length (select excluded inputs) < length inputs.
+Proof.
+  intros excluded inputs item removed.
+  induction inputs as [|head rest ih]; intros present; [contradiction|].
+  unfold select in *. simpl in *.
+  destruct present as [equal|present].
+  - subst head. assert (keep excluded item = false) as no.
+    { destruct (keep excluded item) eqn:kept; [|reflexivity].
+      pose proof (proj1 (kept_exact excluded item) kept) as earlier.
+      specialize (earlier item removed eq_refl). lia. }
+    rewrite no. pose proof (filter_length_le (keep excluded) rest). lia.
+  - specialize (ih present). destruct (keep excluded head); simpl; lia.
+Qed.
 End Nonces.
+
+Module Work.
+Inductive trace (limit : nat) : nat -> nat -> nat -> Prop :=
+  | empty : trace limit 1 4 0
+  | execute : forall attempts credits spent cost,
+      trace limit attempts (S credits) spent -> cost <= limit ->
+      trace limit attempts credits (spent + cost)
+  | rebuild : forall credits spent,
+      trace limit 1 credits spent -> 2 <= credits ->
+      trace limit 0 credits spent.
+
+Theorem finite_work : forall limit attempts credits spent,
+  trace limit attempts credits spent ->
+  credits <= 4 /\ spent <= (4 - credits) * limit /\ attempts <= 1.
+Proof.
+  intros limit attempts credits spent path.
+  induction path.
+  - lia.
+  - destruct IHpath as [remaining [used retries]].
+    split; [lia|]. split; [|exact retries].
+    assert (4 - credits = S (4 - S credits)) as count by lia.
+    rewrite count. rewrite Nat.mul_succ_l. lia.
+  - destruct IHpath as [remaining [used retries]]. auto.
+Qed.
+End Work.
+
+Module Reserve.
+Inductive trace (limit : nat) : nat -> nat -> nat -> Prop :=
+  | empty : trace limit 4 2 0
+  | execute : forall credits slots spent cost,
+      trace limit (S credits) slots spent -> cost <= limit ->
+      trace limit credits slots (spent + cost)
+  | reserve : forall slots spent cost,
+      trace limit 0 (S slots) spent -> cost <= limit ->
+      trace limit 0 slots (spent + cost).
+
+Theorem finite_work : forall limit credits slots spent,
+  trace limit credits slots spent ->
+  credits <= 4 /\ slots <= 2 /\
+  spent <= (4 - credits) * limit + (2 - slots) * limit.
+Proof.
+  intros limit credits slots spent path.
+  induction path.
+  - lia.
+  - destruct IHpath as [remaining [reserved used]].
+    split; [lia|]. split; [exact reserved|].
+    assert (4 - credits = S (4 - S credits)) as count by lia.
+    rewrite count, Nat.mul_succ_l. lia.
+  - destruct IHpath as [remaining [reserved used]].
+    split; [lia|]. split; [lia|].
+    assert (2 - slots = S (2 - S slots)) as count by lia.
+    rewrite count, Nat.mul_succ_l. lia.
+Qed.
+
+Definition select (removed inputs : list tx) := Nonces.select removed inputs.
+
+Theorem independent_kept : forall removed inputs item,
+  In item inputs ->
+  (forall refused, In refused removed -> sender refused <> sender item) ->
+  In item (select removed inputs).
+Proof.
+  intros removed inputs item present independent.
+  unfold select. apply Nonces.selected_exact. split; [exact present|].
+  intros refused included equal. exfalso. apply (independent refused included). exact equal.
+Qed.
+
+Theorem successors_removed : forall removed inputs cut item,
+  In cut removed -> sender cut = sender item -> nonce cut <= nonce item ->
+  ~ In item (select removed inputs).
+Proof.
+  intros removed inputs cut item included same later kept.
+  apply Nonces.selected_exact in kept. destruct kept as [_ earlier].
+  specialize (earlier cut included same). lia.
+Qed.
+End Reserve.
 
 Module Ordered.
 Section Execution.

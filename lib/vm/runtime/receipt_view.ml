@@ -16,9 +16,14 @@ let call_arg_json = function
   | Contract_vm.VU256 z -> `String (Z.to_string z)
   | v -> `String (Contract_vm.to_string v)
 
-let nested_call_arg_json = function
+let nested_call_arg_json ?(typed = false) = function
   | Contract_vm.VString s -> `String s
   | Contract_vm.VInt z -> `Intlit (Z.to_string z)
+  | Contract_vm.VBool b when typed -> `Bool b
+  | Contract_vm.VU64 z | Contract_vm.VU128 z | Contract_vm.VU256 z when typed ->
+    `Intlit (Z.to_string z)
+  | Contract_vm.VCap _ | Contract_vm.VCipher _ | Contract_vm.VPubKey _ when typed ->
+    `Null
   | Contract_vm.VBool b -> `String (if b then "true" else "false")
   | v -> `String (Contract_vm.to_string v)
 

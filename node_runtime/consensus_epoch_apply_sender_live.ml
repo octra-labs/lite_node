@@ -116,11 +116,11 @@ let run deps sender_txs =
         tag
         reason
     in
-    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float =
+    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec =
       match deps.fold (deps.current_epoch ()) with
       | Ok fold ->
         fold.Octra_core.Epoch_exec.standard_mode, fold.program_mode,
-        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float
+        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float, fold.proof_exec
       | Error reason -> failwith reason
     in
     let vm_tx_deps =
@@ -138,6 +138,7 @@ let run deps sender_txs =
           program_mode;
           program_overlap;
           fhe_work;
+          proof_exec;
           wasm_float;
           math;
           current_epoch = deps.current_epoch;
@@ -183,6 +184,7 @@ let run deps sender_txs =
     let handle_circle_tx () =
       let* admitted =
         Consensus_circle_code_admission.admit
+          ~resource_errors:(proof_exec = Octra_core.Rule_graph.Active)
           ~store:deps.store
           ~program_trust:deps.program_trust
           ~point_ops:(proof_mode = Octra_core.Rule_graph.Active)

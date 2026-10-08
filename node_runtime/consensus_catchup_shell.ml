@@ -988,7 +988,9 @@ let apply_chunk_records (deps : record_apply_deps) ~prev_eic ~start_txid chunk =
            ~expected_txid:!expected_txid
            ~head:final_point
            chunk))
-    (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+    (function
+      | Octra_core.Private_ledger.Worker_stopped _ as exn -> Lwt.fail exn
+      | exn -> Lwt.return (Error (Printexc.to_string exn)))
 
 let apply_result_gate ~gap_active ~target_epoch ~start_head ~current_head
     ~from_epoch ~reason = function
@@ -1274,7 +1276,9 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
           ~reason:queued.reason
           ~finish_success
           ~fail_catchup)
-      (fun exn ->
+      (function
+       | Octra_core.Private_ledger.Worker_stopped _ as exn -> Lwt.fail exn
+       | exn ->
         Log.error "catchup"
           "event = actor_failed target = %Ld reason = %s error = %s"
           queued.target_epoch

@@ -393,7 +393,8 @@ let rpc_field name fields field =
 
 let rpc_bytecode name source =
   match Lwt.state (Octra_vm.Contract_rpc.compile_aml_with
-      ~compiler:Octra_vm.Program_package.Source ~point_ops:true ~program:false ~source) with
+      ~compiler:Octra_vm.Program_package.Source ~point_ops:true ~loops:false
+      ~program:false ~source) with
   | Lwt.Return (Ok (`Assoc fields)) ->
     begin
       match List.assoc_opt "bytecode" fields with
@@ -489,6 +490,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
   let history = Filename.concat path "history" in
   Unix.mkdir path 0o700;
   let store = Lwt_main.run (Octra_core.Store_irmin.open_store ~fresh:true irmin) in
+  Lwt_main.run (Octra_core.Store_irmin.set_meta store "last_epoch" "0");
   let chain = ref (Some (Octra_core.Store_chaindata.open_chaindata history)) in
   let close_chain () =
     match !chain with
@@ -510,6 +512,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
           ~profile:{epoch = 0; math = false; point_ops = false;
                     object_cost = false; int_work = Octra_vm.Int_work.Active;
                     fhe_work = Octra_core.Rule_graph.Prior;
+                    proof_exec = Octra_core.Rule_graph.Prior;
                     wasm_float = Octra_core.Rule_graph.Prior}
           ~store
           ~ledger
@@ -630,10 +633,11 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         Lwt_main.run
           (Octra_vm.Contract_rpc.call_params
              ~trusted:[]
-             ~profile:{epoch = 0; math = false; point_ops = false;
+             ~profile:(fun ~epoch:_ -> Ok {epoch = 0; math = false; point_ops = false;
                        object_cost = false; int_work = Octra_vm.Int_work.Active;
                        fhe_work = Octra_core.Rule_graph.Prior;
-                       wasm_float = Octra_core.Rule_graph.Prior}
+                       proof_exec = Octra_core.Rule_graph.Prior;
+                       wasm_float = Octra_core.Rule_graph.Prior})
              ~store
              ~ledger
              ~get_fhe_pubkey:(fun _ -> None)
@@ -933,7 +937,7 @@ let rpc_multi_bytecode name =
       ])
   in
   match Lwt.state (Octra_vm.Contract_rpc.compile_aml_multi_with
-      ~compiler:Octra_vm.Program_package.Source ~point_ops:true ~json) with
+      ~compiler:Octra_vm.Program_package.Source ~point_ops:true ~loops:false ~json) with
   | Lwt.Return (Ok (`Assoc fields)) ->
     begin
       match List.assoc_opt "bytecode" fields with

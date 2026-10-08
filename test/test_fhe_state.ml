@@ -3,6 +3,7 @@
 
 module VM = Octra_vm.Contract_vm
 module R = Octra_core.Rule_graph
+module Image = Octra_core.Fhe_image
 
 let expect reason value = if not value then failwith reason
 
@@ -59,8 +60,8 @@ let () =
     let ctx = {VM.default_ctx with fhe_work = mode epoch; math; point_ops = true} in
     let st = VM.create_state ~limit ~ctx ~caller:"sender" ~origin:"sender"
       ~address:"program" ~value:Z.zero ~storage:(Hashtbl.create 1) () in
-    st.regs.(0) <- VM.VPubKey pk;
-    st.regs.(1) <- VM.VCipher cipher;
+    st.regs.(0) <- VM.VPubKey (Image.of_key pk);
+    st.regs.(1) <- VM.VCipher (Image.of_cipher cipher);
     st.regs.(2) <- VM.VInt Z.one;
     st in
   let rec expand count value =
@@ -69,7 +70,7 @@ let () =
   let expanded_bytes = Pvac_ffi.serialize_cipher expanded in
   List.iter (fun op ->
     let st = state ~limit:2_000 ~epoch:20 ~math:true () in
-    st.regs.(1) <- VM.VCipher expanded;
+    st.regs.(1) <- VM.VCipher (Image.of_cipher expanded);
     expect "expensive stateful consumer accepted" (not (VM.run st [|op; VM.STOP|]));
     expect "failed consumer published result" (st.regs.(3) = VM.VInt Z.zero);
     expect "failed consumer mutated input" (Pvac_ffi.serialize_cipher expanded = expanded_bytes))
@@ -79,7 +80,7 @@ let () =
      VM.FHE_SER (3, 1); VM.FHE_COMMIT (3, 0, 1)];
   List.iter (fun aliases ->
     let st = state ~limit:2_000 ~epoch:20 ~math:true () in
-    st.regs.(1) <- VM.VCipher expanded;
+    st.regs.(1) <- VM.VCipher (Image.of_cipher expanded);
     let code = Array.append aliases [|VM.FHE_SER (3, 4); VM.STOP|] in
     expect "alias escaped work check" (not (VM.run st code)))
     [[|VM.MOV (4, 1)|]; [|VM.MSTORE (3, 1); VM.MLOAD (4, 3)|]];
@@ -145,7 +146,7 @@ let () =
       expect "small historical operation refused" (VM.run prior [|op; VM.STOP|]);
       expect "small active operation refused" (VM.run active [|op; VM.STOP|]);
       let encoded st = match st.VM.regs.(3) with
-        | VM.VCipher value -> Pvac_ffi.serialize_cipher value
+        | VM.VCipher value -> value.data
         | _ -> failwith "cipher result missing" in
       expect "successful cipher bytes changed" (encoded prior = encoded active))
       [VM.FHE_ADD (3, 0, 1, 1); VM.FHE_SUB (3, 0, 1, 1);
@@ -163,11 +164,11 @@ let () =
   List.iter (fun (left, right) ->
     let run epoch =
       let st = state ~limit:1_000_000 ~epoch ~math:true () in
-      st.regs.(1) <- VM.VCipher left;
-      st.regs.(2) <- VM.VCipher right;
+      st.regs.(1) <- VM.VCipher (Image.of_cipher left);
+      st.regs.(2) <- VM.VCipher (Image.of_cipher right);
       expect "constant product refused" (VM.run st [|VM.FHE_MUL (3, 0, 1, 2); VM.STOP|]);
       match st.regs.(3) with
-      | VM.VCipher value -> Pvac_ffi.serialize_cipher value
+      | VM.VCipher value -> value.data
       | _ -> failwith "product result missing" in
     expect "constant product bytes changed" (run 19 = run 20))
     [constant, cipher; cipher, constant; constant, constant];

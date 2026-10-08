@@ -167,10 +167,7 @@ let default_join_log =
 
 let exit_fatal () = Unix._exit 1
 
-let exit_store store () =
-  match Octra_core.Store_irmin.Store.Gc.cancel store.Octra_core.Store_irmin.repo with
-  | _ -> exit_fatal ()
-  | exception _ -> exit_fatal ()
+let exit_store = Epoch_atomic.exit_store
 
 let require_sync ~data_dir ~chain ~store need =
   let status, stored = match Sync_mark.write ~data_dir ~chain need with
@@ -184,34 +181,42 @@ let require_sync ~data_dir ~chain ~store need =
     status (Sync_need.label stored.Sync_need.cause) stored.epoch stored.head;
   exit_store store ()
 
-let run_join ~log ~tasks ~exit_fatal =
+let run_join ~log ~tasks ~exit_fatal ~exit_refused =
   Lwt.catch
     (fun () -> Lwt.pick tasks)
     (fun e ->
-      log.fatal
-        (Printf.sprintf "event = lwt_main_failed reason = %s"
-           (Printexc.to_string e));
-      log.warn "event = store_ownership_retained reason = fatal_exit";
-      exit_fatal ();
+      let exit = match e with
+        | Octra_core.Private_ledger.Worker_stopped _ -> exit_refused
+        | _ -> exit_fatal in
+      Fun.protect ~finally:exit (fun () ->
+        log.fatal
+          (Printf.sprintf "event = lwt_main_failed reason = %s"
+             (Printexc.to_string e));
+        log.warn "event = store_ownership_retained reason = fatal_exit");
       Lwt.return_unit)
 
-let run_launch_tasks (deps : unit Lwt.t launch_tasks) ~exit_fatal =
+let run_launch_tasks ?(exit_refused = fun () -> Unix._exit 78)
+    (deps : unit Lwt.t launch_tasks) ~exit_fatal =
   run_join
     ~log:default_join_log
     ~tasks:(launch_tasks deps)
+    ~exit_refused
     ~exit_fatal
 
-let run_node_launch_tasks ?duty_head ?bft_mode (deps : node_launch_deps)
+let run_node_launch_tasks ?duty_head ?bft_mode ?(exit_refused = fun () -> Unix._exit 78)
+    (deps : node_launch_deps)
     ~exit_fatal =
   run_join
     ~log:default_join_log
     ~tasks:(node_launch_tasks ?duty_head ?bft_mode deps)
+    ~exit_refused
     ~exit_fatal
 
-let run_node_runtime ?duty_head ?bft_mode (runtime : node_launch_runtime) =
+let run_node_runtime ?duty_head ?bft_mode ?exit_refused (runtime : node_launch_runtime) =
   run_node_launch_tasks
     ?duty_head
     ?bft_mode
+    ?exit_refused
     (make_node_launch_deps_with_swarm
        ~p2p:runtime.p2p
        ~rpc:runtime.rpc

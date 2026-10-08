@@ -24,6 +24,10 @@ type verification_failure =
   | Worker_memory_exceeded
   | Worker_failed of string
 
+type control =
+  | Continue
+  | Cancel
+
 type stream = {
   fd : Unix.file_descr;
   data : Buffer.t;
@@ -59,7 +63,8 @@ let float_env name default lower upper =
     begin
       try
         let value = float_of_string raw in
-        if value < lower || value > upper then default else value
+        if not (Float.is_finite value) || value < lower || value > upper then default
+        else value
       with _ ->
         default
     end
@@ -82,7 +87,7 @@ let timeout_seconds () =
 let max_rss_mb () =
   int_env "OCTRA_PVAC_VERIFY_MAX_RSS_MB" 9_216 64 32_768
 
-let executable_candidates () =
+let executable_paths () =
   let directory = Filename.dirname Sys.executable_name in
   let extension = if Sys.win32 then ".exe" else "" in
   [
@@ -103,7 +108,7 @@ let worker_path () =
   match Sys.getenv_opt "OCTRA_PVAC_VERIFY_WORKER" with
   | Some path when path <> "" && executable path -> Some path
   | Some _ -> None
-  | None -> List.find_opt executable (executable_candidates ())
+  | None -> List.find_opt executable (executable_paths ())
 
 let monotonic_seconds () =
   Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.
@@ -149,20 +154,13 @@ let terminate pid =
     try Unix.kill pid Sys.sigkill
     with _ -> ()
   end;
-  let rec reap attempts =
-    if attempts <= 0 then ()
-    else
-      try
-        match Unix.waitpid [Unix.WNOHANG] pid with
-        | 0, _ ->
-          Unix.sleepf 0.01;
-          reap (attempts - 1)
-        | _ ->
-          ()
-      with _ ->
-        ()
+  let rec reap () =
+    try ignore (Unix.waitpid [] pid)
+    with
+    | Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+    | Unix.Unix_error (Unix.ECHILD, _, _) -> ()
   in
-  reap 100
+  reap ()
 
 let close_stream ?(close = close_noerr) stream =
   if stream.open_ then begin
@@ -171,7 +169,7 @@ let close_stream ?(close = close_noerr) stream =
   end
 
 let append stream limit bytes count =
-  if Buffer.length stream.data + count > limit then Error "output_too_large"
+  if count > limit - Buffer.length stream.data then Error "output_too_large"
   else begin
     Buffer.add_subbytes stream.data bytes 0 count;
     Ok ()
@@ -189,7 +187,7 @@ let rec read_available ?(close = close_noerr) stream limit bytes =
         begin
           match append stream limit bytes count with
           | Error _ as error -> error
-          | Ok () -> read_available ~close stream limit bytes
+          | Ok () -> Ok ()
         end
     with
     | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> Ok ()
@@ -248,9 +246,13 @@ let process_response expected_hash stdout stderr status =
   | Unix.WSTOPPED signal ->
     Failed (Printf.sprintf "worker_stopped_%d" signal)
 
-let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
-  let raw = P.request_bytes request in
-  let expected_hash = P.request_hash request in
+let exchange ?(control = Atomic.make Continue)
+    ?(pipe = Unix.pipe ~cloexec:true) ?(arguments = [])
+    ?(limit = P.max_response_bytes) ?(deadline = Float.infinity) worker raw =
+  if Atomic.get control = Cancel then Error (Unavailable "worker_cancelled")
+  else if Float.is_nan deadline || deadline <= monotonic_seconds () then Error Timed_out
+  else if limit < 0 || limit > Sys.max_string_length then Error (Failed "output_limit")
+  else
   let descriptors = ref [] in
   let acquire () =
     let read, write = pipe () in
@@ -267,6 +269,10 @@ let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
     List.iter close !descriptors
   in
   let pid_ref = ref None in
+  let stop () =
+    Option.iter terminate !pid_ref;
+    pid_ref := None
+  in
   try
     let input_read, input_write = acquire () in
     let output_read, output_write = acquire () in
@@ -274,7 +280,7 @@ let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
     let pid =
       Unix.create_process_env
         worker
-        [|worker|]
+        (Array.of_list (worker :: arguments))
         (Unix.environment ())
         input_read
         output_write
@@ -301,24 +307,30 @@ let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
       outcome
     in
     let fail reason =
-      terminate pid;
-      finish (Failed reason)
+      stop ();
+      finish (Error (Failed reason))
     in
     let rec loop status =
       let elapsed = monotonic_seconds () -. started in
-      if elapsed > timeout_seconds () then begin
-        terminate pid;
-        finish Timed_out
+      if Atomic.get control = Cancel then begin
+        stop ();
+        finish (Error (Unavailable "worker_cancelled"))
+      end else if elapsed > timeout_seconds () || monotonic_seconds () >= deadline then begin
+        stop ();
+        finish (Error Timed_out)
       end else
         match read_rss_mb pid with
         | Some rss when rss > max_rss_mb () ->
-          terminate pid;
-          finish Memory_exceeded
+          stop ();
+          finish (Error Memory_exceeded)
         | Some _ | None ->
           let status =
             match status with
             | Some _ -> status
-            | None -> poll_status pid
+            | None ->
+              let status = poll_status pid in
+              if Option.is_some status then pid_ref := None;
+              status
           in
           if Option.is_some status && !input_open then begin
             close input_write;
@@ -331,12 +343,7 @@ let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
           then
             match status with
             | Some value ->
-              finish
-                (process_response
-                   expected_hash
-                   (Buffer.contents output.data)
-                   (Buffer.contents error.data)
-                   value)
+              finish (Ok (Buffer.contents output.data, Buffer.contents error.data, value))
             | None ->
               fail "worker_status_missing"
           else
@@ -348,16 +355,16 @@ let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
             let ready = wait_io input_write output_read error_read mask in
             let read_result =
               List.fold_left
-                (fun result (bit, stream) ->
+                (fun result (bit, stream, limit) ->
                   match result with
                   | Error _ -> result
                   | Ok () when
                       stream.open_
                       && ready land bit <> 0 ->
-                    read_available ~close stream P.max_response_bytes bytes
+                    read_available ~close stream limit bytes
                   | Ok () -> Ok ())
                 (Ok ())
-                [1, output; 2, error]
+                [1, output, limit; 2, error, P.max_response_bytes]
             in
             begin
               match read_result with
@@ -380,14 +387,128 @@ let run_process ?(pipe = Unix.pipe ~cloexec:true) worker request =
     in
     loop None
   with error ->
-    Option.iter terminate !pid_ref;
+    stop ();
     close_all ();
-    Failed (Printexc.to_string error)
+    Error (Failed (Printexc.to_string error))
 
-let run_unmanaged request =
+let run_process ?control ?pipe ?deadline worker request =
+  if Option.fold ~none:false ~some:(fun signal -> Atomic.get signal = Cancel) control then
+    Unavailable "worker_cancelled"
+  else
+    let raw = P.request_bytes request in
+    let expected_hash = P.request_hash request in
+    match exchange ?control ?pipe ?deadline worker raw with
+    | Ok (stdout, stderr, status) ->
+      begin match process_response expected_hash stdout stderr status with
+      | Completed response when not response.accepted
+          && List.mem response.reason ["op_invalid"; "schema_invalid"; "math_invalid";
+            "request_invalid"; "request_json_invalid"; "request_too_large"] ->
+        Unavailable ("worker_protocol_" ^ response.reason)
+      | outcome -> outcome
+      end
+    | Error outcome -> outcome
+
+type session = {
+  program : string;
+  pid : int;
+  input : Unix.file_descr;
+  output : Unix.file_descr;
+  key : (string * string) option;
+}
+
+let close_session session =
+  terminate session.pid;
+  close_noerr session.input;
+  close_noerr session.output
+
+let retire_pid pid =
+  begin try Unix.kill pid Sys.sigkill
+  with Unix.Unix_error (Unix.ESRCH, _, _) -> () end;
+  let rec reap () =
+    Lwt.catch
+      (fun () -> Lwt.map (fun _ -> ()) (Lwt_unix.waitpid [] pid))
+      (function
+        | Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+        | Unix.Unix_error (Unix.ECHILD, _, _) -> Lwt.return_unit
+        | error -> Lwt.fail error) in
+  Lwt.no_cancel (reap ())
+
+let retire_session session =
+  let closed = retire_pid session.pid in
+  close_noerr session.input;
+  close_noerr session.output;
+  closed
+
+let open_session ?(on_exit = terminate) program =
+  let descriptors = ref [] in
+  let pipe () =
+    let left, right = Unix.pipe ~cloexec:true () in
+    descriptors := left :: right :: !descriptors;
+    left, right in
+  let pid = ref None in
+  try
+    let input, write = pipe () in
+    let read, output = pipe () in
+    let error = Unix.openfile "/dev/null" [Unix.O_WRONLY; Unix.O_CLOEXEC] 0 in
+    descriptors := error :: !descriptors;
+    Unix.set_nonblock write;
+    Unix.set_nonblock read;
+    let child = Unix.create_process_env program [|program; "--fhe-session"|]
+      (Unix.environment ()) input output error in
+    pid := Some child;
+    List.iter close_noerr [input; output; error];
+    descriptors := [write; read];
+    {program; pid = child; input = write; output = read; key = None}
+  with error ->
+    Option.iter on_exit !pid;
+    List.iter close_noerr !descriptors;
+    raise error
+
+let session_exchange ~control ~deadline session raw =
+  let header = Bytes.create 8 in
+  Bytes.set_int64_be header 0 (Int64.of_int (String.length raw));
+  let request = Bytes.to_string header ^ raw in
+  let sent = ref 0 in
+  let received = ref 0 in
+  let data = ref (Bytes.create 8) in
+  let framed = ref false in
+  let rec loop () =
+    if Atomic.get control = Cancel then Error (Unavailable "worker_cancelled")
+    else if monotonic_seconds () >= deadline then Error Timed_out
+    else if Option.fold ~none:false ~some:(fun rss -> rss > max_rss_mb ())
+        (read_rss_mb session.pid) then Error Memory_exceeded
+    else if !framed && !received = Bytes.length !data && !sent = String.length request then
+      Ok (Bytes.unsafe_to_string !data)
+    else begin
+      let mask = (if !received < Bytes.length !data then 1 else 0)
+        lor (if !sent < String.length request then 4 else 0) in
+      let ready = wait_io session.input session.output session.output mask in
+      if ready land 4 <> 0 then
+        sent := !sent + Unix.write_substring session.input request !sent
+          (min 65_536 (String.length request - !sent));
+      if ready land 1 <> 0 then begin
+        let count = Unix.read session.output !data !received (Bytes.length !data - !received) in
+        if count = 0 then raise End_of_file;
+        received := !received + count;
+        if not !framed && !received = 8 then begin
+          let length = Bytes.get_int64_be !data 0 in
+          if length <= 0L || length > Int64.of_int Fhe_calc.max_bytes then
+            failwith "worker frame size";
+          data := Bytes.create (Int64.to_int length);
+          received := 0;
+          framed := true
+        end
+      end;
+      loop ()
+    end in
+  try loop () with
+  | Out_of_memory -> Error Memory_exceeded
+  | error -> Error (Failed (Printexc.to_string error))
+
+let run_unmanaged ?control request =
   match worker_path () with
   | None -> Unavailable "worker_missing"
-  | Some worker -> run_process worker request
+  | Some worker -> run_process ?control worker request
 
 let run_sync ?(priority = Required) request =
   match
@@ -404,10 +525,12 @@ let try_run_sync ?(priority = Speculative) request =
   | None -> Busy
 
 let run ?(priority = Required) request =
+  let control = Atomic.make Continue in
+  let pending = Channel.run_threaded proof_channel priority
+    (run_unmanaged ~control) request in
+  Lwt.on_cancel pending (fun () -> Atomic.set control Cancel);
   let open Lwt.Syntax in
-  let* outcome =
-    Channel.run_threaded proof_channel priority run_unmanaged request
-  in
+  let* outcome = pending in
   match outcome with
   | Some value -> Lwt.return value
   | None -> Lwt.return Busy
@@ -459,8 +582,26 @@ let try_result_sync ?(math = false) ?(priority = Speculative) request =
   try_classified_result_sync ~math ~priority request
   |> Result.map_error verification_failure_message
 
+let session_ready () =
+  match worker_path () with
+  | None -> Error "worker_missing"
+  | Some worker ->
+    try
+      let session = open_session worker in
+      Fun.protect ~finally:(fun () -> close_session session) (fun () ->
+        let deadline = monotonic_seconds () +. 5. in
+        let check index =
+          let raw = Fhe_calc.request_bytes
+            (Fhe_calc.Read_cipher (true, true, string_of_int index)) in
+          match session_exchange ~control:(Atomic.make Continue) ~deadline session raw with
+          | Ok reply when Fhe_calc.response_of_bytes (Fhe_calc.hash raw) reply
+              = Ok (Error Fhe_calc.Invalid) -> Ok ()
+          | _ -> Error "worker_session_unavailable" in
+        Result.bind (check 0) (fun () -> check 1))
+    with _ -> Error "worker_session_unavailable"
+
 let ready_sync () =
-  result_sync P.Ping
+  Result.bind (result_sync P.Ping) session_ready
 
 let ready () =
   result P.Ping

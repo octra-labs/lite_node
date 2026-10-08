@@ -5,6 +5,20 @@
   mirage-crypto-ec mirage-crypto-rng.unix))
 
 (test
+ (name test_proof_wait)
+ (modules test_proof_wait)
+ (libraries octra_vm octra_core lwt.unix))
+
+(test
+ (name test_fhe_task)
+ (modules test_fhe_task)
+ (libraries octra_vm octra_core pvac_ffi base64 zarith lwt.unix mtime.clock.os octra_test_workspace)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{dep:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
+
+(test
  (name test_vote_log)
  (modules test_vote_log)
  (libraries octra_consensus unix))
@@ -242,6 +256,11 @@
  (libraries octra_core octra_vm digestif zarith base64 pvac_ffi lwt.unix unix))
 
 (test
+ (name test_pure_loop)
+ (modules test_pure_loop)
+ (libraries octra_core octra_vm octra_node_runtime zarith base64 lwt.unix))
+
+(test
  (name test_byte_modes)
  (modules test_byte_modes)
  (libraries octra_vm zarith))
@@ -293,8 +312,21 @@
 
 (test
  (name test_vm_transition)
- (modules test_vm_transition)
+ (modules test_vm_transition hfhe_case)
+ (deps vault.wasm)
  (libraries octra_node_runtime octra_core octra_vm zarith base64 lwt.unix unix))
+
+(rule
+ (target vault.wasm)
+ (deps
+  (source_tree ../contracts/examples/rust_circle_vault)
+  (source_tree ../contracts/examples/rust_circle_sdk))
+ (action
+  (progn
+   (run cargo build --offline --locked --release --features test_calls --target wasm32-unknown-unknown
+    --manifest-path ../contracts/examples/rust_circle_vault/Cargo.toml
+    --target-dir ../_cargo_target/wasm_calls)
+   (run cp ../_cargo_target/wasm_calls/wasm32-unknown-unknown/release/rust_circle_vault.wasm vault.wasm))))
 
 (test
  (name test_program_abi)
@@ -706,7 +738,7 @@
  (name test_pvac_verify_worker)
  (modules test_pvac_verify_worker)
  (deps ../bin/octra_pvac_worker.exe)
- (libraries octra_core lwt lwt.unix unix))
+ (libraries octra_core lwt lwt.unix unix octra_test_workspace))
 
 (test
  (name test_fixed_q16)
@@ -715,7 +747,7 @@
 
 (test
  (name test_circle_wasm_hfhe_policy)
- (modules test_circle_wasm_hfhe_policy)
+ (modules test_circle_wasm_hfhe_policy hfhe_case)
  (libraries octra_core pvac_ffi))
 
 (test
@@ -724,8 +756,14 @@
  (libraries octra_vm unix lwt.unix base64 digestif))
 
 (test
- (name test_circle_program_admission)
- (modules test_circle_program_admission)
+ (name test_view_root)
+ (modules test_view_root)
+ (libraries octra_vm octra_core octra_test_workspace unix lwt.unix base64 digestif))
+
+(test
+ (name test_circle_program)
+ (modules test_circle_program)
+ (deps ../bin/octra_pvac_worker.exe)
  (libraries octra_core octra_circle_runtime octra_vm unix lwt lwt.unix yojson base64 zarith))
 
 (test
@@ -907,19 +945,29 @@
  (name test_preverify_pool)
  (modules test_preverify_pool)
  (libraries octra_node_runtime octra_core lwt.unix zarith))
+
 (test
  (name test_set_report)
  (modules test_set_report)
  (libraries octra_core))
+
 (test
  (name test_fhe_work)
  (modules test_fhe_work)
- (libraries octra_vm pvac_ffi zarith base64))
+ (libraries octra_vm octra_core pvac_ffi zarith base64)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{dep:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
 
 (test
  (name test_fhe_memory)
  (modules test_fhe_memory)
- (libraries octra_vm pvac_ffi zarith base64))
+ (libraries octra_vm pvac_ffi zarith base64 lwt.unix octra_test_workspace)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{dep:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
 
 (test
  (name test_vm_effects)
@@ -929,21 +977,33 @@
 (test
  (name test_fhe_state)
  (modules test_fhe_state)
- (libraries octra_vm octra_core pvac_ffi zarith))
+ (libraries octra_vm octra_core pvac_ffi zarith)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{dep:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
 
 (test
  (name test_fhe_budget)
  (modules test_fhe_budget)
- (libraries octra_vm octra_core pvac_ffi zarith))
+ (libraries octra_vm octra_core pvac_ffi zarith)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{dep:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
 
 (test
  (name test_native_alloc)
  (modules test_native_alloc preview_alloc)
  (foreign_stubs
   (language cxx)
-  (names alloc_fault)
+ (names alloc_fault)
   (flags (:include ../pvac_ffi/flags.sexp)))
- (libraries octra_vm octra_node_runtime octra_test_workspace pvac_ffi zarith base64 lwt.unix unix))
+ (libraries octra_vm octra_node_runtime octra_test_workspace pvac_ffi zarith base64 lwt.unix unix)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{dep:../bin/octra_pvac_worker.exe}
+   (run %{test}))))
 
 (test
  (name test_zk_ffi)

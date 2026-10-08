@@ -76,7 +76,20 @@ let test_live_chain () =
     List.iter (fun epoch ->
       require (Graph.circle_batch graph ~epoch = Ok Graph.Prior)
         "circle batch active without approval") [0; 1_614_500; max_int])
-    ["octra-devnet-9871-cluster"; "octra-mainnet"; "octra-test"];
+    ["octra-mainnet"; "octra-test"];
+  let root = "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d" in
+  let matching = graph (fun epoch ->
+    require (epoch = 1_504_440) "batch anchor epoch changed";
+    Graph.Root root) in
+  List.iter (fun epoch ->
+    require (Graph.circle_batch matching ~epoch = Ok Graph.Prior)
+      "circle batch active before epoch") [0; 1_614_500; 1_648_974; 1_662_999];
+  List.iter (fun epoch ->
+    require (Graph.circle_batch matching ~epoch = Ok Graph.Active)
+      "circle batch inactive after epoch") [1_663_000; 1_663_001; max_int];
+  require (Result.is_error (Graph.circle_batch
+    (graph (fun _ -> Graph.Root (String.make 64 '0'))) ~epoch:1_663_000))
+    "circle batch ignored anchor";
   List.iter (fun chain_id ->
     require (not (Graph.live_chain ~chain_id)) "missing live plan accepted";
     let prior = Graph.create ~chain_id ~root_at:(fun _ -> fail "anchor read") in
@@ -97,7 +110,7 @@ let test_set_plan () =
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
   require
-    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000; 1_614_500])
+    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
@@ -265,7 +278,46 @@ let test_program_rule () =
     require (Graph.program_source_at ~chain_id ~epoch:max_int = Graph.Prior)
       "other chain RPC mode changed") ["octra-mainnet"; "other"]
 
+let test_proof_rule () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (Graph.proof_activation_for_chain chain_id) in
+  require (plan.activation_epoch = 1_663_000) "proof epoch differs";
+  let unread = graph (fun _ -> fail "proof read before activation") in
+  List.iter (fun epoch ->
+    require (Graph.proof_exec unread ~epoch = Ok Graph.Prior)
+      "proof active before activation";
+    require (Graph.proof_exec_at ~chain_id ~epoch = Graph.Prior)
+      "proof profile active before activation")
+    [0; 1_614_500; 1_639_999; 1_640_000; 1_640_001;
+     1_644_999; 1_645_000; 1_645_001; 1_649_998; 1_649_999;
+     1_650_000; 1_650_001; 1_654_999; 1_655_000; 1_655_001;
+     1_660_999; 1_661_000; 1_661_001; 1_662_998; 1_662_999];
+  let good = graph (fun epoch ->
+    require (epoch = plan.anchor_epoch) "wrong proof anchor";
+    Graph.Root plan.anchor_state_root) in
+  List.iter (fun epoch ->
+    require (Graph.proof_exec good ~epoch = Ok Graph.Active)
+      "proof inactive after activation";
+    require (Graph.proof_exec_at ~chain_id ~epoch = Graph.Active)
+      "proof profile inactive after activation";
+    List.iter (fun (root, expected) ->
+      require (Graph.proof_exec (graph (fun _ -> root)) ~epoch = Error expected)
+        "proof anchor accepted")
+      [Graph.Missing, Graph.Anchor_missing plan.anchor_epoch;
+       Graph.Unreadable "read", Graph.Anchor_unreadable {
+         epoch = plan.anchor_epoch; reason = "read" };
+       Graph.Root "wrong", Graph.Anchor_mismatch {
+         epoch = plan.anchor_epoch; expected = plan.anchor_state_root; actual = "wrong" }])
+    [1_663_000; 1_663_001; max_int];
+  List.iter (fun chain_id ->
+    let other = Graph.create ~chain_id ~root_at:(fun _ -> fail "other proof read") in
+    require (Graph.proof_activation_for_chain chain_id = None) "other proof date";
+    require (Graph.proof_exec other ~epoch:max_int = Ok Graph.Prior)
+      "other proof enabled")
+    ["octra-mainnet"; "octra-test"; ""; "octra-devnet-9871-cluster "]
+
 let () =
+  test_proof_rule ();
   test_exit ();
   test_program_rule ();
   test_live_chain ();

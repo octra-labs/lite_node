@@ -73,8 +73,8 @@ let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | _ -> None
 
-let decode_loaded_for_admission ?(trusted = []) ?(point_ops = false) admission raw =
-  if String.equal admission "source" then
+let decode_mode ?(trusted = []) ?(point_ops = false) mode raw =
+  if String.equal mode "source" then
     try
       match Admission.decode_program_source ~point_ops raw with
       | Ok admitted ->
@@ -89,19 +89,19 @@ let decode_loaded_for_admission ?(trusted = []) ?(point_ops = false) admission r
   else
     decode_loaded ~trusted ~point_ops raw
 
-let load_loaded ?(trusted = []) ?(point_ops = false) store contract_addr =
-  match run_s (Octra_core.Store_irmin.load_bytecode store contract_addr) with
+let load_loaded ?snapshot ?(trusted = []) ?(point_ops = false) store contract_addr =
+  match run_s (Octra_core.Store_irmin.load_bytecode ?snapshot store contract_addr) with
   | Some b64 ->
-    let admission =
-      match run_s (Octra_core.Store_irmin.get_contract_meta store contract_addr) with
+    let mode =
+      match run_s (Octra_core.Store_irmin.get_contract_meta ?snapshot store contract_addr) with
       | Some meta -> meta.admission
       | None -> "binary"
     in
     (try
-       decode_loaded_for_admission
+       decode_mode
          ~trusted
          ~point_ops
-         admission
+         mode
          (Base64.decode_exn b64)
      with
      | (Stack_overflow | Out_of_memory) as error -> raise error
@@ -112,8 +112,26 @@ let load_bytecode ?(trusted = []) ?(point_ops = false) store contract_addr =
   Option.map (fun loaded -> loaded.code)
     (load_loaded ~trusted ~point_ops store contract_addr)
 
-let load_storage store contract_addr =
-  run_s (Octra_core.Store_irmin.load_contract_storage store contract_addr)
+let load_async ?snapshot ~trusted ~point_ops store address =
+  let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
+  let* encoded = Octra_core.Store_irmin.load_bytecode ?snapshot store address in
+  match encoded with
+  | None -> Lwt.return_none
+  | Some encoded ->
+    let* meta = Octra_core.Store_irmin.get_contract_meta ?snapshot store address in
+    let mode = match meta with Some meta -> meta.admission | None -> "binary" in
+    let work = Octra_core.Exec_resource.detach (fun () ->
+      match Base64.decode encoded with
+      | Error _ -> None
+      | Ok raw -> decode_mode ~trusted ~point_ops mode raw) () in
+    Lwt.finalize
+      (fun () -> Lwt.protected work)
+      (fun () -> Lwt.catch
+        (fun () -> Lwt.map (fun _ -> ()) (Lwt.protected work))
+        (fun _ -> Lwt.return_unit))
+
+let load_storage ?snapshot store contract_addr =
+  run_s (Octra_core.Store_irmin.load_contract_storage ?snapshot store contract_addr)
 
 let fix_jumps bytecode =
   let jump_table = Hashtbl.create 10 in
@@ -356,6 +374,20 @@ let run_fixed_from_dispatcher ?running state fixed =
 let run_from_dispatcher state bytecode =
   run_fixed_from_dispatcher state (fix_jumps bytecode)
 
+let run_fixed_async ?running state fixed =
+  Option.iter (fun entry -> state.Contract_vm.pc <- entry) (find_dispatcher fixed);
+  let ( let* ) = Octra_core.Exec_resource.bind in
+  let* success = Contract_vm.run_async ?running state fixed in
+  let ok = success && not state.reverted in
+  Lwt.return {
+    success = ok;
+    return_value = if ok then Some state.regs.(0) else None;
+    effort_used = state.effort_used;
+    events = List.rev !(state.logs);
+    error = if ok then None else Some "execution reverted";
+    storage_writes = count_storage_writes state;
+  }
+
 let trim_error msg =
   if String.length msg <= 256 then msg
   else String.sub msg 0 256
@@ -366,8 +398,9 @@ let exec_result_to_result r =
   else
     Error (trim_error (Option.value r.error ~default:"execution failed"))
 
-let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
-    ?(params = []) store deployer ctype _code bytecode_raw nonce =
+let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
+    ?(params = []) store deployer ctype (_code : Contract_vm.instr array) bytecode_raw nonce =
+  let ctx = { ctx with async_exec } in
   let addr = addr_from_code bytecode_raw deployer nonce in
   let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
   Octra_log.info "program" "event = deploy_start addr = %s deployer = %s size = %d hash = %s"
@@ -383,7 +416,7 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
   in
   match checked with
   | Error error ->
-    (addr, { success = false; return_value = None; effort_used = 0;
+    return (addr, { success = false; return_value = None; effort_used = 0;
              events = []; error = Some (Admission.error_message error); storage_writes = 0 })
 | Ok admitted ->
   let admission = if source_checked then "source" else "binary" in
@@ -400,12 +433,12 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
   let staged = Program_journal.has_deploy journal addr in
   if exists || staged then (
     Octra_log.warn "program" "event = deploy_exists addr = %s" addr;
-    (addr, { success = true; return_value = None; effort_used = 0;
+    return (addr, { success = true; return_value = None; effort_used = 0;
              events = []; error = None; storage_writes = 0 })
   ) else
     match runtime_params (Admission.profile admitted) 0 params with
     | Error error ->
-      (addr, { success = false; return_value = None; effort_used = 0;
+      return (addr, { success = false; return_value = None; effort_used = 0;
                events = []; error = Some (Program_input.error_message error); storage_writes = 0 })
     | Ok values ->
       let storage_tbl = Hashtbl.create 100 in
@@ -419,7 +452,7 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
       Octra_log.info "program" "event = constructor_start addr = %s params = %d"
         addr (List.length params);
       let fixed = fix_jumps code in
-      let success = Contract_vm.run state fixed in
+      bind (run state fixed) (fun success ->
       let result = {
         success = success && not state.reverted;
         return_value = None;
@@ -443,20 +476,28 @@ let deploy ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
         Octra_log.info "program"
           "event = constructor_done addr = %s effort = %d persistence = deferred"
           addr result.effort_used;
-        (addr, result)
+        return (addr, result)
       ) else (
         Octra_log.error "program"
           "event = constructor_failed addr = %s effort = %d"
           addr result.effort_used;
-        (addr, result)
-      )
+        return (addr, result)
+      ))
 
-let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(limit = 1_000_000) ?(params = []) store ~deployer
+let deploy = deploy_with ~async_exec:false ~return:Fun.id ~bind:(fun value next -> next value)
+  ~run:Contract_vm.run
+
+let deploy_async = deploy_with ~async_exec:true ~return:Lwt.return
+  ~bind:Octra_core.Exec_resource.bind
+  ~run:(fun state code -> Contract_vm.run_async state code)
+
+let spawn_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(limit = 1_000_000) ?(params = []) store ~deployer
     ~bytecode_raw ~nonce =
+  let ctx = { ctx with async_exec } in
   match Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw with
-  | Error (Admission.Decode_error error) -> Error (Printf.sprintf "bad bytecode: %s" error)
-  | Error (Admission.Verify_error _) -> Error "verify failed"
-  | Error (Admission.Unsafe_error error) -> Error error
+  | Error (Admission.Decode_error error) -> return (Error (Printf.sprintf "bad bytecode: %s" error))
+  | Error (Admission.Verify_error _) -> return (Error "verify failed")
+  | Error (Admission.Unsafe_error error) -> return (Error error)
   | Ok admitted ->
       let code = Admission.code admitted in
       let profile = Admission.profile admitted in
@@ -465,10 +506,10 @@ let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~dept
       let addr = addr_from_code bytecode_raw deployer nonce in
       let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
       let already_pending = Program_journal.has_deploy journal addr in
-      if exists || already_pending then Error (Printf.sprintf "collision: %s" addr)
+      if exists || already_pending then return (Error (Printf.sprintf "collision: %s" addr))
       else
         match runtime_values (Admission.profile admitted) 0 params with
-        | Error error -> Error (Program_input.error_message error)
+        | Error error -> return (Error (Program_input.error_message error))
         | Ok values ->
           let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
           Octra_log.info "program"
@@ -485,7 +526,7 @@ let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~dept
           Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
           List.iteri (fun i value -> Hashtbl.replace state.memory.data (1001 + i) value) values;
           let fixed = fix_jumps code in
-          let success = Contract_vm.run state fixed in
+          bind (run state fixed) (fun success ->
           if success && not state.reverted then (
             Program_journal.add_deploy journal {
               address = addr;
@@ -500,15 +541,22 @@ let deploy_internal ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~dept
             Octra_log.info "program"
               "event = spawn_done addr = %s effort = %d persistence = deferred"
               addr state.effort_used;
-            Ok {
+            return (Ok {
               Contract_vm.spawned_addr = addr;
               effort_used = state.effort_used;
               events = List.rev !(state.logs);
-            }
+            })
           ) else (
             Octra_log.error "program" "event = spawn_failed addr = %s" addr;
-            Error "constructor failed"
-          )
+            return (Error "constructor failed")
+          ))
+
+let deploy_internal = spawn_with ~async_exec:false ~return:Fun.id ~bind:(fun value next -> next value)
+  ~run:Contract_vm.run
+
+let deploy_inner_async = spawn_with ~async_exec:true ~return:Lwt.return
+  ~bind:Octra_core.Exec_resource.bind
+  ~run:(fun state code -> Contract_vm.run_async state code)
 
 let upgrade ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) store ~address ~caller
     ~expected_code_hash ~bytecode_raw =
@@ -561,7 +609,7 @@ let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store 
   match Program_journal.find_upgrade journal program_addr with
   | Some upgrade ->
     (try
-       decode_loaded_for_admission
+       decode_mode
          ~trusted
          ~point_ops
          upgrade.admission
@@ -573,7 +621,7 @@ let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store 
     match Program_journal.find_deploy journal program_addr with
     | Some deploy ->
       (try
-         decode_loaded_for_admission
+         decode_mode
            ~trusted
            ~point_ops
            deploy.admission
@@ -591,21 +639,43 @@ let contract_exists_with_overlay journal store program_addr =
   if Program_journal.has_deploy journal program_addr then true
   else run_s (Octra_core.Store_irmin.contract_exists store program_addr)
 
-let execute_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
+let run_checked ~journal ~(ctx : Contract_vm.exec_ctx) action =
+  match ctx.proof_exec with
+  | Octra_core.Rule_graph.Prior -> action ()
+  | Octra_core.Rule_graph.Active ->
+    let saved = Program_journal.snapshot journal in
+    match action () with
+    | result ->
+      if not result.success then Program_journal.restore journal saved;
+      result
+    | exception error ->
+      Program_journal.restore journal saved;
+      raise error
+
+let call_with ~return ~run ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
     ~journal store program_addr method_name params caller value =
   Octra_log.info "program"
     "event = call_start addr = %s method = %s depth = %d limit = %d"
     program_addr method_name depth limit;
+  let work = if ctx.proof_exec = Octra_core.Rule_graph.Active then
+    Program_journal.snapshot_effort journal else Z.zero in
+  match Cost.charge_z ~used:0 ~cost:work
+      ~limit:(if ctx.proof_exec = Octra_core.Rule_graph.Active then limit else max_int) with
+  | None ->
+    return {success = false; return_value = None; effort_used = limit;
+      events = []; error = Some "call journal effort exceeds limit"; storage_writes = 0}
+  | Some spent ->
+  let limit = limit - spent in
   match load_loaded_with_overlay
     ~trusted ~point_ops:ctx.point_ops journal store program_addr with
   | None ->
-    { success = false; return_value = None; effort_used = 0;
+    return { success = false; return_value = None; effort_used = 0;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }
   | Some loaded ->
     let fixed = fix_jumps loaded.code in
     match extract_method_arity fixed method_name with
     | Some arity when arity <> List.length params ->
-      { success = false; return_value = None; effort_used = 0;
+      return { success = false; return_value = None; effort_used = 0;
         events = [];
         error = Some (Printf.sprintf "arity mismatch: %s expects %d args, got %d"
           method_name arity (List.length params));
@@ -613,34 +683,55 @@ let execute_call ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?
     | _ ->
       (match extract_method_target fixed method_name with
        | None ->
-         { success = false; return_value = None; effort_used = 0;
+         return { success = false; return_value = None; effort_used = 0;
            events = []; error = Some "method not found"; storage_writes = 0 }
        | Some target ->
          match runtime_params loaded.profile target params with
          | Error error ->
-           { success = false; return_value = None; effort_used = 0;
+           return { success = false; return_value = None; effort_used = 0;
              events = []; error = Some (Program_input.error_message error); storage_writes = 0 }
          | Ok values ->
-           let storage_tbl =
-             Program_journal.checkout_storage journal program_addr
-               ~fallback:(fun () -> load_storage store program_addr)
-           in
-           let state = setup_call_state_values ~ctx ~depth ~limit ~caller
-             ~strict_values:(strict_values loaded.profile)
-             ~storage_kinds:(storage_kinds loaded.profile)
-             ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
-           run_fixed_from_dispatcher state fixed)
+           run ~journal ~ctx ~spent (fun () ->
+             let storage_tbl =
+               Program_journal.checkout_storage journal program_addr
+                 ~fallback:(fun () -> load_storage store program_addr)
+             in
+             let state = setup_call_state_values ~ctx ~depth ~limit ~caller
+               ~strict_values:(strict_values loaded.profile)
+               ~storage_kinds:(storage_kinds loaded.profile)
+               ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
+             state, fixed))
 
-let execute_view_call ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000) store contract_addr method_name params caller =
-  match load_loaded ~trusted ~point_ops:ctx.point_ops store contract_addr with
+let execute_call = call_with ~return:Fun.id ~run:(fun ~journal ~ctx ~spent prepare ->
+  let result = run_checked ~journal ~ctx (fun () ->
+    let state, fixed = prepare () in
+    run_fixed_from_dispatcher state fixed) in
+  {result with effort_used = result.effort_used + spent})
+
+let execute_call_async = call_with ~return:Lwt.return ~run:(fun ~journal ~ctx ~spent prepare ->
+  let saved = Program_journal.snapshot journal in
+  Octra_core.Exec_resource.catch (fun () ->
+    let state, fixed = prepare () in
+    let state = { state with Contract_vm.ctx = { state.ctx with async_exec = true } } in
+    let ( let* ) = Octra_core.Exec_resource.bind in
+    let* result = run_fixed_async state fixed in
+    if not result.success && ctx.proof_exec = Octra_core.Rule_graph.Active then
+      Program_journal.restore journal saved;
+    Lwt.return {result with effort_used = result.effort_used + spent})
+    (fun error ->
+      Program_journal.restore journal saved;
+      Lwt.fail error))
+
+let view_plan loaded method_name params =
+  match loaded with
   | None ->
-    { success = false; return_value = None; effort_used = 0;
+    Error { success = false; return_value = None; effort_used = 0;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }
   | Some loaded ->
     let fixed = fix_jumps loaded.code in
     match extract_method_arity fixed method_name with
     | Some arity when arity <> List.length params ->
-      { success = false; return_value = None; effort_used = 0;
+      Error { success = false; return_value = None; effort_used = 0;
         events = [];
         error = Some (Printf.sprintf "arity mismatch: %s expects %d args, got %d"
           method_name arity (List.length params));
@@ -648,23 +739,47 @@ let execute_view_call ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx) 
     | _ ->
       (match extract_method_target fixed method_name with
        | None ->
-         { success = false; return_value = None; effort_used = 0;
+         Error { success = false; return_value = None; effort_used = 0;
            events = []; error = Some "method not found"; storage_writes = 0 }
        | Some target ->
          match runtime_params loaded.profile target params with
          | Error error ->
-           { success = false; return_value = None; effort_used = 0;
+           Error { success = false; return_value = None; effort_used = 0;
              events = []; error = Some (Program_input.error_message error); storage_writes = 0 }
-         | Ok values ->
-           let storage_tbl = load_storage store contract_addr in
-           let storage_copy = Hashtbl.copy storage_tbl in
-           let state = setup_call_state_values ~ctx ~depth ~limit ~caller
-             ~strict_values:(strict_values loaded.profile)
-             ~storage_kinds:(storage_kinds loaded.profile)
-             ~address:contract_addr ~value:Z.zero ~storage_tbl:storage_copy
-             ~method_name ~params:values () in
-           state.is_view <- true;
-           run_fixed_from_dispatcher ?running state fixed)
+         | Ok values -> Ok (loaded, fixed, values))
+
+let view_state ~ctx ~depth ~limit ~caller ~address ~method_name loaded values storage =
+  let state = setup_call_state_values ~ctx ~depth ~limit ~caller
+    ~strict_values:(strict_values loaded.profile)
+    ~storage_kinds:(storage_kinds loaded.profile)
+    ~address ~value:Z.zero ~storage_tbl:(Hashtbl.copy storage)
+    ~method_name ~params:values () in
+  state.is_view <- true;
+  state
+
+let execute_view_call ?snapshot ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx)
+    ?(depth = 0) ?(limit = 2_000_000_000) store address method_name params caller =
+  let loaded = load_loaded ?snapshot ~trusted ~point_ops:ctx.point_ops store address in
+  match view_plan loaded method_name params with
+  | Error result -> result
+  | Ok (loaded, fixed, values) ->
+    let storage = load_storage ?snapshot store address in
+    let state = view_state ~ctx ~depth ~limit ~caller ~address ~method_name
+      loaded values storage in
+    run_fixed_from_dispatcher ?running state fixed
+
+let view_async ?snapshot ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx)
+    ?(depth = 0) ?(limit = 2_000_000_000) store address method_name params caller =
+  let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
+  let* loaded = load_async ?snapshot ~trusted ~point_ops:ctx.point_ops store address in
+  match view_plan loaded method_name params with
+  | Error result -> Lwt.return result
+  | Ok (loaded, fixed, values) ->
+    let* storage = Octra_core.Store_irmin.load_contract_storage ?snapshot store address in
+    let ctx = {ctx with async_exec = true} in
+    let state = view_state ~ctx ~depth ~limit ~caller ~address ~method_name
+      loaded values storage in
+    run_fixed_async ?running state fixed
 
 let contract_exists store addr =
   run_s (Octra_core.Store_irmin.contract_exists store addr)

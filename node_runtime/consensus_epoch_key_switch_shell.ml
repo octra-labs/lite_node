@@ -79,7 +79,16 @@ let run (deps : deps) =
   | Some r ->
     deps.reject_gate r
   | None ->
-    let* outcome = deps.apply () in
+    let* outcome = Private_ledger.worker_retry
+      ~report:(fun delay reason ->
+        Log.warn "epoch" "event = proof_worker_retry delay = %.2f reason = %s"
+          delay reason) (fun () ->
+      let* outcome = deps.apply () in
+      match outcome with
+      | Private_ledger.Key_switch_rejected r
+          when Private_ledger.failure_action r.failure = Private_ledger.Retry ->
+        Lwt.fail (Private_ledger.Worker_retry r.failure.reason)
+      | _ -> Lwt.return outcome) in
     match outcome with
     | Private_ledger.Key_switch_rejected r ->
       deps.reject_key_switch ~event:(rejected_event r) r

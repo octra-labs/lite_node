@@ -3,8 +3,14 @@
 
 val without : Octra_core.Transaction.t list -> Octra_core.Transaction.t list
 
+val first : Octra_core.Transaction.t list -> Octra_core.Transaction.t list
+
 val before :
   excluded:Octra_core.Transaction.t list ->
+  Octra_core.Transaction.t list -> Octra_core.Transaction.t list
+
+val through :
+  rejected:Octra_core.Transaction.t list ->
   Octra_core.Transaction.t list -> Octra_core.Transaction.t list
 
 val select :
@@ -12,3 +18,8 @@ val select :
   confirmed:Octra_core.Transaction.t list ->
   rejected:int -> Octra_core.Transaction.t list ->
   Octra_core.Transaction.t list option
+
+val work :
+  selected:Octra_core.Transaction.t list ->
+  rejected:Octra_core.Transaction.t list ->
+  Octra_core.Transaction.t list -> Octra_core.Transaction.t list option

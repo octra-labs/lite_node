@@ -100,7 +100,8 @@ type standard_adapters = {
   staging_epoch_txs : ?circles:bool -> unit -> Octra_core.Transaction.t list;
   staging_total : unit -> int;
   proposer : unit -> string;
-  evict_preview : Octra_core.Transaction.t -> unit;
+  evict_preview : ?epoch:int64 -> Octra_core.Transaction.t -> unit;
+  hold_preview : epoch:int64 -> Octra_core.Transaction.t -> unit;
   head_txid_hi : unit -> int64 option;
   set_proposal : Octra_core.Transaction.t list -> string list -> unit;
   current_tx_hashes : unit -> string list;
@@ -140,7 +141,8 @@ type deps = {
   staging_epoch_txs : ?circles:bool -> unit -> Transaction.t list;
   staging_total : unit -> int;
   build_preverify : Consensus_preverify_role.build;
-  evict_preview : Transaction.t -> unit;
+  evict_preview : ?epoch:int64 -> Transaction.t -> unit;
+  hold_preview : epoch:int64 -> Transaction.t -> unit;
   validate_preverify : Consensus_preverify_role.validate;
   proposal_bundles : Consensus_bundle_cache.t;
   store_bundle :

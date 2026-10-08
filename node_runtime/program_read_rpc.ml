@@ -24,7 +24,7 @@ type 'handler dispatch_adapters = {
     'handler;
   compile_read :
     (compiler:Octra_vm.Program_package.compiler ->
-     point_ops:bool -> Yojson.Safe.t -> rpc_result) ->
+     point_ops:bool -> loops:bool -> Yojson.Safe.t -> rpc_result) ->
     'handler;
   program_info : 'handler;
   program_list : 'handler;
@@ -43,7 +43,10 @@ let compile_at ~chain_id ~epoch handler params =
   let compiler = Octra_core.Rule_graph.program_source_at ~chain_id ~epoch
     |> Octra_vm.Program_package.compiler_mode
       ~preview:(Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch) in
-  handler ~compiler ~point_ops params
+  let loops =
+    Octra_core.Rule_graph.proof_exec_at ~chain_id ~epoch = Octra_core.Rule_graph.Active
+  in
+  handler ~compiler ~point_ops ~loops params
 
 let immediate task =
   match Lwt.state task with
@@ -110,14 +113,14 @@ let dispatch adapters =
     program_compile_assembly =
       no_ctx (compile_rpc Octra_vm.Contract_rpc.compile_assembly_params);
     program_compile_aml =
-      adapters.compile_read (fun ~compiler ~point_ops params ->
+      adapters.compile_read (fun ~compiler ~point_ops ~loops params ->
         compile_rpc
-          (Octra_vm.Contract_rpc.compile_aml_params ~compiler ~point_ops) params);
+          (Octra_vm.Contract_rpc.compile_aml_params ~compiler ~point_ops ~loops) params);
     program_compile_aml_multi =
-      adapters.compile_read (fun ~compiler ~point_ops params ->
+      adapters.compile_read (fun ~compiler ~point_ops ~loops params ->
         compile_rpc
           (fun value -> Octra_vm.Contract_rpc.compile_aml_multi_with
-            ~compiler ~point_ops ~json:(Octra_core.Rpc.param_json value 0))
+            ~compiler ~point_ops ~loops ~json:(Octra_core.Rpc.param_json value 0))
           params);
     program_tokens_by_address = adapters.program_tokens_by_address;
   }

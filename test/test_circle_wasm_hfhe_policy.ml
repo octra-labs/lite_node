@@ -186,7 +186,121 @@ let test_math () =
       (Yojson.Safe.Util.member "ok" result = `Bool false))
     [["math", `String "true"]; ["math", `Bool true; "math", `Bool false]]
 
-let () =
+let test_keys () =
+  let module F = Pvac_ffi in
+  let module B = Octra_core.Crypto.FheBalance in
+  let one = Hfhe_case.cipher () in
+  let constant = Hfhe_case.cipher ~edges:false () in
+  List.iter (fun budget ->
+    let raw = Hfhe_case.key ~budget () in
+    let pk = F.deserialize_pubkey raw in
+    List.iter (fun bytes ->
+      let pubkey = bytes |> Bytes.to_string |> Base64.encode_exn in
+      let call mode cap action lhs rhs =
+        let fields = [
+          "action", `String action;
+          "cap", `Bool cap;
+          "pubkey_b64", `String pubkey;
+          "lhs_ciphertext", `String (B.encode_cipher lhs);
+          "rhs_ciphertext", `String (B.encode_cipher rhs);
+        ] in
+        Backend.call_json (Yojson.Safe.to_string (`Assoc (mode @ fields)))
+        |> Yojson.Safe.from_string
+      in
+      List.iter (fun cap ->
+        List.iter (fun (action, operation) ->
+          List.iter (fun wrong ->
+            List.iter (fun (lhs, rhs) ->
+              let prior = call [] cap action lhs rhs in
+              if budget < 2 then
+                check "prior key error changed"
+                  (prior = Backend.unavailable_json "hfhe backend exception")
+              else
+                check "prior key result changed"
+                  (Yojson.Safe.Util.member "ok" prior = `Bool true);
+              check "disabled key mode changed"
+                (call ["hfhe_pairs", `Bool false] cap action lhs rhs = prior);
+              let active = call ["hfhe_pairs", `Bool true] cap action lhs rhs in
+              check "incompatible key became technical retry"
+                (active = Backend.error_json "hfhe key shape mismatch"))
+              [one, wrong; wrong, one])
+            [Hfhe_case.cipher ~index:2 (); Hfhe_case.cipher ~width:2 ()];
+          let slots = call ["hfhe_pairs", `Bool true] cap action one
+            (Hfhe_case.cipher ~width:2 ~slots:2 ()) in
+          check "slot refusal precedence changed"
+            (slots = Backend.error_json "hfhe slot count mismatch");
+          List.iter (fun lhs ->
+            let prior = call [] cap action lhs one in
+            let active = call ["hfhe_pairs", `Bool true] cap action lhs one in
+            check "compatible key result changed" (active = prior);
+            check "compatible key bytes differ"
+              (active = Backend.value_json (`String (B.encode_cipher (operation pk lhs one)))))
+            [one; constant; Hfhe_case.cipher ~c0:false (); Hfhe_case.cipher ~index:1 ();
+             F.ct_add pk one one])
+          ["cipher_add", F.ct_add; "cipher_sub", F.ct_sub]) [false; true])
+      [raw; F.serialize_pubkey pk]) [0; 1; 2; 4]
+
+let test_pairs () =
+  test_keys ();
+  let module F = Pvac_ffi in
+  let module B = Octra_core.Crypto.FheBalance in
+  let seed = Bytes.make 32 '\012' in
+  let pk, sk = F.keygen_from_seed (F.default_params ()) seed in
+  let pubkey = F.serialize_pubkey pk |> Bytes.to_string |> Base64.encode_exn in
+  let one = F.enc_values_seeded pk sk [|3L|] seed in
+  let two = F.enc_values_seeded pk sk [|5L; 7L|] seed in
+  let call mode cap action lhs rhs =
+    let fields = [
+      "action", `String action;
+      "cap", `Bool cap;
+      "pubkey_b64", `String pubkey;
+      "lhs_ciphertext", `String (B.encode_cipher lhs);
+      "rhs_ciphertext", `String (B.encode_cipher rhs);
+    ] in
+    Backend.call_json (Yojson.Safe.to_string (`Assoc (mode @ fields)))
+    |> Yojson.Safe.from_string
+  in
+  List.iter (fun cap ->
+    List.iter (fun (action, operation) ->
+      List.iter (fun (lhs, rhs) ->
+        let prior = call [] cap action lhs rhs in
+        check "prior pair class changed"
+          (Yojson.Safe.Util.member "class" prior = `String "unavailable");
+        check "prior pair message changed"
+          (Yojson.Safe.Util.member "error" prior = `String "hfhe backend exception");
+        check "disabled pair mode changed"
+          (call ["hfhe_pairs", `Bool false] cap action lhs rhs = prior);
+        let active = call ["hfhe_pairs", `Bool true] cap action lhs rhs in
+        check "unequal slots became technical retry"
+          (Yojson.Safe.Util.member "class" active = `String "rejected");
+        check "pair refusal differs"
+          (Yojson.Safe.Util.member "error" active = `String "hfhe slot count mismatch"))
+        [one, two; two, one];
+      List.iter (fun cipher ->
+        let prior = call [] cap action cipher cipher in
+        let active = call ["hfhe_pairs", `Bool true] cap action cipher cipher in
+        check "valid pair result changed" (active = prior);
+        check "valid pair refused" (Yojson.Safe.Util.member "ok" active = `Bool true);
+        check "valid pair bytes differ"
+          (Yojson.Safe.Util.member "value" active
+           = `String (B.encode_cipher (operation pk cipher cipher)))) [one; two])
+      ["cipher_add", F.ct_add; "cipher_sub", F.ct_sub]) [false; true];
+  List.iter (fun pairs ->
+    List.iter (fun fault ->
+      let result = try
+        ignore (Backend.cipher_pair ~pairs (fun _ _ _ -> raise fault) pk one one);
+        None
+      with error -> Some error in
+      check "pair check converted a host fault" (result = Some fault))
+      [Out_of_memory; Stack_overflow; Failure "host failure"]) [false; true];
+  List.iter (fun mode ->
+    let result = call mode true "cipher_add" one one in
+    check "invalid pair mode accepted"
+      (Yojson.Safe.Util.member "error" result = `String "invalid hfhe_pairs"))
+    [["hfhe_pairs", `String "true"];
+     ["hfhe_pairs", `Bool true; "hfhe_pairs", `Bool false]]
+
+let run () =
   check
     "request limit"
     (Policy.request_allowed (String.make Policy.max_request_bytes 'a'));
@@ -266,4 +380,12 @@ let () =
   test_busy_class ();
   test_worker_queue_is_not_held ();
   test_math ();
+  test_pairs ();
   Printf.printf "status = pass test = circle_wasm_hfhe_policy\n%!"
+
+let () =
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--pairs" then begin
+    test_pairs ();
+    Printf.printf "status = pass test = hfhe_pairs\n%!"
+  end
+  else run ()

@@ -64,10 +64,11 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok math_mode ->
     match Rule_graph.fhe_work runtime.rules ~epoch:env.epoch_id,
-          Rule_graph.wasm_float runtime.rules ~epoch:env.epoch_id with
-    | Error fault, _ | _, Error fault ->
+          Rule_graph.wasm_float runtime.rules ~epoch:env.epoch_id,
+          Rule_graph.proof_exec runtime.rules ~epoch:env.epoch_id with
+    | Error fault, _, _ | _, Error fault, _ | _, _, Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
-    | Ok fhe_work, Ok wasm_float ->
+    | Ok fhe_work, Ok wasm_float, Ok proof_exec ->
     let math = math_mode = Rule_graph.Active in
     let object_cost = object_cost_mode = Rule_graph.Active in
     let proposal_id = "circle-" ^ Transaction.hash tx in
@@ -82,7 +83,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
             ~math
             ~fold:(fun epoch ->
               Result.map
-                (fun ctx -> { ctx with Epoch_exec.account_mode; fhe_work; wasm_float })
+                (fun ctx -> { ctx with Epoch_exec.account_mode; fhe_work; wasm_float; proof_exec })
                 (Epoch_exec.prior_fold epoch))
             ~epoch_id:env.epoch_id
             ~proposal_id

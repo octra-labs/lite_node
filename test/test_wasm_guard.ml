@@ -72,6 +72,7 @@ let commit_guard balance before_tbl changed_tbl =
     storage_writes = 1;
   } in
   let result storage_tbl : Exec.call_result = {
+    calls = false;
     receipt;
     storage_tbl;
     baseline_storage_tbl = before_tbl;

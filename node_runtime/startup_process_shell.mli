@@ -129,6 +129,7 @@ val configure_process :
 
 val configure_lwt :
   exit_fatal:(unit -> unit) ->
+  exit_refused:(unit -> unit) ->
   unit
 
 val set_async_exception_hook :

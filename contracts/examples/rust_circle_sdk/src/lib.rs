@@ -545,6 +545,26 @@ pub struct RegisterLaneInput<'a> {
 pub struct Host;
 
 impl Host {
+    pub fn call_value() -> Result<Value, i32> {
+        Self::circle_invoke("call_value", &[])
+    }
+
+    pub fn balance() -> Result<Value, i32> {
+        Self::circle_invoke("oct_balance", &[])
+    }
+
+    pub fn transfer(target: &str, amount: &str) -> Result<bool, i32> {
+        expect_bool(Self::circle_invoke("oct_transfer", &[
+            Value::String(target.to_owned()), Value::Int(amount.to_owned()),
+        ])?)
+    }
+
+    pub fn call(target: &str, method: &str, args: &[Value]) -> Result<Value, i32> {
+        let mut params = vec![Value::String(target.to_owned()), Value::String(method.to_owned())];
+        params.extend_from_slice(args);
+        Self::circle_invoke("program_call", &params)
+    }
+
     pub fn caller() -> Result<String, i32> {
         read_len_prefixed(host_caller_len, host_caller_read)
     }

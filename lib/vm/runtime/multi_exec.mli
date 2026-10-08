@@ -20,3 +20,11 @@ val run :
   balance:(string -> Z.t) ->
   exec:(step -> Contract.exec_result) ->
   result
+
+val run_async :
+  from_addr:string ->
+  calls:Call_plan.call list ->
+  effort_limit:int ->
+  balance:(string -> Z.t) ->
+  exec:(step -> Contract.exec_result Lwt.t) ->
+  result Lwt.t
