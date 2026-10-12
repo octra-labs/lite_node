@@ -109,6 +109,7 @@ let fold standard_mode =
     program_overlap = false;
     fhe_work = Octra_core.Rule_graph.Prior;
     proof_exec = Octra_core.Rule_graph.Prior;
+    vm_bytes = Octra_core.Rule_graph.Prior;
     wasm_float = Octra_core.Rule_graph.Prior;
     math = false;
     cap_mode = Octra_core.Set_fold.Prune;
@@ -498,6 +499,7 @@ let test_integer_work_gate () =
           proof_mode;
           fhe_work = Octra_core.Rule_graph.Prior;
           proof_exec = Octra_core.Rule_graph.Prior;
+          vm_bytes = Octra_core.Rule_graph.Prior;
           wasm_float = Octra_core.Rule_graph.Prior;
           math = false;
           object_cost = false;
@@ -1028,6 +1030,27 @@ let test_ledger_journal () =
     expect "journal commit retained supply"
       (L.get_total_supply ledger = Z.of_int 90))
 
+let test_kat_journal () =
+  with_store (fun store ->
+    let ledger = L.create store in
+    expect "kat starts absent" (L.get_pvac_kat ledger "octKat" = None);
+    expect "kat journal begins" (L.begin_journal ledger = Ok ());
+    L.set_pvac_kat ledger "octKat" "outer";
+    expect "kat nested begins" (L.begin_journal ledger = Ok ());
+    L.set_pvac_kat ledger "octKat" "inner";
+    expect "kat nested abort" (L.abort_journal ledger = Ok ());
+    expect "kat nested restored" (L.get_pvac_kat ledger "octKat" = Some "outer");
+    expect "kat outer abort" (L.abort_journal ledger = Ok ());
+    expect "kat absence restored" (L.get_pvac_kat ledger "octKat" = None);
+    expect "kat commit begins" (L.begin_journal ledger = Ok ());
+    L.set_pvac_kat ledger "octKat" "kept";
+    expect "kat commit" (L.commit_journal ledger = Ok ());
+    expect "kat retained" (S.get_pvac_kat store "octKat" = Some "kept");
+    expect "kat replacement begins" (L.begin_journal ledger = Ok ());
+    L.set_pvac_kat ledger "octKat" "changed";
+    expect "kat replacement abort" (L.abort_journal ledger = Ok ());
+    expect "kat replacement restored" (L.get_pvac_kat ledger "octKat" = Some "kept"))
+
 let atomic_tx nonce =
   {
     T.from = env.X.proposer_addr;
@@ -1464,6 +1487,7 @@ let () =
   test_security_curve_epoch_parity ();
   test_zero_reserve_cutover ();
   test_ledger_journal ();
+  test_kat_journal ();
   test_sender_key_policy ();
   test_sender_key_activation ();
   test_sender_key_preview_parity ();

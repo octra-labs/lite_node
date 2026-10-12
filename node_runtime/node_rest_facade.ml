@@ -15,6 +15,8 @@ type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
   duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
   proof_mode : unit -> Octra_core.Rule_graph.mode;
+  compute_mode : unit -> Octra_core.Rule_graph.mode;
+  settle_mode : unit -> Octra_core.Rule_graph.mode;
   queue_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Staging.drop_record list -> unit;
@@ -86,6 +88,8 @@ let prepare_tx ledger tx =
 
 let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
   let ( let* ) = Result.bind in
+  let* () = Octra_core.Tx_envelope.check_compute ~settle:(runtime.settle_mode ())
+    (runtime.compute_mode ()) [tx] in
   let* tx = prepare_tx ledger tx |> Result.map_error snd in
   let point = runtime.duty_head () in
   let head = Option.map fst point in
@@ -213,6 +217,10 @@ let bft_pending_nonce_window () =
   max 1 (Env.int_value "OCTRA_BFT_PENDING_NONCE_WINDOW" 32)
 
 let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
+  let ( let* ) = Result.bind in
+  let* () = Octra_core.Tx_envelope.check_compute ~settle:(runtime.settle_mode ())
+    (runtime.compute_mode ()) [tx]
+    |> Result.map_error (fun reason -> "malformed_transaction", reason) in
   let now = Unix.gettimeofday () in
   match Tx_view.submit_pre_signature_admission
           ~duty:(runtime.duty_head ())

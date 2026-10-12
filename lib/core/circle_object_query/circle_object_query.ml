@@ -66,16 +66,16 @@ let load_summary_from_storage_tbl storage_tbl object_ref =
     member_refs;
   }
 
-let load_summary store circle_id object_ref =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_summary ?snapshot store circle_id object_ref =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)
   | Ok storage_tbl ->
     Lwt.return (Ok (load_summary_from_storage_tbl storage_tbl object_ref))
 
-let load_member_summaries store circle_id object_ref =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_member_summaries ?snapshot store circle_id object_ref =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)

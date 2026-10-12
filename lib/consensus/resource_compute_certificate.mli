@@ -2,6 +2,11 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type request = {
+  unit_price : int64 option;
+  fee_cap : int64 option;
+  memory_bytes : int option;
+  guest_bytes : int option;
+  fuel_limit : int option;
   chain_id : string;
   epoch_id : int64;
   expires_epoch : int64;
@@ -22,6 +27,9 @@ type request = {
   input_bytes : int;
   max_output_bytes : int;
 }
+
+val max_memory_bytes : int
+val fee_valid : fuel:int option -> price:int64 option -> cap:int64 option -> bool
 
 type vote = {
   request_id : string;
@@ -66,9 +74,11 @@ type decision =
   | Conflicting
   | Agreed of certificate
 
+val request_shape : request -> bool
 val request_id : request -> string
 val vote_sign_bytes : vote -> string
 val vote_id : vote -> string
+val vote_budget : request -> vote -> bool
 val decide :
   chain_id:string ->
   current_epoch:int64 ->

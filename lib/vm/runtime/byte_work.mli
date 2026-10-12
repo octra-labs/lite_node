@@ -14,6 +14,7 @@ type decoding = private {max_bytes : int; requests : request list}
 
 val parsing : length:int -> cells:int -> (int * request list) option
 val encoded_size : int -> int option
+val cell_bytes : count:int -> bits:int -> int option
 val decoding : length:int -> cells:int -> bits:int -> cached:bool -> decoding option
 
 val limits :
@@ -21,8 +22,15 @@ val limits :
   alloc_bytes:int -> unit_bytes:int -> limits option
 
 val create : limits -> t
+val consensus_limits : limits
+val consensus_id : string
 val remaining : t -> int
 val available : t -> int
+val event_left : t -> int
+val text_size : limit:int -> string -> int option
+val output : t -> used:int -> limit:int -> int -> int option
+val event_size :
+  limit:int -> address:string -> depth:int -> name:string -> values:string list -> int option
 val rules : t -> limits
 val text_limit : t -> int
 
@@ -32,3 +40,5 @@ val plan :
 
 val charge :
   t -> used:int -> limit:int -> base:int -> request list -> int option
+
+val emit : t -> used:int -> limit:int -> int -> int option

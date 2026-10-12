@@ -176,6 +176,54 @@ let check_effect_failure () =
   expect "actor survives effect failure" (!sent = 1);
   Lwt_main.run (Actor.shutdown actor)
 
+let check_report_failure () =
+  List.iter (fun phase ->
+    let prior = !Lwt.async_exception_hook in
+    let escaped = ref [] in
+    let failed = ref true in
+    let epoch = ref 102L in
+    let sent = ref 0 in
+    let reported = ref [] in
+    Fun.protect
+      ~finally:(fun () -> Lwt.async_exception_hook := prior)
+      (fun () ->
+        Lwt.async_exception_hook := (fun exn -> escaped := exn :: !escaped);
+        let actor = Actor.create ~observe:(fun _ ->
+          if !failed && phase = `Trace then failwith "planned trace failure")
+          Actor.{
+          sample = (fun () ->
+            if !failed && phase = `Sample then failwith "planned sample failure";
+            { epoch = !epoch; active = true;
+              bonded = if !failed && phase = `Control then Error "planned control failure"
+                else Ok true });
+          read = (fun ~epoch ->
+            if !failed && phase = `Read then Lwt.return_error "planned receipt failure"
+            else unread ~epoch);
+          peers = (fun () -> if !failed && phase = `Peers then 0 else 1);
+          send = (fun ~epoch:_ _ ->
+            if !failed && phase = `Send then Lwt.fail (Failure "planned send failure")
+            else if !failed && phase = `Reply then
+              Lwt.return_error (Send, "planned send refusal")
+            else begin incr sent; Lwt.return_ok () end);
+          warn = (fun fault _ ->
+            reported := fault :: !reported;
+            failwith "planned report failure");
+        } in
+        ignore (Actor.notify actor ~epoch:!epoch (Some (vote 100L, parent 100L)));
+        Lwt_main.run (settle ());
+        expect "report failure escaped owner" (!escaped = []);
+        expect "failed report was attempted" (!reported <> []);
+        failed := false;
+        epoch := 103L;
+        ignore (Actor.notify actor ~epoch:!epoch (Some (vote 100L, parent 100L)));
+        Lwt_main.run (settle ());
+        expect "owner cannot deliver after report failure" (!sent >= 1);
+        let stats = Lwt_main.run (Actor.stats actor) in
+        expect "retry changed proof retention" (stats.appeals = 1);
+        Lwt_main.run (Actor.shutdown actor);
+        expect "report failure escaped during shutdown" (!escaped = [])))
+    [`Read; `Sample; `Control; `Peers; `Send; `Reply; `Trace]
+
 let check_phase () =
   let cases = [
     100L, 100L, Some 99L, false, None;
@@ -252,7 +300,7 @@ let check_ack () =
     Lwt_main.run (settle ())
   in
   notify 102L (Some (vote 100L, parent 100L));
-  expect "local admission keeps proof" ((Lwt_main.run (Actor.stats actor)).appeals = 1);
+  expect "local acceptance keeps proof" ((Lwt_main.run (Actor.stats actor)).appeals = 1);
   notify 102L (Some (vote 101L, parent 101L));
   expect "one submission per epoch" (List.length !sent = 1);
   notify 103L None;
@@ -569,7 +617,7 @@ let check_shadow_appeal () =
   receipt := { !receipt with pulse = Some 104L };
   sample := { !sample with active = true };
   tick 105L None;
-  expect "admission resumes retained appeal"
+  expect "membership resumes retained appeal"
     (match !sent with
      | (105L, Actor.Appeal proof) :: [104L, Actor.Pulse] ->
        proof.vote.epoch_id = 100L
@@ -590,7 +638,7 @@ let check_shadow_appeal () =
     (List.length !sent = 3 && (Lwt_main.run (Actor.stats actor)).appeals = 0);
   sample := { !sample with active = true };
   tick 121L None;
-  expect "readmission cannot resend expired proof" (List.length !sent = 3);
+  expect "membership cannot resend expired proof" (List.length !sent = 3);
   Lwt_main.run (Actor.shutdown actor)
 
 let check_membership_read () =
@@ -983,7 +1031,7 @@ let check_quiet_cycle () =
   for epoch = 100 to 164 do tick epoch None done;
   expect "rejoin needs seventeen confirmed pulses, not one per epoch"
     (List.length !sent = 17);
-  expect "pulse schedule satisfies unchanged admission rule"
+  expect "pulse schedule satisfies unchanged membership rule"
     (Fold.allows Fold.standard ~start:0L ~source:164L ~address:"octA" !state);
   sample := { !sample with active = true };
   for epoch = 165 to 324 do tick epoch None done;
@@ -1107,7 +1155,7 @@ let check_delivery_load loss =
             expect "delivery and loss never reset an established series" (first <= 102L)) entries
       end
     done;
-    expect "all waiting participants retain admission progress"
+    expect "all waiting participants retain membership progress"
       (List.for_all (fun address -> Fold.allows cfg ~start:0L ~source:202L ~address !state) addresses);
     expect "capacity does not cause repeated resigning"
       (List.for_all (fun address ->
@@ -1119,6 +1167,7 @@ let check_delivery_load loss =
       (Hashtbl.length lost))
 
 let () =
+  check_report_failure ();
   List.iter check_read_rollover [
     110L, 111L, `Marked, Actor.Marked;
     116L, 117L, `Error, Actor.Unread;

@@ -8,26 +8,31 @@ module Transaction = Octra_core.Transaction
 type t =
   (Private_ledger.key_switch_artifact, Private_ledger.prepared) Pool.t
 
-let eligible_with field_policy tx =
+let eligible_with ?(cipher_mode = Octra_core.Rule_graph.Prior) field_policy tx =
   tx.Transaction.op_type = Transaction.KeySwitch
   && not
        (Private_ledger.key_switch_requests_legacy_audit
+          ~cipher_mode
           ~field_policy
           tx)
 
-let create ~field_policy ~strict ~math ledger =
+let create ~field_policy ~strict ~math ~cipher_mode ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
       (Octra_core.Resource_lanes.preverify_queue_limit
          Octra_core.Resource_lanes.Fhe)
     {
-      eligible = (fun tx -> eligible_with (field_policy ()) tx);
+      eligible = (fun tx -> eligible_with ~cipher_mode:(cipher_mode ()) (field_policy ()) tx
+        && (not (Private_ledger.key_switch_requests_cipher_proof
+          ~field_policy:(field_policy ()) tx)
+          || (cipher_mode () = Octra_core.Rule_graph.Active && strict ())));
       verify = (fun priority tx ->
         let open Lwt.Syntax in
         let fields = field_policy () in
         let* result =
           Private_ledger.preverify_key_switch_artifact ~math:(math ())
+            ~cipher_mode:(cipher_mode ())
             ~field_policy:fields
             ~strict:(strict ())
             ~worker_priority:priority
@@ -41,6 +46,7 @@ let create ~field_policy ~strict ~math ledger =
           | Ok artifact ->
             let* binding =
               Private_ledger.bind_key_switch_artifact ~math:(math ())
+                ~cipher_mode:(cipher_mode ())
                 ~field_policy:(field_policy ())
                 ~strict:(strict ())
                 ledger
@@ -61,6 +67,7 @@ let create ~field_policy ~strict ~math ledger =
         let open Lwt.Syntax in
         let* binding =
           Private_ledger.bind_key_switch_artifact ~math:(math ())
+            ~cipher_mode:(cipher_mode ())
             ~field_policy:(field_policy ())
             ~strict:(strict ())
             ledger

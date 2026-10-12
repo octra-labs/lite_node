@@ -250,6 +250,105 @@ let lookup_response hash lookup =
   | Ok json -> json
   | Error e -> fail ("transaction lookup error " ^ e.Octra_core.Rpc.message)
 
+let test_circle_tx_code () =
+  let module Text = Octra_node_runtime.Text in
+  let module Rest = Octra_node_runtime.Rest_view in
+  let decode_message = Text.decode_message_if_hex in
+  let code = Base64.encode_exn "private circle program bytes" in
+  let payload privacy = Yojson.Safe.to_string (`Assoc [
+    "privacy_class", `String privacy;
+    "code_b64", `String code;
+  ]) in
+  let cases = List.concat_map (fun privacy ->
+    let message = payload privacy in
+    [message, privacy = "public";
+     Text.raw_to_hex message, privacy = "public"])
+    ["public"; "scoped"; "sealed"; "circle"; "unknown"]
+    @ [
+      {|{"code_b64":"private"}|}, false;
+      {|{"privacy_class":null,"code_b64":"private"}|}, false;
+      {|{"privacy_class":"public","privacy_class":"sealed","code_b64":"private"}|}, false;
+      {|{"privacy_class":"sealed","privacy_class":"public","code_b64":"private"}|}, false;
+      {|{"privacy_class":"public","privacy_class":"public","code_b64":"private"}|}, false;
+      {|{"privacy_class":"sealed","code_b64":"private"|}, false;
+      {|[{"privacy_class":"public","code_b64":"private"}]|}, false;
+      {|{"privacy_class":"public","unused":(1,2),"code_b64":"public"}|}, false;
+      String.make 20_000 '[' ^ "0" ^ String.make 20_000 ']', false;
+    ] in
+  List.iter (fun (message, visible) ->
+    let tx = {(sample_tx Transaction.CircleDeploy) with message = Some message} in
+    let original = Transaction.to_yojson tx |> Yojson.Safe.to_string in
+    let hash = Transaction.hash tx in
+    let expected = if visible then `String (decode_message message) else `Null in
+    let fields = Tx_view.tx_fields ~decode_message tx in
+    let check label json =
+      if member "message" json <> expected then
+        fail (label ^ " exposed circle code input = "
+          ^ String.sub message 0 (min 96 (String.length message))) in
+    check "fields" (`Assoc fields);
+    List.iter (fun lookup ->
+      let result = Result.get_ok (Tx_view.transaction_lookup_response
+        ~decode_message ~hash lookup) in
+      check "lookup" result)
+      [Tx_view.Lookup_pending tx; Tx_view.Lookup_confirmed (19, original)];
+    check "staging" (Tx_view.staging_row ~decode_message tx);
+    let pending = Tx_view.rest_pending ~hash ~fields in
+    check "REST pending" pending;
+    check "REST pending parsed" (member "parsed_tx" pending);
+    let confirmed = Tx_view.rest_confirmed ~hash ~epoch:19 ~tx_json:original ~fields in
+    check "REST confirmed" confirmed;
+    check "REST confirmed parsed" (member "parsed_tx" confirmed);
+    let raw = if visible then `String original else `Null in
+    if member "data" confirmed <> raw then fail "REST data exposed circle code";
+    let listed = Rest.txs_response [19, hash, original] in
+    let row = List.hd (list_field "transactions" listed) in
+    if member "data" row <> raw then fail "REST list exposed circle code";
+    let module Epoch = Octra_consensus.C_light_epoch in
+    let epoch = Epoch.{chain_id = "circle-read-test"; epoch_id = 19L;
+      tx_hashes = [hash]; start_txid = 0L; tx_count = 1;
+      prev_epoch_index_root = String.make 64 '0'; epoch_index_root = String.make 64 '0'} in
+    let epoch = {epoch with epoch_index_root = Epoch.computed_epoch_index_root epoch} in
+    let proof = Epoch.{epoch; tx_hash = hash; index = 0} in
+    if not (Epoch.tx_position_ok proof) then fail "circle inclusion proof control failed";
+    let proof_view = Octra_node_runtime.Rpc_view.tx_inclusion_proof proof ~tx_json:original in
+    let body = if visible then Transaction.to_yojson tx else `Null in
+    if member "tx" proof_view <> body then fail "inclusion proof exposed circle code";
+    if member "tx_hash" proof_view <> `String hash || member "index" proof_view <> `Int 0
+      || member "epoch" proof_view <> Octra_node_runtime.Rpc_view.light_epoch epoch
+      || member "proof_kind" proof_view <> `String "tx_inclusion" then
+      fail "circle projection changed inclusion proof";
+    if Transaction.hash tx <> hash || Transaction.to_yojson tx |> Yojson.Safe.to_string <> original then
+      fail "circle read changed signed transaction") cases;
+  let tx = {(sample_tx Transaction.CircleProgramUpdate) with
+    message = Some (Yojson.Safe.to_string (`Assoc ["code_b64", `String code]))} in
+  let fields = Tx_view.tx_fields ~decode_message tx in
+  if member "message" (`Assoc fields) <> `Null then fail "circle update exposed code";
+  let original = Transaction.to_yojson tx |> Yojson.Safe.to_string in
+  let result = Tx_view.rest_confirmed ~hash:(Transaction.hash tx) ~epoch:20
+    ~tx_json:original ~fields in
+  if member "data" result <> `Null then fail "circle update REST data exposed code";
+  if Octra_node_runtime.Rpc_view.tx_json_value original <> `Null then
+    fail "circle update proof exposed code";
+  let standard = sample_tx Transaction.Standard in
+  let original = Transaction.to_yojson standard |> Yojson.Safe.to_string in
+  let fields = Tx_view.tx_fields ~decode_message standard in
+  let result = Tx_view.rest_confirmed ~hash:(Transaction.hash standard) ~epoch:21
+    ~tx_json:original ~fields in
+  if member "data" result <> `String original then fail "ordinary REST data changed";
+  List.iter (fun fields ->
+    let raw = Yojson.Safe.to_string (`Assoc fields) in
+    if Octra_node_runtime.Rpc_view.public_tx_data raw <> `Null then
+      fail "raw copy exposed circle code") [
+    ["op_type", `String "deploy_circle"; "message", `String (payload "public");
+     "message", `String (payload "sealed")];
+    ["op_type", `String "standard"; "op_type", `String "deploy_circle";
+     "message", `String (payload "public")];
+    ["op_type", `String "deploy_circle"; "op_type", `String "standard";
+     "message", `String (payload "sealed")];
+    ["op_type", `String "deploy_circle"; "message", `Assoc ["code_b64", `String code]];
+    ["op_type", `String "circle_program_update"; "message", `String (payload "public")];
+  ]
+
 let test_transaction_lookup_response () =
   let tx = sample_tx Transaction.Standard in
   let selected =
@@ -1338,6 +1437,7 @@ let test_submit_signature_admission () =
     fail "proof size limit missing"
 
 let () =
+  test_circle_tx_code ();
   test_masking ();
   test_tx_fields ();
   test_staging_error ();

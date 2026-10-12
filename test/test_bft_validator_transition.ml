@@ -363,6 +363,7 @@ let check_profile_plan () =
       sign_fn;
     } in
     let hello = W.make_my_hello remote in
+    local.W.running <- true;
     let fd, writer = Lwt_unix.pipe () in
     let conn = C.create ~peer_class:Octra_net.P2p_frame_budget.Validator
       fd ~peer_id:hello.node_id ~addr:"profile-peer" ~direction:C.Inbound in
@@ -370,7 +371,8 @@ let check_profile_plan () =
       ~finally:(fun () ->
         Lwt_main.run (Lwt.join [C.close conn; Lwt_unix.close writer]))
       (fun () ->
-        assert_msg (W.add_peer local conn hello) "prior profile accepts peer";
+        assert_msg (W.add_peer local ~generation:local.W.generation conn hello)
+          "prior profile accepts peer";
         assert_msg (W.wire_epoch local = 1_499_999L) "future profile not selected";
         let frames =
           let open Lwt.Syntax in
@@ -528,6 +530,59 @@ let check_activation_restart () =
     "validator activation callback runs after restart past target";
   assert_msg (C_types.is_validator after.Driver.engine.C_engine.vs c.address)
     "future validator is active after restart past target"
+
+let check_vote_membership () =
+  let a = validator "octAAAA" in
+  let b = validator "octBBBB" in
+  let c = validator "octCCCC" in
+  let current = C_types.make_validator_set [a; b] in
+  let next = C_types.make_validator_set [a; b; c] in
+  let role = ref true in
+  let ready = ref true in
+  let driver = make_activation_driver
+      ~chain_id:"vote-state-test"
+      ~my_addr:c.address
+      ~initial_vs:current
+      ~target_vs:next
+      ~activate_epoch:20L in
+  let driver = {driver with Driver.config = {
+    driver.config with
+    role_can_vote = (fun () -> !role);
+    can_vote = (fun () -> !ready);
+  }} in
+  let check expected label =
+    let state = driver.engine.state in
+    let before = state.height, state.round, state.step, driver.engine.outputs in
+    assert_msg (Driver.vote_state driver = expected) label;
+    assert_msg (before = (state.height, state.round, state.step, driver.engine.outputs))
+      "vote status changed engine"
+  in
+  check (false, Some "not_member") "nonmember reported voting";
+  Lwt_main.run (Driver.maybe_activate_scheduled_validator_set driver ~target_epoch:20L);
+  check (true, None) "new member reported nonvoting";
+  role := false;
+  check (false, Some "role") "observer voting reason changed";
+  role := true;
+  ready := false;
+  check (false, Some "not_ready") "catchup voting reason changed";
+  ready := true;
+  driver.vote_fault <- Some Driver.{
+    epoch_id = driver.engine.state.height;
+    round = driver.engine.state.round;
+    reason = "vote_sign_failed";
+  };
+  check (false, Some "vote_sign_failed") "vote fault voting reason changed";
+  driver.vote_fault <- None;
+  driver.finality_proof_needed := true;
+  check (false, Some "finality_proof") "proof hold voting reason changed";
+  driver.finality_proof_needed := false;
+  driver.vote_log_issue <- Some "vote log wire refused";
+  check (false, Some "vote_log_corrupt") "vote log voting reason changed";
+  driver.vote_log_issue <- None;
+  C_engine.replace_validator_set driver.engine current;
+  check (false, Some "not_member") "removed member reported voting";
+  C_engine.replace_validator_set driver.engine next;
+  check (true, None) "returned member reported nonvoting"
 
 let check_live_plan () =
   let chain_id = "transition-plan-test" in
@@ -805,6 +860,7 @@ let () =
   check_profile_switch ();
   check_profile_plan ();
   check_activation_restart ();
+  check_vote_membership ();
   check_live_plan ();
   check_start_height_set ();
   check_marked_set_repairs_runtime ();

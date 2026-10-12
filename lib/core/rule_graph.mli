@@ -43,6 +43,14 @@ val proof_activation_for_chain : string -> activation option
 val proof_exec : t -> epoch:int -> (mode, fault) result
 val proof_exec_at : chain_id:string -> epoch:int -> mode
 
+val vm_bytes_activation_for_chain : string -> activation option
+val vm_bytes : t -> epoch:int -> (mode, fault) result
+val vm_bytes_at : chain_id:string -> epoch:int -> mode
+
+val settle_activation_for_chain : string -> activation option
+val settle : t -> epoch:int -> (mode, fault) result
+val settle_at : chain_id:string -> epoch:int -> mode
+
 val create :
   chain_id:string ->
   root_at:(int -> root_read) ->
@@ -190,3 +198,7 @@ val exit : t -> epoch:int -> (mode, fault) result
 val exit_at : chain_id:string -> epoch:int -> mode
 
 val fault_message : fault -> string
+
+val cipher_migration : t -> epoch:int -> (mode, fault) result
+val cipher_activation_for_chain : string -> activation option
+val cipher_migration_at : chain_id:string -> epoch:int -> mode

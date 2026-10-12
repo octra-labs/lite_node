@@ -84,7 +84,7 @@ let with_state ~(base_store : Store_irmin.t) ?base_ledger ~epoch_id:_ ~proposal_
         if unchanged then Lwt.return result
         else Lwt.return_error "preview_state_changed"
 
-let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode ?(math=false)
+let with_preview ?compute ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode ?(math=false)
     ~fold ~epoch_id ~proposal_id
     ?(expected_prev_root : string option) f =
   with_state
@@ -98,6 +98,7 @@ let with_preview ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode ?(math=f
         store;
         ledger;
         ops = Epoch_exec.ledger_ops ledger;
+        compute;
         emission_policy = Emission_policy.of_env Sys.getenv_opt;
         emission_schedule = Emission_schedule.of_env_exn Sys.getenv_opt;
         legacy_total_supply = Emission_policy.legacy_total Sys.getenv_opt;

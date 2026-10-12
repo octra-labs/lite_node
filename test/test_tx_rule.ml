@@ -237,7 +237,8 @@ let test_source_paths () =
         let request = Source.{epoch_id = epoch; override_ordered_txs = None;
           override_receipts_json = None; consensus_mode} in
         expect "cached and staged inputs honor activation"
-          (Result.is_ok (Source.choose deps request) = (epoch < envelope_epoch));
+          (Result.is_ok (Source.choose deps request) = (epoch < envelope_epoch
+            || not consensus_mode && root = Graph.Root plan.anchor_state_root));
         let deps = {deps with cached_bundle = (fun _ -> None); staging_txs = (fun () -> [])} in
         let effects = ref 0 in
         let accepted = try
@@ -289,8 +290,38 @@ let test_replay_receipts () =
       expect "chain override cannot disable new rule" (accepted = (epoch < envelope_height)))
       heights)
 
+let test_compute_source () =
+  let module Source = Octra_node_runtime.Consensus_epoch_apply_source in
+  let module Graph = Octra_core.Rule_graph in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Graph.vm_bytes_activation_for_chain chain_id |> Option.get in
+  let rules = Graph.create ~chain_id ~root_at:(fun _ -> Graph.Root plan.anchor_state_root) in
+  let tx, secret = signed () in
+  let txs = tx :: List.mapi (fun i op_type -> Tx.sign_with_privkey
+    {tx with op_type; nonce = i + 2} secret) [Tx.ComputeFund; Tx.ComputeReturn; Tx.ComputeSettle] in
+  let settlement = List.find (fun item -> item.Tx.op_type = Tx.ComputeSettle) txs in
+  List.iter (fun epoch -> List.iter (fun route ->
+    expect "unscheduled settlement passed history route"
+      (not (check_route route ~epoch:(Int64.of_int epoch)
+        ~trusted:(Option.get tx.public_key) [settlement] []))) [0; 1; 2; 3; 4; 5; 6; 7])
+    [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1];
+  let deps = Source.{rules; check_override_receipts = (fun ~epoch_id:_ ~receipts:_ _ -> Ok ());
+    find_finalized = (fun _ -> None); cached_bundle = (fun _ -> None);
+    receipt_root_matches = (fun _ _ -> true); header_has_empty_bundle = (fun _ -> false);
+    staging_txs = (fun () -> txs)} in
+  List.iter (fun epoch_id ->
+    let result = Source.choose deps Source.{epoch_id; override_ordered_txs = None;
+      override_receipts_json = None; consensus_mode = false} in
+    match result with
+    | Error _ -> failwith "single compute selection failed"
+    | Ok selected -> expect "single compute activation"
+        (selected.txs = if epoch_id < plan.activation_epoch then [tx]
+          else List.filter (fun item -> item.Tx.op_type <> Tx.ComputeSettle) txs))
+    [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1]
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
+  test_compute_source ();
   test_anchor ();
   test_exec_preflight ();
   test_source_paths ();

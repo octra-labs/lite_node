@@ -55,6 +55,8 @@ let test_intake () = List.iter (fun duty ->
       let seen = ref [] in
       let runtime = Rest.{swarm_ref = ref None;
         proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
         preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
@@ -129,6 +131,8 @@ let test_circle_intake () =
       let drops = ref [] in
       let runtime = Rest.{swarm_ref = ref None; duty_head = (fun () -> None);
         proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
         save_drops = (fun rows -> drops := rows @ !drops);
@@ -216,6 +220,8 @@ let test_program_intake () =
         let mode = ref Octra_core.Rule_graph.Active in
         let runtime = Rest.{swarm_ref = ref None; duty_head = (fun () -> None);
           proof_mode = (fun () -> !mode);
+          compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+          settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
           queue_head = (fun () -> None);
           preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
           save_drops = (fun rows -> expect "unexpected queue drop" (rows = []));
@@ -261,6 +267,8 @@ let test_deploy_intake () =
       let mode = ref G.Prior in
       let runtime = Rest.{swarm_ref = ref None; duty_head = (fun () -> None);
         proof_mode = (fun () -> !mode); preverify_admit = (fun _ -> Ok ());
+        compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         save_drops = (fun rows -> expect "deploy replaced queue data" (rows = []));
         find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
@@ -385,6 +393,8 @@ let test_delivery () =
       let checked = ref [] in
       let runtime = Rest.{swarm_ref = ref None;
         proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
         preverify_admit = (fun value ->
@@ -550,6 +560,8 @@ let test_hold_intake () =
         let rows = ref [] in
         let point () = Some (Int64.of_int !current) in
         let runtime = Rest.{swarm_ref = ref None; queue_head = point;
+          compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+          settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
           proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
           duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
           preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());

@@ -45,7 +45,7 @@ let proof tx =
     ~output_hash:(W.bound_output_hash tx state "ok")
     ~state ~ok:true ~reason:"" tx)
 
-let rejection = O.{ position = 1; tx = rejected; error_type = "balance"; reason = "not funded" }
+let rejection = O.{ position = 1; tx = rejected; error_type = "balance"; reason = "not funded"; charged = false }
 let index = E.genesis_root
 let previous = E.folded_state_root ~ledger_state_root:first ~epoch_index_root:index
 let cursor = J.{ epoch = 1L; prev_root = previous; eic = index; txid = 1L }
@@ -147,6 +147,7 @@ let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
           tx = item.tx;
           error_type = item.error_type;
           reason = (if fault = "reason" then "different" else item.reason);
+          charged = item.charged;
         }) (if fault = "order" then List.rev rejections else rejections)
         else []
       in

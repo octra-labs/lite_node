@@ -12,6 +12,10 @@ type outcome =
 
 type event =
   | Finalized of int64
+  | Finalized_after of {
+      epoch : int64;
+      minimum : int64;
+    }
   | Completed of {
       epoch : int64;
       outcome : outcome;
@@ -60,15 +64,19 @@ let due published epoch =
   | None -> true
   | Some prior -> Int64.compare epoch prior > 0
 
-let finalized policy t epoch =
+let finalized policy t epoch minimum =
   if Int64.compare epoch 0L < 0 then
     Error "finalized epoch is negative"
+  else if Int64.compare minimum 0L < 0 then
+    Error "sync minimum epoch is negative"
+  else if Int64.compare minimum epoch > 0 then
+    Error "sync minimum epoch exceeds finalized head"
   else
     match t.seen with
     | Some seen when Int64.compare epoch seen < 0 -> Ok (t, [])
     | _ ->
         let next = { t with seen = Some epoch } in
-        let target = target policy epoch in
+        let target = Int64.max minimum (target policy epoch) in
         begin
           match t.running with
           | Some _ -> Ok (next, [])
@@ -99,5 +107,6 @@ let completed policy t epoch outcome =
       end
 
 let step policy t = function
-  | Finalized epoch -> finalized policy t epoch
+  | Finalized epoch -> finalized policy t epoch 0L
+  | Finalized_after { epoch; minimum } -> finalized policy t epoch minimum
   | Completed { epoch; outcome } -> completed policy t epoch outcome

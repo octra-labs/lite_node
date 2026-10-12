@@ -3,54 +3,55 @@
 
 open Lwt.Syntax
 
-let load_opt store circle_id workflow_ref =
+let load_opt ?snapshot store circle_id workflow_ref =
+  let read = Circle_policy_store.read_first_inline_value ?snapshot in
   let* flow_kind_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.flow_kind_key workflow_ref] in
   let* debit_subject_addr_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.debit_subject_addr_key workflow_ref] in
   let* credit_subject_addr_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.credit_subject_addr_key workflow_ref] in
   let* debit_state_ref_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.debit_state_ref_key workflow_ref] in
   let* credit_state_ref_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.credit_state_ref_key workflow_ref] in
   let* amount_commitment_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.amount_commitment_key workflow_ref] in
   let* proof_kind_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.proof_kind_key workflow_ref] in
   let* proof_receipt_hash_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.proof_receipt_hash_key workflow_ref] in
   let* status_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.status_key workflow_ref] in
   let* intent_id_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_workflow.intent_id_key workflow_ref] in
@@ -71,8 +72,8 @@ let load_opt store circle_id workflow_ref =
   else
     Lwt.return_none
 
-let load store circle_id workflow_ref =
-  let* workflow_opt = load_opt store circle_id workflow_ref in
+let load ?snapshot store circle_id workflow_ref =
+  let* workflow_opt = load_opt ?snapshot store circle_id workflow_ref in
   match workflow_opt with
   | Some workflow -> Lwt.return workflow
   | None -> Lwt.return Circle_balance_workflow.empty

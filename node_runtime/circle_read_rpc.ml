@@ -10,7 +10,7 @@ type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 type 'handler dispatch_adapters = {
   store_read : (Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
   program_read :
-    (float_mode:Octra_core.Rule_graph.mode ->
+    (profile:(epoch:int -> (Octra_vm.Contract_rpc.view_profile, Rpc.rpc_error) result) ->
      Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
   epoch_read :
     (Octra_core.Store_irmin.t ->
@@ -49,10 +49,29 @@ let option_result option ~not_found view =
   | None ->
     Error (Rpc.not_found not_found)
 
-let program_descriptor ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
+let with_snapshot ?snapshot store read =
+  let open Lwt.Syntax in
+  match snapshot with
+  | Some snapshot -> read snapshot
+  | None ->
+    let* captured = Octra_core.Store_irmin.capture_read_snapshot store in
+    match captured with
+    | Ok snapshot -> read snapshot
+    | Error reason -> Lwt.return (Error (rpc_error reason))
+
+let with_epoch_snapshot store read =
+  with_snapshot store (fun snapshot ->
+    if snapshot.Octra_core.Store_irmin.epoch_id >= Int64.of_int max_int then
+      Lwt.return (Error (rpc_error "circle policy epoch exceeds limit"))
+    else
+      read snapshot (Int64.to_int snapshot.epoch_id + 1))
+
+let program_descriptor ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
   let open Lwt.Syntax in
   let* described =
-    Octra_circle_runtime.Circle_program.describe ~float_mode store circle_id in
+    Octra_circle_runtime.Circle_program.describe
+      ?snapshot
+      ~inspect_mode:Octra_core.Rule_graph.Active ~float_mode store circle_id in
   match described with
   | Ok descriptor ->
     ok (Octra_circle_runtime.Circle_program.yojson_of_descriptor descriptor)
@@ -175,12 +194,12 @@ let outbox_status_required_route params _ctx =
 let ingress_packet_required_route params _ctx =
   auth_required1 params "intent_id" "authenticated circle ingress read required"
 
-let with_scope_auth store params ~gate ~op f =
+let with_scope_auth ?snapshot store params ~gate ~op f =
   match Rpc.require_string params 0 "circle_id" with
   | Error e -> err_lwt e
   | Ok circle_id ->
     let open Lwt.Syntax in
-    let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+    let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
     match info_opt with
     | None ->
       err_lwt (Rpc.not_found "circle not found")
@@ -197,8 +216,8 @@ let with_scope_auth store params ~gate ~op f =
         ~subject:""
         (fun _ -> f circle_id info)
 
-let with_owner_scope_auth store params ~op f =
-  with_scope_auth store params ~gate:Circle_auth.Owner ~op (fun circle_id _info ->
+let with_owner_scope_auth ?snapshot store params ~op f =
+  with_scope_auth ?snapshot store params ~gate:Circle_auth.Owner ~op (fun circle_id _info ->
     f circle_id)
 
 let info_auth_params store params =
@@ -210,21 +229,23 @@ let info_auth_params store params =
     (fun _circle_id info ->
       ok (Octra_core.Circles.yojson_of_circle_info info))
 
-let program_descriptor_auth_params ?(float_mode=Octra_core.Rule_graph.Prior) store params =
-  with_scope_auth
-    store
-    params
-    ~gate:Circle_auth.Private_owner
-    ~op:"octra_circle_program_info"
-    (fun circle_id _info ->
-      program_descriptor ~float_mode store ~circle_id)
+let program_descriptor_auth_params ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store params =
+  with_snapshot ?snapshot store (fun snapshot ->
+    with_scope_auth
+      ~snapshot
+      store
+      params
+      ~gate:Circle_auth.Private_owner
+      ~op:"octra_circle_program_info"
+      (fun circle_id _info ->
+        program_descriptor ~snapshot ~float_mode store ~circle_id))
 
-let with_owner_subject_auth store params ~field ~op f =
+let with_owner_subject_auth ?snapshot store params ~field ~op f =
   match Rpc.require_string params 0 "circle_id", Rpc.require_string params 1 field with
   | Error e, _ | _, Error e -> err_lwt e
   | Ok circle_id, Ok subject ->
     let open Lwt.Syntax in
-    let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+    let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
     match info_opt with
     | None ->
       err_lwt (Rpc.not_found "circle not found")
@@ -241,9 +262,9 @@ let with_owner_subject_auth store params ~field ~op f =
         ~subject
         (fun _ -> f circle_id subject)
 
-let with_owner_asset_auth store params ~circle_id ~op ~subject f =
+let with_owner_asset_auth ?snapshot store params ~circle_id ~op ~subject f =
   let open Lwt.Syntax in
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     err_lwt (Rpc.not_found "circle not found")
@@ -260,7 +281,7 @@ let with_owner_asset_auth store params ~circle_id ~op ~subject f =
       ~subject
       (fun _ -> f ())
 
-let with_owner_validated_subject_auth store params ~field ~op ~validate f =
+let with_owner_validated_subject_auth ?snapshot store params ~field ~op ~validate f =
   match Rpc.require_string params 0 "circle_id", Rpc.require_string params 1 field with
   | Error e, _ | _, Error e -> err_lwt e
   | Ok circle_id, Ok value ->
@@ -270,7 +291,7 @@ let with_owner_validated_subject_auth store params ~field ~op ~validate f =
         err_lwt (Rpc.invalid_params e)
       | Ok subject ->
         let open Lwt.Syntax in
-        let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+        let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
         match info_opt with
         | None ->
           err_lwt (Rpc.not_found "circle not found")
@@ -288,7 +309,7 @@ let with_owner_validated_subject_auth store params ~field ~op ~validate f =
             (fun _ -> f circle_id subject)
     end
 
-let with_owner_locator_auth store params ~field ~op ~parse_locator f =
+let with_owner_locator_auth ?snapshot store params ~field ~op ~parse_locator f =
   match Rpc.require_string params 0 "circle_id", Rpc.require_string params 1 field with
   | Error e, _ | _, Error e -> err_lwt e
   | Ok circle_id, Ok locator_value ->
@@ -298,7 +319,7 @@ let with_owner_locator_auth store params ~field ~op ~parse_locator f =
         err_lwt (Rpc.invalid_params e)
       | Ok locator ->
         let open Lwt.Syntax in
-        let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+        let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
         match info_opt with
         | None ->
           err_lwt (Rpc.not_found "circle not found")
@@ -316,12 +337,12 @@ let with_owner_locator_auth store params ~field ~op ~parse_locator f =
             (fun _ -> f circle_id locator)
     end
 
-let with_object_member_auth store params f =
+let with_object_member_auth ?snapshot store params f =
   match Circle_view.object_member_params params with
   | Error e -> err_lwt e
   | Ok req ->
     let open Lwt.Syntax in
-    let* info_opt = Octra_core.Store_irmin.get_circle_info store req.Circle_view.circle_id in
+    let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store req.Circle_view.circle_id in
     match info_opt with
     | None ->
       err_lwt (Rpc.not_found "circle not found")
@@ -338,9 +359,9 @@ let with_object_member_auth store params f =
         ~subject:(Circle_view.object_member_subject req)
         (fun _ -> f req.circle_id req.object_ref req.member_ref)
 
-let program_info_public ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
+let program_info_public ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
   let open Lwt.Syntax in
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error (Rpc.not_found "circle not found"))
@@ -348,16 +369,17 @@ let program_info_public ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_
     if Circle_auth.private_view_required info then
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle program info required" None))
     else
-      program_descriptor ~float_mode store ~circle_id
+      program_descriptor ?snapshot ~float_mode store ~circle_id
 
-let program_info_public_params ?(float_mode=Octra_core.Rule_graph.Prior) store params =
-  circle_id_param params (fun circle_id ->
-    program_info_public ~float_mode store ~circle_id)
+let program_info_public_params ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store params =
+  with_snapshot ?snapshot store (fun snapshot ->
+    circle_id_param params (fun circle_id ->
+      program_info_public ~snapshot ~float_mode store ~circle_id))
 
-let program_value store (info : Octra_core.Circles.circle_info) =
+let program_value ?snapshot store (info : Octra_core.Circles.circle_info) =
   let open Lwt.Syntax in
   let* code_opt =
-    Octra_core.Store_irmin.get_circle_program_code_b64 store info.Octra_core.Circles.circle_id in
+    Octra_core.Store_irmin.get_circle_program_code_b64 ?snapshot store info.Octra_core.Circles.circle_id in
   ok
     (Circle_view.program
        ~circle_id:info.circle_id
@@ -365,9 +387,9 @@ let program_value store (info : Octra_core.Circles.circle_info) =
        ~code_hash:info.code_hash
        ~runtime:info.runtime)
 
-let program store ~circle_id =
+let program ?snapshot store ~circle_id =
   let open Lwt.Syntax in
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error (Rpc.not_found "circle not found"))
@@ -375,22 +397,42 @@ let program store ~circle_id =
     if Circle_auth.private_view_required info then
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle program read required" None))
     else
-      program_value store info
+      program_value ?snapshot store info
 
-let program_params store params =
-  circle_id_param params (fun circle_id ->
-    program store ~circle_id)
+let program_params ?snapshot store params =
+  with_snapshot ?snapshot store (fun snapshot ->
+    circle_id_param params (fun circle_id ->
+      program ~snapshot store ~circle_id))
 
-let program_auth_params store params =
-  with_scope_auth
-    store
-    params
-    ~gate:Circle_auth.Private_owner
-    ~op:"octra_circle_program"
-    (fun _circle_id info ->
-      program_value store info)
+let program_auth_params ?snapshot store params =
+  with_snapshot ?snapshot store (fun snapshot ->
+    with_scope_auth
+      ~snapshot
+      store
+      params
+      ~gate:Circle_auth.Private_owner
+      ~op:"octra_circle_program"
+      (fun _circle_id info ->
+        program_value ~snapshot store info))
+
+let program_rpc ~authenticated ~describe ~profile store params =
+  with_snapshot store (fun snapshot ->
+    if snapshot.epoch_id >= Int64.of_int max_int then
+      err_lwt (rpc_error "circle program epoch exceeds limit")
+    else
+      match profile ~epoch:(Int64.to_int snapshot.epoch_id + 1) with
+      | Error error -> err_lwt error
+      | Ok profile ->
+        if describe then
+          let read = if authenticated then program_descriptor_auth_params
+            else program_info_public_params in
+          read ~snapshot ~float_mode:profile.Octra_vm.Contract_rpc.wasm_float store params
+        else
+          let read = if authenticated then program_auth_params else program_params in
+          read ~snapshot store params)
 
 let view_call
+    ?snapshot
     ?(trusted=[])
     store
     ~view_ctx
@@ -413,9 +455,12 @@ let view_call
       let open Lwt.Syntax in
       let* result =
         Octra_circle_runtime.Circle_exec.execute_view_call
+          ?snapshot
+          ~inspect_mode:Octra_core.Rule_graph.Active
           ~running
           ~trusted
           ~ctx:view_ctx
+          ~limit:Octra_vm.Contract_rpc.view_circle_effort_limit
           store
           circle_id
           method_name
@@ -425,7 +470,7 @@ let view_call
       | Octra_vm.Receipt_view.View_call_ok return_value ->
         if include_storage then
           let* storage_result =
-            Octra_circle_runtime.Circle_exec.list_storage_pairs store circle_id in
+            Octra_circle_runtime.Circle_exec.list_storage_pairs ?snapshot store circle_id in
           begin
             match storage_result with
             | Ok storage_pairs ->
@@ -439,6 +484,7 @@ let view_call
         Lwt.return (Error (rpc_error error)))
 
 let view_call_public
+    ?snapshot
     ?(trusted=[])
     store
     ~view_ctx
@@ -449,7 +495,7 @@ let view_call_public
     ~call_params
     ~caller_addr =
   let open Lwt.Syntax in
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error (Rpc.not_found "circle not found"))
@@ -458,6 +504,7 @@ let view_call_public
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle view required" None))
     else
       view_call
+        ?snapshot
         ~running ~stop
         ~trusted
         store
@@ -468,12 +515,13 @@ let view_call_public
         ~caller_addr
         ~include_storage:false
 
-let view_call_public_params ?(trusted=[]) store params ~view_ctx ~running ~stop =
+let view_call_public_params ?snapshot ?(trusted=[]) store params ~view_ctx ~running ~stop =
   match Circle_view.view_call_params params with
   | Error e ->
     err_lwt e
   | Ok call ->
     view_call_public
+      ?snapshot
       ~running ~stop
       ~trusted
       store
@@ -483,7 +531,7 @@ let view_call_public_params ?(trusted=[]) store params ~view_ctx ~running ~stop 
       ~call_params:call.call_params
       ~caller_addr:"oct00000000000000000000000000000000000000000000"
 
-let view_call_auth ?(trusted=[]) store params ~view_ctx ~running ~stop =
+let view_call_auth ?snapshot ?(trusted=[]) store params ~view_ctx ~running ~stop =
   match Circle_view.view_call_params params with
   | Error e ->
     err_lwt e
@@ -492,7 +540,7 @@ let view_call_auth ?(trusted=[]) store params ~view_ctx ~running ~stop =
       Octra_vm.Call_plan.bool_json ~default:false (Rpc.param_json params 6) in
     let open Lwt.Syntax in
     let* info_opt =
-      Octra_core.Store_irmin.get_circle_info store call.Circle_view.circle_id in
+      Octra_core.Store_irmin.get_circle_info ?snapshot store call.Circle_view.circle_id in
     match info_opt with
     | None ->
       err_lwt (Rpc.not_found "circle not found")
@@ -512,6 +560,7 @@ let view_call_auth ?(trusted=[]) store params ~view_ctx ~running ~stop =
           ~include_storage)
         (fun caller_addr ->
           view_call
+            ?snapshot
             ~running ~stop
             ~trusted
             store
@@ -522,27 +571,48 @@ let view_call_auth ?(trusted=[]) store params ~view_ctx ~running ~stop =
             ~caller_addr
             ~include_storage)
 
-let object_read store ~circle_id ~object_ref ~load ~view =
+let view_rpc ~authenticated ~trusted ~profile ~store ~ledger params =
   let open Lwt.Syntax in
-  let* result = load store circle_id object_ref in
+  let* captured = Octra_core.Store_irmin.capture_read_snapshot store in
+  match captured with
+  | Error reason -> err_lwt (rpc_error reason)
+  | Ok snapshot ->
+    if snapshot.epoch_id >= Int64.of_int max_int then
+      err_lwt (rpc_error "circle view epoch exceeds limit")
+    else
+      match profile ~epoch:(Int64.to_int snapshot.epoch_id + 1) with
+      | Error error -> err_lwt error
+      | Ok profile ->
+        let running, stop = Octra_vm.Contract_rpc.view_clock () in
+        let view_ctx = Octra_vm.Contract_rpc.make_view_ctx ~snapshot ~running
+          ~trusted ~profile ~store ~ledger ~get_fhe_pubkey:(fun _ -> None) () in
+        let read = if authenticated then view_call_auth else view_call_public_params in
+        read ~snapshot ~trusted store params ~view_ctx ~running ~stop
+
+let object_read ?snapshot store ~circle_id ~object_ref ~load ~view =
+  let open Lwt.Syntax in
+  let* result = load ?snapshot store circle_id object_ref in
   match query_result result (view object_ref) with
   | Ok value -> ok value
   | Error e -> Lwt.return (Error e)
 
 let object_read_auth_params store params ~op ~load ~view =
-  with_owner_validated_subject_auth
-    store
-    params
-    ~field:"object_ref"
-    ~op
-    ~validate:(Octra_core.Circle_private_common.normalize_hex64 "object_ref")
-    (fun circle_id object_ref ->
-      object_read
-        store
-        ~circle_id
-        ~object_ref
-        ~load
-        ~view:(view circle_id))
+  with_snapshot store (fun snapshot ->
+    with_owner_validated_subject_auth
+      ~snapshot
+      store
+      params
+      ~field:"object_ref"
+      ~op
+      ~validate:(Octra_core.Circle_private_common.normalize_hex64 "object_ref")
+      (fun circle_id object_ref ->
+        object_read
+          ~snapshot
+          store
+          ~circle_id
+          ~object_ref
+          ~load
+          ~view:(view circle_id)))
 
 let object_summary_auth_params store params =
   object_read_auth_params
@@ -574,10 +644,11 @@ let object_detail_auth_params store params =
     ~view:(fun circle_id _ detail ->
       Circle_view.object_detail ~circle_id detail)
 
-let object_member_detail store ~circle_id ~object_ref ~member_ref =
+let object_member_detail ?snapshot store ~circle_id ~object_ref ~member_ref =
   let open Lwt.Syntax in
   let* detail_result =
     Octra_core.Circle_object_detail_query.load_member_detail
+      ?snapshot
       store
       circle_id
       object_ref
@@ -587,52 +658,58 @@ let object_member_detail store ~circle_id ~object_ref ~member_ref =
   | Error e -> Lwt.return (Error e)
 
 let object_member_auth_params store params =
-  with_object_member_auth store params (fun circle_id object_ref member_ref ->
-    object_member_detail
-      store
-      ~circle_id
-      ~object_ref
-      ~member_ref)
+  with_snapshot store (fun snapshot ->
+    with_object_member_auth ~snapshot store params (fun circle_id object_ref member_ref ->
+      object_member_detail
+        ~snapshot
+        store
+        ~circle_id
+        ~object_ref
+        ~member_ref))
 
-let object_discovery store ~circle_id ~load ~view =
+let object_discovery ?snapshot store ~circle_id ~load ~view =
   let open Lwt.Syntax in
-  let* result = load store circle_id in
+  let* result = load ?snapshot store circle_id in
   match query_result result view with
   | Ok value -> ok value
   | Error e -> Lwt.return (Error e)
 
 let object_refs_auth_params store params =
-  with_owner_scope_auth store params ~op:"octra_circle_object_refs" (fun circle_id ->
-    object_discovery
-      store
-      ~circle_id
-      ~load:Octra_core.Circle_object_discovery_query.load_refs
-      ~view:(Circle_view.object_refs ~circle_id))
+  with_snapshot store (fun snapshot ->
+    with_owner_scope_auth ~snapshot store params ~op:"octra_circle_object_refs" (fun circle_id ->
+      object_discovery
+        ~snapshot
+        store
+        ~circle_id
+        ~load:Octra_core.Circle_object_discovery_query.load_refs
+        ~view:(Circle_view.object_refs ~circle_id)))
 
 let object_list_auth_params store params =
-  with_owner_scope_auth store params ~op:"octra_circle_object_list" (fun circle_id ->
-    object_discovery
-      store
-      ~circle_id
-      ~load:Octra_core.Circle_object_discovery_query.load_summaries
-      ~view:(Circle_view.object_list ~circle_id))
+  with_snapshot store (fun snapshot ->
+    with_owner_scope_auth ~snapshot store params ~op:"octra_circle_object_list" (fun circle_id ->
+      object_discovery
+        ~snapshot
+        store
+        ~circle_id
+        ~load:Octra_core.Circle_object_discovery_query.load_summaries
+        ~view:(Circle_view.object_list ~circle_id)))
 
-let transport_policy store ~circle_id =
+let transport_policy ?snapshot store ~circle_id =
   let open Lwt.Syntax in
   let* policy =
-    Octra_core.Circle_policy_store.load_transport_policy store circle_id in
+    Octra_core.Circle_policy_store.load_transport_policy ?snapshot store circle_id in
   ok (Circle_view.transport_policy ~circle_id policy)
 
-let hfhe_policy store ~circle_id =
+let hfhe_policy ?snapshot store ~circle_id =
   let open Lwt.Syntax in
   let* policy =
-    Octra_core.Circle_policy_store.load_hfhe_policy store circle_id in
+    Octra_core.Circle_policy_store.load_hfhe_policy ?snapshot store circle_id in
   ok (Circle_view.hfhe_policy ~circle_id policy)
 
-let key_policy store ~circle_id ~key_id ~current_epoch =
+let key_policy ?snapshot store ~circle_id ~key_id ~current_epoch =
   let open Lwt.Syntax in
   let* policy =
-    Octra_core.Circle_policy_store.load_key_policy store circle_id key_id in
+    Octra_core.Circle_policy_store.load_key_policy ?snapshot store circle_id key_id in
   let current_epoch = Int64.of_int current_epoch in
   let key_state = Octra_core.Circle_key_state.classify policy current_epoch in
   ok
@@ -651,20 +728,21 @@ let policy_view (policy : Octra_circle_runtime.Circle_exec.slot_policy) =
     ~tombstone:policy.tombstone
     ~revoked:policy.revoked
 
-let read_locator_policy store circle_id locator_mode path_key =
+let read_locator_policy ?snapshot store circle_id locator_mode path_key =
   match locator_mode with
   | Octra_core.Circles.State_locator ->
-    Octra_circle_runtime.Circle_exec.read_state_policy store circle_id path_key
+    Octra_circle_runtime.Circle_exec.read_state_policy ?snapshot store circle_id path_key
   | Octra_core.Circles.Path_locator
   | Octra_core.Circles.Slot_locator ->
-    Octra_circle_runtime.Circle_exec.read_slot_policy store circle_id path_key
+    Octra_circle_runtime.Circle_exec.read_slot_policy ?snapshot store circle_id path_key
 
-let delivery_key_summary store ~circle_id ~current_epoch policy =
+let delivery_key_summary ?snapshot store ~circle_id ~current_epoch policy =
   let open Lwt.Syntax in
   match policy.Octra_circle_runtime.Circle_exec.delivery_key_id with
   | Some key_id ->
     let* key_policy =
       Octra_core.Circle_policy_store.load_key_policy
+        ?snapshot
         store
         circle_id
         key_id in
@@ -676,11 +754,11 @@ let delivery_key_summary store ~circle_id ~current_epoch policy =
   | None ->
     Lwt.return_none
 
-let locator_policy store ~circle_id ~(locator : Circle_view.locator) ~current_epoch ~read_policy =
+let locator_policy ?snapshot store ~circle_id ~(locator : Circle_view.locator) ~current_epoch ~read_policy =
   let open Lwt.Syntax in
-  let* policy = read_policy store circle_id locator.Circle_view.path_key in
+  let* policy = read_policy ?snapshot store circle_id locator.Circle_view.path_key in
   let* delivery_key =
-    delivery_key_summary store ~circle_id ~current_epoch policy in
+    delivery_key_summary ?snapshot store ~circle_id ~current_epoch policy in
   ok
     (Circle_view.locator_policy_of
        ~circle_id
@@ -688,31 +766,35 @@ let locator_policy store ~circle_id ~(locator : Circle_view.locator) ~current_ep
        (policy_view policy)
        delivery_key)
 
-let slot_locator_policy store ~circle_id ~locator ~current_epoch =
+let slot_locator_policy ?snapshot store ~circle_id ~locator ~current_epoch =
   locator_policy
+    ?snapshot
     store
     ~circle_id
     ~locator
     ~current_epoch
     ~read_policy:Octra_circle_runtime.Circle_exec.read_slot_policy
 
-let state_locator_policy store ~circle_id ~locator ~current_epoch =
+let state_locator_policy ?snapshot store ~circle_id ~locator ~current_epoch =
   locator_policy
+    ?snapshot
     store
     ~circle_id
     ~locator
     ~current_epoch
     ~read_policy:Octra_circle_runtime.Circle_exec.read_state_policy
 
-let locator_policy_auth_params store params ~op ~field ~parse_locator ~read_policy ~current_epoch =
-  with_owner_locator_auth store params ~field ~op ~parse_locator (fun circle_id locator ->
-    read_policy
-      store
-      ~circle_id
-      ~locator
-      ~current_epoch)
+let locator_policy_auth_params store params ~op ~field ~parse_locator ~read_policy =
+  with_epoch_snapshot store (fun snapshot current_epoch ->
+    with_owner_locator_auth ~snapshot store params ~field ~op ~parse_locator (fun circle_id locator ->
+      read_policy
+        ?snapshot:(Some snapshot)
+        store
+        ~circle_id
+        ~locator
+        ~current_epoch))
 
-let slot_locator_policy_auth_params store params ~current_epoch =
+let slot_locator_policy_auth_params store params ~current_epoch:_ =
   locator_policy_auth_params
     store
     params
@@ -720,9 +802,8 @@ let slot_locator_policy_auth_params store params ~current_epoch =
     ~field:"slot_ref"
     ~parse_locator:Circle_view.slot_locator
     ~read_policy:slot_locator_policy
-    ~current_epoch
 
-let state_locator_policy_auth_params store params ~current_epoch =
+let state_locator_policy_auth_params store params ~current_epoch:_ =
   locator_policy_auth_params
     store
     params
@@ -730,12 +811,12 @@ let state_locator_policy_auth_params store params ~current_epoch =
     ~field:"state_ref"
     ~parse_locator:Circle_view.state_locator
     ~read_policy:state_locator_policy
-    ~current_epoch
 
-let state_descriptor store ~circle_id ~(locator : Circle_view.locator) =
+let state_descriptor ?snapshot store ~circle_id ~(locator : Circle_view.locator) =
   let open Lwt.Syntax in
   let* descriptor_opt =
     Octra_core.Circle_state_descriptor_store.load_descriptor_opt
+      ?snapshot
       store
       circle_id
       locator.path_key in
@@ -748,23 +829,26 @@ let state_descriptor store ~circle_id ~(locator : Circle_view.locator) =
        descriptor_opt)
 
 let state_descriptor_auth_params store params =
-  with_owner_locator_auth
-    store
-    params
-    ~field:"state_ref"
-    ~op:"octra_circle_state_descriptor"
-    ~parse_locator:Circle_view.state_locator
-    (fun circle_id locator ->
-      state_descriptor store ~circle_id ~locator)
+  with_snapshot store (fun snapshot ->
+    with_owner_locator_auth
+      ~snapshot
+      store
+      params
+      ~field:"state_ref"
+      ~op:"octra_circle_state_descriptor"
+      ~parse_locator:Circle_view.state_locator
+      (fun circle_id locator ->
+        state_descriptor ~snapshot store ~circle_id ~locator))
 
-let asset_delivery_key_fields store ~circle_id ~current_epoch meta path_key =
+let asset_delivery_key_fields ?snapshot store ~circle_id ~current_epoch meta path_key =
   let open Lwt.Syntax in
   let* policy =
-    read_locator_policy store circle_id meta.Octra_core.Circles.locator_mode path_key in
+    read_locator_policy ?snapshot store circle_id meta.Octra_core.Circles.locator_mode path_key in
   match Circle_view.asset_effective_key_id (policy_view policy) meta with
   | Some key_id ->
     let* key_policy =
       Octra_core.Circle_policy_store.load_key_policy
+        ?snapshot
         store
         circle_id
         key_id in
@@ -776,12 +860,13 @@ let asset_delivery_key_fields store ~circle_id ~current_epoch meta path_key =
   | None ->
     Lwt.return (Circle_view.asset_delivery_key_fields None)
 
-let asset_state_descriptor_fields store ~circle_id meta =
+let asset_state_descriptor_fields ?snapshot store ~circle_id meta =
   let open Lwt.Syntax in
   match Circle_view.asset_state_descriptor_path_key meta with
   | Some path_key ->
     let* descriptor_opt =
       Octra_core.Circle_state_descriptor_store.load_descriptor_opt
+        ?snapshot
         store
         circle_id
         path_key in
@@ -789,15 +874,15 @@ let asset_state_descriptor_fields store ~circle_id meta =
   | None ->
     Lwt.return (Circle_view.asset_descriptor_fields None)
 
-let asset_plaintext store ~circle_id ~path_key ~canonical_path =
+let asset_plaintext ?snapshot store ~circle_id ~path_key ~canonical_path =
   let open Lwt.Syntax in
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error (Rpc.not_found "circle not found"))
   | Some info ->
     let* meta_opt =
-      Octra_core.Store_irmin.get_circle_asset_meta store circle_id path_key in
+      Octra_core.Store_irmin.get_circle_asset_meta ?snapshot store circle_id path_key in
     match meta_opt with
     | Some meta
       when meta.body_mode = Octra_core.Circles.Sealed_read ||
@@ -807,6 +892,7 @@ let asset_plaintext store ~circle_id ~path_key ~canonical_path =
     | Some meta ->
       let* body_opt =
         Octra_core.Store_irmin.get_circle_asset_body_b64
+          ?snapshot
           store
           circle_id
           path_key in
@@ -832,13 +918,16 @@ let asset_plaintext_params store params =
   match Circle_view.asset_path_params params with
   | Error e -> Lwt.return (Error e)
   | Ok path ->
-    asset_plaintext
-      store
-      ~circle_id:path.Circle_view.circle_id
-      ~path_key:path.path_key
-      ~canonical_path:path.canonical_path
+    with_snapshot store (fun snapshot ->
+      asset_plaintext
+        ~snapshot
+        store
+        ~circle_id:path.Circle_view.circle_id
+        ~path_key:path.path_key
+        ~canonical_path:path.canonical_path)
 
 let asset_ciphertext
+    ?snapshot
     store
     ~circle_id
     ~path_key
@@ -846,15 +935,16 @@ let asset_ciphertext
     ~current_epoch
     ~reveal_sensitive_fields =
   let open Lwt.Syntax in
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error (Rpc.not_found "circle not found"))
   | Some info ->
     let* meta_opt =
-      Octra_core.Store_irmin.get_circle_asset_meta store circle_id path_key in
+      Octra_core.Store_irmin.get_circle_asset_meta ?snapshot store circle_id path_key in
     let* body_opt =
       Octra_core.Store_irmin.get_circle_asset_ciphertext_b64
+        ?snapshot
         store
         circle_id
         path_key in
@@ -862,6 +952,7 @@ let asset_ciphertext
     | Some meta, Some ciphertext_b64 ->
       let* visible =
         Octra_circle_runtime.Circle_exec.asset_visible_now
+          ?snapshot
           store
           circle_id
           (Int64.of_int current_epoch)
@@ -871,12 +962,12 @@ let asset_ciphertext
       else
         let* delivery_key_fields =
           if reveal_sensitive_fields then
-            asset_delivery_key_fields store ~circle_id ~current_epoch meta path_key
+            asset_delivery_key_fields ?snapshot store ~circle_id ~current_epoch meta path_key
           else
             Lwt.return [] in
         let* state_descriptor_fields =
           if reveal_sensitive_fields then
-            asset_state_descriptor_fields store ~circle_id meta
+            asset_state_descriptor_fields ?snapshot store ~circle_id meta
           else
             Lwt.return [] in
         ok
@@ -894,19 +985,22 @@ let asset_ciphertext
     | _ ->
       Lwt.return (Error (Rpc.not_found "circle ciphertext asset not found"))
 
-let asset_ciphertext_params store params ~current_epoch ~reveal_sensitive_fields =
+let asset_ciphertext_params store params ~current_epoch:_ ~reveal_sensitive_fields =
   match Circle_view.asset_path_params params with
   | Error e -> Lwt.return (Error e)
   | Ok path ->
-    asset_ciphertext
-      store
-      ~circle_id:path.Circle_view.circle_id
-      ~path_key:path.path_key
-      ~canonical_path:path.canonical_path
-      ~current_epoch
-      ~reveal_sensitive_fields
+    with_epoch_snapshot store (fun snapshot current_epoch ->
+      asset_ciphertext
+        ~snapshot
+        store
+        ~circle_id:path.Circle_view.circle_id
+        ~path_key:path.path_key
+        ~canonical_path:path.canonical_path
+        ~current_epoch
+        ~reveal_sensitive_fields)
 
 let asset_ciphertext_by_resource_key
+    ?snapshot
     store
     ~circle_id
     ~resource_key
@@ -915,6 +1009,7 @@ let asset_ciphertext_by_resource_key
   let open Lwt.Syntax in
   let* path_key_opt =
     Octra_core.Store_irmin.get_circle_asset_path_key_by_resource_key
+      ?snapshot
       store
       circle_id
       resource_key in
@@ -923,12 +1018,13 @@ let asset_ciphertext_by_resource_key
     Lwt.return (Error (Rpc.not_found "circle ciphertext asset not found"))
   | Some path_key ->
     let* meta_opt =
-      Octra_core.Store_irmin.get_circle_asset_meta store circle_id path_key in
+      Octra_core.Store_irmin.get_circle_asset_meta ?snapshot store circle_id path_key in
     match meta_opt with
     | None ->
       Lwt.return (Error (Rpc.not_found "circle ciphertext asset not found"))
     | Some meta ->
       asset_ciphertext
+        ?snapshot
         store
         ~circle_id
         ~path_key
@@ -939,35 +1035,39 @@ let asset_ciphertext_by_resource_key
 let asset_ciphertext_by_resource_key_params
     store
     params
-    ~current_epoch
+    ~current_epoch:_
     ~reveal_sensitive_fields =
   match Circle_view.asset_resource_params params with
   | Error e -> Lwt.return (Error e)
   | Ok req ->
-    asset_ciphertext_by_resource_key
-      store
-      ~circle_id:req.Circle_view.circle_id
-      ~resource_key:req.resource_key
-      ~current_epoch
-      ~reveal_sensitive_fields
+    with_epoch_snapshot store (fun snapshot current_epoch ->
+      asset_ciphertext_by_resource_key
+        ~snapshot
+        store
+        ~circle_id:req.Circle_view.circle_id
+        ~resource_key:req.resource_key
+        ~current_epoch
+        ~reveal_sensitive_fields)
 
 let asset_ciphertext_by_locator_params
     store
     params
     ~field
     ~parse_locator
-    ~current_epoch
+    ~current_epoch:_
     ~reveal_sensitive_fields =
   match Circle_view.asset_locator_params params field parse_locator with
   | Error e -> Lwt.return (Error e)
   | Ok parsed ->
-    asset_ciphertext
-      store
-      ~circle_id:parsed.Circle_view.circle_id
-      ~path_key:parsed.locator.Circle_view.path_key
-      ~canonical_path:parsed.locator.Circle_view.canonical_path
-      ~current_epoch
-      ~reveal_sensitive_fields
+    with_epoch_snapshot store (fun snapshot current_epoch ->
+      asset_ciphertext
+        ~snapshot
+        store
+        ~circle_id:parsed.Circle_view.circle_id
+        ~path_key:parsed.locator.Circle_view.path_key
+        ~canonical_path:parsed.locator.Circle_view.canonical_path
+        ~current_epoch
+        ~reveal_sensitive_fields)
 
 let asset_ciphertext_by_slot_ref_params
     store
@@ -995,42 +1095,48 @@ let asset_ciphertext_by_state_ref_params
     ~current_epoch
     ~reveal_sensitive_fields
 
-let asset_ciphertext_auth_params store params ~current_epoch =
+let asset_ciphertext_auth_params store params ~current_epoch:_ =
   match Circle_view.asset_path_params params with
   | Error e -> Lwt.return (Error e)
   | Ok path ->
-    with_owner_asset_auth
-      store
-      params
-      ~circle_id:path.Circle_view.circle_id
-      ~op:"octra_circle_asset_ciphertext"
-      ~subject:(Circle_view.asset_subject ~kind:"path" ~subject:path.canonical_path)
-      (fun () ->
-        asset_ciphertext
-          store
-          ~circle_id:path.Circle_view.circle_id
-          ~path_key:path.path_key
-          ~canonical_path:path.canonical_path
-          ~current_epoch
-          ~reveal_sensitive_fields:true)
+    with_epoch_snapshot store (fun snapshot current_epoch ->
+      with_owner_asset_auth
+        ~snapshot
+        store
+        params
+        ~circle_id:path.Circle_view.circle_id
+        ~op:"octra_circle_asset_ciphertext"
+        ~subject:(Circle_view.asset_subject ~kind:"path" ~subject:path.canonical_path)
+        (fun () ->
+          asset_ciphertext
+            ~snapshot
+            store
+            ~circle_id:path.Circle_view.circle_id
+            ~path_key:path.path_key
+            ~canonical_path:path.canonical_path
+            ~current_epoch
+            ~reveal_sensitive_fields:true))
 
-let asset_ciphertext_by_resource_key_auth_params store params ~current_epoch =
+let asset_ciphertext_by_resource_key_auth_params store params ~current_epoch:_ =
   match Circle_view.asset_resource_params params with
   | Error e -> Lwt.return (Error e)
   | Ok req ->
-    with_owner_asset_auth
-      store
-      params
-      ~circle_id:req.Circle_view.circle_id
-      ~op:"octra_circle_asset_ciphertext_by_resource_key"
-      ~subject:(Circle_view.asset_resource_subject req)
-      (fun () ->
-        asset_ciphertext_by_resource_key
-          store
-          ~circle_id:req.circle_id
-          ~resource_key:req.resource_key
-          ~current_epoch
-          ~reveal_sensitive_fields:true)
+    with_epoch_snapshot store (fun snapshot current_epoch ->
+      with_owner_asset_auth
+        ~snapshot
+        store
+        params
+        ~circle_id:req.Circle_view.circle_id
+        ~op:"octra_circle_asset_ciphertext_by_resource_key"
+        ~subject:(Circle_view.asset_resource_subject req)
+        (fun () ->
+          asset_ciphertext_by_resource_key
+            ~snapshot
+            store
+            ~circle_id:req.circle_id
+            ~resource_key:req.resource_key
+            ~current_epoch
+            ~reveal_sensitive_fields:true))
 
 let asset_ciphertext_by_locator_auth_params
     store
@@ -1038,24 +1144,27 @@ let asset_ciphertext_by_locator_auth_params
     ~op
     ~field
     ~parse_locator
-    ~current_epoch =
+    ~current_epoch:_ =
   match Circle_view.asset_locator_params params field parse_locator with
   | Error e -> Lwt.return (Error e)
   | Ok parsed ->
-    with_owner_asset_auth
-      store
-      params
-      ~circle_id:parsed.Circle_view.circle_id
-      ~op
-      ~subject:(Circle_view.asset_locator_subject field parsed.locator)
-      (fun () ->
-        asset_ciphertext
-          store
-          ~circle_id:parsed.Circle_view.circle_id
-          ~path_key:parsed.locator.Circle_view.path_key
-          ~canonical_path:parsed.locator.Circle_view.canonical_path
-          ~current_epoch
-          ~reveal_sensitive_fields:true)
+    with_epoch_snapshot store (fun snapshot current_epoch ->
+      with_owner_asset_auth
+        ~snapshot
+        store
+        params
+        ~circle_id:parsed.Circle_view.circle_id
+        ~op
+        ~subject:(Circle_view.asset_locator_subject field parsed.locator)
+        (fun () ->
+          asset_ciphertext
+            ~snapshot
+            store
+            ~circle_id:parsed.Circle_view.circle_id
+            ~path_key:parsed.locator.Circle_view.path_key
+            ~canonical_path:parsed.locator.Circle_view.canonical_path
+            ~current_epoch
+            ~reveal_sensitive_fields:true))
 
 let asset_ciphertext_by_slot_ref_auth_params store params ~current_epoch =
   asset_ciphertext_by_locator_auth_params
@@ -1076,6 +1185,7 @@ let asset_ciphertext_by_state_ref_auth_params store params ~current_epoch =
     ~current_epoch
 
 let private_state_cell
+    ?snapshot
     store
     ~circle_id
     ~(locator : Circle_view.locator)
@@ -1088,11 +1198,13 @@ let private_state_cell
   let open Lwt.Syntax in
   let* meta_opt =
     Octra_core.Store_irmin.get_circle_asset_meta
+      ?snapshot
       store
       circle_id
       locator.path_key in
   let* body_opt =
     Octra_core.Store_irmin.get_circle_asset_ciphertext_b64
+      ?snapshot
       store
       circle_id
       locator.path_key in
@@ -1100,6 +1212,7 @@ let private_state_cell
   | Some meta, Some ciphertext_b64 ->
     let* visible =
       Octra_circle_runtime.Circle_exec.asset_visible_now
+        ?snapshot
         store
         circle_id
         (Int64.of_int current_epoch)
@@ -1109,18 +1222,20 @@ let private_state_cell
     else
       let* descriptor_opt =
         Octra_core.Circle_state_descriptor_store.load_descriptor_opt
+          ?snapshot
           store
           circle_id
           locator.path_key in
       let* policy =
         Octra_circle_runtime.Circle_exec.read_state_policy
+          ?snapshot
           store
           circle_id
           locator.path_key in
       let* delivery_key =
-        delivery_key_summary store ~circle_id ~current_epoch policy in
+        delivery_key_summary ?snapshot store ~circle_id ~current_epoch policy in
       let* cell_opt =
-        load_cell store circle_id locator.path_key in
+        load_cell ?snapshot store circle_id locator.path_key in
       let cell =
         Option.value ~default:empty_cell cell_opt in
       ok
@@ -1149,24 +1264,27 @@ let private_state_cell_auth_params
     ~empty_cell
     ~load_cell
     ~cell_json
-    ~current_epoch =
-  with_owner_locator_auth
-    store
-    params
-    ~field:"state_ref"
-    ~op
-    ~parse_locator:Circle_view.state_locator
-    (fun circle_id locator ->
-      private_state_cell
-        store
-        ~circle_id
-        ~locator
-        ~current_epoch
-        ~not_found
-        ~cell_field
-        ~empty_cell
-        ~load_cell
-        ~cell_json)
+    ~current_epoch:_ =
+  with_epoch_snapshot store (fun snapshot current_epoch ->
+    with_owner_locator_auth
+      ~snapshot
+      store
+      params
+      ~field:"state_ref"
+      ~op
+      ~parse_locator:Circle_view.state_locator
+      (fun circle_id locator ->
+        private_state_cell
+          ~snapshot
+          store
+          ~circle_id
+          ~locator
+          ~current_epoch
+          ~not_found
+          ~cell_field
+          ~empty_cell
+          ~load_cell
+          ~cell_json))
 
 let balance_cell_auth_params store params ~current_epoch =
   private_state_cell_auth_params
@@ -1192,7 +1310,7 @@ let register_cell_auth_params store params ~current_epoch =
     ~cell_json:Octra_core.Circle_register_cell.yojson_of_t
     ~current_epoch
 
-let descriptor_for_state_ref store circle_id = function
+let descriptor_for_state_ref ?snapshot store circle_id = function
   | None ->
     Lwt.return_none
   | Some state_ref ->
@@ -1202,12 +1320,14 @@ let descriptor_for_state_ref store circle_id = function
         Lwt.return_none
       | Ok (_, _, path_key) ->
         Octra_core.Circle_state_descriptor_store.load_descriptor_opt
+          ?snapshot
           store
           circle_id
           path_key
     end
 
 let binding
+    ?snapshot
     store
     ~circle_id
     ~binding_field
@@ -1219,12 +1339,12 @@ let binding
     ~current_state_ref =
   let open Lwt.Syntax in
   let* binding_opt =
-    load_binding store circle_id binding_key_value in
+    load_binding ?snapshot store circle_id binding_key_value in
   let binding =
     Option.value ~default:empty_binding binding_opt in
   let state_ref = current_state_ref binding in
   let* descriptor_opt =
-    descriptor_for_state_ref store circle_id state_ref in
+    descriptor_for_state_ref ?snapshot store circle_id state_ref in
   ok
     (Circle_view.binding
        ~circle_id
@@ -1243,46 +1363,53 @@ let validate_subject_addr subject_addr =
     Error "subject_addr must be a valid octra address"
 
 let balance_binding_auth_params store params =
-  with_owner_validated_subject_auth
-    store
-    params
-    ~field:"subject_addr"
-    ~op:"octra_circle_balance_binding"
-    ~validate:validate_subject_addr
-    (fun circle_id subject_addr ->
-      binding
-        store
-        ~circle_id
-        ~binding_field:"balance_binding"
-        ~binding_key_field:"subject_addr"
-        ~binding_key_value:subject_addr
-        ~empty_binding:Octra_core.Circle_balance_binding.empty
-        ~load_binding:Octra_core.Circle_balance_binding_store.load_opt
-        ~binding_json:Octra_core.Circle_balance_binding.yojson_of_t
-        ~current_state_ref:(fun (binding : Octra_core.Circle_balance_binding.t) ->
-          binding.current_state_ref))
+  with_snapshot store (fun snapshot ->
+    with_owner_validated_subject_auth
+      ~snapshot
+      store
+      params
+      ~field:"subject_addr"
+      ~op:"octra_circle_balance_binding"
+      ~validate:validate_subject_addr
+      (fun circle_id subject_addr ->
+        binding
+          ~snapshot
+          store
+          ~circle_id
+          ~binding_field:"balance_binding"
+          ~binding_key_field:"subject_addr"
+          ~binding_key_value:subject_addr
+          ~empty_binding:Octra_core.Circle_balance_binding.empty
+          ~load_binding:Octra_core.Circle_balance_binding_store.load_opt
+          ~binding_json:Octra_core.Circle_balance_binding.yojson_of_t
+          ~current_state_ref:(fun (binding : Octra_core.Circle_balance_binding.t) ->
+            binding.current_state_ref)))
 
 let register_binding_auth_params store params =
-  with_owner_validated_subject_auth
-    store
-    params
-    ~field:"register_ref"
-    ~op:"octra_circle_register_binding"
-    ~validate:(Octra_core.Circle_private_common.normalize_hex64 "register_ref")
-    (fun circle_id register_ref ->
-      binding
-        store
-        ~circle_id
-        ~binding_field:"register_binding"
-        ~binding_key_field:"register_ref"
-        ~binding_key_value:register_ref
-        ~empty_binding:Octra_core.Circle_register_binding.empty
-        ~load_binding:Octra_core.Circle_register_binding_store.load_opt
-        ~binding_json:Octra_core.Circle_register_binding.yojson_of_t
-        ~current_state_ref:(fun (binding : Octra_core.Circle_register_binding.t) ->
-          binding.current_state_ref))
+  with_snapshot store (fun snapshot ->
+    with_owner_validated_subject_auth
+      ~snapshot
+      store
+      params
+      ~field:"register_ref"
+      ~op:"octra_circle_register_binding"
+      ~validate:(Octra_core.Circle_private_common.normalize_hex64 "register_ref")
+      (fun circle_id register_ref ->
+        binding
+          ~snapshot
+          store
+          ~circle_id
+          ~binding_field:"register_binding"
+          ~binding_key_field:"register_ref"
+          ~binding_key_value:register_ref
+          ~empty_binding:Octra_core.Circle_register_binding.empty
+          ~load_binding:Octra_core.Circle_register_binding_store.load_opt
+          ~binding_json:Octra_core.Circle_register_binding.yojson_of_t
+          ~current_state_ref:(fun (binding : Octra_core.Circle_register_binding.t) ->
+            binding.current_state_ref)))
 
 let workflow
+    ?snapshot
     store
     ~circle_id
     ~workflow_field
@@ -1292,7 +1419,7 @@ let workflow
     ~workflow_json =
   let open Lwt.Syntax in
   let* workflow_opt =
-    load_workflow store circle_id workflow_ref in
+    load_workflow ?snapshot store circle_id workflow_ref in
   let workflow =
     Option.value ~default:empty_workflow workflow_opt in
   ok
@@ -1304,51 +1431,58 @@ let workflow
        ~workflow_materialized:(Option.is_some workflow_opt))
 
 let balance_workflow_auth_params store params =
-  with_owner_validated_subject_auth
-    store
-    params
-    ~field:"workflow_ref"
-    ~op:"octra_circle_balance_workflow"
-    ~validate:(Octra_core.Circle_private_common.normalize_hex64 "workflow_ref")
-    (fun circle_id workflow_ref ->
-      workflow
-        store
-        ~circle_id
-        ~workflow_field:"balance_workflow"
-        ~workflow_ref
-        ~empty_workflow:Octra_core.Circle_balance_workflow.empty
-        ~load_workflow:Octra_core.Circle_balance_workflow_store.load_opt
-        ~workflow_json:Octra_core.Circle_balance_workflow.yojson_of_t)
+  with_snapshot store (fun snapshot ->
+    with_owner_validated_subject_auth
+      ~snapshot
+      store
+      params
+      ~field:"workflow_ref"
+      ~op:"octra_circle_balance_workflow"
+      ~validate:(Octra_core.Circle_private_common.normalize_hex64 "workflow_ref")
+      (fun circle_id workflow_ref ->
+        workflow
+          ~snapshot
+          store
+          ~circle_id
+          ~workflow_field:"balance_workflow"
+          ~workflow_ref
+          ~empty_workflow:Octra_core.Circle_balance_workflow.empty
+          ~load_workflow:Octra_core.Circle_balance_workflow_store.load_opt
+          ~workflow_json:Octra_core.Circle_balance_workflow.yojson_of_t))
 
 let register_workflow_auth_params store params =
-  with_owner_validated_subject_auth
-    store
-    params
-    ~field:"workflow_ref"
-    ~op:"octra_circle_register_workflow"
-    ~validate:(Octra_core.Circle_private_common.normalize_hex64 "workflow_ref")
-    (fun circle_id workflow_ref ->
-      workflow
-        store
-        ~circle_id
-        ~workflow_field:"register_workflow"
-        ~workflow_ref
-        ~empty_workflow:Octra_core.Circle_register_workflow.empty
-        ~load_workflow:Octra_core.Circle_register_workflow_store.load_opt
-        ~workflow_json:Octra_core.Circle_register_workflow.yojson_of_t)
+  with_snapshot store (fun snapshot ->
+    with_owner_validated_subject_auth
+      ~snapshot
+      store
+      params
+      ~field:"workflow_ref"
+      ~op:"octra_circle_register_workflow"
+      ~validate:(Octra_core.Circle_private_common.normalize_hex64 "workflow_ref")
+      (fun circle_id workflow_ref ->
+        workflow
+          ~snapshot
+          store
+          ~circle_id
+          ~workflow_field:"register_workflow"
+          ~workflow_ref
+          ~empty_workflow:Octra_core.Circle_register_workflow.empty
+          ~load_workflow:Octra_core.Circle_register_workflow_store.load_opt
+          ~workflow_json:Octra_core.Circle_register_workflow.yojson_of_t))
 
-let storage store ~circle_id ~key =
+let storage ?snapshot store ~circle_id ~key =
   let open Lwt.Syntax in
   let* value_opt =
-    Octra_circle_runtime.Circle_exec.read_storage_key store circle_id key in
+    Octra_circle_runtime.Circle_exec.read_storage_key ?snapshot store circle_id key in
   ok (Circle_view.storage ~circle_id ~key ~value:value_opt)
 
 let storage_dump_limit = 128
 
-let storage_dump store ~circle_id =
+let storage_dump ?snapshot store ~circle_id =
   let open Lwt.Syntax in
   let* result =
     Octra_circle_runtime.Circle_exec.list_storage_page
+      ?snapshot
       store
       circle_id
       ~limit:storage_dump_limit in
@@ -1361,15 +1495,17 @@ let storage_dump store ~circle_id =
   | Ok value -> ok value
   | Error e -> Lwt.return (Error e)
 
-let outbox_claim store ~circle_id ~intent_id ~current_epoch =
+let outbox_claim ?snapshot store ~circle_id ~intent_id ~current_epoch =
   let open Lwt.Syntax in
   let* claims =
     Octra_core.Circle_transport_state.get_outbox_claims
+      ?snapshot
       store
       circle_id
       intent_id in
   let* active_claims =
     Octra_core.Circle_transport_state.active_outbox_claims
+      ?snapshot
       store
       circle_id
       intent_id
@@ -1384,44 +1520,48 @@ let outbox_claim store ~circle_id ~intent_id ~current_epoch =
          ~claims
          ~active_claims)
 
-let outbox_intent store ~circle_id ~intent_id =
+let outbox_intent ?snapshot store ~circle_id ~intent_id =
   let open Lwt.Syntax in
   let* intent_opt =
-    Octra_core.Store_irmin.get_circle_outbox_intent store circle_id intent_id in
+    Octra_core.Store_irmin.get_circle_outbox_intent ?snapshot store circle_id intent_id in
   Lwt.return
     (option_result
        intent_opt
        ~not_found:"circle outbox intent not found"
        (Circle_view.outbox_intent ~circle_id))
 
-let outbox_status store ~circle_id ~intent_id ~current_epoch =
+let outbox_status ?snapshot store ~circle_id ~intent_id ~current_epoch =
   let open Lwt.Syntax in
   let* intent_opt =
-    Octra_core.Store_irmin.get_circle_outbox_intent store circle_id intent_id in
+    Octra_core.Store_irmin.get_circle_outbox_intent ?snapshot store circle_id intent_id in
   let* status_opt =
-    Octra_core.Store_irmin.get_circle_outbox_status store circle_id intent_id in
+    Octra_core.Store_irmin.get_circle_outbox_status ?snapshot store circle_id intent_id in
   match intent_opt, status_opt with
   | Some intent, Some status ->
     let* active_claims =
       Octra_core.Circle_transport_state.active_outbox_claims
+        ?snapshot
         store
         circle_id
         intent_id
         current_epoch in
     let* claims =
       Octra_core.Circle_transport_state.get_outbox_claims
+        ?snapshot
         store
         circle_id
         intent_id in
     let* stored_resolution =
       Octra_core.Circle_transport_state.get_outbox_resolution
+        ?snapshot
         store
         circle_id
         intent_id in
     let* transport_policy =
-      Octra_core.Circle_policy_store.load_transport_policy store circle_id in
+      Octra_core.Circle_policy_store.load_transport_policy ?snapshot store circle_id in
     let* delivery_key_status =
       Octra_core.Circle_transport_state.delivery_key_status
+        ?snapshot
         store
         circle_id
         current_epoch
@@ -1441,98 +1581,98 @@ let outbox_status store ~circle_id ~intent_id ~current_epoch =
   | _ ->
     Lwt.return (Error (Rpc.not_found "circle outbox status not found"))
 
-let ingress_packet store ~circle_id ~intent_id =
+let ingress_packet ?snapshot store ~circle_id ~intent_id =
   let open Lwt.Syntax in
   let* packet_opt =
-    Octra_core.Store_irmin.get_circle_ingress_packet store circle_id intent_id in
+    Octra_core.Store_irmin.get_circle_ingress_packet ?snapshot store circle_id intent_id in
   Lwt.return
     (option_result
        packet_opt
        ~not_found:"circle ingress packet not found"
        (Circle_view.ingress_packet ~circle_id))
 
-let owner_scope_read store params ~op read =
-  with_owner_scope_auth store params ~op (fun circle_id ->
-    read store ~circle_id)
-
-let owner_subject_read store params ~field ~op read =
-  with_owner_subject_auth store params ~field ~op (fun circle_id subject ->
+let owner_subject_read ~snapshot store params ~field ~op read =
+  with_owner_subject_auth ~snapshot store params ~field ~op (fun circle_id subject ->
     read store ~circle_id subject)
 
 let transport_policy_auth store params =
-  owner_scope_read
-    store
-    params
-    ~op:"octra_circle_transport_policy"
-    transport_policy
+  with_snapshot store (fun snapshot ->
+    with_owner_scope_auth ~snapshot store params ~op:"octra_circle_transport_policy"
+      (fun circle_id -> transport_policy ~snapshot store ~circle_id))
 
 let hfhe_policy_auth store params =
-  owner_scope_read
-    store
-    params
-    ~op:"octra_circle_hfhe_policy"
-    hfhe_policy
+  with_snapshot store (fun snapshot ->
+    with_owner_scope_auth ~snapshot store params ~op:"octra_circle_hfhe_policy"
+      (fun circle_id -> hfhe_policy ~snapshot store ~circle_id))
 
-let key_policy_auth store params ~current_epoch =
-  owner_subject_read
-    store
-    params
-    ~field:"key_id"
-    ~op:"octra_circle_key_policy"
-    (fun store ~circle_id key_id ->
-      key_policy store ~circle_id ~key_id ~current_epoch)
+let key_policy_auth store params ~current_epoch:_ =
+  with_epoch_snapshot store (fun snapshot current_epoch ->
+    with_owner_subject_auth ~snapshot store params ~field:"key_id" ~op:"octra_circle_key_policy"
+      (fun circle_id key_id -> key_policy ~snapshot store ~circle_id ~key_id ~current_epoch))
 
 let storage_auth store params =
-  owner_subject_read
-    store
-    params
-    ~field:"key"
-    ~op:"octra_circle_storage"
-    (fun store ~circle_id key ->
-      storage store ~circle_id ~key)
+  with_snapshot store (fun snapshot ->
+    with_owner_subject_auth
+      ~snapshot
+      store
+      params
+      ~field:"key"
+      ~op:"octra_circle_storage"
+      (fun circle_id key ->
+        storage ~snapshot store ~circle_id ~key))
 
 let storage_dump_auth store params =
-  owner_scope_read
-    store
-    params
-    ~op:"octra_circle_storage_dump"
-    storage_dump
+  with_snapshot store (fun snapshot ->
+    with_owner_scope_auth
+      ~snapshot
+      store
+      params
+      ~op:"octra_circle_storage_dump"
+      (fun circle_id -> storage_dump ~snapshot store ~circle_id))
 
-let outbox_claim_auth store params ~current_epoch =
-  owner_subject_read
-    store
-    params
-    ~field:"intent_id"
-    ~op:"octra_circle_outbox_claim"
-    (fun store ~circle_id intent_id ->
-      outbox_claim store ~circle_id ~intent_id ~current_epoch)
+let outbox_claim_auth store params ~current_epoch:_ =
+  with_epoch_snapshot store (fun snapshot current_epoch ->
+    owner_subject_read
+      ~snapshot
+      store
+      params
+      ~field:"intent_id"
+      ~op:"octra_circle_outbox_claim"
+      (fun store ~circle_id intent_id ->
+        outbox_claim ~snapshot store ~circle_id ~intent_id ~current_epoch))
 
 let outbox_intent_auth store params =
-  owner_subject_read
-    store
-    params
-    ~field:"intent_id"
-    ~op:"octra_circle_outbox_intent"
-    (fun store ~circle_id intent_id ->
-      outbox_intent store ~circle_id ~intent_id)
+  with_snapshot store (fun snapshot ->
+    owner_subject_read
+      ~snapshot
+      store
+      params
+      ~field:"intent_id"
+      ~op:"octra_circle_outbox_intent"
+      (fun store ~circle_id intent_id ->
+        outbox_intent ~snapshot store ~circle_id ~intent_id))
 
-let outbox_status_auth store params ~current_epoch =
-  owner_subject_read
-    store
-    params
-    ~field:"intent_id"
-    ~op:"octra_circle_outbox_status"
-    (fun store ~circle_id intent_id ->
-      outbox_status store ~circle_id ~intent_id ~current_epoch)
+let outbox_status_auth store params ~current_epoch:_ =
+  with_epoch_snapshot store (fun snapshot current_epoch ->
+    owner_subject_read
+      ~snapshot
+      store
+      params
+      ~field:"intent_id"
+      ~op:"octra_circle_outbox_status"
+      (fun store ~circle_id intent_id ->
+        outbox_status ~snapshot store ~circle_id ~intent_id ~current_epoch))
 
 let ingress_packet_auth store params =
-  owner_subject_read
-    store
-    params
-    ~field:"intent_id"
-    ~op:"octra_circle_ingress_packet"
-    (fun store ~circle_id intent_id ->
-      ingress_packet store ~circle_id ~intent_id)
+  with_snapshot store (fun snapshot ->
+    owner_subject_read
+      ~snapshot
+      store
+      params
+      ~field:"intent_id"
+      ~op:"octra_circle_ingress_packet"
+      (fun store ~circle_id intent_id ->
+        ingress_packet ~snapshot store ~circle_id ~intent_id))
 
 let dispatch
     (adapters : (Yojson.Safe.t -> 'ctx -> rpc_result Lwt.t) dispatch_adapters) =
@@ -1540,9 +1680,9 @@ let dispatch
     circle_info = adapters.store_read info_public_params;
     circle_info_auth = adapters.store_read info_auth_params;
     circle_program_info = adapters.program_read
-      (fun ~float_mode -> program_info_public_params ~float_mode);
+      (program_rpc ~authenticated:false ~describe:true);
     circle_program_info_auth = adapters.program_read
-      (fun ~float_mode -> program_descriptor_auth_params ~float_mode);
+      (program_rpc ~authenticated:true ~describe:true);
     circle_asset = adapters.store_read asset_plaintext_params;
     circle_view = adapters.circle_view;
     circle_view_auth = adapters.circle_view_auth;
@@ -1608,6 +1748,6 @@ let dispatch
       adapters.epoch_read asset_ciphertext_by_slot_ref_auth_params;
     circle_asset_ciphertext_by_state_ref_auth =
       adapters.epoch_read asset_ciphertext_by_state_ref_auth_params;
-    circle_program = adapters.store_read program_params;
-    circle_program_auth = adapters.store_read program_auth_params;
+    circle_program = adapters.program_read (program_rpc ~authenticated:false ~describe:false);
+    circle_program_auth = adapters.program_read (program_rpc ~authenticated:true ~describe:false);
   }

@@ -138,12 +138,10 @@ inline RecryptResult recrypt_result(const PubKey& pk, const NatKey& key, const C
 }
 
 inline bool recrypt_verify(const PubKey& pk, const NatKey& key, const Cipher& ct, const RecryptResult& out) {
-    if (!out.has_compact)
+    if (!out.has_compact || !out.has_cipher || out.query == 0)
         return false;
     if (!recrypt_compact_verify(pk, key, ct, out.compact, out.adm, out.query ? out.query - 1 : 0))
         return false;
-    if (!out.has_cipher)
-        return true;
     return recrypt_verify(pk, key, ct, out.cipher);
 }
 

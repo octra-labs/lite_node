@@ -31,6 +31,17 @@ type t = {
   validator_set : C_types.validator_set;
 }
 
+type origin = {
+  chain_id : string;
+  epoch_id : int64;
+  state_root : string;
+  validators : C_types.validator_set;
+}
+
+let from_input (root : Octra_core.Compute_input.root) =
+  {chain_id = root.chain_id; epoch_id = root.epoch; state_root = root.state;
+    validators = root.validators}
+
 let max_steps = 1_024
 let max_finalize_bytes = 4_000_000
 let max_set_bytes = 1_000_000
@@ -356,6 +367,34 @@ let verify ~validator_set checkpoint encoded =
     let* () = verify_checkpoint checkpoint value in
     Ok value
 
+let origin_shape ~max_bytes ~chain_id ~epoch_id ~state_root ~set_root encoded =
+  if max_bytes <= 0 || String.length encoded > max_bytes then
+    Error "origin proof size exceeds limit"
+  else if chain_id = "" || String.length chain_id > 128 || epoch_id < 0L
+      || String.length state_root <> 32 || String.length set_root <> 32 then
+    Error "origin context is invalid"
+  else Ok ()
+
+let check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value =
+  let finalize = value.finalize in
+  if finalize.C_types.chain_id <> chain_id || finalize.header.chain_id <> chain_id then
+    Error "origin chain differs"
+  else if finalize.epoch_id <> epoch_id || finalize.header.epoch_id <> epoch_id then
+    Error "origin epoch differs"
+  else if finalize.header.proposed_state_root <> state_root then
+    Error "origin state root differs"
+  else if C_config.validator_set_hash validators <> set_root then
+    Error "origin validator set differs"
+  else
+    let* () = verify_anchor_finalize ~chain_id ~validator_set:validators finalize in
+    Ok {chain_id; epoch_id; state_root; validators}
+
+let verify_origin ~max_bytes ~trusted ~chain_id ~epoch_id ~state_root ~set_root encoded =
+  let* () = origin_shape ~max_bytes ~chain_id ~epoch_id ~state_root ~set_root encoded in
+  let* value = decode encoded in
+  let* validators = derive ~validator_set:trusted value in
+  check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value
+
 let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
   let open Lwt.Syntax in
   if cancelled () then Lwt.return_error "state sync verification cancelled" else
@@ -376,10 +415,11 @@ let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
             Lwt.return_error "validator transition is not before checkpoint"
           else
             let chain_id = value.finalize.chain_id in
-            let* input = Lwt_preemptive.detach
-              (fun () -> step_input ~chain_id ~prior_epoch:prior current step) () in
+            let* checked = Lwt_preemptive.detach (fun () ->
+              Result.bind (step_input ~chain_id ~prior_epoch:prior current step)
+                (step_output ~chain_id step)) () in
             if cancelled () then Lwt.return_error "state sync verification cancelled"
-            else match Result.bind input (step_output ~chain_id step) with
+            else match checked with
             | Error reason -> Lwt.return_error reason
             | Ok (prior, current) -> loop prior current rest
       in
@@ -447,3 +487,51 @@ let verify_lwt ?(cancelled = fun () -> false) ~validator_set checkpoint encoded 
       | Ok _ ->
           Lwt_preemptive.detach (fun () ->
             Result.map (fun () -> value) (verify_checkpoint checkpoint value)) ()
+
+let verify_origin_lwt ?(cancelled = fun () -> false) ~max_bytes ~trusted
+    ~chain_id ~epoch_id ~state_root ~set_root encoded =
+  let open Lwt.Syntax in
+  if cancelled () then Lwt.return_error "state sync verification cancelled"
+  else match origin_shape ~max_bytes ~chain_id ~epoch_id ~state_root ~set_root encoded with
+  | Error reason -> Lwt.return_error reason
+  | Ok () ->
+    let* decoded = Lwt_preemptive.detach decode encoded in
+    match decoded with
+    | Error reason -> Lwt.return_error reason
+    | Ok value ->
+      let* derived = derive_lwt ~cancelled ~validator_set:trusted value in
+      match derived with
+      | Error reason -> Lwt.return_error reason
+      | Ok validators ->
+        if cancelled () then Lwt.return_error "state sync verification cancelled"
+        else
+          let* checked = Lwt_preemptive.detach (fun () ->
+            check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value) () in
+          if cancelled () then Lwt.return_error "state sync verification cancelled"
+          else Lwt.return checked
+
+let read_state ~max_bytes ~(origin : origin) ~ledger_root ~index_root ~path ~proof =
+  if max_bytes <= 0 || String.length proof > max_bytes then Error "state proof size exceeds limit"
+  else if not (lower_hex [64; 128] ledger_root && lower_hex [64] index_root)
+      || path = [] || List.exists (String.equal "") path then
+    Error "state proof context is invalid"
+  else if Eic.folded_state_root ~ledger_state_root:ledger_root ~epoch_index_root:index_root
+      <> Checkpoint.raw_to_hex origin.state_root then
+    Error "state proof root differs"
+  else
+    match Lwt.state (Irmin.verify_merkle_proof_lwt ~ledger_state_root:ledger_root ~path ~proof) with
+    | Lwt.Return result -> result
+    | Lwt.Fail error -> raise error
+    | Lwt.Sleep -> failwith "state proof verification did not settle"
+
+let read_state_lwt ?(cancelled = fun () -> false) ~max_bytes ~origin
+    ~ledger_root ~index_root ~path ~proof () =
+  let open Lwt.Syntax in
+  if cancelled () then Lwt.return_error "state sync verification cancelled"
+  else if max_bytes <= 0 || String.length proof > max_bytes then
+    Lwt.return_error "state proof size exceeds limit"
+  else
+    let* result = Lwt_preemptive.detach (fun () ->
+      read_state ~max_bytes ~origin ~ledger_root ~index_root ~path ~proof) () in
+    if cancelled () then Lwt.return_error "state sync verification cancelled"
+    else Lwt.return result

@@ -53,7 +53,8 @@ let source_request (request : request) =
 
 let run deps request =
   let selected = Source.run_node deps.source (source_request request) in
-  let ordered_txs = selected.Source.txs in
+  let ordered_txs = Octra_core.Tx_outcome.executed
+    ~confirmed:selected.Source.txs selected.rejections in
   let epoch_receipts_json = selected.receipts_json in
   let epoch_start = deps.now () in
   let pending_tx_saves : (Transaction.t * int) list ref = ref [] in

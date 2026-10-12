@@ -286,6 +286,7 @@ type live_contract_ctx_args = {
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  vm_bytes : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   object_cost : bool;
@@ -325,6 +326,7 @@ type live_sender_vm_tx_args = {
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  vm_bytes : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
@@ -344,6 +346,7 @@ type live_sender_vm_tx_args = {
 }
 
 val make_live_vm_tx_deps :
+  ?inspect_mode:Octra_core.Rule_graph.mode ->
   live_vm_tx_args ->
   vm_tx_deps
 
@@ -369,6 +372,7 @@ val make_live_sender_vm_tx_deps :
   vm_tx_deps
 
 val make_contract_ctx :
+  ?bytes:Octra_vm.Byte_work.t ->
   ('value_snapshot, 'program_snapshot) deps ->
   ContractVM.exec_ctx
 

@@ -12,6 +12,9 @@ type prepare = {
 }
 
 type execute = {
+  memory_bytes : int;
+  guest_bytes : int;
+  fuel_limit : int;
   request_id : string;
   session_id : string;
   epoch_id : int64;
@@ -116,7 +119,7 @@ let lower_hex_64 value =
         | _ -> false)
        value
 
-let bounded_ascii maximum value =
+let ascii_text maximum value =
   let length = String.length value in
   length > 0
   && length <= maximum
@@ -199,7 +202,7 @@ let storage_entry_of_json = function
   | `Assoc fields when exact_fields ["key"; "value_b64"] fields ->
     let* key = string_field fields "key" in
     let* value_b64 = string_field fields "value_b64" in
-    if not (bounded_ascii max_storage_key_bytes key) then
+    if not (ascii_text max_storage_key_bytes key) then
       Error "resource compute provider storage key refused"
     else
       begin
@@ -231,6 +234,9 @@ let storage_of_json fields =
 
 let execute_to_json (value : execute) =
   `Assoc [
+    "memory_bytes", `Int value.memory_bytes;
+    "guest_bytes", `Int value.guest_bytes;
+    "fuel_limit", `Int value.fuel_limit;
     "caller", `String value.caller;
     "circle_id", `String value.circle_id;
     "epoch_id", json_int64 value.epoch_id;
@@ -265,6 +271,9 @@ let program_valid raw =
 
 let execute_of_json json =
   let names = [
+    "memory_bytes";
+    "guest_bytes";
+    "fuel_limit";
     "caller";
     "circle_id";
     "epoch_id";
@@ -285,6 +294,9 @@ let execute_of_json json =
     "storage";
   ] in
   let* fields = assoc names json in
+  let* memory_bytes = int_field fields "memory_bytes" in
+  let* guest_bytes = int_field fields "guest_bytes" in
+  let* fuel_limit = int_field fields "fuel_limit" in
   let* request_id = string_field fields "request_id" in
   let* session_id = string_field fields "session_id" in
   let* epoch_id = int64_field fields "epoch_id" in
@@ -313,9 +325,15 @@ let execute_of_json json =
   let* program_root = require_hash "program_root" program_root in
   let* executor_root = require_hash "executor_root" executor_root in
   let* caller = require_address "caller" caller in
-  if epoch_id < 0L || model_epoch < 0L then
+  if memory_bytes <= 0 || memory_bytes > Octra_consensus.Resource_compute_certificate.max_memory_bytes then
+    Error "resource compute provider memory refused"
+  else if guest_bytes < 65_536 || guest_bytes > 67_108_864 || guest_bytes mod 65_536 <> 0 then
+    Error "resource compute provider pages refused"
+  else if fuel_limit <= 0 || fuel_limit > 2_000_000_000 then
+    Error "resource compute provider fuel refused"
+  else if epoch_id < 0L || model_epoch < 0L then
     Error "resource compute provider epoch refused"
-  else if not (bounded_ascii 64 method_name) then
+  else if not (ascii_text 64 method_name) then
     Error "resource compute provider method refused"
   else if not (params_valid params_json) then
     Error "resource compute provider params refused"
@@ -328,6 +346,9 @@ let execute_of_json json =
   else
     Ok {
       request_id;
+      memory_bytes;
+      guest_bytes;
+      fuel_limit;
       session_id;
       epoch_id;
       state_root;
@@ -361,7 +382,7 @@ let self_test_of_json json =
   let* profile = string_field fields "profile" in
   let* evidence_root = require_hash "evidence_root" evidence_root in
   let* executor_root = require_hash "executor_root" executor_root in
-  if not (bounded_ascii 32 profile) then Error "resource compute provider profile refused"
+  if not (ascii_text 32 profile) then Error "resource compute provider profile refused"
   else Ok { executor_root; evidence_root; profile }
 
 let prepared_to_json (value : prepared) =

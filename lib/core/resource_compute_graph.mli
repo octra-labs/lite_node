@@ -91,6 +91,7 @@ type cache_plan = {
 }
 
 val default_limits : limits
+val cache_key : circle_id:string -> graph_root:string -> string
 val stable_json : Yojson.Safe.t -> string
 val parse :
   limits:limits ->

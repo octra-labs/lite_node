@@ -7,6 +7,7 @@ val create :
   field_policy:(unit -> Octra_core.Private_ledger.field_policy) ->
   strict:(unit -> bool) ->
   math:(unit -> bool) ->
+  cipher_mode:(unit -> Octra_core.Rule_graph.mode) ->
   Octra_core.Ledger.t ->
   t
 

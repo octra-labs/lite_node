@@ -451,7 +451,9 @@ let test_preview_trust () =
     let other = key (String.make 32 '\043') in
     let refused = read [other] "1" in
     require (not refused.success) "preview cache accepted a different key";
-    let key = Circle_exec.preview_cache_key ~trusted ~math:false circle_id owner "1,2" in
+    let info = Option.get (Lwt_main.run (Store.get_circle_info store circle_id)) in
+    let scope = Circle_exec.preview_scope Vm.Contract_vm.default_ctx info in
+    let key = Circle_exec.preview_cache_key ~scope ~trusted ~math:false circle_id owner "1,2" in
     let rec drain () =
       if Hashtbl.mem Circle_exec.preview_session_inflight key then
         Lwt.bind (Lwt_unix.sleep 0.001) drain
@@ -479,7 +481,7 @@ let wasm_descriptor methods =
     manifest = Some (`Assoc ["methods", `List methods]);
   }
 
-let read_module ?hfhe_request manifest response =
+let read_module ?hfhe_request ?inspect_stage ?event ?(compute = false) manifest response =
   let byte value = String.make 1 (Char.chr value) in
   let rec number limit value =
     if value < limit then byte value
@@ -491,31 +493,648 @@ let read_module ?hfhe_request manifest response =
   let const value = "\065" ^ number 64 value in
   let export name kind index = text name ^ byte kind ^ size index in
   let body instructions = text ("\000" ^ instructions ^ "\011") in
-  let data = manifest ^ response ^ Option.value ~default:"" hfhe_request in
+  let plain = manifest ^ response ^ Option.value ~default:"" hfhe_request in
+  let contents = plain ^ Option.fold ~none:"" ~some:(fun (topic, value) -> topic ^ value) event in
+  let data = if compute then contents ^ String.make 8 '\000' else contents in
   let imports = [text "octra" ^ text "host_response_write" ^ "\000\000"]
     @ (match hfhe_request with
       | None -> []
-      | Some _ -> [text "octra" ^ text "host_hfhe_invoke_len" ^ "\000\000"]) in
+      | Some _ -> [text "octra" ^ text "host_hfhe_invoke_len" ^ "\000\000"])
+    @ (if compute then [text "octra" ^ text "host_tensor_silu_q24" ^ "\000\000"] else [])
+    @ (match inspect_stage with
+      | None -> []
+      | Some _ -> [text "octra" ^ text "host_session_put" ^ "\000\002"])
+    @ (match event with
+      | None -> []
+      | Some _ -> [text "octra" ^ text "host_emit_event" ^ "\000\002"]) in
   let first = List.length imports in
+  let session = const 0 ^ const 1 ^ const 0 ^ const 1
+    ^ "\016" ^ size (first - (if Option.is_none event then 1 else 2)) ^ "\026" in
+  let inspect stage = if inspect_stage = Some stage then session else "" in
   let invoke = match hfhe_request with
     | None -> ""
     | Some request -> const (String.length manifest + String.length response)
       ^ const (String.length request) ^ "\016\001\026" in
+  let math = if compute then const (String.length contents) ^ const 1
+    ^ "\016" ^ size (if Option.is_none hfhe_request then 1 else 2) ^ "\026" else "" in
+  let emit = match event with
+    | None -> ""
+    | Some (topic, value) -> const (String.length plain) ^ const (String.length topic)
+      ^ const (String.length plain + String.length topic) ^ const (String.length value)
+      ^ "\016" ^ size (first - 1) ^ "\026" in
   let write offset length = const offset ^ const length ^ "\016\000\026" ^ const 0 in
   String.concat "" [
     "\000asm\001\000\000\000";
-    section 1 (vector ["\096\002\127\127\001\127"; "\096\001\127\001\127"]);
+    section 1 (vector (["\096\002\127\127\001\127"; "\096\001\127\001\127"]
+      @ (if Option.is_none inspect_stage && Option.is_none event then [] else
+        ["\096\004\127\127\127\127\001\127"; "\096\000\000"])));
     section 2 (vector imports);
-    section 3 (vector [size 1; size 0; size 0]);
+    section 3 (vector ([size 1; size 0; size 0]
+      @ (if inspect_stage = Some 0 then [size 3] else [])));
     section 5 (vector ["\000\001"]);
     section 7 (vector [export "memory" 2 0; export "octra_alloc" 0 first;
       export "octra_query" 0 (first + 1); export "octra_update" 0 (first + 1);
       export "octra_manifest" 0 (first + 2)]);
-    section 10 (vector [body (const (String.length data));
-      body (invoke ^ write (String.length manifest) (String.length response));
-      body (write 0 (String.length manifest))]);
+    (if inspect_stage = Some 0 then section 8 (size (first + 3)) else "");
+    section 10 (vector ([body (inspect 1 ^ const (String.length data));
+      body (inspect 4 ^ invoke ^ math ^ emit ^ write (String.length manifest) (String.length response));
+      body (inspect 2 ^ write 0 (String.length manifest))]
+      @ (if inspect_stage = Some 0 then [body session] else [])));
     section 11 (vector ["\000" ^ const 0 ^ "\011" ^ text data]);
   ]
+
+let test_wasm_events () =
+  let module VM = Vm.Contract_vm in
+  let module B = Vm.Byte_work in
+  with_store (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111111" in
+    let circle = "octWASM_EVENTS" in
+    let manifest = "{\"methods\":[{\"name\":\"update\",\"view\":false}]}" in
+    let response = "OCWS1\003\000\000\000\0017" in
+    let code = read_module ~event:("log", "\000\n\"\\") manifest response in
+    save_circle ~runtime:Circles.Wasm_v1 store circle owner (Base64.encode_exn code);
+    let run budget = Lwt_main.run (Circle_exec.execute_call
+      ~ctx:{VM.default_ctx with byte_work = budget}
+      store circle "update" [] owner Z.zero) |> fun result -> result.Circle_exec.receipt in
+    let prior = run None in
+    require (prior.success && List.length prior.events = 1)
+      "prior wasm event control failed";
+    let bytes = Vm.Receipt_view.program_events_json prior.events
+      |> Yojson.Safe.to_string |> String.length in
+    let budget = B.create B.consensus_limits in
+    let charged = run (Some budget) in
+    require (charged.success && charged.events = prior.events
+      && charged.return_value = prior.return_value)
+      "wasm event accounting changed result";
+    require (B.event_left budget = 4_194_304 - bytes - 19)
+      "wasm event or result bytes omitted";
+    require (charged.effort_used > prior.effort_used) "wasm event work not charged";
+    List.iter (fun remaining ->
+      let budget = B.create B.consensus_limits in
+      require (Option.is_some (B.output budget ~used:0 ~limit:1_000_000
+        (4_194_304 - remaining))) "wasm quota setup failed";
+      let result = run (Some budget) in
+      require (result.success = (remaining = bytes + 19)) "wasm receipt quota differs";
+      if not result.success then require (result.return_value = None
+        && result.error = Some "circle receipt effort exceeds limit")
+        "wasm quota refusal lost") [bytes - 1; bytes + 18; bytes + 19];
+    let budget = B.create B.consensus_limits in
+    for _ = 1 to 256 do
+      require (Option.is_some (B.emit budget ~used:0 ~limit:1_000_000 0))
+        "wasm event count setup failed"
+    done;
+    require (not (run (Some budget)).success) "wasm event count ignored")
+
+let test_wasm_inspect () =
+  let module Host = Octra_core.Circle_wasm_host in
+  let module Rule = Octra_core.Rule_graph in
+  let manifest = "{\"methods\":[]}" in
+  let response = "OCWS1\000\000\000\000\000" in
+  let fields = ["action", `String "describe"] in
+  require (Host.inspect_fields Rule.Prior fields = fields)
+    "prior inspection changed payload";
+  let refused = function
+    | Error (Host.Rejected reason) ->
+      require (Host.string_starts_with
+        ~prefix:"nonpersistent wasm import during inspection:" reason)
+        "inspection refusal class changed"
+    | Error (Host.Unavailable _) -> fail "inspection became unavailable"
+    | Ok _ -> fail "inspection accepted session effect" in
+  with_store (fun store ->
+    let owner = "octINSPECT_OWNER" in
+    List.iter (fun stage ->
+      let circle_id = "octINSPECT" ^ string_of_int stage in
+      let code_b64 = Base64.encode_exn (read_module ~inspect_stage:stage manifest response) in
+      save_circle ~runtime:Circles.Wasm_v1 store circle_id owner code_b64;
+      let read mode = Lwt_main.run (Circle_program.load ~inspect_mode:mode store circle_id) in
+      refused (Lwt_main.run (Host.describe ~inspect_mode:Rule.Active code_b64));
+      if stage = 0 then begin
+        require (Result.is_ok (Lwt_main.run (Host.validate code_b64)))
+          "prior startup inspection changed";
+        refused (Lwt_main.run (Host.validate ~inspect_mode:Rule.Active code_b64))
+      end;
+      refused (read Rule.Active);
+      require (Result.is_ok (read Rule.Prior)) "prior descriptor inspection changed";
+      refused (read Rule.Active);
+      require (Result.is_ok (read Rule.Prior)) "strict refusal polluted prior cache";
+      let view = Lwt_main.run (Circle_exec.execute_view_call_direct
+        ~inspect_mode:Rule.Active store circle_id "query" [] owner) in
+      require (not view.success && Option.is_some view.error)
+        "view bypassed descriptor inspection";
+      let call = Lwt_main.run (Circle_exec.execute_call
+        ~inspect_mode:Rule.Active store circle_id "update" [] owner Z.zero) in
+      require (not call.receipt.success) "update bypassed descriptor inspection"
+    ) [0; 1; 2];
+    let code_b64 = Base64.encode_exn (read_module ~inspect_stage:3 manifest response) in
+    let circle_id = "octINSPECT_UNUSED" in
+    save_circle ~runtime:Circles.Wasm_v1 store circle_id owner code_b64;
+    require (Result.is_ok (Lwt_main.run (Host.describe ~inspect_mode:Rule.Active code_b64)))
+      "unused session import rejected";
+    let strict = Lwt_main.run (Circle_program.load ~inspect_mode:Rule.Active store circle_id) in
+    require (Result.is_ok strict) "strict descriptor control rejected";
+    let prior = Lwt_main.run (Circle_program.load store circle_id) in
+    require (Result.is_ok prior) "prior descriptor control rejected";
+    require ((Result.get_ok strict).code != (Result.get_ok prior).code)
+      "prior reused strict descriptor identity";
+    let repeated = Lwt_main.run (Circle_program.load ~inspect_mode:Rule.Active store circle_id) in
+    require (Result.is_ok repeated && (Result.get_ok strict).code == (Result.get_ok repeated).code)
+      "strict descriptor cache lost its identity";
+    let ctx = {Vm.Contract_vm.default_ctx with proof_exec = Rule.Prior} in
+    let view = Lwt_main.run (Circle_exec.execute_view_call_direct
+      ~ctx ~inspect_mode:Rule.Active store circle_id "query" [] owner) in
+    require view.success "strict query control rejected");
+  let prior = Circle_exec.preview_cache_key ~scope:"scope" ~trusted:[] ~math:false "circle" "caller" "1" in
+  let strict = Circle_exec.preview_cache_key ~inspect_mode:Rule.Active
+    ~scope:"scope" ~trusted:[] ~math:false "circle" "caller" "1" in
+  require (prior <> strict) "preview cache crossed inspection policy"
+
+let test_inspect_tx () =
+  let module Epoch = Octra_core.Epoch_exec in
+  let module Rule = Octra_core.Rule_graph in
+  with_store (fun store ->
+    let owner = "octINSPECT_TX_OWNER" in
+    let ledger = Octra_core.Ledger.create store in
+    require (Octra_core.Ledger.add_account ledger owner (Z.of_int 1_000) = Ok ())
+      "inspection account creation failed";
+    let backend = Epoch.make_live_backend store ledger in
+    Lwt_main.run (backend.begin_batch Rule.Prior);
+    let tx target op_type message = Octra_core.Transaction.{
+      from = owner; to_ = target; amount = Z.zero; nonce = 1;
+      ou = Z.of_int 10; timestamp = 0.; signature = ""; public_key = None;
+      message = Some (Yojson.Safe.to_string message); op_type; encrypted_data = None;
+    } in
+    let payload code = Circles.{
+      runtime = Wasm_v1; privacy_class = Public; browser_mode = Native_sealed;
+      resource_mode = Public_resources; code_b64 = Some code;
+      policy_hash = None; members_root = None; export_policy = None;
+      limits = default_limits;
+    } in
+    let intact () =
+      let account = Option.get (Octra_core.Ledger.find_opt ledger owner) in
+      require (Z.equal account.balance (Z.of_int 1_000) && account.nonce = 0)
+        "refused inspection consumed funds or nonce" in
+    let refused = function
+      | Error ("circle_runtime_invalid", _) -> ()
+      | Error (_, reason) -> fail reason
+      | Ok _ -> fail "transaction accepted session inspection" in
+    let good = Base64.encode_exn (read_module "{\"methods\":[]}" "OCWS1\000\000\000\000\000") in
+    let circle_id = "octINSPECT_UPDATE" in
+    save_circle ~runtime:Circles.Wasm_v1 store circle_id owner good;
+    List.iter (fun stage ->
+      let code = Base64.encode_exn (read_module ~inspect_stage:stage
+        "{\"methods\":[]}" "OCWS1\000\000\000\000\000") in
+      let data = payload code in
+      let target = Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 data in
+      let deploy = tx target Octra_core.Transaction.CircleDeploy
+        (Circles.yojson_of_deploy_payload data) in
+      refused (Lwt_main.run (Epoch.process_circle_operation_tx
+        ~inspect_mode:Rule.Active ~backend ~current_epoch:0 deploy));
+      require (not (Lwt_main.run (Store.circle_exists store target)))
+        "refused inspection created circle";
+      intact ();
+      let update = tx circle_id Octra_core.Transaction.CircleProgramUpdate
+        (Circles.yojson_of_program_update_payload {Circles.code_b64 = code}) in
+      refused (Lwt_main.run (Epoch.process_circle_operation_tx
+        ~inspect_mode:Rule.Active ~backend ~current_epoch:0 update));
+      intact ();
+      require (Lwt_main.run (Store.get_circle_program_code_b64 store circle_id) = Some good)
+        "refused inspection changed circle code"
+    ) [0; 1; 2];
+    let data = payload good in
+    let target = Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 data in
+    let deploy = tx target Octra_core.Transaction.CircleDeploy
+      (Circles.yojson_of_deploy_payload data) in
+    require (Result.is_ok (Lwt_main.run (Epoch.process_circle_operation_tx
+      ~inspect_mode:Rule.Active ~backend ~current_epoch:0 deploy)))
+      "strict deploy control rejected";
+    Lwt_main.run (backend.commit_batch ()))
+
+let test_inspect_epoch () =
+  let module Epoch = Octra_core.Epoch_exec in
+  let module Rule = Octra_core.Rule_graph in
+  let module Tx = Octra_core.Transaction in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (Rule.vm_bytes_activation_for_chain chain_id) in
+  let rules = Rule.create ~chain_id ~root_at:(fun epoch ->
+    match Rule.root_after_floor ~chain_id ~floor_epoch:plan.activation_epoch ~epoch with
+    | Some root -> Rule.Root root
+    | None -> Rule.Missing) in
+  List.iter (fun (epoch, mode) ->
+    List.iter (fun route ->
+      List.iter (fun operation ->
+      List.iter (fun session -> with_store (fun store ->
+        let update = operation = 1 in
+        let call = operation = 2 in
+        let owner = "oct11111111111111111111111111111111111111111111" in
+        let ledger = Octra_core.Ledger.create store in
+        require (Octra_core.Ledger.add_account ledger owner (Z.of_int 1000) = Ok ())
+          "inspection balance failed";
+        let scheduled = if epoch < plan.activation_epoch then Rule.Prior else Rule.Active in
+        require (Rule.vm_bytes rules ~epoch = Ok scheduled)
+          "inspection schedule differs";
+        let policy = match Octra_node_runtime.Set_rule.policy rules epoch with
+          | Ok value -> value
+          | Error reason -> fail ("set byte policy: " ^ reason) in
+        require (policy.vm_bytes = scheduled) "set policy byte schedule differs";
+        let fold epoch = Epoch.prior_fold epoch |> Result.map (fun value ->
+          {value with Epoch.vm_bytes = mode;
+            proof_exec = if call then Rule.Active else value.Epoch.proof_exec}) in
+        let backend = Epoch.make_live_backend ~fold store ledger in
+        Lwt_main.run (backend.begin_batch Rule.Prior);
+        let code = Base64.encode_exn (read_module
+          ?inspect_stage:(if session then Some 0 else None)
+          "{\"methods\":[{\"name\":\"update\",\"view\":false}]}"
+          "OCWS1\003\000\000\000\0017") in
+        let data = Circles.{runtime = Wasm_v1; privacy_class = Public;
+          browser_mode = Native_sealed; resource_mode = Public_resources;
+          code_b64 = Some code; policy_hash = None; members_root = None;
+          export_policy = None; limits = default_limits} in
+        let target = Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 data in
+        let initial = Base64.encode_exn (read_module
+          "{\"methods\":[]}" "OCWS1\000\000\000\000\000") in
+        if update then save_circle ~runtime:Circles.Wasm_v1 store target owner initial;
+        if call then save_circle ~runtime:Circles.Wasm_v1 store target owner code;
+        let op_type, message = if call then Tx.CircleCall, `List [] else if update then
+          Tx.CircleProgramUpdate,
+          Circles.yojson_of_program_update_payload {Circles.code_b64 = code}
+        else Tx.CircleDeploy, Circles.yojson_of_deploy_payload data in
+        let transaction = Tx.{from = owner; to_ = target; amount = Z.zero;
+          nonce = 1; ou = Z.of_int 10; timestamp = 0.; signature = "";
+          public_key = None; encrypted_data = if call then Some "update" else None; op_type;
+          message = Some (Yojson.Safe.to_string message)} in
+        let env = Epoch.{chain_id; epoch_id = epoch; proposer_addr = owner;
+          validator_addrs = []; validator_pubkeys = []; prev_state_root = "";
+          epoch_ts = 0.; ready_state_root_at = None; ready_max_lag = -1} in
+        let result = if route = 1 then
+          Lwt_main.run (Epoch.process_standard_tx_with_wasm_profile
+            ~wasm_profile:Octra_core.Circle_wasm_host.Manifest ~backend ~env transaction)
+          |> Result.map (fun _ -> ())
+        else if route = 0 then
+          Lwt_main.run (Octra_node_runtime.Consensus_vm_transition.process_tx
+            ~circle_mode:Rule.Prior ~wasm_compute_mode:Rule.Active
+            ~program_trust:Vm.Program_trust.empty ~object_cost:false
+            ~backend ~env transaction) |> fun result ->
+          Result.bind result (function
+            | Epoch.Confirmed _ -> Ok ()
+            | Epoch.Rejected_after_fee result -> Error (result.error_type, result.reason))
+        else
+          let module Sender = Octra_node_runtime.Consensus_epoch_apply_sender_live in
+          let path = Printf.sprintf "runtime_data/circle_program_%d/chain" (Unix.getpid ()) in
+          let chaindata = Octra_core.Store_chaindata.open_chaindata path in
+          let accepted = ref false in
+          let refused = ref ("sender", "rejected") in
+          Octra_core.Store_chaindata.begin_batch chaindata;
+          Fun.protect ~finally:(fun () ->
+            Octra_core.Store_chaindata.abort_batch chaindata;
+            Octra_core.Store_chaindata.close chaindata)
+            (fun () ->
+              Lwt_main.run (Sender.run Sender.{
+                ledger; store; chaindata; program_trust = Vm.Program_trust.empty;
+                object_cost = false; cipher_mode = Octra_core.Rule_graph.Prior;
+                wallet_addr = owner; pre_state_hash = ""; fold;
+                standard_env = (fun () -> env); current_epoch = (fun () -> epoch);
+                max_fhe_per_epoch = 10; max_stealth_per_epoch = 10; max_stealth_defer = 1;
+                stealth_inline_verify_allowed = false; fhe_in_epoch_counter = ref 0;
+                stealth_in_epoch_counter = ref 0; stealth_defer_count = Hashtbl.create 1;
+                deferred_stealth_txs = ref []; confirmed_fees = ref Z.zero;
+                short_addr = Fun.id; log_rejected = (fun _ kind reason -> refused := kind, reason);
+                confirm_tx = (fun _ -> accepted := true);
+                notify_new_account = (fun _ -> ()); notify_confirmed = (fun _ _ -> ());
+                notify_rejected = (fun _ _ -> ());
+                legacy_replay = (fun ~epoch:_ ~address:_ ~cipher:_ ->
+                  fail "unexpected private replay");
+                private_field_policy = Octra_core.Private_ledger.Unique_fields;
+                private_result_policy = (fun _ -> Octra_core.Private_result_policy.Recoverable);
+              } [transaction]);
+              if !accepted then Ok () else Error !refused) in
+        require (Result.is_ok result = (not session || mode = Rule.Prior))
+          (Printf.sprintf "inspection epoch = %d route = %d operation = %d session = %b result = %s"
+            epoch route operation session
+            (match result with Ok () -> "accepted" | Error (kind, reason) -> kind ^ ": " ^ reason));
+        require (Lwt_main.run (Store.circle_exists store target)
+          = (update || call || Result.is_ok result))
+          "consensus inspection state differs";
+        if update then require
+          (Lwt_main.run (Store.get_circle_program_code_b64 store target)
+            = Some (if Result.is_ok result then code else initial))
+          "consensus inspection changed refused code";
+        Store.abort_epoch_batch store)) [false; true])
+        (if route = 1 then [0; 1] else [0; 1; 2])) [0; 1; 2])
+    (List.concat_map (fun epoch -> [epoch, Rule.Prior; epoch, Rule.Active])
+      [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1])
+
+let test_tx_code_reads () =
+  let module Epoch = Octra_core.Epoch_exec in
+  let module Tx = Octra_core.Transaction in
+  let module Read = Octra_node_runtime.Circle_read_rpc in
+  let module Auth = Octra_node_runtime.Circle_auth in
+  let module View = Octra_node_runtime.Tx_view in
+  let secret = Result.get_ok (Mirage_crypto_ec.Ed25519.priv_of_octets
+    (String.make 32 '\047')) in
+  let private_key = Base64.encode_exn (Mirage_crypto_ec.Ed25519.priv_to_octets secret) in
+  let public_key = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets
+    (Mirage_crypto_ec.Ed25519.pub_of_priv secret)) in
+  let owner = Octra_core.Crypto.Address.address_from_pubkey public_key in
+  with_store (fun store ->
+    let ledger = Octra_core.Ledger.create store in
+    require (Octra_core.Ledger.add_account ledger owner (Z.of_int 1_000) = Ok ())
+      "private code account creation failed";
+    let backend = Epoch.make_live_backend store ledger in
+    let code = Base64.encode_exn (read_module "{\"methods\":[]}"
+      "OCWS1\000\000\000\000\000") in
+    List.iteri (fun index privacy_class ->
+      let nonce = index * 2 + 1 in
+      let data = Circles.{runtime = Wasm_v1; privacy_class; browser_mode = Native_sealed;
+        resource_mode = Public_resources; code_b64 = Some code; policy_hash = None;
+        members_root = None; export_policy = None; limits = default_limits} in
+      let circle_id = Circles.circle_id_of_deploy ~deployer:owner ~nonce data in
+      let message = Yojson.Safe.to_string (Circles.yojson_of_deploy_payload data) in
+      let tx = Tx.sign_with_privkey Tx.{from = owner; to_ = circle_id; amount = Z.zero;
+        nonce; ou = Z.of_int 10; timestamp = 0.; signature = "";
+        public_key = Some public_key; message = Some message; op_type = CircleDeploy;
+        encrypted_data = None} private_key in
+      require (Tx.verify tx public_key) "private deploy signature failed";
+      Lwt_main.run (backend.begin_batch Octra_core.Rule_graph.Prior);
+      Lwt_main.run (Store.set_meta store "last_epoch" "0");
+      require (Result.is_ok (Lwt_main.run (Epoch.process_circle_operation_tx
+        ~inspect_mode:Octra_core.Rule_graph.Active ~backend ~current_epoch:0 tx)))
+        "private code deployment failed";
+      Lwt_main.run (backend.commit_batch ());
+      let public = Lwt_main.run (Read.program_params store (`List [`String circle_id])) in
+      require (Result.is_ok public = (privacy_class = Circles.Public))
+        "private code public read policy changed";
+      let signature = Auth.message ~op:"octra_circle_program" ~circle_id ~addr:owner ~subject:""
+        |> Mirage_crypto_ec.Ed25519.sign ~key:secret |> Base64.encode_exn in
+      let params = `List [`String circle_id; `String owner; `String public_key; `String signature] in
+      let signed = Result.get_ok (Lwt_main.run (Read.program_auth_params store params)) in
+      require (Yojson.Safe.Util.member "code_b64" signed = `String code)
+        "private code owner read changed";
+      let raw = Tx.to_yojson tx |> Yojson.Safe.to_string in
+      let response = Result.get_ok (View.transaction_lookup_response
+        ~decode_message:Octra_node_runtime.Text.decode_message_if_hex ~hash:(Tx.hash tx)
+        (View.Lookup_confirmed (1, raw))) in
+      let expected = if privacy_class = Circles.Public then `String message else `Null in
+      require (Yojson.Safe.Util.member "message" response = expected)
+        "private deploy transaction exposed code";
+      require (Tx.to_yojson tx |> Yojson.Safe.to_string = raw)
+        "private transaction bytes changed";
+      let update = Tx.sign_with_privkey {tx with nonce = nonce + 1;
+        op_type = Tx.CircleProgramUpdate;
+        message = Some (Yojson.Safe.to_string
+          (Circles.yojson_of_program_update_payload {Circles.code_b64 = code}))}
+        private_key in
+      Lwt_main.run (backend.begin_batch Octra_core.Rule_graph.Prior);
+      require (Result.is_ok (Lwt_main.run (Epoch.process_circle_operation_tx
+        ~inspect_mode:Octra_core.Rule_graph.Active ~backend ~current_epoch:0 update)))
+        "private code update failed";
+      Lwt_main.run (backend.commit_batch ());
+      let fields = View.tx_fields ~decode_message:Octra_node_runtime.Text.decode_message_if_hex update in
+      require (List.assoc "message" fields = `Null) "private code update exposed bytes";
+      let signed = Result.get_ok (Lwt_main.run (Read.program_auth_params store params)) in
+      require (Yojson.Safe.Util.member "code_b64" signed = `String code)
+        "private code update lost owner read";
+      let wrong = `List [`String circle_id; `String owner; `String public_key; `String "invalid"] in
+      require (Result.is_error (Lwt_main.run (Read.program_auth_params store wrong)))
+        "private code accepted wrong signature")
+      [Circles.Public; Circles.Scoped; Circles.Sealed; Circles.Circle])
+
+let test_inspect_rpc () =
+  let module Read = Octra_node_runtime.Circle_read_rpc in
+  let module Auth = Octra_node_runtime.Circle_auth in
+  let module Rule = Octra_core.Rule_graph in
+  let secret = Result.get_ok (Mirage_crypto_ec.Ed25519.priv_of_octets
+    (String.make 32 '\043')) in
+  let public_key = Base64.encode_exn (Mirage_crypto_ec.Ed25519.pub_to_octets
+    (Mirage_crypto_ec.Ed25519.pub_of_priv secret)) in
+  let owner = Octra_core.Crypto.Address.address_from_pubkey public_key in
+  let view action params store =
+    let running, stop = Vm.Contract_rpc.view_clock () in
+    action store params ~view_ctx:Vm.Contract_vm.default_ctx ~running ~stop in
+  let routes = Read.dispatch Read.{
+    store_read = (fun action params store -> action store params);
+    program_read = (fun action params store ->
+      action ~profile:(fun ~epoch -> Ok Vm.Contract_rpc.{
+        epoch; point_ops = false; math = false; object_cost = false;
+        int_work = Vm.Int_work.Prior; fhe_work = Rule.Prior;
+        proof_exec = Rule.Prior; wasm_float = Rule.Prior;
+      }) store params);
+    epoch_read = (fun action params store -> action store params ~current_epoch:0);
+    public_asset_read = (fun action params store ->
+      action store params ~current_epoch:0 ~reveal_sensitive_fields:false);
+    circle_view = view (Read.view_call_public_params ?snapshot:None ~trusted:[]);
+    circle_view_auth = view (Read.view_call_auth ?snapshot:None ~trusted:[]);
+  } in
+  with_store (fun store ->
+    let circle_id = "octINSPECT_RPC" in
+    Lwt_main.run (Octra_core.Store_irmin.set_meta store "last_epoch" "0");
+    let sign op subject =
+      let message = Auth.message ~op ~circle_id ~addr:owner ~subject in
+      let signature = Base64.encode_exn
+        (Mirage_crypto_ec.Ed25519.sign ~key:secret message) in
+      [`String owner; `String public_key; `String signature] in
+    let info = [`String circle_id] in
+    let info_auth = info @ sign "octra_circle_program_info" "" in
+    let query = [ `String circle_id; `String "query"; `List [] ] in
+    let query_auth storage = query @ sign "octra_circle_view"
+      (Auth.view_subject ~method_name:"query" ~call_params:[] ~include_storage:storage)
+      @ [`Bool storage] in
+    let calls = [
+      "circle_program_info", info;
+      "octra_circleProgramInfo", info;
+      "circle_program_info_auth", info_auth;
+      "octra_circleProgramInfoAuth", info_auth;
+      "circle_view", query;
+      "octra_circleView", query;
+      "circle_view_auth", query_auth false;
+      "octra_circleViewAuth", query_auth true;
+    ] in
+    let run (name, params) =
+      Lwt_main.run ((List.assoc name routes) (`List params) store) in
+    let save ?inspect_stage ?(execution = "standard") () =
+      let manifest = Yojson.Safe.to_string (`Assoc ["methods",
+        `List [method_info "query" true execution]]) in
+      let raw = read_module ?inspect_stage ~compute:(execution = "compute") manifest
+        "OCWS1\000\000\000\000\000" in
+      save_circle ~runtime:Circles.Wasm_v1 store circle_id owner (Base64.encode_exn raw) in
+    List.iter (fun stage ->
+      save ~inspect_stage:stage ();
+      require (Result.is_ok (Lwt_main.run (Circle_program.load store circle_id)))
+        "RPC prior cache control rejected";
+      List.iter (fun ((name, _) as call) ->
+        match run call with
+        | Error error ->
+          let reason = "nonpersistent wasm import during inspection: host_session_put" in
+          require (error.Octra_core.Rpc.message = reason
+            || error.message = "invalid circle wasm: " ^ reason)
+            ("RPC inspection refusal route = " ^ name ^ " error = " ^ error.message)
+        | Ok _ -> fail "RPC inspection accepted session effect") calls
+    ) [0; 1; 2];
+    List.iter (fun stage ->
+      save ~inspect_stage:stage ();
+      List.iter (fun call ->
+        require (Result.is_ok (run call)) "RPC query control rejected") calls)
+      [3; 4];
+    save ~inspect_stage:4 ~execution:"compute" ();
+    require (Result.is_ok (run ("circle_program_info", info)))
+      "RPC compute descriptor control rejected";
+    List.iter (fun call ->
+      match run call with
+      | Error error ->
+        require (error.Octra_core.Rpc.message = "circle compute method requires compute executor")
+          "RPC compute refusal class changed"
+      | Ok _ -> fail "RPC enabled compute method")
+      ["circle_view", query; "circle_view_auth", query_auth false];
+    let compute = Lwt_main.run (Circle_exec.execute_compute_view_call
+      ~inspect_mode:Rule.Active ~ctx:{Vm.Contract_vm.default_ctx with math = true}
+      store circle_id "query" [] owner) in
+    require compute.success ("strict compute executor error = "
+      ^ Option.value ~default:"none" compute.error);
+    save ~inspect_stage:4 ();
+    let storage = Hashtbl.create 1 in
+    Hashtbl.add storage "value" "visible";
+    ignore (Lwt_main.run (Store.save_circle_stable_storage store circle_id storage));
+    let public_view = Result.get_ok (run ("circle_view", query)) in
+    require (Yojson.Safe.Util.member "storage" public_view = `Null)
+      "public RPC view exposed storage";
+    let owner_view = Result.get_ok (run ("circle_view_auth", query_auth true)) in
+    require (Yojson.Safe.Util.member "storage" owner_view =
+      `Assoc ["value", `String "visible"]) "owner RPC storage response differs";
+    let altered = query @ sign "octra_circle_view"
+      (Auth.view_subject ~method_name:"query" ~call_params:[] ~include_storage:false)
+      @ [`Bool true] in
+    begin match run ("circle_view_auth", altered) with
+    | Error error ->
+      require (error.Octra_core.Rpc.message = "signature verification failed")
+        "RPC signed storage flag refusal differs"
+    | Ok _ -> fail "RPC accepted altered storage flag"
+    end;
+    let info = Option.get (Lwt_main.run (Store.get_circle_info store circle_id)) in
+    Lwt_main.run (Store.deploy_circle store {info with privacy_class = Circles.Scoped});
+    List.iter (fun call ->
+      require (Result.is_error (run call)) "private RPC read lost authorization")
+      ["circle_program_info", [`String circle_id]; "circle_view", query];
+    List.iter (fun call ->
+      require (Result.is_ok (run call)) "private RPC owner control rejected")
+      ["circle_program_info_auth", info_auth; "circle_view_auth", query_auth true];
+    let other_key = Result.get_ok (Mirage_crypto_ec.Ed25519.priv_of_octets
+      (String.make 32 '\044')) in
+    let other = Mirage_crypto_ec.Ed25519.pub_of_priv other_key
+      |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn
+      |> Octra_core.Crypto.Address.address_from_pubkey in
+    Lwt_main.run (Store.deploy_circle store {info with
+      privacy_class = Circles.Scoped; owner = other});
+    List.iter (fun call ->
+      require (Result.is_error (run call)) "foreign RPC reader accepted")
+      ["circle_program_info_auth", info_auth; "circle_view_auth", query_auth true];
+    require (Result.is_error (run ("circle_program_info_auth", [`String circle_id])))
+      "RPC inspection bypassed signature check")
+
+let test_preview_code () =
+  let module Rule = Octra_core.Rule_graph in
+  with_store (fun store ->
+    let owner = "octPREVIEW_OWNER" in
+    let circle_id = "octPREVIEW_CODE" in
+    let manifest = "{\"methods\":[]}" in
+    let code ?inspect_stage value = Base64.encode_exn
+      (read_module ?inspect_stage manifest ("OCWS1\004\000\000\000\001" ^ value)) in
+    let save code_b64 = save_circle ~runtime:Circles.Wasm_v1 store circle_id owner code_b64 in
+    let read () = Lwt_main.run (Circle_exec.execute_view_call
+      ~running:(fun () -> true) ~inspect_mode:Rule.Active
+      store circle_id "complete_preview" [`String "1"; `Int 1] owner) in
+    save (code "2");
+    let first = read () in
+    require (first.success && first.return_value = Some (Vm.Contract_vm.VString "2"))
+      "preview code control failed";
+    let cached = read () in
+    require (cached.success && cached.effort_used = 0) "preview code control not cached";
+    save (code "3");
+    let replaced = read () in
+    require (replaced.success && replaced.return_value = Some (Vm.Contract_vm.VString "3")
+      && replaced.effort_used > 0) "preview reused replaced code";
+    save (code ~inspect_stage:2 "4");
+    let refused = read () in
+    require (not refused.success && Option.is_some refused.error)
+      "preview cache bypassed replacement inspection")
+
+let test_preview_root () =
+  let module Rule = Octra_core.Rule_graph in
+  let module Policy = Octra_core.Circle_hfhe_policy in
+  let module Public = Octra_core.Circle_wasm_public_read in
+  with_store (fun store ->
+    let owner = (key (String.make 32 '\047')).Vm.Program_attestation.public_key
+      |> Base64.encode_exn |> Octra_core.Crypto.Address.address_from_pubkey in
+    let circle_id = owner in
+    let path, path_key = Result.get_ok (Circles.path_key_of_raw_path "/value") in
+    let declaration = `Assoc ["circle_id", `String circle_id; "path", `String path;
+      "offset", `Int 0; "max_bytes", `Int 1] in
+    let manifest = Yojson.Safe.to_string (`Assoc ["methods", `List [
+      `Assoc ["name", `String "complete_preview"; "view", `Bool true;
+        "public_reads", `List [declaration]]]]) in
+    let put epoch value access =
+      Lwt_main.run (Store.begin_epoch_batch store);
+      Lwt_main.run (Store.set_meta store "last_epoch" (string_of_int epoch));
+      let code = read_module manifest
+        ("OCWS1\004\000\000\000\001" ^ value) in
+      save_circle ~runtime:Circles.Wasm_v1 store circle_id owner (Base64.encode_exn code);
+      let cells = Hashtbl.create 2 in
+      Hashtbl.add cells "value" value;
+      Hashtbl.add cells Policy.cipher_arithmetic_mode_key access;
+      Hashtbl.add cells Policy.require_live_key_policy_key "false";
+      Hashtbl.add cells (Circles.slot_policy_revoked_key path_key)
+        (string_of_bool (epoch = 90));
+      ignore (Lwt_main.run (Store.save_circle_stable_storage store circle_id cells));
+      let meta = Circles.{path_key; canonical_path = path; content_type = "text/plain";
+        encoding = "identity"; size_bytes = 1L; blob_hash = asset_blob_hash value;
+        body_mode = Public_resources; plaintext_hash = None; key_id = None;
+        padding_class = None; resource_key = path_key; locator_mode = Path_locator;
+        slot_ref = None; activate_after_epoch = None; expire_after_epoch = None;
+        metadata_mode = Metadata_reveal} in
+      Lwt_main.run (Store.save_circle_asset_meta store circle_id meta);
+      Lwt_main.run (Store.save_circle_asset_body_b64 store circle_id path_key
+        (Base64.encode_exn (if epoch = 90 then "invalid" else value))) in
+    put 50 "2" "deny";
+    Lwt_main.run (Store.commit_epoch_batch store "preview seed");
+    let first = Lwt_main.run (Store.capture_read_snapshot store) |> Result.get_ok in
+    put 70 "3" "owner_only";
+    Lwt_main.run (Store.commit_epoch_batch store "preview next");
+    let second = Lwt_main.run (Store.capture_read_snapshot store) |> Result.get_ok in
+    put 90 "4" "deny";
+    let ctx (snapshot : Store.read_snapshot) = {Vm.Contract_vm.default_ctx with
+      tree_hash = snapshot.Store.state_root;
+      current_epoch = Int64.to_int snapshot.epoch_id + 1} in
+    let read snapshot = Lwt_main.run (Circle_exec.execute_view_call ~snapshot
+      ~running:(fun () -> true) ~inspect_mode:Rule.Active ~ctx:(ctx snapshot)
+      store circle_id "complete_preview" [`String "1"; `Int 1] owner) in
+    let check snapshot value =
+      let result = read snapshot in
+      require (result.success && result.return_value = Some (Vm.Contract_vm.VString value))
+        ("preview read another root error = " ^ Option.value ~default:"none" result.error) in
+    check first "2";
+    let cached = read first in
+    require (cached.success && cached.effort_used = 0) "fixed preview was not cached";
+    check second "3";
+    check first "2";
+    let declarations = Public.declarations_of_manifest
+      (Some (Yojson.Safe.from_string manifest)) |> Result.get_ok in
+    List.iter (fun (snapshot, value) ->
+      let bundle = Lwt_main.run (Public.load ~snapshot store
+        (Int64.succ snapshot.Store.epoch_id) declarations) |> Result.get_ok in
+      match bundle.snapshots with
+      | [read] ->
+        require (read.body = value && read.snapshot_root = Circles.h256_hex
+          "circle_public_read_snapshot_v1" [snapshot.state_root])
+          "public read used another root"
+      | _ -> fail "public read set differs") [first, "2"; second, "3"];
+    List.iter (fun (snapshot, access) ->
+      let runtime = Lwt_main.run (Circle_exec.load_runtime_hfhe_ctx ~snapshot
+        (ctx snapshot) store circle_id owner) |> Result.get_ok in
+      require (runtime.exec_ctx.allow_fhe_capability Vm.Contract_vm.Fhe_cipher_arithmetic_cap = access)
+        "preview FHE policy used another root") [first, false; second, true];
+    require (Lwt_main.run (Store.read_circle_stable_inline_value store circle_id "value") = Some "4")
+      "preview changed pending storage";
+    require (Result.is_error (Lwt_main.run (Public.load store 91L declarations)))
+      "pending asset refusal control failed";
+    Store.abort_epoch_batch store)
 
 let test_wasm_inputs () =
   let module Host = Octra_core.Circle_wasm_host in
@@ -548,7 +1167,7 @@ let test_wasm_inputs () =
       Host.clear_storage_payload_cache () in
     let callback _ = failwith "input check invoked callback" in
     let execute ?(hfhe_mode = Transcript.Direct) mode call caller =
-      Lwt_main.run (Host.execute ~proof_mode:mode ~call ~code_b64
+      Lwt_main.run (Host.execute ~inspect_mode:Rule.Prior ~proof_mode:mode ~call ~code_b64
         ~export_name:"octra_update" ~request_bytes ~storage_tbl ~storage_cache_key
         ~caller ~address:"input" ~tx_hash:"input"
         ~current_epoch:(if mode = Rule.Prior then 1_662_999 else 1_663_000)
@@ -605,7 +1224,11 @@ let test_wasm_inputs () =
     ignore (success (execute Rule.Active call "seed"));
     check "warm transport" 1 (execute Rule.Active call prior_caller);
     reset ();
-    check "cold transport" 1 (execute Rule.Active call prior_caller);
+    let before = Gc.allocated_bytes () in
+    let result = execute Rule.Active call prior_caller in
+    let allocated = Gc.allocated_bytes () -. before in
+    check "cold transport" 1 result;
+    require (allocated < 4_194_304.) "input size check allocated encoded JSON";
     List.iter (fun hfhe_mode -> List.iter (fun delta ->
       reset ();
       ignore (success (execute ~hfhe_mode Rule.Active call "seed"));
@@ -801,6 +1424,17 @@ let test_cache_program_identity () =
 
 let () =
   if Array.exists (String.equal "--wasm-inputs") Sys.argv then test_wasm_inputs ()
+  else if Array.exists (String.equal "--events") Sys.argv then test_wasm_events ()
+  else if Array.exists (String.equal "--inspect") Sys.argv then begin
+    test_wasm_inspect ();
+    test_inspect_tx ();
+    test_inspect_epoch ();
+    test_tx_code_reads ();
+    test_inspect_rpc ();
+    test_preview_code ();
+    test_preview_root ();
+    test_preview_trust ()
+  end
   else begin
   test_inputs ();
   test_view_stop ();
@@ -808,9 +1442,17 @@ let () =
   test_async_policy ();
   test_wasm_keys ();
   test_wasm_effort ();
+  test_wasm_events ();
   test_preview_trust ();
   test_compute_manifest ();
   test_cache_program_identity ();
+  test_wasm_inspect ();
+  test_inspect_tx ();
+  test_inspect_epoch ();
+  test_tx_code_reads ();
+  test_inspect_rpc ();
+  test_preview_code ();
+  test_preview_root ();
   test_wasm_inputs ();
   Printf.printf "status = pass test = circle_program strict_inputs = true\n%!"
   end

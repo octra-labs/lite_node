@@ -164,10 +164,10 @@ let test_partition () =
     let reason = verdict mode left in
     let other = verdict mode right in
     let error_type = "validator_ready_rejected" in
-    let rejections = [O.{position = 0; tx; error_type; reason}] in
+    let rejections = [O.{position = 0; tx; error_type; reason; charged = false}] in
     let artifacts = X.{
       confirmed = [];
-      rejected = [{tx; error_type; reason = other}];
+      rejected = [{tx; error_type; reason = other; charged = false}];
       confirmed_fees = Z.zero;
       tx_count = 0;
     } in

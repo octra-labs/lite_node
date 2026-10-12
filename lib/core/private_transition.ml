@@ -19,6 +19,7 @@ type t = {
   ledger : Ledger.t;
   epoch_id : int;
   owner_migration_mode : Rule_graph.mode;
+  cipher_mode : Rule_graph.mode;
   proof_mode : Rule_graph.mode;
   math : bool;
   field_policy : P.field_policy;
@@ -41,6 +42,7 @@ let create
     ~ledger
     ~epoch_id
     ~owner_migration_mode
+    ~cipher_mode
     ~proof_mode
     ~math
     ~field_policy
@@ -50,6 +52,7 @@ let create
     ledger;
     epoch_id;
     owner_migration_mode;
+    cipher_mode;
     proof_mode;
     math;
     field_policy;
@@ -338,7 +341,7 @@ let verify_key t tx replay =
     | None -> Lwt.return_none
     | Some artifact ->
       let* binding =
-        P.bind_key_switch_artifact ~math:t.math
+        P.bind_key_switch_artifact ~math:t.math ~cipher_mode:t.cipher_mode
           ~field_policy:t.field_policy
           ~strict:true
           t.ledger
@@ -353,7 +356,7 @@ let verify_key t tx replay =
   match plan with
   | Some plan -> Lwt.return_ok plan
   | None ->
-    P.key_switch_plan ~math:t.math
+    P.key_switch_plan ~math:t.math ~cipher_mode:t.cipher_mode
       ~field_policy:t.field_policy
       ~strict:(t.proof_mode = Rule_graph.Active)
       ?legacy_public_replay:replay
@@ -376,9 +379,15 @@ let key_switch t tx =
        "historical owner migration is not active at this epoch")
   | _, _, Error e, _
   | _, _, _, Error e -> Lwt.return_error e
+  | _, _, Ok (), Ok ()
+    when P.key_switch_requests_cipher_proof ~field_policy:t.field_policy tx
+      && (t.cipher_mode <> Rule_graph.Active || t.proof_mode <> Rule_graph.Active) ->
+    Lwt.return_error
+      ("key_switch_rejected", "unknown key_switch migration_mode = cipher_proof")
   | _, _, Ok (), Ok () ->
     let replay =
-      if P.key_switch_requests_legacy_audit ~field_policy:t.field_policy tx then
+      if P.key_switch_requests_legacy_audit ~cipher_mode:t.cipher_mode
+          ~field_policy:t.field_policy tx then
         let cipher =
           match Ledger.find_opt t.ledger tx.T.from with
           | Some account ->
@@ -402,7 +411,7 @@ let key_switch t tx =
           check
           ~verify:(fun () -> verify_key t tx replay)
           ~prepare:(fun () ->
-            P.prepare_key_switch_plan ~math:t.math
+            P.prepare_key_switch_plan ~math:t.math ~cipher_mode:t.cipher_mode
               ~field_policy:t.field_policy
               ~cap:(t.proof_mode = Rule_graph.Active)
               t.ledger

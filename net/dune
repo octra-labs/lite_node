@@ -1,3 +1,6 @@
 (library
  (name octra_net)
+ (foreign_stubs
+  (language c)
+  (names socket_stubs))
  (libraries digestif digestif.c lwt lwt.unix mirage-crypto-ec mirage-crypto-rng mirage-crypto-rng.unix cstruct mtime mtime.clock.os octra_log octra_crypto_guard))

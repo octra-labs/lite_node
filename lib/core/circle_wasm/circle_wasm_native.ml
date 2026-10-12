@@ -1,10 +1,25 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-external run_json_native : string -> int * string
+external run_json_native : bool -> string -> int * string
   = "caml_octra_circle_wasm_host_run_json"
 
+external hfhe_bridge : unit -> unit = "caml_octra_circle_hfhe_bridge"
+
+let () = Callback.register "octra_circle_wasm_host_hfhe_bridge" hfhe_bridge
+
 type session
+type lease
+type build
+
+external build_new : unit -> build = "caml_octra_compute_build_new"
+external build_begin : build -> string -> int = "caml_octra_compute_build_begin"
+external build_step : build -> string -> int * string = "caml_octra_compute_build_step"
+external build_close : build -> unit = "caml_octra_compute_build_close"
+
+external lease_new : unit -> lease = "caml_octra_compute_lease_new"
+external lease_hold : lease -> string -> int = "caml_octra_compute_lease_hold"
+external lease_close : lease -> unit = "caml_octra_compute_lease_close"
 
 external call_new : unit -> session = "caml_octra_circle_call_new"
 external call_step : session -> string -> int * string = "caml_octra_circle_call_step"
@@ -40,7 +55,7 @@ let run_call call body =
     call_close session;
     Lwt.return_unit)
 
-let run_json_classified input =
+let run_json_classified ?(optional = false) input =
   if String.length input > max_input_bytes then
     Error
       (Rejected
@@ -50,7 +65,7 @@ let run_json_classified input =
             max_input_bytes))
   else
     try
-      match run_json_native input with
+      match run_json_native optional input with
       | 0, output -> Ok output
       | 1, message -> Error (Rejected message)
       | _, message -> Error (Unavailable message)

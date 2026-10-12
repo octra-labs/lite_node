@@ -1,6 +1,8 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type format = Flat | Shared
+
 type write_report = {
   commit : string;
   root : string;
@@ -17,6 +19,7 @@ type restore_report = {
 }
 
 val write :
+  ?format:format ->
   Store_irmin.t ->
   commit:string ->
   path:string ->

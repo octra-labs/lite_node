@@ -10,6 +10,13 @@ type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
 let view_effort_limit =
   Z.to_int (Octra_core.Resource_lanes.default_budget Program).max_ou
+let view_circle_effort_limit =
+  Z.to_int (Octra_core.Resource_lanes.default_budget Circle_compute).max_ou
+let view_byte_limits =
+  Option.get (Byte_work.limits ~key_bytes:Bytecode.max_const_len
+    ~value_bytes:Contract_vm.max_storage_value_len ~copy_bytes:Bytecode.max_const_len
+    ~write_bytes:(Octra_core.Resource_lanes.default_budget Program).max_bytes
+    ~alloc_bytes:(8 * Bytecode.max_const_len) ~unit_bytes:32)
 let max_compile_source_bytes = 1_048_576
 let max_compile_total_bytes = 2_097_152
 let max_compile_files = 64
@@ -1231,6 +1238,7 @@ let make_view_ctx ?snapshot ?running ~trusted ~profile ~store ~ledger ~get_fhe_p
     get_fhe_pubkey;
     allow_fhe_capability;
     int_work = profile.int_work;
+    byte_work = Some (Byte_work.create view_byte_limits);
     fhe_work = profile.fhe_work;
     proof_exec = profile.proof_exec;
     wasm_float = profile.wasm_float;
@@ -1250,7 +1258,7 @@ let make_view_ctx ?snapshot ?running ~trusted ~profile ~store ~ledger ~get_fhe_p
           ?snapshot
           ?running
           ~trusted
-          ~ctx:{view_ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
+          ~ctx:{view_ctx with fhe_memory = scope.memory}
           ~depth:scope.depth
           ~limit:(Option.fold ~none:view_effort_limit ~some:(min view_effort_limit) scope.limit)
           store
@@ -1263,7 +1271,7 @@ let make_view_ctx ?snapshot ?running ~trusted ~profile ~store ~ledger ~get_fhe_p
     call_async = (fun caller target method_name args scope ->
       let params = List.map argument args in
       Contract.view_async ?snapshot ?running ~trusted
-        ~ctx:{view_ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
+        ~ctx:{view_ctx with fhe_memory = scope.memory}
         ~depth:scope.depth
         ~limit:(Option.fold ~none:view_effort_limit ~some:(min view_effort_limit) scope.limit)
         store target method_name params caller

@@ -9,6 +9,7 @@ type deps = {
   chaindata : Octra_core.Store_chaindata.t;
   program_trust : Octra_vm.Program_trust.t;
   object_cost : bool;
+  cipher_mode : Octra_core.Rule_graph.mode;
   wallet_addr : string;
   pre_state_hash : string;
   fold : int -> (Octra_core.Epoch_exec.fold_ctx, string) result;
@@ -49,6 +50,7 @@ val trace_enc_balance :
   unit
 
 val run :
+  ?compute:Octra_core.Compute_bill.verifier ->
   deps ->
   Transaction.t list ->
   unit Lwt.t

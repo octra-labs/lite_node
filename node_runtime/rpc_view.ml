@@ -9,6 +9,7 @@ module Pvac_migration = Octra_core.Pvac_migration
 module Pvac_legacy_public_replay = Octra_core.Pvac_legacy_public_replay
 module FheBalance = Octra_core.Crypto.FheBalance
 module Rule_graph = Octra_core.Rule_graph
+module Transaction = Octra_core.Transaction
 
 let opt_hex = function
   | None -> `Null
@@ -200,8 +201,52 @@ let epoch_proof proof =
     "epoch", light_epoch proof;
   ]
 
+let public_message ~decode_message op message =
+  match op with
+  | Transaction.CircleProgramUpdate -> `Null
+  | Transaction.CircleDeploy ->
+    let decoded = decode_message message in
+    let is_public =
+      try
+        match Octra_core.Json_tree.read decoded with
+        | `Assoc fields ->
+          List.filter_map
+            (fun (key, value) -> if key = "privacy_class" then Some value else None)
+            fields = [`String "public"]
+        | _ -> false
+      with Yojson.Json_error _ -> false
+    in
+    if is_public then `String decoded else `Null
+  | _ -> `String (decode_message message)
+
+let public_tx_data raw =
+  try
+    match Octra_core.Json_tree.read raw with
+    | `Assoc fields ->
+      let values key = List.filter_map
+        (fun (name, value) -> if name = key then Some value else None) fields in
+      let ops = values "op_type" in
+      let has_code = List.exists (function
+        | `String ("deploy_circle" | "circle_program_update") -> true
+        | _ -> false) ops in
+      if not has_code then `String raw
+      else
+        begin match ops, values "message" with
+        | [`String "deploy_circle"], [`String message] ->
+          begin match public_message ~decode_message:Text.decode_message_if_hex
+            Transaction.CircleDeploy message with
+          | `String _ -> `String raw
+          | _ -> `Null
+          end
+        | _ -> `Null
+        end
+    | _ -> `Null
+  with Yojson.Json_error _ -> `Null
+
 let tx_json_value raw =
-  try Yojson.Safe.from_string raw with _ -> `String raw
+  match public_tx_data raw with
+  | `String visible -> Octra_core.Json_tree.read visible
+  | _ -> `Null
 
 let tx_inclusion_proof proof ~tx_json =
   `Assoc [
@@ -471,14 +516,16 @@ let pvac_status ~addr (status : Pvac_registry.status) =
     "pubkey_format", opt_string status.pubkey_format;
   ]
 
-let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
-    (status : Pvac_migration.status) admissions =
-  let module Admission = Octra_core.Pvac_migration_admission in
-  let admission =
-    if Pvac_migration.needs_history_migration status then
+let pvac_migration_status ~addr ~cipher ~epoch ~math ~owner_migration_mode ~cipher_mode ~proof_mode
+    (status : Pvac_migration.status) records =
+  let module Records = Octra_core.Pvac_migration_admission in
+  let history = Pvac_migration.history_route
+    ~active:(cipher_mode = Rule_graph.Active && proof_mode = Rule_graph.Active) status in
+  let record =
+    if history then
       Some
-        (Admission.lookup
-           admissions
+        (Records.lookup
+           records
            ~epoch
            ~address:addr
            ~cipher)
@@ -486,7 +533,7 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
       None
   in
   let can_owner_proof_migrate =
-    match owner_migration_mode, status.cipher_class, status.key_class, admission with
+    match owner_migration_mode, status.cipher_class, status.key_class, record with
     | Rule_graph.Active, Pvac_migration.V3, Pvac_migration.Historical,
       Some (Ok entry)
       when
@@ -496,18 +543,27 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
       true
     | _ -> false
   in
+  let can_cipher_proof_migrate =
+    cipher_mode = Rule_graph.Active
+    && proof_mode = Rule_graph.Active
+    && status.cipher_class = Pvac_migration.V3
+    && status.key_class = Pvac_migration.Historical in
   let replay_json =
-    match admission with
+    match record with
     | None -> `Null
     | Some result ->
       match result with
       | Error error ->
-        let reason = Admission.lookup_message error in
+        let reason = match error with
+          | Records.Unavailable -> "migration records unavailable"
+          | Records.Not_active -> "migration records not active"
+          | Records.Not_found -> "migration record not found"
+          | Records.Cipher_mismatch -> "migration record ciphertext mismatch" in
         let state = match error with
-          | Admission.Unavailable -> "unavailable"
-          | Admission.Not_active -> "not_active"
-          | Admission.Not_found -> "not_found"
-          | Admission.Cipher_mismatch -> "cipher_mismatch" in
+          | Records.Unavailable -> "unavailable"
+          | Records.Not_active -> "not_active"
+          | Records.Not_found -> "not_found"
+          | Records.Cipher_mismatch -> "cipher_mismatch" in
         `Assoc [
           "total", `Int 0;
           "scanned", `Int 0;
@@ -547,6 +603,9 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
   in
   `Assoc [
     "address", `String addr;
+    "proof_math", `String (if math then "wide" else "prior");
+    "cipher_format", `String (Pvac_migration.format_name status.cipher_class);
+    "history_recovery", `Bool history;
     "cipher_class", `String (Pvac_migration.cipher_class_to_string status.cipher_class);
     "key_class", `String (Pvac_migration.key_class_to_string status.key_class);
     "target_key_class", `String "current";
@@ -554,6 +613,10 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
     "can_key_switch", `Bool (Pvac_migration.can_key_switch status);
     "can_v3_migrate", `Bool (Pvac_migration.can_bound_migrate status);
     "can_owner_proof_migrate", `Bool can_owner_proof_migrate;
+    "can_cipher_proof_migrate", `Bool can_cipher_proof_migrate;
+    "cipher_proof_rule", `String (match cipher_mode with
+      | Rule_graph.Active -> "active"
+      | Rule_graph.Prior -> "prior");
     "owner_migration_authority",
       `String
         (if can_owner_proof_migrate then
@@ -567,20 +630,40 @@ let pvac_migration_status ~addr ~cipher ~epoch ~owner_migration_mode
          | Rule_graph.Prior -> "prior");
     "needs_legacy_public_replay", `Bool (Pvac_migration.needs_history_migration status);
     "reason", `String status.reason;
+    "migration_record", `Assoc [
+      "root", opt_string (Records.root records);
+      "activation_epoch",
+        (match Records.activation_epoch records with
+         | None -> `Null
+         | Some value -> `Int value);
+      "snapshot_epoch",
+        (match Records.snapshot_epoch records with
+         | None -> `Null
+         | Some value -> `Int value);
+      "state_root", opt_string (Records.state_root records);
+      "count", `Int (Records.entry_count records);
+      "status", `String (match record with
+        | None -> "not_required"
+        | Some (Ok _) -> "ready"
+        | Some (Error Records.Unavailable) -> "unavailable"
+        | Some (Error Records.Not_active) -> "not_active"
+        | Some (Error Records.Not_found) -> "not_found"
+        | Some (Error Records.Cipher_mismatch) -> "cipher_mismatch");
+    ];
     "entitlement_root",
-      (match Octra_core.Pvac_migration_admission.root admissions with
+      (match Records.root records with
        | None -> `Null
        | Some value -> `String value);
     "entitlement_activation_epoch",
-      (match Octra_core.Pvac_migration_admission.activation_epoch admissions with
+      (match Records.activation_epoch records with
        | None -> `Null
        | Some value -> `Int value);
     "entitlement_snapshot_epoch",
-      (match Octra_core.Pvac_migration_admission.snapshot_epoch admissions with
+      (match Records.snapshot_epoch records with
        | None -> `Null
        | Some value -> `Int value);
     "entitlement_state_root",
-      (match Octra_core.Pvac_migration_admission.state_root admissions with
+      (match Records.state_root records with
        | None -> `Null
        | Some value -> `String value);
     "legacy_public_replay", replay_json;

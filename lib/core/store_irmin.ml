@@ -109,6 +109,7 @@ type batch_savepoint = {
 }
 
 type read_snapshot = {
+  read_repo : Store.repo;
   tree : Store.tree;
   state_root : string;
   commit_hash : string;
@@ -512,6 +513,7 @@ let capture_read_snapshot t =
       | Some epoch_id when epoch_id >= 0L ->
         Lwt.return
           (Ok {
+             read_repo = t.repo;
              tree;
              state_root =
                Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree);
@@ -522,7 +524,25 @@ let capture_read_snapshot t =
       | _ -> Lwt.return (Error "store epoch missing")
     end
 
-let capture_read_snapshot_at t ~epoch_id ~state_root =
+let snapshot_matches ?index_root ~state_root actual_root =
+  match index_root with
+  | None ->
+    if actual_root = state_root then Ok ()
+    else Error "store snapshot root differs"
+  | Some index_root ->
+    let is_hash value =
+      String.length value = 64 && String.for_all (function
+        | '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' -> true
+        | _ -> false) value in
+    if not (is_hash index_root && is_hash state_root) then
+      Error "store snapshot commitment refused"
+    else
+      let root = Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:actual_root ~epoch_index_root:index_root in
+      if root = String.lowercase_ascii state_root then Ok ()
+      else Error "store snapshot root differs"
+
+let capture_read_snapshot_at ?index_root t ~epoch_id ~state_root =
   if epoch_id < 0L || epoch_id > Int64.of_int max_int then
     Lwt.return (Error "store snapshot epoch refused")
   else
@@ -537,17 +557,19 @@ let capture_read_snapshot_at t ~epoch_id ~state_root =
       let* stored_epoch = Store.Tree.find tree ["meta"; "last_epoch"] in
       if stored_epoch <> Some (Int64.to_string epoch_id) then
         Lwt.return (Error "store snapshot epoch differs")
-      else if actual_root <> state_root then
-        Lwt.return (Error "store snapshot root differs")
       else
-        Lwt.return
-          (Ok {
-             tree;
-             state_root = actual_root;
-             commit_hash =
-               Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit);
-             epoch_id;
-           })
+        match snapshot_matches ?index_root ~state_root actual_root with
+        | Error _ as error -> Lwt.return error
+        | Ok () ->
+          Lwt.return
+            (Ok {
+               read_repo = t.repo;
+               tree;
+               state_root = actual_root;
+               commit_hash =
+                 Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit);
+               epoch_id;
+             })
 
 let capture_read_snapshot_epoch t ~epoch_id =
   if epoch_id < 0L || epoch_id > Int64.of_int max_int then
@@ -565,6 +587,7 @@ let capture_read_snapshot_epoch t ~epoch_id =
       else
         Lwt.return
           (Ok {
+             read_repo = t.repo;
              tree;
              state_root =
                Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree);
@@ -1019,10 +1042,26 @@ let kat_path t addr = Filename.concat t.pvac_dir (addr ^ ".kat")
 
 let set_pvac_kat t addr kat_hex =
   ensure_pvac_dir t;
-  let p = kat_path t addr in
-  let oc = open_out p in
-  output_string oc kat_hex;
-  close_out oc
+  let path = kat_path t addr in
+  incr pvac_write_id;
+  let staged = Printf.sprintf "%s.%d.%d.staged" path (Unix.getpid ()) !pvac_write_id in
+  Fun.protect
+    ~finally:(fun () ->
+      try Unix.unlink staged with Unix.Unix_error (Unix.ENOENT, _, _) -> ())
+    (fun () ->
+      let oc = open_out staged in
+      Fun.protect ~finally:(fun () -> close_out_noerr oc) (fun () ->
+        output_string oc kat_hex;
+        flush oc;
+        Unix.fsync (Unix.descr_of_out_channel oc));
+      Unix.rename staged path;
+      fsync_dir t.pvac_dir)
+
+let remove_pvac_kat t addr =
+  try
+    Unix.unlink (kat_path t addr);
+    fsync_dir t.pvac_dir
+  with Unix.Unix_error (Unix.ENOENT, _, _) -> ()
 
 let get_pvac_kat t addr =
   let p = kat_path t addr in
@@ -1565,7 +1604,8 @@ let circle_exists t circle_id =
   let* v = read t ["circles"; circle_id; "runtime"] in
   Lwt.return (v <> None)
 
-let get_circle_info t circle_id =
+let get_circle_info ?snapshot t circle_id =
+  let read = read ?snapshot in
   let root = ["circles"; circle_id] in
   let* runtime_opt = read t (root @ ["runtime"]) in
   let* version_opt = read t (root @ ["version"]) in
@@ -1623,8 +1663,8 @@ let save_circle_stable_entry t circle_id (entry : Circles.stable_entry) =
   let json = Yojson.Safe.to_string (Circles.yojson_of_stable_entry entry) in
   write t ["circles"; circle_id; "stable"; "by_hash"; entry.key_hash] json
 
-let get_circle_stable_entry t circle_id key_hash =
-  let* v = read t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
+let get_circle_stable_entry ?snapshot t circle_id key_hash =
+  let* v = read ?snapshot t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -1634,14 +1674,14 @@ let get_circle_stable_entry t circle_id key_hash =
       | Error _ -> Lwt.return_none
     end
 
-let list_circle_stable_entries t circle_id =
-  let* tree_opt = read_tree t ["circles"; circle_id; "stable"; "by_hash"] in
+let list_circle_stable_entries ?snapshot t circle_id =
+  let* tree_opt = read_tree ?snapshot t ["circles"; circle_id; "stable"; "by_hash"] in
   match tree_opt with
   | None -> Lwt.return []
   | Some tree ->
     let* entries = Store.Tree.list tree [] in
     let* pairs = Lwt_list.filter_map_s (fun (key_hash, _) ->
-      let* v = read t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
+      let* v = read ?snapshot t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
       match v with
       | None -> Lwt.return_none
       | Some value ->
@@ -1675,7 +1715,100 @@ let list_circle_stable_entries_at snapshot circle_id =
           end)
       entries
 
-let load_circle_stable_storage_at snapshot circle_id =
+let read_stable_raw snapshot row ~raw_limit ~pack_limit =
+  match Store.Tree.destruct row with
+  | `Node _ -> Lwt.return (Error "circle stable entry missing")
+  | `Contents (contents, _) ->
+    begin
+      match Store.Tree.Contents.key contents with
+      | None -> Lwt.return (Error "circle stable entry size missing")
+      | Some key ->
+        let* present = match Irmin_pack_unix.Pack_key.to_length key with
+          | Some _ -> Lwt.return_true
+          | None -> Store.Backend.Contents.mem
+              (Store.Backend.Repo.contents_t snapshot.read_repo) key in
+        if not present then
+          Lwt.return (Error "circle stable entry missing")
+        else
+          match Irmin_pack_unix.Pack_key.to_length key with
+          | None -> Lwt.return (Error "circle stable entry size missing")
+          | Some bytes when bytes < 0 ->
+            Lwt.return (Error "circle stable entry size refused")
+          | Some bytes when Z.gt (Z.of_int bytes) pack_limit ->
+            Lwt.return (Error "circle storage bytes exceed limit")
+          | Some bytes ->
+            let* value = Store.Tree.Contents.force contents in
+            Lwt.return (match value with
+              | Error _ -> Error "circle stable entry missing"
+              | Ok raw when Z.gt (Z.of_int (String.length raw)) raw_limit ->
+                Error "circle storage bytes exceed limit"
+              | Ok raw -> Ok (raw, bytes))
+    end
+
+let load_circle_stable_storage_at ?limits snapshot circle_id =
+  match limits with
+  | Some (max_entries, max_bytes) ->
+    if max_entries < 0 || max_bytes < 0 then
+      Lwt.return (Error "circle storage read limits refused")
+    else
+      let* tree_opt = Store.Tree.find_tree snapshot.tree
+        ["circles"; circle_id; "stable"; "by_hash"] in
+      begin
+        match tree_opt with
+        | None -> Lwt.return (Ok [])
+        | Some tree ->
+          let* count = Store.Tree.length tree [] in
+          if count > max_entries then
+            Lwt.return (Error "circle storage entries exceed limit")
+          else
+            let* rows = Store.Tree.list tree ~length:max_entries [] in
+            let rows = List.sort (fun (a, _) (b, _) -> String.compare a b) rows in
+            let envelope = Circles.make_stable_entry "" (Circles.Inline "")
+              |> Circles.yojson_of_stable_entry |> Yojson.Safe.to_string |> String.length in
+            let prefix = Irmin.Type.unstage (Irmin.Type.to_bin_string Irmin.Type.int)
+              max_int |> String.length in
+            let pack_extra = Store.Hash.hash_size + 1 + 2 * prefix in
+            let rec read_pairs room pairs = function
+              | [] -> Lwt.return (Ok (List.rev pairs))
+              | (_, row) :: rest ->
+                let raw_limit = Z.add (Z.mul (Z.of_int 6) (Z.of_int room))
+                  (Z.of_int envelope) in
+                let pack_limit = Z.add raw_limit (Z.of_int pack_extra) in
+                let* raw = read_stable_raw snapshot row ~raw_limit ~pack_limit in
+                let entry = match raw with
+                  | Error _ as error -> error
+                  | Ok (raw, packed) ->
+                    begin
+                      match Circles.stable_entry_of_yojson (Yojson.Safe.from_string raw) with
+                      | Ok entry -> Ok (entry, String.length raw, packed)
+                      | Error _ -> Error "circle stable entry refused"
+                      | exception (Yojson.Json_error _ | Failure _ | Invalid_argument _) ->
+                        Error "circle stable entry refused"
+                    end in
+                begin
+                  match entry with
+                  | Error _ as error -> Lwt.return error
+                  | Ok (entry, encoded, packed) ->
+                    match entry.Circles.value with
+                    | Circles.Blob_ref _ ->
+                      Lwt.return (Error "circle stable storage contains non-inline values")
+                    | Circles.Inline value ->
+                      let key_bytes = String.length entry.raw_key in
+                      if key_bytes > room || String.length value > room - key_bytes then
+                        Lwt.return (Error "circle storage bytes exceed limit")
+                      else
+                        let used = key_bytes + String.length value in
+                        let raw_max = Z.add (Z.mul (Z.of_int 6) (Z.of_int used))
+                          (Z.of_int envelope) in
+                        let pack_max = Z.add raw_max (Z.of_int pack_extra) in
+                        if Z.gt (Z.of_int encoded) raw_max || Z.gt (Z.of_int packed) pack_max then
+                          Lwt.return (Error "circle stable entry size refused")
+                        else
+                          read_pairs (room - used) ((entry.raw_key, value) :: pairs) rest
+                end in
+            read_pairs max_bytes [] rows
+      end
+  | None ->
   let* entries = list_circle_stable_entries_at snapshot circle_id in
   let rec inline_pairs values = function
     | [] -> Ok (List.rev values)
@@ -1694,8 +1827,8 @@ type circle_stable_page = {
   total : int;
 }
 
-let list_circle_stable_entries_page t circle_id ~limit =
-  let* tree_opt = read_tree t ["circles"; circle_id; "stable"; "by_hash"] in
+let list_circle_stable_entries_page ?snapshot t circle_id ~limit =
+  let* tree_opt = read_tree ?snapshot t ["circles"; circle_id; "stable"; "by_hash"] in
   match tree_opt with
   | None -> Lwt.return { entries = []; total = 0 }
   | Some tree ->
@@ -1705,7 +1838,7 @@ let list_circle_stable_entries_page t circle_id ~limit =
       Lwt_list.filter_map_s
         (fun (key_hash, _) ->
           let* value_opt =
-            read t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
+            read ?snapshot t ["circles"; circle_id; "stable"; "by_hash"; key_hash] in
           match value_opt with
           | None -> Lwt.return_none
           | Some value ->
@@ -1717,26 +1850,26 @@ let list_circle_stable_entries_page t circle_id ~limit =
         rows in
     Lwt.return { entries; total }
 
-let read_circle_stable_key t circle_id raw_key =
-  let* entry_opt = get_circle_stable_entry t circle_id (Circles.stable_key_hash raw_key) in
+let read_circle_stable_key ?snapshot t circle_id raw_key =
+  let* entry_opt = get_circle_stable_entry ?snapshot t circle_id (Circles.stable_key_hash raw_key) in
   match entry_opt with
   | Some entry when entry.raw_key = raw_key -> Lwt.return (Some entry)
   | _ -> Lwt.return_none
 
-let read_circle_stable_inline_value t circle_id raw_key =
-  let* entry_opt = read_circle_stable_key t circle_id raw_key in
+let read_circle_stable_inline_value ?snapshot t circle_id raw_key =
+  let* entry_opt = read_circle_stable_key ?snapshot t circle_id raw_key in
   match entry_opt with
   | Some { Circles.value = Circles.Inline value; _ } -> Lwt.return (Some value)
   | _ -> Lwt.return_none
 
-let load_circle_stable_storage ?charge t circle_id =
+let load_circle_stable_storage ?snapshot ?charge t circle_id =
   match charge with
   | Some charge ->
     let exception Read_refused of string in
     let fail reason = Lwt.fail (Read_refused reason) in
     let values = Hashtbl.create 0 in
     Lwt.catch (fun () ->
-      let* tree = read_tree t ["circles"; circle_id; "stable"; "by_hash"] in
+      let* tree = read_tree ?snapshot t ["circles"; circle_id; "stable"; "by_hash"] in
       let* () = match tree with
         | None -> Lwt.return_unit
         | Some tree ->
@@ -1759,7 +1892,7 @@ let load_circle_stable_storage ?charge t circle_id =
       (function Read_refused error -> Lwt.return (Error error) | error -> Lwt.fail error)
   | None ->
   let tbl = Hashtbl.create 100 in
-  let* entries = list_circle_stable_entries t circle_id in
+  let* entries = list_circle_stable_entries ?snapshot t circle_id in
   let inline_only = ref true in
   List.iter (fun entry ->
     match entry.Circles.value with
@@ -1769,8 +1902,8 @@ let load_circle_stable_storage ?charge t circle_id =
   if !inline_only then Lwt.return (Ok tbl)
   else Lwt.return (Error "circle stable storage contains non-inline values")
 
-let load_circle_stable_storage_page t circle_id ~limit =
-  let* page = list_circle_stable_entries_page t circle_id ~limit in
+let load_circle_stable_storage_page ?snapshot t circle_id ~limit =
+  let* page = list_circle_stable_entries_page ?snapshot t circle_id ~limit in
   let rec inline_pairs acc = function
     | [] -> Ok (List.rev acc)
     | entry :: rest ->
@@ -1816,8 +1949,8 @@ let save_circle_asset_meta t circle_id (meta : Circles.asset_meta) =
   let json = Yojson.Safe.to_string (Circles.yojson_of_asset_meta meta) in
   write t ["circles"; circle_id; "assets"; "by_hash"; meta.path_key; "meta"] json
 
-let get_circle_asset_meta t circle_id path_key =
-  let* v = read t ["circles"; circle_id; "assets"; "by_hash"; path_key; "meta"] in
+let get_circle_asset_meta ?snapshot t circle_id path_key =
+  let* v = read ?snapshot t ["circles"; circle_id; "assets"; "by_hash"; path_key; "meta"] in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -1830,10 +1963,11 @@ let get_circle_asset_meta t circle_id path_key =
 let save_circle_asset_body_b64 t circle_id path_key body_b64 =
   write t ["circles"; circle_id; "assets"; "by_hash"; path_key; "body_b64"] body_b64
 
-let get_circle_asset_body_b64 t circle_id path_key =
-  read t ["circles"; circle_id; "assets"; "by_hash"; path_key; "body_b64"]
+let get_circle_asset_body_b64 ?snapshot t circle_id path_key =
+  read ?snapshot t ["circles"; circle_id; "assets"; "by_hash"; path_key; "body_b64"]
 
-let get_circle_public_asset_at snapshot circle_id raw_path =
+let get_circle_public_asset_at ~max_bytes snapshot circle_id raw_path =
+  if max_bytes < 0 then Lwt.return (Error "circle asset size exceeds limit") else
   match Circles.path_key_of_raw_path raw_path with
   | Error message -> Lwt.return (Error message)
   | Ok (canonical_path, path_key) ->
@@ -1842,24 +1976,36 @@ let get_circle_public_asset_at snapshot circle_id raw_path =
     let* browser_mode = read_snapshot snapshot (root @ ["browser"; "mode"]) in
     let* resource_mode = read_snapshot snapshot (root @ ["resources"; "mode"]) in
     let* meta_raw = read_snapshot snapshot (asset_root @ ["meta"]) in
-    let* body_b64 = read_snapshot snapshot (asset_root @ ["body_b64"]) in
     begin
-      match browser_mode, resource_mode, meta_raw, body_b64 with
-      | Some browser_mode, Some resource_mode, Some meta_raw, Some body_b64 ->
+      match browser_mode, resource_mode, meta_raw with
+      | Some browser_mode, Some resource_mode, Some meta_raw ->
+        let parsed =
+          try Circles.asset_meta_of_yojson (Yojson.Safe.from_string meta_raw)
+          with
+          | Yojson.Json_error _ -> Error "circle asset metadata JSON refused"
+          | Failure _ -> Error "circle asset metadata integer refused" in
         begin
-          match Circles.asset_meta_of_yojson (Yojson.Safe.from_string meta_raw) with
+          match parsed with
+          | Ok meta when meta.Circles.size_bytes < 0L
+              || meta.size_bytes > Int64.of_int max_bytes ->
+            Lwt.return (Error "circle asset size exceeds limit")
           | Ok meta
             when meta.Circles.path_key = path_key
                  && meta.canonical_path = canonical_path ->
-            Lwt.return
-              (Ok {
-                 canonical_path;
-                 path_key;
-                 browser_mode;
-                 resource_mode;
-                 meta;
-                 body_b64;
-               })
+            let* body_b64 = read_snapshot snapshot (asset_root @ ["body_b64"]) in
+            begin match body_b64 with
+            | None -> Lwt.return (Error "circle asset missing")
+            | Some body_b64 ->
+              Lwt.return
+                (Ok {
+                   canonical_path;
+                   path_key;
+                   browser_mode;
+                   resource_mode;
+                   meta;
+                   body_b64;
+                 })
+            end
           | Ok _ -> Lwt.return (Error "circle asset metadata differs")
           | Error message -> Lwt.return (Error message)
         end
@@ -1891,14 +2037,14 @@ let get_circle_program_at snapshot circle_id =
 let save_circle_asset_ciphertext_b64 t circle_id path_key ciphertext_b64 =
   write t ["circles"; circle_id; "assets"; "by_hash"; path_key; "ciphertext_b64"] ciphertext_b64
 
-let get_circle_asset_ciphertext_b64 t circle_id path_key =
-  read t ["circles"; circle_id; "assets"; "by_hash"; path_key; "ciphertext_b64"]
+let get_circle_asset_ciphertext_b64 ?snapshot t circle_id path_key =
+  read ?snapshot t ["circles"; circle_id; "assets"; "by_hash"; path_key; "ciphertext_b64"]
 
 let save_circle_asset_resource_index t circle_id resource_key path_key =
   write t ["circles"; circle_id; "assets"; "resource_keys"; resource_key] path_key
 
-let get_circle_asset_path_key_by_resource_key t circle_id resource_key =
-  read t ["circles"; circle_id; "assets"; "resource_keys"; resource_key]
+let get_circle_asset_path_key_by_resource_key ?snapshot t circle_id resource_key =
+  read ?snapshot t ["circles"; circle_id; "assets"; "resource_keys"; resource_key]
 
 let set_circle_assets_root t circle_id assets_root =
   write t ["circles"; circle_id; "assets_root"] assets_root
@@ -1919,8 +2065,8 @@ let get_circle_asset_usage_bytes t circle_id =
 let save_circle_program_code_b64 t circle_id code_b64 =
   write t ["circles"; circle_id; "program"; "code_b64"] code_b64
 
-let get_circle_program_code_b64 t circle_id =
-  read t ["circles"; circle_id; "program"; "code_b64"]
+let get_circle_program_code_b64 ?snapshot t circle_id =
+  read ?snapshot t ["circles"; circle_id; "program"; "code_b64"]
 
 let update_circle_program t circle_id ~version ~code_hash ~code_b64 =
   let* () = write t ["circles"; circle_id; "version"] (Int64.to_string version) in
@@ -1969,8 +2115,8 @@ let save_circle_outbox_resolution t circle_id (resolution : Circles.outbox_resol
   let json = Yojson.Safe.to_string (Circles.yojson_of_outbox_resolution resolution) in
   write t (root @ ["meta"]) json
 
-let get_circle_outbox_intent t circle_id intent_id =
-  let* v = read t ["circles"; circle_id; "egress"; "outbox"; intent_id; "meta"] in
+let get_circle_outbox_intent ?snapshot t circle_id intent_id =
+  let* v = read ?snapshot t ["circles"; circle_id; "egress"; "outbox"; intent_id; "meta"] in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -1991,8 +2137,8 @@ let get_circle_outbox_claim t circle_id intent_id =
       | Error _ -> Lwt.return_none
     end
 
-let get_circle_outbox_claim_for_relay t circle_id intent_id relay_id =
-  let* v = read t (circle_outbox_claim_root circle_id intent_id relay_id @ ["meta"]) in
+let get_circle_outbox_claim_for_relay ?snapshot t circle_id intent_id relay_id =
+  let* v = read ?snapshot t (circle_outbox_claim_root circle_id intent_id relay_id @ ["meta"]) in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -2002,20 +2148,20 @@ let get_circle_outbox_claim_for_relay t circle_id intent_id relay_id =
       | Error _ -> Lwt.return_none
     end
 
-let list_circle_outbox_claims t circle_id intent_id =
-  let* tree_opt = read_tree t ["circles"; circle_id; "egress"; "outbox"; intent_id; "claims"] in
+let list_circle_outbox_claims ?snapshot t circle_id intent_id =
+  let* tree_opt = read_tree ?snapshot t ["circles"; circle_id; "egress"; "outbox"; intent_id; "claims"] in
   match tree_opt with
   | None -> Lwt.return []
   | Some tree ->
     let* entries = Store.Tree.list tree [] in
     let* claims =
       Lwt_list.filter_map_s
-        (fun (relay_id, _) -> get_circle_outbox_claim_for_relay t circle_id intent_id relay_id)
+        (fun (relay_id, _) -> get_circle_outbox_claim_for_relay ?snapshot t circle_id intent_id relay_id)
         entries in
     Lwt.return claims
 
-let get_circle_outbox_claim_resolution t circle_id intent_id relay_id =
-  let* v = read t (circle_outbox_claim_resolution_root circle_id intent_id relay_id @ ["meta"]) in
+let get_circle_outbox_claim_resolution ?snapshot t circle_id intent_id relay_id =
+  let* v = read ?snapshot t (circle_outbox_claim_resolution_root circle_id intent_id relay_id @ ["meta"]) in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -2025,20 +2171,20 @@ let get_circle_outbox_claim_resolution t circle_id intent_id relay_id =
       | Error _ -> Lwt.return_none
     end
 
-let list_circle_outbox_claim_resolutions t circle_id intent_id =
-  let* tree_opt = read_tree t ["circles"; circle_id; "egress"; "outbox"; intent_id; "claims"] in
+let list_circle_outbox_claim_resolutions ?snapshot t circle_id intent_id =
+  let* tree_opt = read_tree ?snapshot t ["circles"; circle_id; "egress"; "outbox"; intent_id; "claims"] in
   match tree_opt with
   | None -> Lwt.return []
   | Some tree ->
     let* entries = Store.Tree.list tree [] in
     let* resolutions =
       Lwt_list.filter_map_s
-        (fun (relay_id, _) -> get_circle_outbox_claim_resolution t circle_id intent_id relay_id)
+        (fun (relay_id, _) -> get_circle_outbox_claim_resolution ?snapshot t circle_id intent_id relay_id)
         entries in
     Lwt.return resolutions
 
-let get_circle_outbox_resolution t circle_id intent_id =
-  let* v = read t ["circles"; circle_id; "egress"; "outbox"; intent_id; "resolution"; "meta"] in
+let get_circle_outbox_resolution ?snapshot t circle_id intent_id =
+  let* v = read ?snapshot t ["circles"; circle_id; "egress"; "outbox"; intent_id; "resolution"; "meta"] in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -2048,8 +2194,8 @@ let get_circle_outbox_resolution t circle_id intent_id =
       | Error _ -> Lwt.return_none
     end
 
-let get_circle_outbox_status t circle_id intent_id =
-  let* v = read t ["circles"; circle_id; "egress"; "outbox"; intent_id; "status"] in
+let get_circle_outbox_status ?snapshot t circle_id intent_id =
+  let* v = read ?snapshot t ["circles"; circle_id; "egress"; "outbox"; intent_id; "status"] in
   match v with
   | None -> Lwt.return_none
   | Some s ->
@@ -2082,8 +2228,8 @@ let save_circle_ingress_packet t circle_id (packet : Circles.ingress_packet) =
   let json = Yojson.Safe.to_string (Circles.yojson_of_ingress_packet packet) in
   write t (root @ ["meta"]) json
 
-let get_circle_ingress_packet t circle_id intent_id =
-  let* v = read t ["circles"; circle_id; "ingress"; "packets"; intent_id; "meta"] in
+let get_circle_ingress_packet ?snapshot t circle_id intent_id =
+  let* v = read ?snapshot t ["circles"; circle_id; "ingress"; "packets"; intent_id; "meta"] in
   match v with
   | None -> Lwt.return_none
   | Some s ->

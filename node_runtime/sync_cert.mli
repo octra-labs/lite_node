@@ -38,11 +38,15 @@ type job = {
 
 type state
 
+type checked = private {
+  verdict : (Octra_bootstrap.State_sync_manifest.certificate, string) result;
+  size : int;
+}
+
 type message =
   | Ask of int64 * query * float
   | Read of int64 * int64 * float * (bytes, string) result
-  | Checked of int64 * int64 * float * (Octra_bootstrap.State_sync_manifest.certificate, string) result
-  | Parsed of int64 * int64 * float * (Octra_bootstrap.State_sync_manifest.certificate, string) result
+  | Checked of int64 * int64 * float * checked
   | Cancel of int64
   | Tick of float
   | Stop
@@ -50,7 +54,6 @@ type message =
 type effect =
   | Read_file of job
   | Verify of job * string
-  | Parse of job * string
   | Interrupt of int64
   | Reply of int64 * reply
 
@@ -58,17 +61,20 @@ type stats = {
   active : int;
   queued : int;
   cached : int;
+  bytes : int;
   generation : int64;
 }
 
 val capacity : int
 val cache_capacity : int
+val cache_bytes : int
 val lifetime : float
 val negative_seconds : float
 val empty : state
 val delta : state -> message -> state * effect list
 val stats : state -> stats
 val trust_hash : trust -> string
+val measure : (Octra_bootstrap.State_sync_manifest.certificate, string) result -> checked
 val reason : error -> string
 val retryable : error -> bool
 

@@ -160,6 +160,7 @@ dependencies = [
  "base64",
  "hex",
  "libc",
+ "libm",
  "serde",
  "serde_json",
  "sha2",

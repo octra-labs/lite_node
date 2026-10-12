@@ -542,8 +542,9 @@ fn runtime_program() -> Vec<u8> {
 fn float_runtime_cache() {
     use super::{Payload, Runtime, BASE64};
     use base64::Engine;
+    use serde::Deserialize;
     let bytes = runtime_program();
-    let mut payload: Payload = serde_json::from_value(serde_json::json!({
+    let mut payload: Payload = Payload::deserialize(serde_json::json!({
         "code_b64": BASE64.encode(bytes), "code_cache_key": "float_runtime",
         "hfhe_strict": true, "is_view": false, "float_mode": false,
         "execution_profile": "standard", "fuel_limit": 10000
@@ -565,7 +566,7 @@ fn float_runtime_cache() {
     assert!(effort > 0 && effort < 10000);
     println!(
         "event = float_storage bytes = {} effort = {effort}",
-        hex::encode(stored)
+        hex::encode(stored.as_slice())
     );
     let expected = active.store.data().storage.clone();
     payload.code_b64 = None;
@@ -584,6 +585,7 @@ fn float_runtime_cache() {
     }
     payload.float_mode = Some(true);
     for profile in ["standard", "manifest", "compute"] {
+        payload.float_mode = Some(profile != "compute");
         payload.execution_profile = Some(profile.to_owned());
         let mut description = Runtime::instantiate(&payload, true).unwrap();
         let (value, _, effort) = description.call_export("octra_manifest", &[]).unwrap();
@@ -600,5 +602,160 @@ fn float_runtime_cache() {
             "event = float_view profile = {profile} bits = {:08x} effort = {effort}",
             value as u32
         );
+    }
+}
+
+fn tensor_runtime(name: &str, args: &[wasmi::Val], profile: &str) -> super::Runtime {
+    use base64::Engine;
+    use serde::Deserialize;
+    use wasm_encoder::{EntityType, ImportSection, MemorySection, MemoryType};
+    let mut module = Module::new();
+    let mut types = TypeSection::new();
+    types.ty().function(args.iter().map(|arg| match arg {
+        wasmi::Val::I32(_) => ValType::I32,
+        wasmi::Val::I64(_) => ValType::I64,
+        _ => panic!("unexpected tensor argument"),
+    }), [ValType::I32]);
+    types.ty().function([ValType::I32], [ValType::I32]);
+    types.ty().function([ValType::I32; 2], [ValType::I32]);
+    module.section(&types);
+    let mut imports = ImportSection::new();
+    imports.import("octra", name, EntityType::Function(0));
+    module.section(&imports);
+    let mut functions = FunctionSection::new();
+    functions.function(0).function(1).function(2);
+    module.section(&functions);
+    let mut memory = MemorySection::new();
+    memory.memory(MemoryType {
+        minimum: 1, maximum: Some(1), memory64: false, shared: false, page_size_log2: None,
+    });
+    module.section(&memory);
+    let mut exports = ExportSection::new();
+    exports.export("run", ExportKind::Func, 1);
+    exports.export("octra_alloc", ExportKind::Func, 2);
+    exports.export("octra_query", ExportKind::Func, 3);
+    exports.export("memory", ExportKind::Memory, 0);
+    module.section(&exports);
+    let mut code = CodeSection::new();
+    let mut wrapper = Function::new([]);
+    for index in 0..args.len() {
+        wrapper.instruction(&I::LocalGet(index as u32));
+    }
+    wrapper.instruction(&I::Call(0)).instruction(&I::End);
+    code.function(&wrapper);
+    for value in [1024, 0] {
+        let mut body = Function::new([]);
+        body.instruction(&I::I32Const(value)).instruction(&I::End);
+        code.function(&body);
+    }
+    module.section(&code);
+    let input = super::Payload::deserialize(serde_json::json!({
+        "code_b64": super::BASE64.encode(module.finish()), "execution_profile": profile,
+        "is_view": true, "float_mode": false, "fuel_limit": 20_000_000,
+        "hfhe_strict": false,
+    })).unwrap();
+    super::Runtime::instantiate(&input, false).unwrap()
+}
+
+#[test]
+fn tensor_float_vectors() {
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use wasmi::Val::{I32, I64};
+    let _guard = super::tests::cache_test();
+    let cases = [
+        ("load_i8_kv", vec![I32(768), I32(0), I32(1), I32(0), I32(2), I64(0)], 768, 2),
+        ("matmul_fp", vec![I32(768), I32(256), I32(512), I32(1), I32(2), I32(2)], 768, 2),
+        ("rmsnorm_fp", vec![I32(256), I32(2), I32(512)], 256, 2),
+        ("silu_fp", vec![I32(256), I32(2)], 256, 2),
+        ("elemwise_mul_fp", vec![I32(256), I32(512), I32(2)], 256, 2),
+        ("residual_add_fp", vec![I32(256), I32(512), I32(2)], 256, 2),
+        ("rope_apply_fp", vec![I32(256), I32(4), I32(3), I64(0)], 256, 4),
+        ("attention_kv_fp", vec![I32(256), I32(512), I32(640), I32(768),
+            I32(2), I32(1), I32(1), I32(2)], 768, 2),
+        ("linear_i8_kv", vec![I32(768), I32(256), I32(0), I32(1), I32(2), I32(2), I64(0)], 768, 2),
+        ("top1_i8_kv", vec![I32(256), I32(0), I32(1), I32(1), I32(2), I64(0), I32(768)], 768, 1),
+    ];
+    let words = [0_u64, 0x8000000000000000, 1, 0x0010000000000000, 0x3ff0000000000000,
+        0xbff0000000000000, 0x3fd5555555555555, 0x7fefffffffffffff,
+        0x7ff0000000000000, 0xfff0000000000000, 0x7ff0000000000042,
+        0xfff0000000000042, 0x7ff812345678abcd, 0xfff8fedcba987654];
+    for profile in ["standard", "manifest", "compute"] {
+        let mut digest = Sha256::new();
+        for (name, args, offset, count) in &cases {
+            let mut runtime = tensor_runtime(&format!("host_tensor_{name}"), args, profile);
+            let memory = runtime.instance.get_memory(&runtime.store, "memory").unwrap();
+            let run = runtime.instance.get_func(&runtime.store, "run").unwrap();
+            runtime.store.data_mut().storage = Arc::new(super::Storage::from([
+                ("w".to_owned(), Arc::new((if *name == "top1_i8_kv" {
+                    vec![1, 255]
+                } else { vec![1, 255, 1, 255] }).into())),
+            ]));
+            for left in words {
+                for right in words {
+                    memory.write(&mut runtime.store, 0, b"w").unwrap();
+                    for start in [256, 512, 640] {
+                        for (index, value) in [left, right, left, right].iter().enumerate() {
+                            memory.write(&mut runtime.store, start + index * 8, &value.to_le_bytes()).unwrap();
+                        }
+                    }
+                    let mut args = args.clone();
+                    for arg in &mut args {
+                        if matches!(arg, I64(_)) { *arg = I64(right as i64); }
+                    }
+                    let mut result = [I32(0)];
+                    run.call(&mut runtime.store, &args, &mut result).unwrap();
+                    assert!(matches!(result[0], I32(value) if value >= 0), "{name}");
+                    let bytes = &memory.data(&runtime.store)[*offset..*offset + count * 8];
+                    for cell in bytes.chunks_exact(8) {
+                        let bits = u64::from_le_bytes(cell.try_into().unwrap());
+                        if profile == "compute" && f64::from_bits(bits).is_nan() {
+                            assert_eq!(bits, float_ops::NAN_BITS, "{name}");
+                        }
+                    }
+                    if profile == "compute" { digest.update(bytes); }
+                }
+            }
+        }
+        if profile == "compute" {
+            let digest = format!("{:x}", digest.finalize());
+            assert_eq!(digest, "ad9142c8e0443a30bfdd5a52f2570f56de34d4290d69e58ca35f7c72607aa845");
+            println!("event = tensor_float digest = {digest}");
+        }
+    }
+}
+
+#[test]
+fn tensor_copy_bits() {
+    use wasmi::Val::I32;
+    let _guard = super::tests::cache_test();
+    let args = [I32(768), I32(0), I32(256), I32(2)];
+    let mut runtime = tensor_runtime("host_tensor_append_vec_fp", &args, "compute");
+    let memory = runtime.instance.get_memory(&runtime.store, "memory").unwrap();
+    let bytes: Vec<_> = [0xfff0000000000042_u64, 0x8000000000000000]
+        .into_iter().flat_map(u64::to_le_bytes).collect();
+    memory.write(&mut runtime.store, 256, &bytes).unwrap();
+    runtime.instance.get_func(&runtime.store, "run").unwrap()
+        .call(&mut runtime.store, &args, &mut [I32(0)]).unwrap();
+    assert_eq!(&memory.data(&runtime.store)[768..784], bytes);
+}
+
+#[test]
+fn tensor_math_constants() {
+    for (actual, expected) in [
+        (float_ops::sqrt(2.0, true), 0x3ff6a09e667f3bcd_u64),
+        (float_ops::exp(1.0, true), 0x4005bf0a8b14576a),
+        (float_ops::pow(2.0, 0.5, true), 0x3ff6a09e667f3bcd),
+        (float_ops::sin_cos(1.0, true).0, 0x3feaed548f090cee),
+        (float_ops::sin_cos(1.0, true).1, 0x3fe14a280fb5068c),
+    ] {
+        assert_eq!(actual.to_bits(), expected);
+    }
+    for bits in [0, 0x8000000000000000, 1, 0x7fefffffffffffff,
+        0x7ff0000000000000, 0xfff0000000000000, 0x7ff0000000000042, 0xfff812345678abcd] {
+        let value = f64::from_bits(bits);
+        assert_eq!(float_ops::bytes(value, false), bits.to_le_bytes());
+        assert_eq!(float_ops::bytes(value, true),
+            (if value.is_nan() { float_ops::NAN_BITS } else { bits }).to_le_bytes());
     }
 }

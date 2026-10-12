@@ -33,10 +33,16 @@ let float_mode backend env =
   | Ok fold -> fold.wasm_float
   | Error reason -> raise (Policy_unavailable reason)
 
+let inspect_mode backend env =
+  match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
+  | Ok fold -> fold.vm_bytes
+  | Error reason -> raise (Policy_unavailable reason)
+
 let context ~program_trust ~object_cost backend env
     (tx : Transaction.t) effects tx_hash =
-  let fhe_work, wasm_float, proof_exec = match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
-    | Ok fold -> fold.fhe_work, fold.wasm_float, fold.proof_exec
+  let fhe_work, wasm_float, proof_exec, vm_bytes =
+    match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
+    | Ok fold -> fold.fhe_work, fold.wasm_float, fold.proof_exec, fold.vm_bytes
     | Error reason -> raise (Policy_unavailable reason) in
   Vm.make_live_contract_ctx
     {
@@ -48,6 +54,7 @@ let context ~program_trust ~object_cost backend env
       proof_mode = backend.proof_mode;
       fhe_work;
       proof_exec;
+      vm_bytes;
       wasm_float;
       math = backend.math;
       object_cost;
@@ -224,6 +231,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         let ( let* ) = Octra_core.Exec_resource.bind in
         let* result =
           Circle_exec.execute_call
+            ~inspect_mode:(inspect_mode backend env)
             ~trusted:(Program_trust.keys program_trust)
             ~journal:(Tx_effects.program effects)
             ~ctx
@@ -276,6 +284,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
           result.Circle_exec.receipt);
       circle_commit = (fun current result ->
         Circle_exec.commit_call_result
+          ~inspect_mode:(inspect_mode backend env)
           ~deployment_profile:(wasm_admission_profile wasm_compute_mode)
           ~float_mode:(float_mode backend env)
           ~proof_mode:backend.proof_mode
@@ -538,6 +547,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Ok () ->
         let* result =
           Epoch_exec.process_circle_deploy_tx
+            ~inspect_mode:(inspect_mode backend env)
             ~calls:(match backend.fold env.Epoch_exec.epoch_id with
               | Ok fold -> fold.proof_exec = Rule_graph.Active
               | Error reason -> raise (Policy_unavailable reason))
@@ -564,6 +574,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Ok () ->
         let* result =
           Epoch_exec.process_circle_program_update_tx
+            ~inspect_mode:(inspect_mode backend env)
             ~calls:(match backend.fold env.Epoch_exec.epoch_id with
               | Ok fold -> fold.proof_exec = Rule_graph.Active
               | Error reason -> raise (Policy_unavailable reason))
@@ -574,6 +585,8 @@ let process_tx ?preverify ?save_receipt_raw ~backend
         Lwt.return
           (Result.map (fun fee -> Epoch_exec.Confirmed fee) result)
     end
+  | Transaction.ComputeFund | Transaction.ComputeReturn | Transaction.ComputeSettle ->
+    Epoch_exec.process_compute_effect ~backend ~env tx
   | _ ->
     let open Lwt.Syntax in
     let* result =

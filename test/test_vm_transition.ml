@@ -182,9 +182,10 @@ let tx ~owner ~target ~nonce ~op_type ~payload ~message =
     encrypted_data = payload;
   }
 
-let process ?(env = env) ?save_receipt_raw backend transaction =
+let process ?(env = env) ?preverify ?save_receipt_raw backend transaction =
   Lwt_main.run
     (Transition.process_tx
+       ?preverify
        ?save_receipt_raw
        ~backend
        ~env
@@ -1394,6 +1395,7 @@ Program CirclePayments {
         trusted_program_keys = program_trust; store;
         get_fhe_pubkey = (fun _ -> None);
         proof_mode = R.Active; fhe_work = R.Active; proof_exec = R.Active;
+        vm_bytes = R.Prior;
         wasm_float = R.Active; math = true; object_cost = false;
         current_epoch = epoch; epoch_time_ms = 0L; tree_hash = "root";
         node_id = snd program; tx_hash = Transaction.hash transaction;
@@ -1778,7 +1780,7 @@ Program CirclePayments {
       let actual = Outcome.build ~inputs:[transaction]
         [transaction, error_type, reason] |> Result.get_ok in
       let expected = Outcome.{position = 0; tx = transaction;
-        error_type = "circle_call_failed"; reason = legacy} in
+        error_type = "circle_call_failed"; reason = legacy; charged = false} in
       expect "prior wasm encoded refusal differs"
         (List.map Outcome.encode_rejection actual = [Outcome.encode_rejection expected]
          && Outcome.equal actual [expected]);
@@ -2310,7 +2312,258 @@ let test_wasm_response () =
   Hashtbl.clear storage;
   Gc.full_major ()
 
+let test_vm_bytes () =
+  let module R = Octra_core.Rule_graph in
+  let module B = Octra_vm.Byte_work in
+  let module Shell = Octra_node_runtime.Consensus_epoch_vm_shell in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let source = {|
+program ByteWork {
+  event Seen(text: string)
+  state {
+    counter: int
+  }
+  public fn grow(n: int): int {
+    self.counter = n
+    let text = "0123456789abcdef"
+    let i = 0
+    while i < n {
+      text = concat(text, text)
+      i += 1
+    }
+    return i
+  }
+  public view fn read(): int {
+    return self.counter
+  }
+  public fn logs(n: int): int {
+    self.counter = n
+    let text = "0123456789abcdef"
+    let i = 0
+    while i < 14 {
+      text = concat(text, text)
+      i += 1
+    }
+    i = 0
+    while i < n {
+      emit Seen(text)
+      i += 1
+    }
+    return i
+  }
+  public fn result(n: int): string {
+    self.counter = n
+    let text = "0123456789abcdef"
+    let i = 0
+    while i < n {
+      text = concat(text, text)
+      i += 1
+    }
+    return text
+  }
+  public fn relay(target: address, n: int): int {
+    self.counter = 77
+    return to_int(call(target, "grow", [n]))
+  }
+}
+|} in
+  let raw, encoded = compile ~xcalls:[{
+    Octra_vm.Oct_compile.method_name = "grow";
+    inputs = [Octra_vm.Program_type_flow.Int];
+    output = Octra_vm.Program_type_flow.Int;
+    capabilities = [Octra_vm.Program_type_flow.Storage_read;
+      Octra_vm.Program_type_flow.Storage_write];
+  }] source in
+  let run epoch mode circle = with_store "vm_bytes" (fun store ->
+    let fold epoch = Epoch_exec.prior_fold epoch |> Result.map (fun ctx ->
+      {ctx with Epoch_exec.proof_exec = R.Active; standard_mode = R.Active;
+        vm_bytes = mode}) in
+    let owner = "oct11111111111111111111111111111111111111111111" in
+    let ledger = Octra_core.Ledger.create store in
+    Octra_core.Ledger.add_account ledger owner (Z.of_int 100_000_000) |> Result.get_ok;
+    Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+    let backend = Epoch_exec.make_live_backend ~fold store ledger in
+    Lwt_main.run (backend.begin_batch R.Prior);
+    let receipts = ref [] in
+    let apply = process ~env:{env with chain_id; epoch_id = epoch}
+      ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts)
+      backend in
+    let address, operation, payload, message = if circle then
+      let deploy = Circles.{runtime = Octb; privacy_class = Public;
+        browser_mode = Native_sealed; resource_mode = Public_resources;
+        code_b64 = Some encoded; policy_hash = None; members_root = None;
+        export_policy = None; limits = default_limits} in
+      Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 deploy,
+      Transaction.CircleDeploy, None, Some (Yojson.Safe.to_string
+        (Circles.yojson_of_deploy_payload deploy))
+    else Contract.addr_from_code raw owner 1, Transaction.ContractDeploy,
+      Some encoded, Some "[]" in
+    expect_confirmed "byte deploy"
+      (apply (tx ~owner ~target:address ~nonce:1 ~op_type:operation ~payload ~message));
+    let op_type = if circle then Transaction.CircleCall else Transaction.ProgramExec in
+    let call nonce n = apply (tx ~owner ~target:address ~nonce ~op_type
+      ~payload:(Some "grow") ~message:(Some (Printf.sprintf "[%d]" n))) in
+    expect_confirmed "byte small call" (call 2 4);
+    let effects = Octra_vm.Tx_effects.create ~ledger ~store in
+    let context tx_hash = Shell.make_live_contract_ctx Shell.{
+      value_journal = Octra_vm.Tx_effects.value effects;
+      program_journal = Octra_vm.Tx_effects.program effects;
+      trusted_program_keys = program_trust;
+      store;
+      get_fhe_pubkey = (fun _ -> None);
+      proof_mode = R.Active;
+      fhe_work = R.Active;
+      proof_exec = R.Active;
+      vm_bytes = mode;
+      wasm_float = R.Active;
+      math = true;
+      object_cost = false;
+      current_epoch = epoch;
+      epoch_time_ms = 0L;
+      tree_hash = "root";
+      node_id = address;
+      tx_hash;
+    } in
+    let ctx = context "bytes" in
+    expect "byte context mode" (Option.is_some ctx.byte_work = (mode = R.Active));
+    let second = context "other" in
+    begin match ctx.byte_work, second.byte_work with
+    | Some first, Some next ->
+      expect "transaction reused byte owner" (first != next);
+      expect "byte owner initial allocation" (B.available first = 134_217_728);
+      expect "byte owner initial storage" (B.remaining first = 4_194_304)
+    | None, None -> ()
+    | _ -> fail "byte owner mode differs"
+    end;
+    let transaction = tx ~owner ~target:address ~nonce:3 ~op_type
+      ~payload:(Some "grow") ~message:(Some "[21]") in
+    let preverify = if not circle then None else begin
+      let module P = Octra_core.Preverify_receipt in
+      let module W = Octra_core.Preverify_worker in
+      let module C = Octra_core.Preverify_commit in
+      Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+      let root = Lwt_main.run (Store.get_batch_tree_hash store) in
+      let snapshot = Lwt_main.run (Octra_core.Ledger.hash ledger) |> W.state_hash in
+      Octra_core.Ledger.begin_journal ledger |> Result.get_ok;
+      let saved = Store.save_batch store |> Result.get_ok in
+      let result, binding = Fun.protect
+        ~finally:(fun () -> Octra_core.Tx_savepoint.restore ledger store saved)
+        (fun () -> Lwt_main.run (Transition.capture_circle ~circle_mode:R.Active
+          ~wasm_compute_mode:R.Active ~backend ~env:{env with chain_id; epoch_id = epoch}
+          ~program_trust ~object_cost:false transaction)) in
+      expect "byte capture outcome" (match result with
+        | Ok (Epoch_exec.Confirmed _) -> mode = R.Prior
+        | Ok (Epoch_exec.Rejected_after_fee _) -> mode = R.Active
+        | Error _ -> false);
+      expect "byte capture changed state" (root = Lwt_main.run (Store.get_batch_tree_hash store));
+      let state = Octra_node_runtime.Consensus_circle_preverify.circle_state
+        snapshot (Option.get binding) in
+      let receipt = P.make_circle ~tx_hash:(Transaction.hash transaction)
+        ~input_hash:(W.circle_input_hash transaction state)
+        ~output_hash:(W.circle_output_hash transaction state "ok")
+        ~circle:state ~ok:true ~reason:"" ~cost:(Octra_core.Resource_lanes.cost transaction)
+        |> Result.get_ok in
+      expect "byte receipt invalid" (C.check_receipt transaction receipt = Ok ());
+      expect "byte receipt state differs"
+        (Lwt_main.run (C.check_state ledger transaction receipt) = Ok ());
+      Some (C.create [receipt])
+    end in
+    let result = process ?preverify ~env:{env with chain_id; epoch_id = epoch}
+      ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts)
+      backend transaction in
+    if mode = R.Active then begin
+      match result with
+      | Ok (Epoch_exec.Rejected_after_fee rejected) ->
+        expect "byte failure reason" (rejected.reason = "execution reverted")
+      | _ -> fail "consensus concat exceeded byte limit"
+    end else expect_confirmed "prior byte call" result;
+    if not circle then
+      expect "byte rollback" (Z.equal (view_int store address owner "read")
+        (Z.of_int (if mode = R.Active then 4 else 21)));
+    let relay = apply (tx ~owner ~target:address ~nonce:4 ~op_type
+      ~payload:(Some "relay") ~message:(Some (Yojson.Safe.to_string
+        (`List [`String address; `Int 21])))) in
+    if mode = R.Active then
+      expect "nested byte call accepted" (match relay with
+        | Ok (Epoch_exec.Rejected_after_fee _) -> true
+        | _ -> false)
+    else expect_confirmed "prior nested call" relay;
+    if not circle then
+      expect "nested byte rollback" (Z.equal (view_int store address owner "read")
+        (Z.of_int (if mode = R.Active then 4 else 21)));
+    if not circle then begin
+      let item = `Assoc ["to", `String address; "method", `String "grow";
+        "params", `List [`Int 20]; "amount", `String "0"] in
+      let batch = { (tx ~owner ~target:address ~nonce:5 ~op_type:Transaction.MultiExec
+        ~payload:None ~message:(Some (Yojson.Safe.to_string
+          (`List (List.init 5 (fun _ -> item))))))
+        with Transaction.ou = Z.of_int 10_000_000 } in
+      begin match apply batch with
+      | Ok (Epoch_exec.Rejected_after_fee rejected) ->
+        expect "prior batch refused" (mode = R.Active);
+        expect "batch refusal lost fee" (Z.equal rejected.fee batch.ou)
+      | Ok (Epoch_exec.Confirmed fee) ->
+        expect "batch reset byte owner" (mode = R.Prior && Z.equal fee batch.ou)
+      | Error (_, reason) -> fail ("byte batch: " ^ reason)
+      end;
+      expect "batch byte rollback" (Z.equal (view_int store address owner "read")
+        (Z.of_int (if mode = R.Active then 4 else 20)))
+    end;
+    let nonce = if circle then 5 else 6 in
+    let logs nonce count = apply (tx ~owner ~target:address ~nonce ~op_type
+      ~payload:(Some "logs") ~message:(Some (Printf.sprintf "[%d]" count))) in
+    expect_confirmed "small event transaction" (logs nonce 1);
+    let large = logs (nonce + 1) 18 in
+    begin match large with
+    | Ok (Epoch_exec.Rejected_after_fee _) when mode = R.Active -> ()
+    | Ok (Epoch_exec.Confirmed _) when mode = R.Prior -> ()
+    | _ -> fail "event transaction byte limit differs"
+    end;
+    if not circle then
+      expect "event failure kept storage" (Z.equal (view_int store address owner "read")
+        (Z.of_int (if mode = R.Active then 1 else 18)));
+    let nonce = nonce + 2 in
+    let nonce = if circle then nonce else begin
+      let item = `Assoc ["to", `String address; "method", `String "result";
+        "params", `List [`Int 15]; "amount", `String "0"] in
+      let batch = { (tx ~owner ~target:address ~nonce ~op_type:Transaction.MultiExec
+        ~payload:None ~message:(Some (Yojson.Safe.to_string
+          (`List (List.init 8 (fun _ -> item))))))
+        with Transaction.ou = Z.of_int 10_000_000 } in
+      begin match apply batch with
+      | Ok (Epoch_exec.Rejected_after_fee _) when mode = R.Active -> ()
+      | Ok (Epoch_exec.Confirmed _) when mode = R.Prior -> ()
+      | _ -> fail "multi output byte limit differs"
+      end;
+      expect "multi output failure kept storage" (Z.equal (view_int store address owner "read")
+        (Z.of_int (if mode = R.Active then 1 else 15)));
+      nonce + 1
+    end in
+    expect_confirmed "byte next transaction" (call nonce 4);
+    let account = Octra_core.Ledger.find_opt ledger owner |> Option.get in
+    expect "byte nonce" (account.nonce = nonce);
+    Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+    let root = Lwt_main.run (Store.get_batch_tree_hash store) in
+    let snapshot = !receipts, account.balance, root in
+    Lwt_main.run (backend.commit_batch ());
+    snapshot) in
+  List.iter (fun epoch ->
+    List.iter (fun mode ->
+      List.iter (fun circle ->
+        expect "byte replay differs" (run epoch mode circle = run epoch mode circle))
+        [false; true]) [R.Prior; R.Active])
+    (let plan = Option.get (Octra_core.Rule_graph.vm_bytes_activation_for_chain
+       "octra-devnet-9871-cluster") in
+     [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1])
+
 let () =
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--bytes" then begin
+    test_spawn_budget ();
+    test_resource_abort ();
+    test_vm_bytes ();
+    print_endline "status = pass test = vm_bytes";
+    exit 0
+  end;
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--keys" then begin
     test_wasm_pairs ~keyed:true ();
     print_endline "status = pass test = wasm_keys";
@@ -2331,6 +2584,7 @@ let () =
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--circle" then
     print_endline "status = pass test = circle_calls"
   else begin
+  test_vm_bytes ();
   test_wasm_pairs ();
   test_wasm_pairs ~keyed:true ();
   test_wasm_text ();

@@ -178,7 +178,8 @@ let total value store archive ~address ~first_epoch ~last_epoch ~max_txs ~max_re
       | Tx.CircleKeyPolicyPut | Tx.CircleKeyGrant | Tx.CircleKeyExtend | Tx.CircleKeyRevoke
       | Tx.CircleKeyErase | Tx.CircleOutboxOpen | Tx.CircleRelayClaim | Tx.CircleRelayCancel
       | Tx.CircleIngressCommit | Tx.CircleCall | Tx.ValidatorSetUpdate | Tx.ValidatorReady
-      | Tx.ValidatorBond | Tx.ValidatorExit | Tx.ValidatorWithdraw | Tx.ValidatorEvidence ->
+      | Tx.ValidatorBond | Tx.ValidatorExit | Tx.ValidatorWithdraw | Tx.ValidatorEvidence
+      | Tx.ComputeFund | Tx.ComputeReturn | Tx.ComputeSettle ->
         Ok Sum.Keep in
     let rec scan epoch sum records =
       if epoch = last_epoch then Ok (sum, records)

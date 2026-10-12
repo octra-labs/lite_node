@@ -540,9 +540,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok mode -> mode = Rule_graph.Active
       | Error fault -> failwith (Rule_graph.fault_message fault)
     in
+    let cipher_at epoch =
+      match Rule_graph.cipher_migration rules ~epoch with
+      | Ok mode -> mode
+      | Error fault -> failwith (Rule_graph.fault_message fault)
+    in
     let key_switch_preverify =
       Consensus_key_switch_preverify.create
         ~math:(fun () -> math_at !current_epoch)
+        ~cipher_mode:(fun () -> cipher_at !current_epoch)
         ~field_policy:(fun () -> private_field_policy !current_epoch)
         ~strict:(fun () -> private_proof_strict !current_epoch)
         ledger
@@ -651,6 +657,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
     in
+    let compute_verify = Octra_node_runtime.Compute_settle.make () in
     let ready_state_root_at epoch_id =
       if epoch_id < 0 then Lwt.return_none
       else
@@ -925,6 +932,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let* shared_result =
       Consensus_epoch_apply_shared.run_node
+        ~compute:compute_verify
         ?preverify
         ?parent_commit
         {
@@ -1233,6 +1241,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         program_trust;
         backend =
           Consensus_proposal_preview_shell.node_backend
+            ~compute:compute_verify
             ~private_artifacts:
               (Consensus_private_preverify.artifacts private_preverify)
             ~key_artifacts:
@@ -1380,6 +1389,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let rest_runtime =
       Rest.{
         swarm_ref;
+        compute_mode = (fun () ->
+          match Octra_core.Head_manifest.get_cached () with
+          | Some head when head.epoch_id < max_int ->
+            Rule_graph.vm_bytes_at ~chain_id ~epoch:(head.epoch_id + 1)
+          | _ -> Rule_graph.Prior);
+        settle_mode = (fun () ->
+          match Octra_core.Head_manifest.get_cached () with
+          | Some head when head.epoch_id < max_int ->
+            Rule_graph.settle_at ~chain_id ~epoch:(head.epoch_id + 1)
+          | _ -> Rule_graph.Prior);
         queue_head = (fun () -> Option.map (fun head ->
           Int64.of_int head.Octra_core.Head_manifest.epoch_id)
           (Octra_core.Head_manifest.get_cached ()));
@@ -1838,6 +1857,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             let* batch =
               Octra_core.Preverify_worker.run_many
                 ~math
+                ~cipher_mode:(cipher_at epoch)
                 ~field_policy:(private_field_policy epoch)
                 ~strict:(private_proof_strict epoch)
                 ~ledger
@@ -2036,6 +2056,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         match Store_chaindata.get_epoch_header chaindata (Int64.to_int epoch_id) with
         | None -> None
         | Some header -> compute_raw_root header.Octra_core.Epochlog.state_root in
+    let compute_index_root_at epoch_id =
+      if epoch_id < 0L || epoch_id > Int64.of_int max_int then None
+      else
+        snd (Store_chaindata.get_epoch_index_commitment chaindata (Int64.to_int epoch_id)) in
+    let compute_history = try Ok (Octra_core.Compute_history.open_db
+      ~chain_id ~node_id:wallet.address data_dir) with error ->
+      let reason = Printexc.to_string error in
+      Log.warn "compute" "event = history status = unavailable reason = %s" reason;
+      Error reason in
     let compute_provider =
       match
         Resource_compute_config.of_inputs
@@ -2051,12 +2080,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Log.info "compute" "event = provider status = disabled";
         None
       | Ok (Resource_compute_config.Enabled limits) ->
+        Option.map (fun history ->
         let deps =
           Resource_compute_engine.native_deps
             ~limits
             ~store
-            ~state_root_at:compute_state_root_at in
-        let engine = Resource_compute_engine.create ~limits ~deps in
+            ~state_root_at:compute_state_root_at
+            ~index_root_at:compute_index_root_at in
+        let engine = try Resource_compute_engine.create ~limits ~deps with error ->
+          Octra_core.Compute_history.close history;
+          raise error in
         (match Resource_compute_engine.native_accelerator limits.accelerator with
          | Error reason ->
            Log.warn "compute"
@@ -2069,7 +2102,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
              (Resource_compute_config.accelerator_name limits.accelerator)
              limits.lanes
              limits.memory_bytes);
-        Some Resource_compute_service.{ limits; engine }
+        Resource_compute_service.{ limits; engine }) (Result.to_option compute_history)
     in
     let compute_head () =
       match Octra_core.Head_manifest.get_cached () with
@@ -2092,14 +2125,31 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           validator_set = (fun () -> !consensus_validator_set_ref);
           head = compute_head;
           state_root_at = compute_state_root_at;
+          funding = (fun head header ->
+            Octra_core.Compute_funding.observe
+              ?index_root:(compute_index_root_at head.epoch_id)
+              ~chain_id ~epoch:head.epoch_id
+              ~state_root:(Octra_node_runtime.Text.raw_to_hex head.state_root)
+              ~header store);
           self_test = (match compute_provider with
             | None -> fun () -> Resource_compute_engine.native_self_test ()
             | Some provider ->
               fun () -> Resource_compute_engine.self_test provider.engine);
           nonce = (fun () -> Mirage_crypto_rng.generate 32);
+          now = (fun () -> Int64.of_float (Unix.gettimeofday () *. 1000.));
+          cancel_rounds = (fun () -> match compute_head () with
+            | Some head when head.epoch_id >= 0L && head.epoch_id < Int64.of_int max_int ->
+              Rule_graph.vm_bytes rules ~epoch:(Int64.to_int head.epoch_id) = Ok Rule_graph.Active
+            | _ -> false);
+          send = (fun ~peer payload -> match !swarm_opt with
+            | Some swarm -> Octra_net.P2p_swarm.send_to swarm ~peer_id:peer (compute_frame payload)
+            | None -> Lwt.return_unit);
           broadcast = (fun payload ->
+            let required = match Octra_consensus.Resource_compute_protocol.decode payload with
+              | Reveal _ -> true | _ -> false in
             match !swarm_opt with
-            | Some swarm -> Octra_net.P2p_swarm.broadcast swarm (compute_frame payload)
+            | Some swarm -> Octra_net.P2p_swarm.broadcast ~required swarm (compute_frame payload)
+            | None when required -> Lwt.fail_with "compute network unavailable"
             | None -> Lwt.return_unit);
           relay = (fun ~source payload ->
             match !swarm_opt with
@@ -2111,7 +2161,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             | None -> Lwt.return_unit);
           sleep = Lwt_unix.sleep;
         }
-        ~provider:compute_provider in
+        ~provider:compute_provider ~history:compute_history in
 
     let rpc_task =
       Rest.start_task rest_runtime
@@ -2129,8 +2179,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     Startup_node_launch_shell.run
       ~exit_refused
       ~shutdown:(fun () ->
-        Lwt.bind (State_sync_http.shutdown ()) (fun () ->
-          Octra_node_runtime.Drop_sink.finish ~close:(fun () -> Tx_drop.close drop_db) drop_sink))
+        Lwt.finalize
+          (fun () -> Resource_compute_service.shutdown resource_compute)
+          (fun () -> Lwt.finalize State_sync_http.shutdown (fun () ->
+            Octra_node_runtime.Drop_sink.finish
+              ~close:(fun () -> Tx_drop.close drop_db) drop_sink)))
       ~duty_head:rest_runtime.duty_head
       ~bft_mode:consensus_mode
       Startup_node_launch_shell.{

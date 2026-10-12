@@ -649,8 +649,13 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
       | Ok inputs ->
     let ( let* ) = Result.bind in
     let* () = Octra_core.Tx_envelope.check_epoch
-      ~chain_id:header.Octra_consensus.C_types.chain_id ~epoch:header.epoch_id inputs
+      ~chain_id:header.Octra_consensus.C_types.chain_id ~epoch:header.epoch_id
+      inputs
       |> Result.map_error (fun error -> Invalid_tx_envelope error) in
+    let height = Int64.to_int (Int64.min (Int64.of_int max_int) header.epoch_id) in
+    let* () = Octra_core.Tx_envelope.check_charged
+      (Octra_core.Rule_graph.vm_bytes_at ~chain_id:header.chain_id ~epoch:height)
+      artifacts.rejections |> Result.map_error (fun error -> Invalid_tx_envelope error) in
     match first_disabled_bft_tx inputs with
     | Some tx ->
       Error
@@ -959,7 +964,8 @@ let build_preview_status_of_result = function
       rejected =
         List.map
           (fun (r : Octra_core.Epoch_exec.tx_reject) -> r.tx)
-          artifacts.rejected;
+          (List.filter (fun (r : Octra_core.Epoch_exec.tx_reject) -> not r.charged)
+             artifacts.rejected);
     }
   | Stdlib.Error e ->
     Build_preview_error e
@@ -1048,6 +1054,8 @@ let verify_preview_partition ~inputs ~confirmed ~rejections = function
     else
       match
         Octra_core.Tx_outcome.build
+          ~charged:(List.filter_map (fun (r : Octra_core.Epoch_exec.tx_reject) ->
+            if r.charged then Some r.tx else None) artifacts.rejected)
           ~inputs
           (rejection_tuples artifacts.rejected)
       with
@@ -1886,8 +1894,14 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
             let* captured = match prepare with
               | None -> Lwt.return_ok (local, None)
               | Some prepare ->
-                let+ captured = capture_local prepare (request verified.txs) local in
-                Result.map (fun (local, execution) -> local, Some execution) captured in
+                let+ captured = capture_local prepare (request
+                  (Octra_core.Tx_outcome.executed ~confirmed:verified.txs
+                    verified.rejections)) local in
+                Result.map (fun ((local : local_preverify_bundle), execution) ->
+                  let local = {local with ready_txs = verified.txs;
+                    receipts_json = Octra_core.Preverify_worker.receipt_json_for_hashes
+                      local.batch.ready tx_hashes_hex} in
+                  local, Some execution) captured in
             if not (deps.current ()) then Lwt.return wait else
             match captured with
             | Error error ->
@@ -1985,16 +1999,23 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
                 proposer;
                 validator_pubkeys;
                 preverify;
-                txs = tx_list;
+                txs = Octra_core.Tx_outcome.executed ~confirmed:tx_list verified.rejections;
               })
             in
             if not (deps.current ()) then Lwt.return wait else
             match
-              verify_preview_partition
-                ~inputs:tx_list
+              let charged = List.filter (fun (r : Octra_core.Tx_outcome.rejection) ->
+                r.charged) verified.rejections in
+              let charged = Octra_core.Tx_outcome.build
+                ~inputs:(Octra_core.Tx_outcome.executed ~confirmed:tx_list charged)
+                ~charged:(List.map (fun (r : Octra_core.Tx_outcome.rejection) -> r.tx) charged)
+                (List.map (fun (r : Octra_core.Tx_outcome.rejection) ->
+                  r.tx, r.error_type, r.reason) charged) in
+              Result.bind charged (fun rejections -> verify_preview_partition
+                ~inputs:(Octra_core.Tx_outcome.executed ~confirmed:tx_list rejections)
                 ~confirmed:tx_list
-                ~rejections:[]
-                preview_result
+                ~rejections
+                preview_result)
             with
             | Error reason ->
               Octra_log.warn "consensus"
@@ -2278,14 +2299,16 @@ let rec make_attempt ~refill ~steps ~deferred ~refusals ?prepare ?private_slots 
             Lwt.return_error error
           | `Result (Stdlib.Ok (result, batch)) ->
             let artifacts = result.Octra_core.Epoch_exec.artifacts in
-            let confirmed = List.map fst artifacts.confirmed in
-            let current_rejections = artifacts.rejected in
+            let paid, unpaid = List.partition
+              (fun (r : Octra_core.Epoch_exec.tx_reject) -> r.charged) artifacts.rejected in
+            let charged = List.map (fun (r : Octra_core.Epoch_exec.tx_reject) -> r.tx) paid in
+            let confirmed = Transaction.consensus_order (List.map fst artifacts.confirmed @ charged) in
             begin
               match
                 preview_partition
                   ~input_txs:remaining
                   ~confirmed
-                  ~rejected:current_rejections
+                  ~rejected:unpaid
               with
               | Preview_partition_invalid ->
                 Lwt.return_error "preview_partition_mismatch"
@@ -2293,8 +2316,9 @@ let rec make_attempt ~refill ~steps ~deferred ~refusals ?prepare ?private_slots 
                 begin
                   match
                     Octra_core.Tx_outcome.build
+                      ~charged
                       ~inputs
-                      (rejection_tuples accumulated)
+                      (rejection_tuples (accumulated @ paid))
                   with
                   | Error error ->
                     Lwt.return_error ("preview_outcome_invalid:" ^ error)

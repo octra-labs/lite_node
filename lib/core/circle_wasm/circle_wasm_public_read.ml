@@ -214,24 +214,25 @@ let for_method declarations method_name =
     (fun declaration -> String.equal declaration.method_name method_name)
     declarations
 
-let load_path_policy store circle_id path_key =
+let load_path_policy ?snapshot store circle_id path_key =
+  let read = Circle_policy_store.read_first_inline_value ?snapshot in
   let* activate_after_epoch =
-    Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Circles.slot_policy_activate_after_key path_key;
       Circles.mailbox_activate_after_key path_key;
     ] in
   let* expire_after_epoch =
-    Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Circles.slot_policy_expire_after_key path_key;
       Circles.mailbox_expire_after_key path_key;
     ] in
   let* tombstone =
-    Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Circles.slot_policy_tombstone_key path_key;
       Circles.mailbox_tombstone_key path_key;
     ] in
   let* revoked =
-    Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Circles.slot_policy_revoked_key path_key;
       Circles.mailbox_revoked_key path_key;
     ] in
@@ -285,8 +286,8 @@ let metadata_json
       "returned_bytes", `Int (String.length body);
     ])
 
-let load_one ?charge store snapshot_root current_epoch (declaration : declaration) =
-  let* info_opt = Store_irmin.get_circle_info store declaration.circle_id in
+let load_one ?snapshot ?charge store snapshot_root current_epoch (declaration : declaration) =
+  let* info_opt = Store_irmin.get_circle_info ?snapshot store declaration.circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error "wasm public read circle not found")
@@ -297,6 +298,7 @@ let load_one ?charge store snapshot_root current_epoch (declaration : declaratio
   | Some info ->
     let* meta_opt =
       Store_irmin.get_circle_asset_meta
+        ?snapshot
         store
         declaration.circle_id
         declaration.path_key in
@@ -321,6 +323,7 @@ let load_one ?charge store snapshot_root current_epoch (declaration : declaratio
         else
         let* policy =
           load_path_policy
+            ?snapshot
             store
             declaration.circle_id
             declaration.path_key in
@@ -329,6 +332,7 @@ let load_one ?charge store snapshot_root current_epoch (declaration : declaratio
         else
           let* body_b64_opt =
             Store_irmin.get_circle_asset_body_b64
+              ?snapshot
               store
               declaration.circle_id
               declaration.path_key in
@@ -379,7 +383,12 @@ let load_one ?charge store snapshot_root current_epoch (declaration : declaratio
           end
     end
 
-let current_snapshot_root store =
+let current_snapshot_root ?snapshot store =
+  match snapshot with
+  | Some snapshot ->
+    Lwt.return_some
+      (Circles.h256_hex "circle_public_read_snapshot_v1" [snapshot.Store_irmin.state_root])
+  | None ->
   let* batch_root = Store_irmin.get_batch_tree_hash store in
   let* root =
     match batch_root with
@@ -391,7 +400,7 @@ let current_snapshot_root store =
          Circles.h256_hex "circle_public_read_snapshot_v1" [value])
        root)
 
-let load ?charge store current_epoch (declarations : declaration list) =
+let load ?snapshot ?charge store current_epoch (declarations : declaration list) =
   let used = ref 0 in
   let charge = Option.map (fun charge cost ->
     if charge cost then (used := !used + cost; true) else false) charge in
@@ -400,7 +409,7 @@ let load ?charge store current_epoch (declarations : declaration list) =
   else if Option.fold ~none:false ~some:(fun pay -> not (pay base_effort)) charge then
     Lwt.return (Error "wasm public read effort exceeds limit")
   else
-    let* snapshot_root_opt = current_snapshot_root store in
+    let* snapshot_root_opt = current_snapshot_root ?snapshot store in
     match snapshot_root_opt with
     | None ->
       Lwt.return (Error "wasm public read snapshot root is unavailable")
@@ -430,7 +439,7 @@ let load ?charge store current_epoch (declarations : declaration list) =
                })
           | declaration :: rest ->
             let* snapshot_result =
-              load_one ?charge store snapshot_root current_epoch declaration in
+              load_one ?snapshot ?charge store snapshot_root current_epoch declaration in
             begin
               match snapshot_result with
               | Error e -> Lwt.return (Error e)

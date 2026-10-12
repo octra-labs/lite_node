@@ -1180,6 +1180,10 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(upgrade_tool.join_pending("validator", {
             **state, "voting": False, "voting_reason": "not_ready",
         }))
+        pending = {**state, "voting": False, "voting_reason": "not_member"}
+        self.assertTrue(upgrade_tool.join_pending("validator", pending))
+        self.assertFalse(ready("validator", pending))
+        self.assertFalse(upgrade_tool.join_pending("observer", pending))
 
     def test_upgrade_resume(self):
         worker = WORK / "worker"

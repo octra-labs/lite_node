@@ -158,7 +158,10 @@ let pvac_migration_status
     store
     admissions
     ~epoch
+    ~math
     ~owner_migration_mode
+    ~cipher_mode
+    ~proof_mode
     ~addr
     ~account =
   let open Lwt.Syntax in
@@ -185,7 +188,10 @@ let pvac_migration_status
          ~addr
          ~cipher
          ~epoch
+         ~math
          ~owner_migration_mode
+         ~cipher_mode
+         ~proof_mode
          status
          admissions)
 

@@ -64,6 +64,7 @@ let capture store ledger =
   L.get_total_supply ledger
 
 let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
+    ?(cipher_mode = G.Prior)
     ~math ~epoch store ledger admitted tx =
   let backend = E.make_live_backend ~proof_mode:G.Active ~math
     ~emission_policy:Octra_core.Emission_policy.Guard
@@ -74,6 +75,7 @@ let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
     else backend in
   let transition = PT.create ~math ~preverify ~ledger ~epoch_id:epoch
     ~owner_migration_mode:owner_mode ~proof_mode:G.Active ~field_policy:PL.Unique_fields
+    ~cipher_mode
     ~result_policy:Octra_core.Private_result_policy.Recoverable
     ~legacy_replay:(A.decision admitted) ~limits:PT.{max_fhe = 1; max_stealth = 1} in
   let env : E.env = {chain_id; epoch_id = epoch; proposer_addr = proposer;
@@ -85,8 +87,8 @@ let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
   | None -> run (E.run ~backend ~env ~txs:[tx] ~process_tx)
   | Some preverify -> run (E.run_checked ~preverify ~backend ~env ~txs:[tx] ~process_tx)
 
-let preverify ~math ~epoch ledger admitted tx =
-  run (W.run ~math ~field_policy:PL.Unique_fields ~strict:true ~ledger
+let preverify ?(cipher_mode = G.Prior) ~math ~epoch ledger admitted tx =
+  run (W.run ~math ~cipher_mode ~field_policy:PL.Unique_fields ~strict:true ~ledger
     ~legacy_replay:(A.decision admitted ~epoch) tx)
 
 let refused ?reason ~math ~epoch store ledger admitted name tx =
@@ -209,6 +211,220 @@ let test_apply math =
       check "migration restart amount" (FB.get_balance pk sk cipher = Ok (Z.of_int 3))));
   Printf.printf "event = migration_apply math = %b status = pass\n%!" math
 
+let test_recovery tool =
+  let channel = Unix.open_process_args_in tool [|tool; "--history"|] in
+  let images = Fun.protect ~finally:(fun () ->
+    check "image generator exit" (Unix.close_process_in channel = Unix.WEXITED 0))
+    (fun () -> [input_line channel; input_line channel]) in
+  let decode hex =
+    let bytes = String.init (String.length hex / 2) (fun index ->
+      Char.chr (int_of_string ("0x" ^ String.sub hex (2 * index) 2))) in
+    "hfhe_v1|" ^ Base64.encode_exn bytes in
+  let pk, sk = P.keygen_from_seed (P.default_params ()) (bytes '\065') in
+  let key = P.serialize_pubkey pk |> raw in
+  let blind = Bytes.make 32 '\000' in
+  let payload amount =
+    let ct = P.enc_value_seeded pk sk amount (bytes '\066') in
+    let proof = P.make_zero_proof_bound ~math:true pk sk ct amount blind in
+    ["migration_mode", `String "public_history";
+     "new_pubkey", `String (Base64.encode_exn key);
+     "aes_kat", `String (Octra_core.Pvac_registry.expected_kat ());
+     "new_cipher", `String (FB.encode_cipher ct);
+     "new_zero_proof", `String (FB.encode_zero_proof proof);
+     "amount_commitment", `String (P.pedersen_commit_amount amount blind |> b64);
+     "amount_blinding", `String (b64 blind)] in
+  let good = payload 3L in
+  let inflated = payload 4L in
+  let zero = replace "migration_mode" (`String "verified_zero_reset") (payload 0L) in
+  let proven = FB.encode_cipher (P.enc_value_seeded pk sk 3L (bytes '\067')) in
+  List.iteri (fun index source ->
+    let fields payload =
+      if index = 3 then
+        payload |> List.remove_assoc "amount_blinding"
+        |> replace "migration_mode" (`String "commitment_history")
+      else payload in
+    let good = fields good in
+    let inflated = fields inflated in
+    List.iter (fun present ->
+      Test_workspace.with_dir "history_recovery" (fun dir ->
+        let store = run (S.open_store (Filename.concat dir "store")) in
+        Fun.protect ~finally:(fun () -> run (S.close store)) (fun () ->
+          let ledger = L.create store in
+          L.add_account_with_pubkey ledger address funds public |> get;
+          L.update_enc_balance ledger address source |> get;
+          if present then run (L.set_pvac_pubkey ledger address key);
+          run (L.flush_dirty_lwt ledger);
+          run (S.set_meta store "total_supply" "1000003");
+          run (S.set_meta store "emission_remaining" "0");
+          let head = run (S.get_head_hash store) |> Option.get in
+          let root = I.folded_state_root ~ledger_state_root:head
+            ~epoch_index_root:I.genesis_root in
+          let verdict =
+            if index = 3 then R.{audit_class = Hidden_witness;
+              can_public_migrate = false; public_net = None;
+              commitment_net = Some (P.pedersen_commit_amount 3L blind |> b64);
+              blockers = []; effects = []; reason = "verified commitment history"}
+            else R.replay_history ~addr:address [`Assoc [
+              "from", `String address; "to_", `String address;
+              "op_type", `String "encrypt"; "amount", `String "3"]] in
+          let record = A.{address; source_cipher_hash = source_cipher_hash source;
+            total = 1; decision = verdict} in
+          let records = A.create ~chain_id ~snapshot_epoch:0 ~state_root:root
+            ~activation_epoch:1 [record] |> get in
+          let state () =
+            capture store ledger,
+            run (S.get_tree_hash_at_path store ["accounts"; address]),
+            run (S.get_meta store "total_supply") in
+          let before = state () in
+          let check_bad label records fields =
+            let tx = transaction fields in
+            check (label ^ " preverify") (match preverify ~cipher_mode:G.Active
+                ~math:true ~epoch:1 ledger records tx with
+              | W.Skip _ -> true | _ -> false);
+            let result = execute ~cipher_mode:G.Active ~math:true ~epoch:1
+              store ledger records tx |> get in
+            check (label ^ " rejected") (result.artifacts.confirmed = []);
+            check (label ^ " unchanged")
+              (state () = before) in
+          check_bad "missing record" (A.disabled ~chain_id) good;
+          check_bad "inflated amount" records inflated;
+          check_bad "zero replacement" records zero;
+          let wrong = A.create ~chain_id ~snapshot_epoch:0 ~state_root:root
+            ~activation_epoch:1 [{record with source_cipher_hash = digest "other"}] |> get in
+          check_bad "wrong source" wrong good;
+          if index = 2 && not present then begin
+            let result = execute ~cipher_mode:G.Prior ~math:true ~epoch:1
+              store ledger records (transaction good) |> get in
+            check "prior missing key refused" (result.artifacts.confirmed = []);
+            check "prior state unchanged"
+              (state () = before)
+          end;
+          let tx = transaction good in
+          if index = 2 then begin
+            let head = run (S.get_head_hash store) in
+            let interrupted = execute ~cipher_mode:G.Active ~math:true ~epoch:1
+              ~fail_flush:true store ledger records tx in
+            check "record write interrupted"
+              (interrupted = Error "Failure(\"migration flush interrupted\")");
+            check "record interruption keeps funds"
+              (state () = before);
+            check "record interruption keeps root" (run (S.get_head_hash store) = head)
+          end;
+          let result = execute ~cipher_mode:G.Active ~math:true ~epoch:1
+            store ledger records tx |> get in
+          check "record recovery confirmed" (List.length result.artifacts.confirmed = 1);
+          let account = L.find_opt ledger address |> Option.get in
+          let cipher = Option.get account.encrypted_balance in
+          check "record amount" (FB.get_balance pk sk cipher = Ok (Z.of_int 3));
+          check "record key" (run (L.get_pvac_pubkey ledger address) = Some key);
+          check "record nonce" (account.nonce = 1);
+          check "record fee" (account.balance = Z.sub funds tx.ou);
+          check "record supply" (run (S.get_meta store "total_supply") = Some "1000003");
+          let after = capture store ledger in
+          let repeated = execute ~cipher_mode:G.Active ~math:true ~epoch:2
+            store ledger records (transaction ~nonce:2 good) |> get in
+          check "record cannot apply twice" (repeated.artifacts.confirmed = []);
+          check "repeat keeps funds" (capture store ledger = after))))
+      (if index >= 2 then [false] else [false; true]))
+    (List.map decode images @ [proven; proven]);
+  Printf.printf "event = history_recovery status = pass\n%!"
+
+let test_zero () =
+  let old_pk, old_sk = P.keygen_from_seed (P.default_params ()) (bytes '\101') in
+  historical old_pk old_sk;
+  let old_key = P.serialize_pubkey old_pk |> raw in
+  let source = P.enc_value_seeded old_pk old_sk 0L (bytes '\102') |> FB.encode_cipher in
+  let pk, sk = P.keygen_from_seed (P.default_params ()) (bytes '\103') in
+  let key = P.serialize_pubkey pk |> raw in
+  let blind = bytes '\104' in
+  let cipher = P.enc_value_seeded pk sk 0L (bytes '\105') in
+  let proof = P.make_zero_proof_bound ~math:true pk sk cipher 0L blind in
+  let fields = [
+    "migration_mode", `String "verified_zero_reset";
+    "new_pubkey", `String (Base64.encode_exn key);
+    "aes_kat", `String (Octra_core.Pvac_registry.expected_kat ());
+    "new_cipher", `String (FB.encode_cipher cipher);
+    "new_zero_proof", `String (FB.encode_zero_proof proof);
+    "amount_commitment", `String (P.pedersen_commit_amount 0L blind |> b64);
+    "amount_blinding", `String (b64 blind)] in
+  let tx = transaction fields in
+  let prior_epoch = (Option.get (G.cipher_activation_for_chain chain_id)).activation_epoch - 1 in
+  let active_epoch = prior_epoch + 1 in
+  let prior = G.Prior in
+  let active = G.Active in
+  check "zero rule schedule differs"
+    (G.cipher_migration_at ~chain_id ~epoch:prior_epoch = G.Prior
+     && G.cipher_migration_at ~chain_id ~epoch:active_epoch = G.Active);
+  Test_workspace.with_dir "zero_history" (fun dir ->
+    let store = run (S.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> run (S.close store)) (fun () ->
+      let ledger = L.create store in
+      L.add_account_with_pubkey ledger address funds public |> get;
+      L.update_enc_balance ledger address source |> get;
+      run (L.set_pvac_pubkey ledger address old_key);
+      run (L.flush_dirty_lwt ledger);
+      run (S.set_meta store "total_supply" (Z.to_string funds));
+      run (S.set_meta store "emission_remaining" "0");
+      let head = run (S.get_head_hash store) |> Option.get in
+      let root = I.folded_state_root ~ledger_state_root:head
+        ~epoch_index_root:I.genesis_root in
+      let clean = R.replay_history ~addr:address [] in
+      check "zero public history" (clean.can_public_migrate && clean.public_net = Some Z.zero);
+      let records ?(hash = A.source_cipher_hash source) verdict =
+        let entry = A.{address; source_cipher_hash = hash; total = 0; decision = verdict} in
+        A.create ~chain_id ~snapshot_epoch:0 ~state_root:root
+          ~activation_epoch:1 [entry] |> get in
+      let ready = records clean in
+      let before = capture store ledger in
+      let checked = run (PL.key_switch_plan ~math:true ~cipher_mode:prior
+        ~field_policy:PL.Unique_fields ~strict:true ledger tx) in
+      check "prior zero check" (Result.is_ok checked);
+      let checked = run (PL.key_switch_plan ~math:true ~cipher_mode:active
+        ~field_policy:PL.Unique_fields ~strict:true ledger tx) in
+      check "prior cache cannot authorize zero reset" (match checked with
+        | Error failure -> failure.PL.reason = "zero reset requires verified zero public history"
+        | Ok _ -> false);
+      let denied name records =
+        check (name ^ " preverify") (match preverify ~cipher_mode:active
+            ~math:true ~epoch:active_epoch ledger records tx with
+          | W.Skip _ -> true | _ -> false);
+        let result = execute ~cipher_mode:active ~math:true ~epoch:active_epoch
+          store ledger records tx |> get in
+        check (name ^ " apply") (result.artifacts.confirmed = []);
+        check (name ^ " funds") (capture store ledger = before) in
+      denied "zero missing record" (A.disabled ~chain_id);
+      denied "zero nonzero record" (records {clean with public_net = Some (Z.of_int 3)});
+      denied "zero private record" (records {clean with can_public_migrate = false;
+        public_net = None; audit_class = R.Hidden_witness});
+      denied "zero wrong source" (records ~hash:(digest "other") clean);
+      let receipt = match preverify ~cipher_mode:active ~math:true ~epoch:active_epoch
+          ledger ready tx with
+        | W.Ready value -> value
+        | W.Skip reason | W.Defer reason -> failwith reason in
+      let gate = Octra_core.Preverify_commit.create [receipt] in
+      let head = run (S.get_head_hash store) in
+      let interrupted = execute ~preverify:gate ~cipher_mode:active ~fail_flush:true
+        ~math:true ~epoch:active_epoch store ledger ready tx in
+      check "zero interruption" (interrupted = Error "Failure(\"migration flush interrupted\")");
+      check "zero interruption funds" (capture store ledger = before);
+      check "zero interruption root" (run (S.get_head_hash store) = head);
+      let result = execute ~preverify:gate ~cipher_mode:active ~math:true
+        ~epoch:active_epoch store ledger ready tx |> get in
+      check "zero confirmed" (List.length result.artifacts.confirmed = 1);
+      let account = L.find_opt ledger address |> Option.get in
+      check "zero fee and nonce" (account.balance = Z.sub funds tx.ou && account.nonce = 1);
+      check "zero key" (run (L.get_pvac_pubkey ledger address) = Some key);
+      check "zero amount" (FB.get_balance pk sk (Option.get account.encrypted_balance) = Ok Z.zero);
+      check "zero supply" (run (S.get_meta store "total_supply") = Some (Z.to_string funds))));
+  Printf.printf "event = zero_history status = pass\n%!"
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
-  List.iter test_apply [false; true]
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--zero" then test_zero ()
+  else begin
+    if Array.length Sys.argv = 2 then List.iter test_apply [false; true]
+    else if Array.length Sys.argv <> 3 || Sys.argv.(2) <> "--history" then
+      failwith "migration_apply: expected image tool and optional --history";
+    test_recovery Sys.argv.(1);
+    test_zero ()
+  end

@@ -94,9 +94,16 @@ val capture_epochs :
   Octra_core.Head_manifest.t option ->
   int64 list
 
+val cycle_event :
+  chain_id:string -> epoch:int64 -> Octra_bootstrap.Sync_cycle.event
+
 val monitor_capture :
   deps -> prepared -> string ->
   ('a, string) result Lwt.t -> ('a, string) result Lwt.t
+
+val run_loop :
+  deps -> force:bool -> Octra_consensus.C_types.validator_set ->
+  Octra_bootstrap.Sync_cycle.t -> unit Lwt.t
 
 val run :
   deps ->

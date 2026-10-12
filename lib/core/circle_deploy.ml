@@ -120,6 +120,7 @@ let validate_runtime
     ?(resource_errors = false)
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior)
     (payload : Circles.deploy_payload) =
   match payload.Circles.runtime with
   | Circles.Octb ->
@@ -133,7 +134,7 @@ let validate_runtime
              ("circle_program_missing", "wasm_v1 circles require program code"))
       | Some code_b64 ->
         let* validate_result =
-          Circle_wasm_host.describe ~execution_profile ~float_mode code_b64 in
+          Circle_wasm_host.describe ~execution_profile ~float_mode ~inspect_mode code_b64 in
         begin
           match validate_result with
           | Ok descriptor ->
@@ -158,6 +159,7 @@ let check_available
     ?(resource_errors = false)
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior)
     store
     source
     (payload : Circles.deploy_payload) =
@@ -169,7 +171,8 @@ let check_available
     if exists then
       Lwt.return (Error ("circle_exists", "circle already exists"))
     else
-      let* runtime_ok = validate_runtime ~resource_errors ~execution_profile ~float_mode payload in
+      let* runtime_ok = validate_runtime ~resource_errors ~execution_profile
+        ~float_mode ~inspect_mode payload in
       begin
         match runtime_ok with
         | Error e -> Lwt.return (Error e)
@@ -192,8 +195,8 @@ let save_origin store source circle_id =
 let allow_calls store (info : Circles.circle_info) =
   Store_irmin.write store ["circles"; info.circle_id; "call_code"] info.code_hash
 
-let calls_enabled store (info : Circles.circle_info) =
-  let* code = Store_irmin.read store ["circles"; info.circle_id; "call_code"] in
+let calls_enabled ?snapshot store (info : Circles.circle_info) =
+  let* code = Store_irmin.read ?snapshot store ["circles"; info.circle_id; "call_code"] in
   Lwt.return (code = Some info.code_hash)
 
 let write_prepared ?(calls = false) store source prepared (payload : Circles.deploy_payload) =
@@ -211,10 +214,11 @@ let write_prepared ?(calls = false) store source prepared (payload : Circles.dep
 let apply
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior)
     store
     source
     (payload : Circles.deploy_payload) =
-  let* checked = check_available ~execution_profile ~float_mode store source payload in
+  let* checked = check_available ~execution_profile ~float_mode ~inspect_mode store source payload in
   match checked with
   | Error e ->
     Lwt.return (Error e)

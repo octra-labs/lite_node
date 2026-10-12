@@ -18,6 +18,7 @@ type op_type =
   | ValidatorBond | ValidatorExit | ValidatorWithdraw | ValidatorEvidence
   | StealthOp | ClaimOp | RecryptOp | KeySwitch
   | Op01Burn
+  | ComputeFund | ComputeReturn | ComputeSettle
 
 let op_type_to_string = function
   | Standard -> "standard" | EncryptOp -> "encrypt"
@@ -58,6 +59,9 @@ let op_type_to_string = function
   | RecryptOp -> "recrypt"
   | KeySwitch -> "key_switch"
   | Op01Burn -> "op01_burn"
+  | ComputeFund -> "compute_fund"
+  | ComputeReturn -> "compute_return"
+  | ComputeSettle -> "compute_settle"
 
 let is_circle_noncall = function
   | CircleDeploy
@@ -164,6 +168,9 @@ let bft_lab_op_allowed op =
       | ProgramExec
       | MultiExec
       | ContractUpgrade
+      | ComputeFund
+      | ComputeReturn
+      | ComputeSettle
       | CircleCall -> true
       | _ -> false
     end
@@ -236,6 +243,9 @@ let op_type_of_string = function
   | "recrypt" -> Ok RecryptOp
   | "key_switch" -> Ok KeySwitch
   | "op01_burn" -> Ok Op01Burn
+  | "compute_fund" -> Ok ComputeFund
+  | "compute_return" -> Ok ComputeReturn
+  | "compute_settle" -> Ok ComputeSettle
   | value -> Error ("unsupported op_type: " ^ value)
 
 type t = {
@@ -446,6 +456,9 @@ let ou_cost tx = match tx.op_type with
   | KeySwitch -> Z.of_int 3_000
   | Standard -> Z.of_int 1_000
   | Op01Burn -> Z.of_int 1_000
+  | ComputeFund -> Z.of_int 10_000
+  | ComputeReturn -> Z.of_int 1_000
+  | ComputeSettle -> Compute_bill.fee (Option.value ~default:"" tx.message)
 
 let better_fee_rate a b =
   let ca = ou_cost a in

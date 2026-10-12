@@ -60,6 +60,8 @@ type exec_result = {
   compute_trace_root : string option;
   compute_steps : int64 option;
   compute_operations : int64 option;
+  compute_exit : int option;
+  compute_fault : string option;
   response_value : Circle_wasm_codec.response option;
   response_status : int;
   storage_tbl : (string, string) Hashtbl.t;
@@ -119,13 +121,17 @@ let decode_b64_field name = function
   | _ ->
     Error (Printf.sprintf "invalid %s encoding" name)
 
-let read_process_json ?call payload =
+let read_process_json ?(optional = false) ?call payload =
   Circle_wasm_hfhe_backend.ensure_registered ();
-  let body = Yojson.Safe.to_string payload in
   let* native = match call with
-    | None -> Exec_resource.detach
-        (fun () -> Circle_wasm_native.run_json_classified body) ()
+    | None when optional -> Exec_resource.detach (fun () ->
+        let body = Yojson.Safe.to_string payload in
+        Circle_wasm_native.run_json_classified ~optional:true body) ()
+    | None ->
+      let body = Yojson.Safe.to_string payload in
+      Exec_resource.detach (fun () -> Circle_wasm_native.run_json_classified body) ()
     | Some call ->
+      let body = Yojson.Safe.to_string payload in
       Circle_wasm_native.run_call (fun raw ->
         let* response = call (Yojson.Safe.from_string raw) in
         Lwt.return (Yojson.Safe.to_string response)) body
@@ -568,31 +574,6 @@ let compute_storage_payload action cache_key fields =
       "compute_storage_cache_key", `String cache_key;
     ] @ fields)
 
-let compute_storage_begin cache_key =
-  read_process_json
-    (compute_storage_payload "compute_storage_begin" cache_key [])
-
-let compute_storage_put ~cache_key ~key ~value =
-  read_process_json
-    (compute_storage_payload
-       "compute_storage_put"
-       cache_key
-       [
-         "compute_storage_key", `String key;
-         "compute_storage_value_b64", `String (Base64.encode_exn value);
-       ])
-
-let compute_storage_seal ~cache_key ~root ~entries ~bytes =
-  read_process_json
-    (compute_storage_payload
-       "compute_storage_seal"
-       cache_key
-       [
-         "compute_storage_root", `String root;
-         "compute_storage_entries", `Int entries;
-         "compute_storage_bytes", `Int bytes;
-       ])
-
 let compute_storage_status cache_key =
   read_process_json
     (compute_storage_payload "compute_storage_status" cache_key [])
@@ -613,30 +594,37 @@ let float_id = "wasm_float:arith_nan_7fc00000_7ff8000000000000:operand_calls:met
 
 let float_enabled = function Rule_graph.Active -> true | Rule_graph.Prior -> false
 
-let validate ?(execution_profile=Standard) ?(float_mode=Rule_graph.Prior) code_b64 =
+let inspect_fields mode fields =
+  match mode with
+  | Rule_graph.Prior -> fields
+  | Rule_graph.Active -> ("inspect_policy", `Bool true) :: fields
+
+let validate ?(optional = false) ?(execution_profile = Standard) ?(float_mode = Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior) code_b64 =
   let payload =
-    `Assoc [
+    `Assoc (inspect_fields inspect_mode ((if optional then ["is_view", `Bool true] else []) @ [
       "action", `String "validate";
       "float_mode", `Bool (float_enabled float_mode);
       "code_b64", `String code_b64;
       "execution_profile", `String (profile_name execution_profile);
-    ] in
-  let* json_result = read_process_json payload in
+    ])) in
+  let* json_result = read_process_json ~optional payload in
   match json_result with
   | Error _ as e ->
     Lwt.return e
   | Ok json ->
     Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
-let describe ?(execution_profile=Standard) ?(float_mode=Rule_graph.Prior) code_b64 =
+let describe ?(optional = false) ?(execution_profile = Standard) ?(float_mode = Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior) code_b64 =
   let payload =
-    `Assoc [
+    `Assoc (inspect_fields inspect_mode ((if optional then ["is_view", `Bool true] else []) @ [
       "action", `String "describe";
       "float_mode", `Bool (float_enabled float_mode);
       "code_b64", `String code_b64;
       "execution_profile", `String (profile_name execution_profile);
-    ] in
-  let* json_result = read_process_json payload in
+    ])) in
+  let* json_result = read_process_json ~optional payload in
   match json_result with
   | Error _ as e ->
     Lwt.return e
@@ -657,7 +645,10 @@ let input_receipt_bytes =
   |> Yojson.Safe.to_string
   |> String.length
 
-let execute_with_profile
+let rec execute_with_profile
+    ~memory_bytes
+    ~guest_bytes
+    ~inspect_mode
     ~proof_mode
     ~call
     ~code_b64
@@ -721,18 +712,22 @@ let execute_with_profile
       "is_view", `Bool is_view;
       "update_policy", `Bool update_policy;
     ] in
-    `Assoc (match proof_mode with
+    let fields = match memory_bytes with
+      | None -> fields | Some bytes -> ("memory_bytes", `Int bytes) :: fields in
+    let fields = match guest_bytes with
+      | None -> fields | Some bytes -> ("guest_bytes", `Int bytes) :: fields in
+    `Assoc (inspect_fields inspect_mode (match proof_mode with
       | Rule_graph.Prior -> fields
-      | Rule_graph.Active -> ("hfhe_pairs", `Bool true) :: fields) in
+      | Rule_graph.Active -> ("hfhe_pairs", `Bool true) :: fields)) in
   let input_check = match proof_mode with
     | Rule_graph.Prior -> Ok ()
     | Rule_graph.Active ->
-      let entries_bytes = Circle_hfhe_transcript.mode_entries hfhe_mode
+      let entries_size = Circle_hfhe_transcript.mode_entries hfhe_mode
         |> Circle_hfhe_transcript.entries_json
-        |> Yojson.Safe.to_string
-        |> String.length in
-      if entries_bytes > input_receipt_bytes then Error "input too large"
-      else
+        |> Json_tree.measure ~limit:input_receipt_bytes in
+      begin match entries_size with
+      | None -> Error "input too large"
+      | Some _ ->
         let storage = make_storage_pairs_json storage_tbl in
         let full = payload ~code:(`String code_b64)
           ~storage:(`List storage)
@@ -742,8 +737,10 @@ let execute_with_profile
         let limit = match call with
           | None -> Circle_wasm_native.max_input_bytes
           | Some _ -> Circle_wasm_native.max_call_input_bytes in
-        if String.length (Yojson.Safe.to_string full) + input_receipt_bytes - 2 <= limit
-        then Ok () else Error "input too large" in
+        match Json_tree.measure ~limit:(limit - input_receipt_bytes + 2) full with
+        | Some _ -> Ok ()
+        | None -> Error "input too large"
+      end in
   let initial_allow_code_cache_only = code_seeded code_key in
   let initial_allow_cache_only =
     match storage_cache_key with
@@ -790,7 +787,7 @@ let execute_with_profile
     let payload = payload
       ~code:(if use_code_cache_only then `Null else `String code_b64)
       ~storage:storage_json ~storage_key:storage_cache_key_json ~hfhe_mode in
-    let* json_result = read_process_json ?call payload in
+    let* json_result = read_process_json ~optional:is_view ?call payload in
     match json_result with
     | Error (Rejected e)
       when use_code_cache_only
@@ -820,6 +817,9 @@ let execute_with_profile
       ~allow_cache_only:initial_allow_cache_only
       ~allow_code_cache_only:initial_allow_code_cache_only
   in
+  decode_execution ~storage_tbl json_result
+
+and decode_execution ~storage_tbl json_result =
   match json_result with
   | Error e ->
     Lwt.return (Error e)
@@ -905,6 +905,12 @@ let execute_with_profile
                      compute_trace_root;
                      compute_steps;
                      compute_operations;
+                     compute_exit = (match List.assoc_opt "compute_exit" fields with
+                       | Some (`Int code) when code >= Int32.to_int Int32.min_int
+                           && code <= Int32.to_int Int32.max_int -> Some code
+                       | _ -> None);
+                     compute_fault = (match List.assoc_opt "compute_fault" fields with
+                       | Some (`String code) -> Some code | _ -> None);
                      response_value;
                      response_status = status_code;
                      storage_tbl;
@@ -932,7 +938,74 @@ let execute_with_profile
   | Ok _ ->
     Lwt.return (Error (Rejected "invalid wasm execution response"))
 
+type replay_step = {
+  request_bytes : string;
+  tx_hash : string;
+  epoch : int;
+  fuel : int;
+  memory : int;
+  guest : int;
+}
+
+let replay_compute ~code_b64 ~cache_key ~root ~entries ~bytes ~scope ~caller ~address steps =
+  let refused reason = Lwt.return_error (Rejected reason) in
+  if steps = [] || List.length steps > 64 then refused "compute replay step count"
+  else if List.exists (fun step -> step.fuel <= 0 || step.epoch < 0) steps then
+    refused "compute replay step refused"
+  else
+    let fuel = List.fold_left (fun sum step -> match sum with
+      | Some sum when step.fuel <= 10_000_000 - sum -> Some (sum + step.fuel)
+      | _ -> None) (Some 0) steps in
+    if Option.is_none fuel then refused "compute replay fuel limit" else
+      let fields step = `Assoc [
+        "action", `String "execute";
+        "code_b64", `String code_b64;
+        "code_cache_key", `String (code_cache_key code_b64);
+        "export_name", `String "octra_query";
+        "request_b64", `String (Base64.encode_exn step.request_bytes);
+        "compute_storage_cache_key", `String cache_key;
+        "compute_storage_root", `String root;
+        "compute_storage_entries", `Int entries;
+        "compute_storage_bytes", `Intlit (Int64.to_string bytes);
+        "compute_session_scope", `String scope;
+        "storage_pairs", `Null;
+        "caller", `String caller;
+        "address", `String address;
+        "tx_hash", `String step.tx_hash;
+        "current_epoch", `Int step.epoch;
+        "execution_profile", `String "compute";
+        "is_view", `Bool true;
+        "hfhe_strict", `Bool true;
+        "fuel_limit", `Int step.fuel;
+        "memory_bytes", `Int step.memory;
+        "guest_bytes", `Int step.guest;
+      ] in
+      let payloads = List.map fields steps in
+      let size = List.fold_left (fun total value -> match total with
+        | None -> None
+        | Some total -> Option.map ((+) total)
+            (Json_tree.measure ~limit:(8_000_000 - total) value)) (Some 0) payloads in
+      match size with
+      | None -> refused "compute replay input size"
+      | Some _ ->
+        let payload = `Assoc ["action", `String "compute_replay";
+          "execution_profile", `String "compute"; "is_view", `Bool true;
+          "replay_steps", `List (List.map (fun value -> `String (Yojson.Safe.to_string value)) payloads)] in
+        let* result = read_process_json ~optional:true payload in
+        match result with
+        | Error _ as error -> Lwt.return error
+        | Ok (`Assoc ["replies", `List replies]) when List.length replies = List.length steps ->
+          let rec decode saved = function
+            | [] -> Lwt.return_ok (List.rev saved)
+            | raw :: rest ->
+              let* result = decode_execution ~storage_tbl:(Hashtbl.create 0) (Ok raw) in
+              (match result with Error _ as error -> Lwt.return error
+                | Ok value -> decode (value :: saved) rest) in
+          decode [] replies
+        | Ok _ -> Lwt.return_error (Unavailable "compute replay response differs")
+
 let execute
+    ~inspect_mode
     ~proof_mode
     ~call
     ~code_b64
@@ -956,6 +1029,9 @@ let execute
     ~is_view
     ~update_policy =
   execute_with_profile
+    ~memory_bytes:None
+    ~guest_bytes:None
+    ~inspect_mode
     ~proof_mode
     ~call
     ~code_b64
@@ -983,6 +1059,8 @@ let execute
     ~update_policy
 
 let execute_compute_with_storage_inner
+    ~memory_bytes
+    ~guest_bytes
     ~compute_session_scope
     ~compute_storage_cache_key
     ~code_b64
@@ -1004,6 +1082,9 @@ let execute_compute_with_storage_inner
     ~public_reads
     ~fuel_limit =
   execute_with_profile
+    ~memory_bytes
+    ~guest_bytes
+    ~inspect_mode:Rule_graph.Prior
     ~proof_mode:Rule_graph.Prior
     ~call:None
     ~code_b64
@@ -1051,6 +1132,8 @@ let execute_compute_with_storage
     ~public_reads
     ~fuel_limit =
   execute_compute_with_storage_inner
+    ~memory_bytes:None
+    ~guest_bytes:None
     ~compute_session_scope:None
     ~compute_storage_cache_key
     ~code_b64
@@ -1073,6 +1156,8 @@ let execute_compute_with_storage
     ~fuel_limit
 
 let execute_compute_isolated_with_storage
+    ~memory_bytes
+    ~guest_bytes
     ~compute_session_scope
     ~compute_storage_cache_key
     ~code_b64
@@ -1094,6 +1179,8 @@ let execute_compute_isolated_with_storage
     ~public_reads
     ~fuel_limit =
   execute_compute_with_storage_inner
+    ~memory_bytes:(Some memory_bytes)
+    ~guest_bytes:(Some guest_bytes)
     ~compute_session_scope:(Some compute_session_scope)
     ~compute_storage_cache_key
     ~code_b64

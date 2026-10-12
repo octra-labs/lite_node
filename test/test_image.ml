@@ -20,7 +20,7 @@ let seed store pairs =
   run (S.commit_bulk store tree "image inputs");
   Option.get (run (S.get_commit_hash store)), Option.get (run (S.get_head_hash store))
 
-let test_roundtrip () =
+let test_roundtrip ?(format = I.Flat) () =
   W.with_dir "image" (fun dir ->
     let source = Filename.concat dir "ledger.dat" in
     let target = Filename.concat dir "restored" in
@@ -33,7 +33,7 @@ let test_roundtrip () =
         String.make 4194305 'f'] in
       let pairs = List.map (fun key -> ["contracts"; "program"; "storage"; key], "kept") keys in
       let commit, root = seed store pairs in
-      let written = run (I.write store ~commit ~path:source) |> ok in
+      let written = run (I.write ~format store ~commit ~path:source) |> ok in
       expect "export root differs" (written.root = root);
       expect "export byte count differs"
         (written.bytes = (Unix.LargeFile.stat source).Unix.LargeFile.st_size);
@@ -152,7 +152,7 @@ let test_formats () =
         end;
         with_store target (fun saved ->
           expect "existing target changed" (run (S.get_commit_hash saved) = Some commit))
-      ) [false, false, "v1.dat"; true, false, "v2.dat"; true, true, "v3.dat"]));
+      ) [false, false, "prior.dat"; true, false, "path.dat"; true, true, "full.dat"]));
   print_endline "status = pass test = image_formats"
 
 let test_invalid () =
@@ -246,6 +246,142 @@ let read path =
   Fun.protect ~finally:(fun () -> close_in_noerr channel)
     (fun () -> really_input_string channel (in_channel_length channel))
 
+let same_stream left right =
+  In_channel.with_open_bin left (fun left ->
+    In_channel.with_open_bin right (fun right ->
+      let a = Bytes.create 65536 in
+      let b = Bytes.create 65536 in
+      let rec loop () =
+        let n = input left a 0 (Bytes.length a) in
+        let m = input right b 0 (Bytes.length b) in
+        n = m && Bytes.sub_string a 0 n = Bytes.sub_string b 0 m
+        && (n = 0 || loop ()) in
+      loop ()))
+
+let test_shared flat =
+  W.with_dir "image-shared" (fun dir ->
+    with_store (Filename.concat dir "origin") (fun store ->
+      let payload = String.init 131089 (fun n -> Char.chr ((n * 17) land 255)) in
+      let pairs = List.init 65 (fun n ->
+        let path = ["compute"; "roots"; Printf.sprintf "%02d" n] in
+        [path @ ["data"; "payload"], payload;
+         path @ ["state"], if n = 64 then "changed" else "same"])
+        |> List.concat in
+      let commit, root = seed store pairs in
+      let source = Filename.concat dir "shared.dat" in
+      let format = if flat then I.Flat else I.Shared in
+      let written = run (I.write ~format store ~commit ~path:source) |> ok in
+      expect "shared image expanded repeated roots" (written.bytes < 200_000L);
+      expect "shared byte count differs"
+        (written.bytes = (Unix.LargeFile.stat source).Unix.LargeFile.st_size);
+      let target = Filename.concat dir "restored" in
+      let restored = run (I.restore ~source ~target ~expected_root:root) |> ok in
+      expect "shared root differs" (restored.root = root);
+      expect "shared record count differs" (restored.records = written.records);
+      let flat_bytes = with_store target (fun saved ->
+        List.iter (fun (path, value) ->
+          expect "shared subtree differs" (run (S.read saved path) = Some value)) pairs;
+        let commit = Option.get (run (S.get_commit_hash saved)) in
+        let copy = Filename.concat dir "copy.dat" in
+        ignore (run (I.write ~format:I.Shared saved ~commit ~path:copy) |> ok);
+        expect "shared stream changed after restore" (same_stream source copy);
+        let a = Filename.concat dir "flat.dat" in
+        let b = Filename.concat dir "flat-copy.dat" in
+        let report = run (I.write saved ~commit ~path:a) |> ok in
+        ignore (run (I.write ~format:I.Flat saved ~commit ~path:b) |> ok);
+        expect "default format changed" (same_stream a b);
+        expect "flat size control did not expand" (report.bytes > 8_000_000L);
+        let start = In_channel.with_open_bin a (fun input ->
+          really_input_string input (String.length "octra-ledger-image-3\n")) in
+        expect "default header changed" (start = "octra-ledger-image-3\n");
+        report.bytes) in
+      expect "shared export changed source" (run (S.get_commit_hash store) = Some commit);
+      Printf.printf "status = pass test = image_shared bytes = %Ld flat_bytes = %Ld records = %Ld\n%!"
+        written.bytes flat_bytes written.records))
+
+let test_shared_pvac () =
+  W.with_dir "image-shared-pvac" (fun dir ->
+    with_store (Filename.concat dir "origin") (fun store ->
+      let hash = String.make 64 'a' in
+      let pairs = [["a"; "key"], hash; ["pvac_hashes"; "key"], hash] in
+      let commit, root = seed store pairs in
+      let source = Filename.concat dir "shared.dat" in
+      let report = run (I.write ~format:I.Shared store ~commit ~path:source) |> ok in
+      expect "shared PVAC hash was omitted" (report.pvac_hashes = [hash]);
+      let target = Filename.concat dir "restored" in
+      ignore (run (I.restore ~source ~target ~expected_root:root) |> ok);
+      let commit, _ = seed store [["a"; "key"], "invalid"; ["pvac_hashes"; "key"], "invalid"] in
+      let source = Filename.concat dir "invalid.dat" in
+      expect "shared PVAC hash validation was skipped"
+        (Result.is_error (run (I.write ~format:I.Shared store ~commit ~path:source)));
+      expect "invalid shared image remains" (not (Sys.file_exists source))));
+  print_endline "status = pass test = image_shared_pvac"
+
+let test_shared_invalid () =
+  W.with_dir "image-shared-invalid" (fun dir ->
+    with_store (Filename.concat dir "origin") (fun store ->
+      let _, root = seed store [["a"; "x"], "one"; ["b"; "x"], "one"] in
+      let tree = run (S.Store.Tree.add (S.Store.Tree.empty ()) ["x"] "one") in
+      let hash = Irmin.Type.to_string S.Store.Hash.t (S.Store.Tree.hash tree) in
+      let value = run (S.Store.Tree.add (S.Store.Tree.empty ()) [] "one") in
+      let leaf = Irmin.Type.to_string S.Store.Hash.t (S.Store.Tree.hash value) in
+      let other = run (S.Store.Tree.add (S.Store.Tree.empty ()) ["x"] "two") in
+      let wrong = Irmin.Type.to_string S.Store.Hash.t (S.Store.Tree.hash other) in
+      let row kind path = record ~full:true ~wide:true ~kind path "" in
+      let text hash = integer 8 (Int64.of_int (String.length hash)) ^ hash in
+      let finish path hash = row 5 path ^ text hash in
+      let reference kind path id hash = row kind path ^ integer 8 id ^ text hash in
+      let node = row 1 ["a"] in
+      let data = record ~full:true ~wide:true ~kind:2 ["a"; "x"] "one" in
+      let closed = [node; data; finish ["a"] hash] in
+      let image rows = "octra-ledger-image-refs\n" ^ String.concat "" rows ^ u32 0 in
+      let cases = [
+        "zero", closed @ [reference 3 ["b"] 0L hash], "not backward";
+        "negative", closed @ [reference 3 ["b"] (-1L) hash], "not backward";
+        "self", closed @ [reference 3 ["b"] 4L hash], "not backward";
+        "forward", closed @ [reference 3 ["b"] 5L hash], "not backward";
+        "unfinished", [node; reference 3 ["a"; "x"] 1L hash], "not finished";
+        "cycle", [node; row 1 ["a"; "x"]; reference 3 ["a"; "x"; "y"] 1L hash], "not finished";
+        "finish_id", closed @ [reference 3 ["b"] 3L hash], "not finished";
+        "node_kind", closed @ [reference 4 ["b"] 1L hash], "kind mismatch";
+        "value_kind", closed @ [reference 3 ["b"] 2L leaf], "kind mismatch";
+        "ref_hash", closed @ [reference 3 ["b"] 1L wrong], "reference hash mismatch";
+        "finish_hash", [node; data; finish ["a"] wrong], "subtree hash mismatch";
+        "hash_text", closed @ [reference 3 ["b"] 1L "invalid"], "hash is invalid";
+        "hash_case", closed @ [reference 3 ["b"] 1L (String.uppercase_ascii hash)], "hash is invalid";
+        "hash_size", closed @ [row 3 ["b"] ^ integer 8 1L ^ integer 8 257L], "exceeds limit";
+        "hash_short", closed @ [row 3 ["b"] ^ integer 8 1L ^ integer 8 128L], "remaining file bytes";
+        "id_short", closed @ [row 3 ["b"] ^ "\001"], "End_of_file";
+        "kind", closed @ [row 6 ["b"]], "record kind is invalid";
+        "finish_order", [node; row 1 ["a"; "x"]; finish ["a"] hash], "finish order";
+        "finish_twice", closed @ [finish ["a"] hash], "finish order";
+        "open", [node; data], "unfinished";
+        "parent", [data], "subtree order";
+        "sibling_open", [node; row 1 ["b"]], "subtree order";
+        "ref_child", closed @ [reference 3 ["b"] 1L hash; row 1 ["b"; "x"]], "subtree order";
+        "value_child", [record ~full:true ~wide:true ~kind:2 ["a"] "one"; row 1 ["a"; "x"]], "subtree order";
+        "duplicate", closed @ [reference 3 ["a"] 1L hash], "not strictly ordered";
+        "order", closed @ [reference 3 [""] 1L hash], "not strictly ordered";
+      ] in
+      List.iter (fun (name, rows, reason) ->
+        let source = Filename.concat dir (name ^ ".dat") in
+        write source (image rows);
+        refuse ~source ~target:(source ^ ".store") ~root ~reason) cases;
+      List.iter (fun (name, rows, root) ->
+        let source = Filename.concat dir (name ^ ".dat") in
+        write source (image rows);
+        let report = run (I.restore ~source ~target:(source ^ ".store") ~expected_root:root) |> ok in
+        expect "valid reference root differs" (report.root = root))
+        ["node", closed @ [reference 3 ["b"] 1L hash], root;
+         "value", [node; data; finish ["a"] hash; row 1 ["b"];
+            reference 4 ["b"; "x"] 2L leaf; finish ["b"] hash], root];
+      List.iter (fun header ->
+        let source = Filename.concat dir (string_of_int (String.length header) ^ "-old.dat") in
+        write source (header ^ row 3 ["a"] ^ integer 8 1L ^ text hash ^ u32 0);
+        refuse ~source ~target:(source ^ ".store") ~root ~reason:"record kind is invalid")
+        ["octra-ledger-image\n"; "octra-ledger-image-2\n"; "octra-ledger-image-3\n"]));
+  print_endline "status = pass test = image_shared_invalid"
+
 let test_write_yield () =
   W.with_dir "image-write" (fun dir ->
     with_store (Filename.concat dir "origin") (fun store ->
@@ -312,12 +448,12 @@ let test_replaced_path () =
       expect "image replacement changed source" (run (S.get_head_hash store) = Some root)));
   print_endline "status = pass test = image_replaced_path"
 
-let test_empty () =
+let test_empty ?(format = I.Flat) () =
   W.with_dir "image-empty" (fun dir ->
     with_store (Filename.concat dir "origin") (fun store ->
       let commit, root = seed store [] in
       let source = Filename.concat dir "ledger.dat" in
-      let written = run (I.write store ~commit ~path:source) |> ok in
+      let written = run (I.write ~format store ~commit ~path:source) |> ok in
       let target = Filename.concat dir "restored" in
       let restored = run (I.restore ~source ~target ~expected_root:root) |> ok in
       expect "empty image has records" (written.records = 0L && restored.records = 0L);
@@ -369,10 +505,14 @@ let test_live source commit dir =
 let () =
   match Array.to_list Sys.argv with
   | [_] ->
+      test_shared false;
+      test_shared_pvac ();
+      test_shared_invalid ();
       test_restore_path ();
       test_large_value ();
       test_circle_value ();
       test_roundtrip ();
+      test_roundtrip ~format:I.Shared ();
       test_formats ();
       test_invalid ();
       test_full_lengths ();
@@ -380,6 +520,8 @@ let () =
       test_foreign_path ();
       test_write_yield ();
       test_replaced_path ();
-      test_empty ()
+      test_empty ();
+      test_empty ~format:I.Shared ()
   | [_; "--store"; source; commit; dir] -> test_live source commit dir
+  | [_; "--flat"] -> test_shared true
   | _ -> failwith "image test arguments are invalid"

@@ -17,7 +17,13 @@ type request =
   | Allocate of int
   | Scan of int
 
-type t = {limits : limits; mutable remaining : int; mutable available : int}
+type t = {
+  limits : limits;
+  mutable remaining : int;
+  mutable available : int;
+  mutable event_left : int;
+  mutable event_count : int;
+}
 
 type decoding = {max_bytes : int; requests : request list}
 
@@ -36,20 +42,26 @@ let encoded_size length =
     let size = Z.mul (Z.cdiv (Z.of_int length) (Z.of_int 3)) (Z.of_int 4) in
     if Z.gt size (Z.of_int Sys.max_string_length) then None else Some (Z.to_int size)
 
-let decoding ~length ~cells ~bits ~cached =
-  if length < 0 || cells < 0 || bits < 0 then None
+let cell_bytes ~count ~bits =
+  if count < 0 || bits < 0 then None
   else
+    let width = Z.add (Z.of_int 80) (Z.cdiv (Z.of_int bits) (Z.of_int 8)) in
+    let size = Z.mul (Z.of_int count) width in
+    if Z.fits_int size then Some (Z.to_int size) else None
+
+let decoding ~length ~cells ~bits ~cached =
+  if length < 0 then None
+  else
+    Option.bind (cell_bytes ~count:cells ~bits) (fun memory ->
     let capacity = Z.mul (Z.cdiv (Z.of_int length) (Z.of_int 4)) (Z.of_int 3) in
-    let cell_size = Z.add (Z.of_int 80) (Z.cdiv (Z.of_int bits) (Z.of_int 8)) in
-    let memory = Z.mul (Z.of_int cells) cell_size in
     let copies = if cached then Z.zero else Z.mul capacity (Z.of_int 2) in
-    let allocated = Z.add memory copies in
+    let allocated = Z.add (Z.of_int memory) copies in
     if Z.gt capacity (Z.of_int Sys.max_string_length) || not (Z.fits_int allocated)
     then None
     else
       let requests = [Allocate (Z.to_int allocated)] in
       let requests = if cached then requests else Scan length :: requests in
-      Some {max_bytes = Z.to_int capacity; requests}
+      Some {max_bytes = Z.to_int capacity; requests})
 
 let limits ~key_bytes ~value_bytes ~copy_bytes ~write_bytes ~alloc_bytes ~unit_bytes =
   if List.exists (fun size -> size < 0 || size > Sys.max_string_length)
@@ -59,7 +71,58 @@ let limits ~key_bytes ~value_bytes ~copy_bytes ~write_bytes ~alloc_bytes ~unit_b
   else Some {key_bytes; value_bytes; copy_bytes; write_bytes; alloc_bytes; unit_bytes}
 
 let create limits =
-  {limits; remaining = limits.write_bytes; available = limits.alloc_bytes}
+  {limits; remaining = limits.write_bytes; available = limits.alloc_bytes;
+    event_left = 4_194_304; event_count = 256}
+
+let consensus_limits = {
+  key_bytes = 16_777_216;
+  value_bytes = 4_194_304;
+  copy_bytes = 16_777_216;
+  write_bytes = 4_194_304;
+  alloc_bytes = 134_217_728;
+  unit_bytes = 32;
+}
+
+let consensus_id =
+  "bytes_v2:key_16777216:value_4194304:copy_16777216:write_4194304:alloc_134217728:unit_32:receipt_4194304:event_count_256:returns:shared_gross:inspect_isolated"
+
+let event_left budget = budget.event_left
+
+let text_size ~limit value =
+  if limit < 2 || String.length value > limit - 2 then None else
+  let exception Full in
+  let size = ref 2 in
+  try
+    String.iter (fun byte ->
+      let width = match byte with
+        | '"' | '\\' | '\b' | '\012' | '\n' | '\r' | '\t' -> 2
+        | '\x00'..'\x1f' | '\x7f' -> 6
+        | _ -> 1 in
+      if width > limit - !size then raise Full;
+      size := !size + width) value;
+    Some !size
+  with Full -> None
+
+let event_size ~limit ~address ~depth ~name ~values =
+  let exception Full in
+  let left = ref limit in
+  let take size = if size > !left then raise Full else left := !left - size in
+  let quoted value =
+    match text_size ~limit:!left value with
+    | None -> raise Full
+    | Some size -> take size in
+  if limit < 0 then None else
+  try
+    take (String.length "{\"program\":,\"contract\":,\"depth\":,\"event\":,\"values\":[]}");
+    quoted address;
+    quoted address;
+    take (String.length (string_of_int depth));
+    quoted name;
+    List.iteri (fun index value ->
+      if index > 0 then take 1;
+      quoted value) values;
+    Some (limit - !left)
+  with Full -> None
 
 let remaining budget = budget.remaining
 
@@ -132,4 +195,21 @@ let charge budget ~used ~limit ~base requests =
   | Some (effort, remaining, available) ->
     budget.remaining <- remaining;
     budget.available <- available;
+    Some effort
+
+let output budget ~used ~limit size =
+  if size < 0 || size > budget.event_left then None
+  else match charge budget ~used ~limit ~base:0 [Allocate size] with
+  | None -> None
+  | Some effort ->
+    budget.event_left <- budget.event_left - size;
+    Some effort
+
+let emit budget ~used ~limit size =
+  if size < 0 || budget.event_count = 0 then None else
+  let size = if budget.event_count = 256 && size < max_int then size + 1 else size in
+  match output budget ~used ~limit size with
+  | None -> None
+  | Some effort ->
+    budget.event_count <- budget.event_count - 1;
     Some effort

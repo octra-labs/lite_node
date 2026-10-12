@@ -20,17 +20,18 @@ let test_count () =
       I.put_u32 sink.buffer 0;
       Lwt_main.run (I.drain sink));
     expect "writer record count was capped" (sink.records = 16_777_217L);
-    let channel = open_in_bin path in
-    Fun.protect ~finally:(fun () -> close_in_noerr channel) (fun () ->
-      let reader : I.reader = {
-        channel; size = LargeFile.in_channel_length channel; format = I.Full64;
-        records = 16_777_215L; prior = None;
-      } in
-      expect "first record differs" (I.read_record reader = Some (I.Value (["a"], "one")));
-      expect "second record differs" (I.read_record reader = Some (I.Value (["b"], "two")));
-      expect "reader record count was capped" (reader.records = 16_777_217L);
-      expect "image end differs" (I.read_record reader = None);
-      I.exact_end reader);
+    List.iter (fun format ->
+      let channel = open_in_bin path in
+      Fun.protect ~finally:(fun () -> close_in_noerr channel) (fun () ->
+        let reader : I.reader = {
+          channel; size = LargeFile.in_channel_length channel; format;
+          records = 16_777_215L; prior = None;
+        } in
+        expect "first record differs" (I.read_record reader = Some (I.Value (["a"], "one")));
+        expect "second record differs" (I.read_record reader = Some (I.Value (["b"], "two")));
+        expect "reader record count was capped" (reader.records = 16_777_217L);
+        expect "image end differs" (I.read_record reader = None);
+        I.exact_end reader)) [I.Full64; I.Refs];
     List.iter (fun format ->
       let channel = open_in_bin path in
       Fun.protect ~finally:(fun () -> close_in_noerr channel) (fun () ->
@@ -44,6 +45,71 @@ let test_count () =
             expect "old record refusal differs" (reason = "ledger image record count exceeds limit")))
       [I.Prior; I.Path64]);
   print_endline "status = pass test = image_count"
+
+let test_ref_codec () =
+  W.with_dir "image-ref-codec" (fun dir ->
+    let path = Filename.concat dir "records.dat" in
+    let hash = I.tree_hash (I.Store.Tree.empty ()) in
+    let records = [I.Value (["a"], "one"); I.Ref (["b"], 2, 16_777_216L, hash);
+      I.Node ["c"]; I.Finish (["c"], hash)] in
+    let channel = open_out_bin path in
+    let sink : I.sink = {
+      channel; buffer = Buffer.create 128; records = 16_777_215L;
+      bytes = 0L; prior = None; pvac_hashes = [];
+    } in
+    Fun.protect ~finally:(fun () -> close_out_noerr channel) (fun () ->
+      List.iter (fun record -> Lwt_main.run (I.emit sink record)) records;
+      I.put_u32 sink.buffer 0;
+      Lwt_main.run (I.drain sink));
+    let channel = open_in_bin path in
+    Fun.protect ~finally:(fun () -> close_in_noerr channel) (fun () ->
+      let reader : I.reader = {
+        channel; size = LargeFile.in_channel_length channel; format = I.Refs;
+        records = 16_777_215L; prior = None;
+      } in
+      List.iter (fun record ->
+        expect "reference codec differs" (I.read_record reader = Some record)) records;
+      expect "reference count was capped" (reader.records = 16_777_219L);
+      expect "reference end differs" (I.read_record reader = None);
+      I.exact_end reader));
+  print_endline "status = pass test = image_ref_codec"
+
+let test_shared_batch () =
+  let module S = Octra_core.Store_irmin in
+  let run = Lwt_main.run in
+  let ok = function Ok value -> value | Error reason -> failwith reason in
+  W.with_dir "image-shared-batch" (fun dir ->
+    let store = run (S.open_store (Filename.concat dir "origin")) in
+    Fun.protect ~finally:(fun () -> run (S.close store)) (fun () ->
+      let blob = String.make (I.drain_bytes + 1) 'z' in
+      let child = run (I.Store.Tree.add (I.Store.Tree.empty ()) ["blob"] blob) in
+      let child = List.init (I.import_batch + 1) string_of_int
+        |> List.fold_left (fun tree key ->
+          run (I.Store.Tree.add tree ["entries"; key] key)) child in
+      let tree = run (S.begin_bulk store) in
+      let tree = run (I.Store.Tree.add_tree tree ["a"] child) in
+      let tree = run (I.Store.Tree.add_tree tree ["b"] child) in
+      let tree = run (I.Store.Tree.add_tree tree ["c"] (I.Store.Tree.empty ())) in
+      let tree = run (I.Store.Tree.add_tree tree ["d"] (I.Store.Tree.empty ())) in
+      run (S.commit_bulk store tree "image shared batch");
+      let commit = Option.get (run (S.get_commit_hash store)) in
+      let root = Option.get (run (S.get_head_hash store)) in
+      let source = Filename.concat dir "shared.dat" in
+      let report = run (I.write ~format:I.Shared store ~commit ~path:source) |> ok in
+      expect "shared batch lacks record flush" (report.records > Int64.of_int I.import_batch);
+      expect "shared batch lacks byte flush" (report.bytes > Int64.of_int I.drain_bytes);
+      expect "shared batch duplicated blob" (report.bytes < Int64.of_int (2 * I.drain_bytes));
+      let target = Filename.concat dir "restored" in
+      let restored = run (I.restore ~source ~target ~expected_root:root) |> ok in
+      expect "shared batch root differs" (restored.root = root);
+      expect "shared batch count differs" (restored.records = report.records);
+      let saved = run (S.open_store target) in
+      Fun.protect ~finally:(fun () -> run (S.close saved)) (fun () ->
+        expect "shared persisted reference differs" (run (S.read saved ["b"; "blob"]) = Some blob);
+        expect "shared persisted node differs"
+          (run (S.read saved ["b"; "entries"; string_of_int I.import_batch])
+           = Some (string_of_int I.import_batch)))));
+  print_endline "status = pass test = image_shared_batch"
 
 let test_emit_yield () =
   W.with_dir "image-loop" (fun dir ->
@@ -200,6 +266,8 @@ let test_restore_sync () =
 let () =
   match Array.to_list Sys.argv with
   | [_] ->
+      test_ref_codec ();
+      test_shared_batch ();
       test_restore_sync ();
       test_count ();
       test_emit_yield ();

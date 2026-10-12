@@ -1,12 +1,12 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-let read_first_inline_value store circle_id keys =
+let read_first_inline_value ?snapshot store circle_id keys =
   let rec loop = function
     | [] -> Lwt.return_none
     | key :: rest ->
       let open Lwt.Syntax in
-      let* value_opt = Store_irmin.read_circle_stable_inline_value store circle_id key in
+      let* value_opt = Store_irmin.read_circle_stable_inline_value ?snapshot store circle_id key in
       begin
         match value_opt with
         | Some _ -> Lwt.return value_opt
@@ -15,7 +15,8 @@ let read_first_inline_value store circle_id keys =
   in
   loop keys
 
-let load_transport_policy store circle_id =
+let load_transport_policy ?snapshot store circle_id =
+  let read_first_inline_value = read_first_inline_value ?snapshot in
   let open Lwt.Syntax in
   let* relay_mode_raw =
     read_first_inline_value store circle_id [Circle_transport_policy.relay_mode_key] in
@@ -68,7 +69,8 @@ let load_transport_policy store circle_id =
        ~require_external_receipt_raw
        ~accepted_result_codes_raw)
 
-let load_hfhe_policy store circle_id =
+let load_hfhe_policy ?snapshot store circle_id =
+  let read_first_inline_value = read_first_inline_value ?snapshot in
   let open Lwt.Syntax in
   let* load_pk_mode_raw =
     read_first_inline_value store circle_id [Circle_hfhe_policy.load_pk_mode_key] in
@@ -127,7 +129,8 @@ let load_hfhe_policy store circle_id =
        ~encrypt_proof_raw
        ~decrypt_proof_raw)
 
-let load_key_policy store circle_id key_id =
+let load_key_policy ?snapshot store circle_id key_id =
+  let read_first_inline_value = read_first_inline_value ?snapshot in
   let open Lwt.Syntax in
   let* activate_after_raw =
     read_first_inline_value store circle_id [Circle_key_policy.activate_after_key key_id] in

@@ -12,6 +12,42 @@ let max_method_bytes = 64
 let max_params_bytes = 65_536
 let max_output_bytes = 262_144
 let max_nonce_bytes = 128
+let max_members = 5
+let max_records = 256
+let reveal_delay = 1L
+let offer_ttl = 16L
+let call_ttl = 64L
+let capacity_ttl = 16L
+
+type cancellation = {
+  chain_id : string;
+  caller : string;
+  caller_public_key : string;
+  session_id : string;
+  caller_signature : string;
+  until : int64 option;
+}
+
+type cancel_round = {
+  cancel : cancellation;
+  origin : string;
+  epoch : int64;
+  expires : int64;
+  round : int;
+  signature : string;
+}
+
+type cancel_ack = {
+  delivery : cancel_round;
+  origin_key : string;
+  node_id : string;
+  node_key : string;
+  epoch : int64;
+  signature : string;
+}
+
+let cancel_rounds = 64
+let cancel_span = 64L
 
 type offer = {
   chain_id : string;
@@ -32,8 +68,18 @@ type offer = {
   signature : string;
 }
 
+type header = {
+  request : Resource_compute_certificate.request;
+  valid_until : int64 option;
+  caller_public_key : string;
+  caller_signature : string;
+  coordinator : string;
+  signature : string;
+}
+
 type call = {
   request : Certificate.request;
+  valid_until : int64 option;
   method_name : string;
   params_json : string;
   caller_public_key : string;
@@ -47,6 +93,18 @@ type result = {
   output_json : string;
 }
 
+type fetch = {
+  call : call;
+  target : string;
+  epoch_id : int64;
+  expires_epoch : int64;
+  round : int;
+  signature : string;
+}
+
+let fetch_rounds = 8
+let fetch_span = 4L
+
 type message =
   | Offer of offer
   | Capability of Capability.t
@@ -54,6 +112,11 @@ type message =
   | Reveal of Selection.reveal
   | Call of call
   | Result of result
+  | Cancel of cancellation
+  | Cancel_round of cancel_round
+  | Cancel_ack of cancel_ack
+  | Fetch of fetch
+  | Answer of fetch * result
 
 let hash32 value =
   String.length value = 32
@@ -61,17 +124,70 @@ let hash32 value =
 let signature64 value =
   String.length value = 64
 
-let bounded_non_empty limit value =
+let non_empty limit value =
   let length = String.length value in
   length > 0 && length <= limit
 
-let offer_shape offer =
-  bounded_non_empty max_chain_id_bytes offer.chain_id
+let cancel_shape (cancel : cancellation) =
+  non_empty max_chain_id_bytes cancel.chain_id
+  && non_empty max_node_id_bytes cancel.caller
+  && hash32 cancel.caller_public_key
+  && hash32 cancel.session_id
+  && signature64 cancel.caller_signature
+  && (match cancel.until with None -> true | Some until -> until >= 0L)
+
+let cancel_sign_bytes (cancel : cancellation) =
+  if not (cancel_shape cancel) then invalid_arg "resource compute cancellation";
+  let domain = match cancel.until with None -> "octra:resource_compute_cancel"
+    | Some _ -> "octra:compute_cancel_until" in
+  Octra_net.Hash_domain.hash_encoded domain (fun buffer ->
+    Octra_net.Oce1.put_string buffer cancel.chain_id;
+    Octra_net.Oce1.put_string buffer cancel.caller;
+    Octra_net.Oce1.put_hash32 buffer cancel.caller_public_key;
+    Octra_net.Oce1.put_hash32 buffer cancel.session_id;
+    Option.iter (Octra_net.Oce1.put_u64 buffer) cancel.until)
+
+let cancel_round_shape value =
+  cancel_shape value.cancel && non_empty max_node_id_bytes value.origin
+  && value.epoch >= 0L && value.expires >= value.epoch
+  && Int64.sub value.expires value.epoch <= cancel_span
+  && value.round >= 1 && value.round <= cancel_rounds
+  && signature64 value.signature
+  && (match value.cancel.until with None -> true | Some until -> value.expires = until)
+
+let cancel_round_sign value =
+  if not (cancel_round_shape value) then invalid_arg "compute cancel round shape";
+  Octra_net.Hash_domain.hash_encoded "octra:compute_cancel_round" (fun buffer ->
+    Octra_net.Oce1.put_hash32 buffer (cancel_sign_bytes value.cancel);
+    Octra_net.Oce1.put_sig64 buffer value.cancel.caller_signature;
+    Octra_net.Oce1.put_string buffer value.origin;
+    Octra_net.Oce1.put_u64 buffer value.epoch;
+    Octra_net.Oce1.put_u64 buffer value.expires;
+    Octra_net.Oce1.put_u8 buffer value.round)
+
+let cancel_ack_shape (value : cancel_ack) =
+  cancel_round_shape value.delivery && non_empty max_node_id_bytes value.node_id
+  && hash32 value.origin_key && hash32 value.node_key
+  && value.epoch >= value.delivery.epoch && value.epoch <= value.delivery.expires
+  && signature64 value.signature
+
+let cancel_ack_sign (value : cancel_ack) =
+  if not (cancel_ack_shape value) then invalid_arg "compute cancel ack shape";
+  Octra_net.Hash_domain.hash_encoded "octra:compute_cancel_ack" (fun buffer ->
+    Octra_net.Oce1.put_hash32 buffer (cancel_round_sign value.delivery);
+    Octra_net.Oce1.put_sig64 buffer value.delivery.signature;
+    Octra_net.Oce1.put_hash32 buffer value.origin_key;
+    Octra_net.Oce1.put_string buffer value.node_id;
+    Octra_net.Oce1.put_hash32 buffer value.node_key;
+    Octra_net.Oce1.put_u64 buffer value.epoch)
+
+let offer_shape (offer : offer) =
+  non_empty max_chain_id_bytes offer.chain_id
   && offer.offered_epoch >= 0L
   && offer.expires_epoch >= offer.offered_epoch
-  && bounded_non_empty max_node_id_bytes offer.coordinator
+  && non_empty max_node_id_bytes offer.coordinator
   && hash32 offer.validator_set_root
-  && bounded_non_empty max_circle_id_bytes offer.circle_id
+  && non_empty max_circle_id_bytes offer.circle_id
   && offer.model_epoch >= 0L
   && hash32 offer.model_state_root
   && hash32 offer.graph_root
@@ -112,7 +228,7 @@ let offer_id offer =
 
 let input_hash ~method_name ~params_json =
   if
-    not (bounded_non_empty max_method_bytes method_name)
+    not (non_empty max_method_bytes method_name)
     || String.length params_json > max_params_bytes
   then
     invalid_arg "resource compute input";
@@ -120,18 +236,43 @@ let input_hash ~method_name ~params_json =
     Octra_net.Oce1.put_string buf method_name;
     Octra_net.Oce1.put_string buf params_json)
 
-let call_shape call =
-  bounded_non_empty max_method_bytes call.method_name
-  && String.length call.params_json <= max_params_bytes
+let header_fields (call : call) : header = {
+  request = call.request; valid_until = call.valid_until;
+  caller_public_key = call.caller_public_key; caller_signature = call.caller_signature;
+  coordinator = call.coordinator; signature = call.signature;
+}
+
+let terms_shape (call : header) =
+  Certificate.fee_valid ~fuel:call.request.fuel_limit
+    ~price:call.request.unit_price ~cap:call.request.fee_cap
+  && (match call.request.unit_price with None -> true | Some _ -> Option.is_some call.request.memory_bytes)
+  && (match call.request.memory_bytes with None -> true | Some bytes ->
+    Option.is_some call.request.guest_bytes && bytes > 0 && bytes <= Certificate.max_memory_bytes)
+  && (match call.valid_until with None -> true | Some epoch ->
+    epoch >= 0L && call.request.expires_epoch <= epoch)
+  && (match call.request.fuel_limit with None -> true | Some fuel ->
+    Option.is_some call.valid_until && fuel > 0 && fuel <= 2_000_000_000)
+  && (match call.request.guest_bytes with None -> true | Some bytes ->
+    Option.is_some call.request.fuel_limit && Option.is_some call.valid_until
+    && bytes >= 65_536 && bytes <= 67_108_864 && bytes mod 65_536 = 0)
   && hash32 call.caller_public_key
   && signature64 call.caller_signature
-  && bounded_non_empty max_node_id_bytes call.coordinator
+  && non_empty max_node_id_bytes call.coordinator
   && signature64 call.signature
+
+let call_shape call =
+  non_empty max_method_bytes call.method_name
+  && terms_shape (header_fields call)
+  && String.length call.params_json <= max_params_bytes
   && call.request.input_hash = input_hash ~method_name:call.method_name ~params_json:call.params_json
 
-let intent_sign_bytes call =
-  if not (call_shape call) then
-    invalid_arg "resource compute call";
+let header_shape call = terms_shape call && Certificate.request_shape call.request
+
+let header call =
+  if call_shape call && Certificate.request_shape call.request then Ok (header_fields call)
+  else Error "compute header shape"
+
+let intent_body (call : header) =
   Octra_net.Hash_domain.hash_encoded "octra:resource_compute_intent" (fun buf ->
     Octra_net.Oce1.put_string buf call.request.chain_id;
     Octra_net.Oce1.put_string buf call.request.circle_id;
@@ -149,14 +290,93 @@ let intent_sign_bytes call =
     Octra_net.Oce1.put_u32_int buf call.request.input_bytes;
     Octra_net.Oce1.put_u32_int buf call.request.max_output_bytes)
 
-let call_sign_bytes call =
-  if not (call_shape call) then
-    invalid_arg "resource compute call";
+let intent_digest (call : header) =
+  let digest = intent_body call in
+  let digest = match call.valid_until with
+    | None -> digest
+    | Some epoch ->
+      Octra_net.Hash_domain.hash_encoded "octra:compute_intent_expiry" (fun buf ->
+        Octra_net.Oce1.put_hash32 buf digest;
+        Octra_net.Oce1.put_u64 buf epoch) in
+  let digest = match call.request.fuel_limit with
+  | None -> digest
+  | Some fuel ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_intent_fuel" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u32_int buf fuel) in
+  let digest = match call.request.guest_bytes with
+  | None -> digest
+  | Some bytes ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_intent_guest" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u32_int buf bytes) in
+  let digest = match call.request.memory_bytes with
+  | None -> digest
+  | Some bytes ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_intent_memory" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u32_int buf bytes) in
+  match call.request.unit_price, call.request.fee_cap with
+  | Some price, Some cap ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_intent_fee" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u64 buf price;
+      Octra_net.Oce1.put_u64 buf cap)
+  | _ -> digest
+
+let call_digest (call : header) =
   Octra_net.Hash_domain.hash_encoded "octra:resource_compute_call" (fun buf ->
     Octra_net.Oce1.put_hash32 buf (Certificate.request_id call.request);
     Octra_net.Oce1.put_string buf call.coordinator;
-    Octra_net.Oce1.put_hash32 buf (intent_sign_bytes call);
+    Octra_net.Oce1.put_hash32 buf (intent_digest call);
     Octra_net.Oce1.put_sig64 buf call.caller_signature)
+
+let intent_sign_bytes call =
+  if not (call_shape call) then invalid_arg "resource compute call";
+  intent_digest (header_fields call)
+
+let call_sign_bytes call =
+  if not (call_shape call) then invalid_arg "resource compute call";
+  call_digest (header_fields call)
+
+let header_intent value =
+  if not (header_shape value) then invalid_arg "compute header shape";
+  intent_digest value
+
+let header_sign value =
+  if not (header_shape value) then invalid_arg "compute header shape";
+  call_digest value
+
+let signed_id digest signature =
+  Octra_net.Hash_domain.hash_encoded "octra:resource_compute_intent_id" (fun buffer ->
+    Octra_net.Oce1.put_hash32 buffer digest;
+    Octra_net.Oce1.put_sig64 buffer signature)
+
+let header_id (value : header) =
+  signed_id (header_intent value) value.caller_signature
+
+let intent_id call =
+  signed_id (intent_sign_bytes call) call.caller_signature
+
+let fetch_shape (fetch : fetch) =
+  call_shape fetch.call && Certificate.request_shape fetch.call.request
+  && non_empty max_node_id_bytes fetch.target
+  && fetch.epoch_id >= fetch.call.request.epoch_id
+  && fetch.expires_epoch >= fetch.epoch_id
+  && fetch.expires_epoch <= fetch.call.request.expires_epoch
+  && Int64.sub fetch.expires_epoch fetch.epoch_id <= fetch_span
+  && fetch.round >= 0 && fetch.round < fetch_rounds
+  && signature64 fetch.signature
+
+let fetch_sign_bytes fetch =
+  if not (fetch_shape fetch) then invalid_arg "compute fetch shape";
+  Octra_net.Hash_domain.hash_encoded "octra:compute_fetch" (fun buf ->
+    Octra_net.Oce1.put_hash32 buf (call_sign_bytes fetch.call);
+    Octra_net.Oce1.put_sig64 buf fetch.call.signature;
+    Octra_net.Oce1.put_string buf fetch.target;
+    Octra_net.Oce1.put_u64 buf fetch.epoch_id;
+    Octra_net.Oce1.put_u64 buf fetch.expires_epoch;
+    Octra_net.Oce1.put_u8 buf fetch.round)
 
 let output_hash output_json =
   if String.length output_json > max_output_bytes then
@@ -188,7 +408,8 @@ let put_request buf (request : Certificate.request) =
   Octra_net.Oce1.put_u32_int buf request.input_bytes;
   Octra_net.Oce1.put_u32_int buf request.max_output_bytes
 
-let get_request cursor =
+let get_request ?(fuel_limit = None) ?(guest_bytes = None) ?(memory_bytes = None)
+    ?(unit_price = None) ?(fee_cap = None) cursor =
   let chain_id = Octra_net.Oce1.get_string_bounded ~max:max_chain_id_bytes cursor in
   let epoch_id = Octra_net.Oce1.get_u64 cursor in
   let expires_epoch = Octra_net.Oce1.get_u64 cursor in
@@ -209,6 +430,11 @@ let get_request cursor =
   let input_bytes = Octra_net.Oce1.get_u32_int cursor in
   let max_output_bytes = Octra_net.Oce1.get_u32_int cursor in
   ({
+    unit_price;
+    fee_cap;
+    memory_bytes;
+    guest_bytes;
+    fuel_limit;
     chain_id = chain_id;
     epoch_id = epoch_id;
     expires_epoch = expires_epoch;
@@ -229,6 +455,50 @@ let get_request cursor =
     input_bytes = input_bytes;
     max_output_bytes = max_output_bytes;
   } : Certificate.request)
+
+let get_memory cursor =
+  Int64.to_int (Int64.logand (Int64.of_int32 (Octra_net.Oce1.get_u32 cursor)) 0xffff_ffffL)
+
+let encode_header (value : header) =
+  if not (header_shape value) then invalid_arg "compute header shape";
+  let open Octra_net.Oce1 in
+  encode (fun buffer ->
+    put_string buffer "compute_header";
+    put_option put_u64 buffer value.valid_until;
+    put_option put_u32_int buffer value.request.fuel_limit;
+    put_option put_u32_int buffer value.request.guest_bytes;
+    put_option put_u32_int buffer value.request.memory_bytes;
+    put_option put_u64 buffer value.request.unit_price;
+    put_option put_u64 buffer value.request.fee_cap;
+    put_request buffer value.request;
+    put_hash32 buffer value.caller_public_key;
+    put_sig64 buffer value.caller_signature;
+    put_string buffer value.coordinator;
+    put_sig64 buffer value.signature)
+
+let decode_header raw =
+  if String.length raw > 2048 then Error "compute header size"
+  else try
+    let open Octra_net.Oce1 in
+    decode (fun cursor ->
+      if get_string_bounded ~max:14 cursor <> "compute_header" then
+        invalid_arg "compute header format";
+      let valid_until = get_option get_u64 cursor in
+      let fuel_limit = get_option get_u32_int cursor in
+      let guest_bytes = get_option get_u32_int cursor in
+      let memory_bytes = get_option get_memory cursor in
+      let unit_price = get_option get_u64 cursor in
+      let fee_cap = get_option get_u64 cursor in
+      let request = get_request ~fuel_limit ~guest_bytes ~memory_bytes ~unit_price ~fee_cap cursor in
+      let caller_public_key = get_hash32 cursor in
+      let caller_signature = get_sig64 cursor in
+      let coordinator = get_string_bounded ~max:max_node_id_bytes cursor in
+      let signature = get_sig64 cursor in
+      let value = {request; valid_until; caller_public_key; caller_signature; coordinator; signature} in
+      if header_shape value then Ok value else Error "compute header shape") raw
+  with
+  | (Out_of_memory | Stack_overflow) as error -> raise error
+  | _ -> Error "compute header encoding"
 
 let put_vote buf (vote : Certificate.vote) =
   Octra_net.Oce1.put_hash32 buf vote.Certificate.request_id;
@@ -455,6 +725,100 @@ let get_reveal cursor =
     signature = signature;
   } : Selection.reveal)
 
+let put_call buf (call : call) =
+  put_request buf call.request;
+  Octra_net.Oce1.put_string buf call.method_name;
+  Octra_net.Oce1.put_string buf call.params_json;
+  Octra_net.Oce1.put_hash32 buf call.caller_public_key;
+  Octra_net.Oce1.put_sig64 buf call.caller_signature;
+  Octra_net.Oce1.put_string buf call.coordinator;
+  Octra_net.Oce1.put_sig64 buf call.signature
+
+let get_call ?(timed = false) ?(metered = false) ?(pages = false) ?(memory = false)
+    ?(priced = false) cursor =
+  let valid_until = if timed then Some (Octra_net.Oce1.get_u64 cursor) else None in
+  let fuel_limit = if metered then Some (Octra_net.Oce1.get_u32_int cursor) else None in
+  let guest_bytes = if pages then Some (Octra_net.Oce1.get_u32_int cursor) else None in
+  let memory_bytes = if memory then Some (get_memory cursor) else None in
+  let unit_price = if priced then Some (Octra_net.Oce1.get_u64 cursor) else None in
+  let fee_cap = if priced then Some (Octra_net.Oce1.get_u64 cursor) else None in
+  let request = get_request ~fuel_limit ~guest_bytes ~memory_bytes ~unit_price ~fee_cap cursor in
+  let method_name = Octra_net.Oce1.get_string_bounded ~max:max_method_bytes cursor in
+  let params_json = Octra_net.Oce1.get_string_bounded ~max:max_params_bytes cursor in
+  let caller_public_key = Octra_net.Oce1.get_hash32 cursor in
+  let caller_signature = Octra_net.Oce1.get_sig64 cursor in
+  let coordinator = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
+  let signature = Octra_net.Oce1.get_sig64 cursor in
+  {request; valid_until; method_name; params_json; caller_public_key; caller_signature; coordinator; signature}
+
+let put_expiry buf call =
+  (match call.valid_until with None -> () | Some epoch -> Octra_net.Oce1.put_u64 buf epoch);
+  (match call.request.fuel_limit with None -> () | Some fuel -> Octra_net.Oce1.put_u32_int buf fuel);
+  (match call.request.guest_bytes with None -> () | Some bytes -> Octra_net.Oce1.put_u32_int buf bytes);
+  (match call.request.memory_bytes with None -> () | Some bytes -> Octra_net.Oce1.put_u32_int buf bytes);
+  (match call.request.unit_price with None -> () | Some price -> Octra_net.Oce1.put_u64 buf price);
+  match call.request.fee_cap with None -> () | Some cap -> Octra_net.Oce1.put_u64 buf cap
+
+let put_fetch buf fetch =
+  if not (fetch_shape fetch) then invalid_arg "compute fetch shape";
+  put_expiry buf fetch.call;
+  put_call buf fetch.call;
+  Octra_net.Oce1.put_string buf fetch.target;
+  Octra_net.Oce1.put_u64 buf fetch.epoch_id;
+  Octra_net.Oce1.put_u64 buf fetch.expires_epoch;
+  Octra_net.Oce1.put_u8 buf fetch.round;
+  Octra_net.Oce1.put_sig64 buf fetch.signature
+
+let get_fetch ?(timed = false) ?(metered = false) ?(pages = false) ?(memory = false)
+    ?(priced = false) cursor =
+  let call = get_call ~timed ~metered ~pages ~memory ~priced cursor in
+  let target = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
+  let epoch_id = Octra_net.Oce1.get_u64 cursor in
+  let expires_epoch = Octra_net.Oce1.get_u64 cursor in
+  let round = Octra_net.Oce1.get_u8 cursor in
+  let signature = Octra_net.Oce1.get_sig64 cursor in
+  let fetch = {call; target; epoch_id; expires_epoch; round; signature} in
+  if not (fetch_shape fetch) then invalid_arg "compute fetch shape";
+  fetch
+
+let put_cancel buffer (cancel : cancellation) =
+  if not (cancel_shape cancel) then invalid_arg "resource compute cancellation";
+  Octra_net.Oce1.put_string buffer cancel.chain_id;
+  Octra_net.Oce1.put_string buffer cancel.caller;
+  Octra_net.Oce1.put_hash32 buffer cancel.caller_public_key;
+  Octra_net.Oce1.put_hash32 buffer cancel.session_id;
+  Octra_net.Oce1.put_sig64 buffer cancel.caller_signature;
+  Option.iter (Octra_net.Oce1.put_u64 buffer) cancel.until
+
+let get_cancel ?(timed = false) cursor =
+  let chain_id = Octra_net.Oce1.get_string_bounded ~max:max_chain_id_bytes cursor in
+  let caller = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
+  let caller_public_key = Octra_net.Oce1.get_hash32 cursor in
+  let session_id = Octra_net.Oce1.get_hash32 cursor in
+  let caller_signature = Octra_net.Oce1.get_sig64 cursor in
+  let until = if timed then Some (Octra_net.Oce1.get_u64 cursor) else None in
+  {chain_id; caller; caller_public_key; session_id; caller_signature; until}
+
+let put_cancel_round buffer (value : cancel_round) =
+  if not (cancel_round_shape value) then invalid_arg "compute cancel round shape";
+  put_cancel buffer value.cancel;
+  Octra_net.Oce1.put_string buffer value.origin;
+  Octra_net.Oce1.put_u64 buffer value.epoch;
+  Octra_net.Oce1.put_u64 buffer value.expires;
+  Octra_net.Oce1.put_u8 buffer value.round;
+  Octra_net.Oce1.put_sig64 buffer value.signature
+
+let get_cancel_round ?(timed = false) cursor =
+  let cancel = get_cancel ~timed cursor in
+  let origin = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
+  let epoch = Octra_net.Oce1.get_u64 cursor in
+  let expires = Octra_net.Oce1.get_u64 cursor in
+  let round = Octra_net.Oce1.get_u8 cursor in
+  let signature = Octra_net.Oce1.get_sig64 cursor in
+  let value = {cancel; origin; epoch; expires; round; signature} in
+  if not (cancel_round_shape value) then invalid_arg "compute cancel round shape";
+  value
+
 let encode message =
   Octra_net.Oce1.encode (fun buf ->
     match message with
@@ -471,16 +835,46 @@ let encode message =
       Octra_net.Oce1.put_u8 buf 4;
       put_reveal buf reveal
     | Call call ->
-      Octra_net.Oce1.put_u8 buf 5;
-      put_request buf call.request;
-      Octra_net.Oce1.put_string buf call.method_name;
-      Octra_net.Oce1.put_string buf call.params_json;
-      Octra_net.Oce1.put_hash32 buf call.caller_public_key;
-      Octra_net.Oce1.put_sig64 buf call.caller_signature;
-      Octra_net.Oce1.put_string buf call.coordinator;
-      Octra_net.Oce1.put_sig64 buf call.signature
+      Octra_net.Oce1.put_u8 buf (if Option.is_some call.request.unit_price then 22
+        else if Option.is_some call.request.memory_bytes then 19
+        else if Option.is_some call.request.guest_bytes then 16
+        else if Option.is_some call.request.fuel_limit then 13
+        else if Option.is_some call.valid_until then 10 else 5);
+      put_expiry buf call;
+      put_call buf call
     | Result result ->
       Octra_net.Oce1.put_u8 buf 6;
+      put_vote buf result.vote;
+      Octra_net.Oce1.put_string buf result.output_json
+    | Cancel cancel ->
+      Octra_net.Oce1.put_u8 buf (if cancel.until = None then 7 else 27);
+      put_cancel buf cancel
+    | Cancel_round value ->
+      Octra_net.Oce1.put_u8 buf (if value.cancel.until = None then 25 else 28);
+      put_cancel_round buf value
+    | Cancel_ack value ->
+      if not (cancel_ack_shape value) then invalid_arg "compute cancel ack shape";
+      Octra_net.Oce1.put_u8 buf (if value.delivery.cancel.until = None then 26 else 29);
+      put_cancel_round buf value.delivery;
+      Octra_net.Oce1.put_hash32 buf value.origin_key;
+      Octra_net.Oce1.put_string buf value.node_id;
+      Octra_net.Oce1.put_hash32 buf value.node_key;
+      Octra_net.Oce1.put_u64 buf value.epoch;
+      Octra_net.Oce1.put_sig64 buf value.signature
+    | Fetch fetch ->
+      Octra_net.Oce1.put_u8 buf (if Option.is_some fetch.call.request.unit_price then 23
+        else if Option.is_some fetch.call.request.memory_bytes then 20
+        else if Option.is_some fetch.call.request.guest_bytes then 17
+        else if Option.is_some fetch.call.request.fuel_limit then 14
+        else if Option.is_some fetch.call.valid_until then 11 else 8);
+      put_fetch buf fetch
+    | Answer (fetch, result) ->
+      Octra_net.Oce1.put_u8 buf (if Option.is_some fetch.call.request.unit_price then 24
+        else if Option.is_some fetch.call.request.memory_bytes then 21
+        else if Option.is_some fetch.call.request.guest_bytes then 18
+        else if Option.is_some fetch.call.request.fuel_limit then 15
+        else if Option.is_some fetch.call.valid_until then 12 else 9);
+      put_fetch buf fetch;
       put_vote buf result.vote;
       Octra_net.Oce1.put_string buf result.output_json)
 
@@ -492,23 +886,12 @@ let decode payload =
       | 2 -> Capability (get_capability cursor)
       | 3 -> Commitment (get_commitment cursor)
       | 4 -> Reveal (get_reveal cursor)
-      | 5 ->
-        let request = get_request cursor in
-        let method_name = Octra_net.Oce1.get_string_bounded ~max:max_method_bytes cursor in
-        let params_json = Octra_net.Oce1.get_string_bounded ~max:max_params_bytes cursor in
-        let caller_public_key = Octra_net.Oce1.get_hash32 cursor in
-        let caller_signature = Octra_net.Oce1.get_sig64 cursor in
-        let coordinator = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
-        let signature = Octra_net.Oce1.get_sig64 cursor in
-        Call {
-          request;
-          method_name;
-          params_json;
-          caller_public_key;
-          caller_signature;
-          coordinator;
-          signature;
-        }
+      | 5 -> Call (get_call cursor)
+      | 10 -> Call (get_call ~timed:true cursor)
+      | 13 -> Call (get_call ~timed:true ~metered:true cursor)
+      | 16 -> Call (get_call ~timed:true ~metered:true ~pages:true cursor)
+      | 19 -> Call (get_call ~timed:true ~metered:true ~pages:true ~memory:true cursor)
+      | 22 -> Call (get_call ~timed:true ~metered:true ~pages:true ~memory:true ~priced:true cursor)
       | 6 ->
         let vote = get_vote cursor in
         let output_json = Octra_net.Oce1.get_string_bounded ~max:max_output_bytes cursor in
@@ -516,5 +899,31 @@ let decode payload =
           vote;
           output_json;
         }
+      | 7 -> Cancel (get_cancel cursor)
+      | 27 -> Cancel (get_cancel ~timed:true cursor)
+      | 25 -> Cancel_round (get_cancel_round cursor)
+      | 28 -> Cancel_round (get_cancel_round ~timed:true cursor)
+      | (26 | 29) as tag ->
+        let delivery = get_cancel_round ~timed:(tag = 29) cursor in
+        let origin_key = Octra_net.Oce1.get_hash32 cursor in
+        let node_id = Octra_net.Oce1.get_string_bounded ~max:max_node_id_bytes cursor in
+        let node_key = Octra_net.Oce1.get_hash32 cursor in
+        let epoch = Octra_net.Oce1.get_u64 cursor in
+        let signature = Octra_net.Oce1.get_sig64 cursor in
+        let value = {delivery; origin_key; node_id; node_key; epoch; signature} in
+        if not (cancel_ack_shape value) then invalid_arg "compute cancel ack shape";
+        Cancel_ack value
+      | 8 -> Fetch (get_fetch cursor)
+      | 11 -> Fetch (get_fetch ~timed:true cursor)
+      | 14 -> Fetch (get_fetch ~timed:true ~metered:true cursor)
+      | 17 -> Fetch (get_fetch ~timed:true ~metered:true ~pages:true cursor)
+      | 20 -> Fetch (get_fetch ~timed:true ~metered:true ~pages:true ~memory:true cursor)
+      | 23 -> Fetch (get_fetch ~timed:true ~metered:true ~pages:true ~memory:true ~priced:true cursor)
+      | (9 | 12 | 15 | 18 | 21 | 24) as tag ->
+        let fetch = get_fetch ~timed:(tag <> 9) ~metered:(tag >= 15) ~pages:(tag >= 18)
+          ~memory:(tag >= 21) ~priced:(tag = 24) cursor in
+        let vote = get_vote cursor in
+        let output_json = Octra_net.Oce1.get_string_bounded ~max:max_output_bytes cursor in
+        Answer (fetch, {vote; output_json})
       | _ -> failwith "bad resource compute message tag")
     payload

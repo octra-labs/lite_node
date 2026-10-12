@@ -53,10 +53,30 @@ let kept = [
   Some ("hfhe_v1|" ^ Base64.encode_exn (String.make 140_000 'x'));
 ]
 
-let unknown = [
-  "v2|legacy"; String.make 140_000 'z'; " hfhe_v1|payload";
+let foreign = [
+  "v2|" ^ Base64.encode_exn (String.make 29 '\001');
+  Base64.encode_exn (String.make 33 '\002');
+]
+
+let unknown = foreign @ [
+  String.make 140_000 'z'; " hfhe_v1|payload";
   "\000\255cipher"; "0 "; "00"; "HFHE_v1|payload";
 ]
+
+let test_foreign () =
+  let module M = Octra_core.Pvac_migration in
+  List.iter (fun cipher ->
+    expect "non-HFHE decoding refuses"
+      (Octra_core.Crypto.FheBalance.decode_cipher cipher = Error "not FHE cipher");
+    expect "non-HFHE format stays foreign" (M.classify_cipher cipher = M.Foreign);
+    List.iter (fun key ->
+      let status = M.status_of_classes (M.classify_cipher cipher) key in
+      expect "non-HFHE cannot migrate" (status.route = M.Blocked);
+      List.iter (fun active ->
+        expect "non-HFHE cannot use history" (not (M.history_route ~active status))
+      ) [false; true]
+    ) [M.Current; M.Historical; M.Missing]
+  ) foreign
 
 let test_formats () =
   List.iter (fun cipher ->
@@ -198,6 +218,7 @@ let test_disk_kept layout create =
     ) [false; true; false])
 
 let () =
+  test_foreign ();
   test_formats ();
   List.iter (fun layout ->
     List.iter (fun create ->

@@ -82,7 +82,10 @@ let of_op = function
   | Transaction.ValidatorExit
   | Transaction.ValidatorWithdraw
   | Transaction.ValidatorEvidence
+  | Transaction.ComputeReturn
   | Transaction.Op01Burn -> Standard
+  | Transaction.ComputeFund
+  | Transaction.ComputeSettle
   | Transaction.ContractDeploy
   | Transaction.ContractCall
   | Transaction.ProgramExec

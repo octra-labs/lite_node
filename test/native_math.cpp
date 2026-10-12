@@ -2,6 +2,7 @@
 // Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 #include "pvac_serialize.hpp"
+#include "pvac/ops/recrypt_legacy.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -744,6 +745,75 @@ bool field_eq(const pvac::Fp& a, const pvac::Fp& b) {
     return a.lo == b.lo && a.hi == b.hi;
 }
 
+void recrypt_cases() {
+    using namespace pvac;
+    PubKey key;
+    SecKey secret;
+    const uint8_t seed[32] = {79};
+    keygen_from_seed(Params{}, key, secret, seed);
+    const auto input = enc(key, secret, uint64_t{2});
+    const auto material = make_recrypt_key(key, secret, 64, recrypt_prod_budget());
+    check(recrypt_key_safe(key, material), "recrypt key rejected");
+    auto output = recrypt_result(key, material, input);
+    check(output.has_compact && !output.has_cipher, "recrypt result shape");
+    check(recrypt_compact_verify(key, material, input, output.compact), "recrypt metadata rejected");
+    check(!recrypt_verify(key, material, input, output), "metadata accepted as recrypt");
+    output.has_cipher = true;
+    output.cipher = input;
+    check(!recrypt_verify(key, material, input, output), "copied input accepted as recrypt");
+    output.has_compact = false;
+    check(!recrypt_verify(key, material, input, output), "missing metadata accepted");
+    const auto other = enc(key, secret, uint64_t{3});
+    check(!recrypt_compact_verify(key, material, other, output.compact), "recrypt input mismatch");
+    bool rejected = false;
+    try {
+        (void)recrypt_result(key, material, input, nat_chain(), 0, true);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()) == "pvac: recrypt mode rejected";
+    }
+    check(rejected, "missing evaluator emitted a cipher");
+
+    const auto source = ct_add(key, input, other);
+    const auto rows = make_recrypt_key_seeded(key, secret, source, 2, seed);
+    const auto audit = audit_recrypt_public_key(source, rows);
+    check(audit.rank.size() == 1 && audit.rank[0] == 2 &&
+        audit.quotient[0] == 2 && !audit.reusable_public_safe, "linear recrypt audit");
+    rejected = false;
+    try {
+        require_recrypt_reusable_public_safe(source, rows);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()) == "pvac: public recrypt key leaks quotient relations";
+    }
+    check(rejected, "linear key accepted for public reuse");
+    std::array<Fp, 3> weights;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const auto left = (i + 1) % weights.size();
+        const auto right = (i + 2) % weights.size();
+        weights[i] = fp_sub(fp_mul(rows.mix[left][0][0], rows.mix[right][1][0]),
+            fp_mul(rows.mix[right][0][0], rows.mix[left][1][0]));
+    }
+    check(std::any_of(weights.begin(), weights.end(),
+        [](const auto& value) { return value.lo || value.hi; }), "linear relation is zero");
+    auto disclosed = fp_from_u64(0);
+    auto expected = fp_from_u64(0);
+    auto first = fp_from_u64(0);
+    auto second = fp_from_u64(0);
+    const auto inverses = recrypt_layer_inv(key, secret, source);
+    for (size_t i = 0; i < weights.size(); ++i) {
+        disclosed = fp_add(disclosed, fp_mul(weights[i], rows.bias[i][0]));
+        expected = fp_add(expected, fp_mul(weights[i], inverses[i][0]));
+        first = fp_add(first, fp_mul(weights[i], rows.mix[i][0][0]));
+        second = fp_add(second, fp_mul(weights[i], rows.mix[i][1][0]));
+    }
+    check(field_eq(first, fp_from_u64(0)) && field_eq(second, fp_from_u64(0)),
+        "linear relation leaves a secret coefficient");
+    check(field_eq(disclosed, expected), "public linear relation differs");
+    check(field_eq(dec1(key, secret, source), fp_from_u64(5)), "recrypt source value");
+    const auto clean = ct_recrypt_apply_seeded(key, rows, source, seed);
+    check(clean.L.size() == 2 && clean.L.size() < source.L.size(), "linear output size");
+    check(field_eq(dec1(key, secret, clean), fp_from_u64(5)), "linear output value");
+}
+
 void cipher_math_cases() {
     using namespace pvac;
     Params params;
@@ -857,6 +927,7 @@ int main(int argc, char** argv) {
         if (mode == "all" || mode == "build") build_cases();
         if (mode == "all" || mode == "circuit") circuit_cases();
         if (mode == "all" || mode == "cipher") cipher_math_cases();
+        if (mode == "all" || mode == "recrypt") recrypt_cases();
 #ifdef PVAC_C_API
         if (mode == "all" || mode == "api") api_proof_cases();
 #endif

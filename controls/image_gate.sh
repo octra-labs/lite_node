@@ -4,7 +4,12 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
+BUILD_DIR=${OCTRA_BUILD_DIR:-$ROOT/runtime_data/_build_image}
+MODE=${1:-}
+if [ "$#" -gt 1 ] || { [ -n "$MODE" ] && [ "$MODE" != --flat ]; }; then
+  printf 'event = gate name = image status = fail reason = arguments\n' >&2
+  exit 2
+fi
 cd "$ROOT"
 opam exec -- dune build --root . --build-dir "$BUILD_DIR" --profile release \
   bin/octra_state_sync_manifest.exe \
@@ -17,7 +22,14 @@ for name in driver_boot journal_hash sync_files image_count image state_sync_cli
   if [ "$name" = sync_chain ]; then
     set -- "$@" "$BUILD_DIR/default/bin/octra_state_sync_manifest.exe"
   fi
+  if [ "$name" = image ] && [ "$MODE" = --flat ]; then
+    set -- "$@" --flat
+  fi
   opam exec -- "$@"
 done
-sh controls/proof_gate.sh formal/coq/sync_chain.v
+PROOF="$ROOT/runtime_data/image-proof-$$"
+mkdir -p "$PROOF/controls" "$PROOF/formal/coq"
+cp controls/proof_gate.sh "$PROOF/controls/proof_gate.sh"
+cp formal/coq/sync_chain.v "$PROOF/formal/coq/sync_chain.v"
+sh "$PROOF/controls/proof_gate.sh" formal/coq/sync_chain.v
 printf 'event = gate name = image status = pass\n'

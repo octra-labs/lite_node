@@ -10,6 +10,7 @@ type deps = {
   chaindata : Octra_core.Store_chaindata.t;
   program_trust : Octra_vm.Program_trust.t;
   object_cost : bool;
+  cipher_mode : Octra_core.Rule_graph.mode;
   wallet_addr : string;
   pre_state_hash : string;
   fold : int -> (Octra_core.Epoch_exec.fold_ctx, string) result;
@@ -48,7 +49,7 @@ let trace_enc_balance ~short op_name addr current_str new_str =
     (String.length current_str)
     (String.length new_str)
 
-let run deps sender_txs =
+let run ?compute deps sender_txs =
   Octra_core.Chaos.inject "process_sender_txs:enter";
   let had_encrypted_debit = ref false in
   let handle_sender_tx (raw_ctx : Sender.tx_context) =
@@ -116,11 +117,12 @@ let run deps sender_txs =
         tag
         reason
     in
-    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec =
+    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec, vm_bytes =
       match deps.fold (deps.current_epoch ()) with
       | Ok fold ->
         fold.Octra_core.Epoch_exec.standard_mode, fold.program_mode,
-        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float, fold.proof_exec
+        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float, fold.proof_exec,
+        fold.vm_bytes
       | Error reason -> failwith reason
     in
     let vm_tx_deps =
@@ -139,6 +141,7 @@ let run deps sender_txs =
           program_overlap;
           fhe_work;
           proof_exec;
+          vm_bytes;
           wasm_float;
           math;
           current_epoch = deps.current_epoch;
@@ -163,6 +166,7 @@ let run deps sender_txs =
       Sender.live_epoch_exec_deps
         ~backend:(fun () ->
           Octra_core.Epoch_exec.make_live_backend
+            ?compute
             ~fold:deps.fold
             ~proof_mode
             ~math
@@ -198,6 +202,7 @@ let run deps sender_txs =
           epoch_exec_deps
           ~process:(fun ~backend ~current_epoch tx ->
             Octra_core.Epoch_exec.process_circle_operation_tx
+              ~inspect_mode:vm_bytes
               ~backend
               ~current_epoch
               tx)
@@ -289,6 +294,7 @@ let run deps sender_txs =
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
+                  cipher_mode = deps.cipher_mode;
                   legacy_replay = (fun address ->
                     let cipher =
                       match Octra_core.Ledger.find_opt deps.ledger address with
@@ -372,6 +378,15 @@ let run deps sender_txs =
                 epoch_exec_deps
                 ~process:Octra_core.Epoch_exec.process_standard_tx
                 tx
+            | ComputeFund | ComputeReturn | ComputeSettle ->
+              let* result = Octra_core.Epoch_exec.process_compute_effect
+                ~backend:(epoch_exec_deps.backend ()) ~env:(epoch_exec_deps.standard_env ()) tx in
+              (match result with
+              | Ok (Octra_core.Epoch_exec.Confirmed _) -> confirm_current_tx ()
+              | Ok (Octra_core.Epoch_exec.Rejected_after_fee rejected) ->
+                deps.confirmed_fees := Z.add !(deps.confirmed_fees) rejected.fee;
+                reject_current_tx ~persist_state:true rejected.error_type rejected.reason
+              | Error (tag, reason) -> reject_current_tx tag reason)
             | ContractUpgrade ->
               Consensus_epoch_vm_shell.run_program_upgrade_tx
                 vm_tx_deps.runtime

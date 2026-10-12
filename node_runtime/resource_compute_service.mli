@@ -18,16 +18,27 @@ type deps = {
   validator_set : unit -> Octra_consensus.C_types.validator_set;
   head : unit -> head option;
   state_root_at : int64 -> string option;
+  funding : head -> Octra_consensus.Resource_compute_protocol.header ->
+    (Octra_core.Compute_funding.funded option, string) result Lwt.t;
   self_test :
     unit ->
     (Resource_compute_provider_rpc.self_test, string) result Lwt.t;
   nonce : unit -> string;
   broadcast : string -> unit Lwt.t;
+  send : peer:string -> string -> unit Lwt.t;
+  cancel_rounds : unit -> bool;
+  now : unit -> int64;
   relay : source:string -> string -> unit Lwt.t;
   sleep : float -> unit Lwt.t;
 }
 
 type request = {
+  unit_price : int64 option;
+  fee_cap : int64 option;
+  memory_bytes : int option;
+  guest_bytes : int option;
+  fuel_limit : int option;
+  valid_until : int64 option;
   model_epoch : int64;
   model_state_root : string;
   circle_id : string;
@@ -52,16 +63,27 @@ type response = {
   selection : Octra_consensus.Resource_compute_selection.selection;
 }
 
+type cancel_status = {
+  selection_root : string;
+  members : string list;
+  missing : string list;
+  receipts : Octra_consensus.Resource_compute_protocol.cancel_ack list;
+  expires : int64 option;
+}
+
 type job_status =
   | Waiting
+  | Funding of Octra_consensus.Resource_compute_protocol.header
   | Finished of response
   | Refused of string
+  | Cancelled of cancel_status
 
 type cancellation = {
   caller : string;
   caller_public_key : string;
   caller_signature : string;
   session_id : string;
+  until : int64 option;
 }
 
 type t
@@ -69,6 +91,7 @@ type t
 val create :
   deps:deps ->
   provider:provider option ->
+  history:(Octra_core.Compute_history.t, string) result ->
   t
 
 val on_message :
@@ -85,13 +108,12 @@ val compute :
 val submit :
   t ->
   request ->
-  (string, string) result Lwt.t
+  (string * string, string) result Lwt.t
 
 val status :
   t ->
-  caller:string ->
-  job_id:string ->
-  job_status option Lwt.t
+  Compute_read.t ->
+  (job_status option, string) result Lwt.t
 
 val cancellation_sign_bytes :
   chain_id:string ->
@@ -104,6 +126,10 @@ val cancel :
   t ->
   cancellation ->
   (int, string) result Lwt.t
+
+val cancel_receipts :
+  t -> cancellation ->
+  (Octra_consensus.Resource_compute_protocol.cancel_ack list, string) result Lwt.t
 
 val active_jobs :
   t ->

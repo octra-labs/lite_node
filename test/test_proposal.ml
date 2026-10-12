@@ -656,7 +656,7 @@ let exec_result ~confirmed ~rejected ~post_state_root =
       rejected =
         List.map
           (fun item ->
-            { tx = item; error_type = "bad"; reason = "rejected" })
+            { tx = item; error_type = "bad"; reason = "rejected"; charged = false })
           rejected;
       confirmed_fees = Z.zero;
       tx_count = List.length confirmed + List.length rejected;
@@ -789,6 +789,33 @@ let test_circle_budget () =
     expect "circle excess budget cannot block proposal" (Option.is_some (run_make_proposal deps))) [0; 1];
   expect "circle excess omitted before preview"
     (List.for_all (fun request -> request.C.txs = [ordinary]) !(probe.preview_requests))
+
+let test_compute_budget () =
+  let module Bill = Octra_core.Compute_bill in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch = (Option.get (Octra_core.Rule_graph.vm_bytes_activation_for_chain chain_id)).activation_epoch in
+  let public_key = Base64.encode_exn (String.make 32 'p') in
+  let message = Bill.encode_request ~fuel:100_000 ["selection payload"] in
+  let item = {(tx 1) with Transaction.op_type = ComputeSettle;
+    from = Octra_core.Crypto.Address.address_from_pubkey public_key;
+    to_ = Octra_core.Compute_funding.escrow;
+    signature = Base64.encode_exn (String.make 64 '\000');
+    public_key = Some public_key; message = Some message; ou = Bill.fee message} in
+  let limits = C.limits ~max_txs:100 ~max_bytes:1_000_000 ~max_ou:(Z.of_int 10_000_000) in
+  let run height =
+    let deps, probe = make_proposal_deps ~current_epoch:height ~staging:[item] () in
+    let plan = Lwt_main.run (C.make_proposal deps ~chain_id ~root_to_raw32:Fun.id
+      ~limits ~epoch_id:(Int64.of_int height)) in
+    expect "compute payment proposal missing" (Option.is_some plan);
+    probe in
+  let before = run (epoch - 1) in
+  expect "compute payment selected before activation"
+    (List.for_all (fun request -> request.C.txs = []) !(before.preview_requests));
+  let probe = run epoch in
+  expect "compute payment reached preview without rule"
+    (List.for_all (fun request -> request.C.txs = []) !(probe.preview_requests));
+  expect "compute payment reached proposal without rule"
+    (List.for_all (fun (txs, hashes) -> txs = [] && hashes = []) !(probe.set_proposals))
 
 let test_build_head_progress () =
   List.iter (fun phase ->
@@ -975,6 +1002,39 @@ let test_make_preview_rejections () =
    | _ ->
      fail "make stored bundle");
   expect "make freeze" (List.length !(probe.frozen_writes) = 1)
+
+let test_paid_proposal () =
+  let paid = tx 1 in
+  let unpaid = { (tx 1) with from = "oct_other" } in
+  let calls = ref 0 in
+  let preview request =
+    incr calls;
+    expect "paid request disappeared" (List.mem paid request.C.txs);
+    let rejected = List.map (fun item -> Octra_core.Epoch_exec.{
+      tx = item; error_type = "compute_fund_failed"; reason = "input refused";
+      charged = item = paid}) request.txs in
+    Ok Octra_core.Epoch_exec.{post_state_root = raw 'q'; artifacts = {
+      confirmed = []; rejected; confirmed_fees = paid.ou; tx_count = 0}} in
+  let deps, probe = make_proposal_deps ~staging:[paid; unpaid]
+    ~preview_result:preview () in
+  expect "paid proposal absent" (Option.is_some (run_make_proposal deps));
+  expect "paid proposal retry count" (!calls = 2);
+  match !(probe.stored_bundles) with
+  | [_, [], [], receipts] ->
+    let module O = Octra_core.Tx_outcome in
+    let outcomes = Result.get_ok (O.decode ~confirmed:[] receipts) in
+    let inputs = Result.get_ok (O.merge ~confirmed:[] ~rejections:outcomes.rejections) in
+    expect "paid receipt missing"
+      (List.exists (fun (item : O.rejection) -> item.tx = paid && item.charged) outcomes.rejections);
+    expect "paid execution missing" (O.executed ~confirmed:[] outcomes.rejections = [paid]);
+    expect "paid verification failed" (Result.is_ok (C.verify_preview_partition
+      ~inputs ~confirmed:[] ~rejections:outcomes.rejections (preview { C.epoch_id = 12L;
+        epoch_ts = 1.; proposal_id = "paid"; expected_prev_root = raw 'p';
+        prev_state_root = raw 'p'; parent_commit = None; proposer = "oct_creator";
+        validator_pubkeys = []; preverify = Octra_core.Preverify_commit.create []; txs = inputs })));
+    let forged = List.map (fun (item : O.rejection) -> {item with charged = false}) outcomes.rejections in
+    expect "unpaid marker accepted" (not (O.equal forged outcomes.rejections))
+  | _ -> fail "paid bundle changed"
 
 let test_private_apply_slot () =
   let item key ou =
@@ -1849,6 +1909,7 @@ let test_preview_output_reject_retry () =
           tx = rejected;
           error_type = "bad";
           reason = "rejected";
+          charged = false;
         }];
         confirmed_fees = Z.zero;
         tx_count = 2;
@@ -2362,6 +2423,7 @@ let outcome_preview ~accepted ~rejected ~reason request =
           tx = rejected;
           error_type = "program_exec_failed";
           reason;
+          charged = false;
         }];
         confirmed_fees = Z.zero;
         tx_count = 2;
@@ -2400,6 +2462,131 @@ let test_verify_reproduced_rejection () =
   expect "rejection outcome previews" (List.length !previews = 2);
   expect "rejection outcome proposal"
     (!set_proposals = [([accepted], [Transaction.hash accepted])])
+
+let test_verify_paid () =
+  let key = "OCTRA_BFT_RELEASE_PROFILE" in
+  let prior = Sys.getenv_opt key in
+  let check () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let height = (Option.get (Octra_core.Rule_graph.vm_bytes_activation_for_chain chain_id)).activation_epoch in
+  let epoch_id = Int64.of_int height in
+  let public_key = Base64.encode_exn (String.make 32 'p') in
+  let paid = {(tx ~message:"{}" ~ou:10000 1) with op_type = Transaction.ComputeFund;
+    from = Octra_core.Crypto.Address.address_from_pubkey public_key;
+    to_ = Octra_core.Compute_funding.escrow; public_key = Some public_key;
+    signature = Base64.encode_exn (String.make 64 '\000')} in
+  let outcomes = Octra_core.Tx_outcome.build ~charged:[paid] ~inputs:[paid]
+    [paid, "compute_fund_failed", "input refused"] |> Result.get_ok in
+  let receipts = Octra_core.Tx_outcome.encode [] outcomes in
+  let base = proposal_for_txs [] in
+  let root = folded_root ~ledger_state_root:(raw 'q')
+    ~epoch_index_root:(eic_root ~epoch_id:height ~tx_hashes:[] ~start_txid:7L
+      ~prev_eic_root:Octra_core.Epoch_index_commitment.genesis_root) in
+  let proposal = {base with C_types.chain_id; epoch_id;
+    header = {base.header with chain_id; epoch_id; receipt_root = C_hash.receipt_root receipts;
+      proposed_state_root = root}} in
+  let calls = ref 0 in
+  let prepare request =
+    incr calls;
+    expect "validator omitted paid execution" (request.C.txs = [paid]);
+    Lwt.return_ok C.{preverify = Octra_core.Preverify_commit.create [];
+      execution = Octra_core.Epoch_exec.{post_state_root = raw 'q'; artifacts = {
+        confirmed = []; rejected = [{tx = paid; error_type = "compute_fund_failed";
+          reason = "input refused"; charged = true}]; confirmed_fees = paid.ou; tx_count = 1}}} in
+  let bundle = F.{txs = []; receipts_json = receipts; rejections = outcomes} in
+  let deps, _, _, _, _, _, _, _ = verify_proposal_deps
+    ~cached_bundle:(fun ~proposal_id:_ -> Some bundle)
+    ~preview_result:(fun _ -> fail "validator skipped prepared execution") () in
+  expect "ordered validator refused paid outcome"
+    (verdict_accepts (Lwt_main.run (C.verify_proposal ~prepare deps ~chain_id proposal)));
+  expect "ordered paid execution not checked" (!calls >= 2) in
+  Unix.putenv key "devnet_full_v1";
+  Fun.protect check ~finally:(fun () -> Unix.putenv key (Option.value prior ~default:""))
+
+let test_receipt_order () =
+  let key = "OCTRA_BFT_RELEASE_PROFILE" in
+  let prior = Sys.getenv_opt key in
+  Unix.putenv key "devnet_full_v1";
+  Fun.protect ~finally:(fun () -> Unix.putenv key (Option.value prior ~default:"")) (fun () ->
+    let chain_id = "octra-devnet-9871-cluster" in
+    let activation = (Option.get
+      (Octra_core.Rule_graph.vm_bytes_activation_for_chain chain_id)).activation_epoch in
+    let module Receipt = Octra_core.Preverify_receipt in
+    let module Gate = Octra_core.Preverify_commit in
+    let items = List.init 2 (fun index ->
+      let who = Circle_proposal.identity (index + 10) in
+      let op_type, method_ = if index = 0 then Transaction.CircleCall, Some "run"
+        else Transaction.EncryptOp, None in
+      Circle_proposal.signed who ~op_type ~to_:who.address
+        ~nonce:1 ~message:"[]" ~method_) |> Transaction.consensus_order in
+    let make_receipt item =
+      if item.Transaction.op_type <> Transaction.CircleCall then
+        let state = Receipt.{pre_state_hash = String.make 64 'a';
+          source_cipher_hash = String.make 64 'b'; pvac_key_hash = String.make 64 'c';
+          transition_hash = None} in
+        Receipt.for_tx_bound ~input_hash:(W.bound_input_hash item state)
+          ~output_hash:(W.bound_output_hash item state "ok") ~state ~ok:true ~reason:"" item
+        |> Result.get_ok
+      else
+      let circle = Receipt.{snapshot_hash = String.make 64 'a'; circle_id = item.Transaction.to_;
+        code_hash = String.make 64 'b'; stable_root = String.make 64 'c';
+        public_reads_hash = String.make 64 'd'; context_hash = String.make 64 'e'; transcript = []} in
+      Receipt.make_circle ~tx_hash:(Transaction.hash item)
+        ~input_hash:(W.circle_input_hash item circle)
+        ~output_hash:(W.circle_output_hash item circle "ok")
+        ~circle ~ok:true ~reason:"" ~cost:(Octra_core.Resource_lanes.cost item)
+      |> Result.get_ok in
+    let batch items = W.{ready = List.map (fun tx ->
+      {tx; receipt = if tx.Transaction.op_type = Transaction.ComputeFund then None
+        else Some (make_receipt tx)}) items; skipped = []} in
+    let prepare request =
+      let rejected, confirmed = List.partition (fun item ->
+        item.Transaction.op_type = Transaction.ComputeFund) request.C.txs in
+      let confirmed = Transaction.consensus_order confirmed in
+      let execution = exec_result ~confirmed ~rejected ~post_state_root:(raw 'l')
+        |> Result.get_ok in
+      let artifacts = execution.Octra_core.Epoch_exec.artifacts in
+      let execution = {execution with artifacts = {artifacts with
+        rejected = List.map (fun row -> {row with Octra_core.Epoch_exec.charged = true}) artifacts.rejected;
+        confirmed_fees = List.fold_left (fun sum item -> Z.add sum item.Transaction.ou) Z.zero rejected}} in
+      Lwt.return_ok C.{execution; preverify = Gate.create (List.map make_receipt confirmed)} in
+    List.iter (fun height -> List.iter (fun (count, with_paid) ->
+      let confirmed = List.filteri (fun index _ -> index < count) items in
+      let paid = if with_paid then [Circle_proposal.signed (Circle_proposal.identity 12)
+        ~op_type:Transaction.ComputeFund ~to_:Octra_core.Compute_funding.escrow
+        ~nonce:1 ~message:"{}" ~method_:None] else [] in
+      let staging = List.rev confirmed @ paid in
+      if count = 2 then expect "receipt order case has equal input and execution"
+        (List.rev confirmed <> confirmed);
+      let deps, probe = make_proposal_deps ~current_epoch:height ~staging
+        ~build_preverify_once:(fun ~state_root:_ ~tx_hashes:_ txs -> Lwt.return (batch txs)) () in
+      let plan = Lwt_main.run (C.make_proposal ~prepare deps ~chain_id
+        ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:(Int64.of_int height))
+        |> Option.get in
+      expect "ordered proposal changed transaction order"
+        (plan.tx_hashes = List.map Transaction.hash confirmed);
+      let bundle = match !(probe.stored_bundles) with
+        | [_, _, txs, receipts_json] -> F.{txs; receipts_json; rejections = []}
+        | _ -> fail "ordered proposal bundle absent" in
+      let proposal = C_types.{chain_id; epoch_id = Int64.of_int height; round = 0;
+        valid_round = None; header = plan.header; tx_hashes = plan.tx_hashes;
+        parent_commit = plan.parent_commit; proposer = plan.header.creator_addr; signature = "sig"} in
+      let deps, _, _, _, _, _, _, _ = verify_proposal_deps ~staging
+        ~cached_bundle:(fun ~proposal_id:_ -> Some bundle)
+        ~validate_preverify_once:(fun ~state_root:_ ~tx_hashes:_ txs -> Lwt.return (batch txs)) () in
+      expect "validator refused execution-ordered receipts"
+        (verdict_accepts (Lwt_main.run (C.verify_proposal ~prepare deps ~chain_id proposal)));
+      let artifacts = Octra_core.Tx_outcome.split_admit bundle.receipts_json |> Result.get_ok in
+      let expected = List.map (fun item -> Receipt.canonical (make_receipt item)) confirmed in
+      expect "proposal receipts differ from execution order" (artifacts.preverify = expected);
+      expect "paid refusal disappeared from receipt order case"
+        (List.map (fun row -> row.Octra_core.Tx_outcome.tx, row.charged) artifacts.rejections
+         = List.map (fun item -> item, true) paid);
+      expect "paid refusal disappeared from replay"
+        (Octra_core.Tx_outcome.executed ~confirmed artifacts.rejections
+         = Transaction.consensus_order (confirmed @ paid)))
+      ([1, false; 2, false] @ if height = activation then [2, true] else []))
+      [1_663_000; activation - 1; activation])
 
 let test_verify_forged_rejection () =
   let accepted = tx 1 in
@@ -3136,6 +3323,18 @@ let test_precommit_write_failure () =
   expect "write failure no pending" (!pending = [])
 
 let () =
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--order" then begin
+    test_receipt_order ();
+    print_endline "status = pass test = receipt_order";
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--compute" then begin
+    test_compute_budget ();
+    test_paid_proposal ();
+    test_verify_paid ();
+    print_endline "status = pass test = compute_proposal";
+    exit 0
+  end;
   if Array.length Sys.argv = 6 && Sys.argv.(1) = "circle-store" then
     Circle_store.child ();
   Circle_proposal.run ~limits:generous_limits
@@ -3179,6 +3378,8 @@ let () =
   test_build_head_progress ();
   test_make_reuse_frozen_bundle ();
   test_circle_budget ();
+  test_compute_budget ();
+  test_paid_proposal ();
   test_make_preview_rejections ();
   test_private_apply_slot ();
   test_private_refill_cap ();
@@ -3229,6 +3430,8 @@ let () =
   test_verify_staging_lookup ();
   test_verify_ledger_preverify ();
   test_verify_reproduced_rejection ();
+  test_verify_paid ();
+  test_receipt_order ();
   test_verify_forged_rejection ();
   test_verify_old_valid_round ();
   test_future_reproposal_prior ();

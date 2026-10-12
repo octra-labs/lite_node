@@ -45,9 +45,12 @@ let admission entries =
     ~activation_epoch:20 entries |> unwrap
 
 let view ?(epoch = 20) ?(cipher = cipher) ?(mode = Octra_core.Rule_graph.Active)
+    ?(math = true)
+    ?(cipher_mode = Octra_core.Rule_graph.Prior)
+    ?(proof_mode = Octra_core.Rule_graph.Active)
     ?(status = M.status_of_classes M.V3 M.Historical) admissions =
   V.pvac_migration_status ~addr:address ~cipher ~epoch
-    ~owner_migration_mode:mode status admissions
+    ~math ~owner_migration_mode:mode ~cipher_mode ~proof_mode status admissions
 
 let check_missing name reason response =
   let replay = field "legacy_public_replay" response in
@@ -63,18 +66,25 @@ let check_missing name reason response =
 
 let check_errors () =
   let enabled = admission [entry clean] in
+  check "wide arithmetic visible" (field "proof_math" (view enabled) = `String "wide");
+  check "prior arithmetic visible" (field "proof_math" (view ~math:false enabled) = `String "prior");
   let cases = [
-    "unavailable", A.disabled ~chain_id, 20, cipher,
+    "unavailable", "migration records unavailable", A.disabled ~chain_id, 20, cipher,
       "migration entitlement artifact unavailable";
-    "not_active", enabled, 19, cipher,
+    "not_active", "migration records not active", enabled, 19, cipher,
       "migration entitlement is not active";
-    "not_found", admission [], 20, cipher,
+    "not_found", "migration record not found", admission [], 20, cipher,
       "migration entitlement not found";
-    "cipher_mismatch", enabled, 20, cipher ^ "changed",
+    "cipher_mismatch", "migration record ciphertext mismatch", enabled, 20, cipher ^ "changed",
       "migration entitlement source ciphertext mismatch";
   ] in
-  List.iter (fun (name, admissions, epoch, cipher, reason) ->
-    check_missing name reason (view ~epoch ~cipher admissions);
+  List.iter (fun (name, note, admissions, epoch, cipher, reason) ->
+    let response = view ~epoch ~cipher admissions in
+    check_missing name note response;
+    let record = field "migration_record" response in
+    check "record status" (field "status" record = `String name);
+    check "record count" (field "count" record = `Int (A.entry_count admissions));
+    check "record root compatibility" (field "root" record = field "entitlement_root" response);
     check "find compatibility"
       (A.find admissions ~epoch ~address ~cipher = Error reason);
     let denied = A.decision admissions ~epoch ~address ~cipher in
@@ -131,8 +141,47 @@ let check_owner () =
     ) [hidden; {hidden with audit_class = R.Poisoned}]
   ) [Octra_core.Rule_graph.Prior; Octra_core.Rule_graph.Active]
 
+let check_cipher () =
+  let records = A.disabled ~chain_id in
+  let open Octra_core.Rule_graph in
+  List.iter (fun (cipher_mode, proof_mode) ->
+    List.iter (fun (cipher_class, key_class) ->
+      let status = M.status_of_classes cipher_class key_class in
+      let response = view ~cipher_mode ~proof_mode ~status records in
+      let expected = proof_mode = Active && cipher_mode = Active && cipher_class = M.V3
+        && key_class = M.Historical in
+      check "cipher proof requires no record"
+        (field "can_cipher_proof_migrate" response = `Bool expected);
+      check "history authority remains separate"
+        (field "can_owner_proof_migrate" response = `Bool false)
+    ) [M.V3, M.Historical; M.V3, M.Current; M.V3, M.Missing;
+       M.Legacy_hfhe, M.Historical; M.Empty, M.Historical]
+  ) [Prior, Prior; Prior, Active; Active, Prior; Active, Active]
+
+let check_recovery () =
+  let open Octra_core.Rule_graph in
+  let records = admission [entry clean] in
+  List.iter (fun mode ->
+    let status = M.status_of_classes M.V3 M.Missing in
+    let result = view ~cipher_mode:mode ~status records in
+    check "semantic format" (field "cipher_format" result = `String "proven");
+    check "missing key history gate" (field "history_recovery" result = `Bool (mode = Active));
+    check "missing key record gate" (if mode = Active then
+        field "status" (field "migration_record" result) = `String "ready"
+      else field "legacy_public_replay" result = `Null);
+    check "missing key cannot use cipher proof"
+      (field "can_cipher_proof_migrate" result = `Bool false)
+  ) [Prior; Active];
+  List.iter (fun cipher_class ->
+    let status = M.status_of_classes cipher_class M.Missing in
+    let result = view ~cipher_mode:Active ~status records in
+    check "invalid source cannot recover" (field "history_recovery" result = `Bool false)
+  ) [M.Empty; M.Foreign; M.Malformed "invalid"]
+
 let () =
   check_errors ();
   check_entries ();
   check_owner ();
+  check_cipher ();
+  check_recovery ();
   Printf.printf "status = pass test = migration_status\n%!"

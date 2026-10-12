@@ -387,22 +387,9 @@ let accept ?submit config ~call =
   let lock = Lwt_mutex.create () in
   connection config call submit lock
 
-external socket_codes : unit -> int list = "octra_accept_codes"
+let accept_codes = Octra_net.P2p_conn.accept_codes
 
-let accept_codes = socket_codes ()
-
-let accept_delay attempt error =
-  let delay = min 1.0 (0.01 *. Float.of_int (1 lsl min 7 (max 0 attempt))) in
-  match error with
-  | Unix.Unix_error (Unix.EUNKNOWNERR code, _, _)
-      when List.mem code accept_codes -> Some delay
-  | Unix.Unix_error ((Unix.EINTR | Unix.EAGAIN | Unix.EWOULDBLOCK
-      | Unix.ECONNABORTED | Unix.ENETDOWN | Unix.ENETUNREACH
-      | Unix.EHOSTDOWN | Unix.EHOSTUNREACH
-      | Unix.ENOPROTOOPT | Unix.EOPNOTSUPP | Unix.EMFILE | Unix.ENFILE
-      | Unix.ENOBUFS | Unix.ENOMEM), _, _) ->
-    Some delay
-  | _ -> None
+let accept_delay = Octra_net.P2p_conn.accept_delay
 
 let take_client ?(take = fun socket -> Lwt_unix.accept ~cloexec:true socket)
     ?(sleep = Lwt_unix.sleep) socket =

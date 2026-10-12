@@ -695,17 +695,120 @@ let collect_ops () =
 let cache_key_mode_case () =
   let path, store, ledger, _, _ = setup "cache_key_mode" in
   let transaction = { (tx "switch") with T.op_type = T.KeySwitch } in
-  let key ?(math = false) cap =
-    Lwt_main.run (PL.key_switch_cache_key ~math PL.Unique_fields cap ledger transaction)
+  let key ?(math = false) ?(cipher_mode = Octra_core.Rule_graph.Prior) cap =
+    Lwt_main.run (PL.key_switch_cache_key ~math ~cipher_mode
+      PL.Unique_fields cap ledger transaction)
   in
   expect (String.equal (key false) (key false)) "prior cache key stable";
   expect (String.equal (key true) (key true)) "active cache key stable";
   expect (not (String.equal (key false) (key true))) "cache key mode isolation";
   List.iter (fun cap ->
     expect (key ~math:false cap <> key ~math:true cap) "cache arithmetic isolation";
-    expect (key cap = key ~math:false cap) "cache prior arithmetic") [false; true];
+    expect (key cap = key ~math:false cap) "cache prior arithmetic";
+    List.iter (fun math ->
+      let prior = key ~math ~cipher_mode:Octra_core.Rule_graph.Prior cap in
+      let active = key ~math ~cipher_mode:Octra_core.Rule_graph.Active cap in
+      expect (prior <> active) "cache cipher rule isolation";
+      expect (prior = key ~math cap) "cache prior cipher key unchanged"
+    ) [false; true]) [false; true];
   Lwt_main.run (Octra_core.Store_irmin.close store);
   clear_case path
+
+let switch_rule () =
+  let path, store, ledger, pk, _ = setup "switch_rule" in
+  let module G = Octra_core.Rule_graph in
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (Octra_core.Store_irmin.close store);
+    clear_case path) (fun () ->
+    expect (Octra_core.Ledger.update_enc_balance ledger addr "0" = Ok ()) "empty source";
+    let key = P.serialize_pubkey pk |> Bytes.to_string |> Base64.encode_exn in
+    List.iter (fun mode ->
+      List.iter (fun strict ->
+        List.iter (fun valid ->
+          let payload = Yojson.Safe.to_string (`Assoc [
+            "new_pubkey", `String key;
+            "aes_kat", `String (if valid then FB.aes_kat_hex () else "invalid")]) in
+          let transaction = {(tx payload) with T.op_type = T.KeySwitch; amount = Z.zero} in
+          let artifact = match Lwt_main.run (PL.preverify_key_switch_artifact
+              ~cipher_mode:mode ~field_policy:PL.Unique_fields ~strict ledger transaction) with
+            | Ok value -> value
+            | Error error -> fail error.PL.reason in
+          let bind cipher_mode = Lwt_main.run (PL.bind_key_switch_artifact
+            ~cipher_mode ~field_policy:PL.Unique_fields ~strict ledger transaction artifact) in
+          expect (match bind mode with
+            | PL.Key_switch_bound _ -> valid
+            | PL.Key_switch_artifact_invalid _ -> not valid
+            | PL.Key_switch_source_changed -> false) "same rule artifact";
+          let other = match mode with G.Prior -> G.Active | G.Active -> G.Prior in
+          expect (bind other = PL.Key_switch_source_changed) "changed rule artifact"
+        ) [false; true]
+      ) [false; true]
+    ) [G.Prior; G.Active];
+    let module Pool = Octra_node_runtime.Consensus_key_switch_preverify in
+    let mode = ref G.Prior in
+    let transaction = {(tx (Yojson.Safe.to_string (`Assoc [
+      "new_pubkey", `String key;
+      "aes_kat", `String (FB.aes_kat_hex ())]))) with
+      T.op_type = T.KeySwitch; amount = Z.zero} in
+    let pool = Pool.create ~field_policy:(fun () -> PL.Unique_fields)
+      ~strict:(fun () -> true) ~math:(fun () -> false)
+      ~cipher_mode:(fun () -> !mode) ledger in
+    let ready () = match Lwt_main.run (Pool.await pool transaction) with
+      | Octra_core.Preverify_availability.Ready _ -> ()
+      | _ -> fail "pool did not verify current rule" in
+    ready ();
+    let prior = Pool.artifacts pool [transaction] in
+    expect (List.length prior = 1) "prior pool artifact";
+    mode := G.Active;
+    ready ();
+    let active = Pool.artifacts pool [transaction] in
+    expect (List.length active = 1 && prior <> active) "pool replaced prior artifact";
+    let module Queue = Octra_node_runtime.Consensus_preverify_pool in
+    let prior_artifact = snd (List.hd prior) in
+    let pending, resolve = Lwt.wait () in
+    let calls = ref 0 in
+    let queued = Queue.create {
+      eligible = (fun _ -> true);
+      verify = (fun _ _ -> incr calls;
+        if !calls = 1 then pending else
+        Lwt.return_ok (Queue.Verification_ready (snd (List.hd active))));
+      bind = (fun tx artifact ->
+        let open Lwt.Syntax in
+        let* result = PL.bind_key_switch_artifact ~cipher_mode:!mode
+          ~field_policy:PL.Unique_fields ~strict:true ledger tx artifact in
+        Lwt.return (match result with
+          | PL.Key_switch_bound plan -> Queue.Bound plan
+          | PL.Key_switch_source_changed -> Queue.Source_changed
+          | PL.Key_switch_artifact_invalid error -> Queue.Source_invalid error.PL.reason));
+    } in
+    ignore (Queue.admit queued transaction);
+    Lwt_main.run (Lwt.pause ());
+    let waiting = Queue.await queued transaction in
+    Lwt.wakeup resolve (Ok (Queue.Verification_ready prior_artifact));
+    expect (match Lwt_main.run waiting with
+      | Octra_core.Preverify_availability.Ready _ -> !calls = 2
+      | _ -> false) "late prior result rechecked";
+    let zero = {transaction with T.encrypted_data = Some (Yojson.Safe.to_string (`Assoc [
+      "new_pubkey", `String key; "aes_kat", `String (FB.aes_kat_hex ());
+      "migration_mode", `String "verified_zero_reset"]))} in
+    List.iter (fun (cipher_mode, active) ->
+      expect (PL.key_switch_requests_legacy_audit ~cipher_mode
+        ~field_policy:PL.Unique_fields zero = active) "zero history rule boundary";
+      if active then begin
+        let pool = Pool.create ~field_policy:(fun () -> PL.Unique_fields)
+          ~strict:(fun () -> true) ~math:(fun () -> false)
+          ~cipher_mode:(fun () -> cipher_mode) ledger in
+        expect (Pool.admit pool zero = Octra_core.Preverify_availability.Unmanaged)
+          "zero history pool boundary"
+      end) [G.Prior, false; G.Active, true];
+    let reused = ref false in
+    let prepared = Lwt_main.run (Pool.await pool transaction) in
+    let result = Lwt_main.run (Octra_core.Preverify_worker.run
+      ~cipher_mode:G.Active ~field_policy:PL.Unique_fields ~strict:true ~ledger
+      ~prepared:(fun _ -> reused := true; Lwt.return prepared) zero) in
+    expect (not !reused) "zero history bypassed prepared result";
+    expect (match result with Octra_core.Preverify_worker.Skip _ -> true | _ -> false)
+      "zero history required before proof")
 
 let math_artifact () =
   let path, store, ledger, pk, sk = setup "math_artifact" in
@@ -833,6 +936,7 @@ let process_lwt ?(math = false) ?(artifacts = []) ?(keys = [])
       ~ledger
       ~epoch_id:env.epoch_id
       ~owner_migration_mode:Octra_core.Rule_graph.Active
+      ~cipher_mode:Octra_core.Rule_graph.Prior
       ~proof_mode
       ~field_policy
       ~result_policy
@@ -928,6 +1032,7 @@ let batch_case () =
             let transition = Apply.create ~math:true ~preverify:(Some gate)
               ~ledger ~epoch_id:env.epoch_id
               ~owner_migration_mode:Octra_core.Rule_graph.Active
+              ~cipher_mode:Octra_core.Rule_graph.Prior
               ~proof_mode:Octra_core.Rule_graph.Active
               ~field_policy:PL.Unique_fields
               ~result_policy:Octra_core.Private_result_policy.Recoverable
@@ -1100,6 +1205,7 @@ let switch_reuse () =
       expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "switch source";
       Lwt_main.run (L.flush_dirty_lwt ledger);
       let pool = Pool.create ~math:(fun () -> false) ~field_policy:(fun () -> PL.Unique_fields)
+        ~cipher_mode:(fun () -> Octra_core.Rule_graph.Prior)
         ~strict:(fun () -> true) ledger in
       let prepared = match Lwt_main.run (Pool.await pool transaction) with
         | Octra_core.Preverify_availability.Ready plan -> plan
@@ -1180,6 +1286,7 @@ let switch_reuse () =
             "encrypted balance changed before key switch verification") in
           expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "restore pool source";
           let pool = Pool.create ~math:(fun () -> false) ~field_policy:(fun () -> PL.First_field)
+            ~cipher_mode:(fun () -> Octra_core.Rule_graph.Prior)
             ~strict:(fun () -> false) ledger in
           let* prepared = Pool.await pool transaction in
           begin match prepared with
@@ -1958,6 +2065,9 @@ let () =
   | [_; "cache_key"] ->
     cache_key_mode_case ();
     print_endline "status = pass test = private_transition_receipt case = cache_key"
+  | [_; "switch_rule"] ->
+    switch_rule ();
+    print_endline "status = pass test = private_transition_receipt case = switch_rule"
   | [_; "migration"] ->
     migration_case ();
     print_endline "status = pass test = private_transition_receipt case = migration"
@@ -1990,6 +2100,7 @@ let () =
     worker_retry_case ();
     print_endline "status = pass test = private_transition_receipt case = worker_retry"
   | [_] ->
+    switch_rule ();
     batch_case ();
     collect_ops ();
     migration_case ();

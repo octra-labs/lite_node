@@ -78,6 +78,7 @@ type key_switch_source = {
   source_fields : field_policy;
   source_strict : bool;
   source_math : bool;
+  source_mode : Rule_graph.mode;
 }
 
 type key_switch_snapshot = {
@@ -96,6 +97,7 @@ type key_switch_artifact =
       artifact_fields : field_policy;
       artifact_strict : bool;
       artifact_math : bool;
+      artifact_mode : Rule_graph.mode;
       artifact_plan : key_switch_plan;
       artifact_snapshot : key_switch_snapshot;
     }
@@ -139,7 +141,8 @@ let key_switch_cache_cap = 32
 let key_switch_cache : (string, key_switch_entry) Hashtbl.t =
   Hashtbl.create key_switch_cache_cap
 
-let key_switch_cache_key ?(math = false) field_policy strict ledger tx =
+let key_switch_cache_key ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+    field_policy strict ledger tx =
   let open Lwt.Syntax in
   let* root = Ledger.hash ledger in
   Lwt.return
@@ -150,7 +153,8 @@ let key_switch_cache_key ?(math = false) field_policy strict ledger tx =
      ^ field_policy_key field_policy
      ^ ":"
      ^ string_of_bool strict
-     ^ (if math then ":math" else ""))
+     ^ (if math then ":math" else "")
+     ^ (match cipher_mode with Rule_graph.Prior -> "" | Rule_graph.Active -> ":cipher"))
 
 let remember_key_switch_plan ?source key plan =
   if
@@ -257,6 +261,7 @@ type key_switch_migration =
   | Commitment_history
   | Verified_zero_reset
   | Historical_owner_proof
+  | Cipher_proof
 
 type key_switch_payload = {
   new_pubkey_b64 : string;
@@ -269,6 +274,7 @@ type key_switch_payload = {
   new_zero_proof : string option;
   amount_commitment : string option;
   amount_blinding : string option;
+  new_range_proof : string option;
   migration : key_switch_migration;
 }
 
@@ -279,6 +285,7 @@ let key_switch_migration_of_name = function
   | "commitment_history" -> Ok Commitment_history
   | "verified_zero_reset" -> Ok Verified_zero_reset
   | "historical_owner_proof" -> Ok Historical_owner_proof
+  | "cipher_proof" -> Ok Cipher_proof
   | value -> Error ("unknown key_switch migration_mode = " ^ value)
 
 let json_member field_policy json name =
@@ -573,6 +580,10 @@ let parse_key_switch field_policy raw =
       let* new_zero_proof = optional_string_field field_policy json "new_zero_proof" in
       let* amount_commitment = optional_string_field field_policy json "amount_commitment" in
       let* amount_blinding = optional_string_field field_policy json "amount_blinding" in
+      let* new_range_proof =
+        if migration = Cipher_proof then
+          optional_string_field field_policy json "new_range_proof"
+        else Ok None in
       Ok {
         new_pubkey_b64;
         aes_kat;
@@ -584,6 +595,7 @@ let parse_key_switch field_policy raw =
         new_zero_proof;
         amount_commitment;
         amount_blinding;
+        new_range_proof;
         migration;
       }
     in
@@ -609,7 +621,24 @@ let key_switch_requests_historical_owner_proof
   | Ok payload -> payload.migration = Historical_owner_proof
   | Error _ -> false
 
+let key_switch_requests_cipher_proof ~field_policy tx =
+  if tx.T.op_type <> T.KeySwitch then false
+  else match json_payload "key_switch" tx.T.encrypted_data with
+  | Error _ -> false
+  | Ok json ->
+    let ( let* ) = Result.bind in
+    let selected =
+      let* _ = required_string_field field_policy json "new_pubkey" in
+      let* _ = required_string_field field_policy json "aes_kat" in
+      parse_key_switch_migration field_policy json in
+    selected = Ok Cipher_proof
+
+let cipher_proof_inactive ~field_policy ~cipher_mode ~strict tx =
+  key_switch_requests_cipher_proof ~field_policy tx
+  && (cipher_mode <> Rule_graph.Active || not strict)
+
 let key_switch_requests_legacy_audit
+    ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     tx =
   match parse_key_switch field_policy tx.T.encrypted_data with
@@ -620,8 +649,9 @@ let key_switch_requests_legacy_audit
       | Rejected_rebinding
       | Commitment_history
       | Historical_owner_proof -> true
+      | Verified_zero_reset -> cipher_mode = Rule_graph.Active
       | Standard
-      | Verified_zero_reset -> false
+      | Cipher_proof -> false
     end
   | Error _ -> false
 
@@ -1471,7 +1501,55 @@ let verify_historical_owner ?(math = false)
         | Ok () -> Lwt.return_ok new_cipher
     end
 
-let verify_key_switch_plan ?(math = false)
+let cipher_proof_id =
+  "ledger_source:historical_strict:current_range64:shared_commitment:source_sha256:record_recovery:zero_record"
+
+let prepared_cipher_proof ~cap current_cipher payload =
+  if Option.is_some payload.old_bound_pubkey_b64
+     || Option.is_some payload.old_bound_cipher
+     || Option.is_some payload.amount_blinding
+     || Option.is_some payload.new_zero_proof then
+    error "key_switch_rejected" "cipher migration has unexpected proof fields"
+  else
+    match payload.source_cipher_hash with
+    | None -> error "key_switch_rejected" "cipher migration requires source_cipher_hash"
+    | Some hash when hash <> Digestif.SHA256.(digest_string current_cipher |> to_hex) ->
+      error "key_switch_rejected" "encrypted balance changed before cipher migration"
+    | Some _ ->
+      match guard_refresh_source ~cap current_cipher with
+      | Error failure -> Error failure
+      | Ok () ->
+        match payload.new_cipher, payload.old_zero_proof,
+              payload.new_range_proof, payload.amount_commitment with
+        | Some cipher, Some old_proof, Some new_proof, Some commitment
+          when FB.cipher_is_wrapped_scalar ~cap cipher ->
+          Ok (cipher, old_proof, new_proof, commitment)
+        | _ -> error "key_switch_rejected"
+          "cipher migration requires scalar new_cipher, old_zero_proof, new_range_proof and amount_commitment"
+
+let verify_cipher_proof ~math ~worker_priority ~current_cipher ~old_key ~new_key payload =
+  let open Lwt.Syntax in
+  match prepared_cipher_proof ~cap:true current_cipher payload with
+  | Error failure -> Lwt.return_error failure
+  | Ok (cipher, old_proof, new_proof, commitment) ->
+    let* old_checked =
+      VW.verify_historical_migration_claim_classified_with_priority ~math
+        worker_priority ~strict:true ~pubkey:old_key ~cipher:current_cipher
+        ~proof:old_proof ~commitment in
+    match old_checked with
+    | Error failure -> Lwt.return (key_switch_worker_error
+        "old encrypted balance proof failed: " failure)
+    | Ok () ->
+      let* new_checked = VW.classified_result ~math ~priority:worker_priority
+        (Pvac_verify_protocol.Range_bound {
+          pubkey = new_key; cipher; proof = new_proof; commitment; strict = true;
+        }) in
+      match new_checked with
+      | Error failure -> Lwt.return (key_switch_worker_error
+          "new encrypted balance range proof failed: " failure)
+      | Ok () -> Lwt.return_ok cipher
+
+let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
@@ -1524,15 +1602,38 @@ let verify_key_switch_plan ?(math = false)
                     ~cipher:current_cipher
                     ~pubkey:old_pk)
             in
-            if payload.migration = Verified_zero_reset
-              && not (PM.needs_history_migration migration_status)
+            let history = PM.history_route ~active:(cipher_mode = Rule_graph.Active)
+              migration_status in
+            if payload.migration = Cipher_proof then
+              begin
+                match migration_status.cipher_class, migration_status.key_class, old_pk with
+                | PM.V3, PM.Historical, Some old_key ->
+                  let* checked = verify_cipher_proof ~math ~worker_priority
+                    ~current_cipher ~old_key ~new_key:new_pubkey payload in
+                  Lwt.return (Result.bind checked (fun new_cipher ->
+                    key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
+                      ~new_cipher:(Some new_cipher) ~source_cipher:current_cipher))
+                | _ -> Lwt.return (error "key_switch_rejected"
+                    "cipher migration requires a proven balance and historical registered key")
+              end
+            else if payload.migration = Verified_zero_reset
+              && cipher_mode = Rule_graph.Active
+              && (match legacy_public_replay with
+                | Some replay -> not (replay.Pvac_legacy_public_replay.can_public_migrate
+                    && replay.public_net = Some Z.zero)
+                | None -> true)
+            then
+              Lwt.return (error "key_switch_rejected"
+                "zero reset requires verified zero public history")
+            else if payload.migration = Verified_zero_reset
+              && not history
             then
               Lwt.return (error "key_switch_rejected" "legacy zero reset requires a legacy hfhe balance")
             else if PM.can_key_switch migration_status then
               Lwt.return
                 (key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
                   ~new_cipher:None ~source_cipher:current_cipher)
-            else if PM.needs_history_migration migration_status then
+            else if history then
               if payload.migration = Verified_zero_reset then
                   let* checked =
                     verify_new_key new_pubkey "legacy zero reset failed: "
@@ -1704,7 +1805,7 @@ let verify_key_switch_plan ?(math = false)
             Lwt.return (Result.map (fun plan -> plan, source) result)
     end
 
-let prepare_key_switch_plan_uncached ~cap field_policy ledger tx =
+let prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx =
   let open Lwt.Syntax in
   match parse_key_switch field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
@@ -1740,16 +1841,24 @@ let prepare_key_switch_plan_uncached ~cap field_policy ledger tx =
                   ~cipher:current_cipher
                   ~pubkey:old_pk)
           in
+          let history = PM.history_route ~active:(cipher_mode = Rule_graph.Active) status in
           let prepared =
-            if payload.migration = Verified_zero_reset
-              && not (PM.needs_history_migration status)
+            if payload.migration = Cipher_proof then
+              if status.cipher_class <> PM.V3 || status.key_class <> PM.Historical then
+                error "key_switch_rejected"
+                  "cipher migration requires a proven balance and historical registered key"
+              else
+                Result.map (fun (cipher, _, _, _) -> Some cipher)
+                  (prepared_cipher_proof ~cap current_cipher payload)
+            else if payload.migration = Verified_zero_reset
+              && not history
             then
               error
                 "key_switch_rejected"
                 "legacy zero reset requires a legacy hfhe balance"
             else if PM.can_key_switch status then
               Ok None
-            else if PM.needs_history_migration status then
+            else if history then
               if payload.migration = Verified_zero_reset then
                 Result.map Option.some (prepared_legacy_zero_reset ~cap payload)
               else if payload.migration = Historical_owner_proof then
@@ -1796,32 +1905,35 @@ let prepare_key_switch_plan_uncached ~cap field_policy ledger tx =
                prepared)
     end
 
-let prepare_key_switch_plan ?(math = false)
+let prepare_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ?(cap = true)
     ledger
     tx =
   let open Lwt.Syntax in
-  if key_switch_requests_legacy_audit ~field_policy tx then
-    prepare_key_switch_plan_uncached ~cap field_policy ledger tx
+  if key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx then
+    prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx
   else
-    let* key = key_switch_cache_key ~math field_policy cap ledger tx in
+    let* key = key_switch_cache_key ~math ~cipher_mode field_policy cap ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some entry -> Lwt.return_ok entry.plan
-    | None -> prepare_key_switch_plan_uncached ~cap field_policy ledger tx
+    | None -> prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx
 
-let key_switch_plan ?(math = false)
+let key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
     ledger
     tx =
   let open Lwt.Syntax in
-  let legacy = key_switch_requests_legacy_audit ~field_policy tx in
+  if cipher_proof_inactive ~field_policy ~cipher_mode ~strict tx then
+    Lwt.return (error "key_switch_rejected" "unknown key_switch migration_mode = cipher_proof")
+  else
+  let legacy = key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx in
   let* cache_key =
     if legacy then Lwt.return_none
     else
-      let* key = key_switch_cache_key ~math field_policy strict ledger tx in
+      let* key = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
       Lwt.return_some key
   in
   let* cached =
@@ -1843,7 +1955,7 @@ let key_switch_plan ?(math = false)
   | Some plan -> Lwt.return_ok plan
   | None ->
     let* result =
-      verify_key_switch_plan ~math
+      verify_key_switch_plan ~math ~cipher_mode
         ~field_policy
         ~strict
         ?legacy_public_replay
@@ -1857,7 +1969,7 @@ let key_switch_plan ?(math = false)
         match cache_key with
         | None -> Lwt.return_unit
         | Some key ->
-          let* current = key_switch_cache_key ~math field_policy strict ledger tx in
+          let* current = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
           if not (String.equal key current) then Lwt.return_unit
           else begin
             let source = if strict then Some source else None in
@@ -1867,14 +1979,16 @@ let key_switch_plan ?(math = false)
       in
       Lwt.return_ok plan
 
-let preverify_key_switch_artifact ?(math = false)
+let preverify_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Speculative)
     ledger
     tx =
   let open Lwt.Syntax in
-  if key_switch_requests_legacy_audit ~field_policy tx then
+  if cipher_proof_inactive ~field_policy ~cipher_mode ~strict tx then
+    Lwt.return (error "key_switch_rejected" "unknown key_switch migration_mode = cipher_proof")
+  else if key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx then
     Lwt.return
       (error
          "key_switch_artifact_rejected"
@@ -1890,10 +2004,11 @@ let preverify_key_switch_artifact ?(math = false)
         source_fields = field_policy;
         source_strict = strict;
         source_math = math;
+        source_mode = cipher_mode;
       } in
       let artifact_tx_hash = T.hash tx in
       let* result =
-        verify_key_switch_plan ~math
+        verify_key_switch_plan ~math ~cipher_mode
           ~field_policy
           ~strict
           ~snapshot
@@ -1910,6 +2025,7 @@ let preverify_key_switch_artifact ?(math = false)
                artifact_fields = field_policy;
                artifact_strict = strict;
                artifact_math = math;
+               artifact_mode = cipher_mode;
                artifact_plan;
                artifact_snapshot;
              })
@@ -1925,7 +2041,7 @@ let preverify_key_switch_artifact ?(math = false)
              })
       end
 
-let bind_key_switch_artifact ?(math = false)
+let bind_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ledger
@@ -1958,13 +2074,14 @@ let bind_key_switch_artifact ?(math = false)
             verified.artifact_fields = field_policy
             && Bool.equal verified.artifact_strict strict
             && Bool.equal verified.artifact_math math
+            && verified.artifact_mode = cipher_mode
             && String.equal current_cipher plan.source_cipher
             && key_source_equal snapshot verified.artifact_snapshot
           then begin
             let* () =
               if strict then Lwt.return_unit
               else
-                let* key = key_switch_cache_key ~math field_policy strict ledger tx in
+                let* key = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
                 remember_key_switch_plan key plan;
                 Lwt.return_unit
             in
@@ -1977,6 +2094,7 @@ let bind_key_switch_artifact ?(math = false)
             rejected.artifact_source.source_fields = field_policy
             && Bool.equal rejected.artifact_source.source_strict strict
             && Bool.equal rejected.artifact_source.source_math math
+            && rejected.artifact_source.source_mode = cipher_mode
             && String.equal current_cipher rejected.artifact_source.source_cipher
             && Option.equal String.equal
                  snapshot.snapshot_pubkey
@@ -1988,21 +2106,22 @@ let bind_key_switch_artifact ?(math = false)
             Lwt.return Key_switch_source_changed
       end
 
-let key_switch_plan_for_apply ?(math = false)
+let key_switch_plan_for_apply ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
     ledger
     tx =
   let open Lwt.Syntax in
-  if strict || key_switch_requests_legacy_audit ~field_policy tx then
-    key_switch_plan ~math ~field_policy ~strict ?legacy_public_replay ledger tx
+  if strict || key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx
+     || key_switch_requests_cipher_proof ~field_policy tx then
+    key_switch_plan ~math ~cipher_mode ~field_policy ~strict ?legacy_public_replay ledger tx
   else
-    let* key = key_switch_cache_key ~math field_policy strict ledger tx in
+    let* key = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some entry -> Lwt.return_ok entry.plan
     | None ->
-      key_switch_plan ~math ~field_policy ~strict ?legacy_public_replay ledger tx
+      key_switch_plan ~math ~cipher_mode ~field_policy ~strict ?legacy_public_replay ledger tx
 
 let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
   let open Lwt.Syntax in
@@ -2039,7 +2158,7 @@ let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
             migrated_cipher;
           })
 
-let apply_key_switch ?(math = false)
+let apply_key_switch ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
@@ -2047,7 +2166,7 @@ let apply_key_switch ?(math = false)
     tx =
   let open Lwt.Syntax in
   let* plan =
-    key_switch_plan_for_apply ~math
+    key_switch_plan_for_apply ~math ~cipher_mode
       ~field_policy
       ~strict
       ?legacy_public_replay

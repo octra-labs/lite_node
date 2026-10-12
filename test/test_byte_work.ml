@@ -178,6 +178,75 @@ let check_copy_volume () =
   in
   copies 0
 
+let check_events () =
+  let emit st text =
+    st.regs.(0) <- VString text;
+    exec_one st (EMIT ("log", [0])) in
+  let budget () = Byte_work.create Byte_work.consensus_limits in
+  let rules = Option.get (Byte_work.limits ~key_bytes:16_777_216
+    ~value_bytes:4_194_304 ~copy_bytes:16_777_216 ~write_bytes:4_194_304
+    ~alloc_bytes:134_217_728 ~unit_bytes:32) in
+  require (Byte_work.consensus_limits = rules) "consensus byte limits differ";
+  require (Byte_work.consensus_id =
+    "bytes_v2:key_16777216:value_4194304:copy_16777216:write_4194304:alloc_134217728:unit_32:receipt_4194304:event_count_256:returns:shared_gross:inspect_isolated")
+    "byte rules identity differs";
+  let huge = String.make 800_000 '\000' in
+  let full = budget () in
+  let rejected = state ~budget:full ~limit:1_000_000 () in
+  require (not (emit rejected huge)) "escaped event volume accepted";
+  require (!(rejected.logs) = []) "oversized event retained";
+  require (Byte_work.event_left full = 4_194_304) "failed event consumed volume";
+  let owner = budget () in
+  let st = state ~budget:owner ~limit:1_000_000 () in
+  require (emit st "\000\n\"\\") "small event refused";
+  let wire = Receipt_view.program_events_json !(st.logs)
+    |> Yojson.Safe.to_string |> String.length in
+  require (Byte_work.event_left owner = 4_194_304 - wire)
+    "event JSON size differs";
+  require (st.effort_used = 30 + (wire + 31) / 32) "event byte price";
+  let prior = state ~limit:1_000_000 () in
+  require (emit prior huge && prior.effort_used = 30) "prior events changed";
+  let owner = budget () in
+  for index = 1 to 257 do
+    let child = state ~budget:owner ~limit:1_000_000 () in
+    require (emit child "x" = (index <= 256)) "shared event count ignored"
+  done;
+  let owner = budget () in
+  let first = state ~budget:owner ~limit:1_000_000 () in
+  require (emit first (String.make 2_100_000 'x')) "first shared event refused";
+  let second = state ~budget:owner ~limit:1_000_000 () in
+  require (not (emit second (String.make 2_100_000 'x'))) "shared event bytes ignored";
+  let owner = budget () in
+  let st = state ~budget:owner ~limit:1_000_000 () in
+  st.regs.(0) <- VInt (Z.shift_left Z.one 256);
+  require (exec_one st (EMIT ("number", [0]))) "number event refused";
+  require (st.effort_used > 30) "number event not charged";
+  let st = state ~budget:(budget ()) ~limit:30 () in
+  require (not (emit st "x")) "event effort ignored"
+
+let check_outputs () =
+  let owner = Byte_work.create Byte_work.consensus_limits in
+  let st = state ~budget:owner ~limit:1_000_000 () in
+  st.regs.(0) <- VString (String.make 800_000 '\000');
+  require (not (run st [|STOP|])) "escaped output volume accepted";
+  let first = state ~budget:owner ~limit:1_000_000 () in
+  first.regs.(0) <- VString (String.make 2_100_000 'x');
+  require (run first [|STOP|]) "first output refused";
+  let left = Byte_work.event_left owner in
+  require (step first [|STOP|] = Finished && Byte_work.event_left owner = left)
+    "completed output charged twice";
+  let second = state ~budget:owner ~limit:1_000_000 () in
+  second.regs.(0) <- first.regs.(0);
+  require (not (run second [|STOP|])) "shared output bytes ignored";
+  let prior = state ~limit:1_000_000 () in
+  prior.regs.(0) <- st.regs.(0);
+  require (run prior [|STOP|]) "prior output changed";
+  let owner = Byte_work.create Byte_work.consensus_limits in
+  let st = state ~budget:owner ~limit:1_000_000 () in
+  st.regs.(0) <- VString (String.make 2_100_000 'x');
+  require (exec_one st (EMIT ("log", [0]))) "shared output event refused";
+  require (not (run st [|STOP|])) "output ignored event bytes"
+
 let check_delete () =
   List.iter (fun indexed ->
     let budget = Byte_work.create (limits ()) in
@@ -446,7 +515,71 @@ let check_scan_limit () =
     require (Text_work.measure ~fits:(fun bytes -> bytes <= 71)
       (List.to_seq values) = Some 71) "key work order") [["a"; "bcdefg"]; ["bcdefg"; "a"]]
 
+let check_local_bytes () =
+  let module Local = Local_vm in
+  let seed = String.make 1024 'x' in
+  let code count =
+    Array.of_list ([JDEST 100; LDI (0, VString seed)]
+      @ List.init count (fun _ -> CONCAT (0, 0, 0)) @ [STOP]) in
+  let run ?(trace = false) ?(view = false) ?(entry = false)
+      ?(storage = []) ~limit code =
+    let config = Local.config ~view ~storage ~limit ~method_name:"run" ~args:[] () in
+    let result = if entry then Local.run_at ~trace config ~entry:0 code
+      else Local.run ~trace config code in
+    match result with
+    | Ok value -> value
+    | Error error -> failwith (Local.error_text error) in
+  List.iter (fun trace ->
+    List.iter (fun view ->
+      List.iter (fun entry ->
+        let before = Gc.allocated_bytes () in
+        let value = run ~trace ~view ~entry ~limit:200 (code 15) in
+        let allocated = Gc.allocated_bytes () -. before in
+        require (value.stop = Local.Reverted) "local copy quota ignored";
+        require (value.steps < 18) "local copy checked after growth";
+        require (allocated < 40. *. 1_048_576.) "local copy allocated before check";
+        require (value.effort <= 200) "local copy exceeds effort") [false; true])
+      [false; true]) [false; true];
+  let small = code 2 in
+  let first = run ~trace:true ~limit:1000 small in
+  let second = run ~trace:true ~limit:1000 small in
+  require (first = second && first.stop = Local.Returned) "local quota reused";
+  require (first.result = VString (String.make 4096 'x')) "local copy bytes changed";
+  require (first.effort = 9) "local copy price changed";
+  let exact = run ~limit:9 small in
+  require (exact.stop = Local.Returned) "local exact price refused";
+  let short = run ~limit:8 small in
+  require (short.stop = Local.Reverted) "local short price accepted";
+  let writes = Array.of_list ([JDEST 100; LDI (1, VString "new");
+      SSTORE ("key", 1); LDI (0, VString seed)]
+    @ List.init 15 (fun _ -> CONCAT (0, 0, 0)) @ [STOP]) in
+  let value = run ~storage:["key", "old"] ~limit:400 writes in
+  require (value.stop = Local.Reverted && value.storage = ["key", "old"])
+    "local copy refusal kept writes";
+  let repeated = Array.of_list ([JDEST 100; LDI (1, VString (String.make 1_048_576 'x'))]
+    @ List.init 65 (fun _ -> CONCAT (0, 1, 1)) @ [STOP]) in
+  let value = run ~limit:1000 repeated in
+  require (value.stop = Local.Reverted && value.steps = 67)
+    "local cumulative copy quota ignored";
+  let bytes = [|JDEST 100; LDI (1, VBytes "a"); LDI (2, VBytes "b");
+    CONCAT (0, 1, 2); STOP|] in
+  let config = Local.config ~byte_result:Typed_bytes ~method_name:"run" ~args:[] () in
+  begin match Local.run ~trace:false config bytes with
+  | Ok value -> require (value.stop = Local.Returned && value.result = VBytes "ab")
+      "local typed copy changed"
+  | Error error -> failwith (Local.error_text error)
+  end;
+  List.iter (fun reg ->
+    let value = run ~limit:100 [|JDEST 100; CONCAT (0, reg, 0); STOP|] in
+    require (value.stop = Local.Reverted) "local invalid register accepted")
+    [-1; register_count];
+  let value = run ~limit:100 [|JDEST 100; LDI (1, VInt (Z.of_int (-123)));
+    LDI (2, VBool true); CONCAT (0, 1, 2); STOP|] in
+  require (value.stop = Local.Returned && value.result = VString "-123true"
+    && value.effort = 7) "local scalar copy changed"
+
 let () =
+  check_local_bytes ();
   check_alloc_plan ();
   check_copy_rollback ();
   check_slices ();
@@ -461,6 +594,8 @@ let () =
   check_rollback ();
   check_concat ();
   check_copy_volume ();
+  check_events ();
+  check_outputs ();
   check_delete ();
   check_blob ();
   check_view ();

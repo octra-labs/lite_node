@@ -12,6 +12,9 @@ type prepare = {
 }
 
 type execute = {
+  memory_bytes : int;
+  guest_bytes : int;
+  fuel_limit : int;
   request_id : string;
   session_id : string;
   epoch_id : int64;

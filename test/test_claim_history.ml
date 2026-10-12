@@ -883,6 +883,7 @@ let execution_case sender_key receiver_key transfer receipt deposit withdraw =
         let preverify = Octra_core.Preverify_commit.create checked in
         let transition = Private.create ~math:false ~preverify:(Some preverify) ~ledger
           ~epoch_id:epoch ~owner_migration_mode:G.Prior ~proof_mode:G.Active
+          ~cipher_mode:G.Prior
           ~field_policy:Octra_core.Private_ledger.Unique_fields
           ~result_policy:Octra_core.Private_result_policy.Recoverable
           ~legacy_replay:(Admission.decision (Admission.disabled ~chain_id))

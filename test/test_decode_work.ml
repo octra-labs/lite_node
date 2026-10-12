@@ -73,6 +73,60 @@ let check_decode_effort () =
     require (Hashtbl.length st.memory.data = 0) "effort refusal wrote memory")
     [integer; q16; fp]
 
+let check_raw_space () =
+  let raw = LOAD_INT8_BYTES_TO_MEM (0, 1, 2, 3, 4) in
+  List.iter (fun mode ->
+    List.iter (fun (scale, size) ->
+      List.iter (fun alloc ->
+        let work = budget ~alloc () in
+        let st = state ~work () in
+        let st = {st with int_mode = mode} in
+        let accepted = load st raw ~dst:10 ~input:"\002" ~off:0 ~count:1 ~scale in
+        require (accepted = (alloc >= size)) "raw cell quota";
+        require (Byte_work.available work = if accepted then alloc - size else alloc)
+          "raw cell reservation";
+        if accepted then
+          require (Hashtbl.find st.memory.data 10 = VInt (Z.mul (Z.of_int 2) scale))
+            "raw cell value"
+        else
+          require (Hashtbl.length st.memory.data = 0) "raw refusal wrote memory")
+        [0; size - 1; size; size + 1])
+      [Z.one, 82; Z.shift_left Z.one 65, 90])
+    [Int_work.Prior; Int_work.Active]
+
+let check_decode_quote () =
+  List.iter (fun mode ->
+    List.iter (fun limit ->
+      let work = budget ~alloc:1000 () in
+      let st = state ~limit ~work () in
+      let st = {st with int_mode = mode} in
+      let accepted = load st integer ~dst:10 ~input:"AQ==" ~off:0 ~count:1 ~scale:Z.one in
+      require (accepted = (limit >= 36)) "decode quote threshold";
+      if accepted then begin
+        require (st.effort_used = 36 && Byte_work.available work = 912)
+          "decode quote price";
+        require (Hashtbl.find st.memory.data 10 = VInt Z.one) "decode quote value"
+      end else begin
+        require (st.effort_used = 30 && Byte_work.available work = 1000)
+          "decode spent before full quote";
+        require (Hashtbl.length st.memory.data = 0) "decode quote wrote memory"
+      end) [34; 35; 36; 37])
+    [Int_work.Prior; Int_work.Active]
+
+let check_raw_text () =
+  let work = budget ~alloc:0 () in
+  let st = state ~work () in
+  st.regs.(0) <- VInt Z.zero;
+  st.regs.(1) <- VInt (Z.shift_left Z.one 1_048_576);
+  st.regs.(2) <- VInt Z.zero;
+  st.regs.(3) <- VInt Z.one;
+  st.regs.(4) <- VInt Z.one;
+  let before = Gc.allocated_bytes () in
+  let accepted = exec_one st (LOAD_INT8_BYTES_TO_MEM (0, 1, 2, 3, 4)) in
+  require (not accepted && Gc.allocated_bytes () -. before < 100_000.)
+    "raw number formatted before quota";
+  require (Hashtbl.length st.memory.data = 0) "raw number wrote memory"
+
 let check_fixed_text () =
   List.iter (fun size ->
     let raw = String.init size (fun index -> Char.chr (index land 255)) in
@@ -240,6 +294,9 @@ let check_spawn_values () =
       [SPAWN (1, 0); SPAWN2 (1, 0, 2, 0)]) [raw; Base64.encode_exn raw]
 
 let () =
+  check_raw_space ();
+  check_raw_text ();
+  check_decode_quote ();
   check_plan ();
   check_cache_identity ();
   check_cache_invalid ();

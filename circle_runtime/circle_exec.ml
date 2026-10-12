@@ -300,8 +300,17 @@ let preview_request_of_call method_name params =
   | _ ->
     None
 
-let preview_cache_key ~trusted ~math circle_id caller prompt_csv =
-  trusted, circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv ^ (if math then "|math" else "")
+let preview_cache_key ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    ~scope ~trusted ~math circle_id caller prompt_csv =
+  let policy = match inspect_mode with
+    | Octra_core.Rule_graph.Prior -> ""
+    | Octra_core.Rule_graph.Active -> "|inspect" in
+  trusted, circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv
+    ^ (if math then "|math" else "") ^ policy ^ "|" ^ scope
+
+let preview_scope (ctx : ContractVM.exec_ctx) (info : Octra_core.Circles.circle_info) =
+  String.concat ":" [info.code_hash; Int64.to_string info.version; info.stable_root;
+    ctx.tree_hash; string_of_int ctx.current_epoch]
 
 let preview_cache_store key result_csv =
   match parse_csv_tokens result_csv with
@@ -341,7 +350,7 @@ let preview_result_csv (receipt : Contract.exec_result) =
   | _ ->
     None
 
-let load_wasm_view_storage_cached store circle_id stable_root =
+let load_wasm_view_storage_cached ?snapshot store circle_id stable_root =
   let cache_key = wasm_view_storage_cache_key circle_id stable_root in
   prune_wasm_view_storage_cache 0 0;
   match Hashtbl.find_opt wasm_view_storage_cache cache_key with
@@ -349,7 +358,7 @@ let load_wasm_view_storage_cached store circle_id stable_root =
     entry.touched_at <- Unix.gettimeofday ();
     Lwt.return (Ok (cache_key, entry.storage_tbl))
   | None ->
-    let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
+    let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
     begin
       match storage_result with
       | Error _ as e ->
@@ -507,28 +516,29 @@ let vm_response_value = function
     | Ok value -> Ok (Some value)
     | Error _ as error -> error
 
-let load_slot_policy store circle_id path_key =
+let load_slot_policy ?snapshot store circle_id path_key =
+  let read = Octra_core.Circle_policy_store.read_first_inline_value ?snapshot in
   let* delivery_key_id =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.slot_policy_delivery_key_key path_key;
     ] in
   let* activate_after_epoch =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.slot_policy_activate_after_key path_key;
       Octra_core.Circles.mailbox_activate_after_key path_key;
     ] in
   let* expire_after_epoch =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.slot_policy_expire_after_key path_key;
       Octra_core.Circles.mailbox_expire_after_key path_key;
     ] in
   let* tombstone =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.slot_policy_tombstone_key path_key;
       Octra_core.Circles.mailbox_tombstone_key path_key;
     ] in
   let* revoked =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.slot_policy_revoked_key path_key;
       Octra_core.Circles.mailbox_revoked_key path_key;
     ] in
@@ -540,25 +550,26 @@ let load_slot_policy store circle_id path_key =
     revoked = Octra_core.Circle_policy_value.bool_value revoked;
   }
 
-let load_state_policy store circle_id path_key =
+let load_state_policy ?snapshot store circle_id path_key =
+  let read = Octra_core.Circle_policy_store.read_first_inline_value ?snapshot in
   let* delivery_key_id =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.state_policy_delivery_key_key path_key;
     ] in
   let* activate_after_epoch =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.state_policy_activate_after_key path_key;
     ] in
   let* expire_after_epoch =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.state_policy_expire_after_key path_key;
     ] in
   let* tombstone =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.state_policy_tombstone_key path_key;
     ] in
   let* revoked =
-    Octra_core.Circle_policy_store.read_first_inline_value store circle_id [
+    read store circle_id [
       Octra_core.Circles.state_policy_revoked_key path_key;
     ] in
   Lwt.return {
@@ -569,17 +580,17 @@ let load_state_policy store circle_id path_key =
     revoked = Octra_core.Circle_policy_value.bool_value revoked;
   }
 
-let load_key_policy store circle_id key_id =
-  Octra_core.Circle_policy_store.load_key_policy store circle_id key_id
+let load_key_policy ?snapshot store circle_id key_id =
+  Octra_core.Circle_policy_store.load_key_policy ?snapshot store circle_id key_id
 
-let asset_visible_now store circle_id current_epoch (meta : Octra_core.Circles.asset_meta) =
+let asset_visible_now ?snapshot store circle_id current_epoch (meta : Octra_core.Circles.asset_meta) =
   let* policy =
     match meta.Octra_core.Circles.locator_mode with
     | Octra_core.Circles.State_locator ->
-      load_state_policy store circle_id meta.path_key
+      load_state_policy ?snapshot store circle_id meta.path_key
     | Path_locator
     | Slot_locator ->
-      load_slot_policy store circle_id meta.path_key in
+      load_slot_policy ?snapshot store circle_id meta.path_key in
   let activate_after_epoch =
     match policy.activate_after_epoch with
     | Some epoch -> Some epoch
@@ -604,21 +615,22 @@ let asset_visible_now store circle_id current_epoch (meta : Octra_core.Circles.a
   let* key_live =
     match policy.delivery_key_id, meta.Octra_core.Circles.key_id with
     | Some key_id, _ ->
-      let* key_policy = load_key_policy store circle_id key_id in
+      let* key_policy = load_key_policy ?snapshot store circle_id key_id in
       Lwt.return (Octra_core.Circle_key_policy.live key_policy current_epoch)
     | None, Some key_id ->
-      let* key_policy = load_key_policy store circle_id key_id in
+      let* key_policy = load_key_policy ?snapshot store circle_id key_id in
       Lwt.return (Octra_core.Circle_key_policy.live key_policy current_epoch)
     | None, None ->
       Lwt.return true
   in
   Lwt.return (not tombstoned && activate_ok && expire_ok && key_live)
 
-let resolve_runtime_active_relay_id store circle_id current_epoch transport_policy intent_id_opt relay_id_opt =
+let resolve_runtime_active_relay_id ?snapshot store circle_id current_epoch transport_policy intent_id_opt relay_id_opt =
   match intent_id_opt, relay_id_opt with
   | Some intent_id, Some relay_id ->
     let* active_claims =
       Octra_core.Circle_transport_state.active_outbox_claims
+        ?snapshot
         store
         circle_id
         intent_id
@@ -633,11 +645,11 @@ let resolve_runtime_active_relay_id store circle_id current_epoch transport_poli
   | _ ->
     Lwt.return_none
 
-let runtime_key_policy_live store circle_id current_epoch key_id_opt =
+let runtime_key_policy_live ?snapshot store circle_id current_epoch key_id_opt =
   match key_id_opt with
   | Some key_id ->
     let* key_policy =
-      Octra_core.Circle_policy_store.load_key_policy store circle_id key_id in
+      Octra_core.Circle_policy_store.load_key_policy ?snapshot store circle_id key_id in
     Lwt.return
       (Octra_core.Circle_key_policy.live
          key_policy
@@ -761,22 +773,23 @@ let empty_runtime_hfhe_details (ctx : ContractVM.exec_ctx) owner = {
   active_relay = None;
 }
 
-let load_runtime_hfhe_ctx ?(receipt_linked = false)
+let load_runtime_hfhe_ctx ?snapshot ?(receipt_linked = false)
     (ctx : ContractVM.exec_ctx) store circle_id caller =
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return (Error "circle not found")
   | Some info ->
     let* calls = if ctx.proof_exec = Octra_core.Rule_graph.Active then
-      Octra_core.Circle_deploy.calls_enabled store info
+      Octra_core.Circle_deploy.calls_enabled ?snapshot store info
     else Lwt.return_false in
     let runtime_ctx = restrict_runtime_exec_ctx ~calls ctx in
-    let* policy = Octra_core.Circle_policy_store.load_hfhe_policy store circle_id in
-    let* transport_policy = Octra_core.Circle_policy_store.load_transport_policy store circle_id in
+    let* policy = Octra_core.Circle_policy_store.load_hfhe_policy ?snapshot store circle_id in
+    let* transport_policy = Octra_core.Circle_policy_store.load_transport_policy ?snapshot store circle_id in
     let owner = info.owner in
     let* active_relay =
       resolve_runtime_active_relay_id
+        ?snapshot
         store
         circle_id
         runtime_ctx.current_epoch
@@ -784,7 +797,7 @@ let load_runtime_hfhe_ctx ?(receipt_linked = false)
         runtime_ctx.circle_hfhe_intent_id
         runtime_ctx.circle_hfhe_active_relay_id in
     let* key_policy_live =
-      runtime_key_policy_live store circle_id runtime_ctx.current_epoch runtime_ctx.circle_hfhe_key_id in
+      runtime_key_policy_live ?snapshot store circle_id runtime_ctx.current_epoch runtime_ctx.circle_hfhe_key_id in
     let key_policy_satisfied =
       not policy.require_live_key_policy || key_policy_live in
     let proof_binding_satisfied =
@@ -1130,6 +1143,7 @@ let wasm_compute_fuel_limit limit =
 
 let execute_wasm_view
     execution
+    ~inspect_mode
     ~proof_mode
     ~code_b64
     ~export_name
@@ -1153,6 +1167,9 @@ let execute_wasm_view
     | Circle_program.Standard -> Octra_core.Circle_wasm_host.Standard, wasm_fuel_limit fuel_limit
     | Circle_program.Compute -> Octra_core.Circle_wasm_host.Compute, wasm_compute_fuel_limit fuel_limit in
   Octra_core.Circle_wasm_host.execute_with_profile
+    ~memory_bytes:None
+    ~guest_bytes:None
+    ~inspect_mode
     ~proof_mode
     ~call:None
     ~code_b64
@@ -1192,7 +1209,8 @@ let run_preview_prefetch ~clear task =
       clear ();
       Lwt.return_unit)
 
-let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id method_name params caller =
   let timing_enabled = wasm_view_method_timing_enabled method_name in
   let timing_started_at = if timing_enabled then Some (Unix.gettimeofday ()) else None in
@@ -1232,8 +1250,8 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
     end;
     Lwt.return receipt in
   let* loaded_result =
-    Circle_program.load ~trusted ~point_ops:ctx.point_ops
-      ~float_mode:ctx.wasm_float store circle_id in
+    Circle_program.load ?snapshot ~optional:true ~trusted ~point_ops:ctx.point_ops
+      ~float_mode:ctx.wasm_float ~inspect_mode store circle_id in
   timing_mark "load_program";
   match loaded_result with
   | Error e ->
@@ -1256,13 +1274,13 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
     begin
       match loaded.code with
       | Circle_program.Octb { bytecode; profile } ->
-        let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
+        let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
         timing_mark "load_storage";
         begin
           match storage_result with
           | Error e -> finish (failed_receipt e)
           | Ok storage_tbl ->
-            let* runtime_ctx_result = load_runtime_hfhe_ctx ctx store circle_id caller in
+            let* runtime_ctx_result = load_runtime_hfhe_ctx ?snapshot ctx store circle_id caller in
             timing_mark "load_hfhe";
             begin
               match runtime_ctx_result with
@@ -1295,7 +1313,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
         end
       | Circle_program.Wasm_v1 wasm ->
         let* storage_result =
-          load_wasm_view_storage_cached store circle_id loaded.info.stable_root in
+          load_wasm_view_storage_cached ?snapshot store circle_id loaded.info.stable_root in
         timing_mark "load_storage";
         begin
           match storage_result with
@@ -1303,7 +1321,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
           | Ok (storage_cache_key, storage_tbl) ->
             let* runtime_ctx_result =
               if wasm_method_needs_hfhe method_name then
-                load_runtime_hfhe_ctx ctx store circle_id caller
+                load_runtime_hfhe_ctx ?snapshot ctx store circle_id caller
               else
                 Lwt.return (Ok (empty_runtime_hfhe_details ctx loaded.info.owner))
             in
@@ -1342,6 +1360,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                         method_name in
                     let* public_reads_result =
                       Octra_core.Circle_wasm_public_read.load
+                        ?snapshot
                         ~charge
                         store
                         (Int64.of_int runtime_hfhe.exec_ctx.current_epoch)
@@ -1360,6 +1379,7 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                         let* wasm_result =
                           execute_wasm_view
                             execution
+                            ~inspect_mode
                             ~proof_mode:runtime_hfhe.exec_ctx.proof_exec
                             ~code_b64:wasm.code_b64
                             ~export_name:"octra_query"
@@ -1401,13 +1421,19 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
                                       values = [ContractVM.VString event.data];
                                     })
                                   result.events in
+                              let used = key_effort + public_reads.effort_used + result.effort_used in
+                              let output = match return_value with
+                                | None -> Some used
+                                | Some value -> ContractVM.output_work runtime_hfhe.exec_ctx
+                                  ~used ~limit value in
                               finish {
-                                Contract.success = result.success;
-                                return_value;
-                                effort_used = key_effort + public_reads.effort_used + result.effort_used;
+                                Contract.success = result.success && Option.is_some output;
+                                return_value = if Option.is_some output then return_value else None;
+                                effort_used = Option.value ~default:limit output;
                                 events;
                                 error =
-                                  if result.success then None
+                                  if Option.is_none output then Some "circle receipt effort exceeds limit"
+                                  else if result.success then None
                                   else Some (Option.value ~default:"execution reverted" result.error);
                                 storage_writes = 0;
                               }
@@ -1419,7 +1445,8 @@ let rec execute_view_call_with_execution execution ?running ?(trusted = []) ?(ct
     end
     end
 
-and maybe_prefetch_preview ~trusted ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+and maybe_prefetch_preview ~scope ~trusted ?snapshot ?running ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id caller prompt_csv prompt_tokens delivered_csv =
   if Option.is_some running then () else
   match parse_csv_tokens delivered_csv with
@@ -1432,7 +1459,7 @@ and maybe_prefetch_preview ~trusted ?running ?(ctx = ContractVM.default_ctx) ?(d
       ()
     else
       let next_prompt_csv = append_csv prompt_csv delivered_csv in
-      let next_key = preview_cache_key ~trusted ~math:ctx.math circle_id caller next_prompt_csv in
+      let next_key = preview_cache_key ~inspect_mode ~scope ~trusted ~math:ctx.math circle_id caller next_prompt_csv in
       let prefetch_n = min preview_prefetch_tokens remaining in
       if prefetch_n <= 0 then
         ()
@@ -1448,6 +1475,8 @@ and maybe_prefetch_preview ~trusted ?running ?(ctx = ContractVM.default_ctx) ?(d
               let* receipt =
                 execute_view_call_with_execution
                   Circle_program.Standard
+                  ?snapshot
+                  ~inspect_mode
                   ~trusted
                   ~ctx
                   ~depth
@@ -1457,22 +1486,26 @@ and maybe_prefetch_preview ~trusted ?running ?(ctx = ContractVM.default_ctx) ?(d
                   "complete_preview"
                   params
                   caller in
+              let* current = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
               begin
-                match preview_result_csv receipt with
-                | Some result_csv ->
+                match preview_result_csv receipt, current with
+                | Some result_csv, Some info when String.equal scope (preview_scope ctx info) ->
                   preview_cache_store next_key result_csv
-                | None ->
+                | _ ->
                   ()
               end;
               Lwt.return_unit))
       end
 
-and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+and execute_view_call ?snapshot ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id method_name params caller =
   match preview_request_of_call method_name params with
   | None ->
     execute_view_call_with_execution
       Circle_program.Standard
+      ?snapshot
+      ~inspect_mode
       ?running
       ~trusted
       ~ctx
@@ -1484,11 +1517,20 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
       params
       caller
   | Some (prompt_csv, prompt_tokens, n_tokens) ->
-    let cache_key = preview_cache_key ~trusted ~math:ctx.math circle_id caller prompt_csv in
+    let* loaded = Circle_program.load ?snapshot ~optional:true ~inspect_mode ~trusted ~point_ops:ctx.point_ops
+      ~float_mode:ctx.wasm_float store circle_id in
+    begin match loaded with
+    | Error error -> Lwt.return (failed_receipt (Octra_core.Circle_wasm_host.error_message error))
+    | Ok loaded ->
+    let scope = preview_scope ctx loaded.info in
+    let cache_key = preview_cache_key ~inspect_mode ~scope ~trusted ~math:ctx.math circle_id caller prompt_csv in
     begin
       match preview_cache_lookup cache_key n_tokens with
       | Some result_csv ->
         maybe_prefetch_preview
+          ~scope
+          ?snapshot
+          ~inspect_mode
           ~trusted
           ?running
           ~ctx
@@ -1505,6 +1547,8 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
         let* receipt =
           execute_view_call_with_execution
             Circle_program.Standard
+            ?snapshot
+            ~inspect_mode
             ?running
             ~trusted
             ~ctx
@@ -1515,11 +1559,15 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
             method_name
             params
             caller in
+        let* current = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
         begin
-          match preview_result_csv receipt with
-          | Some result_csv ->
+          match preview_result_csv receipt, current with
+          | Some result_csv, Some info when String.equal scope (preview_scope ctx info) ->
             preview_cache_store cache_key result_csv;
             maybe_prefetch_preview
+              ~scope
+              ?snapshot
+              ~inspect_mode
               ~trusted
               ?running
               ~ctx
@@ -1531,16 +1579,20 @@ and execute_view_call ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?
               prompt_csv
               prompt_tokens
               result_csv
-          | None ->
+          | _ ->
             ()
         end;
         Lwt.return receipt
     end
+    end
 
-let execute_view_call_direct ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+let execute_view_call_direct ?snapshot ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id method_name params caller =
   execute_view_call_with_execution
     Circle_program.Standard
+    ?snapshot
+    ~inspect_mode
     ~trusted
     ~ctx
     ~depth
@@ -1551,10 +1603,13 @@ let execute_view_call_direct ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(d
     params
     caller
 
-let execute_compute_view_call ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+let execute_compute_view_call ?snapshot ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id method_name params caller =
   execute_view_call_with_execution
     Circle_program.Compute
+    ?snapshot
+    ~inspect_mode
     ~trusted
     ~ctx
     ~depth
@@ -1571,11 +1626,12 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
     ?(hfhe_mode = Octra_core.Circle_hfhe_transcript.Direct)
     ?(update_policy = false)
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id method_name params caller value =
   let* loaded_result =
     Circle_program.load
       ~trusted ~point_ops:ctx.point_ops ~manifest_profile
-      ~float_mode:ctx.wasm_float store circle_id in
+      ~float_mode:ctx.wasm_float ~inspect_mode store circle_id in
   match loaded_result with
   | Error (Octra_core.Circle_wasm_host.Rejected e) ->
     Lwt.return (failed_call_result e)
@@ -1775,6 +1831,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                             else None in
                           let* wasm_result =
                             Octra_core.Circle_wasm_host.execute
+                              ~inspect_mode
                               ~proof_mode:runtime_hfhe.exec_ctx.proof_exec
                               ~call
                               ~math:runtime_hfhe.exec_ctx.math
@@ -1808,7 +1865,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                               | Error e ->
                                 Lwt.return (rejected (min limit (spent + result.effort_used)) e)
                               | Ok return_value ->
-                                let events =
+                                let own_events =
                                   List.map
                                     (fun event ->
                                       {
@@ -1817,8 +1874,17 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                                         event = event.Octra_core.Circle_wasm_host.topic;
                                         values = [ContractVM.VString event.data];
                                       })
-                                    result.events
-                                  |> fun events -> Wasm_call.merge_events events !nested in
+                                    result.events in
+                                let event_work = List.fold_left (fun work event ->
+                                  Option.bind work (fun used ->
+                                    ContractVM.event_work ctx ~used ~limit event))
+                                  (Some (spent + result.effort_used)) own_events in
+                                let output = Option.bind event_work (fun used ->
+                                  match return_value with
+                                  | None -> Some used
+                                  | Some value -> ContractVM.output_work ctx ~used ~limit value) in
+                                let events = if Option.is_none event_work then []
+                                  else Wasm_call.merge_events own_events !nested in
                                 if result.success && priced then begin
                                   Hashtbl.reset storage_tbl;
                                   Hashtbl.iter (Hashtbl.replace storage_tbl) result.storage_tbl
@@ -1827,15 +1893,16 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                                   Z.add (Octra_vm.Program_journal.storage_effort result.storage_tbl)
                                     (Octra_vm.Program_journal.write_effort result.storage_tbl)
                                 else Z.zero in
-                                let effort = Octra_vm.Cost.charge_z
-                                  ~used:(spent + result.effort_used) ~cost:work ~limit in
+                                let effort = Option.bind output (fun used ->
+                                  Octra_vm.Cost.charge_z ~used ~cost:work ~limit) in
                                 let receipt = {
                                   Contract.success = result.success && Option.is_some effort;
-                                  return_value;
+                                  return_value = if Option.is_some output then return_value else None;
                                   effort_used = Option.value ~default:limit effort;
                                   events;
                                   error =
-                                    if Option.is_none effort then Some "circle storage effort exceeds limit"
+                                    if Option.is_none output then Some "circle receipt effort exceeds limit"
+                                    else if Option.is_none effort then Some "circle storage effort exceeds limit"
                                     else if result.success then None
                                     else Some (Option.value ~default:"execution reverted" result.error);
                                   storage_writes = 0;
@@ -1872,14 +1939,14 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
         end
     end
 
-let read_storage_key store circle_id key =
-  Octra_core.Store_irmin.read_circle_stable_inline_value store circle_id key
+let read_storage_key ?snapshot store circle_id key =
+  Octra_core.Store_irmin.read_circle_stable_inline_value ?snapshot store circle_id key
 
-let read_slot_policy store circle_id path_key =
-  load_slot_policy store circle_id path_key
+let read_slot_policy ?snapshot store circle_id path_key =
+  load_slot_policy ?snapshot store circle_id path_key
 
-let read_state_policy store circle_id path_key =
-  load_state_policy store circle_id path_key
+let read_state_policy ?snapshot store circle_id path_key =
+  load_state_policy ?snapshot store circle_id path_key
 
 let read_state_descriptor store circle_id path_key =
   Octra_core.Circle_state_descriptor_store.load_descriptor store circle_id path_key
@@ -1902,20 +1969,21 @@ let read_register_cell store circle_id path_key =
 let read_register_workflow store circle_id workflow_ref =
   Octra_core.Circle_register_workflow_store.load store circle_id workflow_ref
 
-let list_storage_pairs store circle_id =
-  let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage store circle_id in
+let list_storage_pairs ?snapshot store circle_id =
+  let* storage_result = Octra_core.Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error e -> Lwt.return (Error e)
   | Ok storage_tbl ->
     let pairs = Hashtbl.fold (fun key value acc -> (key, value) :: acc) storage_tbl [] in
     Lwt.return (Ok pairs)
 
-let list_storage_page store circle_id ~limit =
-  Octra_core.Store_irmin.load_circle_stable_storage_page store circle_id ~limit
+let list_storage_page ?snapshot store circle_id ~limit =
+  Octra_core.Store_irmin.load_circle_stable_storage_page ?snapshot store circle_id ~limit
 
 let commit_call_result
     ?(deployment_profile = Octra_core.Circle_wasm_host.Standard)
     ?(float_mode = Octra_core.Rule_graph.Prior)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     ~proof_mode
     store
     circle_id
@@ -1977,6 +2045,7 @@ let commit_call_result
                     ~resource_errors:t.calls
                     ~execution_profile:deployment_profile
                     ~float_mode
+                    ~inspect_mode
                     store
                     src
                     payload in

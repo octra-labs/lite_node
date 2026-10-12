@@ -514,6 +514,8 @@ let publish_owned archive deps ~force exporter_set prepared =
           prepared
           target
           (Capture.stage_owned archive
+             ~format:(Capture.format ~chain_id:prepared.checkpoint.chain_id
+               ~epoch:prepared.head.epoch_id)
              Capture.{
                data_dir = deps.data_dir;
                head = prepared.head;
@@ -846,6 +848,17 @@ let rec perform deps ~force exporter_set state effects =
             perform deps ~force exporter_set state rest
       end
 
+let cycle_event ~chain_id ~epoch =
+  let minimum =
+    Octra_core.Rule_graph.profile_epochs ~chain_id
+    |> List.fold_left (fun prior activation ->
+      let activation = Int64.of_int activation in
+      if Int64.compare activation epoch <= 0 then Int64.max prior activation
+      else prior) 0L
+  in
+  if minimum = 0L then Cycle.Finalized epoch
+  else Cycle.Finalized_after { epoch; minimum }
+
 let run_loop deps ~force exporter_set initial =
   let rec loop state =
     match publisher_current deps ~force exporter_set with
@@ -862,7 +875,9 @@ let run_loop deps ~force exporter_set initial =
                   match Cycle.step
                     Cycle.default
                     state
-                    (Cycle.Finalized (Int64.of_int head.Head.epoch_id)) with
+                    (cycle_event
+                       ~chain_id:deps.chain_id
+                       ~epoch:(Int64.of_int head.Head.epoch_id)) with
                   | Error reason ->
                       deps.warn ("event = sync_cycle_failed reason = " ^ reason);
                       Lwt.return state

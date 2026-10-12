@@ -56,6 +56,7 @@ let loaded_cache_ttl_secs = 300.0
 let loaded_cache_limit = 64
 
 let loaded_cache_key ?(float_mode=Octra_core.Rule_graph.Prior)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     ?(manifest_profile=Octra_core.Circle_wasm_host.Manifest) circle_id
     (info : Octra_core.Circles.circle_info) =
   String.concat ":" [
@@ -63,6 +64,9 @@ let loaded_cache_key ?(float_mode=Octra_core.Rule_graph.Prior)
     Octra_core.Circle_wasm_host.profile_name manifest_profile;
     string_of_bool (Octra_core.Circle_wasm_host.float_enabled float_mode);
   ]
+  |> fun key -> match inspect_mode with
+    | Octra_core.Rule_graph.Prior -> key
+    | Octra_core.Rule_graph.Active -> key ^ ":inspect"
 
 let prune_loaded_cache () =
   let now = Unix.gettimeofday () in
@@ -229,15 +233,17 @@ let yojson_of_descriptor (t : descriptor) =
   ]
 
 let describe
+    ?snapshot
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     ?(float_mode = Octra_core.Rule_graph.Prior)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store
     circle_id =
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None -> Lwt.return (Error "circle not found")
   | Some info ->
-    let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 store circle_id in
+    let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 ?snapshot store circle_id in
     begin
       match code_opt with
       | None ->
@@ -278,8 +284,10 @@ let describe
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
                   Octra_core.Circle_wasm_host.describe
+                    ~optional:true
                     ~execution_profile:manifest_profile
                     ~float_mode
+                    ~inspect_mode
                     code_b64 in
                 begin
                   match wasm_descriptor_result with
@@ -313,20 +321,23 @@ let describe
     end
 
 let load
+    ?snapshot
+    ?(optional = false)
     ?(trusted = [])
     ?(point_ops = false)
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     ?(float_mode = Octra_core.Rule_graph.Prior)
+    ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store
     circle_id =
-  let* info_opt = Octra_core.Store_irmin.get_circle_info store circle_id in
+  let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
   | None ->
     Lwt.return
       (Error (Octra_core.Circle_wasm_host.Rejected "circle not found"))
   | Some info ->
     prune_loaded_cache ();
-    let cache_key = loaded_cache_key ~float_mode ~manifest_profile circle_id info in
+    let cache_key = loaded_cache_key ~float_mode ~inspect_mode ~manifest_profile circle_id info in
     begin
       match Hashtbl.find_opt loaded_cache cache_key with
       | Some entry ->
@@ -337,7 +348,7 @@ let load
           { loaded; updated_at = Unix.gettimeofday () };
         Lwt.return (Ok loaded)
       | None ->
-    let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 store circle_id in
+    let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 ?snapshot store circle_id in
     begin
       match code_opt with
       | None ->
@@ -375,8 +386,10 @@ let load
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
                   Octra_core.Circle_wasm_host.describe
+                    ~optional
                     ~execution_profile:manifest_profile
                     ~float_mode
+                    ~inspect_mode
                     code_b64 in
                 begin
                   match wasm_descriptor_result with

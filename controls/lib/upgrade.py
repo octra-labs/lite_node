@@ -680,7 +680,7 @@ def join_pending(role, state):
         and state.get("validator_member") is False
         and (
             state.get("voting") is True
-            or state.get("voting_reason") == "not_ready"
+            or state.get("voting_reason") in ("not_ready", "not_member")
         )
     )
 

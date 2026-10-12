@@ -310,6 +310,7 @@ type s = {
   mutable effort_used : int;
   effort_limit : int;
   mutable reverted : bool;
+  mutable output_ready : bool;
   mutable pc : int;
   caller : string;
   origin : string;
@@ -449,6 +450,7 @@ let create_state ?(limit = 1_000_000) ?(ctx = default_ctx) ?(depth = 0) ?(is_vie
     effort_used = 0;
     effort_limit = limit;
     reverted = false;
+    output_ready = false;
     pc = 0;
     caller; origin; address; value;
     logs = ref [];
@@ -779,17 +781,72 @@ let revert st =
   st.reverted <- true;
   false
 
+let value_work budget ~used ~limit value =
+  let ready = match value with
+    | VInt number | VU64 number | VU128 number | VU256 number ->
+      let size = Z.numbits number / 3 + 2 in
+      if size > Byte_work.event_left budget then None else
+        Byte_work.charge budget ~used ~limit ~base:0 [Byte_work.Allocate size]
+    | _ -> Some used in
+  Option.map (fun used -> used, to_string value) ready
+
+let output_work ctx ~used ~limit value =
+  match ctx.byte_work with
+  | None -> Some used
+  | Some budget ->
+    let left = Byte_work.event_left budget - 16 in
+    Option.bind (value_work budget ~used ~limit value) (fun (used, text) ->
+      Option.bind (Byte_work.text_size ~limit:left text) (fun size ->
+        let size = match value with
+          | VBytes _ | VBytes32 _ ->
+            Option.map (fun encoded -> max size (encoded + 2))
+              (Byte_work.encoded_size (String.length text))
+          | _ -> Some size in
+        Option.bind size (fun size ->
+          Byte_work.output budget ~used ~limit (size + 16))))
+
+let event_work ctx ~used ~limit (record : event_record) =
+  match ctx.byte_work with
+  | None -> Some used
+  | Some budget ->
+    let left = Byte_work.event_left budget in
+    let rec values used output = function
+      | [] -> Some (used, List.rev output)
+      | value :: rest ->
+        Option.bind (value_work budget ~used ~limit value) (fun (used, text) ->
+          values used (text :: output) rest) in
+    Option.bind (values used [] record.values) (fun (used, values) ->
+      Option.bind (Byte_work.event_size ~limit:(left - 1)
+        ~address:record.contract ~depth:record.depth ~name:record.event ~values)
+        (fun size -> Byte_work.emit budget ~used ~limit (size + 1)))
+
+let append_event st event =
+  match event_work st.ctx ~used:st.effort_used ~limit:st.effort_limit event with
+  | None -> false
+  | Some effort ->
+    st.effort_used <- effort;
+    st.logs := event :: !(st.logs);
+    true
+
+let finish_output st =
+  if st.reverted then false
+  else if st.output_ready then true
+  else match output_work st.ctx ~used:st.effort_used ~limit:st.effort_limit st.regs.(0) with
+  | None -> revert st
+  | Some effort ->
+    st.effort_used <- effort;
+    st.output_ready <- true;
+    true
+
 let revert_with_reason st reason =
-  st.logs := { contract = st.address; depth = st.call_depth;
-               event = "Require"; values = [VString reason] }
-             :: !(st.logs);
+  ignore (append_event st { contract = st.address; depth = st.call_depth;
+    event = "Require"; values = [VString reason] });
   revert st
 
 let view_guard st =
   if st.is_view then begin
-    st.logs := { contract = st.address; depth = st.call_depth;
-                 event = "Require"; values = [VString "write in view context"] }
-               :: !(st.logs);
+    ignore (append_event st { contract = st.address; depth = st.call_depth;
+      event = "Require"; values = [VString "write in view context"] });
     ignore (revert st); false
   end else true
 
@@ -1074,14 +1131,29 @@ let memory_span st ?(sized = false) base factors =
 let memory_offset st base index width =
   st.ctx.byte_work = None || Mem_span.offset base index width <> None
 
+let read_number st value =
+  begin match st.ctx.byte_work, value with
+  | Some budget, VString input ->
+    let quoted = Option.bind (Byte_work.parsing ~length:(String.length input) ~cells:1)
+      (fun (base, requests) -> Byte_work.charge budget ~used:st.effort_used
+        ~limit:st.effort_limit ~base requests) in
+    begin match quoted with
+    | Some effort -> st.effort_used <- effort
+    | None -> failwith "numeric work limit"
+    end
+  | _ -> ()
+  end;
+  to_z value
+
 let read_q16 st addr n =
   if not (valid_mem_span addr n) then None
   else
     let values = Array.init n (fun i ->
       match Hashtbl.find_opt st.memory.data (addr + i) with
       | None -> Some Z.zero
-      | Some value when is_numeric value && Fixed_q16.in_range (to_z value) ->
-        Some (to_z value)
+      | Some value when is_numeric value ->
+        let number = read_number st value in
+        if Fixed_q16.in_range number then Some number else None
       | Some _ -> None)
     in
     if Array.for_all Option.is_some values then
@@ -1137,21 +1209,34 @@ let reserve_text st value =
     && charge_bytes st ~base:0 ~prior:0 [Byte_work.Allocate bytes]
   | _ -> true
 
-let reserve_decode st ~input ~count ~bits ~cached ~cost =
+let reserve_bytes st ~base requests =
   match st.ctx.byte_work with
   | None -> true
   | Some budget ->
+    match Byte_work.plan (Byte_work.rules budget) ~remaining:(Byte_work.remaining budget)
+      ~available:(Byte_work.available budget) ~used:st.effort_used
+      ~limit:st.effort_limit ~base requests with
+    | None -> false
+    | Some _ -> charge_bytes st ~base:0 ~prior:0 requests
+
+let reserve_cells st ~count ~bits ~cost =
+  match st.ctx.byte_work with
+  | None -> true
+  | Some _ ->
+    match Byte_work.cell_bytes ~count ~bits, cost () with
+    | Some size, Some base -> reserve_bytes st ~base [Byte_work.Allocate size]
+    | _ -> false
+
+let reserve_decode st ~input ~count ~bits ~cached ~cost =
+  match st.ctx.byte_work with
+  | None -> true
+  | Some _ ->
     match Byte_work.decoding ~length:(String.length input) ~cells:count ~bits ~cached with
     | None -> false
     | Some plan ->
       match cost plan.max_bytes with
       | None -> false
-      | Some base ->
-        match Byte_work.plan (Byte_work.rules budget) ~remaining:(Byte_work.remaining budget)
-          ~available:(Byte_work.available budget) ~used:st.effort_used
-          ~limit:st.effort_limit ~base plan.requests with
-        | None -> false
-        | Some _ -> charge_bytes st ~base:0 ~prior:0 plan.requests
+      | Some base -> reserve_bytes st ~base plan.requests
 
 type number_arg = Numeric of reg * int | Machine of reg * int
 
@@ -1329,6 +1414,7 @@ let byte_inputs_ok st op =
     | KECCAK256 (_, source) | SDELK source | SKEYS (_, source, _) -> register source
     | INDEXOF (_, source, pattern) -> register source && register pattern
     | PARSE_INTS (_, source, _) -> register source
+    | LOAD_INT8_BYTES_TO_MEM (dst, source, off, count, _)
     | LOAD_INT8_B64_TO_MEM (dst, source, off, count, _)
     | LOAD_INT8_Q16 (dst, source, off, count, _)
     | LOAD_INT8_FP (dst, source, off, count, _) ->
@@ -1389,12 +1475,13 @@ let copy_key_page st ~prefix ~after ~base =
         Some (List.length selected, if more then !last else "")
 
 let op_effort st op =
+  let mode = if st.ctx.byte_work = None then st.int_mode else Int_work.Active in
   let binary kind left right =
-    Int_work.cost st.int_mode ~base:(effort_cost op) kind
+    Int_work.cost mode ~base:(effort_cost op) kind
       (to_z (getr st left)) (to_z (getr st right))
   in
   let unary kind source =
-    Int_work.cost st.int_mode ~base:(effort_cost op) kind
+    Int_work.cost mode ~base:(effort_cost op) kind
       (to_z (getr st source)) Z.zero
   in
   match op with
@@ -1431,21 +1518,35 @@ let prepare_int_work st op count operands =
       in
       sum 0 Z.zero
 
-let int_values values index current =
+let int_values st op values index current =
   match values with
-  | Live -> current index
+  | Live ->
+    let first, second = current index in
+    if st.ctx.byte_work <> None
+      && not (add_z_effort st (Int_work.variable op first second)) then
+      failwith "integer work limit";
+    first, second
   | Fixed saved -> saved.(index)
 
-let charge_same_int_work st op count first second =
-  match st.int_mode with
-  | Int_work.Prior -> true
-  | Int_work.Active ->
+let same_int_cost st op count first second =
+  match st.int_mode, st.ctx.byte_work with
+  | Int_work.Prior, None -> Some Z.zero
+  | _ ->
     let left = st.effort_limit - st.effort_used in
     if count < 0 || count > Int_work.item_cap || left < 0 || count > left then
-      false
+      None
     else
       let one = Int_work.variable op first second in
-      add_z_effort st (Z.mul (Z.of_int count) one)
+      Some (Z.mul (Z.of_int count) one)
+
+let charge_same_int_work st op count first second =
+  Option.fold ~none:false ~some:(add_z_effort st)
+    (same_int_cost st op count first second)
+
+let load_int_cost st ~base ~count ~scale =
+  Option.bind (same_int_cost st Int_work.Mul count Z.zero scale) (fun work ->
+    let total = Z.add (Z.of_int base) work in
+    if Z.fits_int total then Some (Z.to_int total) else None)
 
 let add_dyn_product st factors divisor =
   match Cost.scaled_product factors ~divisor with
@@ -2033,9 +2134,8 @@ let exec_one st op =
     let s = to_string (getr st rs) in
     if is_valid_addr s then true
     else begin
-      st.logs := { contract = st.address; depth = st.call_depth;
-                   event = "Require"; values = [VString "invalid address"] }
-                 :: !(st.logs);
+      ignore (append_event st { contract = st.address; depth = st.call_depth;
+        event = "Require"; values = [VString "invalid address"] });
       revert st
     end
   | SUBSTR (rd, rs, rstart, rlen) ->
@@ -2345,7 +2445,7 @@ let exec_one st op =
       else begin
         let mem_get a =
           match Hashtbl.find_opt st.memory.data a with
-          | Some v -> to_z v
+          | Some v -> read_number st v
           | None -> Z.zero
         in
         let row_size = n * k in
@@ -2354,8 +2454,9 @@ let exec_one st op =
           let offset = index mod row_size in
           let column = offset / k in
           let inner = offset mod k in
-          mem_get (lhs_addr + row * k + inner),
-          mem_get (rhs_addr + inner * n + column)
+          let first = mem_get (lhs_addr + row * k + inner) in
+          let second = mem_get (rhs_addr + inner * n + column) in
+          first, second
         in
         match prepare_int_work st Int_work.Mul (m * row_size) operands with
         | None -> revert st
@@ -2365,7 +2466,7 @@ let exec_one st op =
               let acc = ref Z.zero in
               for i = 0 to k - 1 do
                 let index = r * row_size + c * k + i in
-                let lv, rv = int_values values index operands in
+                let lv, rv = int_values st Int_work.Mul values index operands in
                 acc := Z.add !acc (Z.mul lv rv)
               done;
               let cell = dst_addr + r * n + c in
@@ -2387,18 +2488,20 @@ let exec_one st op =
       else begin
         let mem_get a =
           match Hashtbl.find_opt st.memory.data a with
-          | Some v -> to_z v
+          | Some v -> read_number st v
           | None -> Z.zero
         in
         let operands index =
-          mem_get (a_addr + index), mem_get (b_addr + index)
+          let first = mem_get (a_addr + index) in
+          let second = mem_get (b_addr + index) in
+          first, second
         in
         match prepare_int_work st Int_work.Mul n operands with
         | None -> revert st
         | Some values ->
           let acc = ref Z.zero in
           for i = 0 to n - 1 do
-            let av, bv = int_values values i operands in
+            let av, bv = int_values st Int_work.Mul values i operands in
             acc := Z.add !acc (Z.mul av bv)
           done;
           setr st rd (VInt !acc);
@@ -2453,7 +2556,7 @@ let exec_one st op =
         let mem_get a =
           match Hashtbl.find_opt st.memory.data a with
           | Some v ->
-            let z = to_z v in
+            let z = read_number st v in
             if Z.fits_int z then Z.to_int z else 0
           | None -> 0
         in
@@ -2539,7 +2642,7 @@ let exec_one st op =
         let mem_get_f a =
           match Hashtbl.find_opt st.memory.data a with
           | Some v ->
-            let z = to_z v in
+            let z = read_number st v in
             if Z.fits_int z then float_of_int (Z.to_int z) /. q_one else 0.0
           | None -> 0.0
         in
@@ -2570,7 +2673,7 @@ let exec_one st op =
           let cell = addr + i in
           match Hashtbl.find_opt st.memory.data cell with
           | Some v ->
-            let z = to_z v in
+            let z = read_number st v in
             if Z.sign z < 0 then
               Hashtbl.replace st.memory.data cell (VInt Z.zero)
           | None -> ()
@@ -2592,7 +2695,7 @@ let exec_one st op =
         let mem_get_f a =
           match Hashtbl.find_opt st.memory.data a with
           | Some v ->
-            let z = to_z v in
+            let z = read_number st v in
             if Z.fits_int z then float_of_int (Z.to_int z) /. q_one else 0.0
           | None -> 0.0
         in
@@ -2636,7 +2739,7 @@ let exec_one st op =
           let cell = addr + i in
           match Hashtbl.find_opt st.memory.data cell with
           | Some v ->
-            let z = to_z v in
+            let z = read_number st v in
             if Z.fits_int z then begin
               let x = float_of_int (Z.to_int z) /. q_one in
               let sigmoid = 1.0 /. (1.0 +. exp (-. x)) in
@@ -2677,12 +2780,12 @@ let exec_one st op =
         let operands index =
           let first =
             match Hashtbl.find_opt st.memory.data (dst + index) with
-            | Some value -> to_z value
+            | Some value -> read_number st value
             | None -> Z.zero
           in
           let second =
             match Hashtbl.find_opt st.memory.data (src + index) with
-            | Some value -> to_z value
+            | Some value -> read_number st value
             | None -> Z.zero
           in
           first, second
@@ -2691,7 +2794,7 @@ let exec_one st op =
         | None -> revert st
         | Some values ->
           for i = 0 to n - 1 do
-            let first, second = int_values values i operands in
+            let first, second = int_values st Int_work.Mul values i operands in
             Hashtbl.replace st.memory.data (dst + i)
               (VInt (Fixed_q16.trunc_mul first second))
           done;
@@ -2720,6 +2823,9 @@ let exec_one st op =
     let slen = String.length src_str in
     if n <= 0 || n > 1_048_576 then revert st
     else if not (memory_span st dst [n] && decode_range st off n slen) then revert st
+    else if not (reserve_cells st ~count:n ~bits:(Z.numbits scale_z + 8)
+      ~cost:(fun () -> load_int_cost st ~base:(n / 2) ~count:n ~scale:scale_z))
+    then revert st
     else begin
       if not (add_dyn_effort st (n / 2)) then revert st
       else if not
@@ -2747,12 +2853,12 @@ let exec_one st op =
         let operands index =
           let first =
             match Hashtbl.find_opt st.memory.data (dst + index) with
-            | Some value -> to_z value
+            | Some value -> read_number st value
             | None -> Z.zero
           in
           let second =
             match Hashtbl.find_opt st.memory.data (src + index) with
-            | Some value -> to_z value
+            | Some value -> read_number st value
             | None -> Z.zero
           in
           first, second
@@ -2761,7 +2867,7 @@ let exec_one st op =
         | None -> revert st
         | Some values ->
           for i = 0 to n - 1 do
-            let first, second = int_values values i operands in
+            let first, second = int_values st Int_work.Add values i operands in
             Hashtbl.replace st.memory.data (dst + i)
               (VInt (Z.add first second))
           done;
@@ -2827,7 +2933,7 @@ let exec_one st op =
         | Some round ->
           for i = 0 to n - 1 do
             let v = match Hashtbl.find_opt st.memory.data (addr + i) with
-              | Some x -> to_z x | None -> Z.zero in
+              | Some x -> read_number st x | None -> Z.zero in
             Hashtbl.replace st.memory.data (addr + i) (VInt (round v))
           done;
           true
@@ -2844,15 +2950,7 @@ let exec_one st op =
     else if not (reserve_decode st ~input:src_b64 ~count:n
       ~bits:(Z.numbits scale_z + 8) ~cached:false
       ~cost:(fun size ->
-        let base = Z.add (Z.of_int n) (Z.of_int (size / 4)) in
-        let work = match st.int_mode with
-          | Int_work.Prior -> Z.zero
-          | Int_work.Active ->
-            Z.mul (Z.of_int n) (Int_work.variable Int_work.Mul Z.zero scale_z) in
-        let cost = Z.add base work in
-        if not (Z.fits_int cost) ||
-          (st.int_mode = Int_work.Active && n > Int_work.item_cap)
-        then None else Some (Z.to_int cost))) then revert st
+        load_int_cost st ~base:(n + size / 4) ~count:n ~scale:scale_z)) then revert st
     else begin
       match Base64.decode src_b64 with
       | Error _ -> revert st
@@ -2952,7 +3050,7 @@ let exec_one st op =
         let mem_get_f a =
           match Hashtbl.find_opt st.memory.data a with
           | Some v ->
-            let z = to_z v in
+            let z = read_number st v in
             if Z.fits_int z then float_of_int (Z.to_int z) /. q_one else 0.0
           | None -> 0.0
         in
@@ -3516,9 +3614,8 @@ let exec_one st op =
     if List.length !(st.logs) >= 256 then revert st
     else
     let vals = List.map (fun r -> getr st r) regs_list in
-    st.logs := { contract = st.address; depth = st.call_depth; event; values = vals }
-               :: !(st.logs);
-    true
+    if append_event st { contract = st.address; depth = st.call_depth;
+      event; values = vals } then true else revert st
   | CONCAT (rd, rs1, rs2) ->
     let left = getr st rs1 in
     let right = getr st rs2 in
@@ -3877,7 +3974,7 @@ let run state program =
       state.pc <- state.pc + 1;
       if not (exec_one state op) then state.pc <- len
     done;
-    not state.reverted
+    finish_output state
   with
   | Z.Overflow
   | Invalid_argument _
@@ -3898,13 +3995,15 @@ let step state program =
     let len = Array.length program in
     if state.reverted then Refused
     else if state.pc < 0 then refuse state
-    else if state.pc >= len then Finished
+    else if state.pc >= len then
+      if finish_output state then Finished else Refused
     else
       let op = program.(state.pc) in
       state.pc <- state.pc + 1;
       if not (exec_one state op) then state.pc <- len;
       if state.reverted then Refused
-      else if state.pc >= len then Finished
+      else if state.pc >= len then
+        if finish_output state then Finished else Refused
       else Running
   with
   | Z.Overflow

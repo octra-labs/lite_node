@@ -6,7 +6,7 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 type 'handler dispatch_adapters = {
   store_read : (Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
   program_read :
-    (float_mode:Octra_core.Rule_graph.mode ->
+    (profile:(epoch:int -> (Octra_vm.Contract_rpc.view_profile, Octra_core.Rpc.rpc_error) result) ->
      Octra_core.Store_irmin.t -> Yojson.Safe.t -> rpc_result Lwt.t) -> 'handler;
   epoch_read :
     (Octra_core.Store_irmin.t ->
@@ -37,12 +37,14 @@ val option_result :
   rpc_result
 
 val program_descriptor :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val program_descriptor_auth_params :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
@@ -215,6 +217,7 @@ val ingress_packet_required_route :
   rpc_result Lwt.t
 
 val with_scope_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   gate:Circle_auth.gate ->
@@ -223,6 +226,7 @@ val with_scope_auth :
   rpc_result Lwt.t
 
 val with_owner_scope_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   op:string ->
@@ -230,6 +234,7 @@ val with_owner_scope_auth :
   rpc_result Lwt.t
 
 val with_owner_subject_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   field:string ->
@@ -238,6 +243,7 @@ val with_owner_subject_auth :
   rpc_result Lwt.t
 
 val with_owner_asset_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   circle_id:string ->
@@ -247,6 +253,7 @@ val with_owner_asset_auth :
   rpc_result Lwt.t
 
 val with_owner_validated_subject_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   field:string ->
@@ -256,6 +263,7 @@ val with_owner_validated_subject_auth :
   rpc_result Lwt.t
 
 val with_owner_locator_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   field:string ->
@@ -265,39 +273,54 @@ val with_owner_locator_auth :
   rpc_result Lwt.t
 
 val with_object_member_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   (string -> string -> string -> rpc_result Lwt.t) ->
   rpc_result Lwt.t
 
 val program_info_public :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val program_info_public_params :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t
 
 val program :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val program_params :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t
 
 val program_auth_params :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
+  Octra_core.Store_irmin.t ->
+  Yojson.Safe.t ->
+  rpc_result Lwt.t
+
+val program_rpc :
+  authenticated:bool ->
+  describe:bool ->
+  profile:(epoch:int -> (Octra_vm.Contract_rpc.view_profile, Octra_core.Rpc.rpc_error) result) ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t
 
 val view_call :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
@@ -311,6 +334,7 @@ val view_call :
   rpc_result Lwt.t
 
 val view_call_public :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   view_ctx:Octra_vm.Contract_vm.exec_ctx ->
@@ -323,6 +347,7 @@ val view_call_public :
   rpc_result Lwt.t
 
 val view_call_public_params :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
@@ -332,6 +357,7 @@ val view_call_public_params :
   rpc_result Lwt.t
 
 val view_call_auth :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?trusted:Octra_vm.Program_attestation.key list ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
@@ -340,11 +366,22 @@ val view_call_auth :
   stop:(unit -> unit) ->
   rpc_result Lwt.t
 
+val view_rpc :
+  authenticated:bool ->
+  trusted:Octra_vm.Program_attestation.key list ->
+  profile:(epoch:int -> (Octra_vm.Contract_rpc.view_profile, Octra_core.Rpc.rpc_error) result) ->
+  store:Octra_core.Store_irmin.t ->
+  ledger:Octra_core.Ledger.t ->
+  Yojson.Safe.t ->
+  rpc_result Lwt.t
+
 val object_read :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   object_ref:string ->
-  load:(Octra_core.Store_irmin.t -> string -> string -> ('a, string) result Lwt.t) ->
+  load:(?snapshot:Octra_core.Store_irmin.read_snapshot ->
+    Octra_core.Store_irmin.t -> string -> string -> ('a, string) result Lwt.t) ->
   view:(string -> 'a -> Yojson.Safe.t) ->
   rpc_result Lwt.t
 
@@ -369,9 +406,11 @@ val object_member_auth_params :
   rpc_result Lwt.t
 
 val object_discovery :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
-  load:(Octra_core.Store_irmin.t -> string -> ('a, string) result Lwt.t) ->
+  load:(?snapshot:Octra_core.Store_irmin.read_snapshot ->
+    Octra_core.Store_irmin.t -> string -> ('a, string) result Lwt.t) ->
   view:('a -> Yojson.Safe.t) ->
   rpc_result Lwt.t
 
@@ -386,16 +425,19 @@ val object_list_auth_params :
   rpc_result Lwt.t
 
 val transport_policy :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val hfhe_policy :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val key_policy :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   key_id:string ->
@@ -403,6 +445,7 @@ val key_policy :
   rpc_result Lwt.t
 
 val slot_locator_policy :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   locator:Circle_view.locator ->
@@ -416,6 +459,7 @@ val slot_locator_policy_auth_params :
   rpc_result Lwt.t
 
 val state_locator_policy :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   locator:Circle_view.locator ->
@@ -429,6 +473,7 @@ val state_locator_policy_auth_params :
   rpc_result Lwt.t
 
 val state_descriptor :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   locator:Circle_view.locator ->
@@ -440,6 +485,7 @@ val state_descriptor_auth_params :
   rpc_result Lwt.t
 
 val asset_plaintext :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   path_key:string ->
@@ -452,6 +498,7 @@ val asset_plaintext_params :
   rpc_result Lwt.t
 
 val asset_ciphertext :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   path_key:string ->
@@ -468,6 +515,7 @@ val asset_ciphertext_params :
   rpc_result Lwt.t
 
 val asset_ciphertext_by_resource_key :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   resource_key:string ->
@@ -539,6 +587,7 @@ val asset_ciphertext_by_state_ref_auth_params :
   rpc_result Lwt.t
 
 val private_state_cell :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   locator:Circle_view.locator ->
@@ -546,7 +595,8 @@ val private_state_cell :
   not_found:string ->
   cell_field:string ->
   empty_cell:'a ->
-  load_cell:(Octra_core.Store_irmin.t -> string -> string -> 'a option Lwt.t) ->
+  load_cell:(?snapshot:Octra_core.Store_irmin.read_snapshot ->
+    Octra_core.Store_irmin.t -> string -> string -> 'a option Lwt.t) ->
   cell_json:('a -> Yojson.Safe.t) ->
   rpc_result Lwt.t
 
@@ -563,13 +613,15 @@ val register_cell_auth_params :
   rpc_result Lwt.t
 
 val binding :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   binding_field:string ->
   binding_key_field:string ->
   binding_key_value:string ->
   empty_binding:'a ->
-  load_binding:(Octra_core.Store_irmin.t -> string -> string -> 'a option Lwt.t) ->
+  load_binding:(?snapshot:Octra_core.Store_irmin.read_snapshot ->
+    Octra_core.Store_irmin.t -> string -> string -> 'a option Lwt.t) ->
   binding_json:('a -> Yojson.Safe.t) ->
   current_state_ref:('a -> string option) ->
   rpc_result Lwt.t
@@ -585,12 +637,14 @@ val register_binding_auth_params :
   rpc_result Lwt.t
 
 val workflow :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   workflow_field:string ->
   workflow_ref:string ->
   empty_workflow:'a ->
-  load_workflow:(Octra_core.Store_irmin.t -> string -> string -> 'a option Lwt.t) ->
+  load_workflow:(?snapshot:Octra_core.Store_irmin.read_snapshot ->
+    Octra_core.Store_irmin.t -> string -> string -> 'a option Lwt.t) ->
   workflow_json:('a -> Yojson.Safe.t) ->
   rpc_result Lwt.t
 
@@ -605,17 +659,20 @@ val register_workflow_auth_params :
   rpc_result Lwt.t
 
 val storage :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   key:string ->
   rpc_result Lwt.t
 
 val storage_dump :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
 
 val outbox_claim :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   intent_id:string ->
@@ -623,12 +680,14 @@ val outbox_claim :
   rpc_result Lwt.t
 
 val outbox_intent :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   intent_id:string ->
   rpc_result Lwt.t
 
 val outbox_status :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   intent_id:string ->
@@ -636,6 +695,7 @@ val outbox_status :
   rpc_result Lwt.t
 
 val ingress_packet :
+  ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   intent_id:string ->

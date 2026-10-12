@@ -70,7 +70,7 @@ let tx_fields ~decode_message tx =
     "op_type", `String (Transaction.op_type_to_string tx.Transaction.op_type);
     "message",
       (match tx.Transaction.message with
-       | Some m -> `String (decode_message m)
+       | Some m -> Rpc_view.public_message ~decode_message tx.Transaction.op_type m
       | None -> `Null);
   ]
 
@@ -278,7 +278,7 @@ let rest_confirmed ~hash ~epoch ~tx_json ~fields =
     "finality", `String "confirmed";
     "epoch", `Int epoch;
     "tx_hash", `String hash;
-    "data", `String tx_json;
+    "data", Rpc_view.public_tx_data tx_json;
     "source", `String "database";
   ] in
   `Assoc (("parsed_tx", `Assoc fields) :: (fields @ top))
@@ -334,7 +334,7 @@ let staging_row ~decode_message tx =
     "has_encrypted_data", `Bool (has_encrypted_data_marker tx);
     "message",
       (match tx.Transaction.message with
-       | Some m -> `String (decode_message m)
+       | Some m -> Rpc_view.public_message ~decode_message tx.Transaction.op_type m
        | None -> `Null);
     "priority", `String (priority_label (Transaction.priority_of tx));
   ]
@@ -451,6 +451,10 @@ let semantic_check tx =
   else match tx.Transaction.op_type with
   | Transaction.Standard ->
     if Z.leq tx.Transaction.amount Z.zero then Error "amount must be positive" else Ok ()
+  | Transaction.ComputeFund ->
+    if Z.leq tx.Transaction.amount Z.zero then Error "compute reserve must be positive" else Ok ()
+  | Transaction.ComputeReturn | Transaction.ComputeSettle ->
+    if not (Z.equal tx.Transaction.amount Z.zero) then Error "compute return amount must be zero" else Ok ()
   | Transaction.PrivateOp
   | Transaction.ContractDeploy
   | Transaction.ProgramDeploy

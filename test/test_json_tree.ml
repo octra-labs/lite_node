@@ -5,6 +5,12 @@ open Octra_core
 
 let require ok reason = if not ok then failwith reason
 
+let check_size json size =
+  require (Json_tree.measure ~limit:size json = Some size) "JSON size differs";
+  require (Json_tree.measure ~limit:(size - 1) json = None) "JSON size limit exceeded";
+  require (Json_tree.measure ~limit:(size + 1) json = Some size) "JSON size rounded up";
+  require (Json_tree.measure ~limit:(-1) json = None) "negative JSON limit accepted"
+
 let outcome read raw =
   try Ok (Yojson.Safe.to_string (read raw)) with
   | Yojson.Json_error reason -> Error reason
@@ -18,7 +24,43 @@ let check raw =
   match next with
   | Error _ -> ()
   | Ok encoded ->
-    require (Json_tree.write (Json_tree.read raw) = encoded) "JSON encoding differs"
+    let json = Json_tree.read raw in
+    require (Json_tree.write json = encoded) "JSON encoding differs";
+    check_size json (String.length encoded)
+
+let check_measure () =
+  let bytes = String.init 256 Char.chr in
+  let json = [`String bytes; `Intlit bytes; `Int min_int; `Int max_int;
+    `Float (-0.);
+    `Float min_float; `Float max_float; `Float 1e-310;
+    `Assoc [bytes, `String bytes; bytes, `Intlit "0e01"]] in
+  List.iter (fun value ->
+    check_size value (String.length (Yojson.Safe.to_string value))) json;
+  let failure action =
+    try ignore (action ()); None with Yojson.Json_error reason -> Some reason in
+  List.iter (fun value ->
+    let expected = failure (fun () -> Yojson.Safe.to_string value) in
+    require (Option.is_some expected) "JSON float policy changed";
+    require (failure (fun () -> Json_tree.measure ~limit:max_int value) = expected)
+      "JSON float error changed") [`Float nan; `Float infinity; `Float neg_infinity];
+  let wide = `List (List.init 1_000_000 (fun _ -> `Int 0)) in
+  let before = Gc.allocated_bytes () in
+  let result = Json_tree.measure ~limit:2_000_001 wide in
+  let allocated = Gc.allocated_bytes () -. before in
+  require (result = Some 2_000_001) "wide JSON size differs";
+  require (allocated < 1_048_576.) "JSON scalar checks allocate per entry";
+  let raw = String.make (32 * 1_024 * 1_024) '\000' in
+  List.iter (fun value ->
+    let before = Gc.allocated_bytes () in
+    let result = Json_tree.measure ~limit:1024 value in
+    let allocated = Gc.allocated_bytes () -. before in
+    require (result = None) "large JSON accepted";
+    require (allocated < 1_048_576.) "JSON size check allocated payload")
+    [`String raw; `Intlit raw; `Assoc [raw, `Null]];
+  let rec shared count json =
+    if count = 0 then json else shared (count - 1) (`List [json; json]) in
+  require (Json_tree.measure ~limit:1024 (shared 80 `Null) = None)
+    "shared JSON size exceeded limit"
 
 let rec ordered = function
   | `Assoc fields -> `Assoc (List.sort (fun (a, _) (b, _) -> String.compare a b)
@@ -82,7 +124,8 @@ let check_depth prior =
     let raw = nested left right count in
     let json = read raw in
     require (Json_tree.write json = raw) "deep JSON changed";
-    require (Json_tree.write ~sort:true json = raw) "deep sorted JSON changed")
+    require (Json_tree.write ~sort:true json = raw) "deep sorted JSON changed";
+    check_size json (String.length raw))
     ["[", "]", 250_000; "{\"a\":", "}", 80_000];
   let raw = "[" ^ String.concat "," (List.init 100_000 string_of_int) ^ "]" in
   require (Json_tree.write (read raw) = raw) "wide JSON changed";
@@ -100,6 +143,7 @@ let () =
   | [_; "--stack"] -> check_depth false
   | _ ->
     check_grammar ();
+    check_measure ();
     check_depth false;
     let pid = Unix.create_process "/bin/sh"
       [|"sh"; "-c";

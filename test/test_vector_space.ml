@@ -194,7 +194,89 @@ let check_prior () =
   require (reserve_vectors st [Vector_space.Array [max_int; 2]] &&
     st.effort_used = 0) "prior array plan applied"
 
+let check_read_order () =
+  List.iter (fun mode ->
+    let extra = if mode = Int_work.Active then
+      Option.get (Vector_space.bytes (Vector_space.arrays 1 1)) else 0 in
+    List.iter (fun op ->
+      let st = state ~alloc:(100 + extra) ~int_work:mode () in
+      Hashtbl.clear st.memory.data;
+      Hashtbl.add st.memory.data 10 (VString "1");
+      Hashtbl.add st.memory.data 20 (VString (String.make 33 '1'));
+      List.iteri (fun index value -> st.regs.(index) <- VInt (Z.of_int value))
+        (match op with MATMUL _ -> [30; 10; 20; 1; 1; 1] | _ -> [10; 20; 1]);
+      let refused = try ignore (exec_one st op); false
+        with Failure reason when reason = "numeric work limit" -> true in
+      require refused "ordered read should refuse";
+      require (Byte_work.available (Option.get st.ctx.byte_work) = 2)
+        "ordered read reservation";
+      require (st.effort_used = effort_cost op + 7 + (extra + 31) / 32)
+        "ordered read price";
+      require (Hashtbl.length st.memory.data = 2) "ordered read wrote output")
+      [MATMUL (0, 1, 2, 3, 4, 5); VECDOT (8, 0, 1, 2)])
+    [Int_work.Prior; Int_work.Active]
+
+let check_memory_text () =
+  let cases = [
+    RELU_INPLACE (0, 1), [10; 1], 0;
+    SILU_INPLACE (0, 1), [10; 1], 0;
+    SOFTMAX_INPLACE (0, 1), [10; 1], 32;
+    LAYERNORM_INPLACE (0, 1, 2, 3), [10; 1; 20; 30], 16;
+    RMSNORM_INPLACE (0, 1, 2), [10; 1; 20], 16;
+    ROPE_APPLY (0, 1, 2, 3), [10; 2; 0; 655360000], 0;
+  ] in
+  List.iter (fun mode ->
+    List.iter (fun (op, args, alloc) ->
+      let setup active =
+        let st = state ~active ~alloc ~int_work:mode () in
+        Hashtbl.clear st.memory.data;
+        Hashtbl.add st.memory.data 10 (VString "-1");
+        Hashtbl.add st.memory.data 11 (VInt Z.one);
+        Hashtbl.add st.memory.data 20 (VInt Z.one);
+        Hashtbl.add st.memory.data 30 (VInt Z.zero);
+        List.iteri (fun index value -> st.regs.(index) <- VInt (Z.of_int value)) args;
+        st in
+      let st = setup true in
+      let original = bindings st.memory.data in
+      let refused = try ignore (exec_one st op); false
+        with Failure reason when reason = "numeric work limit" -> true in
+      require refused "memory text quota";
+      require (bindings st.memory.data = original) "memory text wrote output";
+      require (Byte_work.available (Option.get st.ctx.byte_work) = 0)
+        "memory text scratch";
+      require (exec_one (setup false) op) "historical memory text refused")
+      cases) [Int_work.Prior; Int_work.Active]
+
+let check_scalar_price () =
+  List.iter (fun mode ->
+    List.iter (fun metered ->
+      let st = state ~active:metered ~int_work:mode () in
+      st.regs.(0) <- VInt (Z.shift_left Z.one 65);
+      st.regs.(1) <- VInt (Z.of_int 2);
+      require (exec_one st (MUL (2, 0, 1))) "scalar product refused";
+      let used = if metered || mode = Int_work.Active then 5 else 3 in
+      require (st.effort_used = used) "scalar product price";
+      require (exec_one st (EFFORT 3) && st.regs.(3) = VInt (Z.of_int (used + 1)))
+        "scalar effort result") [false; true])
+    [Int_work.Prior; Int_work.Active]
+
+let check_shift_text () =
+  let st = state ~alloc:100 ~int_work:Int_work.Prior () in
+  st.regs.(0) <- VInt (Z.of_int 10);
+  st.regs.(1) <- VInt Z.one;
+  st.regs.(2) <- VInt Z.one;
+  Hashtbl.clear st.memory.data;
+  Hashtbl.add st.memory.data 10 (VString "3");
+  require (exec_one st (SHIFT_ROUND_INPLACE (0, 1, 2))) "text shift refused";
+  require (Hashtbl.find st.memory.data 10 = VInt (Z.of_int 2)) "text shift value";
+  require (st.effort_used = 12 && Byte_work.available (Option.get st.ctx.byte_work) = 2)
+    "text shift price"
+
 let () =
+  check_memory_text ();
+  check_read_order ();
+  check_scalar_price ();
+  check_shift_text ();
   check_plan ();
   check_size ();
   check_values ();

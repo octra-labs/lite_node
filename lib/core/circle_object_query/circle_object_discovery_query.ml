@@ -41,16 +41,16 @@ let load_summaries_from_storage_tbl storage_tbl =
   |> List.map (Circle_object_query.load_summary_from_storage_tbl storage_tbl)
   |> List.filter summary_materialized
 
-let load_refs store circle_id =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_refs ?snapshot store circle_id =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)
   | Ok storage_tbl ->
     Lwt.return (Ok (object_refs_from_storage_tbl storage_tbl))
 
-let load_summaries store circle_id =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_summaries ?snapshot store circle_id =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)

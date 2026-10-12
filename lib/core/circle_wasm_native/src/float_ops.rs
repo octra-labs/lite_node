@@ -8,6 +8,28 @@ use wasm_encoder::{
 };
 use wasmparser::{Operator, Parser, Payload, TypeRef};
 
+pub const NAN_BITS: u64 = 0x7ff8000000000000;
+
+pub fn bytes(value: f64, compute: bool) -> [u8; 8] {
+    if compute && value.is_nan() { NAN_BITS.to_le_bytes() } else { value.to_le_bytes() }
+}
+
+pub fn sqrt(value: f64, compute: bool) -> f64 {
+    if compute { libm::sqrt(value) } else { value.sqrt() }
+}
+
+pub fn exp(value: f64, compute: bool) -> f64 {
+    if compute { libm::exp(value) } else { value.exp() }
+}
+
+pub fn pow(value: f64, power: f64, compute: bool) -> f64 {
+    if compute { libm::pow(value, power) } else { value.powf(power) }
+}
+
+pub fn sin_cos(value: f64, compute: bool) -> (f64, f64) {
+    if compute { libm::sincos(value) } else { value.sin_cos() }
+}
+
 #[derive(Clone, Copy)]
 enum Width {
     Single,

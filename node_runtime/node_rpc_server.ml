@@ -311,20 +311,6 @@ let view_profile ctx =
   | Ok profile -> profile
   | Error error -> failwith error.Rpc.message
 
-let make_view_ctx ~trusted ~profile store ledger =
-  let running, stop = Octra_vm.Contract_rpc.view_clock () in
-  let ctx =
-    Octra_vm.Contract_rpc.make_view_ctx
-      ~trusted
-      ~profile
-      ~running
-      ~store
-      ~ledger
-      ~get_fhe_pubkey:(fhe_pubkey_loader store)
-      ()
-  in
-  ctx, running, stop
-
 let contract_call params ctx =
   Octra_vm.Contract_rpc.call_params
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
@@ -336,22 +322,14 @@ let contract_call params ctx =
     params
 
 let circle_view params ctx =
-  let view_ctx, running, stop =
-    make_view_ctx ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
-      ~profile:(view_profile ctx) ctx.store ctx.ledger in
-  Circle_read_rpc.view_call_public_params
-    ~running ~stop
+  Circle_read_rpc.view_rpc ~authenticated:false
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
-    ctx.store params ~view_ctx
+    ~profile:(profile_at ctx) ~store:ctx.store ~ledger:ctx.ledger params
 
 let circle_view_auth params ctx =
-  let view_ctx, running, stop =
-    make_view_ctx ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
-      ~profile:(view_profile ctx) ctx.store ctx.ledger in
-  Circle_read_rpc.view_call_auth
-    ~running ~stop
+  Circle_read_rpc.view_rpc ~authenticated:true
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
-    ctx.store params ~view_ctx
+    ~profile:(profile_at ctx) ~store:ctx.store ~ledger:ctx.ledger params
 
 let octra_register_pvac_pubkey params ctx =
   Registration_rpc.pvac_pubkey
@@ -372,25 +350,33 @@ let octra_register_public_key params ctx =
     params
 
 let octra_pvac_migration_status params ctx =
+  let epoch = !(ctx.current_epoch) in
   match
     Octra_core.Rule_graph.owner_migration
       ctx.rules
-      ~epoch:!(ctx.current_epoch)
+      ~epoch,
+    Octra_core.Rule_graph.cipher_migration ctx.rules ~epoch,
+    Octra_core.Rule_graph.standard ctx.rules ~epoch,
+    Octra_core.Rule_graph.math ctx.rules ~epoch
   with
-  | Error fault ->
+  | Error fault, _, _, _ | _, Error fault, _, _ | _, _, Error fault, _
+  | _, _, _, Error fault ->
     Lwt.return_error
       (Rpc.err
          (-32005)
          (Octra_core.Rule_graph.fault_message fault)
          None)
-  | Ok owner_migration_mode ->
+  | Ok owner_migration_mode, Ok cipher_mode, Ok proof_mode, Ok math ->
     with_account params ctx (fun addr account ->
       Account_read_rpc.pvac_migration_status
         ctx.pvac_status
         ctx.store
         ctx.migration_admissions
-        ~epoch:!(ctx.current_epoch)
+        ~epoch
+        ~math:(math = Octra_core.Rule_graph.Active)
         ~owner_migration_mode
+        ~cipher_mode
+        ~proof_mode
         ~addr
         ~account)
 
@@ -442,7 +428,7 @@ let circle_dispatch =
   Circle_read_rpc.dispatch Circle_read_rpc.{
     store_read;
     program_read = (fun f params ctx ->
-      f ~float_mode:(view_profile ctx).wasm_float ctx.store params);
+      f ~profile:(profile_at ctx) ctx.store params);
     epoch_read;
     public_asset_read = circle_asset_public_read;
     circle_view;

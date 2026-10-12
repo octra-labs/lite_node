@@ -20,6 +20,7 @@ val create :
   ledger:Ledger.t ->
   epoch_id:int ->
   owner_migration_mode:Rule_graph.mode ->
+  cipher_mode:Rule_graph.mode ->
   proof_mode:Rule_graph.mode ->
   math:bool ->
   field_policy:Private_ledger.field_policy ->

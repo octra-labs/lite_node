@@ -4,6 +4,7 @@
 module Frame = Octra_net.P2p_frame
 module Guard = Octra_net.P2p_peer_guard
 module Handshake = Octra_net.P2p_handshake
+module Swarm = Octra_net.P2p_swarm
 
 let () = Mirage_crypto_rng_unix.use_default ()
 
@@ -334,6 +335,341 @@ let wait_release () =
           && Lwt.state conn.closed = Lwt.Sleep))
       (fun () -> Conn.close conn))
 
+let swarm port =
+  let port = if port <> 0 then port else
+    let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Fun.protect ~finally:(fun () -> Unix.close socket) (fun () ->
+      Unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+      match Unix.getsockname socket with
+      | Unix.ADDR_INET (_, port) -> port
+      | _ -> failwith "listener address differs") in
+  let hello, sign_fn = identity port in
+  let state = Swarm.create {
+    listen_port = port;
+    chain_id = hello.chain_id;
+    node_id = hello.node_id;
+    node_addr = "127.0.0.1";
+    pubkey_raw = hello.pubkey;
+    consensus_config_hash = hello.consensus_config_hash;
+    binary_hash = String.make 32 '\000';
+    require_binary_hash = false;
+    upgrade_plan = None;
+    profile_plan = [];
+    allowed_pubkeys = [];
+    bootstrap_peers = [];
+    max_peers = 8;
+    sign_fn;
+    best_epoch_fn = (fun () -> 0L);
+    best_root_fn = (fun () -> hello.best_root);
+  } in
+  state.running <- true;
+  state
+
+let accept_delays () =
+  let retry = [Unix.EINTR; Unix.EAGAIN; Unix.EWOULDBLOCK;
+    Unix.ECONNABORTED; Unix.ENETDOWN; Unix.ENETUNREACH; Unix.EHOSTDOWN;
+    Unix.EHOSTUNREACH; Unix.ENOPROTOOPT; Unix.EOPNOTSUPP; Unix.EMFILE;
+    Unix.ENFILE; Unix.ENOBUFS; Unix.ENOMEM]
+    @ List.map (fun code -> Unix.EUNKNOWNERR code) Octra_net.P2p_conn.accept_codes in
+  List.iter (fun reason ->
+    let error = Unix.Unix_error (reason, "accept", "") in
+    require (Octra_net.P2p_conn.accept_delay min_int error = Some 0.01
+      && Octra_net.P2p_conn.accept_delay 0 error = Some 0.01
+      && Octra_net.P2p_conn.accept_delay 7 error = Some 1.
+      && Octra_net.P2p_conn.accept_delay max_int error = Some 1.)
+      "accept delay differs") retry;
+  List.iter (fun error ->
+    require (Octra_net.P2p_conn.accept_delay 0 error = None) "fatal accept retried")
+    [Lwt.Canceled; Failure "accept";
+     Unix.Unix_error (Unix.EBADF, "accept", "");
+     Unix.Unix_error (Unix.EINVAL, "accept", "");
+     Unix.Unix_error (Unix.ENOTSOCK, "accept", "");
+     Unix.Unix_error (Unix.EUNKNOWNERR (-1), "accept", "")]
+
+let accept_resume () =
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let first, first_fd = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let second, second_fd = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let pending, _ = Lwt.task () in
+  let calls = ref 0 in
+  let delays = ref [] in
+  let take _ =
+    incr calls;
+    match !calls with
+    | 1 | 5 -> raise (Unix.Unix_error (Unix.EMFILE, "accept", ""))
+    | 2 | 3 | 6 -> Lwt.fail (Unix.Unix_error (Unix.ENOBUFS, "accept", ""))
+    | 4 -> Lwt.return (first_fd, Unix.ADDR_UNIX "first")
+    | 7 -> Lwt.return (second_fd, Unix.ADDR_UNIX "second")
+    | _ -> pending in
+  let sleep delay = delays := delay :: !delays; Lwt.pause () in
+  let received, deliver = Lwt.task () in
+  Swarm.set_handler state (fun _ frame ->
+    if frame.Frame.msg_type = Frame.msg_tx_gossip
+      && frame.payload = "recovered" && Lwt.is_sleeping received then
+      Lwt.wakeup_later deliver ();
+    Lwt.return_unit);
+  let listening = Swarm.listen ~socket ~take ~sleep state in
+  let connect client port =
+    let hello, sign = identity port in
+    let* result = Handshake.dial_handshake client ~my_hello:hello
+      ~allowed_pubkeys:[] ~sign_fn:sign in
+    require (match result with Handshake.Ok _ -> true | _ -> false)
+      "recovered listener rejected handshake";
+    Lwt.return_unit in
+  Lwt.finalize
+    (fun () ->
+      let* () = connect first 9107 in
+      let* () = connect second 9108 in
+      let* () = Frame.write_frame second
+        { Frame.msg_type = Frame.msg_tx_gossip; payload = "recovered" } in
+      let* () = Lwt_unix.with_timeout 2.0 (fun () -> received) in
+      require (Swarm.connected_count state = 2) "recovered peers missing";
+      require (List.rev !delays = [0.01; 0.02; 0.04; 0.01; 0.02])
+        "accept retry did not reset";
+      let* () = Swarm.stop state in
+      let* () = listening in
+      require (Lwt_unix.state socket = Lwt_unix.Closed) "listener socket retained";
+      require (Swarm.connected_count state = 0) "stopped peers remain connected";
+      Lwt.return_unit)
+    (fun () ->
+      let* () = Swarm.stop state in
+      Lwt_list.iter_s close [first; second; first_fd; second_fd; socket])
+
+let accept_cancel ~halt sleeping =
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let paused, _ = Lwt.task () in
+  let entered, enter = Lwt.task () in
+  let take _ =
+    if sleeping then Lwt.fail (Unix.Unix_error (Unix.EMFILE, "accept", ""))
+    else begin
+      Lwt.wakeup_later enter ();
+      Lwt.map (fun () -> failwith "cancelled accept resumed") paused
+    end in
+  let sleep _ = Lwt.wakeup_later enter (); paused in
+  let listening = Swarm.listen ~socket ~take ~sleep state in
+  Lwt.finalize
+    (fun () ->
+      let* () = entered in
+      let* () = if halt then Swarm.stop state else begin
+        Lwt.cancel listening;
+        Lwt.catch
+          (fun () ->
+            let* () = listening in
+            Lwt.fail_with "listener cancellation was swallowed")
+          (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error)
+      end in
+      let* () = if halt then listening else Lwt.return_unit in
+      let* () = Swarm.stop state in
+      require (Lwt.state paused = Lwt.Fail Lwt.Canceled)
+        "listener stop left pending work";
+      require (Lwt_unix.state socket = Lwt_unix.Closed)
+        "listener stop left socket open";
+      Lwt.return_unit)
+    (fun () -> Swarm.stop state)
+
+let accept_fatal () =
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let error = Unix.Unix_error (Unix.EINVAL, "accept", "") in
+  let entered, enter = Lwt.task () in
+  let take _ = Lwt.wakeup_later enter (); Lwt.fail error in
+  let listener = Swarm.listen ~socket ~take state in
+  let idle, _ = Lwt.task () in
+  let tasks = Swarm.run_tasks listener [Lwt.return_unit; idle] in
+  let* () = entered in
+  let* () = Lwt.catch
+    (fun () ->
+      let* () = Lwt_unix.with_timeout 1.0 (fun () -> tasks) in
+      Lwt.fail_with "fatal accept was hidden")
+    (fun found -> if found = error then Lwt.return_unit else Lwt.fail found) in
+  require (Lwt_unix.state socket = Lwt_unix.Closed) "fatal accept retained socket";
+  require (Lwt.state idle = Lwt.Fail Lwt.Canceled) "fatal accept retained service";
+  Swarm.stop state
+
+let bootstrap_finish () =
+  let open Lwt.Syntax in
+  let listening, finish = Lwt.task () in
+  let idle, _ = Lwt.task () in
+  let tasks = Swarm.run_tasks listening [Lwt.return_unit; idle] in
+  let* () = Lwt.pause () in
+  require (Lwt.is_sleeping tasks) "bootstrap completion stopped listener";
+  Lwt.wakeup_later finish ();
+  let* () = tasks in
+  require (Lwt.state idle = Lwt.Fail Lwt.Canceled) "listener completion retained service";
+  Lwt.return_unit
+
+let listen_busy () =
+  let open Lwt.Syntax in
+  let occupied = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let* () = Lwt_unix.bind occupied (Unix.ADDR_INET (Unix.inet_addr_any, 0)) in
+  Lwt_unix.listen occupied 1;
+  let port = match Lwt_unix.getsockname occupied with
+    | Unix.ADDR_INET (_, port) -> port
+    | _ -> failwith "listener address differs" in
+  let state = swarm port in
+  Lwt.finalize
+    (fun () ->
+      let* () = Lwt.catch
+        (fun () ->
+          let* () = Swarm.listen ~socket state in
+          Lwt.fail_with "occupied listener accepted")
+        (function
+          | Unix.Unix_error (Unix.EADDRINUSE, _, _) -> Lwt.return_unit
+          | error -> Lwt.fail error) in
+      require (Lwt_unix.state socket = Lwt_unix.Closed) "bind failure retained socket";
+      Lwt.return_unit)
+    (fun () -> let* () = Swarm.stop state in close occupied)
+
+let late_handshake () =
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let client, server = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let waiting, _ = Lwt.task () in
+  let handed = ref false in
+  let take _ =
+    if !handed then waiting else begin
+      handed := true;
+      Lwt.return (server, Unix.ADDR_UNIX "late")
+    end in
+  let listening = Swarm.listen ~take state in
+  Lwt.finalize
+    (fun () ->
+      let* () = Lwt.pause () in
+      require !handed "late handshake not started";
+      let* () = Swarm.stop state in
+      let* () = listening in
+      require (Lwt_unix.state server = Lwt_unix.Closed)
+        "stopped swarm retained handshake socket";
+      require (state.pending = []) "stopped swarm retained handshake task";
+      state.running <- true;
+      require (Swarm.connected_count state = 0) "late handshake registered peer";
+      Lwt.return_unit)
+    (fun () ->
+      let* () = Swarm.stop state in
+      let* () = close client in
+      close server)
+
+let old_peer () =
+  let module Conn = Octra_net.P2p_conn in
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let generation = state.generation in
+  let hello, _ = identity 9110 in
+  pair (fun fd _ ->
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator
+      fd ~peer_id:hello.node_id ~addr:"old" ~direction:Conn.Inbound in
+    let* () = Swarm.stop state in
+    state.running <- true;
+    require (not (Swarm.add_peer state ~generation conn hello))
+      "previous generation registered peer";
+    let* () = Lwt.pause () in
+    require (Swarm.connected_count state = 0 && not (Conn.is_connected conn))
+      "previous generation retained peer";
+    Lwt.return true)
+
+let bootstrap_stop () =
+  let open Lwt.Syntax in
+  let base = swarm 0 in
+  let remote = swarm 0 in
+  let endpoint = Printf.sprintf "127.0.0.1:%d" remote.config.listen_port in
+  let state = Swarm.create { base.config with bootstrap_peers = [endpoint] } in
+  let rec wait () =
+    if Hashtbl.mem state.dialing endpoint && List.length state.pending = 1 then
+      Lwt.return_unit
+    else let* () = Lwt_unix.sleep 0.001 in wait () in
+  let run () =
+    let task = Swarm.start state ~on_message:(fun _ _ -> Lwt.return_unit) in
+    Lwt.finalize
+      (fun () ->
+        let* () = wait () in
+        let* () = Swarm.stop state in
+        let* () = task in
+        require (state.pending = [] && Hashtbl.length state.dialing = 0)
+          "stopped bootstrap retained work";
+        Lwt.return_unit)
+      (fun () -> Lwt.cancel task; Swarm.stop state) in
+  let* () = run () in
+  run ()
+
+let dial_stop () =
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let listener = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  let* () = Lwt_unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0)) in
+  Lwt_unix.listen listener 1;
+  let port = match Lwt_unix.getsockname listener with
+    | Unix.ADDR_INET (_, port) -> port
+    | _ -> failwith "dial address differs" in
+  let task = Swarm.dial state "127.0.0.1" port in
+  Lwt.finalize
+    (fun () ->
+      let* server, _ = Lwt_unix.accept listener in
+      Lwt.finalize
+        (fun () ->
+          let* _ = Frame.read_handshake_frame ~timeout_s:1.0 server in
+          let error = Failure "listener failed" in
+          let* () = Lwt.catch
+            (fun () -> Swarm.run_tasks ~stop:(fun () -> Swarm.stop state)
+              (Lwt.fail error) [Lwt.map (fun _ -> ()) task])
+            (fun caught -> if caught == error then Lwt.return_unit else Lwt.fail caught) in
+          require (state.pending = [] &&
+            (Lwt.state task = Lwt.Fail Lwt.Canceled || Lwt.state task = Lwt.Return None))
+            "stopped dial retained work";
+          Lwt.catch
+            (fun () ->
+              let* _ = Frame.read_handshake_frame ~timeout_s:1.0 server in
+              Lwt.fail_with "stopped dial retained socket")
+            (function
+              | Failure reason when reason = "connection_closed" -> Lwt.return_unit
+              | error -> Lwt.fail error))
+        (fun () -> close server))
+    (fun () ->
+      let* () = Swarm.stop state in
+      close listener)
+
+let swarm_stop () =
+  let open Lwt.Syntax in
+  let state = swarm 0 in
+  let run () =
+    let task = Swarm.start state ~on_message:(fun _ _ -> Lwt.return_unit) in
+    let duplicate = try
+      ignore (Swarm.start state ~on_message:(fun _ _ -> Lwt.return_unit));
+      false
+    with Invalid_argument _ -> true in
+    require duplicate "duplicate swarm start accepted";
+    let client = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Lwt.finalize
+      (fun () ->
+        let* () = Lwt_unix.connect client
+          (Unix.ADDR_INET (Unix.inet_addr_loopback, state.config.listen_port)) in
+        let hello, sign_fn = identity 9111 in
+        let* result = Handshake.dial_handshake client ~my_hello:hello
+          ~allowed_pubkeys:[] ~sign_fn in
+        require (match result with Handshake.Ok _ -> true | _ -> false)
+          "real listener rejected handshake";
+        let* () = Lwt.pause () in
+        let* () = Swarm.stop state in
+        let* () = Lwt_unix.with_timeout 1.0 (fun () -> task) in
+        require (not state.running && Swarm.connected_count state = 0)
+          "swarm shutdown incomplete";
+        Lwt.return_unit)
+      (fun () ->
+        Lwt.cancel task;
+        let* () = Swarm.stop state in
+        close client) in
+  let* () = run () in
+  run ()
+
+let run_case name run =
+  try Lwt_main.run (Lwt_unix.with_timeout 5.0 run)
+  with error -> failwith (name ^ ": " ^ Printexc.to_string error)
+
 let () =
   require (Lwt_main.run (preauth_refusal ())) "pre-auth payload accepted";
   require (Lwt_main.run (accept_refusal ())) "accept path payload accepted";
@@ -371,4 +707,22 @@ let () =
     "write progress did not renew the interval";
   require (Lwt_main.run (write_interval ())) "invalid write interval accepted";
   require (Lwt_main.run (wait_release ())) "peer queue retained completed waits";
-  Printf.printf "p2p_preauth = pass cases = 16\n%!"
+  accept_delays ();
+  run_case "accept_resume" accept_resume;
+  run_case "accept_stop" (fun () -> accept_cancel ~halt:true false);
+  run_case "backoff_stop" (fun () -> accept_cancel ~halt:true true);
+  run_case "accept_cancel" (fun () -> accept_cancel ~halt:false false);
+  run_case "backoff_cancel" (fun () -> accept_cancel ~halt:false true);
+  run_case "accept_fatal" accept_fatal;
+  run_case "bootstrap_finish" bootstrap_finish;
+  run_case "listen_busy" listen_busy;
+  run_case "late_handshake" late_handshake;
+  run_case "swarm_stop" swarm_stop;
+  run_case "old_peer" (fun () ->
+    let open Lwt.Syntax in
+    let* result = old_peer () in
+    require result "previous generation accepted";
+    Lwt.return_unit);
+  run_case "bootstrap_stop" bootstrap_stop;
+  run_case "dial_stop" dial_stop;
+  Printf.printf "p2p_preauth = pass cases = 30\n%!"

@@ -28,6 +28,23 @@ type t = {
 
 let read_idle_timeout_s = 60.0
 
+external socket_codes : unit -> int list = "octra_accept_codes"
+
+let accept_codes = socket_codes ()
+
+let accept_delay attempt error =
+  let delay = min 1.0 (0.01 *. Float.of_int (1 lsl min 7 (max 0 attempt))) in
+  match error with
+  | Unix.Unix_error (Unix.EUNKNOWNERR code, _, _)
+      when List.mem code accept_codes -> Some delay
+  | Unix.Unix_error ((Unix.EINTR | Unix.EAGAIN | Unix.EWOULDBLOCK
+      | Unix.ECONNABORTED | Unix.ENETDOWN | Unix.ENETUNREACH
+      | Unix.EHOSTDOWN | Unix.EHOSTUNREACH
+      | Unix.ENOPROTOOPT | Unix.EOPNOTSUPP | Unix.EMFILE | Unix.ENFILE
+      | Unix.ENOBUFS | Unix.ENOMEM), _, _) ->
+    Some delay
+  | _ -> None
+
 let monotonic_seconds () =
   Int64.to_float (Mtime_clock.elapsed_ns ()) /. 1_000_000_000.0
 
@@ -97,11 +114,14 @@ let until_closed t wait =
     Lwt.map (fun () -> None) (Lwt.protected t.closed);
   ]
 
-let send t (frame : P2p_frame.frame) =
+let enqueue t (frame : P2p_frame.frame) =
   if t.connected then
-    Lwt.map (fun _ -> ()) (until_closed t (Lwt_mvar.put t.write_queue frame))
+    Lwt.map Option.is_some (until_closed t (Lwt_mvar.put t.write_queue frame))
   else
-    Lwt.return_unit
+    Lwt.return_false
+
+let send t (frame : P2p_frame.frame) =
+  Lwt.map (fun _ -> ()) (enqueue t frame)
 
 let rec repeat step =
   let open Lwt.Syntax in

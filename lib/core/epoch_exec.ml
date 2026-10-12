@@ -29,6 +29,7 @@ type tx_reject = {
   tx : Transaction.t;
   error_type : string;
   reason : string;
+  charged : bool;
 }
 
 type tx_effect =
@@ -81,6 +82,7 @@ type fold_ctx = {
   program_overlap : bool;
   fhe_work : Rule_graph.mode;
   proof_exec : Rule_graph.mode;
+  vm_bytes : Rule_graph.mode;
   wasm_float : Rule_graph.mode;
   math : bool;
   cap_mode : Set_fold.cap_mode;
@@ -123,6 +125,7 @@ type backend = {
   store : Store_irmin.t;
   ledger : Ledger.t;
   ops : account_ops;
+  compute : Compute_bill.verifier option;
   emission_policy : Emission_policy.t;
   emission_schedule : Emission_schedule.t;
   legacy_total_supply : string option;
@@ -163,6 +166,7 @@ let prior_fold _ =
     program_overlap = false;
     fhe_work = Rule_graph.Prior;
     proof_exec = Rule_graph.Prior;
+    vm_bytes = Rule_graph.Prior;
     wasm_float = Rule_graph.Prior;
     math = false;
     cap_mode = Set_fold.Reject;
@@ -173,13 +177,14 @@ let prior_fold _ =
     members = [];
   }
 
-let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
+let make_live_backend ?compute ?emission_policy ?emission_schedule ?legacy_total_supply
     ?sender_key_activation_epoch ?validator_policy
     ?(proof_mode=Rule_graph.Active) ?(math=false) ?(fold=prior_fold)
     store ledger = {
   store;
   ledger;
   ops = ledger_ops ledger;
+  compute;
   emission_policy = Option.value emission_policy ~default:(Emission_policy.of_env Sys.getenv_opt);
   emission_schedule =
     Option.value
@@ -202,12 +207,13 @@ let make_live_backend ?emission_policy ?emission_schedule ?legacy_total_supply
   set_meta = (fun k v -> Store_irmin.set_meta store k v);
 }
 
-let make_overlay_backend ?emission_policy ?emission_schedule
+let make_overlay_backend ?compute ?emission_policy ?emission_schedule
     ?legacy_total_supply ?sender_key_activation_epoch ?validator_policy
     ?(proof_mode=Rule_graph.Active) ?(math=false) ?(fold=prior_fold) store ledger overlay = {
   store;
   ledger;
   ops = overlay_ops overlay;
+  compute;
   emission_policy = Option.value emission_policy ~default:(Emission_policy.of_env Sys.getenv_opt);
   emission_schedule =
     Option.value
@@ -997,6 +1003,7 @@ let process_circle_deploy_tx
     ?(calls = false)
     ?(wasm_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior)
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -1013,6 +1020,7 @@ let process_circle_deploy_tx
           ~resource_errors:calls
           ~execution_profile:wasm_profile
           ~float_mode
+          ~inspect_mode
           backend.store
           src
           payload in
@@ -1033,6 +1041,7 @@ let process_circle_program_update_tx
     ?(calls = false)
     ?(wasm_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
+    ?(inspect_mode = Rule_graph.Prior)
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -1061,10 +1070,14 @@ let process_circle_program_update_tx
                   | Circles.Octb ->
                     Lwt.return (Stdlib.Ok ())
                   | Circles.Wasm_v1 ->
+                    let inspect = match inspect_mode with
+                      | Rule_graph.Prior -> Circle_wasm_host.validate
+                      | Rule_graph.Active -> Circle_wasm_host.describe in
                     let* validate_result =
-                      Circle_wasm_host.validate
+                      inspect
                         ~execution_profile:wasm_profile
                         ~float_mode
+                        ~inspect_mode
                         payload.code_b64 in
                     begin
                       match validate_result with
@@ -3186,16 +3199,17 @@ let process_validator_ready_tx ~backend ~env tx =
 
 let process_circle_operation_tx
     ?(wasm_profile=Circle_wasm_host.Standard)
+    ?(inspect_mode = Rule_graph.Prior)
     ?expected_transition_hash
     ~(backend : backend) ~(current_epoch : int) (tx : Transaction.t) =
   let open Transaction in
   match tx.op_type with
   | CircleDeploy ->
-    process_circle_deploy_tx ~wasm_profile
+    process_circle_deploy_tx ~wasm_profile ~inspect_mode
       ~calls:((fold_at backend current_epoch).proof_exec = Rule_graph.Active)
       ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleProgramUpdate ->
-    process_circle_program_update_tx ~wasm_profile
+    process_circle_program_update_tx ~wasm_profile ~inspect_mode
       ~calls:((fold_at backend current_epoch).proof_exec = Rule_graph.Active)
       ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleAssetPut ->
@@ -3245,6 +3259,196 @@ let process_circle_operation_tx
   | _ ->
     Lwt.return (Stdlib.Error ("malformed_transaction", "unsupported circle operation"))
 
+let apply_compute_tx ?(inputs = false) ~(backend : backend) ~(env : env) (tx : Transaction.t) =
+  let open Lwt.Syntax in
+  let module Funding = Compute_funding in
+  let refused reason = Lwt.return_error ("compute_request_refused", reason) in
+  let epoch = Int64.of_int env.epoch_id in
+  let required result = match result with
+    | Ok () -> () | Error reason -> failwith ("compute transfer failed: " ^ reason) in
+  let save deposit =
+    Store_irmin.write backend.store (Funding.deposit_path deposit.Funding.request_id)
+      (Funding.encode_deposit deposit) in
+  if tx.to_ <> Funding.escrow || tx.from = Funding.escrow
+      || tx.encrypted_data <> None || Z.sign tx.ou < 0
+      || Z.lt tx.ou (Transaction.ou_cost tx) then
+    refused "compute transaction envelope differs"
+  else match tx.op_type, tx.message with
+  | Transaction.ComputeSettle, Some raw when Z.equal tx.amount Z.zero ->
+    let payer = backend.ops.find_opt tx.from in
+    if Option.fold ~none:true ~some:(fun (account : Ledger.account) ->
+        Z.lt account.balance tx.ou || tx.nonce <> account.nonce + 1) payer then
+      refused "compute payment payer balance or nonce differs"
+    else (match backend.compute with
+    | None -> Lwt.fail (Exec_resource.Unavailable Exec_resource.Host)
+    | Some verify ->
+      let funded (header : Compute_funding.Protocol.header) =
+        let id = Octra_consensus.Resource_compute_certificate.request_id header.request in
+        let* found = Funding.read backend.store ~id in
+        Lwt.return (match found with
+        | Error reason -> Error (Compute_bill.Unavailable reason)
+        | Ok None -> Error (Compute_bill.Rejected "compute deposit missing")
+        | Ok (Some deposit) ->
+          let terms = Funding.terms deposit.permission in
+          let valid = Funding.verify_header ~extended:true ~chain_id:env.chain_id ~epoch:deposit.opened_epoch
+            ~nonce:terms.nonce ~target:Funding.escrow ~header deposit.permission in
+          match valid with
+          | Error reason -> Error (Compute_bill.Rejected reason)
+          | Ok _ when deposit.returned_epoch <> None ->
+            Error (Compute_bill.Rejected "compute deposit returned")
+          | Ok _ when deposit.paid <> None -> Ok (Compute_bill.Paid deposit.opened_epoch)
+          | Ok _ when epoch < deposit.opened_epoch || epoch > terms.expires_epoch ->
+            Error (Compute_bill.Rejected "compute deposit epoch outside window")
+          | Ok _ -> Ok (Compute_bill.Due deposit.opened_epoch)) in
+      let* checked = verify ~store:backend.store ~epoch ~funded raw in
+      match checked with
+      | Error (Compute_bill.Rejected reason) -> refused reason
+      | Error (Compute_bill.Unavailable _) ->
+        Lwt.fail (Exec_resource.Unavailable Exec_resource.Host)
+      | Ok bills ->
+        let rec prepare seen saved = function
+          | [] -> Lwt.return_ok (List.rev saved)
+          | (bill : Compute_bill.t) :: rest ->
+            let id = bill.measured.request_id in
+            if List.mem id seen then Lwt.return_error "compute payment repeated request"
+            else
+              let* found = Funding.read backend.store ~id in
+              match found with
+              | Error reason -> Lwt.fail_with ("compute deposit unreadable: " ^ reason)
+              | Ok None -> Lwt.return_error "compute deposit missing"
+              | Ok (Some deposit) ->
+                match deposit.paid with
+                | Some (_, root) when root = bill.root -> prepare (id :: seen) saved rest
+                | _ ->
+                  match Funding.payment ~chain_id:env.chain_id ~epoch bill deposit with
+                  | Error _ as error -> Lwt.return error
+                  | Ok payment -> prepare (id :: seen) (payment :: saved) rest in
+        let* prepared = prepare [] [] bills in
+        match prepared with
+        | Error reason -> refused reason
+        | Ok [] -> refused "compute payment has no unpaid work"
+        | Ok payments ->
+          let amount = List.fold_left (fun total (deposit, _) ->
+            Z.add total (Z.of_int64 (Funding.terms deposit.Funding.permission).amount)) Z.zero payments in
+          let funds = match backend.ops.find_opt Funding.escrow with
+            | None -> Z.zero | Some account -> account.balance in
+          if Z.lt funds amount then Lwt.fail_with "compute escrow balance missing"
+          else match backend.ops.debit tx.from tx.ou tx.nonce with
+          | Error reason -> refused reason
+          | Ok () ->
+            required (backend.ops.debit_amount_only Funding.escrow amount);
+            Chaos.inject "compute_pay_after_debit";
+            let* () = Lwt_list.iter_s (fun (deposit, credits) ->
+              List.iter (fun (address, amount) ->
+                required (backend.ops.credit address amount);
+                Chaos.inject "compute_pay_after_credit") credits;
+              let* () = save deposit in
+              Chaos.inject "compute_pay_after_record";
+              Lwt.return_unit) payments in
+            Lwt.return_ok tx.ou)
+  | Transaction.ComputeFund, Some raw ->
+    (match Funding.decode_request raw with
+    | Error reason -> refused reason
+    | Ok (header, permission) ->
+      let terms = Funding.terms permission in
+      if terms.payer <> tx.from || tx.public_key <> Some (Base64.encode_exn terms.public_key)
+          || not (Z.equal tx.amount (Z.of_int64 terms.amount)) then
+        refused "compute funding transaction differs"
+      else match Funding.reserve ~extended:inputs ~chain_id:env.chain_id ~epoch
+          ~nonce:(Int64.of_int tx.nonce) ~header permission with
+      | Error reason -> refused reason
+      | Ok deposit ->
+        let* input = if not inputs then Lwt.return_ok None else
+          let* () = match (fold_at backend env.epoch_id).parent with
+            | None -> Lwt.return_unit
+            | Some parent -> Compute_input.remember backend.store
+                ~epoch:env.epoch_id ~state:env.prev_state_root parent in
+          Lwt.map (Result.map Option.some)
+            (Compute_input.prepare backend.store ~max_fee:tx.ou ~header) in
+        (match input with
+        | Error reason -> refused reason
+        | Ok input ->
+        let* found = Funding.read backend.store ~id:deposit.request_id in
+        match found with
+        | Error reason -> Lwt.fail_with ("compute deposit unreadable: " ^ reason)
+        | Ok (Some _) -> refused "compute deposit exists"
+        | Ok None ->
+          match backend.ops.debit tx.from (Z.add tx.amount tx.ou) tx.nonce with
+          | Error reason -> refused reason
+          | Ok () ->
+            Chaos.inject "compute_tx_after_debit";
+            required (backend.ops.credit Funding.escrow tx.amount);
+            let* () = save deposit in
+            let* () = match input with None -> Lwt.return_unit
+              | Some input -> Compute_input.commit backend.store deposit.request_id input in
+            Chaos.inject "compute_tx_after_record";
+            Lwt.return_ok tx.ou))
+  | Transaction.ComputeReturn, Some raw when Z.equal tx.amount Z.zero ->
+    let id = if String.length raw <> 64 then None else
+      try Some Digestif.SHA256.(to_raw_string (of_hex raw)) with _ -> None in
+    (match id with
+    | None -> refused "compute return id refused"
+    | Some id ->
+      let* found = Funding.read backend.store ~id in
+      match found with
+      | Error reason -> Lwt.fail_with ("compute deposit unreadable: " ^ reason)
+      | Ok None -> refused "compute deposit missing"
+      | Ok (Some deposit) ->
+        let terms = Funding.terms deposit.permission in
+        if terms.payer <> tx.from || tx.public_key <> Some (Base64.encode_exn terms.public_key) then
+          refused "compute return payer differs"
+        else match Funding.return_deposit ~chain_id:env.chain_id ~epoch deposit with
+        | Error reason -> refused reason
+        | Ok deposit ->
+          let amount = Z.of_int64 terms.amount in
+          let funds = match backend.ops.find_opt Funding.escrow with
+            | None -> Z.zero | Some account -> account.balance in
+          if Z.lt funds amount then failwith "compute escrow balance missing";
+          match backend.ops.debit tx.from tx.ou tx.nonce with
+          | Error reason -> refused reason
+          | Ok () ->
+            Chaos.inject "compute_tx_after_debit";
+            required (backend.ops.debit_amount_only Funding.escrow amount);
+            required (backend.ops.credit tx.from amount);
+            let* () = save deposit in
+            let* () = if inputs then Compute_input.release backend.store id else Lwt.return_unit in
+            Chaos.inject "compute_tx_after_record";
+            Lwt.return_ok tx.ou)
+  | _ -> refused "compute transaction body refused"
+
+let process_compute_tx ~(backend : backend) ~(env : env) tx =
+  let settle = Rule_graph.settle_at ~chain_id:env.chain_id ~epoch:env.epoch_id in
+  match Tx_envelope.check_compute ~settle (fold_at backend env.epoch_id).vm_bytes [tx] with
+  | Error reason -> Lwt.return_error ("compute_request_refused", reason)
+  | Ok () -> apply_compute_tx
+      ~inputs:((fold_at backend env.epoch_id).vm_bytes = Rule_graph.Active) ~backend ~env tx
+
+let apply_compute_effect ~backend ~env tx =
+  let open Lwt.Syntax in
+  let fee = Transaction.ou_cost tx in
+  let ready = Z.geq tx.Transaction.ou fee && match backend.ops.find_opt tx.from with
+    | Some account -> account.nonce < max_int && tx.nonce = account.nonce + 1
+        && Z.geq account.balance tx.ou
+    | None -> false in
+  if not ready then Lwt.return_error ("compute_request_refused", "compute fee or nonce differs")
+  else
+    let* result = Tx_savepoint.run ~ledger:backend.ledger ~store:backend.store
+      (fun () -> apply_compute_tx ~inputs:true ~backend ~env tx) in
+    match result with
+    | Ok fee -> Lwt.return_ok (Confirmed fee)
+    | Error (error_type, reason) ->
+      match backend.ops.debit tx.from tx.ou tx.nonce with
+      | Error reason -> Lwt.return_error ("compute_request_refused", reason)
+      | Ok () -> Lwt.return_ok (Rejected_after_fee {fee = tx.ou; error_type; reason})
+
+let process_compute_effect ~backend ~env tx =
+  let settle = Rule_graph.settle_at ~chain_id:env.chain_id ~epoch:env.epoch_id in
+  let mode = (fold_at backend env.epoch_id).vm_bytes in
+  match Tx_envelope.check_compute ~settle mode [tx] with
+  | Error reason -> Lwt.return_error ("compute_request_refused", reason)
+  | Ok () when mode = Rule_graph.Active -> apply_compute_effect ~backend ~env tx
+  | Ok () -> Lwt.map (Result.map (fun fee -> Confirmed fee)) (process_compute_tx ~backend ~env tx)
+
 let process_standard_tx_with_wasm_profile
     ~wasm_profile
     ~(backend : backend)
@@ -3252,6 +3456,7 @@ let process_standard_tx_with_wasm_profile
     (tx : Transaction.t) =
   let open Transaction in
   match tx.op_type with
+  | ComputeFund | ComputeReturn | ComputeSettle -> process_compute_tx ~backend ~env tx
   | Standard ->
     let fee = tx.ou in
     let total_cost = Z.add tx.amount fee in
@@ -3280,6 +3485,7 @@ let process_standard_tx_with_wasm_profile
   | CircleRelayCancel | CircleIngressCommit ->
     process_circle_operation_tx
       ~wasm_profile
+      ~inspect_mode:(fold_at backend env.epoch_id).vm_bytes
       ~backend
       ~current_epoch:env.epoch_id
       tx
@@ -3530,6 +3736,11 @@ let promote_active_validator_set ~backend ~env =
 
 let advance_validator_set ~backend ~env =
   let open Lwt.Syntax in
+  let* () = match (fold_at backend env.epoch_id).vm_bytes,
+      (fold_at backend env.epoch_id).parent with
+    | Rule_graph.Active, Some parent ->
+      Compute_input.remember backend.store ~epoch:env.epoch_id ~state:env.prev_state_root parent
+    | _ -> Lwt.return_unit in
   let* () = apply_set_fold ~backend ~env in
   let* active = promote_active_validator_set ~backend ~env in
   schedule_validator_snapshot ?active ~backend ~env ()
@@ -3600,10 +3811,14 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
            confirmed := (tx, !pos) :: !confirmed;
            confirmed_fees := Z.add !confirmed_fees fee
          | Ok (Rejected_after_fee { fee; error_type; reason }) ->
-           rejected := { tx; error_type; reason } :: !rejected;
+           let charged = ctx.vm_bytes = Rule_graph.Active
+             && (match tx.op_type with
+               | Transaction.ComputeFund | ComputeReturn | ComputeSettle -> true
+               | _ -> false) in
+           rejected := { tx; error_type; reason; charged } :: !rejected;
            confirmed_fees := Z.add !confirmed_fees fee
          | Error (etype, reason) ->
-           rejected := { tx; error_type = etype; reason } :: !rejected);
+           rejected := { tx; error_type = etype; reason; charged = false } :: !rejected);
         incr pos;
         Lwt.return_unit
       ) ordered_txs in
@@ -3754,8 +3969,13 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
 
 let confirmed_process process_tx ~backend ~env tx =
   let open Lwt.Syntax in
-  let* result = process_tx ~backend ~env tx in
-  Lwt.return (Result.map (fun fee -> Confirmed fee) result)
+  match tx.Transaction.op_type with
+  | ComputeFund | ComputeReturn | ComputeSettle when
+      (fold_at backend env.epoch_id).vm_bytes = Rule_graph.Active ->
+    process_compute_effect ~backend ~env tx
+  | _ ->
+    let* result = process_tx ~backend ~env tx in
+    Lwt.return (Result.map (fun fee -> Confirmed fee) result)
 
 let run ~backend ~env ~(txs : Transaction.t list) ~process_tx =
   run_core

@@ -861,7 +861,162 @@ let test_view_cache_upgrade () =
     V.Program_journal.discard journal;
     call 7)
 
+let test_view_overlap () =
+  let module V = Octra_vm in
+  with_store (fun store ->
+    let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = false;
+      object_cost = false; int_work = V.Int_work.Prior;
+      fhe_work = Octra_core.Rule_graph.Prior;
+      proof_exec = Octra_core.Rule_graph.Prior;
+      wasm_float = Octra_core.Rule_graph.Prior} in
+    let ctx = V.Contract_rpc.make_view_ctx ~trusted:[] ~profile ~store
+      ~ledger:(Octra_core.Ledger.create store) ~get_fhe_pubkey:(fun _ -> None) () in
+    let state = V.Contract_vm.create_state ~ctx ~limit:1000
+      ~caller:"" ~origin:"" ~address:"" ~value:Z.zero ~storage:(Hashtbl.create 0) () in
+    List.iteri (fun index value -> Hashtbl.add state.memory.data index
+      (V.Contract_vm.VInt (Z.of_int value))) [1; 2; 3];
+    state.regs.(0) <- V.Contract_vm.VInt Z.one;
+    state.regs.(1) <- V.Contract_vm.VInt Z.zero;
+    state.regs.(2) <- V.Contract_vm.VInt (Z.of_int 2);
+    if not (V.Contract_vm.run state [|V.Contract_vm.RESIDUAL_ADD (0, 1, 2)|]) then
+      fail "overlap control refused";
+    if Hashtbl.find state.memory.data 2 <> V.Contract_vm.VInt (Z.of_int 6) then
+      fail "view changed prior overlap result")
+
+let test_view_memory () =
+  let module V = Octra_vm in
+  with_store (fun store ->
+    List.iter (fun mode ->
+      let run space text =
+        let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = false;
+          object_cost = false; int_work = mode;
+          fhe_work = Octra_core.Rule_graph.Prior;
+          proof_exec = Octra_core.Rule_graph.Prior;
+          wasm_float = Octra_core.Rule_graph.Prior} in
+        let ctx = V.Contract_rpc.make_view_ctx ~trusted:[] ~profile ~store
+          ~ledger:(Octra_core.Ledger.create store) ~get_fhe_pubkey:(fun _ -> None) () in
+        let budget = Option.get ctx.byte_work in
+        if V.Byte_work.charge budget ~used:0 ~limit:max_int ~base:0
+          [V.Byte_work.Allocate (V.Byte_work.available budget - space)] = None then
+          fail "memory reservation failed";
+        let state = V.Contract_vm.create_state ~ctx ~limit:1000
+          ~caller:"" ~origin:"" ~address:"" ~value:Z.zero ~storage:(Hashtbl.create 0) () in
+        let value = V.Contract_vm.VString text in
+        Hashtbl.add state.memory.data 0 value;
+        Hashtbl.add state.memory.data 1 value;
+        state.regs.(0) <- V.Contract_vm.VInt Z.zero;
+        state.regs.(1) <- V.Contract_vm.VInt (Z.of_int 2);
+        V.Contract_vm.run state [|V.Contract_vm.VECDOT (2, 0, 0, 1)|] in
+      if not (run 512 "0") then fail "memory parsing control refused";
+      if run 24 (String.make 1_048_576 '0') then
+        fail "memory parsing escaped byte work") [V.Int_work.Prior; V.Int_work.Active])
+
+let test_view_bytes () =
+  let module V = Octra_vm in
+  let source = {|
+program WorkRead {
+  public view fn copy(text: string, count: int): int {
+    let index = 0
+    while index < count {
+      text = concat(text, text)
+      index += 1
+    }
+    return len(text)
+  }
+  public view fn square(count: int): int {
+    let number = 2
+    let index = 0
+    while index < count {
+      number = number * number
+      index += 1
+    }
+    return 7
+  }
+}
+|} in
+  let compiled = V.Oct_compile.compile source in
+  if compiled.error <> None then fail "work view compile failed";
+  with_store (fun store ->
+    let address = token_address '5' in
+    Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
+      ~code_hash:Digestif.SHA256.(digest_string compiled.bytecode |> to_hex)
+      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~admission:"binary"
+      ~bytecode_b64:(Base64.encode_exn compiled.bytecode));
+    let ledger = Octra_core.Ledger.create store in
+    let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = false;
+      object_cost = false; int_work = V.Int_work.Prior;
+      fhe_work = Octra_core.Rule_graph.Prior;
+      proof_exec = Octra_core.Rule_graph.Prior;
+      wasm_float = Octra_core.Rule_graph.Prior} in
+    let read name params =
+      Lwt_main.run (V.Contract_rpc.call_params ~trusted:[]
+        ~profile:(fun ~epoch:_ -> Ok profile) ~store ~ledger
+        ~get_fhe_pubkey:(fun _ -> None) ~storage_json:(fun _ -> `Assoc [])
+        (`List [`String address; `String name; `List params])) in
+    let answer expected = function
+      | Ok (`Assoc fields) when List.assoc_opt "result" fields = Some (`String expected) -> ()
+      | Error error -> fail ("work view refused: " ^ error.Octra_core.Rpc.message)
+      | Ok _ -> fail "work view result differs" in
+    answer "1024" (read "copy" [`String "abcd"; `Int 8]);
+    answer "7" (read "square" [`Int 4]);
+    let refused reason = function
+      | Error error when error.Octra_core.Rpc.code = -32000 -> ()
+      | Error error -> fail ("work view technical error: " ^ error.Octra_core.Rpc.message)
+      | Ok _ -> fail reason in
+    refused "unpriced concat reached RPC result"
+      (read "copy" [`String (String.make 128 'a'); `Int 18]);
+    refused "unpriced multiply reached RPC result" (read "square" [`Int 20]);
+    let ctx () = V.Contract_rpc.make_view_ctx ~trusted:[] ~profile ~store ~ledger
+      ~get_fhe_pubkey:(fun _ -> None) () in
+    let first = ctx () in
+    if first.int_work <> profile.int_work then fail "view changed integer semantics";
+    let budget = match first.byte_work with
+      | Some value -> value | None -> fail "view byte work unarmed" in
+    let second = ctx () in
+    if second.byte_work = None || second.byte_work == first.byte_work then
+      fail "top level view reused byte owner";
+    let invoke (async, shared) =
+      let ctx = ctx () in
+      let budget = Option.get ctx.byte_work in
+      let space = V.Byte_work.available budget in
+      if V.Byte_work.charge budget ~used:0 ~limit:max_int ~base:0
+        [V.Byte_work.Allocate (space - 256 - 26)] = None then fail "view reservation failed";
+      let scope = V.Contract_vm.{depth = 0; limit = Some 1000;
+        memory = ctx.fhe_memory; bytes = if shared then ctx.byte_work else None} in
+      let args = V.Contract_vm.[VString (String.make 128 'a'); VInt Z.one] in
+      let call () =
+        if async then Lwt_main.run (ctx.call_async address address "copy" args scope)
+        else Lwt_main.run (Lwt_preemptive.detach
+          (fun () -> ctx.call_contract address address "copy" args scope) ()) in
+      begin match call () with
+      | Ok value when value.V.Contract_vm.return_value = V.Contract_vm.VInt (Z.of_int 256) -> ()
+      | _ -> fail "nested view copy refused"
+      end;
+      if V.Byte_work.available budget <> 0 then fail "nested view changed byte owner";
+      if Result.is_ok (call ()) then fail "nested view refilled byte budget" in
+    List.iter invoke [false, false; false, true; true, false; true, true];
+    if V.Byte_work.available budget = 0 then fail "view changed unrelated owner";
+    answer "1024" (read "copy" [`String "abcd"; `Int 8]))
+
 let () =
+  if Array.exists (String.equal "--overlap") Sys.argv then begin
+    test_view_overlap ();
+    exit 0
+  end;
+  if Array.exists (String.equal "--memory") Sys.argv then begin
+    test_view_memory ();
+    exit 0
+  end;
+  if Array.exists (String.equal "--bytes") Sys.argv then begin
+    test_view_bytes ();
+    test_view_overlap ();
+    test_view_memory ();
+    print_endline "status = pass test = program_view_bytes";
+    exit 0
+  end;
+  test_view_bytes ();
+  test_view_overlap ();
+  test_view_memory ();
   test_view_cache_upgrade ();
   test_view_release_keys ();
   test_view_profile ();

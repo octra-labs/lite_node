@@ -6,6 +6,7 @@ type rejection = {
   tx : Transaction.t;
   error_type : string;
   reason : string;
+  charged : bool;
 }
 
 type partition = {
@@ -22,6 +23,7 @@ val parse : string -> (item, string) result
 val split : string list -> (partition, string) result
 val split_admit : string list -> (partition, string) result
 val build :
+  ?charged:Transaction.t list ->
   inputs:Transaction.t list ->
   (Transaction.t * string * string) list ->
   (rejection list, string) result
@@ -29,6 +31,7 @@ val merge :
   confirmed:Transaction.t list ->
   rejections:rejection list ->
   (Transaction.t list, string) result
+val executed : confirmed:Transaction.t list -> rejection list -> Transaction.t list
 val decode :
   confirmed:Transaction.t list ->
   string list ->

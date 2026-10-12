@@ -19,6 +19,9 @@ let standard = {
 
 let message_limit limits tx =
   match tx.Transaction.op_type with
+  | Transaction.ComputeFund -> 8192
+  | Transaction.ComputeReturn -> 64
+  | Transaction.ComputeSettle -> Compute_bill.max_wire
   | Transaction.RecryptOp
   | Transaction.ClaimOp -> limits.message_zkp_len
   | Transaction.CircleAssetPut

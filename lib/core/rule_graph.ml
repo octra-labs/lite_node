@@ -254,6 +254,15 @@ let proof_activation_for_chain chain_id =
 
 let batch_activation_for_chain = proof_activation_for_chain
 
+let vm_bytes_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then
+    Some { devnet_set_plan_activation with activation_epoch = 1_688_734 }
+  else None
+
+let cipher_activation_for_chain = vm_bytes_activation_for_chain
+
+let settle_activation_for_chain _ : activation option = None
+
 let profile_epochs ~chain_id =
   [standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
@@ -265,7 +274,10 @@ let profile_epochs ~chain_id =
    fhe_work_activation_for_chain chain_id;
    wasm_float_activation_for_chain chain_id;
    batch_activation_for_chain chain_id;
-   proof_activation_for_chain chain_id]
+   proof_activation_for_chain chain_id;
+   vm_bytes_activation_for_chain chain_id;
+   cipher_activation_for_chain chain_id;
+   settle_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -373,6 +385,18 @@ let consensus_id ~chain_id ~epoch =
     match proof_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
+  |> (fun plans ->
+    match vm_bytes_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match cipher_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match settle_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -461,6 +485,9 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       wasm_float_activation_for_chain chain_id;
       batch_activation_for_chain chain_id;
       proof_activation_for_chain chain_id;
+      vm_bytes_activation_for_chain chain_id;
+      cipher_activation_for_chain chain_id;
+      settle_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -586,6 +613,28 @@ let wasm_float t ~epoch = mode t (wasm_float_activation_for_chain t.chain_id) ~e
 let circle_batch t ~epoch = mode t (batch_activation_for_chain t.chain_id) ~epoch
 
 let proof_exec t ~epoch = mode t (proof_activation_for_chain t.chain_id) ~epoch
+
+let vm_bytes t ~epoch = mode t (vm_bytes_activation_for_chain t.chain_id) ~epoch
+
+let settle t ~epoch = mode t (settle_activation_for_chain t.chain_id) ~epoch
+
+let settle_at ~chain_id ~epoch =
+  match settle_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let cipher_migration t ~epoch =
+  mode t (cipher_activation_for_chain t.chain_id) ~epoch
+
+let cipher_migration_at ~chain_id ~epoch =
+  match cipher_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let vm_bytes_at ~chain_id ~epoch =
+  match vm_bytes_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
 
 let proof_exec_at ~chain_id ~epoch =
   match proof_activation_for_chain chain_id with

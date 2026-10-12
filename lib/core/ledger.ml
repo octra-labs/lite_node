@@ -11,6 +11,7 @@ type account = Ledger_types.account = {
 
 type epoch_journal = {
   accounts : (string, account option) Hashtbl.t;
+  kats : (string, string option) Hashtbl.t;
   dirty_addrs : (string, unit) Hashtbl.t;
   dirty : bool;
   total_supply : Z.t;
@@ -61,6 +62,7 @@ let clear_spent_nonces l = Hashtbl.reset l.spent_nonces
 let begin_journal l =
   l.epoch_journals <- {
     accounts = Hashtbl.create 64;
+    kats = Hashtbl.create 16;
     dirty_addrs = Hashtbl.copy l.dirty_addrs;
     dirty = l.dirty;
     total_supply = l.total_supply;
@@ -84,6 +86,12 @@ let abort_journal l =
   match l.epoch_journals with
   | [] -> Ok ()
   | journal :: rest ->
+    Hashtbl.iter
+      (fun addr value ->
+        match value with
+        | Some value -> Store_irmin.set_pvac_kat l.store addr value
+        | None -> Store_irmin.remove_pvac_kat l.store addr)
+      journal.kats;
     Hashtbl.iter
       (fun addr account ->
         match account with
@@ -392,6 +400,11 @@ let get_pvac_kat l addr =
   Store_irmin.get_pvac_kat l.store addr
 
 let set_pvac_kat l addr kat_hex =
+  List.iter
+    (fun journal ->
+      if not (Hashtbl.mem journal.kats addr) then
+        Hashtbl.add journal.kats addr (Store_irmin.get_pvac_kat l.store addr))
+    l.epoch_journals;
   Store_irmin.set_pvac_kat l.store addr kat_hex
 
 let clear_encrypted_balance l addr =

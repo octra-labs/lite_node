@@ -15,6 +15,8 @@ type failure = {
 exception Worker_retry of string
 exception Worker_stopped of string
 
+val cipher_proof_id : string
+
 val worker_retry : ?wait:(float -> unit Lwt.t) -> ?report:(float -> string -> unit) ->
   (unit -> 'a Lwt.t) -> 'a Lwt.t
 
@@ -190,6 +192,7 @@ val apply_decrypt :
 
 val key_switch_plan :
   ?math:bool ->
+  ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
   ?legacy_public_replay:Pvac_legacy_public_replay.decision ->
@@ -199,6 +202,7 @@ val key_switch_plan :
 
 val preverify_key_switch_artifact :
   ?math:bool ->
+  ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -214,6 +218,7 @@ val failure_action : failure -> failure_action
 
 val bind_key_switch_artifact :
   ?math:bool ->
+  ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
   Ledger.t ->
@@ -261,6 +266,7 @@ val prepared_current :
 
 val key_switch_cache_key :
   ?math:bool ->
+  ?cipher_mode:Rule_graph.mode ->
   field_policy ->
   bool ->
   Ledger.t ->
@@ -269,6 +275,7 @@ val key_switch_cache_key :
 
 val prepare_key_switch_plan :
   ?math:bool ->
+  ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   ?cap:bool ->
   Ledger.t ->
@@ -285,13 +292,18 @@ val key_switch_requests_historical_owner_proof :
   Transaction.t ->
   bool
 
+val key_switch_requests_cipher_proof :
+  field_policy:field_policy -> Transaction.t -> bool
+
 val key_switch_requests_legacy_audit :
+  ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   Transaction.t ->
   bool
 
 val apply_key_switch :
   ?math:bool ->
+  ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
   ?legacy_public_replay:Pvac_legacy_public_replay.decision ->

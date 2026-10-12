@@ -43,6 +43,8 @@ let runtime () =
   R.{
     swarm_ref = ref None;
     proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+    compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+    settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
     queue_head = (fun () -> None);
     duty_head = (fun () -> None);
     preverify_admit = (fun _ -> Ok ());
@@ -104,6 +106,8 @@ let test_preverify () =
     R.{
       swarm_ref = ref None;
       proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
       queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun tx ->
@@ -126,6 +130,8 @@ let test_preverify () =
     R.{
       swarm_ref = ref None;
       proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
       queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Error "pre_verify_busy pending = 6 limit = 6");
@@ -158,6 +164,8 @@ let test_eviction () =
     R.{
       swarm_ref = ref None;
       proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
       queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Ok ());
@@ -466,7 +474,71 @@ let test_delivery_retry () =
     expect "ordinary protected from duty replacement" (Result.is_error (submit (duty 106L)));
     expect "ordinary still present" (Staging.find_by_hash (Transaction.hash ordinary) = Some ordinary))
 
+let test_compute_paths () =
+  let module G = Octra_core.Rule_graph in
+  let module P = Octra_node_runtime.P2p_tx_handler in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let activation = (Option.get (G.vm_bytes_activation_for_chain chain_id)).activation_epoch in
+  let head = ref (activation - 2) in
+  let count = ref 0 in
+  let runtime = R.{(runtime ()) with
+    compute_mode = (fun () -> G.vm_bytes_at ~chain_id ~epoch:(!head + 1));
+    settle_mode = (fun () -> G.settle_at ~chain_id ~epoch:(!head + 1));
+    preverify_admit = (fun _ -> incr count; Ok ())} in
+  let ledger = ledger () in
+  let base = standard_tx () in
+  Ledger.add_account ledger base.from (Z.of_int 20_000_000) |> Result.get_ok;
+  let secret = Base64.encode_exn (String.make 32 '\001') in
+  let check op_type =
+    let tx = Transaction.sign_with_privkey {base with op_type;
+      to_ = Octra_core.Compute_funding.escrow;
+      amount = (if op_type = Transaction.ComputeFund then Z.one else Z.zero);
+      ou = (if op_type = Transaction.ComputeSettle then Z.of_int 10_000_000 else Z.of_int 10_000);
+      message = Some (String.make 64 'a')} secret in
+    List.iter (fun height ->
+      head := height;
+      let active = height + 1 >= activation in
+      let accepted = active && op_type <> Transaction.ComputeSettle in
+      let reason = if active then "compute settlement not active" else "compute transfers not active" in
+      List.iter (fun route ->
+        Staging.clear (); count := 0;
+        let before = Ledger.find ledger tx.from in
+        (match route with
+        | 0 ->
+          let result = R.validate_and_submit_tx runtime ledger tx in
+          expect "compute RPC activation" (Result.is_ok result = accepted);
+          if not accepted then expect "compute RPC exact error"
+            (result = Error ("malformed_transaction", reason))
+        | 1 ->
+          let result = R.add_tx_to_staging ~relay:false runtime ledger tx in
+          expect "compute queue activation" (Result.is_ok result = accepted);
+          if not accepted then expect "compute queue exact error"
+            (result = Error reason)
+        | _ ->
+          let gossip = ref 0 in
+          let json = Transaction.to_yojson tx |> Yojson.Safe.to_string in
+          let payload = if route = 2 then Octra_net.P2p_tx_gossip.encode
+              (Octra_net.P2p_tx_gossip.Tx {hash = Transaction.hash tx; tx_json = json})
+            else Octra_net.Oce1.encode (fun buffer -> Octra_net.Oce1.put_string buffer json) in
+          P.handle P.{guard = Octra_net.P2p_tx_gossip_guard.create (); payload;
+            peer_id = "compute-peer"; has_tx = (fun _ -> false); find_tx = (fun _ -> None);
+            sender_pk = (fun _ -> tx.public_key);
+            add_tx = R.add_tx_to_staging ~relay:false runtime ledger;
+            send_payload = (fun _ -> fail "unexpected compute fetch");
+            broadcast_payload = (fun _ -> incr gossip);
+            report_bad_peer = (fun _ -> fail "compute peer punished");
+            close_peer = (fun () -> fail "compute peer closed");
+            now = Unix.gettimeofday; max_drift = 300.};
+          expect "compute gossip activation" (!gossip = if accepted then 1 else 0));
+        expect "compute queue size" (Staging.staging_size () = if accepted then 1 else 0);
+        expect "compute preverification activation" (!count = if accepted then 1 else 0);
+        expect "compute receipt leaves balance" (Ledger.find ledger tx.from = before)) [0; 1; 2; 3])
+      [activation - 2; activation - 1; activation] in
+  Fun.protect ~finally:Staging.clear (fun () ->
+    List.iter check [Transaction.ComputeFund; Transaction.ComputeReturn; Transaction.ComputeSettle])
+
 let () =
+  test_compute_paths ();
   test_delivery_retry ();
   test_max_timestamp_drift ();
   test_missing_sender ();

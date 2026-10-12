@@ -16,6 +16,13 @@ type step = {
 
 type t
 
+type origin = private {
+  chain_id : string;
+  epoch_id : int64;
+  state_root : string;
+  validators : Octra_consensus.C_types.validator_set;
+}
+
 val max_steps : int
 
 val make :
@@ -87,3 +94,27 @@ val verify_lwt :
   State_sync_checkpoint.body ->
   string ->
   (t, string) result Lwt.t
+
+val from_input : Octra_core.Compute_input.root -> origin
+
+val verify_origin :
+  max_bytes:int ->
+  trusted:Octra_consensus.C_types.validator_set ->
+  chain_id:string -> epoch_id:int64 -> state_root:string -> set_root:string ->
+  string -> (origin, string) result
+
+val verify_origin_lwt :
+  ?cancelled:(unit -> bool) ->
+  max_bytes:int ->
+  trusted:Octra_consensus.C_types.validator_set ->
+  chain_id:string -> epoch_id:int64 -> state_root:string -> set_root:string ->
+  string -> (origin, string) result Lwt.t
+
+val read_state :
+  max_bytes:int -> origin:origin -> ledger_root:string -> index_root:string ->
+  path:string list -> proof:string -> (string option, string) result
+
+val read_state_lwt :
+  ?cancelled:(unit -> bool) -> max_bytes:int -> origin:origin ->
+  ledger_root:string -> index_root:string -> path:string list -> proof:string ->
+  unit -> (string option, string) result Lwt.t

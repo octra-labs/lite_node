@@ -77,6 +77,14 @@ val tx_json_value :
   string ->
   Yojson.Safe.t
 
+val public_message :
+  decode_message:(string -> string) ->
+  Octra_core.Transaction.op_type ->
+  string ->
+  Yojson.Safe.t
+
+val public_tx_data : string -> Yojson.Safe.t
+
 val tx_inclusion_proof :
   Octra_consensus.C_light_epoch.tx_inclusion ->
   tx_json:string ->
@@ -238,7 +246,10 @@ val pvac_migration_status :
   addr:string ->
   cipher:string ->
   epoch:int ->
+  math:bool ->
   owner_migration_mode:Octra_core.Rule_graph.mode ->
+  cipher_mode:Octra_core.Rule_graph.mode ->
+  proof_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Pvac_migration.status ->
   Octra_core.Pvac_migration_admission.t ->
   Yojson.Safe.t

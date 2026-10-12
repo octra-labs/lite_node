@@ -343,7 +343,7 @@ let standard_hash ~chain_id ~epoch getenv =
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "program_preview" Octra_vm.Program_package.preview_id
     end;
-    match Octra_core.Rule_graph.proof_exec_at ~chain_id ~epoch with
+    begin match Octra_core.Rule_graph.proof_exec_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "proof_exec"
@@ -351,7 +351,23 @@ let standard_hash ~chain_id ~epoch getenv =
       put_standard_component buf "wasm_calls"
         "suspend_v1:code_optin:update_policy:journal_storage:exchange_bytes_16:exchange_entries_32:circle_delta_v1:shared_fuel:transfer_50:depth_8";
       put_standard_component buf "wasm_limits"
-        "full_request_v2:receipt_9233:direct_16777216:session_67108864:response_2097152:reply_67108864:guest_refusal:error_utf8_256_v1:hfhe_pairs_v2")
+        "full_request_v2:receipt_9233:direct_16777216:session_67108864:response_2097152:reply_67108864:guest_refusal:error_utf8_256_v1:hfhe_pairs_v2"
+    end;
+    begin match Octra_core.Rule_graph.vm_bytes_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "vm_bytes" Octra_vm.Byte_work.consensus_id;
+      put_standard_component buf "compute_transfers" Octra_core.Compute_bill.consensus_id
+    end;
+    begin match Octra_core.Rule_graph.settle_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "compute_settle" Octra_core.Compute_bill.consensus_id
+    end;
+    match Octra_core.Rule_graph.cipher_migration_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "cipher_migration" Octra_core.Private_ledger.cipher_proof_id)
 
 let hash ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with

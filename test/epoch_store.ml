@@ -103,6 +103,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
   in
   let key_pool =
     N.Consensus_key_switch_preverify.create
+      ~cipher_mode:(fun () -> rule G.cipher_migration)
       ~field_policy:(fun () -> field_policy)
       ~strict:(fun () -> proof_mode = G.Active)
       ~math:(fun () -> math)
@@ -190,6 +191,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
             let* batch =
               R.W.run_many
                 ~math
+                ~cipher_mode:(rule G.cipher_migration)
                 ~prepared:(fun tx ->
                   if tx.R.T.op_type = R.T.KeySwitch then
                     N.Consensus_key_switch_preverify.await key_pool tx
@@ -245,6 +247,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
           ~ledger:context.ledger
           ~epoch_id:epoch
           ~owner_migration_mode
+          ~cipher_mode:(rule G.cipher_migration)
           ~proof_mode
           ~field_policy
           ~result_policy:(context.result_policy epoch)

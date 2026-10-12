@@ -53,3 +53,6 @@ val can_key_switch : status -> bool
 val can_bound_migrate : status -> bool
 
 val needs_history_migration : status -> bool
+
+val history_route : active:bool -> status -> bool
+val format_name : cipher_class -> string

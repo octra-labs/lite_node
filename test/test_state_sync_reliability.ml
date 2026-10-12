@@ -66,6 +66,103 @@ let test_published_before_capture () =
   | Error reason -> fail ("publication before capture reason differs: " ^ reason)
   | Ok _ -> fail "publication before capture was accepted"
 
+let test_activation_cycle () =
+  let activation = 1_663_000L in
+  let before = 1_662_840L in
+  let after = Int64.succ activation in
+  let event epoch = Publish.cycle_event
+    ~chain_id:"octra-devnet-9871-cluster" ~epoch in
+  let tick state epoch = expect_ok (Cycle.step Cycle.default state (event epoch)) in
+  let complete state epoch outcome =
+    Cycle.step Cycle.default state (Cycle.Completed { epoch; outcome }) in
+  if event activation <> Cycle.Finalized_after {
+    epoch = activation;
+    minimum = activation;
+  } then fail "publisher omitted activation minimum";
+  if event (Int64.pred activation) <> Cycle.Finalized_after {
+    epoch = Int64.pred activation;
+    minimum = 1_614_500L;
+  } then fail "publisher selected future activation";
+  let initial = Cycle.init ~published:(Some before) in
+  let state, effects = tick initial (Int64.pred activation) in
+  expect_effects [] effects;
+  let state, effects = tick state activation in
+  expect_effects [Cycle.Capture activation] effects;
+  if Cycle.running state <> Some activation then fail "activation capture not running";
+  let state, effects = tick state after in
+  expect_effects [] effects;
+  begin match complete state after (Cycle.Published after) with
+  | Error "sync completion epoch mismatch" -> ()
+  | _ -> fail "different capture completion was accepted"
+  end;
+  begin match complete state activation (Cycle.Published (Int64.pred activation)) with
+  | Error "sync published epoch precedes capture target" -> ()
+  | _ -> fail "preactivation publication was accepted"
+  end;
+  let state, effects = expect_ok (complete state activation Cycle.Failed) in
+  expect_effects [] effects;
+  if Cycle.published state <> Some before then fail "failed capture lost old image";
+  let state, effects = tick state after in
+  expect_effects [Cycle.Capture activation] effects;
+  let state, effects = expect_ok (complete state activation (Cycle.Published after)) in
+  expect_effects [Cycle.Retain 2] effects;
+  if Cycle.published state <> Some after || Cycle.running state <> None then
+    fail "activation publication did not complete";
+  let state, effects = tick state after in
+  expect_effects [] effects;
+  let _, effects = tick state (Int64.pred activation) in
+  expect_effects [] effects;
+  let _, effects = tick state 1_663_200L in
+  expect_effects [Cycle.Capture 1_663_200L] effects;
+  let _, effects = tick (Cycle.init ~published:(Some after)) after in
+  expect_effects [] effects;
+  let _, effects = tick initial after in
+  expect_effects [Cycle.Capture activation] effects;
+  let state, _ = tick initial activation in
+  let state, _ = expect_ok (complete state activation (Cycle.Published after)) in
+  begin match complete state activation (Cycle.Published after) with
+  | Error "sync completion has no active capture" -> ()
+  | _ -> fail "duplicate capture completion was accepted"
+  end
+
+let test_capture_crossing () =
+  let policy = expect_ok (Cycle.policy ~interval:10L ~retain:2) in
+  let state, _ = expect_ok (Cycle.step policy
+    (Cycle.init ~published:(Some 120L)) (Cycle.Finalized 137L)) in
+  let event = Cycle.Finalized_after { epoch = 138L; minimum = 138L } in
+  let state, effects = expect_ok (Cycle.step policy state event) in
+  expect_effects [] effects;
+  let state, effects = expect_ok (Cycle.step policy state
+    (Cycle.Completed { epoch = 130L; outcome = Cycle.Published 137L })) in
+  expect_effects [Cycle.Retain 2] effects;
+  let _, effects = expect_ok (Cycle.step policy state event) in
+  expect_effects [Cycle.Capture 138L] effects
+
+let test_cycle_minimum () =
+  let policy = expect_ok (Cycle.policy ~interval:10L ~retain:2) in
+  let initial = Cycle.init ~published:(Some 120L) in
+  List.iter (fun (epoch, minimum, reason) ->
+    match Cycle.step policy initial (Cycle.Finalized_after { epoch; minimum }) with
+    | Error actual when actual = reason -> ()
+    | _ -> fail "invalid capture minimum was accepted") [
+      -1L, 0L, "finalized epoch is negative";
+      137L, -1L, "sync minimum epoch is negative";
+      137L, 138L, "sync minimum epoch exceeds finalized head";
+    ];
+  for epoch = 0 to 150 do
+    let epoch = Int64.of_int epoch in
+    let legacy = Cycle.step policy initial (Cycle.Finalized epoch) in
+    let actual = Cycle.step policy initial
+      (Cycle.Finalized_after { epoch; minimum = 0L }) in
+    if actual <> legacy then fail "zero minimum changed interval cycle"
+  done;
+  if Publish.cycle_event ~chain_id:"unconfigured-chain" ~epoch:1_663_001L
+     <> Cycle.Finalized 1_663_001L then
+    fail "unconfigured chain changed interval cycle";
+  if Publish.cycle_event ~chain_id:"octra-devnet-9871-cluster" ~epoch:1_499_999L
+     <> Cycle.Finalized 1_499_999L then
+    fail "publisher selected activation before first profile"
+
 let mkdir path mode =
   if not (Sys.file_exists path) then Unix.mkdir path mode
 
@@ -166,6 +263,9 @@ let test_bridge_epoch_limit () =
 let () =
   test_published_epoch ();
   test_published_before_capture ();
+  test_activation_cycle ();
+  test_capture_crossing ();
+  test_cycle_minimum ();
   test_read_only_retention ();
   test_staged_retention ();
   Sync_archive_case.run ();

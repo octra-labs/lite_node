@@ -158,6 +158,28 @@ let storage_rows table =
   Hashtbl.fold (fun key value rows -> (key, value) :: rows) table []
   |> List.sort (fun (left, _) (right, _) -> String.compare left right)
 
+let copy_limits =
+  Option.get (Byte_work.limits ~key_bytes:Bytecode.max_const_len
+    ~value_bytes:Contract_vm.max_storage_value_len ~copy_bytes:Bytecode.max_const_len
+    ~write_bytes:0 ~alloc_bytes:(8 * Bytecode.max_const_len) ~unit_bytes:32)
+
+let copy_room budget state = function
+  | Contract_vm.CONCAT (_, left, right)
+      when left < 0 || right < 0 || left >= Array.length state.Contract_vm.regs
+        || right >= Array.length state.regs -> false
+  | Contract_vm.CONCAT (_, left, right) ->
+    let size reg =
+      match Contract_vm.getr state reg with
+      | VInt value | VU64 value | VU128 value | VU256 value ->
+        let bytes = Z.numbits value / 3 + 2 in
+        bytes, bytes
+      | value -> String.length (Contract_vm.to_string value), 0 in
+    let left, first = size left in
+    let right, second = size right in
+    Byte_work.charge budget ~used:0 ~limit:max_int ~base:0
+      [Allocate first; Allocate second; Copy (left, right)] <> None
+  | _ -> true
+
 let make_state config storage =
   let ctx = {
     Contract_vm.default_ctx with
@@ -237,6 +259,7 @@ let execute ~trace config code entry =
         | Error error -> Error error
         | Ok storage ->
           let state = make_state config storage in
+          let copies = Byte_work.create copy_limits in
           state.Contract_vm.pc <- entry;
           let rec run index frames =
             if index >= config.step_cap then
@@ -252,7 +275,12 @@ let execute ~trace config code entry =
                 | Some name ->
                   Ok (outcome state (Host_operation (pc, name)) index frames config.storage storage)
                 | None ->
-                  let progress = Contract_vm.step state code in
+                  let progress =
+                    if copy_room copies state op then Contract_vm.step state code
+                    else begin
+                      ignore (Contract_vm.revert state);
+                      Contract_vm.Refused
+                    end in
                   let frame = {
                     index;
                     pc;

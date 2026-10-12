@@ -7,12 +7,55 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
 export OCTRA_SRC_ROOT="$ROOT"
 cd "$ROOT"
+if [ "${1:-}" = "--recrypt" ]; then
+  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    test/native_math.exe
+  "$BUILD_DIR/default/test/native_math.exe" recrypt
+  sh controls/proof_gate.sh formal/coq/recrypt.v
+  printf 'event = gate name = fhe_memory scope = recrypt status = passed\n'
+  exit 0
+fi
+if [ "${1:-}" = "--bytes" ]; then
+  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    test/test_contract_rpc_guard.exe test/test_view_root.exe test/test_byte_work.exe \
+    test/test_byte_modes.exe test/test_int_text.exe test/test_decode_work.exe \
+    test/test_vector_space.exe \
+    bin/octra_pvac_worker.exe
+  opam exec -- "$BUILD_DIR/default/test/test_contract_rpc_guard.exe" --bytes
+  opam exec -- "$BUILD_DIR/default/test/test_view_root.exe" --bytes
+  opam exec -- "$BUILD_DIR/default/test/test_byte_work.exe"
+  opam exec -- "$BUILD_DIR/default/test/test_byte_modes.exe"
+  opam exec -- "$BUILD_DIR/default/test/test_int_text.exe"
+  opam exec -- "$BUILD_DIR/default/test/test_decode_work.exe"
+  opam exec -- "$BUILD_DIR/default/test/test_vector_space.exe"
+  sh controls/proof_gate.sh formal/coq/byte_work.v
+  opam exec -- "$BUILD_DIR/default/test/test_view_root.exe" --fhe
+  printf 'event = gate name = fhe_memory scope = bytes status = passed\n'
+  exit 0
+fi
+if [ "${1:-}" = "--view" ]; then
+  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    test/test_view_root.exe test/test_circle_program.exe
+  opam exec -- "$BUILD_DIR/default/test/test_view_root.exe" --circle
+  opam exec -- "$BUILD_DIR/default/test/test_circle_program.exe" --inspect
+  sh controls/proof_gate.sh formal/coq/root_query.v
+  printf 'event = gate name = fhe_memory scope = view status = passed\n'
+  exit 0
+fi
+if [ "${1:-}" = "--inspect" ]; then
+  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    test/test_circle_program.exe
+  opam exec -- "$BUILD_DIR/default/test/test_circle_program.exe" --inspect
+  printf 'event = gate name = fhe_memory scope = inspect status = passed\n'
+  exit 0
+fi
 sh controls/queue_gate.sh
 opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
   test/test_fhe_task.exe test/test_fhe_memory.exe test/test_fhe_work.exe test/test_vm_effects.exe \
   test/native_math.exe test/test_cipher_views.exe test/test_circle_program.exe \
   test/test_native_alloc.exe test/test_proof_wait.exe test/test_pvac_verify_worker.exe \
   test/test_contract_rpc_guard.exe test/test_view_root.exe test/test_vm_transition.exe \
+  test/vault.wasm \
   test/test_private_transition_receipt.exe test/test_epoch_exec_reward_atomic.exe \
   test/test_run_exit.exe test/test_journal_hash.exe test/test_catchup_shell.exe \
   bin/octra_pvac_worker.exe
@@ -38,5 +81,5 @@ opam exec -- dune runtest --cache=disabled --root "$ROOT" --build-dir "$BUILD_DI
 "$BUILD_DIR/default/test/native_math.exe"
 opam exec -- "$BUILD_DIR/default/test/test_cipher_views.exe"
 sh controls/proof_gate.sh formal/coq/aux_restore.v formal/coq/fhe_work.v formal/coq/r1cs_build.v \
-  formal/coq/fhe_queue.v formal/coq/proof_wait.v
+  formal/coq/fhe_queue.v formal/coq/proof_wait.v formal/coq/recrypt.v
 printf 'event = gate name = fhe_memory status = passed\n'

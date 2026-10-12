@@ -8,6 +8,9 @@ val normalize :
 
 val consensus_id : string
 
+val check_compute : settle:Rule_graph.mode -> Rule_graph.mode ->
+  Transaction.t list -> (unit, string) result
+
 val check_epoch :
   chain_id:string -> epoch:int64 -> Transaction.t list -> (unit, string) result
 
@@ -17,3 +20,4 @@ val check_rule :
 val check_outcome :
   chain_id:string -> epoch:int64 -> receipts:string list ->
   Transaction.t list -> (unit, string) result
+val check_charged : Rule_graph.mode -> Tx_outcome.rejection list -> (unit, string) result

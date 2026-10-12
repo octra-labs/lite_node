@@ -49,6 +49,7 @@ type runtime = {
   wasm_compute_mode : Octra_core.Rule_graph.mode;
   object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
+  cipher_mode : Octra_core.Rule_graph.mode;
   proof_mode : Octra_core.Rule_graph.mode;
   math : bool;
   private_field_policy : Octra_core.Private_ledger.field_policy;
@@ -180,6 +181,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
         ~ledger:(Lazy.force backend).Epoch_exec.ledger
         ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id
         ~owner_migration_mode:runtime.owner_migration_mode
+        ~cipher_mode:runtime.cipher_mode
         ~proof_mode:runtime.proof_mode
         ~math:runtime.math
         ~field_policy:runtime.private_field_policy
@@ -282,7 +284,7 @@ let run_runtime ?preverify ?save_receipt_raw (runtime : runtime) txs =
   in
   runtime.advance_validator_set ()
 
-let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
+let run_node ?compute ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
   let open Lwt.Syntax in
   let tx_sink =
     Sender.live_tx_sink
@@ -302,14 +304,16 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
     tx_sink.confirm tx
   in
   let deferred_stealth_txs = ref [] in
-  let process_sender ~fold ~env ~object_cost private_field_policy sender_txs =
+  let process_sender ~fold ~env ~object_cost ~cipher_mode private_field_policy sender_txs =
     Sender_live.run
+      ?compute
       {
         ledger = runtime.ledger;
         store = runtime.store;
         chaindata = runtime.chaindata;
         program_trust = runtime.program_trust;
         object_cost;
+        cipher_mode;
         wallet_addr = runtime.wallet_addr;
         pre_state_hash = runtime.pre_state_hash;
         fold;
@@ -370,6 +374,10 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
       | Error fault ->
         failwith (Octra_core.Rule_graph.fault_message fault)
     in
+    let cipher_mode =
+      match Octra_core.Rule_graph.cipher_migration runtime.rules ~epoch:epoch_id with
+      | Ok mode -> mode
+      | Error fault -> failwith (Octra_core.Rule_graph.fault_message fault) in
     let wasm_compute_mode =
       match
         Octra_core.Rule_graph.wasm_compute
@@ -431,6 +439,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         exit = runtime.exit;
         backend = (fun () ->
           Epoch_exec.make_live_backend
+            ?compute
             ~proof_mode
             ~math
             ~fold
@@ -440,7 +449,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         max_fhe_per_epoch = runtime.max_fhe_per_epoch;
         max_stealth_per_epoch = runtime.max_stealth_per_epoch;
         process_sender =
-          process_sender ~fold ~env ~object_cost private_field_policy;
+          process_sender ~fold ~env ~object_cost ~cipher_mode private_field_policy;
         confirm_tx;
         reject_tx = log_rejected;
         notify_confirmed = runtime.notify_confirmed;
@@ -450,6 +459,7 @@ let run_node ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
         wasm_compute_mode;
         object_cost;
         owner_migration_mode;
+        cipher_mode;
         proof_mode;
         math;
         private_field_policy;

@@ -154,6 +154,17 @@ fn scaled_sum(sum: i128, scale: i64, message: &'static str) -> Result<i64, &'sta
         .and_then(|value| rounded_shift(value, FRAC_BITS))
 }
 
+fn cells<B: AsMut<[i64]>, E: From<&'static str>>(
+    output: &mut B,
+    count: usize,
+) -> Result<&mut [i64], E> {
+    let values = output.as_mut();
+    if values.len() != count {
+        return Err("tensor output shape differs".into());
+    }
+    Ok(values)
+}
+
 pub fn linear_i8(
     input: &[i64],
     weights: &[u8],
@@ -163,13 +174,22 @@ pub fn linear_i8(
     linear_i8_with_thread_limit(input, weights, out_dim, scale, available_compute_threads())
 }
 
-fn linear_i8_with_thread_limit(
+pub(crate) fn linear_i8_with<B: AsMut<[i64]>, E: From<&'static str>>(
     input: &[i64],
     weights: &[u8],
     out_dim: usize,
     scale: i64,
-    thread_limit: usize,
-) -> Result<Vec<i64>, &'static str> {
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    linear_alloc(input, weights, out_dim, scale, available_compute_threads(), alloc)
+}
+
+fn linear_shape(
+    input: &[i64],
+    weights: &[u8],
+    out_dim: usize,
+    scale: i64,
+) -> Result<bool, &'static str> {
     if input.is_empty()
         || out_dim == 0
         || weights.len()
@@ -181,57 +201,121 @@ fn linear_i8_with_thread_limit(
     {
         return Err("invalid linear tensor shape");
     }
-    if i64_accumulator_safe(input, input.len()) {
-        let mut accumulators = vec![0_i64; out_dim];
-        let threads = compute_threads(input.len() * out_dim, out_dim, thread_limit);
-        let chunk_size = out_dim.div_ceil(threads);
-        std::thread::scope(|scope| {
-            for (chunk_index, chunk) in accumulators.chunks_mut(chunk_size).enumerate() {
-                let output_start = chunk_index * chunk_size;
-                scope.spawn(move || {
-                    let chunk_len = chunk.len();
-                    for (input_index, value) in input.iter().copied().enumerate() {
-                        let offset = input_index * out_dim + output_start;
-                        for (accumulator, weight) in
-                            chunk.iter_mut().zip(&weights[offset..offset + chunk_len])
-                        {
-                            *accumulator += i64::from(*weight as i8) * value;
-                        }
-                    }
-                });
-            }
-        });
-        return accumulators
-            .into_iter()
-            .map(|sum| scaled_sum(i128::from(sum), scale, "linear accumulator overflow"))
-            .collect();
-    }
-    if !i128_accumulator_safe(input, input.len()) {
+    let narrow = i64_accumulator_safe(input, input.len());
+    if !narrow && !i128_accumulator_safe(input, input.len()) {
         return Err("linear accumulator overflow");
     }
-    let mut accumulators = vec![0_i128; out_dim];
+    Ok(narrow)
+}
+
+const LINEAR_TILE: usize = 256;
+
+fn linear_chunk(
+    input: &[i64],
+    weights: &[u8],
+    out_dim: usize,
+    start: usize,
+    scale: i64,
+    narrow: bool,
+    output: &mut [i64],
+) -> Result<(), &'static str> {
+    for (index, tile) in output.chunks_mut(LINEAR_TILE).enumerate() {
+        let column = start + index * LINEAR_TILE;
+        let length = tile.len();
+        if narrow {
+            tile.fill(0);
+            for (row, value) in input.iter().copied().enumerate() {
+                let offset = row * out_dim + column;
+                for (sum, weight) in tile.iter_mut().zip(&weights[offset..offset + length]) {
+                    *sum += i64::from(*weight as i8) * value;
+                }
+            }
+            for value in tile {
+                *value = scaled_sum(i128::from(*value), scale, "linear accumulator overflow")?;
+            }
+        } else {
+            let mut sums = [0_i128; LINEAR_TILE];
+            for (row, value) in input.iter().copied().enumerate() {
+                let offset = row * out_dim + column;
+                for (sum, weight) in sums[..length].iter_mut().zip(&weights[offset..offset + length]) {
+                    *sum += i128::from(*weight as i8) * i128::from(value);
+                }
+            }
+            for (value, sum) in tile.iter_mut().zip(sums) {
+                *value = scaled_sum(sum, scale, "linear accumulator overflow")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn visit_linear_i8(
+    input: &[i64],
+    weights: &[u8],
+    out_dim: usize,
+    scale: i64,
+    mut emit: impl FnMut(&[i64]),
+) -> Result<(), &'static str> {
+    let narrow = linear_shape(input, weights, out_dim, scale)?;
+    let mut tile = [0_i64; LINEAR_TILE];
+    for start in (0..out_dim).step_by(LINEAR_TILE) {
+        let length = (out_dim - start).min(LINEAR_TILE);
+        linear_chunk(input, weights, out_dim, start, scale, narrow, &mut tile[..length])?;
+        emit(&tile[..length]);
+    }
+    Ok(())
+}
+
+fn linear_i8_with_thread_limit(
+    input: &[i64],
+    weights: &[u8],
+    out_dim: usize,
+    scale: i64,
+    thread_limit: usize,
+) -> Result<Vec<i64>, &'static str> {
+    let narrow = linear_shape(input, weights, out_dim, scale)?;
+    let mut output = vec![0_i64; out_dim];
     let threads = compute_threads(input.len() * out_dim, out_dim, thread_limit);
     let chunk_size = out_dim.div_ceil(threads);
     std::thread::scope(|scope| {
-        for (chunk_index, chunk) in accumulators.chunks_mut(chunk_size).enumerate() {
-            let output_start = chunk_index * chunk_size;
-            scope.spawn(move || {
-                let chunk_len = chunk.len();
-                for (input_index, value) in input.iter().copied().enumerate() {
-                    let offset = input_index * out_dim + output_start;
-                    for (accumulator, weight) in
-                        chunk.iter_mut().zip(&weights[offset..offset + chunk_len])
-                    {
-                        *accumulator += i128::from(*weight as i8) * i128::from(value);
-                    }
-                }
-            });
-        }
-    });
-    accumulators
-        .into_iter()
-        .map(|sum| scaled_sum(sum, scale, "linear accumulator overflow"))
-        .collect()
+        output.chunks_mut(chunk_size).enumerate()
+            .map(|(index, chunk)| {
+                scope.spawn(move || linear_chunk(
+                    input, weights, out_dim, index * chunk_size, scale, narrow, chunk))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .try_for_each(|worker| worker.join()
+                .unwrap_or_else(|error| std::panic::resume_unwind(error)))
+    })?;
+    Ok(output)
+}
+
+fn linear_alloc<B: AsMut<[i64]>, E: From<&'static str>>(
+    input: &[i64],
+    weights: &[u8],
+    out_dim: usize,
+    scale: i64,
+    thread_limit: usize,
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    let narrow = linear_shape(input, weights, out_dim, scale)?;
+    let mut output = alloc(out_dim)?;
+    let values = cells::<_, E>(&mut output, out_dim)?;
+    let threads = compute_threads(input.len() * out_dim, out_dim, thread_limit);
+    let chunk_size = out_dim.div_ceil(threads);
+    std::thread::scope(|scope| {
+        values.chunks_mut(chunk_size).enumerate()
+            .map(|(index, chunk)| {
+                scope.spawn(move || linear_chunk(
+                    input, weights, out_dim, index * chunk_size, scale, narrow, chunk))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .try_for_each(|worker| worker.join()
+                .unwrap_or_else(|error| std::panic::resume_unwind(error)))
+    })?;
+    Ok(output)
 }
 
 fn top1_i64(
@@ -422,6 +506,36 @@ pub fn rmsnorm(values: &[i64], gamma: &[i64]) -> Result<Vec<i64>, &'static str> 
         .collect()
 }
 
+pub(crate) fn rmsnorm_with<B: AsMut<[i64]>, E: From<&'static str>>(
+    values: &[i64],
+    gamma: &[i64],
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    if values.is_empty() || values.len() != gamma.len() {
+        return Err("invalid rmsnorm tensor shape".into());
+    }
+    let squares = values.iter().try_fold(0_u128, |sum, value| {
+        let magnitude = i128::from(*value).unsigned_abs();
+        sum.checked_add(magnitude.checked_mul(magnitude).ok_or("rmsnorm overflow")?)
+            .ok_or("rmsnorm overflow")
+    })?;
+    let mean = squares / values.len() as u128;
+    let rms = integer_sqrt(
+        mean.checked_add(RMS_EPSILON_Q48)
+            .ok_or("rmsnorm overflow")?,
+    );
+    if rms == 0 || rms > i128::MAX as u128 {
+        return Err("invalid rmsnorm divisor".into());
+    }
+    let mut output = alloc(values.len())?;
+    let out = cells::<_, E>(&mut output, values.len())?;
+    for ((value, gain), cell) in values.iter().zip(gamma).zip(out) {
+        *cell = rounded_div(i128::from(*value) * i128::from(*gain), rms as i128)
+            .and_then(checked_i64)?;
+    }
+    Ok(output)
+}
+
 fn exp_polynomial(value: i64) -> Result<i64, &'static str> {
     let mut term = ONE;
     let mut total = ONE;
@@ -481,11 +595,39 @@ pub fn silu(values: &[i64]) -> Result<Vec<i64>, &'static str> {
         .collect()
 }
 
+pub(crate) fn silu_with<B: AsMut<[i64]>, E: From<&'static str>>(
+    values: &[i64],
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    let mut output = alloc(values.len())?;
+    let out = cells::<_, E>(&mut output, values.len())?;
+    for (value, cell) in values.iter().zip(out) {
+        *cell = mul(*value, sigmoid(*value)?)?;
+    }
+    Ok(output)
+}
+
 pub fn elementwise_mul(left: &[i64], right: &[i64]) -> Result<Vec<i64>, &'static str> {
     if left.len() != right.len() {
         return Err("invalid elementwise tensor shape");
     }
     left.iter().zip(right).map(|(a, b)| mul(*a, *b)).collect()
+}
+
+pub(crate) fn elementwise_mul_with<B: AsMut<[i64]>, E: From<&'static str>>(
+    left: &[i64],
+    right: &[i64],
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    if left.len() != right.len() {
+        return Err("invalid elementwise tensor shape".into());
+    }
+    let mut output = alloc(left.len())?;
+    let out = cells::<_, E>(&mut output, left.len())?;
+    for ((a, b), cell) in left.iter().zip(right).zip(out) {
+        *cell = mul(*a, *b)?;
+    }
+    Ok(output)
 }
 
 pub fn residual_add(left: &[i64], right: &[i64]) -> Result<Vec<i64>, &'static str> {
@@ -496,6 +638,22 @@ pub fn residual_add(left: &[i64], right: &[i64]) -> Result<Vec<i64>, &'static st
         .zip(right)
         .map(|(a, b)| a.checked_add(*b).ok_or("residual overflow"))
         .collect()
+}
+
+pub(crate) fn residual_add_with<B: AsMut<[i64]>, E: From<&'static str>>(
+    left: &[i64],
+    right: &[i64],
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    if left.len() != right.len() {
+        return Err("invalid residual tensor shape".into());
+    }
+    let mut output = alloc(left.len())?;
+    let out = cells::<_, E>(&mut output, left.len())?;
+    for ((a, b), cell) in left.iter().zip(right).zip(out) {
+        *cell = a.checked_add(*b).ok_or("residual overflow")?;
+    }
+    Ok(output)
 }
 
 fn divide_integer(value: i64, divisor: i64) -> Result<i64, &'static str> {
@@ -560,6 +718,36 @@ pub fn rope(values: &[i64], frequencies: &[i64], position: i64) -> Result<Vec<i6
     Ok(output)
 }
 
+pub(crate) fn rope_with<B: AsMut<[i64]>, E: From<&'static str>>(
+    values: &[i64],
+    frequencies: &[i64],
+    position: i64,
+    alloc: impl FnOnce(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    if values.len() % 2 != 0 || frequencies.len() * 2 != values.len() || position < 0 {
+        return Err("invalid rope tensor shape".into());
+    }
+    let half = frequencies.len();
+    let mut output = alloc(values.len())?;
+    let out = cells::<_, E>(&mut output, values.len())?;
+    out.copy_from_slice(values);
+    for index in 0..half {
+        let angle = frequencies[index]
+            .checked_mul(position)
+            .ok_or("rope angle overflow")?;
+        let (sine, cosine) = sin_cos(angle)?;
+        let left = values[index];
+        let right = values[index + half];
+        out[index] = mul(left, cosine)?
+            .checked_sub(mul(right, sine)?)
+            .ok_or("rope overflow")?;
+        out[index + half] = mul(left, sine)?
+            .checked_add(mul(right, cosine)?)
+            .ok_or("rope overflow")?;
+    }
+    Ok(output)
+}
+
 pub fn attention_kv(
     query: &[i64],
     keys: &[i64],
@@ -592,10 +780,11 @@ pub fn attention_kv(
     let kv_dim = kv_heads * head_dim;
     let group = query_heads / kv_heads;
     let mut output = vec![0_i64; query.len()];
+    let mut scores = Vec::with_capacity(sequence_len);
     for head in 0..query_heads {
         let kv_head = head / group;
         let query_start = head * head_dim;
-        let mut scores = Vec::with_capacity(sequence_len);
+        scores.clear();
         for position in 0..sequence_len {
             let key_start = position * kv_dim + kv_head * head_dim;
             let dot = (0..head_dim).try_fold(0_i128, |sum, index| {
@@ -609,15 +798,10 @@ pub fn attention_kv(
             scores.push(mul(rounded_shift(dot, FRAC_BITS)?, scale)?);
         }
         let maximum = *scores.iter().max().ok_or("empty attention score")?;
-        let exponentials = scores
-            .iter()
-            .map(|score| {
-                exp(score
-                    .checked_sub(maximum)
-                    .ok_or("attention score overflow")?)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let denominator = exponentials.iter().try_fold(0_i128, |sum, value| {
+        for score in &mut scores {
+            *score = exp(score.checked_sub(maximum).ok_or("attention score overflow")?)?;
+        }
+        let denominator = scores.iter().try_fold(0_i128, |sum, value| {
             sum.checked_add(i128::from(*value))
                 .ok_or("attention sum overflow")
         })?;
@@ -628,7 +812,7 @@ pub fn attention_kv(
             let numerator = (0..sequence_len).try_fold(0_i128, |sum, position| {
                 let value_index = position * kv_dim + kv_head * head_dim + dimension;
                 sum.checked_add(
-                    i128::from(exponentials[position])
+                    i128::from(scores[position])
                         .checked_mul(i128::from(values[value_index]))
                         .ok_or("attention output overflow")?,
                 )
@@ -640,9 +824,146 @@ pub fn attention_kv(
     Ok(output)
 }
 
+pub(crate) fn attention_kv_with<B: AsMut<[i64]>, E: From<&'static str>>(
+    query: &[i64],
+    keys: &[i64],
+    values: &[i64],
+    sequence_len: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    scale: i64,
+    mut alloc: impl FnMut(usize) -> Result<B, E>,
+) -> Result<B, E> {
+    if sequence_len == 0
+        || query_heads == 0
+        || kv_heads == 0
+        || head_dim == 0
+        || query_heads % kv_heads != 0
+        || query.len()
+            != query_heads
+                .checked_mul(head_dim)
+                .ok_or("tensor size overflow")?
+        || keys.len()
+            != sequence_len
+                .checked_mul(kv_heads)
+                .and_then(|size| size.checked_mul(head_dim))
+                .ok_or("tensor size overflow")?
+        || values.len() != keys.len()
+        || scale <= 0
+    {
+        return Err("invalid attention tensor shape".into());
+    }
+    let kv_dim = kv_heads * head_dim;
+    let group = query_heads / kv_heads;
+    let mut output = alloc(query.len())?;
+    let out = cells::<_, E>(&mut output, query.len())?;
+    let mut scratch = alloc(sequence_len)?;
+    let scores = cells::<_, E>(&mut scratch, sequence_len)?;
+    for head in 0..query_heads {
+        let kv_head = head / group;
+        let query_start = head * head_dim;
+        for position in 0..sequence_len {
+            let key_start = position * kv_dim + kv_head * head_dim;
+            let dot = (0..head_dim).try_fold(0_i128, |sum, index| {
+                sum.checked_add(
+                    i128::from(query[query_start + index])
+                        .checked_mul(i128::from(keys[key_start + index]))
+                        .ok_or("attention accumulator overflow")?,
+                )
+                .ok_or("attention accumulator overflow")
+            })?;
+            scores[position] = mul(rounded_shift(dot, FRAC_BITS)?, scale)?;
+        }
+        let maximum = *scores.iter().max().ok_or("empty attention score")?;
+        for score in scores.iter_mut() {
+            *score = exp(score.checked_sub(maximum).ok_or("attention score overflow")?)?;
+        }
+        let denominator = scores.iter().try_fold(0_i128, |sum, value| {
+            sum.checked_add(i128::from(*value))
+                .ok_or("attention sum overflow")
+        })?;
+        if denominator <= 0 {
+            return Err("invalid attention denominator".into());
+        }
+        for dimension in 0..head_dim {
+            let numerator = (0..sequence_len).try_fold(0_i128, |sum, position| {
+                let value_index = position * kv_dim + kv_head * head_dim + dimension;
+                sum.checked_add(
+                    i128::from(scores[position])
+                        .checked_mul(i128::from(values[value_index]))
+                        .ok_or("attention output overflow")?,
+                )
+                .ok_or("attention output overflow")
+            })?;
+            out[query_start + dimension] = checked_i64(rounded_div(numerator, denominator)?)?;
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output(count: usize) -> Result<Vec<i64>, &'static str> {
+        Ok(vec![0; count])
+    }
+
+    #[test]
+    fn owned_results_match() {
+        for count in [0, 1, 2, 4, 17, 513] {
+            let values = (0..count).map(|index| (index as i64 % 9 - 4) * ONE / 3)
+                .collect::<Vec<_>>();
+            let gamma = vec![ONE; count];
+            let weights = (0..count * 3).map(|index| (index % 7) as u8).collect::<Vec<_>>();
+            let frequencies = vec![ONE / 13; count / 2];
+            assert_eq!(rmsnorm_with(&values, &gamma, output), rmsnorm(&values, &gamma));
+            assert_eq!(silu_with(&values, output), silu(&values));
+            assert_eq!(elementwise_mul_with(&values, &gamma, output),
+                elementwise_mul(&values, &gamma));
+            assert_eq!(residual_add_with(&values, &gamma, output), residual_add(&values, &gamma));
+            assert_eq!(rope_with(&values, &frequencies, 19, output),
+                rope(&values, &frequencies, 19));
+            assert_eq!(linear_i8_with(&values, &weights, 3, ONE, output),
+                linear_i8(&values, &weights, 3, ONE));
+        }
+        for values in [vec![i64::MAX; 5], vec![i64::MIN, i64::MAX], vec![0, ONE]] {
+            let gamma = vec![i64::MAX; values.len()];
+            assert_eq!(rmsnorm_with(&values, &gamma, output), rmsnorm(&values, &gamma));
+            assert_eq!(silu_with(&values, output), silu(&values));
+            assert_eq!(elementwise_mul_with(&values, &gamma, output),
+                elementwise_mul(&values, &gamma));
+            assert_eq!(residual_add_with(&values, &gamma, output), residual_add(&values, &gamma));
+            assert_eq!(rope_with(&values, &[i64::MAX], 2, output),
+                rope(&values, &[i64::MAX], 2));
+        }
+        for (query, keys, values, count) in [
+            (vec![ONE; 4], vec![ONE; 6], vec![ONE; 6], 3),
+            (vec![i64::MIN, i64::MAX], vec![i64::MAX; 2], vec![ONE; 2], 1),
+            (vec![ONE; 4], vec![ONE; 6], vec![ONE; 5], 3),
+        ] {
+            assert_eq!(attention_kv_with(&query, &keys, &values, count, 2, 1, 2, ONE, output),
+                attention_kv(&query, &keys, &values, count, 2, 1, 2, ONE));
+        }
+    }
+
+    #[test]
+    fn output_shape_checked() {
+        let short = |_: usize| Ok::<_, &'static str>(Vec::<i64>::new());
+        let long = |count: usize| Ok::<_, &'static str>(vec![0_i64; count + 1]);
+        for alloc in [short as fn(usize) -> _, long as fn(usize) -> _] {
+            let expected = Err("tensor output shape differs");
+            assert_eq!(rmsnorm_with(&[ONE], &[ONE], alloc), expected);
+            assert_eq!(silu_with(&[ONE], alloc), expected);
+            assert_eq!(elementwise_mul_with(&[ONE], &[ONE], alloc), expected);
+            assert_eq!(residual_add_with(&[ONE], &[ONE], alloc), expected);
+            assert_eq!(rope_with(&[ONE; 2], &[ONE], 0, alloc), expected);
+            assert_eq!(linear_i8_with(&[ONE], &[1], 1, ONE, alloc), expected);
+            assert_eq!(attention_kv_with(&[ONE], &[ONE], &[ONE], 1, 1, 1, 1, ONE, alloc),
+                expected);
+        }
+    }
 
     fn reference_linear(
         input: &[i64],
@@ -698,6 +1019,178 @@ mod tests {
                 }
             })
             .ok_or("empty top1 tensor")
+    }
+
+    fn reference_attention(query: &[i64], keys: &[i64], values: &[i64],
+        count: usize, heads: usize, groups: usize, dim: usize, scale: i64)
+        -> Result<Vec<i64>, &'static str> {
+        let mut output = vec![0; query.len()];
+        for head in 0..heads {
+            let group = head / (heads / groups);
+            let mut scores = Vec::with_capacity(count);
+            for position in 0..count {
+                let start = (position * groups + group) * dim;
+                let dot = (0..dim).try_fold(0_i128, |sum, index| {
+                    sum.checked_add(i128::from(query[head * dim + index])
+                        * i128::from(keys[start + index]))
+                        .ok_or("attention accumulator overflow")
+                })?;
+                scores.push(mul(rounded_shift(dot, FRAC_BITS)?, scale)?);
+            }
+            let maximum = *scores.iter().max().unwrap();
+            let weights = scores.iter().map(|score| {
+                exp(score.checked_sub(maximum).ok_or("attention score overflow")?)
+            }).collect::<Result<Vec<_>, _>>()?;
+            let denominator = weights.iter().try_fold(0_i128, |sum, value| {
+                sum.checked_add(i128::from(*value)).ok_or("attention sum overflow")
+            })?;
+            for dimension in 0..dim {
+                let numerator = (0..count).try_fold(0_i128, |sum, position| {
+                    let index = (position * groups + group) * dim + dimension;
+                    sum.checked_add(i128::from(weights[position]) * i128::from(values[index]))
+                        .ok_or("attention output overflow")
+                })?;
+                output[head * dim + dimension] = checked_i64(rounded_div(numerator, denominator)?)?;
+            }
+        }
+        Ok(output)
+    }
+
+    #[test]
+    fn attention_values() {
+        for count in [1, 2, 7, 17] {
+            for (heads, groups, dim) in [(1, 1, 1), (4, 1, 3), (6, 3, 4)] {
+                let query: Vec<_> = (0..heads * dim)
+                    .map(|index| (index as i64 % 7 - 3) * HALF + 1).collect();
+                let keys: Vec<_> = (0..count * groups * dim)
+                    .map(|index| (index as i64 % 11 - 5) * ONE - 1).collect();
+                let values: Vec<_> = (0..keys.len())
+                    .map(|index| (index as i64 % 13 - 6) * HALF + 3).collect();
+                for scale in [1, HALF, ONE, 16 * ONE] {
+                    assert_eq!(attention_kv(&query, &keys, &values,
+                        count, heads, groups, dim, scale),
+                        reference_attention(&query, &keys, &values,
+                            count, heads, groups, dim, scale));
+                }
+            }
+        }
+        for values in [[0, 1], [0, -1], [i64::MIN, i64::MAX]] {
+            assert_eq!(attention_kv(&[0], &[0, 0], &values, 2, 1, 1, 1, ONE),
+                reference_attention(&[0], &[0, 0], &values, 2, 1, 1, 1, ONE));
+        }
+        assert_eq!(attention_kv(&[0], &[0, 0], &[0, 1], 2, 1, 1, 1, ONE), Ok(vec![1]));
+        assert_eq!(attention_kv(&[0], &[0, 0], &[0, -1], 2, 1, 1, 1, ONE), Ok(vec![-1]));
+        for value in [-16 * ONE - 1, -16 * ONE, -16 * ONE + 1] {
+            assert_eq!(attention_kv(&[ONE], &[0, value], &[1, 3], 2, 1, 1, 1, ONE),
+                reference_attention(&[ONE], &[0, value], &[1, 3], 2, 1, 1, 1, ONE));
+        }
+    }
+
+    #[test]
+    fn attention_errors() {
+        let shape = Err("invalid attention tensor shape");
+        assert_eq!(attention_kv(&[], &[], &[], 0, usize::MAX, 1, 2, 0), shape);
+        assert_eq!(attention_kv(&[], &[], &[], 1, 0, 1, 1, ONE), shape);
+        assert_eq!(attention_kv(&[], &[], &[], 1, 1, 0, 1, ONE), shape);
+        assert_eq!(attention_kv(&[], &[], &[], 1, 1, 1, 0, ONE), shape);
+        assert_eq!(attention_kv(&[], &[], &[], 1, 3, 2, 1, ONE), shape);
+        assert_eq!(attention_kv(&[], &[], &[], usize::MAX, 1, 1, 2, ONE), shape);
+        assert_eq!(attention_kv(&[], &[], &[], 1, usize::MAX, 1, 2, ONE),
+            Err("tensor size overflow"));
+        assert_eq!(attention_kv(&[0, 0], &[], &[], usize::MAX, 1, 1, 2, ONE),
+            Err("tensor size overflow"));
+        assert_eq!(attention_kv(&[0, 0], &[], &[], usize::MAX, 2, 2, 1, ONE),
+            Err("tensor size overflow"));
+        assert_eq!(attention_kv(&[0], &[], &[], 1, 1, 1, 1, ONE), shape);
+        assert_eq!(attention_kv(&[0], &[0], &[], 1, 1, 1, 1, ONE), shape);
+        for scale in [0, -1] {
+            assert_eq!(attention_kv(&[0], &[0], &[0], 1, 1, 1, 1, scale), shape);
+        }
+        for (query, keys, count, heads, dim, scale, error) in [
+            (vec![ONE], vec![i64::MIN, i64::MAX], 2, 1, 1, ONE, "attention score overflow"),
+            (vec![i64::MAX], vec![i64::MAX], 1, 1, 1, ONE, "fixed point overflow"),
+            (vec![ONE], vec![i64::MAX], 1, 1, 1, 2 * ONE, "fixed point overflow"),
+            (vec![i64::MAX; 3], vec![i64::MAX; 3], 1, 1, 3, ONE,
+                "attention accumulator overflow"),
+            (vec![ONE, ONE], vec![i64::MIN, 0, i64::MAX, 0, i64::MAX, i64::MAX],
+                3, 1, 2, ONE, "fixed point overflow"),
+            (vec![0, ONE], vec![i64::MIN, i64::MAX], 2, 2, 1, ONE,
+                "attention score overflow"),
+        ] {
+            let values = vec![ONE; keys.len()];
+            assert_eq!(reference_attention(&query, &keys, &values,
+                count, heads, 1, dim, scale), Err(error));
+            assert_eq!(attention_kv(&query, &keys, &values,
+                count, heads, 1, dim, scale), Err(error));
+        }
+    }
+
+    #[test]
+    fn linear_tiles() {
+        for wide in [false, true] {
+            let unit = if wide { i64::MAX } else { ONE };
+            let input: Vec<_> = (0..2049).map(|index| {
+                if index == 2048 { 1 } else if index % 2 == 0 { unit } else { -unit }
+            }).collect();
+            let columns = 1537;
+            let weights: Vec<_> = (0..input.len() * columns).map(|index| {
+                let row = index / columns;
+                let column = index % columns;
+                ((row / 2 + column) as i64 % 3 - 1) as i8 as u8
+            }).collect();
+            let expected = reference_linear(&input, &weights, columns, HALF).unwrap();
+            for threads in 1..=6 {
+                assert_eq!(linear_i8_with_thread_limit(&input, &weights, columns, HALF, threads),
+                    Ok(expected.clone()));
+            }
+            let mut streamed = Vec::new();
+            visit_linear_i8(&input, &weights, columns, HALF, |tile| {
+                assert!(tile.len() <= LINEAR_TILE);
+                streamed.extend_from_slice(tile);
+            }).unwrap();
+            assert_eq!(streamed, expected);
+        }
+        assert_eq!(linear_i8(&[1, -1, 3, -3], &[1, 0, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 0, 1], 4, HALF), Ok(vec![1, -1, 2, -2]));
+    }
+
+    #[test]
+    fn linear_error_order() {
+        for columns in [2, 257, 1025] {
+            let mut weights = vec![0; columns];
+            weights[columns - 2] = 1;
+            weights[columns - 1] = 127;
+            for threads in 1..=6 {
+                assert_eq!(linear_i8_with_thread_limit(&[i64::MAX], &weights,
+                    columns, 1_i64 << 62, threads), Err("fixed point overflow"));
+            }
+            assert_eq!(visit_linear_i8(&[i64::MAX], &weights, columns, 1_i64 << 62, |_| {}),
+                Err("fixed point overflow"));
+            weights[columns - 2] = 127;
+            assert_eq!(linear_i8(&[i64::MAX], &weights, columns, 1_i64 << 62),
+                Err("linear accumulator overflow"));
+        }
+        let mut input = vec![0; 1025];
+        input[0] = i64::MAX;
+        let mut weights = vec![0; input.len() * 1025];
+        weights[0] = 1;
+        weights[1024] = 127;
+        for threads in 1..=6 {
+            assert_eq!(linear_i8_with_thread_limit(&input, &weights, 1025, 1_i64 << 62, threads),
+                Err("fixed point overflow"));
+        }
+        for (input, weights, columns, scale) in [
+            (&[][..], &[0][..], 1, ONE),
+            (&[1][..], &[][..], 0, ONE),
+            (&[1][..], &[1][..], 2, ONE),
+            (&[1][..], &[1][..], 1, 0),
+        ] {
+            assert_eq!(linear_i8(input, weights, columns, scale),
+                Err("invalid linear tensor shape"));
+            assert_eq!(visit_linear_i8(input, weights, columns, scale, |_| {
+                panic!("invalid tensor emitted output");
+            }), Err("invalid linear tensor shape"));
+        }
     }
 
     #[test]

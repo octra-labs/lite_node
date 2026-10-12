@@ -178,6 +178,19 @@ let test_capture () = with_root (fun root ->
     let head = Head.{ (head 42) with state_root = ledger;
       ledger_state_root = Some ledger; irmin_commit = Some commit } in
     let source = Capture.{ data_dir; store; head; roots = [] } in
+    let chain_id = "octra-devnet-9871-cluster" in
+    let epoch = (Option.get
+      (Octra_core.Rule_graph.vm_bytes_activation_for_chain chain_id)).activation_epoch in
+    expect "image shared before rule" (Capture.format ~chain_id ~epoch:(epoch - 1) = Image.Flat);
+    expect "image flat at rule" (Capture.format ~chain_id ~epoch = Image.Shared);
+    expect "other chain image changed" (Capture.format ~chain_id:"other" ~epoch = Image.Flat);
+    let shared = Filename.concat root "shared" in
+    let format = Capture.format ~chain_id ~epoch in
+    let report = run (Capture.build ~format source ~target:shared) |> get in
+    expect "shared capture root changed" (report.ledger_root = ledger);
+    let magic = In_channel.with_open_bin (Filename.concat shared "ledger.dat")
+      In_channel.input_line in
+    expect "shared capture ignored format" (magic = Some "octra-ledger-image-refs");
     let target = Filename.concat root "captured" in
     ignore (Archive.run root (fun _ ->
       expect_busy (run (Capture.build source ~target))) |> get);

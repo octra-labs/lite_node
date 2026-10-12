@@ -36,6 +36,7 @@ type deps = {
 }
 
 let node_backend
+    ?compute
     ?(private_artifacts = fun _ -> [])
     ?(key_artifacts = fun _ -> [])
     ~program_trust
@@ -68,12 +69,14 @@ let node_backend
             begin
               match
                 Octra_core.Rule_graph.object_cost rules ~epoch:epoch_id,
-                Octra_core.Rule_graph.owner_migration rules ~epoch:epoch_id
+                Octra_core.Rule_graph.owner_migration rules ~epoch:epoch_id,
+                Octra_core.Rule_graph.cipher_migration rules ~epoch:epoch_id
               with
-              | Error fault, _
-              | _, Error fault ->
+              | Error fault, _, _
+              | _, Error fault, _
+              | _, _, Error fault ->
                 Lwt.return_error (Octra_core.Rule_graph.fault_message fault)
-              | Ok object_cost_mode, Ok owner_migration_mode ->
+              | Ok object_cost_mode, Ok owner_migration_mode, Ok cipher_mode ->
                 let object_cost =
                   object_cost_mode = Octra_core.Rule_graph.Active in
                 begin
@@ -100,6 +103,7 @@ let node_backend
                         | Error error -> Lwt.return_error error
                         | Ok fold_ctx ->
                       Octra_core.State_preview.with_preview
+                        ?compute
                         ~base_store:store
                         ~base_ledger:ledger
                         ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
@@ -139,6 +143,7 @@ let node_backend
                     ~ledger:backend.Octra_core.Epoch_exec.ledger
                     ~epoch_id
                     ~owner_migration_mode
+                    ~cipher_mode
                     ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
                     ~math:fold_ctx.math
                     ~field_policy:

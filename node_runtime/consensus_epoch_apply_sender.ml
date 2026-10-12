@@ -237,6 +237,8 @@ let live_tx_sink deps =
     } : tx_sink_effects)
 
 let save_rejections ~epoch_id ~ts ~processed_hashes effects rejections =
+  let rejections = List.filter (fun (item : Octra_core.Tx_outcome.rejection) ->
+    not item.charged) rejections in
   let prior = !processed_hashes in
   let hashes =
     List.map

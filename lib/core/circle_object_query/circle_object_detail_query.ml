@@ -101,24 +101,24 @@ let load_detail_from_storage_tbl storage_tbl object_ref =
     last_transition;
   }
 
-let load_member_detail store circle_id object_ref member_ref =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_member_detail ?snapshot store circle_id object_ref member_ref =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)
   | Ok storage_tbl ->
     Lwt.return (Ok (load_member_detail_from_storage_tbl storage_tbl object_ref member_ref))
 
-let load_member_details store circle_id object_ref =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_member_details ?snapshot store circle_id object_ref =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)
   | Ok storage_tbl ->
     Lwt.return (Ok (load_member_details_from_storage_tbl storage_tbl object_ref))
 
-let load_detail store circle_id object_ref =
-  let* storage_result = Store_irmin.load_circle_stable_storage store circle_id in
+let load_detail ?snapshot store circle_id object_ref =
+  let* storage_result = Store_irmin.load_circle_stable_storage ?snapshot store circle_id in
   match storage_result with
   | Error message ->
     Lwt.return (Error message)

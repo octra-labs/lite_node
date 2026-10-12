@@ -55,6 +55,17 @@ let can_bound_migrate status =
 let needs_history_migration status =
   status.route = History_migration
 
+let history_route ~active status =
+  needs_history_migration status
+  || (active && status.cipher_class = V3 && status.key_class = Missing)
+
+let format_name = function
+  | Empty -> "empty"
+  | V3 -> "proven"
+  | Legacy_hfhe -> "historical"
+  | Foreign -> "foreign"
+  | Malformed _ -> "malformed"
+
 let classify_cipher ?(cap = true) = function
   | "" | "0" -> Empty
   | cipher when not (Crypto.FheBalance.is_fhe_cipher cipher) -> Foreign

@@ -746,6 +746,20 @@ let salt_for_first left right chunk =
   in
   loop 0
 
+let test_cert_hit trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let query = Cache.{ path = "current"; trust; trust_hash = trust_hash trust } in
+  let bytes = Cache.{ raw = "bytes"; digest = sha "bytes" } in
+  let state, _ = Cache.delta Cache.empty (Ask (1L, query, 0.)) in
+  let state, _ = Cache.delta state (Read (1L, 0L, 1., Ok bytes)) in
+  let state, _ = Cache.delta state (Checked (1L, 0L, 2., Cache.measure (Ok certificate))) in
+  let state, _ = Cache.delta state (Ask (2L, query, 3.)) in
+  let _, effects = Cache.delta state (Read (2L, 0L, 4., Ok bytes)) in
+  match effects with
+  | [Cache.Reply (2L, Ok loaded)]
+    when loaded.raw = bytes.raw && loaded.certificate == certificate -> ()
+  | _ -> fail "verified certificate was decoded again"
+
 let test_cert_model trust certificate =
   let module Cache = Octra_node_runtime.Sync_cert in
   let query = Cache.{ path = "first"; trust; trust_hash = trust_hash trust } in
@@ -753,7 +767,7 @@ let test_cert_model trust certificate =
   let state, effects = Cache.delta Cache.empty (Ask (1L, query, 0.)) in
   begin match effects with
   | [Cache.Read_file job] when job.id = 1L && job.generation = 0L -> ()
-  | _ -> fail "certificate read admission differs"
+  | _ -> fail "certificate read selection differs"
   end;
   let same, duplicate = Cache.delta state (Ask (1L, query, 0.)) in
   if Cache.stats same <> Cache.stats state || duplicate <> [] then
@@ -784,13 +798,14 @@ let test_cert_model trust certificate =
   | _ -> fail "certificate verification was skipped"
   end;
   let stopped, _ = Cache.delta checked Stop in
-  let stopped, effects = Cache.delta stopped (Checked (1L, 0L, 2., Ok certificate)) in
+  let stopped, effects = Cache.delta stopped (Checked (1L, 0L, 2., Cache.measure (Ok certificate))) in
   if effects <> [] || (Cache.stats stopped).cached <> 0 then fail "old verification entered stopped actor";
   let checked, _ = Cache.delta checked (Cancel 1L) in
-  let checked, effects = Cache.delta checked (Checked (1L, 0L, 2., Ok certificate)) in
+  let checked, effects = Cache.delta checked (Checked (1L, 0L, 2., Cache.measure (Ok certificate))) in
   if effects <> [] || (Cache.stats checked).cached <> 0 then fail "cancelled verification was published";
   let checking, _ = Cache.delta state (Read (1L, 0L, 1., Ok bytes)) in
-  let checked, effects = Cache.delta checking (Checked (1L, 0L, Cache.lifetime +. 1., Ok certificate)) in
+  let checked, effects = Cache.delta checking
+    (Checked (1L, 0L, Cache.lifetime +. 1., Cache.measure (Ok certificate))) in
   begin match effects with
   | [Cache.Reply (1L, Error Cache.Expired)] -> ()
   | _ -> fail "late verification did not expire its waiter"
@@ -799,7 +814,7 @@ let test_cert_model trust certificate =
   let checked, _ = Cache.delta checked (Ask (2L, query, Cache.lifetime +. 2.)) in
   let _, effects = Cache.delta checked (Read (2L, 0L, Cache.lifetime +. 3., Ok bytes)) in
   begin match effects with
-  | [Cache.Parse (_, "bytes")] -> ()
+  | [Cache.Reply (2L, Ok loaded)] when loaded.certificate == certificate -> ()
   | _ -> fail "late valid verification was repeated"
   end
 
@@ -875,7 +890,7 @@ let test_cert_cache trust certificate =
     let raw = string_of_int index in
     let state, _ = Cache.delta state (Ask (id, query, 0.)) in
     let state, _ = Cache.delta state (Read (id, 0L, 1., Ok Cache.{ raw; digest = sha raw })) in
-    let state, _ = Cache.delta state (Checked (id, 0L, 2., Ok certificate)) in
+    let state, _ = Cache.delta state (Checked (id, 0L, 2., Cache.measure (Ok certificate))) in
     if (Cache.stats state).cached > Cache.cache_capacity then fail "certificate cache exceeds capacity";
     state
   in
@@ -887,6 +902,58 @@ let test_cert_cache trust certificate =
   | [Cache.Verify (_, "1")] -> ()
   | _ -> fail "evicted certificate was reused"
   end
+
+let test_cert_bytes trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let query = Cache.{ path = "current"; trust; trust_hash = trust_hash trust } in
+  let save state index value =
+    let id = Int64.of_int index in
+    let raw = string_of_int index in
+    let bytes = Cache.{ raw; digest = sha raw } in
+    let state, _ = Cache.delta state (Ask (id, query, 0.)) in
+    let state, _ = Cache.delta state (Read (id, 0L, 1., Ok bytes)) in
+    let state, effects = Cache.delta state (Checked (id, 0L, 2., value)) in
+    if (Cache.stats state).bytes > Cache.cache_bytes then
+      fail "certificate cache exceeds memory limit";
+    begin match effects with
+    | [Cache.Reply (_, Ok _)] when Result.is_ok value.Cache.verdict -> ()
+    | [Cache.Reply (_, Error (Cache.Invalid _))] when Result.is_error value.verdict -> ()
+    | _ -> fail "memory limit changed certificate reply"
+    end;
+    state
+  in
+  let sized bytes = Cache.measure (Ok Manifest.{ certificate with
+    authority = Finalized (String.make bytes 'x') }) in
+  let large = sized (Cache.cache_bytes / 3) in
+  let state = List.fold_left (fun state id -> save state id large) Cache.empty [1; 2; 3] in
+  if (Cache.stats state).cached <> 2 || (Cache.stats state).bytes <> 2 * large.size then
+    fail "large certificates were not evicted by memory";
+  let state, _ = Cache.delta state (Ask (4L, query, 3.)) in
+  let state, effects = Cache.delta state (Read (4L, 0L, 4., Ok Cache.{ raw = "2"; digest = sha "2" })) in
+  begin match effects with
+  | [Cache.Reply (4L, Ok _)] -> ()
+  | _ -> fail "recent large certificate was discarded"
+  end;
+  let state = save state 5 large in
+  let state, _ = Cache.delta state (Ask (6L, query, 3.)) in
+  let state, effects = Cache.delta state (Read (6L, 0L, 4., Ok Cache.{ raw = "3"; digest = sha "3" })) in
+  begin match effects with
+  | [Cache.Verify (_, "3")] -> ()
+  | _ -> fail "cache hit did not update eviction order"
+  end;
+  let state, _ = Cache.delta state (Checked (6L, 0L, 5., Cache.measure (Ok certificate))) in
+  let prior = Cache.stats state in
+  let oversized = sized Cache.cache_bytes in
+  if oversized.size <= Cache.cache_bytes then fail "large certificate memory was undercounted";
+  let state = save state 7 oversized in
+  if (Cache.stats state).bytes <> prior.bytes || (Cache.stats state).cached <> prior.cached then
+    fail "oversized certificate entered cache";
+  let denied = Cache.measure (Error (String.make Cache.cache_bytes 'x')) in
+  let state = save state 8 denied in
+  if (Cache.stats state).bytes <> prior.bytes then fail "oversized error entered cache";
+  let stopped, _ = Cache.delta state Stop in
+  if (Cache.stats stopped).bytes <> 0 || (Cache.stats stopped).cached <> 0 then
+    fail "stopped cache retained certificates"
 
 let test_http_cert root wallets certificate validators =
   let path = Filename.concat root "http-certificate.json" in
@@ -900,7 +967,7 @@ let test_http_cert root wallets certificate validators =
   let exporter = member (List.hd wallets) in
   let write certificate = Manifest.write_json path (Manifest.certificate_json certificate) in
   let snapshot = Int64.to_int certificate.checkpoint.epoch in
-  let read ?(chain = chain_id) ?(epoch = snapshot + 1_061) status =
+  let read ?(chain = chain_id) ?(epoch = snapshot + 1_061) ?(expected = certificate) status =
     Http.handle_manifest ~data_dir:root ~chain_id:chain ~config_hash
       ~validator_set:validators ~current_epoch:(ref epoch) >>= fun (response, body) ->
     Cohttp_lwt.Body.to_string body >|= fun raw ->
@@ -908,7 +975,7 @@ let test_http_cert root wallets certificate validators =
       fail (Printf.sprintf "certificate HTTP status differs lag = %d expected = %d actual = %d"
         (epoch - snapshot - 1) (Cohttp.Code.code_of_status status)
         (Cohttp.Code.code_of_status (Cohttp.Response.status response)));
-    if status = `OK && Manifest.parse_certificate_string raw <> Ok certificate then
+    if status = `OK && Manifest.parse_certificate_string raw <> Ok expected then
       fail "certificate HTTP bytes differ"
   in
   let read_lag lag =
@@ -978,6 +1045,14 @@ let test_http_cert root wallets certificate validators =
     read `Service_unavailable >>= fun () ->
     let _, _, _, _, expired = sample ~valid_for:(-1L) wallets "payload" "expired" in
     write expired;
+    read `Service_unavailable >>= fun () ->
+    write certificate;
+    read `OK >>= fun () ->
+    let _, _, _, _, brief = sample ~valid_for:5L wallets "payload" "brief" in
+    write brief;
+    read ~expected:brief `OK >>= fun () ->
+    let until = Int64.to_float brief.checkpoint.valid_until +. 1. in
+    Lwt_unix.sleep (max 0. (until -. Unix.gettimeofday ())) >>= fun () ->
     read `Service_unavailable >>= fun () ->
     write certificate;
     read `OK >>= fun () ->
@@ -1066,8 +1141,10 @@ let run () =
   let trust = Octra_node_runtime.Sync_cert.{
     validators; exporters; config = config_hash; chain = certificate.checkpoint.chain_id;
   } in
+  test_cert_hit trust certificate;
   test_cert_model trust certificate;
   test_cert_cache trust certificate;
+  test_cert_bytes trust certificate;
   test_cert_actor trust certificate >>= fun () ->
   test_cert_cancel trust certificate >>= fun () ->
   test_verify_cancel trust certificate >>= fun () ->

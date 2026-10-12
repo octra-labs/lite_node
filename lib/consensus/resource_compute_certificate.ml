@@ -11,8 +11,14 @@ let max_selected = 64
 let max_votes = 256
 let max_request_bytes = 1_048_576
 let max_response_bytes = 1_048_576
+let max_memory_bytes = 2_147_483_648
 
 type request = {
+  unit_price : int64 option;
+  fee_cap : int64 option;
+  memory_bytes : int option;
+  guest_bytes : int option;
+  fuel_limit : int option;
   chain_id : string;
   epoch_id : int64;
   expires_epoch : int64;
@@ -83,17 +89,35 @@ let hash32 value =
 let signature64 value =
   String.length value = 64
 
-let bounded_non_empty limit value =
+let non_empty limit value =
   let length = String.length value in
   length > 0 && length <= limit
 
+let fee_valid ~fuel ~price ~cap =
+  match price, cap with
+  | None, None -> true
+  | Some price, Some cap ->
+    price > 0L && cap > 0L && (match fuel with
+      | Some fuel when fuel > 0 ->
+        Z.leq (Z.mul (Z.of_int64 price) (Z.of_int fuel)) (Z.of_int64 cap)
+      | _ -> false)
+  | _ -> false
+
 let request_shape (request : request) =
-  bounded_non_empty max_chain_id_bytes request.chain_id
+  fee_valid ~fuel:request.fuel_limit ~price:request.unit_price ~cap:request.fee_cap
+  && (match request.unit_price with None -> true | Some _ -> Option.is_some request.memory_bytes)
+  && (match request.memory_bytes with None -> true | Some bytes ->
+    Option.is_some request.guest_bytes && bytes > 0 && bytes <= max_memory_bytes)
+  && (match request.guest_bytes with None -> true | Some bytes ->
+    Option.is_some request.fuel_limit && bytes >= 65_536 && bytes <= 67_108_864
+    && bytes mod 65_536 = 0)
+  && (match request.fuel_limit with None -> true | Some fuel -> fuel > 0 && fuel <= 2_000_000_000)
+  && non_empty max_chain_id_bytes request.chain_id
   && request.epoch_id >= 0L
   && request.expires_epoch >= request.epoch_id
   && hash32 request.validator_set_root
   && hash32 request.selection_root
-  && bounded_non_empty max_circle_id_bytes request.circle_id
+  && non_empty max_circle_id_bytes request.circle_id
   && hash32 request.state_root
   && request.model_epoch >= 0L
   && hash32 request.model_state_root
@@ -101,7 +125,7 @@ let request_shape (request : request) =
   && hash32 request.model_root
   && hash32 request.program_root
   && hash32 request.executor_root
-  && bounded_non_empty max_node_id_bytes request.caller
+  && non_empty max_node_id_bytes request.caller
   && hash32 request.session_id
   && request.sequence >= 0L
   && hash32 request.input_hash
@@ -110,7 +134,7 @@ let request_shape (request : request) =
   && request.max_output_bytes > 0
   && request.max_output_bytes <= max_response_bytes
 
-let request_id request =
+let request_body request =
   if not (request_shape request) then
     invalid_arg "resource compute request";
   Octra_net.Hash_domain.hash_encoded "octra:resource_compute_request" (fun buf ->
@@ -134,9 +158,37 @@ let request_id request =
     Octra_net.Oce1.put_u32_int buf request.input_bytes;
     Octra_net.Oce1.put_u32_int buf request.max_output_bytes)
 
+let request_id request =
+  let digest = request_body request in
+  let digest = match request.fuel_limit with
+  | None -> digest
+  | Some fuel ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_request_fuel" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u32_int buf fuel) in
+  let digest = match request.guest_bytes with
+  | None -> digest
+  | Some bytes ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_request_guest" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u32_int buf bytes) in
+  let digest = match request.memory_bytes with
+  | None -> digest
+  | Some bytes ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_request_memory" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u32_int buf bytes) in
+  match request.unit_price, request.fee_cap with
+  | Some price, Some cap ->
+    Octra_net.Hash_domain.hash_encoded "octra:compute_request_fee" (fun buf ->
+      Octra_net.Oce1.put_hash32 buf digest;
+      Octra_net.Oce1.put_u64 buf price;
+      Octra_net.Oce1.put_u64 buf cap)
+  | _ -> digest
+
 let vote_shape (vote : vote) =
   hash32 vote.request_id
-  && bounded_non_empty max_node_id_bytes vote.node_id
+  && non_empty max_node_id_bytes vote.node_id
   && hash32 vote.output_hash
   && hash32 vote.trace_root
   && vote.output_bytes > 0
@@ -144,6 +196,11 @@ let vote_shape (vote : vote) =
   && vote.steps > 0L
   && vote.operations > 0L
   && signature64 vote.signature
+
+let vote_budget (request : request) (vote : vote) =
+  match request.fuel_limit with
+  | None -> true
+  | Some limit -> vote.steps > 0L && vote.steps <= Int64.of_int limit
 
 let vote_sign_bytes vote =
   if not (vote_shape vote) then
@@ -290,7 +347,7 @@ let decide
       selected = []
       || List.length selected > max_selected
       || NodeMap.cardinal selected_set <> List.length selected
-      || NodeMap.exists (fun node_id () -> not (bounded_non_empty max_node_id_bytes node_id)) selected_set
+      || NodeMap.exists (fun node_id () -> not (non_empty max_node_id_bytes node_id)) selected_set
     then
       Rejected Selection_malformed
     else if
@@ -307,6 +364,7 @@ let decide
         List.filter
           (fun vote ->
             vote_shape vote
+            && vote_budget request vote
             && vote.request_id = expected_request_id
             && vote.output_bytes <= request.max_output_bytes
             && NodeMap.mem vote.node_id selected_set

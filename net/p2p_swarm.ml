@@ -58,6 +58,10 @@ type t = {
   mutable on_message : (P2p_conn.t -> P2p_frame.frame -> unit Lwt.t);
   mutable on_peer : (P2p_conn.t -> unit);
   mutable running : bool;
+  mutable started : bool;
+  mutable generation : unit ref;
+  mutable listener : unit Lwt.t option;
+  mutable pending : (unit ref * unit Lwt.t) list;
 }
 
 let max_observer_peers = 8
@@ -93,6 +97,10 @@ let create config =
     on_message = (fun _ _ -> Lwt.return_unit);
     on_peer = (fun _ -> ());
     running = false;
+    started = false;
+    generation = ref ();
+    listener = None;
+    pending = [];
   }
 
 let config_hash t = t.active_hash
@@ -329,9 +337,10 @@ let set_profile t hello =
       offered = [];
     }
 
-let add_peer t (conn : P2p_conn.t) hello =
+let add_peer t ~generation (conn : P2p_conn.t) hello =
   let peer_id = conn.peer_id in
-  if peer_id = t.config.node_id then begin
+  if not t.running || generation != t.generation
+      || peer_id = t.config.node_id then begin
     Lwt.async (fun () -> P2p_conn.close conn);
     false
   end
@@ -382,18 +391,24 @@ let remove_peer t peer_id =
      Hashtbl.remove t.profiles peer_id
    | None -> ())
 
-let send_with_timeout conn frame timeout_s =
+let send_deadline = 2.0
+let broadcast_deadline = 2.0 *. send_deadline
+
+let enqueue_with_timeout conn frame timeout_s =
   Lwt.catch
     (fun () ->
       Lwt.pick [
-        P2p_conn.send conn frame;
+        P2p_conn.enqueue conn frame;
         (let open Lwt.Syntax in
          let* () = Lwt_unix.sleep timeout_s in
-         Lwt.return_unit)
+         Lwt.return_false)
       ])
     (function
       | Lwt.Canceled as error -> Lwt.fail error
-      | _ -> Lwt.return_unit)
+      | _ -> Lwt.return_false)
+
+let send_with_timeout conn frame timeout_s =
+  Lwt.map (fun _ -> ()) (enqueue_with_timeout conn frame timeout_s)
 
 let connected_peers t =
   let conns = Hashtbl.fold (fun _ c acc -> c :: acc) t.peers [] in
@@ -413,19 +428,23 @@ let peer_diagnostics t =
     ~relayed_records:(relayed_record_stats t)
     ()
 
-let broadcast t (frame : P2p_frame.frame) =
-  connected_peers t
-  |> Lwt_list.iter_p (fun conn -> send_with_timeout conn frame 2.0)
+let broadcast ?(required = false) t (frame : P2p_frame.frame) =
+  let open Lwt.Syntax in
+  let* sent = connected_peers t
+    |> Lwt_list.map_p (fun conn -> enqueue_with_timeout conn frame send_deadline) in
+  if required && not (List.exists Fun.id sent) then
+    Lwt.fail_with "broadcast queues unavailable"
+  else Lwt.return_unit
 
 let broadcast_except t ~except (frame : P2p_frame.frame) =
   connected_peers t
   |> List.filter (fun conn -> conn.P2p_conn.peer_id <> except)
-  |> Lwt_list.iter_p (fun conn -> send_with_timeout conn frame 2.0)
+  |> Lwt_list.iter_p (fun conn -> send_with_timeout conn frame send_deadline)
 
 let send_to t ~peer_id (frame : P2p_frame.frame) =
   match Hashtbl.find_opt t.peers peer_id with
   | Some conn when P2p_conn.is_connected conn ->
-    send_with_timeout conn frame 2.0
+    send_with_timeout conn frame send_deadline
   | _ -> Lwt.return_unit
 
 let make_my_hello t =
@@ -527,8 +546,25 @@ let accept_record t r =
       | P2p_peer_registry.Refreshed -> Ok false
       | P2p_peer_registry.Rejected reason -> Error reason
 
-let dial t host port =
+let close_socket fd =
+  Lwt.catch
+    (fun () ->
+      if Lwt_unix.state fd = Lwt_unix.Closed then Lwt.return_unit
+      else Lwt_unix.close fd)
+    (fun _ -> Lwt.return_unit)
+
+let track t run =
+  let token = ref () in
+  let task = Lwt.finalize run (fun () ->
+    t.pending <- List.filter (fun (key, _) -> key != token) t.pending;
+    Lwt.return_unit) in
+  if Lwt.is_sleeping task then
+    t.pending <- (token, Lwt.map (fun _ -> ()) task) :: t.pending;
+  task
+
+let dial t host port = track t (fun () ->
   let open Lwt.Syntax in
+  let generation = t.generation in
   if validator_count t >= t.config.max_peers then
     Lwt.return_none
   else begin
@@ -570,7 +606,7 @@ let dial t host port =
               peer_id;
             let* () = P2p_conn.close conn in
             Lwt.return_none
-          end else if add_peer t conn peer_hello then begin
+          end else if add_peer t ~generation conn peer_hello then begin
             log_node t.config.node_addr
               "event = connected peer = %s addr = %s"
               peer_id addr_str;
@@ -584,14 +620,17 @@ let dial t host port =
             Lwt.return existing
           end)
     (fun exn ->
-      (match !fd_ref with
-       | Some fd -> (try Lwt_unix.close fd |> ignore with _ -> ())
-       | None -> ());
-      err_node t.config.node_addr
-        "event = dial_exception host = %s port = %d error = %s"
-        host port (Printexc.to_string exn);
-      Lwt.return_none)
-  end
+      let* () = match !fd_ref with
+        | Some fd -> close_socket fd
+        | None -> Lwt.return_unit in
+      match exn with
+      | Lwt.Canceled -> Lwt.fail exn
+      | _ ->
+        err_node t.config.node_addr
+          "event = dial_exception host = %s port = %d error = %s"
+          host port (Printexc.to_string exn);
+        Lwt.return_none)
+  end)
 
 let maybe_dial_record_at t ~now r =
   let endpoint = P2p_peer_record.endpoint r in
@@ -617,7 +656,7 @@ let maybe_dial_record_at t ~now r =
         Hashtbl.replace t.dialing endpoint ();
         Hashtbl.replace t.record_dialing endpoint ();
         Lwt.async (fun () ->
-          Lwt.finalize
+          Lwt.catch (fun () -> Lwt.finalize
             (fun () ->
               let open Lwt.Syntax in
               let* _ = dial t host port in
@@ -626,6 +665,7 @@ let maybe_dial_record_at t ~now r =
               Hashtbl.remove t.dialing endpoint;
               Hashtbl.remove t.record_dialing endpoint;
               Lwt.return_unit))
+            (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error))
 
 let maybe_dial_record t r =
   maybe_dial_record_at t ~now:(Unix.gettimeofday ()) r
@@ -721,8 +761,10 @@ let bootstrap_endpoints t =
 
 let accept t fd addr =
   let open Lwt.Syntax in
-  Lwt.async (fun () ->
-    Lwt.catch
+  let generation = t.generation in
+  let owned = ref true in
+  Lwt.async (fun () -> track t (fun () -> Lwt.finalize
+    (fun () -> Lwt.catch
       (fun () ->
         let key = P2p_peer_guard.unix_key addr in
         match P2p_peer_guard.admit_conn t.peer_guard
@@ -770,7 +812,8 @@ let accept t fd addr =
               peer_id;
             let* () = P2p_conn.close conn in
             Lwt.return_unit
-          end else if add_peer t conn peer_hello then begin
+          end else if add_peer t ~generation conn peer_hello then begin
+            owned := false;
             Lwt.async (fun () -> P2p_conn.start conn ~on_message:t.on_message);
             Lwt.async (fun () -> exchange_peers t conn);
             Lwt.async (fun () -> send_profile t conn);
@@ -780,26 +823,102 @@ let accept t fd addr =
             Lwt.return_unit
           end)
       (fun _exn ->
-        (try Lwt_unix.close fd |> ignore with _ -> ());
         Lwt.return_unit))
+    (fun () -> if !owned then close_socket fd else Lwt.return_unit)))
 
-let listen t =
+let listen ?(take = fun fd -> Lwt_unix.accept ~cloexec:true fd)
+    ?(sleep = Lwt_unix.sleep) ?socket t =
   let open Lwt.Syntax in
-  let fd = Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
-  Lwt_unix.setsockopt fd Lwt_unix.SO_REUSEADDR true;
-  let* () = Lwt_unix.bind fd (Unix.ADDR_INET (Unix.inet_addr_any, t.config.listen_port)) in
-  Lwt_unix.listen fd 32;
-  let rec accept_loop () =
+  if Option.fold ~none:false ~some:Lwt.is_sleeping t.listener then
+    invalid_arg "p2p listener is active";
+  let fd = match socket with
+    | Some fd -> fd
+    | None -> Lwt_unix.socket Lwt_unix.PF_INET Lwt_unix.SOCK_STREAM 0 in
+  let rec accept_loop attempt =
     if not t.running then Lwt.return_unit
     else
-      let* (client_fd, client_addr) = Lwt_unix.accept fd in
-      accept t client_fd client_addr;
-      let* () = Lwt.pause () in
-      accept_loop ()
+      let* result = Lwt.catch
+        (fun () -> Lwt.map Result.ok (take fd))
+        (fun error -> Lwt.return_error error) in
+      match result with
+      | Ok (client_fd, client_addr) ->
+        if not t.running then close_socket client_fd
+        else begin
+          let* () = Lwt.catch
+            (fun () ->
+              if attempt > 0 then
+                log_node t.config.node_addr "event = accept status = resumed";
+              accept t client_fd client_addr;
+              Lwt.return_unit)
+            (fun error ->
+              let* () = close_socket client_fd in
+              Lwt.fail error) in
+          let* () = Lwt.pause () in
+          accept_loop 0
+        end
+      | Error error ->
+        match P2p_conn.accept_delay attempt error with
+        | None -> Lwt.fail error
+        | Some delay ->
+          if attempt = 0 then
+            err_node t.config.node_addr
+              "event = accept status = waiting reason = %s"
+              (Printexc.to_string error);
+          let* () = sleep delay in
+          accept_loop (min 7 (attempt + 1))
   in
-  accept_loop ()
+  let task = Lwt.catch
+    (fun () -> Lwt.finalize
+      (fun () ->
+        Lwt_unix.set_close_on_exec fd;
+        Lwt_unix.setsockopt fd Lwt_unix.SO_REUSEADDR true;
+        let* () = Lwt_unix.bind fd
+          (Unix.ADDR_INET (Unix.inet_addr_any, t.config.listen_port)) in
+        Lwt_unix.listen fd 32;
+        accept_loop 0)
+      (fun () -> close_socket fd))
+    (function
+      | Lwt.Canceled when not t.running -> Lwt.return_unit
+      | error -> Lwt.fail error) in
+  t.listener <- Some task;
+  task
 
-let dial_bootstrap t =
+let stop t =
+  let open Lwt.Syntax in
+  t.running <- false;
+  t.generation <- ref ();
+  let listener = t.listener in
+  t.listener <- None;
+  let* () = match listener with
+    | None -> Lwt.return_unit
+    | Some task ->
+      Lwt.cancel task;
+      Lwt.catch (fun () -> task) (fun _ -> Lwt.return_unit) in
+  let pending = List.map snd t.pending in
+  List.iter Lwt.cancel pending;
+  let* () = Lwt_list.iter_p (fun task ->
+    Lwt.catch (fun () -> task) (fun _ -> Lwt.return_unit)) pending in
+  let conns = Hashtbl.fold (fun _ conn rest -> conn :: rest) t.peers [] in
+  Lwt_list.iter_p P2p_conn.close conns
+
+let run_tasks ?(stop = fun () -> Lwt.return_unit) listener services =
+  let open Lwt.Syntax in
+  let tasks = listener :: services in
+  let failed, report = Lwt.wait () in
+  let watch task = Lwt.catch
+    (fun () -> task)
+    (fun error ->
+      if Lwt.is_sleeping failed then Lwt.wakeup_later_exn report error;
+      Lwt.return_unit) in
+  let watched = List.map watch tasks in
+  Lwt.finalize
+    (fun () -> Lwt.pick [listener; Lwt.join watched; failed])
+    (fun () ->
+      let* () = stop () in
+      List.iter Lwt.cancel tasks;
+      Lwt.join watched)
+
+let dial_bootstrap t = track t (fun () ->
   let open Lwt.Syntax in
   let endpoints = bootstrap_endpoints t in
   let target = List.length endpoints in
@@ -810,27 +929,25 @@ let dial_bootstrap t =
     else begin
       Hashtbl.replace t.dialing addr ();
       let rec retry delay =
-        if not t.running then begin
-          Hashtbl.remove t.dialing addr;
-          Lwt.return_unit
-        end else if validator_count t >= target then begin
-          Hashtbl.remove t.dialing addr;
+        if not t.running || validator_count t >= target then begin
           Lwt.return_unit
         end else
           let* result = dial t endpoint.host endpoint.port in
           match result with
           | Some _conn ->
-            Hashtbl.remove t.dialing addr;
             Lwt.return_unit
+          | None when not t.running -> Lwt.return_unit
           | None ->
             let next_delay = min 60.0 (delay *. 2.0) in
             let* () = Lwt_unix.sleep delay in
             retry next_delay
       in
-      retry 1.0
+      Lwt.finalize (fun () -> retry 1.0) (fun () ->
+        Hashtbl.remove t.dialing addr;
+        Lwt.return_unit)
     end
   in
-  Lwt_list.iter_p dial_one endpoints
+  Lwt_list.iter_p dial_one endpoints)
 
 let reconnect_loop t =
   let open Lwt.Syntax in
@@ -846,7 +963,9 @@ let reconnect_loop t =
           Hashtbl.remove t.profiles id)
         dead;
       if validator_count t < List.length (bootstrap_endpoints t) then
-        Lwt.async (fun () -> dial_bootstrap t);
+        Lwt.async (fun () -> Lwt.catch
+          (fun () -> dial_bootstrap t)
+          (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error));
       retry_records t;
       let* () = Lwt_unix.sleep 10.0 in
       loop ()
@@ -866,14 +985,18 @@ let peer_exchange_loop t =
   loop ()
 
 let start t ~on_message =
+  if t.started then invalid_arg "p2p swarm is active";
+  t.started <- true;
   t.running <- true;
   t.on_message <- handle_frame t on_message;
-  Lwt.join [
-    listen t;
-    dial_bootstrap t;
-    reconnect_loop t;
-    peer_exchange_loop t;
-  ]
+  let listener = Lwt.apply listen t in
+  let services = List.map (fun run -> Lwt.apply run t)
+    [dial_bootstrap; reconnect_loop; peer_exchange_loop] in
+  Lwt.finalize
+    (fun () -> run_tasks ~stop:(fun () -> stop t) listener services)
+    (fun () ->
+      t.started <- false;
+      Lwt.return_unit)
 
 let switch_profile t ~epoch =
   match List.find_opt (fun profile -> Int64.equal epoch profile.epoch)
@@ -922,8 +1045,3 @@ let switch_profile t ~epoch =
         (Hashtbl.length t.peers)
         (List.length removed);
       Lwt.return_ok profile.profile_hash
-
-let stop t =
-  t.running <- false;
-  let conns = Hashtbl.fold (fun _ c acc -> c :: acc) t.peers [] in
-  Lwt_list.iter_p P2p_conn.close conns

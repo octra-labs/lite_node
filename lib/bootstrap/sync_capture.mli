@@ -17,10 +17,15 @@ type report = {
   bytes : int64;
 }
 
+val format : chain_id:string -> epoch:int -> Octra_core.Ledger_image.format
+
 val stage_owned :
+  ?format:Octra_core.Ledger_image.format ->
   Sync_archive.t -> source -> target:string -> (report, string) result Lwt.t
 
 val build_owned :
+  ?format:Octra_core.Ledger_image.format ->
   Sync_archive.t -> source -> target:string -> (report, string) result Lwt.t
 
-val build : source -> target:string -> (report, string) result Lwt.t
+val build : ?format:Octra_core.Ledger_image.format ->
+  source -> target:string -> (report, string) result Lwt.t

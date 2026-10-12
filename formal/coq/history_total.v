@@ -321,3 +321,46 @@ Proof.
 Qed.
 
 End Admission.
+
+Module Cipher.
+Open Scope Z_scope.
+
+Definition limit : Z := 2 ^ 64.
+Definition field : Z := 2 ^ 127 - 1.
+
+Lemma range_in_field : forall value,
+  0 <= value < limit -> 0 <= value < field.
+Proof.
+  intros value range. unfold limit, field in *. lia.
+Qed.
+
+Theorem equal_amount : forall old fresh residue,
+  0 <= old < field -> 0 <= fresh < limit ->
+  old mod field = residue mod field ->
+  fresh mod field = residue mod field -> old = fresh.
+Proof.
+  intros old fresh residue old_range new_range old_link new_link.
+  rewrite Z.mod_small in old_link by exact old_range.
+  rewrite Z.mod_small in new_link by (apply range_in_field; exact new_range).
+  congruence.
+Qed.
+
+Theorem field_alias_refused : forall value multiple,
+  0 <= value < limit -> multiple <> 0 ->
+  ~ (0 <= value + multiple * field < limit).
+Proof.
+  intros value multiple range differs alias.
+  unfold limit, field in *. nia.
+Qed.
+
+Theorem range_required : exists old fresh,
+  0 <= old < field /\ old mod field = fresh mod field /\ old <> fresh.
+Proof.
+  exists 1, (field + 1). unfold field. vm_compute. repeat split; congruence.
+Qed.
+
+End Cipher.
+
+Print Assumptions Cipher.equal_amount.
+Print Assumptions Cipher.field_alias_refused.
+Print Assumptions Cipher.range_required.

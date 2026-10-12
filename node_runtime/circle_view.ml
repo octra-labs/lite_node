@@ -689,9 +689,6 @@ let asset_meta_sensitive_fields meta =
     "padding_class", opt_string meta.padding_class;
   ]
 
-let asset_sensitive_fields meta delivery_key_fields state_descriptor_fields =
-  asset_meta_sensitive_fields meta @ delivery_key_fields @ state_descriptor_fields
-
 let asset_plaintext
     ~circle_id
     ~canonical_path
@@ -725,6 +722,11 @@ let asset_ciphertext
     ~delivery_key_fields
     ~state_descriptor_fields
     ~reveal_sensitive_fields =
+  let meta_fields, extra_fields =
+    if reveal_sensitive_fields then
+      asset_meta_sensitive_fields meta, delivery_key_fields @ state_descriptor_fields
+    else
+      [], [] in
   let address_fields, response_fields =
     match meta.metadata_mode with
     | Octra_core.Circles.Metadata_reveal ->
@@ -741,22 +743,17 @@ let asset_ciphertext
          "body_mode", `String (Octra_core.Circles.string_of_resource_mode meta.body_mode);
          "locator_mode", `String (Octra_core.Circles.string_of_locator_mode meta.locator_mode);
          "metadata_mode", `String (Octra_core.Circles.string_of_metadata_mode meta.metadata_mode);
-       ] @ asset_meta_sensitive_fields meta @ [
+       ] @ meta_fields @ [
          "browser_mode", `String (Octra_core.Circles.string_of_browser_mode browser_mode);
          "resource_mode", `String (Octra_core.Circles.string_of_resource_mode resource_mode);
-       ] @ delivery_key_fields @ state_descriptor_fields)
+       ] @ extra_fields)
     | Octra_core.Circles.Metadata_opaque ->
-      let opaque_sensitive_fields =
-        if reveal_sensitive_fields then
-          asset_sensitive_fields meta delivery_key_fields state_descriptor_fields
-        else
-          [] in
       ([],
        [
          "content_type", `String meta.content_type;
          "encoding", `String meta.encoding;
          "metadata_mode", `String (Octra_core.Circles.string_of_metadata_mode meta.metadata_mode);
-       ] @ opaque_sensitive_fields)
+       ] @ meta_fields @ extra_fields)
   in
   `Assoc
     ([

@@ -166,7 +166,12 @@ let remove_stage archive target =
       remove_tree (target ^ ".next")
   with _ -> ()
 
-let stage_owned archive source ~target =
+let format ~chain_id ~epoch =
+  match Octra_core.Rule_graph.vm_bytes_at ~chain_id ~epoch with
+  | Octra_core.Rule_graph.Active -> Image.Shared
+  | Octra_core.Rule_graph.Prior -> Image.Flat
+
+let stage_owned ?(format = Image.Flat) archive source ~target =
   match Sync_archive.owns archive target, point source.head with
   | false, _ -> Lwt.return_error "state sync target differs from archive"
   | true, (Error _ as error) -> Lwt.return error
@@ -187,6 +192,7 @@ let stage_owned archive source ~target =
                 Sync_archive.mark_stage archive (Filename.basename target)) ()
               >>= fun () ->
               Image.write
+                ~format
                 source.store
                 ~commit:point.commit
                 ~path:(Filename.concat stage "ledger.dat")
@@ -225,10 +231,10 @@ let stage_owned archive source ~target =
                 () >>= fun () ->
               Lwt.return_error reason)
 
-let build_owned archive source ~target =
+let build_owned ?format archive source ~target =
   Lwt.catch
     (fun () ->
-      stage_owned archive source ~target >>= function
+      stage_owned ?format archive source ~target >>= function
       | Error _ as error -> Lwt.return error
       | Ok report ->
           Lwt_preemptive.detach (fun () ->
@@ -238,6 +244,6 @@ let build_owned archive source ~target =
       Lwt_preemptive.detach (fun () -> remove_stage archive target) () >>= fun () ->
       Lwt.return_error (Printexc.to_string exn))
 
-let build source ~target =
+let build ?format source ~target =
   Sync_archive.run_lwt (Filename.dirname target)
-    (fun archive -> build_owned archive source ~target)
+    (fun archive -> build_owned ?format archive source ~target)

@@ -275,7 +275,7 @@ let txs_row (epoch, hash, tx_json) =
   `Assoc [
     "hash", `String hash;
     "epoch", `Int epoch;
-    "data", `String tx_json;
+    "data", Rpc_view.public_tx_data tx_json;
     "url", `String ("/tx/" ^ hash);
   ]
 

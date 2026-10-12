@@ -6,6 +6,7 @@ type rejection = {
   tx : Transaction.t;
   error_type : string;
   reason : string;
+  charged : bool;
 }
 
 type partition = {
@@ -69,14 +70,14 @@ let normalize_reason ~error_type value =
       value
 
 let encode_rejection rejection =
-  `Assoc [
+  `Assoc ([
     "schema", `String schema;
     "position", `Int rejection.position;
     "hash", `String (Transaction.hash rejection.tx);
     "tx", Transaction.to_yojson rejection.tx;
     "error_type", `String rejection.error_type;
     "reason", `String rejection.reason;
-  ]
+  ] @ if rejection.charged then ["charged", `Bool true] else [])
   |> Yojson.Safe.to_string
 
 let assoc name fields =
@@ -96,7 +97,8 @@ let parse_rejection decode_tx raw fields =
       match decode_tx tx_json with
       | Error error -> Error ("rejection_tx_invalid:" ^ error)
       | Ok tx ->
-        let rejection = { position; tx; error_type; reason } in
+        let charged = assoc "charged" fields = Some (`Bool true) in
+        let rejection = { position; tx; error_type; reason; charged } in
         if position < 0 || position >= max_rejections then
           Error "rejection_position_invalid"
         else if Transaction.hash tx <> hash then
@@ -186,7 +188,7 @@ let find_position hash txs =
   in
   loop 0 txs
 
-let build ~inputs rejected =
+let build ?(charged = []) ~inputs rejected =
   let inputs = Transaction.consensus_order inputs in
   let hashes = List.map Transaction.hash inputs in
   if
@@ -212,7 +214,8 @@ let build ~inputs rejected =
           | Some position ->
             let reason = normalize_reason ~error_type reason in
             let error_type = normalize_error_type error_type in
-            let rejection = { position; tx; error_type; reason } in
+            let charged = List.exists (fun item -> Transaction.hash item = hash) charged in
+            let rejection = { position; tx; error_type; reason; charged } in
             loop (rejection :: acc) rest
         end
     in
@@ -255,6 +258,10 @@ let merge ~confirmed ~rejections =
       Error "rejection_positions_not_ordered"
     else
       loop 0 confirmed rejections []
+
+let executed ~confirmed rejections =
+  Transaction.consensus_order (confirmed @ List.filter_map
+    (fun item -> if item.charged then Some item.tx else None) rejections)
 
 let decode_with decode_tx ~confirmed raws =
   match split_with decode_tx raws with

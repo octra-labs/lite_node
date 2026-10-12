@@ -11,26 +11,26 @@ type delivery_key_status = {
 let get_outbox_claim store circle_id intent_id =
   Store_irmin.get_circle_outbox_claim store circle_id intent_id
 
-let get_outbox_claims store circle_id intent_id =
-  Store_irmin.list_circle_outbox_claims store circle_id intent_id
+let get_outbox_claims ?snapshot store circle_id intent_id =
+  Store_irmin.list_circle_outbox_claims ?snapshot store circle_id intent_id
 
 let get_outbox_claim_for_relay store circle_id intent_id relay_id =
   Store_irmin.get_circle_outbox_claim_for_relay store circle_id intent_id relay_id
 
-let get_outbox_claim_resolutions store circle_id intent_id =
-  Store_irmin.list_circle_outbox_claim_resolutions store circle_id intent_id
+let get_outbox_claim_resolutions ?snapshot store circle_id intent_id =
+  Store_irmin.list_circle_outbox_claim_resolutions ?snapshot store circle_id intent_id
 
-let get_outbox_resolution store circle_id intent_id =
-  Store_irmin.get_circle_outbox_resolution store circle_id intent_id
+let get_outbox_resolution ?snapshot store circle_id intent_id =
+  Store_irmin.get_circle_outbox_resolution ?snapshot store circle_id intent_id
 
 let cancelled_relay_ids resolutions =
   resolutions
   |> List.filter_map (fun (resolution : Circles.outbox_resolution) -> resolution.actor_id)
   |> List.sort_uniq String.compare
 
-let active_outbox_claims store circle_id intent_id current_epoch =
-  let* claims = get_outbox_claims store circle_id intent_id in
-  let* resolutions = get_outbox_claim_resolutions store circle_id intent_id in
+let active_outbox_claims ?snapshot store circle_id intent_id current_epoch =
+  let* claims = get_outbox_claims ?snapshot store circle_id intent_id in
+  let* resolutions = get_outbox_claim_resolutions ?snapshot store circle_id intent_id in
   Lwt.return
     (Circle_transport_claim_set.live_claims
        ~current_epoch
@@ -50,7 +50,7 @@ let claim_ready ~transport_policy claims =
     transport_policy
     ~active_claims:claims
 
-let delivery_key_status store circle_id current_epoch (intent : Circles.outbox_intent) =
+let delivery_key_status ?snapshot store circle_id current_epoch (intent : Circles.outbox_intent) =
   match intent.delivery_key_id with
   | None ->
     Lwt.return {
@@ -58,7 +58,7 @@ let delivery_key_status store circle_id current_epoch (intent : Circles.outbox_i
       state = Circle_key_state.Live;
     }
   | Some key_id ->
-    let* key_policy = Circle_policy_store.load_key_policy store circle_id key_id in
+    let* key_policy = Circle_policy_store.load_key_policy ?snapshot store circle_id key_id in
     Lwt.return {
       key_id = Some key_id;
       state = Circle_key_state.classify key_policy (Int64.of_int current_epoch);

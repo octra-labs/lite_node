@@ -47,6 +47,7 @@ type runtime = {
   wasm_compute_mode : Octra_core.Rule_graph.mode;
   object_cost : bool;
   owner_migration_mode : Octra_core.Rule_graph.mode;
+  cipher_mode : Octra_core.Rule_graph.mode;
   proof_mode : Octra_core.Rule_graph.mode;
   math : bool;
   private_field_policy : Octra_core.Private_ledger.field_policy;
@@ -149,6 +150,7 @@ val run_runtime :
   unit Lwt.t
 
 val run_node :
+  ?compute:Octra_core.Compute_bill.verifier ->
   ?preverify:Octra_core.Preverify_commit.t ->
   ?parent_commit:Octra_consensus.C_types.parent_commit ->
   node_runtime ->

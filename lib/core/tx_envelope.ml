@@ -69,18 +69,45 @@ let check_mode mode txs =
         else loop (Nonces.add key seen) rest in
     loop Nonces.empty txs
 
+let check_compute ~settle mode txs =
+  if mode = Rule_graph.Prior && List.exists (fun tx ->
+    match tx.Tx.op_type with Tx.ComputeFund | Tx.ComputeReturn | Tx.ComputeSettle -> true | _ -> false) txs
+  then Error "compute transfers not active"
+  else if settle = Rule_graph.Prior
+      && List.exists (fun tx -> tx.Tx.op_type = Tx.ComputeSettle) txs then
+    Error "compute settlement not active"
+  else Ok ()
+
 let check_epoch ~chain_id ~epoch txs =
+  let height = Int64.to_int (Int64.max (Int64.of_int min_int)
+    (Int64.min (Int64.of_int max_int) epoch)) in
+  let* () = check_compute ~settle:(Rule_graph.settle_at ~chain_id ~epoch:height)
+    (Rule_graph.vm_bytes_at ~chain_id ~epoch:height) txs in
   check_mode (Rule_graph.tx_envelope_at ~chain_id ~epoch) txs
 
 let check_rule rules ~epoch txs =
+  let* compute = Rule_graph.vm_bytes rules ~epoch |> Result.map_error Rule_graph.fault_message in
+  let* settle = Rule_graph.settle rules ~epoch |> Result.map_error Rule_graph.fault_message in
+  let* () = check_compute ~settle compute txs in
   let* mode = Rule_graph.tx_envelope rules ~epoch
     |> Result.map_error Rule_graph.fault_message in
   check_mode mode txs
+
+let check_charged mode rejections =
+  if List.for_all (fun (item : Tx_outcome.rejection) ->
+    not item.charged || (mode = Rule_graph.Active
+      && match item.tx.op_type with
+        | Tx.ComputeFund | Tx.ComputeReturn | Tx.ComputeSettle -> true
+        | _ -> false)) rejections then Ok ()
+  else Error "charged outcome not active"
 
 let check_outcome ~chain_id ~epoch ~receipts txs =
   match Rule_graph.tx_envelope_at ~chain_id ~epoch with
   | Rule_graph.Prior -> Ok ()
   | Rule_graph.Active ->
     let* partition = Tx_outcome.decode_final ~confirmed:txs receipts in
+    let height = Int64.to_int (Int64.min (Int64.of_int max_int) epoch) in
+    let* () = check_charged (Rule_graph.vm_bytes_at ~chain_id ~epoch:height)
+      partition.rejections in
     let* inputs = Tx_outcome.merge ~confirmed:txs ~rejections:partition.rejections in
-    check_mode Rule_graph.Active inputs
+    check_epoch ~chain_id ~epoch inputs

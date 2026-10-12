@@ -8,20 +8,22 @@ let max_batch_bytes = 16 * 1_024 * 1_024
 let max_id_bytes = 256
 
 let response_bytes value =
-  String.length (Yojson.Safe.to_string value)
+  match Octra_core.Json_tree.measure ~limit:max_int value with
+  | Some bytes -> bytes
+  | None -> invalid_arg "RPC response size exceeds integer range"
 
 let response_id = function
   | Rpc.Result (_, id)
   | Rpc.Error_ (_, id) -> id
 
-let bounded_id id =
+let checked_id id =
   if response_bytes id <= max_id_bytes then id else `Null
 
 let refused response =
   Rpc.response_json
     (Rpc.Error_
        (Rpc.err (-32013) "RPC response exceeds byte limit" None,
-        bounded_id (response_id response)))
+        checked_id (response_id response)))
 
 let within limit response =
   let value = Rpc.response_json response in

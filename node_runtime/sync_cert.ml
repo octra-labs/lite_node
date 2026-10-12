@@ -39,17 +39,21 @@ type job = {
   listener : listener;
 }
 
+type checked = {
+  verdict : (Manifest.certificate, string) result;
+  size : int;
+}
+
 type entry = {
   digest : string;
   trust_hash : string;
   checked_at : float;
-  verdict : (unit, string) result;
+  checked : checked;
 }
 
 type active =
   | Reading of job
   | Checking of job * string * string
-  | Parsing of job * string
 
 type state = {
   open_ : bool;
@@ -63,8 +67,7 @@ type state = {
 type message =
   | Ask of int64 * query * float
   | Read of int64 * int64 * float * (bytes, string) result
-  | Checked of int64 * int64 * float * (Manifest.certificate, string) result
-  | Parsed of int64 * int64 * float * (Manifest.certificate, string) result
+  | Checked of int64 * int64 * float * checked
   | Cancel of int64
   | Tick of float
   | Stop
@@ -72,14 +75,28 @@ type message =
 type effect =
   | Read_file of job
   | Verify of job * string
-  | Parse of job * string
   | Interrupt of int64
   | Reply of int64 * reply
 
 let capacity = 8
 let cache_capacity = 64
+let cache_bytes = 64 * 1024 * 1024
 let lifetime = 15.
 let negative_seconds = 5.
+
+let measure verdict =
+  let words = Obj.reachable_words (Obj.repr verdict) in
+  let word_bytes = Sys.word_size / 8 in
+  let size = if words > (cache_bytes - 512) / word_bytes then cache_bytes + 1
+    else 512 + words * word_bytes in
+  { verdict; size }
+
+let rec trim count bytes entries =
+  match entries with
+  | [] -> []
+  | entry :: rest ->
+    if count <= 0 || entry.checked.size > bytes then []
+    else entry :: trim (count - 1) (bytes - entry.checked.size) rest
 
 let empty = {
   open_ = true;
@@ -91,14 +108,13 @@ let empty = {
 }
 
 let job = function
-  | Reading job | Checking (job, _, _) | Parsing (job, _) -> job
+  | Reading job | Checking (job, _, _) -> job
 
 let with_listener listener active =
   let next = { (job active) with listener } in
   match active with
   | Reading _ -> Reading next
   | Checking (_, raw, digest) -> Checking (next, raw, digest)
-  | Parsing (_, raw) -> Parsing (next, raw)
 
 let reason = function
   | Busy -> "state sync verification busy"
@@ -163,14 +179,13 @@ let delta state message =
         | Ok { raw; digest } ->
           let matches entry = entry.digest = digest && entry.trust_hash = current.query.trust_hash in
           let cached = List.find_opt (fun entry -> matches entry &&
-            (Result.is_ok entry.verdict || now -. entry.checked_at <= negative_seconds)) state.entries in
+            (Result.is_ok entry.checked.verdict || now -. entry.checked_at <= negative_seconds)) state.entries in
           match cached with
           | Some entry ->
             let entries = entry :: List.filter (fun row -> not (matches row)) state.entries in
-            begin match entry.verdict with
+            begin match entry.checked.verdict with
             | Error reason -> complete now { state with entries } current (Error (Invalid reason))
-            | Ok () ->
-              { state with entries; active = Some (Parsing (current, raw)) }, [Parse (current, raw)]
+            | Ok certificate -> complete now { state with entries } current (Ok { raw; certificate })
             end
           | None ->
             { state with active = Some (Checking (current, raw, digest)) }, [Verify (current, raw)]
@@ -178,31 +193,20 @@ let delta state message =
       state, expired @ effects
     | _ -> state, []
     end
-  | Checked (id, generation, now, result) ->
+  | Checked (id, generation, now, checked) ->
     begin match state.active with
     | Some (Checking (current, raw, digest)) when state.open_ && current.id = id
         && current.generation = generation && generation = state.generation ->
       let state, expired = expire now state in
       let current = job (Option.get state.active) in
-      let reply = Result.map (fun certificate -> { raw; certificate }) result |> Result.map_error (fun e -> Invalid e) in
-      let entries = if current.listener = Cancelled then state.entries else
-        let entry = { digest; trust_hash = current.query.trust_hash; checked_at = now;
-          verdict = Result.map (fun _ -> ()) result } in
-        entry :: List.filter (fun row -> row.digest <> digest || row.trust_hash <> entry.trust_hash) state.entries
-        |> List.filteri (fun index _ -> index < cache_capacity) in
-      let state, effects = complete now { state with entries } current reply in
-      state, expired @ effects
-    | _ -> state, []
-    end
-  | Parsed (id, generation, now, result) ->
-    begin match state.active with
-    | Some (Parsing (current, raw)) when state.open_ && current.id = id
-        && current.generation = generation && generation = state.generation ->
-      let state, expired = expire now state in
-      let current = job (Option.get state.active) in
-      let reply = Result.map (fun certificate -> { raw; certificate }) result
+      let reply = Result.map (fun certificate -> { raw; certificate }) checked.verdict
         |> Result.map_error (fun e -> Invalid e) in
-      let state, effects = complete now state current reply in
+      let entries = if current.listener = Cancelled || checked.size < 0
+          || checked.size > cache_bytes then state.entries else
+        let entry = { digest; trust_hash = current.query.trust_hash; checked_at = now; checked } in
+        entry :: List.filter (fun row -> row.digest <> digest || row.trust_hash <> entry.trust_hash) state.entries
+        |> trim cache_capacity cache_bytes in
+      let state, effects = complete now { state with entries } current reply in
       state, expired @ effects
     | _ -> state, []
     end
@@ -277,15 +281,9 @@ and execute t = function
       let open Lwt.Syntax in
       let* value = Lwt.catch (fun () -> t.deps.verify ~cancelled job.query.trust raw)
         (fun _ -> Lwt.return_error "state sync certificate verification failed") in
-      dispatch t (Checked (job.id, job.generation, t.deps.now (), value));
-      Lwt.return_unit)
-  | Parse (job, raw) ->
-    launch t job (fun _ ->
-      let open Lwt.Syntax in
-      let* value = Lwt.catch
-        (fun () -> Lwt_preemptive.detach Manifest.parse_certificate_string raw)
-        (fun _ -> Lwt.return_error "state sync certificate parse failed") in
-      dispatch t (Parsed (job.id, job.generation, t.deps.now (), value));
+      let* checked = Lwt.catch (fun () -> Lwt_preemptive.detach measure value)
+        (fun _ -> Lwt.return { verdict = value; size = cache_bytes + 1 }) in
+      dispatch t (Checked (job.id, job.generation, t.deps.now (), checked));
       Lwt.return_unit)
   | Interrupt id ->
     Option.iter (fun work -> if work.id = id then work.interrupted := true) t.work
@@ -296,6 +294,7 @@ type stats = {
   active : int;
   queued : int;
   cached : int;
+  bytes : int;
   generation : int64;
 }
 
@@ -303,6 +302,7 @@ let stats (state : state) = {
   active = if state.active = None then 0 else 1;
   queued = List.length state.queued;
   cached = List.length state.entries;
+  bytes = List.fold_left (fun total entry -> total + entry.checked.size) 0 state.entries;
   generation = state.generation;
 }
 

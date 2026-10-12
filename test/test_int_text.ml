@@ -288,7 +288,9 @@ let check_number_price () =
     LT (2, 0, 1), false, text, VInt Z.zero, 1] in
   List.iter (fun (op, strict, left, right, passes) ->
     let memory = passes * 98 in
-    let cost = passes * 7 + effort_cost op in
+    let parsed = passes * 7 in
+    let ready = parsed + effort_cost op in
+    let cost = ready + (match op with ADD _ | NEG _ -> 1 | _ -> 0) in
     let check alloc limit =
       let work = budget ~alloc () in
       let st = state ~strict ~limit ~work () in
@@ -302,8 +304,11 @@ let check_number_price () =
         require (Byte_work.available work = alloc - memory) "number allocation price"
       end else begin
         require (st.regs = original) "refused number changed register";
-        require (Byte_work.available work = alloc) "partial number allocation";
-        require (st.effort_used = 0) "partial number effort"
+        let charged = alloc >= memory && limit >= ready in
+        let remaining = if charged then alloc - memory else alloc in
+        require (Byte_work.available work = remaining) "refused number allocation";
+        require (st.effort_used = if charged then parsed else 0)
+          "refused number effort"
       end in
     for alloc = 0 to memory + 1 do check alloc 1000 done;
     for limit = 0 to cost + 1 do check 1000 limit done) cases;

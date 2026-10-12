@@ -24,6 +24,10 @@ type restore_report = {
 type record =
   | Node of string list
   | Value of string list * string
+  | Ref of string list * int * int64 * string
+  | Finish of string list * string
+
+type format = Flat | Shared
 
 type sink = {
   channel : out_channel;
@@ -37,7 +41,8 @@ type sink = {
 let prior_magic = "octra-ledger-image\n"
 let path_magic = "octra-ledger-image-2\n"
 let magic = "octra-ledger-image-3\n"
-type format = Prior | Path64 | Full64
+let shared_magic = "octra-ledger-image-refs\n"
+type encoding = Prior | Path64 | Full64 | Refs
 let prior_records = 16_777_216L
 let max_path_parts = 1_024
 let prior_part_bytes = 4_096
@@ -104,16 +109,19 @@ let put_u32 buffer value =
   Buffer.add_char buffer (Char.chr ((value lsr 16) land 0xff));
   Buffer.add_char buffer (Char.chr ((value lsr 24) land 0xff))
 
-let put_u64 buffer value =
-  let value = Int64.of_int value in
+let put_int64 buffer value =
   for index = 0 to 7 do
     Buffer.add_char buffer
       (Char.chr (Int64.to_int (Int64.logand 255L (Int64.shift_right_logical value (index * 8)))))
   done
 
+let put_u64 buffer value = put_int64 buffer (Int64.of_int value)
+
 let path_of_record = function
   | Node path
-  | Value (path, _) -> path
+  | Value (path, _)
+  | Ref (path, _, _, _)
+  | Finish (path, _) -> path
 
 let validate_path path =
   let count = List.length path in
@@ -164,21 +172,24 @@ let add_pvac sink path value =
 
 let emit sink record =
   let path = path_of_record record in
-  if not (validate_order sink.prior path) then
+  let finish = match record with Finish _ -> true | _ -> false in
+  if not finish && not (validate_order sink.prior path) then
     Lwt.fail_with "ledger image paths are not strictly ordered"
   else
     match validate_path path with
     | Error reason -> Lwt.fail_with reason
     | Ok () ->
         sink.records <- Int64.succ sink.records;
-        sink.prior <- Some path;
+        if not finish then sink.prior <- Some path;
         begin
           match record with
-          | Node _ -> ()
+          | Node _ | Ref _ | Finish _ -> ()
           | Value (path, value) -> add_pvac sink path value
         end;
         put_u32 sink.buffer (List.length path);
-        put_u8 sink.buffer (match record with Node _ -> 1 | Value _ -> 2);
+        put_u8 sink.buffer (match record with
+          | Node _ -> 1 | Value _ -> 2 | Ref (_, kind, _, _) -> kind + 2
+          | Finish _ -> 5);
         sink.bytes <- Int64.add sink.bytes 5L;
         let* () = Lwt_list.iter_s (fun part ->
           put_u64 sink.buffer (String.length part);
@@ -190,6 +201,15 @@ let emit sink record =
               put_u64 sink.buffer (String.length value);
               sink.bytes <- Int64.add sink.bytes 8L;
               append sink value
+          | Ref (_, _, id, hash) ->
+              put_int64 sink.buffer id;
+              put_u64 sink.buffer (String.length hash);
+              sink.bytes <- Int64.add sink.bytes 16L;
+              append sink hash
+          | Finish (_, hash) ->
+              put_u64 sink.buffer (String.length hash);
+              sink.bytes <- Int64.add sink.bytes 8L;
+              append sink hash
         in
         if Buffer.length sink.buffer >= drain_bytes then drain sink
         else if Int64.rem sink.records 256L = 0L then Lwt.pause ()
@@ -230,6 +250,47 @@ let rec write_tree sink tree prefix =
       | None -> Lwt.fail_with "ledger image entry disappeared")
     entries
 
+let tree_hash tree =
+  Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree)
+
+let rec write_shared sink seen tree prefix =
+  let* entries = sorted_entries tree in
+  Lwt_list.iter_s (fun (name, child) ->
+    let path = prefix @ [name] in
+    let* kind = Store.Tree.kind child [] in
+    let kind = match kind with
+      | Some `Node -> 1
+      | Some `Contents -> 2
+      | None -> failwith "ledger image entry disappeared" in
+    let hash = tree_hash child in
+    match Hashtbl.find_opt seen (kind, hash) with
+    | Some id -> emit sink (Ref (path, kind, id, hash))
+    | None ->
+        let* () = if kind = 1 then emit sink (Node path)
+          else
+            let* value = Store.Tree.find child [] in
+            match value with
+            | Some value -> emit sink (Value (path, value))
+            | None -> Lwt.fail_with "ledger image content disappeared" in
+        let id = sink.records in
+        let* () = if kind = 1 then
+            let* () = write_shared sink seen child path in
+            emit sink (Finish (path, hash))
+          else Lwt.return_unit in
+        Hashtbl.add seen (kind, hash) id;
+        Lwt.return_unit) entries
+
+let collect_pvac sink tree =
+  let* tree = Store.Tree.find_tree tree ["pvac_hashes"] in
+  match tree with
+  | None -> Lwt.return_unit
+  | Some tree ->
+      let* entries = sorted_entries tree in
+      Lwt_list.iter_s (fun (name, child) ->
+        let* value = Store.Tree.find child [] in
+        Option.iter (add_pvac sink ["pvac_hashes"; name]) value;
+        Lwt.return_unit) entries
+
 let discard channel path =
   let owned = try Some (Unix.fstat (Unix.descr_of_out_channel channel))
     with _ -> None in
@@ -243,7 +304,7 @@ let discard channel path =
            && current.st_ino = owned.st_ino then Unix.unlink path
       with _ -> ()
 
-let write store ~commit ~path =
+let write ?(format = Flat) store ~commit ~path =
   if Sys.file_exists path then
     Lwt.return_error "ledger image target already exists"
   else
@@ -260,6 +321,7 @@ let write store ~commit ~path =
               Lwt.catch
                 (fun () ->
                   let tree = Store.Commit.tree selected in
+                  let magic = match format with Flat -> magic | Shared -> shared_magic in
                   let root =
                     Irmin.Type.to_string Store.Hash.t (Store.Tree.hash tree)
                   in
@@ -280,7 +342,11 @@ let write store ~commit ~path =
                         pvac_hashes = [];
                       } in
                       output_string channel magic;
-                      let* () = write_tree sink tree [] in
+                      let* () = match format with
+                        | Flat -> write_tree sink tree []
+                        | Shared ->
+                            let* () = collect_pvac sink tree in
+                            write_shared sink (Hashtbl.create 1024) tree [] in
                       put_u32 sink.buffer 0;
                       sink.bytes <- Int64.add sink.bytes 4L;
                       let* () = drain sink in
@@ -309,7 +375,7 @@ let write store ~commit ~path =
 type reader = {
   channel : in_channel;
   size : int64;
-  format : format;
+  format : encoding;
   mutable records : int64;
   mutable prior : string list option;
 }
@@ -350,38 +416,52 @@ let read_path reader count =
       let index = count - remaining in
       let length = match reader.format with
         | Prior -> Int64.of_int (read_u32 reader)
-        | Path64 | Full64 -> read_u64 reader in
+        | Path64 | Full64 | Refs -> read_u64 reader in
       let max = match reader.format with
         | Prior -> prior_part_bytes
-        | Path64 | Full64 -> Sys.max_string_length in
+        | Path64 | Full64 | Refs -> Sys.max_string_length in
       let name = Printf.sprintf "ledger image path part = %d bytes = %Ld" index length in
       let part = read_string reader ~length ~max name in
       loop (remaining - 1) (part :: path)
   in
   loop count []
 
+let read_hash reader =
+  let length = read_u64 reader in
+  let hash = read_string reader ~length ~max:256 "ledger image subtree hash" in
+  match Irmin.Type.of_string Store.Hash.t hash with
+  | Ok value when Irmin.Type.to_string Store.Hash.t value = hash -> hash
+  | _ -> failwith "ledger image subtree hash is invalid"
+
 let read_record reader =
   let count = read_u32 reader in
   if count = 0 then None
   else begin
-    if reader.format <> Full64 && reader.records >= prior_records then
+    if (reader.format = Prior || reader.format = Path64) && reader.records >= prior_records then
       failwith "ledger image record count exceeds limit";
     let kind = read_u8 reader in
-    if kind <> 1 && kind <> 2 then
+    if kind < 1 || kind > (if reader.format = Refs then 5 else 2) then
       failwith "ledger image record kind is invalid";
     let path = read_path reader count in
-    if not (validate_order reader.prior path) then
+    if kind <> 5 && not (validate_order reader.prior path) then
       failwith "ledger image paths are not strictly ordered";
     reader.records <- Int64.succ reader.records;
-    reader.prior <- Some path;
+    if kind <> 5 then reader.prior <- Some path;
     match kind with
     | 1 -> Some (Node path)
     | 2 ->
         let length, max = match reader.format with
           | Prior | Path64 -> Int64.of_int (read_u32 reader), prior_value_bytes
-          | Full64 -> read_u64 reader, Sys.max_string_length in
+          | Full64 | Refs -> read_u64 reader, Sys.max_string_length in
         let value = read_string reader ~length ~max "ledger image value" in
         Some (Value (path, value))
+    | 3 | 4 ->
+        let id = read_u64 reader in
+        if id <= 0L || id >= reader.records then
+          failwith "ledger image reference is not backward";
+        let hash = read_hash reader in
+        Some (Ref (path, kind - 2, id, hash))
+    | 5 -> Some (Finish (path, read_hash reader))
     | _ -> failwith "ledger image record kind is invalid"
   end
 
@@ -391,9 +471,9 @@ let exact_end reader =
   | exception End_of_file -> ()
 
 let read_header channel =
-  let buffer = Buffer.create (String.length magic) in
+  let buffer = Buffer.create (String.length shared_magic) in
   let rec loop () =
-    if Buffer.length buffer >= String.length magic then
+    if Buffer.length buffer >= String.length shared_magic then
       failwith "ledger image header is invalid";
     let byte = input_char channel in
     Buffer.add_char buffer byte;
@@ -402,6 +482,7 @@ let read_header channel =
       | value when value = prior_magic -> Prior
       | value when value = path_magic -> Path64
       | value when value = magic -> Full64
+      | value when value = shared_magic -> Refs
       | _ -> failwith "ledger image header is invalid"
   in
   loop ()
@@ -414,6 +495,21 @@ let restore_records store source =
         let format = read_header channel in
         let size = LargeFile.in_channel_length channel in
         let reader = { channel; size; format; records = 0L; prior = None } in
+        let seen = Hashtbl.create 1024 in
+        let opened = ref [] in
+        let check_parent path =
+          let parent = List.rev (List.tl (List.rev path)) in
+          let expected = match !opened with (path, _) :: _ -> path | [] -> [] in
+          if parent <> expected then
+            failwith "ledger image subtree order is invalid" in
+        let remember tree path kind id =
+          let* child = Store.Tree.find_tree tree path in
+          match child with
+          | None -> Lwt.fail_with "ledger image subtree is missing"
+          | Some child ->
+              let hash = tree_hash child in
+              Hashtbl.add seen id (kind, hash, path);
+              Lwt.return hash in
         let commit tree =
           let* () = Irmin_store.commit_bulk store tree "state sync" in
           Store.flush store.Irmin_store.repo;
@@ -424,17 +520,56 @@ let restore_records store source =
           match read_record reader with
           | None ->
               exact_end reader;
+              if !opened <> [] then failwith "ledger image subtree is unfinished";
               if pending > 0 || not committed then
                 let* _ = commit tree in
                 Lwt.return reader.records
               else
                 Lwt.return reader.records
           | Some (Node path) ->
+              if format = Refs then begin
+                check_parent path;
+                opened := (path, reader.records) :: !opened
+              end;
               let* tree = Store.Tree.add_tree tree path (Store.Tree.empty ()) in
               next tree pending bytes offset committed
           | Some (Value (path, value)) ->
+              if format = Refs then check_parent path;
               let* tree = Store.Tree.add tree path value in
+              let* () = if format = Refs then
+                  let* _ = remember tree path 2 reader.records in
+                  Lwt.return_unit
+                else Lwt.return_unit in
               next tree pending bytes offset committed
+          | Some (Finish (path, hash)) ->
+              begin match !opened with
+              | (current, id) :: rest when current = path ->
+                  let* actual = remember tree path 1 id in
+                  if actual <> hash then Lwt.fail_with "ledger image subtree hash mismatch"
+                  else begin
+                    opened := rest;
+                    next tree pending bytes offset committed
+                  end
+              | _ -> Lwt.fail_with "ledger image subtree finish order is invalid"
+              end
+          | Some (Ref (path, kind, id, hash)) ->
+              check_parent path;
+              begin match Hashtbl.find_opt seen id with
+              | None -> Lwt.fail_with "ledger image reference target is not finished"
+              | Some (actual, _, _) when actual <> kind ->
+                  Lwt.fail_with "ledger image reference kind mismatch"
+              | Some (_, actual, _) when actual <> hash ->
+                  Lwt.fail_with "ledger image reference hash mismatch"
+              | Some (_, _, source) ->
+                  let* child = Store.Tree.find_tree tree source in
+                  begin match child with
+                  | None -> Lwt.fail_with "ledger image reference target is missing"
+                  | Some child ->
+                      let* tree = Store.Tree.add_tree tree path child in
+                      Hashtbl.add seen reader.records (kind, hash, path);
+                      next tree pending bytes offset committed
+                  end
+              end
         and next tree pending bytes offset committed =
           let pending = pending + 1 in
           let bytes = Int64.add bytes (Int64.sub (LargeFile.pos_in channel) offset) in

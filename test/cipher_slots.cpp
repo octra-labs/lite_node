@@ -7,7 +7,40 @@
 #include <string>
 #include <vector>
 
-int main() {
+static int history_images() {
+    pvac::PubKey key;
+    pvac::SecKey secret;
+    std::array<uint8_t, 32> seed{};
+    seed.fill(62);
+    pvac::keygen_from_seed(pvac::Params{}, key, secret, seed.data());
+    const auto cipher = pvac::enc_value_seeded(key, secret, 3, seed.data());
+    for (const auto tag : {pvac_ser::VERSION_V1, pvac_ser::VERSION_V2}) {
+        pvac_ser::Writer out;
+        out.header_version(pvac_ser::TAG_CIPHER, tag);
+        out.u64(cipher.slots);
+        out.u64(cipher.L.size());
+        for (const auto& layer : cipher.L) {
+            pvac_ser::write_layer_public(out, layer);
+            out.raw(layer.R_com.data(), layer.R_com.size());
+            if (tag == pvac_ser::VERSION_V2) {
+                out.u64(layer.PC.size());
+                for (const auto& point : layer.PC) out.raw(point.data(), point.size());
+            }
+        }
+        out.u64(cipher.c0.size());
+        for (const auto& value : cipher.c0) out.fp(value);
+        out.u64(cipher.E.size());
+        for (const auto& edge : cipher.E) pvac_ser::write_edge(out, edge);
+        static const char hex[] = "0123456789abcdef";
+        for (const auto byte : out.buf) std::cout << hex[byte >> 4] << hex[byte & 15];
+        std::cout << '\n';
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--history") return history_images();
+    if (argc != 1) return 1;
     constexpr std::array<uint64_t, 6> values = {0, 1, 8, 9, 65536, 65537};
     size_t cases = 0;
     for (uint8_t version = pvac_ser::VERSION_V1; version <= pvac_ser::VERSION_V5; ++version) {

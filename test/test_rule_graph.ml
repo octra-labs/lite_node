@@ -110,7 +110,8 @@ let test_set_plan () =
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
   require
-    (Graph.profile_epochs ~chain_id = [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000])
+    (Graph.profile_epochs ~chain_id =
+      [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000; 1_688_734])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
@@ -316,7 +317,67 @@ let test_proof_rule () =
       "other proof enabled")
     ["octra-mainnet"; "octra-test"; ""; "octra-devnet-9871-cluster "]
 
+let test_pending_rules () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (Graph.vm_bytes_activation_for_chain chain_id) in
+  require (plan.activation_epoch = 1_688_734) "byte activation date";
+  require (Graph.cipher_activation_for_chain chain_id = Some plan) "cipher activation date";
+  let good = Graph.create ~chain_id ~root_at:(fun epoch ->
+    require (epoch = plan.anchor_epoch) "pending anchor epoch";
+    Graph.Root plan.anchor_state_root) in
+  List.iter (fun epoch ->
+    let prior = Graph.create ~chain_id ~root_at:(fun _ -> fail "early anchor read") in
+    require (Graph.vm_bytes prior ~epoch = Ok Graph.Prior) "early byte mode";
+    require (Graph.cipher_migration prior ~epoch = Ok Graph.Prior) "early cipher mode")
+    [0; 1_663_000; 1_672_000; 1_682_000; plan.activation_epoch - 1];
+  List.iter (fun epoch ->
+    require (Graph.vm_bytes good ~epoch = Ok Graph.Active) "byte mode not active";
+    require (Graph.cipher_migration good ~epoch = Ok Graph.Active) "cipher mode not active";
+    require (Graph.vm_bytes_at ~chain_id ~epoch = Graph.Active) "byte profile not active";
+    require (Graph.cipher_migration_at ~chain_id ~epoch = Graph.Active)
+      "cipher profile not active";
+    List.iter (fun (root, error) ->
+      let rules = Graph.create ~chain_id ~root_at:(fun _ -> root) in
+      require (Graph.vm_bytes rules ~epoch = Error error) "byte anchor accepted";
+      require (Graph.cipher_migration rules ~epoch = Error error) "cipher anchor accepted")
+      [Graph.Missing, Graph.Anchor_missing plan.anchor_epoch;
+       Graph.Root "wrong", Graph.Anchor_mismatch {epoch = plan.anchor_epoch;
+         expected = plan.anchor_state_root; actual = "wrong"};
+       Graph.Unreadable "read", Graph.Anchor_unreadable {epoch = plan.anchor_epoch;
+         reason = "read"}])
+    [plan.activation_epoch; plan.activation_epoch + 1; max_int];
+  List.iter (fun chain_id ->
+    let rules = Graph.create ~chain_id ~root_at:(fun _ -> fail "unplanned anchor read") in
+    require (Graph.vm_bytes_activation_for_chain chain_id = None) "byte date assigned";
+    require (Graph.cipher_activation_for_chain chain_id = None) "cipher date assigned";
+    List.iter (fun epoch ->
+      require (Graph.vm_bytes rules ~epoch = Ok Graph.Prior) "unplanned byte mode";
+      require (Graph.vm_bytes_at ~chain_id ~epoch = Graph.Prior) "unplanned byte profile";
+      require (Graph.cipher_migration rules ~epoch = Ok Graph.Prior) "unplanned cipher mode";
+      require (Graph.cipher_migration_at ~chain_id ~epoch = Graph.Prior)
+        "unplanned cipher profile")
+      [0; 1_663_000; 1_672_000; 1_681_999; 1_682_000; 1_682_001; max_int])
+    ["octra-mainnet"; "octra-test"; "";
+     "octra-devnet-9871-cluster "];
+  let plan = Graph.{anchor_epoch = 17; anchor_state_root = String.make 64 'a';
+    activation_epoch = 23} in
+  let resolve root epoch = Graph.activation_mode ~root_at:(fun observed ->
+    require (observed = plan.anchor_epoch) "plan anchor epoch";
+    root) (Some plan) ~epoch in
+  require (resolve Graph.Missing 22 = Ok Graph.Prior) "plan active before date";
+  List.iter (fun epoch ->
+    require (resolve (Graph.Root plan.anchor_state_root) epoch = Ok Graph.Active)
+      "plan mode missing";
+    require (resolve Graph.Missing epoch = Error (Graph.Anchor_missing 17))
+      "plan accepted missing root";
+    require (resolve (Graph.Root "wrong") epoch = Error (Graph.Anchor_mismatch {
+      epoch = 17; expected = plan.anchor_state_root; actual = "wrong"}))
+      "plan accepted wrong root";
+    require (resolve (Graph.Unreadable "read") epoch = Error (Graph.Anchor_unreadable {
+      epoch = 17; reason = "read"})) "plan accepted unreadable root") [23; 24; max_int]
+
 let () =
+  test_pending_rules ();
   test_proof_rule ();
   test_exit ();
   test_program_rule ();

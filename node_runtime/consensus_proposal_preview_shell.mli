@@ -32,6 +32,7 @@ type deps = {
 }
 
 val node_backend :
+  ?compute:Octra_core.Compute_bill.verifier ->
   ?private_artifacts:
     (Octra_core.Transaction.t list ->
      (string * Octra_core.Private_ledger.private_artifact) list) ->

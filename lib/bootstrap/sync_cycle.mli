@@ -9,6 +9,10 @@ type outcome =
 
 type event =
   | Finalized of int64
+  | Finalized_after of {
+      epoch : int64;
+      minimum : int64;
+    }
   | Completed of {
       epoch : int64;
       outcome : outcome;

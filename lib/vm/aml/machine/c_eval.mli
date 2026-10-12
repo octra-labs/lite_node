@@ -32,6 +32,7 @@ type out = {
   row : C_eff.t;
   limit : Z.t;
   work_limit : Z.t;
+  int_work : Z.t;
 }
 
 type exec = private {
@@ -62,6 +63,7 @@ type error =
   | Fuel of Z.t * Z.t
   | Cost of Z.t * Z.t
   | Work of Z.t * Z.t
+  | Arith of Z.t * Z.t
   | Effects of C_eff.t * C_eff.t
 
 type rule_error =

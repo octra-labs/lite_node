@@ -3,19 +3,20 @@
 
 open Lwt.Syntax
 
-let load_opt store circle_id path_key =
+let load_opt ?snapshot store circle_id path_key =
+  let read = Circle_policy_store.read_first_inline_value ?snapshot in
   let* ciphertext_commitment_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_register_cell.ciphertext_commitment_key path_key] in
   let* proof_kind_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_register_cell.proof_kind_key path_key] in
   let* proof_receipt_hash_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_register_cell.proof_receipt_hash_key path_key] in
@@ -29,8 +30,8 @@ let load_opt store circle_id path_key =
   else
     Lwt.return_none
 
-let load store circle_id path_key =
-  let* cell_opt = load_opt store circle_id path_key in
+let load ?snapshot store circle_id path_key =
+  let* cell_opt = load_opt ?snapshot store circle_id path_key in
   match cell_opt with
   | Some cell -> Lwt.return cell
   | None -> Lwt.return Circle_register_cell.empty

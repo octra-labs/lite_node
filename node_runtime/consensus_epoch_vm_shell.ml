@@ -285,6 +285,7 @@ type live_contract_ctx_args = {
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  vm_bytes : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
   object_cost : bool;
@@ -324,6 +325,7 @@ type live_sender_vm_tx_args = {
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  vm_bytes : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
@@ -411,7 +413,7 @@ let subcall_result (r : Contract.exec_result) =
   | Error e ->
     Error e
 
-let make_contract_ctx (deps : (_, _) deps) =
+let make_contract_ctx ?bytes (deps : (_, _) deps) =
   let fhe_memory = match deps.fhe_work with
     | Octra_core.Rule_graph.Prior -> None
     | Octra_core.Rule_graph.Active -> Some (Octra_vm.Fhe_memory.create ()) in
@@ -469,6 +471,7 @@ let make_contract_ctx (deps : (_, _) deps) =
       proof_exec = deps.proof_exec;
       wasm_float = deps.wasm_float;
       fhe_memory;
+      byte_work = bytes;
       current_epoch = deps.current_epoch;
       epoch_time_ms = deps.epoch_time_ms;
       tree_hash = deps.tree_hash;
@@ -479,7 +482,11 @@ let make_contract_ctx (deps : (_, _) deps) =
   ctx
 
 let make_live_contract_ctx (args : live_contract_ctx_args) =
-  let ctx = make_contract_ctx
+  let bytes = match args.vm_bytes with
+    | Octra_core.Rule_graph.Prior -> None
+    | Octra_core.Rule_graph.Active ->
+      Some (Octra_vm.Byte_work.create Octra_vm.Byte_work.consensus_limits) in
+  let ctx = make_contract_ctx ?bytes
     {
       get_balance = Value_journal.effective args.value_journal;
       transfer = (fun ~from_addr ~to_addr ~amount ->
@@ -584,6 +591,7 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
           let* enabled = Octra_core.Circle_deploy.calls_enabled args.store info in
           if not enabled then Lwt.return (Error "circle code update required") else
           let* result = Circle_exec.execute_call
+            ~inspect_mode:args.vm_bytes
             ~trusted:(Program_trust.keys args.trusted_program_keys)
             ~journal:args.program_journal ~ctx:scoped
             ~depth:scope.depth ?limit:scope.limit
@@ -595,6 +603,7 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
           | Error _ as error -> Lwt.return error
           | Ok receipt ->
             let* committed = Circle_exec.commit_call_result
+              ~inspect_mode:args.vm_bytes
               ~deployment_profile:Octra_core.Circle_wasm_host.Manifest
               ~proof_mode:args.proof_mode ~float_mode:args.wasm_float
               args.store target result in
@@ -1121,7 +1130,8 @@ let make_live_call_runtime (args : live_call_runtime_args) =
     log_constructor_failed;
   }
 
-let make_live_vm_tx_deps (args : live_vm_tx_args) =
+let make_live_vm_tx_deps ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    (args : live_vm_tx_args) =
   let save_receipt =
     save_receipt
       {
@@ -1161,6 +1171,7 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
     circle_exec = (fun tx ~ctx call ->
       let ctx = { ctx with ContractVM.node_id = tx.to_ } in
       Circle_exec.execute_call
+        ~inspect_mode
         ~trusted:(Program_trust.keys args.trusted_program_keys)
         ~journal:args.program_journal
         ~ctx
@@ -1173,6 +1184,7 @@ let make_live_vm_tx_deps (args : live_vm_tx_args) =
         ~method_name:call.method_name call_result.receipt);
     circle_commit = (fun tx call_result ->
       Circle_exec.commit_call_result
+        ~inspect_mode
         ~proof_mode:args.proof_mode
         ~float_mode:(args.ctx_for_hash (Transaction.hash tx)).wasm_float
         args.store
@@ -1280,6 +1292,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         proof_mode = args.proof_mode;
         fhe_work = args.fhe_work;
         proof_exec = args.proof_exec;
+        vm_bytes = args.vm_bytes;
         wasm_float = args.wasm_float;
         math = args.math;
         object_cost = args.object_cost;
@@ -1304,7 +1317,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
       confirm = args.confirm;
     }
   in
-  make_live_vm_tx_deps {
+  make_live_vm_tx_deps ~inspect_mode:args.vm_bytes {
     runtime;
     trusted_program_keys = args.trusted_program_keys;
     program_journal = args.program_journal;

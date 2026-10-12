@@ -1003,6 +1003,7 @@ let vote_state t =
      | _ when not (t.config.role_can_vote ()) -> false, Some "role"
      | _ when !(t.finality_proof_needed) -> false, Some "finality_proof"
      | _ when not (vote_allowed t) -> false, Some "not_ready"
+     | _ when not (local_validator t) -> false, Some "not_member"
      | _ -> true, None)
 
 let resume_local_vote t =

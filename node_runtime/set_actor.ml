@@ -150,9 +150,12 @@ let proof_key (proof : Octra_core.Set_fold.proof) =
   in
   Digestif.SHA256.digest_string raw |> Digestif.SHA256.to_hex
 
+let report t fault reason =
+  try t.deps.warn fault reason with _ -> ()
+
 let observe t stage epoch proof =
   try t.observe { stage; epoch; proof } with exn ->
-    try t.deps.warn Internal (Printexc.to_string exn) with _ -> ()
+    report t Internal (Printexc.to_string exn)
 
 let removed epoch receipt before after =
   String_map.bindings before
@@ -299,7 +302,7 @@ let permit t (sample : sample) =
   let error = match sample.bonded with Error reason -> Some reason | Ok _ -> None in
   let changed = error <> t.state.sample_error in
   t.state <- { t.state with sample_error = error };
-  if changed then Option.iter (t.deps.warn Control) error;
+  if changed then Option.iter (report t Control) error;
   sample.bonded = Ok true
 
 let handle_notice t notice =
@@ -322,7 +325,7 @@ let handle_notice t notice =
     match receipt with
     | Error error ->
       settle_read None { t.state with appeals = prune current.epoch t.state.appeals };
-      t.deps.warn Receipt error;
+      report t Receipt error;
       Lwt.return_unit
     | Ok receipt ->
       settle_read (Some (sample.epoch, receipt.marked))
@@ -331,7 +334,7 @@ let handle_notice t notice =
       match decide current receipt t.state with
       | None -> Lwt.return_unit
       | Some _ when t.deps.peers () <= 0 ->
-        t.deps.warn Transport "validator set fold transport has no peers";
+        report t Transport "validator set fold transport has no peers";
         Lwt.return_unit
       | Some action ->
         begin match action with
@@ -345,7 +348,7 @@ let handle_notice t notice =
             t.state <- settle current.epoch t.state;
             Lwt.return_unit
           | Error (fault, error) ->
-            t.deps.warn fault error;
+            report t fault error;
             Lwt.return_unit
         end
 
@@ -380,7 +383,7 @@ let rec loop t =
           Lwt.catch
             (fun () -> handle_notice t notice)
             (fun exn ->
-              t.deps.warn Internal (Printexc.to_string exn);
+              report t Internal (Printexc.to_string exn);
               Lwt.return_unit)
         in
         loop t

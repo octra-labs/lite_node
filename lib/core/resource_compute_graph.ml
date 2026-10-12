@@ -109,17 +109,19 @@ let ( let* ) value next =
   | Ok value -> next value
   | Error _ as error -> error
 
-let rec map_result f = function
-  | [] -> Ok []
-  | value :: values ->
-    let* value = f value in
-    let* values = map_result f values in
-    Ok (value :: values)
+let map_result f values =
+  let rec loop saved = function
+    | [] -> Ok (List.rev saved)
+    | value :: rest ->
+      let* value = f value in
+      loop (value :: saved) rest
+  in
+  loop [] values
 
 let is_ascii value =
   String.for_all (fun char -> Char.code char < 128) value
 
-let bounded_ascii maximum value =
+let ascii_fits maximum value =
   let bytes = String.length value in
   bytes > 0 && bytes <= maximum && is_ascii value
 
@@ -132,9 +134,9 @@ let is_lower_hex value =
        value
 
 let exact_fields names fields =
-  let actual = List.map fst fields |> List.sort String.compare in
-  let expected = List.sort String.compare names in
-  List.length actual = List.length expected && actual = expected
+  List.length fields = List.length names
+  && List.sort String.compare (List.rev_map fst fields)
+     = List.sort String.compare names
 
 let field fields name =
   match List.assoc_opt name fields with
@@ -186,17 +188,8 @@ let field_list fields name =
   let* value = field fields name in
   list value
 
-let rec ordered_json = function
-  | `Assoc fields ->
-    `Assoc
-      (fields
-       |> List.map (fun (name, value) -> name, ordered_json value)
-       |> List.sort (fun (left, _) (right, _) -> String.compare left right))
-  | `List values -> `List (List.map ordered_json values)
-  | value -> value
-
 let stable_json value =
-  Yojson.Safe.to_string (ordered_json value)
+  Json_tree.write ~sort:true value
 
 let without name = function
   | `Assoc fields -> `Assoc (List.filter (fun (key, _) -> key <> name) fields)
@@ -218,7 +211,7 @@ let valid_circle_id value =
   Crypto.Address.is_valid_address value
 
 let valid_name value =
-  bounded_ascii 96 value
+  ascii_fits 96 value
   && String.for_all
        (function
         | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true
@@ -226,13 +219,13 @@ let valid_name value =
        value
 
 let valid_source value =
-  bounded_ascii 256 value
+  ascii_fits 256 value
   && Filename.basename value = value
   && value <> "."
   && value <> ".."
 
 let valid_asset_path value =
-  bounded_ascii 128 value
+  ascii_fits 128 value
   && String.length value > 12
   && String.sub value 0 12 = "/model/data/"
   && Filename.basename value <> "."
@@ -324,7 +317,7 @@ let parse_tensor json =
     let* chunks = parse_int_list chunks_json in
     let* shape_json = field fields "shape" in
     let* shape = parse_int_list shape_json in
-    if not (valid_name name) || not (bounded_ascii 256 source_name) then
+    if not (valid_name name) || not (ascii_fits 256 source_name) then
       Error "resource tensor identity refused"
     else if chunks = [] || shape = [] || List.exists ((>=) 0) shape then
       Error "resource tensor dimensions refused"
@@ -352,8 +345,8 @@ let parse_model limits ~format json =
     let* tensors_json = field_list fields "tensors" in
     let* tensors = map_result parse_tensor tensors_json in
     if
-      not (bounded_ascii 256 id)
-      || not (bounded_ascii 128 root_domain)
+      not (ascii_fits 256 id)
+      || not (ascii_fits 128 root_domain)
       || not (is_lower_hex root)
     then
       Error "resource model identity refused"
@@ -644,7 +637,7 @@ let parse ~limits ~root_circle_id raw =
     Error "resource root circle refused"
   else
     let json_result =
-      try Ok (Yojson.Safe.from_string raw) with _ -> Error "resource graph JSON refused" in
+    try Ok (Json_tree.read_plain raw) with Yojson.Json_error _ -> Error "resource graph JSON refused" in
     let* json = json_result in
     let* fields = assoc json in
     if not
@@ -740,6 +733,11 @@ let raw_of_hex value =
 let cache_entry key source value bytes sha256 =
   { key; source; bytes; sha256 = if sha256 = "" then digest_string value else sha256 }
 
+let cache_key ~circle_id ~graph_root =
+  digest_string
+    (String.concat "\000"
+      ["octra:resource_compute_model_cache:v2"; circle_id; graph_root])
+
 let cache_plan ~limits ~state_root graph =
   if not (is_lower_hex state_root) then
     Error "resource compute state root refused"
@@ -792,15 +790,7 @@ let cache_plan ~limits ~state_root graph =
           add_u64 buffer (Int64.of_int entry.bytes);
           Buffer.add_string buffer (raw_of_hex entry.sha256))
         entries;
-      let key =
-        digest_string
-          (String.concat
-             "\000"
-             [
-               "octra:resource_compute_model_cache:v2";
-               graph.root_circle_id;
-               graph.graph_root;
-             ]) in
+      let key = cache_key ~circle_id:graph.root_circle_id ~graph_root:graph.graph_root in
       Ok {
         key;
         root = digest_string (Buffer.contents buffer);

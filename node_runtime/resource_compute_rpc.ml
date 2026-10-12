@@ -58,6 +58,15 @@ let raw_hash_field fields name =
   if Text.is_hex_len 64 value then Ok (Text.hex_to_string value)
   else invalid ("resource compute hash refused: " ^ name)
 
+let fee_field fields name =
+  let* raw = string_field fields name in
+  if raw = "" || String.length raw > 19 || raw.[0] = '0'
+     || not (String.for_all (fun c -> c >= '0' && c <= '9') raw) then
+    invalid ("resource compute fee refused: " ^ name)
+  else match Int64.of_string_opt raw with
+    | Some value when value > 0L -> Ok value
+    | _ -> invalid ("resource compute fee refused: " ^ name)
+
 let address_field fields name =
   let* value = string_field fields name in
   if Octra_core.Crypto.Address.is_valid_address value then Ok value
@@ -65,11 +74,19 @@ let address_field fields name =
 
 let base64_field fields name bytes =
   let* value = string_field fields name in
-  match Base64.decode value with
-  | Ok raw when String.length raw = bytes -> Ok raw
-  | _ -> invalid ("resource compute base64 refused: " ^ name)
+  if String.length value > ((bytes + 2) / 3) * 4 then
+    invalid ("resource compute base64 refused: " ^ name)
+  else match Base64.decode value with
+    | Ok raw when String.length raw = bytes -> Ok raw
+    | _ -> invalid ("resource compute base64 refused: " ^ name)
 
 let submit_fields = [
+  "unit_price";
+  "fee_cap";
+  "memory_bytes";
+  "guest_bytes";
+  "fuel_limit";
+  "valid_until";
   "caller";
   "caller_public_key";
   "caller_signature";
@@ -89,6 +106,12 @@ let submit_fields = [
 
 let request_of_params params =
   let* fields = object_fields submit_fields params in
+  let* unit_price = fee_field fields "unit_price" in
+  let* fee_cap = fee_field fields "fee_cap" in
+  let* memory_bytes = int_field fields "memory_bytes" in
+  let* guest_bytes = int_field fields "guest_bytes" in
+  let* fuel_limit = int_field fields "fuel_limit" in
+  let* valid_until = int64_field fields "valid_until" in
   let* model_epoch = int64_field fields "model_epoch" in
   let* model_state_root = raw_hash_field fields "model_state_root" in
   let* circle_id = address_field fields "circle_id" in
@@ -105,6 +128,12 @@ let request_of_params params =
   let* params_json = string_field fields "params_json" in
   let* max_output_bytes = int_field fields "max_output_bytes" in
   Ok Service.{
+    unit_price = Some unit_price;
+    fee_cap = Some fee_cap;
+    memory_bytes = Some memory_bytes;
+    guest_bytes = Some guest_bytes;
+    fuel_limit = Some fuel_limit;
+    valid_until = Some valid_until;
     model_epoch;
     model_state_root;
     circle_id;
@@ -163,7 +192,11 @@ let certificate_json (certificate : Certificate.certificate) =
   ]
 
 let request_json (request : Certificate.request) =
-  `Assoc [
+  `Assoc ((match request.unit_price with None -> [] | Some value -> ["unit_price", int64 value]) @
+    (match request.fee_cap with None -> [] | Some value -> ["fee_cap", int64 value]) @
+    (match request.memory_bytes with None -> [] | Some bytes -> ["memory_bytes", `Int bytes]) @
+    (match request.guest_bytes with None -> [] | Some bytes -> ["guest_bytes", `Int bytes]) @
+    (match request.fuel_limit with None -> [] | Some fuel -> ["fuel_limit", `Int fuel]) @ [
     "caller", `String request.caller;
     "chain_id", `String request.chain_id;
     "circle_id", `String request.circle_id;
@@ -183,7 +216,7 @@ let request_json (request : Certificate.request) =
     "session_id", hex request.session_id;
     "state_root", hex request.state_root;
     "validator_set_root", hex request.validator_set_root;
-  ]
+  ])
 
 let member_json (member : Selection.member) =
   `Assoc [
@@ -210,15 +243,33 @@ let output_value output_json =
   | value -> value
   | exception _ -> `String output_json
 
+let quote_json (response : Service.response) =
+  let request = response.request in
+  let module Fee = Octra_core.Fee_policy in
+  match request.unit_price, request.fee_cap, request.fuel_limit with
+  | Some price, Some cap, Some fuel ->
+    begin match Fee.reserve ~price:(Z.of_int64 price) ~work:(Z.of_int fuel) ~cap:(Z.of_int64 cap) with
+    | Error error -> invalid_arg error
+    | Ok reserve ->
+      begin match Fee.settle reserve ~used:(Z.of_int64 response.certificate.steps) with
+      | Error error -> invalid_arg error
+      | Ok payment -> ["quote", `Assoc [
+          "used", `String (Z.to_string payment.charged);
+          "unused", `String (Z.to_string payment.refund)]]
+      end
+    end
+  | None, None, _ -> []
+  | _ -> invalid_arg "resource compute fee terms differ"
+
 let response_json (response : Service.response) =
-  `Assoc [
+  `Assoc (quote_json response @ [
     "certificate", certificate_json response.certificate;
     "output", output_value response.output_json;
     "output_json", `String response.output_json;
     "request", request_json response.request;
     "selection", selection_json response.selection;
     "status", `String "finished";
-  ]
+  ])
 
 let submit service params =
   match request_of_params params with
@@ -228,11 +279,12 @@ let submit service params =
     let* result = Service.submit service request in
     begin
       match result with
-      | Ok job_id ->
+      | Ok (job_id, node_id) ->
         Lwt.return
           (Ok
              (`Assoc [
                 "job_id", `String job_id;
+                "node_id", `String node_id;
                 "status", `String "waiting";
               ]))
       | Error message ->
@@ -244,44 +296,70 @@ let submit service params =
                 (Some (`String message))))
     end
 
+let read_of_params params =
+  let* fields = object_fields ["chain_id"; "node_id"; "caller"; "caller_public_key";
+    "caller_signature"; "job_id"; "epoch_id"; "expires_epoch"] params in
+  let* chain_id = string_field fields "chain_id" in
+  let* node_id = address_field fields "node_id" in
+  let* caller = address_field fields "caller" in
+  let* caller_public_key = base64_field fields "caller_public_key" 32 in
+  let* caller_signature = base64_field fields "caller_signature" 64 in
+  let* job_id = raw_hash_field fields "job_id" in
+  let* epoch_id = int64_field fields "epoch_id" in
+  let* expires_epoch = int64_field fields "expires_epoch" in
+  let read = Compute_read.{chain_id; node_id; caller; caller_public_key;
+    caller_signature; job_id; epoch_id; expires_epoch} in
+  if Compute_read.shape read then Ok read else invalid "compute read shape refused"
+
+let cancel_receipt (ack : Octra_consensus.Resource_compute_protocol.cancel_ack) =
+  let module Protocol = Octra_consensus.Resource_compute_protocol in
+  `Assoc ["node_id", `String ack.node_id; "epoch", int64 ack.epoch;
+    "round", `Int ack.delivery.round;
+    "wire", `String (Base64.encode_exn (Protocol.encode (Protocol.Cancel_ack ack)))]
+
 let status service params =
-  match object_fields ["caller"; "job_id"] params with
+  match read_of_params params with
   | Error error -> Lwt.return (Error error)
-  | Ok fields ->
-    begin
-      match address_field fields "caller", string_field fields "job_id" with
-      | Error error, _ | _, Error error -> Lwt.return (Error error)
-      | Ok caller, Ok job_id ->
-        let open Lwt.Syntax in
-        let* job_status = Service.status service ~caller ~job_id in
-        begin
-          match job_status with
-          | None -> Lwt.return (Error (Rpc.not_found "resource compute job"))
-          | Some Service.Waiting ->
-            Lwt.return
-              (Ok
-                 (`Assoc [
-                    "job_id", `String job_id;
-                    "status", `String "waiting";
-                  ]))
-          | Some (Service.Refused message) ->
-            Lwt.return
-              (Ok
-                 (`Assoc [
-                    "job_id", `String job_id;
-                    "reason", `String message;
-                    "status", `String "refused";
-                  ]))
-          | Some (Service.Finished response) ->
-            Lwt.return (Ok (response_json response))
-        end
-    end
+  | Ok read ->
+    let open Lwt.Syntax in
+    let* result = Service.status service read in
+    let job_id = Text.raw_to_hex read.job_id in
+    match result with
+    | Error reason -> Lwt.return (Error
+        (Rpc.err (-32042) "resource compute read refused" (Some (`String reason))))
+    | Ok None -> Lwt.return (Error (Rpc.not_found "resource compute job"))
+    | Ok (Some Service.Waiting) -> Lwt.return (Ok (`Assoc [
+        "job_id", `String job_id; "status", `String "waiting"]))
+    | Ok (Some (Service.Funding header)) -> Lwt.return (Ok (`Assoc [
+        "job_id", `String job_id; "status", `String "funding";
+        "header", `String (Base64.encode_exn
+          (Octra_consensus.Resource_compute_protocol.encode_header header));
+        "target", `String Octra_core.Compute_funding.escrow;
+        "amount", (match header.request.fee_cap with None -> `Null | Some value -> int64 value)]))
+    | Ok (Some (Service.Refused reason)) -> Lwt.return (Ok (`Assoc [
+        "job_id", `String job_id; "reason", `String reason; "status", `String "refused"]))
+    | Ok (Some (Service.Cancelled value)) ->
+      let state = match value.expires with
+        | None -> "unavailable"
+        | Some _ when value.members <> [] && value.missing = [] -> "complete"
+        | Some _ -> "partial" in
+      Lwt.return (Ok (`Assoc [
+        "job_id", `String job_id; "reason", `String "resource compute session cancelled";
+        "status", `String "refused";
+        "cancellation", `Assoc ["status", `String state;
+          "scope", `String "session_closed";
+          "selection_root", `String (Text.raw_to_hex value.selection_root);
+          "members", `List (List.map (fun node -> `String node) value.members);
+          "missing", `List (List.map (fun node -> `String node) value.missing);
+          "expires_epoch", (match value.expires with None -> `Null | Some epoch -> int64 epoch);
+          "receipts", `List (List.map cancel_receipt value.receipts)]]))
+    | Ok (Some (Service.Finished response)) -> Lwt.return (Ok (response_json response))
 
 let cancel service params =
+  let fields = ["caller"; "caller_public_key"; "caller_signature"; "session_id"] in
   match
-    object_fields
-      ["caller"; "caller_public_key"; "caller_signature"; "session_id"]
-      params
+    (match object_fields ("valid_until" :: fields) params with
+    | Ok _ as value -> value | Error _ -> object_fields fields params)
   with
   | Error error -> Lwt.return (Error error)
   | Ok fields ->
@@ -290,23 +368,20 @@ let cancel service params =
         address_field fields "caller",
         base64_field fields "caller_public_key" 32,
         base64_field fields "caller_signature" 64,
-        raw_hash_field fields "session_id"
+        raw_hash_field fields "session_id",
+        (if List.mem_assoc "valid_until" fields then
+          Result.map Option.some (int64_field fields "valid_until") else Ok None)
       with
-      | Error error, _, _, _
-      | _, Error error, _, _
-      | _, _, Error error, _
-      | _, _, _, Error error -> Lwt.return (Error error)
-      | Ok caller, Ok caller_public_key, Ok caller_signature, Ok session_id ->
+      | Error error, _, _, _, _
+      | _, Error error, _, _, _
+      | _, _, Error error, _, _
+      | _, _, _, Error error, _
+      | _, _, _, _, Error error -> Lwt.return (Error error)
+      | Ok caller, Ok caller_public_key, Ok caller_signature, Ok session_id, Ok until ->
         let open Lwt.Syntax in
+        let cancellation = Service.{caller; caller_public_key; caller_signature; session_id; until} in
         let* result =
-          Service.cancel
-            service
-            Service.{
-              caller;
-              caller_public_key;
-              caller_signature;
-              session_id;
-            } in
+          Service.cancel service cancellation in
         begin
           match result with
           | Error message ->
@@ -317,11 +392,17 @@ let cancel service params =
                     "resource compute cancellation refused"
                     (Some (`String message))))
           | Ok cancelled ->
-            Lwt.return
-              (Ok
-                 (`Assoc [
-                    "cancelled_jobs", `Int cancelled;
-                    "status", `String "cancelled";
-                  ]))
+            let* receipts = Service.cancel_receipts service cancellation in
+            Lwt.return (match receipts with
+              | Error reason -> Error (Rpc.err (-32041)
+                  "resource compute cancellation recorded; receipts unavailable"
+                  (Some (`String reason)))
+              | Ok receipts -> Ok (`Assoc [
+                  "cancelled_jobs", `Int cancelled;
+                  "scope", `String "local";
+                  "status", `String "cancelled";
+                  "receipt_scope", `String "session_closed";
+                  "receipts", `List (List.map cancel_receipt receipts);
+                ]))
         end
     end

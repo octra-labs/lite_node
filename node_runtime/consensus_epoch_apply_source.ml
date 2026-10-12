@@ -118,7 +118,12 @@ let selected rules ~epoch ?(effects = []) txs receipts_json =
     with
     | Error error -> Error (Outcome_invalid error)
     | Ok inputs ->
-      match Octra_core.Tx_envelope.check_rule rules ~epoch inputs with
+      let checked = let ( let* ) = Result.bind in
+        let* mode = Octra_core.Rule_graph.vm_bytes rules ~epoch
+          |> Result.map_error Octra_core.Rule_graph.fault_message in
+        let* () = Octra_core.Tx_envelope.check_charged mode partition.rejections in
+        Octra_core.Tx_envelope.check_rule rules ~epoch inputs in
+      match checked with
       | Error error -> Error (Outcome_invalid error)
       | Ok () ->
       Ok {
@@ -167,7 +172,11 @@ let choose (deps : deps) request =
   match request.override_ordered_txs with
   | Some txs -> choose_override deps request txs
   | None when request.consensus_mode -> choose_consensus deps request
-  | None -> selected deps.rules ~epoch:request.epoch_id (deps.staging_txs ()) []
+  | None ->
+    let txs = deps.staging_txs () |> List.filter (fun tx ->
+      Result.is_ok (Octra_core.Tx_envelope.check_rule deps.rules
+        ~epoch:request.epoch_id [tx])) in
+    selected deps.rules ~epoch:request.epoch_id txs []
 
 let run (deps : deps) request ~apply_effect ~fatal ~exit =
   match choose deps request with

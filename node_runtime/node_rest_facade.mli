@@ -12,6 +12,8 @@ type runtime = {
   swarm_ref : Octra_net.P2p_swarm.t option ref;
   duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
   proof_mode : unit -> Octra_core.Rule_graph.mode;
+  compute_mode : unit -> Octra_core.Rule_graph.mode;
+  settle_mode : unit -> Octra_core.Rule_graph.mode;
   queue_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;

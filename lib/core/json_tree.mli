@@ -3,4 +3,5 @@
 
 val read : string -> Yojson.Safe.t
 val read_plain : string -> Yojson.Safe.t
+val measure : limit:int -> Yojson.Safe.t -> int option
 val write : ?sort:bool -> Yojson.Safe.t -> string

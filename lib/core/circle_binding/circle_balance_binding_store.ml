@@ -3,24 +3,25 @@
 
 open Lwt.Syntax
 
-let load_opt store circle_id subject_addr =
+let load_opt ?snapshot store circle_id subject_addr =
+  let read = Circle_policy_store.read_first_inline_value ?snapshot in
   let* current_state_ref_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_binding.current_state_ref_key subject_addr] in
   let* version_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_binding.version_key subject_addr] in
   let* status_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_binding.status_key subject_addr] in
   let* last_workflow_ref_raw =
-    Circle_policy_store.read_first_inline_value
+    read
       store
       circle_id
       [Circle_balance_binding.last_workflow_ref_key subject_addr] in
@@ -35,8 +36,8 @@ let load_opt store circle_id subject_addr =
   else
     Lwt.return_none
 
-let load store circle_id subject_addr =
-  let* binding_opt = load_opt store circle_id subject_addr in
+let load ?snapshot store circle_id subject_addr =
+  let* binding_opt = load_opt ?snapshot store circle_id subject_addr in
   match binding_opt with
   | Some binding -> Lwt.return binding
   | None -> Lwt.return Circle_balance_binding.empty

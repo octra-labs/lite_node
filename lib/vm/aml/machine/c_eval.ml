@@ -32,6 +32,7 @@ type out = {
   row : C_eff.t;
   limit : Z.t;
   work_limit : Z.t;
+  int_work : Z.t;
 }
 
 type exec = {
@@ -62,6 +63,7 @@ type error =
   | Fuel of Z.t * Z.t
   | Cost of Z.t * Z.t
   | Work of Z.t * Z.t
+  | Arith of Z.t * Z.t
   | Effects of C_eff.t * C_eff.t
 
 type rule_error =
@@ -81,6 +83,8 @@ type done_ = {
 }
 
 let max_cost = Z.of_int C_rule.local.fuel
+
+type meter = { mutable used : Z.t }
 
 let ( let* ) value next =
   match value with
@@ -292,13 +296,38 @@ let held atom payload kind id = { atom; payload; origin = Held (kind, id) }
 
 let item value = { value; trace = Nil; steps = Z.one; work = Z.one }
 
-let integer op reject left right =
-  let actual = Int_work.cost Int_work.Active op left right in
-  if Z.gt actual max_cost then Error (Work (max_cost, actual))
-  else
-    match Int_work.eval op left right with
-    | Int_work.Value value -> Ok value
-    | Int_work.Reject -> Error reject
+let charge meter cost =
+  let actual = Z.add meter.used cost in
+  if Z.gt actual max_cost then Error (Arith (max_cost, actual))
+  else begin
+    meter.used <- actual;
+    Ok ()
+  end
+
+let integer meter op reject left right =
+  let cost = Int_work.cost Int_work.Active op left right in
+  let* () = charge meter cost in
+  match Int_work.eval op left right with
+  | Int_work.Value value -> Ok value
+  | Int_work.Reject -> Error reject
+
+let rec equal_charge meter left right =
+  match left, right with
+  | Int left, Int right ->
+    charge meter (Int_work.cost Int_work.Active Int_work.Sub left right)
+  | Vec left, Vec right when Array.length left = Array.length right ->
+    let rec walk index =
+      if index = Array.length left then Ok ()
+      else
+        let* () = equal_charge meter left.(index) right.(index) in
+        walk (index + 1)
+    in
+    walk 0
+  | Pair (la, lb), Pair (ra, rb) ->
+    let* () = equal_charge meter la ra in
+    equal_charge meter lb rb
+  | Inl left, Inl right | Inr left, Inr right -> equal_charge meter left right
+  | _ -> Ok ()
 
 let host_len value =
   match C_nat.of_int value with
@@ -433,7 +462,7 @@ let input_value (bind : C_term.bind) caps value =
   in
   walk 0 caps [0, bind.typ, value]
 
-let rec eval env term =
+let rec eval meter env term =
   match term with
   | C_term.Unit -> Ok (item Unit)
   | C_term.Bool value -> Ok (item (Bool value))
@@ -442,7 +471,7 @@ let rec eval env term =
     if C_type.admits typ value then Ok (item (Int value))
     else Error Need_int
   | C_term.Bytes value -> bytes value
-  | C_term.Vec (_, values) -> eval_vec env values
+  | C_term.Vec (_, values) -> eval_vec meter env values
   | C_term.Seq (cap, elem, values) ->
     let count = List.length values in
     if count > C_nat.to_int cap then
@@ -452,7 +481,7 @@ let rec eval env term =
         | None -> Error Need_seq
       end
     else
-      let* active = eval_vec env values in
+      let* active = eval_vec meter env values in
       begin
         match active.value, zero elem with
         | Vec items, Some empty ->
@@ -474,41 +503,41 @@ let rec eval env term =
     begin
       match bind.mul with
       | C_type.Zero ->
-        let* body = eval env body in
+        let* body = eval meter env body in
         Ok { body with steps = Z.succ body.steps; work = Z.succ body.work }
       | C_type.One | C_type.Many ->
-        let* value = eval env value in
-        let* body = eval ((bind.id, value.value) :: env) body in
+        let* value = eval meter env value in
+        let* body = eval meter ((bind.id, value.value) :: env) body in
         Ok (seq value body body.value)
     end
   | C_term.If (guard, yes, no) ->
-    let* guard = eval env guard in
+    let* guard = eval meter env guard in
     begin
       match guard.value with
       | Bool true ->
-        let* body = eval env yes in
+        let* body = eval meter env yes in
         Ok (seq guard body body.value)
       | Bool false ->
-        let* body = eval env no in
+        let* body = eval meter env no in
         Ok (seq guard body body.value)
       | _ -> Error Need_bool
     end
   | C_term.Pair (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     Ok (seq left right (Pair (left.value, right.value)))
   | C_term.Unpair (pair, left, right, body) ->
-    let* pair = eval env pair in
+    let* pair = eval meter env pair in
     begin
       match pair.value with
       | Pair (left_value, right_value) ->
         let body_env = bind_env right right_value (bind_env left left_value env) in
-        let* body = eval body_env body in
+        let* body = eval meter body_env body in
         Ok (seq pair body body.value)
       | _ -> Error Need_pair
     end
   | C_term.Fst pair ->
-    let* pair = eval env pair in
+    let* pair = eval meter env pair in
     begin
       match pair.value with
       | Pair (left, _) ->
@@ -517,7 +546,7 @@ let rec eval env term =
       | _ -> Error Need_pair
     end
   | C_term.Snd pair ->
-    let* pair = eval env pair in
+    let* pair = eval meter env pair in
     begin
       match pair.value with
       | Pair (_, right) ->
@@ -526,102 +555,102 @@ let rec eval env term =
       | _ -> Error Need_pair
     end
   | C_term.Inl (value, _) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     Ok { value with value = Inl value.value; steps = Z.succ value.steps;
       work = Z.succ value.work }
   | C_term.Inr (_, value) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     Ok { value with value = Inr value.value; steps = Z.succ value.steps;
       work = Z.succ value.work }
   | C_term.Case (value, left, yes, right, no) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Inl payload ->
-        let* body = eval (bind_env left payload env) yes in
+        let* body = eval meter (bind_env left payload env) yes in
         Ok (seq value body body.value)
       | Inr payload ->
-        let* body = eval (bind_env right payload env) no in
+        let* body = eval meter (bind_env right payload env) no in
         Ok (seq value body body.value)
       | _ -> Error Need_sum
     end
   | C_term.Act (atom, body) ->
-    let* body = eval env body in
+    let* body = eval meter env body in
     let action = direct atom body.value in
     Ok { body with trace = cat (Atom action) body.trace;
       steps = Z.succ body.steps; work = Z.succ body.work }
   | C_term.Add (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Int left_int, Int right_int ->
-        let* value = integer Int_work.Add Need_int left_int right_int in
+        let* value = integer meter Int_work.Add Need_int left_int right_int in
         Ok (seq left right (Int value))
       | _ -> Error Need_int
     end
   | C_term.Sub (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Int left_int, Int right_int ->
-        let* value = integer Int_work.Sub Need_int left_int right_int in
+        let* value = integer meter Int_work.Sub Need_int left_int right_int in
         Ok (seq left right (Int value))
       | _ -> Error Need_int
     end
   | C_term.Mul (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Int left_int, Int right_int ->
-        let* value = integer Int_work.Mul Need_int left_int right_int in
+        let* value = integer meter Int_work.Mul Need_int left_int right_int in
         Ok (seq left right (Int value))
       | _ -> Error Need_int
     end
   | C_term.Div (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Int left_int, Int right_int ->
-        let* value = integer Int_work.Div Divide_zero left_int right_int in
+        let* value = integer meter Int_work.Div Divide_zero left_int right_int in
         Ok (seq left right (Int value))
       | _ -> Error Need_int
     end
   | C_term.Mod (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Int left_int, Int right_int ->
-        let* value = integer Int_work.Mod Modulo_zero left_int right_int in
+        let* value = integer meter Int_work.Mod Modulo_zero left_int right_int in
         Ok (seq left right (Int value))
       | _ -> Error Need_int
     end
   | C_term.Neg value ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Int number ->
-        let* result = integer Int_work.Neg Need_int number number in
+        let* result = integer meter Int_work.Neg Need_int number number in
         Ok { value with value = Int result;
           steps = Z.succ value.steps; work = Z.succ value.work }
       | _ -> Error Need_int
     end
   | C_term.Abs value ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Int number ->
-        let* result = integer Int_work.Abs Need_int number number in
+        let* result = integer meter Int_work.Abs Need_int number number in
         Ok { value with value = Int result;
           steps = Z.succ value.steps; work = Z.succ value.work }
       | _ -> Error Need_int
     end
   | C_term.Fit (target, value) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Int number ->
@@ -633,7 +662,7 @@ let rec eval env term =
       | _ -> Error Need_int
     end
   | C_term.Wide value ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Int _ ->
@@ -641,7 +670,7 @@ let rec eval env term =
       | _ -> Error Need_int
     end
   | C_term.Length value ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Pair (Int len, Vec items)
@@ -651,17 +680,19 @@ let rec eval env term =
       | _ -> Error Need_seq
     end
   | C_term.Eq (typ, left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
+    let* () = equal_charge meter left.value right.value in
     let same, work = equal_run typ left.value right.value in
     let out = seq left right (Bool same) in
     Ok { out with work = Z.add out.work work }
   | C_term.Cmp (rel, left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Int lhs, Int rhs ->
+        let* () = charge meter (Int_work.cost Int_work.Active Int_work.Sub lhs rhs) in
         let value =
           match rel with
           | C_term.Lt -> Z.lt lhs rhs
@@ -673,8 +704,8 @@ let rec eval env term =
       | _ -> Error Need_int
     end
   | C_term.Cat (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Bytes left_bytes, Bytes right_bytes ->
@@ -684,7 +715,7 @@ let rec eval env term =
       | _ -> Error Need_bytes
     end
   | C_term.Take (len, value) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Bytes raw ->
@@ -696,7 +727,7 @@ let rec eval env term =
       | _ -> Error Need_bytes
     end
   | C_term.Drop (len, value) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Bytes raw ->
@@ -711,8 +742,8 @@ let rec eval env term =
       | _ -> Error Need_bytes
     end
   | C_term.Vcat (left, right) ->
-    let* left = eval env left in
-    let* right = eval env right in
+    let* left = eval meter env left in
+    let* right = eval meter env right in
     begin
       match left.value, right.value with
       | Vec left_values, Vec right_values ->
@@ -722,7 +753,7 @@ let rec eval env term =
       | _ -> Error Need_vec
     end
   | C_term.At (index, value) ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Vec values ->
@@ -734,7 +765,7 @@ let rec eval env term =
       | _ -> Error Need_vec
     end
   | C_term.Uncons value ->
-    let* value = eval env value in
+    let* value = eval meter env value in
     begin
       match value.value with
       | Vec values when Array.length values > 0 ->
@@ -753,27 +784,27 @@ let rec eval env term =
       | _ -> Error Need_vec
     end
   | C_term.Vfold (vector, seed, fold) ->
-    let* vector = eval env vector in
-    let* seed = eval env seed in
+    let* vector = eval meter env vector in
+    let* seed = eval meter env seed in
     begin
       match vector.value with
       | Vec values ->
         let trace = cat vector.trace seed.trace in
         let steps = Z.succ (Z.add vector.steps seed.steps) in
         let work = Z.succ (Z.add vector.work seed.work) in
-        eval_fold env fold values 0 seed.value trace steps work
+        eval_fold meter env fold values 0 seed.value trace steps work
       | Pair (Int len, Vec values)
           when Z.sign len >= 0 && Z.leq len (Z.of_int (Array.length values)) ->
         let trace = cat vector.trace seed.trace in
         let steps = Z.succ (Z.add vector.steps seed.steps) in
         let work = Z.succ (Z.add vector.work seed.work) in
-        eval_fold env fold (Array.sub values 0 (Z.to_int len)) 0 seed.value
+        eval_fold meter env fold (Array.sub values 0 (Z.to_int len)) 0 seed.value
           trace steps work
       | _ -> Error Need_vec
     end
   | C_term.Step (cap, value) ->
-    let* cap = eval env cap in
-    let* value = eval env value in
+    let* cap = eval meter env cap in
+    let* value = eval meter env value in
     begin
       match cap.value with
       | Cap (kind, id) ->
@@ -787,7 +818,7 @@ let rec eval env term =
       | _ -> Error Need_cap
     end
   | C_term.Close cap ->
-    let* cap = eval env cap in
+    let* cap = eval meter env cap in
     begin
       match cap.value with
       | Cap (kind, id) ->
@@ -805,7 +836,7 @@ let rec eval env term =
       | _ -> Error Need_cap
     end
 
-and eval_vec env values =
+and eval_vec meter env values =
   let rec loop out trace steps work = function
     | [] ->
       Ok {
@@ -815,7 +846,7 @@ and eval_vec env values =
         work;
       }
     | value :: rest ->
-      let* value = eval env value in
+      let* value = eval meter env value in
       let trace = cat trace value.trace in
       let steps = Z.succ (Z.add steps value.steps) in
       let work = Z.succ (Z.add work value.work) in
@@ -823,18 +854,18 @@ and eval_vec env values =
   in
   loop [] Nil Z.one Z.one values
 
-and eval_fold env (fold : C_term.fold) values index state trace steps work =
+and eval_fold meter env (fold : C_term.fold) values index state trace steps work =
   if index = Array.length values then
     Ok { value = state; trace; steps; work }
   else
     let body_env =
       bind_env fold.state state (bind_env fold.item values.(index) env)
     in
-    let* body = eval body_env fold.body in
+    let* body = eval meter body_env fold.body in
     let trace = cat trace body.trace in
     let steps = Z.succ (Z.add steps body.steps) in
     let work = Z.succ (Z.add work body.work) in
-    eval_fold env fold values (index + 1) body.value trace steps work
+    eval_fold meter env fold values (index + 1) body.value trace steps work
 
 let rec input_env env caps ids = function
   | [] -> Ok env
@@ -863,7 +894,8 @@ let run_in ?(fuel = max_cost) inputs term =
     if Z.sign fuel < 0 || Z.gt limit fuel then Error (Fuel (fuel, limit))
     else
     let* env = input_env [] Caps.empty Ids.empty inputs in
-    let* done_ = eval env term in
+    let meter = { used = Z.zero } in
+    let* done_ = eval meter env term in
     let actions = trace_list done_.trace in
     let plan = atoms actions in
     let used = C_eff.of_list plan in
@@ -884,6 +916,7 @@ let run_in ?(fuel = max_cost) inputs term =
       row = info.eff;
       limit;
       work_limit = info.res.work;
+      int_work = meter.used;
     }
 
 let run ?fuel term = run_in ?fuel [] term
@@ -935,6 +968,8 @@ let text = function
     "cost limit = " ^ Z.to_string limit ^ " actual = " ^ Z.to_string actual
   | Work (limit, actual) ->
     "work limit = " ^ Z.to_string limit ^ " actual = " ^ Z.to_string actual
+  | Arith (limit, actual) ->
+    "integer work limit = " ^ Z.to_string limit ^ " actual = " ^ Z.to_string actual
   | Effects (row, used) ->
     "effects row = " ^ C_eff.text row ^ " actual = " ^ C_eff.text used
 
