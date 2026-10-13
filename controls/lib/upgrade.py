@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -71,6 +72,20 @@ def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()), flush=True)
 
 def call(command, cwd=None, check=True, quiet=False, timeout=None):
+    if timeout is not None and not quiet:
+        with subprocess.Popen(command, cwd=cwd, start_new_session=True) as process:
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                raise ValidatorError(f"command timed out: {command[0]}") from error
+            if check and code:
+                raise subprocess.CalledProcessError(code, command)
+            return subprocess.CompletedProcess(command, code)
     return subprocess.run(
         command,
         cwd=cwd,
@@ -886,7 +901,7 @@ def git_update(root, public, source):
     if not HEX40.fullmatch(prior):
         raise ValidatorError("local release commit is invalid")
     remote, merge = update_ref(root)
-    call(["git", "fetch", "--no-tags", remote, merge], cwd=root)
+    call(["git", "fetch", "--no-tags", remote, merge], cwd=root, timeout=120)
     target = capture(["git", "rev-parse", "FETCH_HEAD"], cwd=root)
     if not HEX40.fullmatch(target):
         raise ValidatorError("fetched release commit is invalid")
@@ -1094,8 +1109,8 @@ def apply(root, sup, values, args, release):
         if need is not None
         else None
     )
-    call(["sh", str(root / "controls/check.sh")], cwd=root)
-    call(["sh", str(root / "controls/build.sh")], cwd=root)
+    call(["sh", str(root / "controls/check.sh")], cwd=root, timeout=300)
+    call(["sh", str(root / "controls/build.sh")], cwd=root, timeout=3600)
     if sup["pid"]:
         marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
         require_profile(view(values, sup["pid"], release), release,
@@ -1246,7 +1261,7 @@ def parser():
     value.add_argument("--sudo", action="store_true")
     value.add_argument("--unit")
     value.add_argument("--user-unit", action="store_true")
-    value.add_argument("--wait-seconds", type=float, default=600.0)
+    value.add_argument("--wait-seconds", type=float, default=3600.0)
     return value
 
 def main():

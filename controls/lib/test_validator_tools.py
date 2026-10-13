@@ -1073,6 +1073,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 mock.call(
                     ["git", "fetch", "--no-tags", "origin", "refs/heads/main"],
                     cwd=WORK,
+                    timeout=120,
                 ),
                 mock.call(["git", "merge", "--ff-only", public], cwd=WORK),
             ],
@@ -1111,6 +1112,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 mock.call(
                     ["git", "fetch", "--no-tags", "origin", "refs/heads/main"],
                     cwd=WORK,
+                    timeout=120,
                 ),
                 mock.call(["git", "merge", "--ff-only", public], cwd=WORK),
             ],
@@ -4584,7 +4586,7 @@ class ValidatorToolsTest(unittest.TestCase):
             return f"/{path}/{command}"
 
         def probe(command, **_):
-            version = "1.75.0" if command[0].startswith("/old/") else "1.80.1"
+            version = "1.80.1" if command[0].startswith("/old/") else "1.88.0"
             return subprocess.CompletedProcess(command, 0, f"rustc {version}\n", "")
 
         with mock.patch(
@@ -4595,6 +4597,55 @@ class ValidatorToolsTest(unittest.TestCase):
                     with mock.patch("validator_config.install_rust_toolchain") as install:
                         self.assertEqual(ensure_build_toolchain(), fresh)
         install.assert_called_once_with()
+
+    def test_build_rust_missing(self):
+        replies = [subprocess.CompletedProcess([], 1, "", "missing toolchain"),
+                   subprocess.CompletedProcess([], 0, "rustc 1.88.0\n", "")]
+        with mock.patch("validator_config.rust_environment", return_value={"PATH": "local"}), \
+                mock.patch("validator_config.shutil.which", return_value="rustc"), \
+                mock.patch("validator_config.subprocess.run", side_effect=replies), \
+                mock.patch("validator_config.install_rust_toolchain") as install:
+            self.assertEqual(ensure_build_toolchain(), {"PATH": "local"})
+        install.assert_called_once_with()
+
+    def test_build_rust_refused(self):
+        reply = subprocess.CompletedProcess([], 0, "rustc 1.80.1\n", "")
+        with mock.patch("validator_config.rust_environment", return_value={"PATH": "local"}), \
+                mock.patch("validator_config.shutil.which", return_value="rustc"), \
+                mock.patch("validator_config.subprocess.run", return_value=reply), \
+                mock.patch("validator_config.install_rust_toolchain") as install:
+            with self.assertRaisesRegex(ValidatorError, "requires rustc 1.88"):
+                ensure_build_toolchain()
+        install.assert_called_once_with()
+
+    def test_build_rust_current(self):
+        reply = subprocess.CompletedProcess([], 0, "rustc 1.88.0\n", "")
+        with mock.patch("validator_config.rust_environment", return_value={"PATH": "local"}), \
+                mock.patch("validator_config.shutil.which", return_value="rustc"), \
+                mock.patch("validator_config.subprocess.run", return_value=reply), \
+                mock.patch("validator_config.install_rust_toolchain") as install:
+            ensure_build_toolchain()
+        install.assert_not_called()
+
+    def test_rust_install(self):
+        import validator_config
+        environment = {"PATH": "local", "RUSTUP_TOOLCHAIN": "1.88.0"}
+        with mock.patch("validator_config.rust_environment", return_value=environment), \
+                mock.patch("validator_config.rust_version", return_value=None), \
+                mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch("validator_config.run") as run:
+            validator_config.install_rust_toolchain()
+        run.assert_called_once_with(
+            [str(CARGO_HOME / "bin/rustup"), "toolchain", "install", "1.88.0", "--profile", "minimal"],
+            env=environment, timeout=900)
+
+    def test_rust_probe_timeout(self):
+        import validator_config
+        with mock.patch("validator_config.shutil.which", return_value="rustc"), \
+                mock.patch("validator_config.subprocess.run",
+                    side_effect=subprocess.TimeoutExpired("rustc", 30)):
+            with self.assertRaisesRegex(ValidatorError, "compiler check timed out"):
+                validator_config.rust_version({"PATH": "local"})
 
     def test_gate_python(self):
         script_path = Path(__file__).resolve().parent.parent / "check.sh"
@@ -5570,6 +5621,7 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertEqual(environment["TMPDIR"], str(BUILD_WORK))
             self.assertEqual(environment["CARGO_HOME"], str(CARGO_HOME))
             self.assertEqual(environment["RUSTUP_HOME"], str(RUSTUP_HOME))
+            self.assertEqual(environment["RUSTUP_TOOLCHAIN"], "1.88.0")
             self.assertEqual(OPAM_SWITCH, TOOLCHAIN_ROOT / "ocaml")
             self.assertEqual("OPAMROOT" in environment, opam is not None)
             self.assertEqual(environment.get("OPAMROOT"), opam)
@@ -5599,7 +5651,9 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn("liblmdb0", install_value)
         self.assertIn("https://sh.rustup.rs", install_value)
         self.assertIn("OCAML_TOOLCHAIN=4.14.2", install_value)
-        self.assertIn("RUST_TOOLCHAIN=1.80.1", install_value)
+        self.assertIn("RUST_TOOLCHAIN=1.88.0", install_value)
+        self.assertIn("--max-time 300", install_value)
+        self.assertIn('timeout 900 "$RUSTUP" toolchain install', install_value)
         config_path = Path(__file__).resolve().with_name("validator_config.py")
         config_value = config_path.read_text(encoding="utf-8")
         self.assertIn("switch = str(OPAM_SWITCH)", config_value)

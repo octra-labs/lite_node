@@ -7,7 +7,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE_BUILD=0
 DATA_ROOT=${OCTRA_DATA_ROOT:-/var/lib/octra}
 OCAML_TOOLCHAIN=4.14.2
-RUST_TOOLCHAIN=1.80.1
+RUST_TOOLCHAIN=1.88.0
 TOOLCHAIN_ROOT="$ROOT/runtime_data/toolchains"
 CARGO_HOME="$TOOLCHAIN_ROOT/cargo"
 RUSTUP_HOME="$TOOLCHAIN_ROOT/rustup"
@@ -98,10 +98,12 @@ install_rust_toolchain() {
       --location \
       --silent \
       --show-error \
+      --connect-timeout 15 \
+      --max-time 300 \
       https://sh.rustup.rs \
       --output "$TOOLCHAIN_ROOT/rustup-init.sh"
     run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-      sh "$TOOLCHAIN_ROOT/rustup-init.sh" \
+      timeout 900 sh "$TOOLCHAIN_ROOT/rustup-init.sh" \
       -y \
       --no-modify-path \
       --profile minimal \
@@ -110,7 +112,7 @@ install_rust_toolchain() {
   run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
     "$RUSTUP" set profile minimal
   run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-    "$RUSTUP" toolchain install "$RUST_TOOLCHAIN"
+    timeout 900 "$RUSTUP" toolchain install "$RUST_TOOLCHAIN"
   run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
     "$RUSTUP" default "$RUST_TOOLCHAIN"
 }
@@ -140,6 +142,8 @@ bind_build_toolchains() {
     "setenv=CARGO_HOME=\"$CARGO_HOME\""
   run_operator opam option --switch "$OCAML_SWITCH" \
     "setenv+=RUSTUP_HOME=\"$RUSTUP_HOME\""
+  run_operator opam option --switch "$OCAML_SWITCH" \
+    "setenv+=RUSTUP_TOOLCHAIN=\"$RUST_TOOLCHAIN\""
   run_operator opam option --switch "$OCAML_SWITCH" \
     "setenv+=PATH+=\"$CARGO_HOME/bin\""
   OPAM_ENVIRONMENT="$OCAML_SWITCH/_opam/.opam-switch/environment"

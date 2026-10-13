@@ -71,7 +71,7 @@ DEFAULT_FLOOR_BINARY = (
 DEFAULT_CONFIG = ROOT / ".keys/validator/node.env"
 DEFAULT_DATA = ROOT / "data"
 IDENTITY_WALLET = ROOT / ".keys/validator/wallet.json"
-RUST_TOOLCHAIN = "1.80.1"
+RUST_TOOLCHAIN = "1.88.0"
 TOOLCHAIN_ROOT = ROOT / "runtime_data/toolchains"
 BUILD_WORK = TOOLCHAIN_ROOT / "build"
 CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
@@ -205,9 +205,12 @@ def ask_bool(label, default):
         return False
     raise ValidatorError(f"invalid yes or no answer: {value}")
 
-def run(command, cwd=ROOT, env=None):
+def run(command, cwd=ROOT, env=None, timeout=None):
     emit(event="run", command=command[0])
-    subprocess.run(command, cwd=cwd, check=True, env=env)
+    try:
+        subprocess.run(command, cwd=cwd, check=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise ValidatorError(f"command timed out: {command[0]}") from error
 
 def elevated(command):
     if os.geteuid() == 0:
@@ -303,23 +306,38 @@ def rust_environment():
         "CARGO_HOME": str(CARGO_HOME),
         "PATH": os.pathsep.join([cargo_bin, os.environ.get("PATH", "")]),
         "RUSTUP_HOME": str(RUSTUP_HOME),
+        "RUSTUP_TOOLCHAIN": RUST_TOOLCHAIN,
     }
     environment["TMPDIR"] = str(BUILD_WORK)
     return environment
 
-def install_rust_toolchain():
-    environment = rust_environment()
+def rust_version(environment):
     rustc = shutil.which("rustc", path=environment["PATH"])
-    if rustc is not None:
-        version = subprocess.run(
+    if rustc is None:
+        return None
+    try:
+        probe = subprocess.run(
             [rustc, "--version"],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             env=environment,
-        ).stdout
-        if tool_version(version) >= (1, 80, 0):
-            return
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValidatorError("Rust compiler check timed out") from error
+    return tool_version(probe.stdout) if probe.returncode == 0 else None
+
+def install_rust_toolchain():
+    environment = rust_environment()
+    version = rust_version(environment)
+    if version is not None and version >= (1, 88, 0):
+        return
+    rustup = CARGO_HOME / "bin/rustup"
+    if rustup.is_file():
+        run([str(rustup), "toolchain", "install", RUST_TOOLCHAIN,
+             "--profile", "minimal"], env=environment, timeout=900)
+        return
     stage = ROOT / "runtime_data/rustup"
     stage.mkdir(parents=True, exist_ok=True)
     installer = stage / "rustup-init.sh"
@@ -332,10 +350,12 @@ def install_rust_toolchain():
         "--location",
         "--silent",
         "--show-error",
+        "--connect-timeout", "15",
+        "--max-time", "300",
         "https://sh.rustup.rs",
         "--output",
         str(installer),
-    ], env=environment)
+    ], env=environment, timeout=330)
     run([
         "sh",
         str(installer),
@@ -345,27 +365,14 @@ def install_rust_toolchain():
         "minimal",
         "--default-toolchain",
         RUST_TOOLCHAIN,
-    ], env=environment)
+    ], env=environment, timeout=900)
 
 def ensure_build_toolchain():
     environment = rust_environment()
-    rustc = shutil.which("rustc", path=environment["PATH"])
-    if rustc is None:
+    version = rust_version(environment)
+    if version is None or version < (1, 88, 0):
         install_rust_toolchain()
         environment = rust_environment()
-        rustc = shutil.which("rustc", path=environment["PATH"])
-    elif tool_version(
-        subprocess.run(
-            [rustc, "--version"],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        ).stdout
-    ) < (1, 80, 0):
-        install_rust_toolchain()
-        environment = rust_environment()
-        rustc = shutil.which("rustc", path=environment["PATH"])
     commands = ["cargo", "g++", "make", "opam", "rustc"]
     missing = [
         command
@@ -374,23 +381,16 @@ def ensure_build_toolchain():
     ]
     if missing:
         raise ValidatorError("missing build tools: " + ",".join(missing))
-    if rustc is None:
-        raise ValidatorError("source build requires rustc 1.80 or newer")
-    version = subprocess.run(
-        ["rustc", "--version"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=environment,
-    ).stdout
-    if tool_version(version) < (1, 80, 0):
-        raise ValidatorError("source build requires rustc 1.80 or newer")
+    version = rust_version(environment)
+    if version is None or version < (1, 88, 0):
+        raise ValidatorError("source build requires rustc 1.88 or newer")
     return environment
 
 def bind_build_toolchains(environment, switch):
     updates = [
         "setenv=" + f'CARGO_HOME="{CARGO_HOME}"',
         "setenv+=" + f'RUSTUP_HOME="{RUSTUP_HOME}"',
+        "setenv+=" + f'RUSTUP_TOOLCHAIN="{RUST_TOOLCHAIN}"',
         "setenv+=" + f'PATH+="{CARGO_HOME / "bin"}"',
     ]
     for update in updates:

@@ -4,9 +4,14 @@
 import unittest
 import json
 import shutil
+import signal
+import subprocess
+import sys
+import time
 import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
@@ -75,6 +80,72 @@ def effects(states):
         yield mocks
 
 class UpgradeProfileTest(unittest.TestCase):
+    def test_call_timeout(self):
+        child = mock.Mock(pid=4242)
+        child.wait.side_effect = [subprocess.TimeoutExpired(["build"], 1), -9]
+        with mock.patch.object(upgrade.subprocess, "Popen") as start, \
+                mock.patch.object(upgrade.os, "killpg") as kill:
+            start.return_value.__enter__.return_value = child
+            with self.assertRaisesRegex(ValidatorError, "command timed out"):
+                upgrade.call(["build"], cwd=ROOT, timeout=1)
+        start.assert_called_once_with(["build"], cwd=ROOT, start_new_session=True)
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+        self.assertEqual(child.wait.call_count, 2)
+
+    def test_call_exit(self):
+        for code in (0, 3):
+            with self.subTest(code=code), mock.patch.object(upgrade.subprocess, "Popen") as start:
+                start.return_value.__enter__.return_value.wait.return_value = code
+                if code:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        upgrade.call(["build"], timeout=1)
+                else:
+                    self.assertEqual(upgrade.call(["build"], timeout=1).returncode, 0)
+
+    def test_timeout_processes(self):
+        work = ROOT / "runtime_data"
+        work.mkdir(exist_ok=True)
+        with TemporaryDirectory(dir=work) as directory:
+            path = Path(directory)
+            pulse = path / "pulse"
+            child_id = path / "child"
+            child = (
+                "import pathlib, sys, time\n"
+                "path = pathlib.Path(sys.argv[1])\n"
+                "while True:\n"
+                " with path.open('a') as stream: stream.write('x')\n"
+                " time.sleep(0.02)\n"
+            )
+            parent = (
+                "import pathlib, subprocess, sys\n"
+                "child = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+                "pathlib.Path(sys.argv[3]).write_text(str(child.pid))\n"
+                "child.wait()\n"
+            )
+            with self.assertRaisesRegex(ValidatorError, "command timed out"):
+                upgrade.call([sys.executable, "-c", parent, child, str(pulse), str(child_id)], timeout=2)
+            self.assertGreater(int(child_id.read_text()), 0)
+            before = pulse.stat().st_size
+            self.assertGreater(before, 1)
+            time.sleep(0.15)
+            self.assertEqual(pulse.stat().st_size, before)
+
+    def test_build_timeout_live(self):
+        def call(command, **options):
+            if Path(command[1]).name == "build.sh":
+                self.assertEqual(options["timeout"], 3600)
+                raise ValidatorError("command timed out: sh")
+        with effects([STATE]) as calls:
+            calls["call"].side_effect = call
+            with self.assertRaisesRegex(ValidatorError, "command timed out"):
+                upgrade.apply(ROOT, SUP, VALUES, ARGS, MARKER)
+            for name in ("stop", "restore_cycle", "wait_node"):
+                calls[name].assert_not_called()
+
+    def test_wait_default(self):
+        args = upgrade.parser().parse_args(["--root", str(ROOT)])
+        self.assertEqual(args.wait_seconds, 3600)
+
     def test_snapshot_recovery_floor(self):
         head = 1_620_000
         for lag, floor, limit, accepted in (
