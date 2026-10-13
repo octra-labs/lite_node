@@ -4591,7 +4591,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
         with mock.patch(
             "validator_config.rust_environment", side_effect=[old, fresh]
-        ):
+        ), mock.patch.object(Path, "is_file", return_value=False):
             with mock.patch("validator_config.shutil.which", side_effect=locate):
                 with mock.patch("validator_config.subprocess.run", side_effect=probe):
                     with mock.patch("validator_config.install_rust_toolchain") as install:
