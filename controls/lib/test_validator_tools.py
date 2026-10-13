@@ -4647,6 +4647,17 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidatorError, "compiler check timed out"):
                 validator_config.rust_version({"PATH": "local"})
 
+    def test_rust_probe_no_install(self):
+        import validator_config
+        reply = subprocess.CompletedProcess([], 1, "", "toolchain not installed")
+        with mock.patch("validator_config.shutil.which", return_value="rustc"), \
+                mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch("validator_config.subprocess.run", return_value=reply) as run:
+            self.assertIsNone(validator_config.rust_version({"PATH": "local"}))
+        self.assertEqual(run.call_args.args[0], [str(CARGO_HOME / "bin/rustup"),
+            "run", "1.88.0", "rustc", "--version"])
+        self.assertNotIn("--install", run.call_args.args[0])
+
     def test_gate_python(self):
         script_path = Path(__file__).resolve().parent.parent / "check.sh"
         script = script_path.read_text(encoding="utf-8")

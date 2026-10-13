@@ -315,9 +315,12 @@ def rust_version(environment):
     rustc = shutil.which("rustc", path=environment["PATH"])
     if rustc is None:
         return None
+    rustup = CARGO_HOME / "bin/rustup"
+    command = [str(rustup), "run", RUST_TOOLCHAIN, "rustc", "--version"] \
+        if rustup.is_file() else [rustc, "--version"]
     try:
         probe = subprocess.run(
-            [rustc, "--version"],
+            command,
             check=False,
             capture_output=True,
             text=True,
